@@ -150,6 +150,8 @@ fn turn_serde_round_trip() {
         token_usage: None,
         tool_results: vec![],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
     let frame = encode_frame(&turn).expect("encode");
     let decoded: Turn = decode_frame(&frame[4..]).expect("decode");
@@ -197,6 +199,8 @@ fn turn_with_tool_results_round_trip() {
             invocation_description: String::new(),
         }],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
     let frame = encode_frame(&turn).expect("encode");
     let decoded: Turn = decode_frame(&frame[4..]).expect("decode");
@@ -466,6 +470,8 @@ fn turn_appended_serde_round_trip() {
         token_usage: None,
         tool_results: vec![],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
     let msg = DaemonMessage::TurnAppended {
         session_id: 1,
@@ -494,6 +500,8 @@ fn turn_finalized_serde_round_trip() {
         }),
         tool_results: vec![],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
     let msg = DaemonMessage::TurnFinalized {
         session_id: 1,

@@ -181,6 +181,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         }
     }
 

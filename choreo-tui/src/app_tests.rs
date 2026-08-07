@@ -30,6 +30,8 @@ fn add_user_text(app: &mut App, content: &str) {
         token_usage: None,
         tool_results: vec![],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
     app.display_for(0).view.insert_or_replace(turn_id, turn);
     app.rebuild_height_prefix();
@@ -1110,6 +1112,8 @@ fn navigate_history_up_down_with_multi_line() {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         },
     );
     app.next_request_id += 1;
@@ -1144,6 +1148,8 @@ fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         },
     );
     app.next_request_id += 1;
@@ -1194,6 +1200,8 @@ fn navigate_history_down_adjusts_scroll_offset_for_long_draft() {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         },
     );
     app.next_request_id += 1;
@@ -2215,6 +2223,8 @@ fn navigate_history_down_survives_shrunk_history() {
                 token_usage: None,
                 tool_results: vec![],
                 displayed_images: vec![],
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
     }
@@ -2276,6 +2286,8 @@ fn navigate_history_up_survives_shrunk_history() {
                 token_usage: None,
                 tool_results: vec![],
                 displayed_images: vec![],
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
     }
@@ -2404,6 +2416,8 @@ fn click_on_reasoning_header_toggles_collapse() {
         token_usage: None,
         tool_results: vec![],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
     app.active_display()
         .unwrap()
@@ -2467,6 +2481,8 @@ fn click_on_reasoning_header_toggles_collapse_when_content_fits_viewport() {
         token_usage: None,
         tool_results: vec![],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
     app.active_display()
         .unwrap()
@@ -2534,6 +2550,8 @@ fn click_on_tool_result_header_toggles_collapse() {
             invocation_description: "Reading file `src/main.rs`.".into(),
         }],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
     app.active_display()
         .unwrap()
@@ -2624,6 +2642,8 @@ fn click_on_reasoning_header_toggles_collapse_when_scrolled() {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.active_display()
             .unwrap()
@@ -2642,6 +2662,8 @@ fn click_on_reasoning_header_toggles_collapse_when_scrolled() {
         token_usage: None,
         tool_results: vec![],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
     app.active_display()
         .unwrap()
@@ -3595,6 +3617,8 @@ fn streamed_turn(user_text: &str, assistant_text: &str) -> Turn {
         token_usage: None,
         tool_results: vec![],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     }
 }
 
@@ -3613,6 +3637,8 @@ fn placeholder_turn(user_text: &str) -> Turn {
         token_usage: None,
         tool_results: vec![],
         displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     }
 }
 
@@ -3855,6 +3881,8 @@ fn handle_turn_appended_with_displayed_image_populates_rendered_images() {
             data: vec![0u8; 100],
             tool_call_id: None,
         }],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
     app.handle_turn_appended(0, 1, turn);
 

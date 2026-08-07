@@ -11,8 +11,8 @@ pub use io::{
 pub use types::{
     AccountInfo, AssistantToolCallRecord, ClientMessage, ContextConfig, DaemonMessage,
     DiscardedToolCall, DisplayedImageRecord, ImageMetadata, InferenceError, OutputStream,
-    ReasoningCapability, SessionStatus, SessionSummary, TimestampMs, TokenUsage, ToolResultRecord,
-    Turn,
+    ReasoningArtifact, ReasoningCapability, ReasoningProducer, SessionStatus, SessionSummary,
+    TimestampMs, TokenUsage, ToolResultRecord, Turn,
 };
 
 #[cfg(test)]

@@ -2171,6 +2171,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         assert!(!lines.is_empty());
@@ -2195,6 +2197,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
@@ -2218,6 +2222,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         // Default state for a turn with a response: reasoning collapsed.
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
@@ -2264,6 +2270,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
@@ -2302,6 +2310,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         // User re-expanded the reasoning: the header points down and the
         // reasoning body appears BELOW the response.
@@ -2342,6 +2352,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         // No response text: reasoning defaults to expanded.
         let lines = render_turn_lines(&turn, 80, 85, true, &[]).lines;
@@ -2376,6 +2388,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         // Turn with a response: reasoning collapsed by default.
         let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
@@ -2416,6 +2430,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let collapsed = render_turn_lines(&turn, 80, 85, false, &[]);
         let expanded = render_turn_lines(&turn, 80, 85, true, &[]);
@@ -2439,6 +2455,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
         assert!(
@@ -2460,6 +2478,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
         assert!(
@@ -2481,6 +2501,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
@@ -2517,6 +2539,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         // No response text: reasoning defaults to expanded.
         let lines = render_turn_lines(&turn, 80, 85, true, &[]).lines;
@@ -2546,6 +2570,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         assert!(
             !reasoning_expanded_default(&turn),
@@ -2566,6 +2592,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         assert!(
             reasoning_expanded_default(&turn),
@@ -2586,6 +2614,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         assert!(
             !reasoning_expanded_default(&turn),
@@ -2610,6 +2640,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
@@ -2646,6 +2678,8 @@ mod tests {
                 invocation_description: "Reading file `src/main.rs`.".into(),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[true]).lines;
         let text = lines
@@ -2682,6 +2716,8 @@ mod tests {
                 invocation_description: "Reading file `src/main.rs`.".into(),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[false]).lines;
         let text = lines
@@ -2717,6 +2753,8 @@ mod tests {
                 invocation_description: "Running `sh` with an extremely long argument list that keeps going well past the wrap width and continues onto a second line of description text.".into(),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[true]).lines;
         let text = lines
@@ -2757,6 +2795,8 @@ mod tests {
                 invocation_description: "lorem ipsum dolor sit amet ".repeat(10),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 40, 45, false, &[true]).lines;
         // tool_content_width = 45 → rows are padded to exactly 49 columns;
@@ -2809,6 +2849,8 @@ mod tests {
                 invocation_description: String::new(),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let join = |lines: Vec<ratatui::text::Line<'static>>| {
             lines
@@ -2860,6 +2902,8 @@ mod tests {
                 },
             ],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let collapsed = render_turn_lines(&turn, 80, 85, false, &[true, true]);
         let expanded = render_turn_lines(&turn, 80, 85, false, &[false, false]);
@@ -2898,6 +2942,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
         assert!(rendered.tool_result_header_idxs.is_empty());
@@ -2933,6 +2979,8 @@ content ---"
                     .into(),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
@@ -2981,6 +3029,8 @@ content ---"
                 invocation_description: "Showing git object at `HEAD`.".into(),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
@@ -3013,6 +3063,8 @@ content ---"
                 invocation_description: String::new(),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
@@ -3037,6 +3089,8 @@ content ---"
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         assert_eq!(lines.len(), 1);
@@ -3056,6 +3110,8 @@ content ---"
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
@@ -3098,6 +3154,8 @@ content ---"
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines

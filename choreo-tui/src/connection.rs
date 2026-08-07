@@ -2508,6 +2508,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.display_for(0).view.insert_or_replace(id, turn);
     }
@@ -2756,6 +2758,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.display_for(0).view.insert_or_replace(0, turn);
         app.rebuild_height_prefix();

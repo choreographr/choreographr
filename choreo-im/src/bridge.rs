@@ -549,6 +549,8 @@ mod tests {
                         data: b"hello".to_vec(),
                         tool_call_id: None,
                     }],
+                    reasoning_artifact: None,
+                    reasoning_producer: None,
                 },
             },
             &mut buffers,

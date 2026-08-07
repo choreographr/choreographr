@@ -36,6 +36,8 @@ fn app_state_stream_updates_history() {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         },
     );
 
@@ -117,6 +119,8 @@ fn apply_daemon_turn_appended_with_image() {
             data: png,
             tool_call_id: None,
         }],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
 
     dispatch_daemon_message(

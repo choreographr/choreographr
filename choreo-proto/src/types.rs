@@ -210,6 +210,45 @@ pub struct ToolResultRecord {
     pub invocation_description: String,
 }
 
+/// Opaque reasoning round-trip payload, captured verbatim by a provider
+/// adapter and re-emitted verbatim on the next request. Only the producing
+/// adapter may interpret the payload. Display text lives separately in
+/// `Turn::assistant_reasoning`.
+///
+/// Stored as raw bytes so the proto type stays dependency-light and cannot
+/// accidentally be interpreted: the producing adapter serializes its own
+/// wire representation (e.g. Anthropic block JSON, Gemini signature string)
+/// into `Vec<u8>` at parse time and deserializes it back at request-build
+/// time. The variant tags which adapter owns the payload.
+///
+/// Serialized as an externally-tagged enum (`rename_all = "snake_case"`), so
+/// the adapter-ownership tag is the JSON object key (e.g.
+/// `{"chat_reasoning": [104,105]}`) and the postcard variant index — NOT
+/// `#[serde(tag = "kind", content = "payload")]`, because postcard (the
+/// workspace wire format, see `frame.rs`) cannot deserialize
+/// internally/adjacently tagged enums (`WontImplement`: they require
+/// `deserialize_any`, which postcard's deserializer does not implement).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningArtifact {
+    /// OpenAI-compatible chat: the `reasoning_content` string (verbatim).
+    ChatReasoning(Vec<u8>),
+    /// Anthropic: ordered thinking / redacted_thinking blocks, JSON as
+    /// received (signatures + redacted data intact, order preserved).
+    AnthropicThinking(Vec<u8>),
+    /// Gemini: encrypted thought signatures to send back.
+    GoogleSignatures(Vec<u8>),
+    /// OpenAI/xAI Responses: opaque reasoning items (or encrypted_content).
+    ResponsesItems(Vec<u8>),
+}
+
+/// Identity of the model that produced a reasoning artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReasoningProducer {
+    pub provider_slug: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Turn {
     pub created_at: TimestampMs,
@@ -222,6 +261,13 @@ pub struct Turn {
     pub token_usage: Option<TokenUsage>,
     pub tool_results: Vec<ToolResultRecord>,
     pub displayed_images: Vec<DisplayedImageRecord>,
+    /// Opaque reasoning round-trip artifact (None when never captured or
+    /// when the provider exposes no reusable artifact).
+    pub reasoning_artifact: Option<ReasoningArtifact>,
+    /// Which provider+model produced `reasoning_artifact`. Set whenever the
+    /// artifact is captured; used for the same-model check at build time
+    /// (artifacts are model-bound and must be dropped after a model switch).
+    pub reasoning_producer: Option<ReasoningProducer>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -684,5 +730,145 @@ impl DaemonMessage {
             | Self::AccountListFailed { .. }
             | Self::ShuttingDown => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// All four artifact variants, with realistic payload bytes.
+    fn all_artifacts() -> Vec<ReasoningArtifact> {
+        vec![
+            ReasoningArtifact::ChatReasoning(b"deep think step-by-step".to_vec()),
+            ReasoningArtifact::AnthropicThinking(
+                br#"[{"type":"thinking","thinking":"...","signature":"sig_abc"},{"type":"redacted_thinking","data":"eJxT"}]"#
+                    .to_vec(),
+            ),
+            ReasoningArtifact::GoogleSignatures(b"encrypted-sig-1\nencrypted-sig-2".to_vec()),
+            ReasoningArtifact::ResponsesItems(b"[{\"type\":\"reasoning\",\"id\":\"re_1\"}]".to_vec()),
+        ]
+    }
+
+    #[test]
+    fn reasoning_artifact_variants_round_trip_postcard() {
+        // postcard is the workspace wire format (see frame.rs) — persistence
+        // and the client socket both round-trip through it, so every variant
+        // must survive byte-for-byte.
+        for artifact in all_artifacts() {
+            let bytes = postcard::to_allocvec(&artifact).expect("encode");
+            let decoded: ReasoningArtifact = postcard::from_bytes(&bytes).expect("decode");
+            assert_eq!(decoded, artifact);
+        }
+    }
+
+    #[test]
+    fn reasoning_artifact_variants_round_trip_json() {
+        // serde_json is a dev-dependency already; the externally-tagged serde
+        // layout (variant name as the object key, payload as its value) must
+        // round-trip too.
+        for artifact in all_artifacts() {
+            let json = serde_json::to_string(&artifact).expect("serialize");
+            let decoded: ReasoningArtifact = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, artifact);
+        }
+    }
+
+    #[test]
+    fn reasoning_artifact_json_uses_kind_tag() {
+        // The variant name is the adapter-ownership contract: the producing
+        // adapter's identity must be visible on the wire (as the JSON object
+        // key) without interpreting the payload bytes. Pin the exact shape so
+        // a serde refactor cannot silently change it.
+        let artifact = ReasoningArtifact::ChatReasoning(b"hi".to_vec());
+        let json = serde_json::to_value(&artifact).expect("serialize");
+        assert_eq!(json["chat_reasoning"], serde_json::json!([104, 105]));
+        // Exactly one key — the ownership tag — and nothing else.
+        let keys: Vec<_> = json.as_object().expect("object").keys().collect();
+        assert_eq!(keys, vec!["chat_reasoning"]);
+    }
+
+    #[test]
+    fn reasoning_producer_round_trip_postcard() {
+        let producer = ReasoningProducer {
+            provider_slug: "openai".to_string(),
+            model: "gpt-5.6".to_string(),
+        };
+        let bytes = postcard::to_allocvec(&producer).expect("encode");
+        let decoded: ReasoningProducer = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, producer);
+    }
+
+    /// A fully-populated Turn used by the round-trip tests below.
+    fn sample_turn(
+        reasoning_artifact: Option<ReasoningArtifact>,
+        reasoning_producer: Option<ReasoningProducer>,
+    ) -> Turn {
+        Turn {
+            created_at: TimestampMs(1_700_000_000_000),
+            undone: false,
+            error: None,
+            user_text: Some("list files".to_string()),
+            assistant_text: None,
+            assistant_reasoning: Some("thinking…".to_string()),
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: "call_1".to_string(),
+                name: "ls".to_string(),
+                arguments_json: "{}".to_string(),
+            }],
+            token_usage: Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                total_tokens: 30,
+            }),
+            tool_results: vec![ToolResultRecord {
+                call_id: "call_1".to_string(),
+                name: "ls".to_string(),
+                content: "file.txt".to_string(),
+                is_error: false,
+                invocation_description: String::new(),
+            }],
+            displayed_images: vec![DisplayedImageRecord {
+                metadata: ImageMetadata {
+                    mime_type: "image/png".to_string(),
+                    width: 640,
+                    height: 480,
+                    byte_len: 100,
+                    alt: None,
+                },
+                data: vec![0u8; 100],
+                tool_call_id: None,
+            }],
+            reasoning_artifact,
+            reasoning_producer,
+        }
+    }
+
+    #[test]
+    fn turn_with_artifact_and_producer_round_trips_postcard() {
+        let turn = sample_turn(
+            Some(ReasoningArtifact::AnthropicThinking(
+                b"{\"sig\":\"x\"}".to_vec(),
+            )),
+            Some(ReasoningProducer {
+                provider_slug: "anthropic".to_string(),
+                model: "claude-4.6".to_string(),
+            }),
+        );
+        let bytes = postcard::to_allocvec(&turn).expect("encode");
+        let decoded: Turn = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, turn);
+    }
+
+    #[test]
+    fn turn_without_artifact_round_trips_postcard() {
+        // Legacy/placeholder turns (and providers that expose no reusable
+        // artifact) must round-trip with both new fields as None.
+        let turn = sample_turn(None, None);
+        let bytes = postcard::to_allocvec(&turn).expect("encode");
+        let decoded: Turn = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, turn);
+        assert!(decoded.reasoning_artifact.is_none());
+        assert!(decoded.reasoning_producer.is_none());
     }
 }

@@ -4538,6 +4538,8 @@ mod tests {
                 token_usage: None,
                 tool_results: vec![],
                 displayed_images: vec![],
+                reasoning_artifact: None,
+                reasoning_producer: None,
             };
             let display = app.active_display().unwrap();
             display.view.insert_or_replace(i, turn);
@@ -4572,6 +4574,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
@@ -4609,6 +4613,8 @@ mod tests {
                 token_usage: None,
                 tool_results: vec![],
                 displayed_images: vec![],
+                reasoning_artifact: None,
+                reasoning_producer: None,
             };
             app.active_display()
                 .unwrap()
@@ -4678,6 +4684,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.active_display()
             .unwrap()
@@ -4929,6 +4937,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(0, turn);
@@ -4957,6 +4967,8 @@ mod tests {
                 token_usage: None,
                 tool_results: vec![],
                 displayed_images: vec![],
+                reasoning_artifact: None,
+                reasoning_producer: None,
             };
             let display = app.active_display().unwrap();
             display.view.insert_or_replace(i, turn);
@@ -5073,6 +5085,8 @@ mod tests {
                     tool_call_id: None,
                 },
             ],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.sync_turn_images(0, 42, &turn);
 
@@ -5106,6 +5120,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.active_display()
             .unwrap()
@@ -5155,6 +5171,8 @@ mod tests {
                     tool_call_id: None,
                 },
             ],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let turn_clone = turn.clone();
         app.active_display()
@@ -5210,6 +5228,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.active_display()
             .unwrap()
@@ -5249,6 +5269,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.active_display()
             .unwrap()
@@ -5267,6 +5289,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.active_display()
             .unwrap()
@@ -5302,6 +5326,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.active_display()
             .unwrap()
@@ -5332,6 +5358,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
@@ -5399,6 +5427,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
@@ -5449,6 +5479,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         {
             let display = app.active_display().unwrap();
@@ -5531,6 +5563,8 @@ mod tests {
                 invocation_description: "Reading file `src/main.rs`.".into(),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
@@ -5604,6 +5638,8 @@ mod tests {
                 invocation_description: String::new(),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         display.view.insert_or_replace(1, turn);
         display.toggle_tool_result(1, "call-1");
@@ -5630,6 +5666,8 @@ mod tests {
                 invocation_description: String::new(),
             }],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         {
             let display = app.active_display().unwrap();
@@ -5686,6 +5724,8 @@ mod tests {
                 },
             ],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.active_display()
             .unwrap()
@@ -5730,6 +5770,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
@@ -5765,6 +5807,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
@@ -5817,6 +5861,8 @@ mod tests {
                 data: vec![3u8; 30],
                 tool_call_id: None,
             }],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let turn_clone = turn.clone();
         app.active_display()
@@ -5886,6 +5932,8 @@ mod tests {
                 data: vec![4u8; 40],
                 tool_call_id: None,
             }],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         let turn_clone = turn.clone();
         app.active_display()
@@ -5941,6 +5989,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         app.display_for(0).view.insert_or_replace(id, turn);
     }
@@ -6048,6 +6098,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         {
             let display = app.active_display().unwrap();
@@ -6080,6 +6132,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         {
             let display = app.active_display().unwrap();
@@ -6460,6 +6514,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         }
     }
 
@@ -6589,6 +6645,8 @@ mod tests {
             token_usage: None,
             tool_results: vec![],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         {
             let display = app.active_display().unwrap();
@@ -6655,6 +6713,8 @@ mod tests {
                 },
             ],
             displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         {
             let display = app.active_display().unwrap();

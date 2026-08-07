@@ -589,6 +589,8 @@ impl SessionState {
             token_usage: None,
             tool_results: Vec::new(),
             displayed_images: Vec::new(),
+            reasoning_artifact: None,
+            reasoning_producer: None,
         };
         self.turns.insert(turn_id, turn.clone());
         (turn_id, turn)
@@ -2133,6 +2135,8 @@ mod tests {
                 token_usage: None,
                 tool_results: Vec::new(),
                 displayed_images: Vec::new(),
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
         SessionState {
@@ -2618,6 +2622,8 @@ mod tests {
                 token_usage: None,
                 tool_results: Vec::new(),
                 displayed_images: Vec::new(),
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
 
@@ -2639,6 +2645,8 @@ mod tests {
                 }),
                 tool_results: Vec::new(),
                 displayed_images: Vec::new(),
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
 
@@ -2660,6 +2668,8 @@ mod tests {
                 }),
                 tool_results: Vec::new(),
                 displayed_images: Vec::new(),
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
 
@@ -2677,6 +2687,8 @@ mod tests {
                 token_usage: None,
                 tool_results: Vec::new(),
                 displayed_images: Vec::new(),
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
 
@@ -2720,6 +2732,8 @@ mod tests {
                 token_usage: None,
                 tool_results: Vec::new(),
                 displayed_images: Vec::new(),
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
 
@@ -2741,6 +2755,8 @@ mod tests {
                 }),
                 tool_results: Vec::new(),
                 displayed_images: Vec::new(),
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
 
@@ -2762,6 +2778,8 @@ mod tests {
                 }),
                 tool_results: Vec::new(),
                 displayed_images: Vec::new(),
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
 
@@ -2803,6 +2821,8 @@ mod tests {
                 token_usage: None,
                 tool_results: Vec::new(),
                 displayed_images: Vec::new(),
+                reasoning_artifact: None,
+                reasoning_producer: None,
             },
         );
 

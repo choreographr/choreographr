@@ -853,6 +853,8 @@ mod tests {
             token_usage: None,
             tool_results: Vec::new(),
             displayed_images: Vec::new(),
+            reasoning_artifact: None,
+            reasoning_producer: None,
         }
     }
 

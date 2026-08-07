@@ -15,7 +15,16 @@ use crate::error::AcpError;
 /// Events produced by the ACP stdin reader thread and the daemon socket
 /// reader thread.  The main event loop receives these from a single mpsc
 /// channel and dispatches them.
+///
+/// `DaemonMessage` is deliberately unboxed: the session state variants
+/// already carry the full turn history (including images and reasoning
+/// artifacts) as designed, and boxing would only add an indirection on the
+/// hot dispatch path. The lint fires because `Turn` gained the
+/// `reasoning_artifact`/`reasoning_producer` fields in choreo-proto, pushing
+/// the largest variant past clippy's size-difference threshold — the size is
+/// inherent to carrying whole session snapshots, not an accident.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     /// A JSON-RPC request or notification received from the editor (stdin).
     AcpRequest(acp_jsonrpc::RpcMessage),

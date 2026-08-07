@@ -203,6 +203,8 @@ fn bridge_turn_images() {
             data: b"abcd".to_vec(),
             tool_call_id: None,
         }],
+        reasoning_artifact: None,
+        reasoning_producer: None,
     };
 
     write_message(
