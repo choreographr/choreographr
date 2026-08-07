@@ -80,14 +80,27 @@ pub(crate) fn setup_child(cmd: &mut Command) {
 /// Kill a spawned child, preferring its whole process group so descendants
 /// (e.g. a shell's `sleep`) are reaped too.
 ///
-/// Falls back to killing just the direct child for callers that spawn without
-/// `setup_child` — then the child shares our process group, so `killpg(pid)`
-/// legitimately returns ESRCH (no group has that pid as its leader) and we
-/// would otherwise fail to kill anything at all.
+/// `killpg(pid)` is only attempted when the child is confirmed to be its
+/// group's leader (`getpgid(pid) == pid`). That confirmation is what makes the
+/// syscall safe: when the child is *not* a leader — the caller spawned without
+/// `setup_child`, or the timeout landed in the fork→setpgid window —
+/// `killpg(pid)` would signal whatever process group happens to have that id
+/// (normally ESRCH, but a recycled PID could collide with an orphaned group id
+/// and take down an unrelated tree). Non-leaders fall straight back to a
+/// direct kill of the child itself.
 fn kill_child_tree(pid: u32) -> bool {
     let pid = nix::unistd::Pid::from_raw(pid as i32);
-    nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL).is_ok()
-        || nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).is_ok()
+    // True only while the child lives as its group's leader. Once it has
+    // exited (even unreaped) getpgid can still succeed — matching kill(2),
+    // which also "succeeds" on zombies — so the was_killed flag stays accurate
+    // for the narrow finish-vs-timeout race exactly as before.
+    let is_group_leader = nix::unistd::getpgid(Some(pid))
+        .map(|pgid| pgid == pid)
+        .unwrap_or(false);
+    if is_group_leader && nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL).is_ok() {
+        return true;
+    }
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).is_ok()
 }
 
 /// Spawn the command, run a watchdog thread to enforce the timeout,
@@ -119,6 +132,10 @@ pub(crate) fn spawn_with_watchdog(
             // a narrow race where the timeout fires at the same instant the
             // child finishes).
             if kill_child_tree(pid) {
+                warn!(
+                    pid,
+                    timeout_ms, "shell tool timed out; killed child process group"
+                );
                 let _ = killed_tx.send(());
             }
         }
@@ -204,6 +221,10 @@ pub fn spawn_with_streaming(
             .is_err()
             && kill_child_tree(pid)
         {
+            warn!(
+                pid,
+                timeout_ms, "shell tool timed out; killed child process group"
+            );
             let _ = killed_tx.send(());
         }
     });
@@ -283,6 +304,20 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::process::Stdio;
 
+    /// Reap a spawned test child on any exit path — including a panicking
+    /// assertion. `setup_child` deliberately places children in their own
+    /// process group, which also puts them *outside* the test runner's cleanup
+    /// scope: a leaked busy-loop `sh` would otherwise spin at 100% CPU forever
+    /// (and nextest cannot reach it because it lives in a different group).
+    struct ReapOnDrop(std::process::Child);
+
+    impl Drop for ReapOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     #[test]
     fn setup_child_places_child_in_its_own_process_group() {
         // `sh -c 'echo $$; …'` reports its own PID, then busy-spins forever
@@ -297,7 +332,12 @@ mod tests {
         setup_child(&mut cmd);
 
         let mut child = cmd.spawn().expect("spawn child");
-        let mut reader = BufReader::new(child.stdout.take().expect("take stdout"));
+        let stdout = child.stdout.take().expect("take stdout");
+        // Ensure the busy-loop child is killed even if an assertion below
+        // panics — it lives in its own group, so nothing else can clean it up.
+        let _reap = ReapOnDrop(child);
+
+        let mut reader = BufReader::new(stdout);
         let mut pid_line = String::new();
         reader.read_line(&mut pid_line).expect("read child pid");
         let child_pid = pid_line.trim().parse::<i32>().expect("parse child pid");
@@ -309,9 +349,28 @@ mod tests {
             child_pid,
             "child must be leader of its own process group"
         );
+    }
 
-        let _ = child.kill();
-        let _ = child.wait();
+    #[test]
+    fn kill_child_tree_falls_back_to_direct_kill_when_not_group_leader() {
+        // Without setup_child the child shares our process group, so it is not
+        // a group leader and kill_child_tree must skip killpg (there is no
+        // group to target by this pid — and a recycled PID could otherwise
+        // collide with an orphaned group id and signal an unrelated tree) and
+        // reap the child via the direct-kill fallback instead. Guards the
+        // fallback branch against silently becoming dead code.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let child = cmd.spawn().expect("spawn child");
+        let pid = child.id();
+        let mut _reap = ReapOnDrop(child);
+
+        assert!(
+            kill_child_tree(pid),
+            "direct-kill fallback must reap a non-leader child"
+        );
+        // The child must have been SIGKILLed, not exited cleanly.
+        assert!(!_reap.0.wait().expect("wait on killed child").success());
     }
 
     #[test]

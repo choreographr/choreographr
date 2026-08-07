@@ -2030,10 +2030,12 @@ itself is the kernel's responsibility.
 
 Shell tools (`sh`, `fish`, `nu`, `exec`, and the streaming variants) put the
 child in its own process group (`setup_child` in `tools/shell_util.rs`); on
-timeout the watchdog kills the whole group via `killpg(2)` rather than just the
-direct child. This matters for shells that don't `exec` the final command
-(fish): killing only the wrapper would orphan grandchildren like `sleep`, which
-keep the output pipes open and turn a 500ms timeout into a ~10s hang.
+timeout the watchdog kills the whole group via `killpg(2)` — after verifying
+the child is its group's leader, with a direct-kill fallback otherwise —
+rather than just the direct child. This matters for shells that don't `exec`
+the final command (fish): killing only the wrapper would orphan grandchildren
+like `sleep`, which keep the output pipes open and turn a 500ms timeout into a
+~10s hang.
 
 
 | Layer | What's tested | Location |
@@ -2057,9 +2059,15 @@ tests). Cargo aliases `test-fast` (unit tests), `test-integration` (the
 `cargo test` / `cargo test -- --ignored` still work via libtest. Nextest runs
 every test in its own process — a large wall-time win for this 12-crate
 workspace, since libtest serializes test binaries and threads their tests
-within one process. Unit tests with `#[serial]` (global state, e.g. metrics port
-or keystore root overrides) need no special handling under nextest's
-process-per-test model.
+within one process. Global *process-local* state needs no special handling
+under nextest's process-per-test model — e.g. the keystore test-config-root
+override in `choreo-transport` is thread-local and marked `#[serial]` only
+because libtest runs tests as threads within one process; each nextest test
+process gets its own copy. Fixed network ports are *not* isolated by
+process-per-test, however: two test processes binding the same address conflict
+just as two threads would, and `#[serial]` cannot serialize across processes —
+prefer ephemeral ports (`TcpListener::bind("127.0.0.1:0")`) so tests never
+contend for a fixed address.
 
 Run all tests:
 ```bash

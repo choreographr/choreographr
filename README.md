@@ -538,9 +538,11 @@ file descriptors).
 
 The workspace uses [cargo-nextest](https://nexte.st) as its primary test runner:
 it executes every test in its own process, in parallel across all cores, and
-gives per-test timeouts and retries. The unit-vs-integration split is the same
-as libtest's — integration tests live in crate-level `tests/` and are marked
-`#[ignore]` (see AGENTS.md):
+gives per-test timeouts and retries. Install it once with
+`cargo install cargo-nextest` (or `brew install nextest` on macOS); the aliases
+below fail with "no such command" until it is on `PATH`. The unit-vs-integration
+split is the same as libtest's — integration tests live in crate-level `tests/`
+and are marked `#[ignore]` (see AGENTS.md):
 
 ```bash
 cargo test-fast          # unit tests (nextest, parallel)
@@ -567,6 +569,10 @@ cargo nextest run --workspace -E 'test(ignored)'   # filterset: integration only
 cargo nextest run --workspace --retries 2          # retry flaky tests
 cargo nextest run --workspace --partition count:1/2   # shard for CI
 ```
+
+Note that the `test-*` aliases bake in `--workspace`, so `-p <crate>` passed to
+them is swallowed — run `cargo nextest run -p <crate>` directly to scope a run
+to a single crate.
 
 ## Troubleshooting
 

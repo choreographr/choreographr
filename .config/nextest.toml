@@ -9,11 +9,12 @@
 # would hide the rest of a run's regressions. (libtest default: fail fast.)
 fail-fast = false
 
-# Bound any single test at 120s: after a test has run for one `period` (60s) it
-# is marked slow; if it is still running after `terminate-after` more periods it
-# is killed and reported as a failure. This is the CI-level guard against hung
-# tests — it replaces ad-hoc watchdog threads in integration tests (e.g. the
-# 120s abort thread in choreo-daemon/tests/mcp_integration.rs) while leaving the
+# Bound any single test at 120s: nextest terminates a test once it has been
+# running for `period` (60s) × `terminate-after` (2) = 120s and reports it as a
+# failure. (The intermediate "slow" marking is just reporter signal — the kill
+# happens at the full budget.) This is the CI-level guard against hung tests —
+# it replaces ad-hoc watchdog threads in integration tests (e.g. the 120s abort
+# thread in choreo-daemon/tests/mcp_integration.rs) while leaving the
 # libtest-only `cargo test -- --ignored` path with its own in-test watchdog.
 # Healthy tests finish in well under a minute; anything slower is a regression.
 slow-timeout = { period = "60s", terminate-after = 2 }
