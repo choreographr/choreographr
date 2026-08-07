@@ -297,6 +297,28 @@ enum StopReason {
     ByteBudget,
 }
 
+/// One file's buffered Content-mode output. Bucket identity is keyed on the
+/// **raw path**, not the sanitized label: distinct files can sanitize to the
+/// same display string (a literal TAB in a name escapes to the two characters
+/// `\t`, identical to a file literally named `\t`), so a label-keyed check
+/// would let one file's items bleed into the other's bucket — and an abort of
+/// the later file would drop the earlier file's legitimate matches.
+///
+/// The `charged` total lets `drop_current_bucket` refund the exact bytes so
+/// the byte budget stays precise across aborted files.
+struct ContentBucket {
+    /// Sanitized display label, precomputed at push time so the byte budget
+    /// could charge exact rendered bytes and `render_content` can render
+    /// without recomputing it.
+    label: String,
+    /// Raw path of the file this bucket belongs to — the identity key.
+    path: PathBuf,
+    /// Ordered items in stream order.
+    items: Vec<GrepItem>,
+    /// Rendered bytes charged to the byte budget for these items.
+    charged: usize,
+}
+
 /// Accumulates matches during the walk and renders them per `GrepOutputMode`.
 ///
 /// grep-searcher drives this sink one file at a time. `SinkMatch`/`SinkContext`
@@ -329,18 +351,12 @@ struct GrepSink {
     /// `render_content` can render without recomputing it.
     current_label: String,
 
-    // Content-mode state: per-file (label, path, ordered items, charged byte
-    // total), capped by match count. Buckets are opened lazily by
-    // `push_item`; the charged total lets `drop_current_bucket` refund the
-    // exact bytes so the budget stays precise across aborted files.
-    //
-    // Bucket identity is keyed on the **raw path**, not the sanitized label:
-    // distinct files can sanitize to the same display string (a literal TAB
-    // in a name escapes to the two characters `\t`, identical to a file
-    // literally named `\t`), so a label-keyed check would let one file's
-    // items bleed into the other's bucket — and an abort of the later file
-    // would drop the earlier file's legitimate matches.
-    content_files: Vec<(String, PathBuf, Vec<GrepItem>, usize)>,
+    // Content-mode state: per-file ordered output, capped by match count.
+    // Buckets are opened lazily by `push_item`; each bucket's charged total
+    // lets `drop_current_bucket` refund the exact bytes so the budget stays
+    // precise across aborted files. Identity is keyed on the raw path, not
+    // the sanitized label (see [`ContentBucket`]).
+    content_files: Vec<ContentBucket>,
     content_match_count: usize,
     /// Running byte total of the *rendered* output buffered in `content_files`
     /// — each item charges `label + separator + line number + content +
@@ -478,16 +494,17 @@ impl GrepSink {
     /// output and the byte budget stays exact. Match counts are refunded too,
     /// keeping `result_count` in line with what will actually render.
     fn drop_current_bucket(&mut self) {
-        // Keyed on the raw path (see `content_files`): the sanitized label is
-        // not unique across files, so a label match could drop a *previous*
+        // Keyed on the raw path (see [`ContentBucket`]): the sanitized label
+        // is not unique across files, so a label match could drop a *previous*
         // file's bucket on this file's abort.
-        if let Some((_, path, items, charged)) = self.content_files.last()
-            && path == &self.current_path
+        if let Some(bucket) = self.content_files.last()
+            && bucket.path == self.current_path
         {
-            self.content_bytes -= *charged;
+            self.content_bytes -= bucket.charged;
             // Refund the match tally so a file whose matches were all dropped
             // does not count as "has results" in `finish_grep`.
-            let matches = items
+            let matches = bucket
+                .items
                 .iter()
                 .filter(|i| matches!(i, GrepItem::Match { .. }))
                 .count();
@@ -504,8 +521,8 @@ impl GrepSink {
     /// length computed on its *prepared* line (windowed/stripped/capped
     /// exactly as the display path) so an over-budget line is rejected
     /// *before* `sanitize_content` pays for the sanitizing copy. Exactness
-    /// matters: escaping expands a control or format char to up to ~6 bytes
-    /// (`\u{1b}`), so a raw-length estimate would let an ESC-heavy line slip
+    /// matters: escaping expands a control or format char to up to 10 bytes
+    /// (`\u{10ffff}`), so a raw-length estimate would let an ESC-heavy line slip
     /// through the pre-check only to be rejected inside `push_item` after the
     /// allocation. Because the estimate and `push_item` share the same
     /// threshold, the pre-check is a perfect predictor: no line that would fit
@@ -515,18 +532,26 @@ impl GrepSink {
         // Newline joins every rendered line but the very first of the output
         // (`render_content`'s join emits n-1 separators), matching
         // `push_item`'s charge.
-        let newline = usize::from(self.content_bytes != 0);
         let estimate = self.content_bytes
             + self.current_label.len()
             + 2
             + decimal_len(line_number)
             + content_len
-            + newline;
+            + self.joining_newline();
         if estimate > MAX_TOOL_OUTPUT_BYTES {
             self.stop = Some(StopReason::ByteBudget);
             return false;
         }
         true
+    }
+
+    /// Whether the next rendered item is charged a joining newline: the very
+    /// first item of the output has none (`render_content`'s join emits n-1
+    /// separators), every later item is prefixed with one. Shared by
+    /// `budget_allows_len` and `push_item` so the byte-budget threshold can
+    /// never drift from the renderer's charge.
+    fn joining_newline(&self) -> usize {
+        usize::from(self.content_bytes != 0)
     }
 
     /// Deliver one line of the capped match's after-context window (Content
@@ -586,7 +611,7 @@ impl GrepSink {
             // Path-keyed for the same reason as `drop_current_bucket`: the
             // label can collide across distinct files, so it must not decide
             // whether this item belongs to the open bucket.
-            .map(|(_, path, _, _)| path == &self.current_path)
+            .map(|bucket| bucket.path == self.current_path)
             .unwrap_or(false);
         // A `Break` with no open bucket for the current file has nothing to
         // separate — dropped rather than rendered as a stray `--`. (This also
@@ -603,8 +628,7 @@ impl GrepSink {
         // preceding newline). This matches the bytes the renderer produces
         // exactly, so collection stops at the same threshold the renderer
         // caps at.
-        let first_item = self.content_bytes == 0;
-        let rendered = item.render_len(&self.current_label) + usize::from(!first_item);
+        let rendered = item.render_len(&self.current_label) + self.joining_newline();
         if self.content_bytes + rendered > MAX_TOOL_OUTPUT_BYTES {
             self.stop = Some(StopReason::ByteBudget);
             return false;
@@ -614,12 +638,12 @@ impl GrepSink {
         // behind (`render_content` renders every bucket, and `push_item`'s
         // collapse logic treats the last bucket as the current file's).
         if !matches_current {
-            self.content_files.push((
-                self.current_label.clone(),
-                self.current_path.clone(),
-                Vec::new(),
-                0,
-            ));
+            self.content_files.push(ContentBucket {
+                label: self.current_label.clone(),
+                path: self.current_path.clone(),
+                items: Vec::new(),
+                charged: 0,
+            });
         }
         // Collapse consecutive Breaks: a separator directly after another
         // separator (grep-searcher never does this, but defend against it)
@@ -627,16 +651,19 @@ impl GrepSink {
         // to be the current file's so it never inspects the previous file's
         // trailing break.
         if matches!(item, GrepItem::Break)
-            && self.content_files.last().is_some_and(|(_, _, items, _)| {
-                items.last().is_some_and(|i| matches!(i, GrepItem::Break))
+            && self.content_files.last().is_some_and(|bucket| {
+                bucket
+                    .items
+                    .last()
+                    .is_some_and(|i| matches!(i, GrepItem::Break))
             })
         {
             return true;
         }
-        if let Some((_, _, items, charged)) = self.content_files.last_mut() {
-            *charged += rendered;
+        if let Some(bucket) = self.content_files.last_mut() {
+            bucket.charged += rendered;
             self.content_bytes += rendered;
-            items.push(item);
+            bucket.items.push(item);
         }
         true
     }
@@ -881,8 +908,8 @@ fn render_content(sink: &GrepSink) -> String {
     // Buckets are never empty (push_item opens one only to fill it), so no
     // empty-skip is needed here. The label was precomputed at push time so
     // the byte budget could charge exact rendered bytes; reuse it verbatim.
-    for (label, _, items, _) in &sink.content_files {
-        lines.extend(items.iter().map(|item| item.render(label)));
+    for bucket in &sink.content_files {
+        lines.extend(bucket.items.iter().map(|item| item.render(&bucket.label)));
     }
     lines.join("\n")
 }
@@ -1244,7 +1271,13 @@ impl Tool for Grep {
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
-        let mut parts = vec![format!("Searching for `{}`.", args.pattern)];
+        // The description is line-oriented (logs, TUI), so a pattern containing
+        // a control character (hostile or accidental) must render as an inert
+        // escape rather than splitting the line or injecting terminal escapes.
+        let mut parts = vec![format!(
+            "Searching for `{}`.",
+            sanitize_content(&args.pattern)
+        )];
         if args.regex {
             parts.push(" Using regex.".to_string());
         }
@@ -1265,10 +1298,10 @@ impl Tool for Grep {
             parts.push(format!(" Output mode: {}.", args.output_mode));
         }
         if let Some(ref incl) = args.include {
-            parts.push(format!(" Include pattern: `{}`.", incl));
+            parts.push(format!(" Include pattern: `{}`.", sanitize_content(incl)));
         }
         match &args.path {
-            Some(p) => parts.push(format!(" In path: `{}`.", p)),
+            Some(p) => parts.push(format!(" In path: `{}`.", sanitize_content(p))),
             None => parts.push(" In working directory.".to_string()),
         }
         // Always report the effective result cap the tool will apply — the
@@ -1790,6 +1823,51 @@ mod tests {
         assert!(sink.content_files.is_empty(), "bucket must be dropped");
         assert_eq!(sink.content_bytes, 0, "charged bytes must be refunded");
         assert_eq!(sink.result_count(), 0, "match tally must be refunded");
+    }
+
+    #[test]
+    fn marker_count_stays_honest_after_post_cap_abort() {
+        // When the max_results cap stops matching in Content mode, the capped
+        // match's after-context drain can still be cut short afterwards by a
+        // read error or a NUL byte, which aborts the file and refunds its
+        // matches from `result_count`. The truncation marker still reports the
+        // cap — the "at least N exist" claim stays true (the file did produce
+        // N matches) even though the rendered body shows fewer. Pin that
+        // contract so a future change to `marker_count` cannot silently flip
+        // it.
+        let mut sink = GrepSink::new(GrepOutputMode::Content, 5, 0, Path::new("root"), false);
+        sink.begin_file(Path::new("a.txt"));
+        // Two matches buffered and tallied; the cap fires while the searcher
+        // is still draining the capped match's after-context.
+        assert!(sink.push_item(GrepItem::Match {
+            line_number: 1,
+            content: "x".into(),
+        }));
+        sink.content_match_count += 1;
+        assert!(sink.push_item(GrepItem::Match {
+            line_number: 2,
+            content: "y".into(),
+        }));
+        sink.content_match_count += 1;
+        sink.stop = Some(StopReason::Cap);
+
+        // The drain is cut short (binary NUL / read error) -> file aborted;
+        // the bucket is dropped and its matches refunded.
+        sink.abort_file();
+        sink.end_file();
+
+        assert_eq!(
+            sink.result_count(),
+            0,
+            "aborted file's matches must be refunded from the rendered count"
+        );
+        assert_eq!(sink.content_bytes, 0, "charged bytes must be refunded");
+        // The marker still reports the cap: at least 5 matches exist.
+        assert_eq!(sink.marker_count(), 5);
+        assert!(
+            sink.truncated(),
+            "content mode keeps the truncation marker after a cap"
+        );
     }
 
     #[test]
@@ -2354,7 +2432,7 @@ mod tests {
             line_number: 2,
             content: "c".into(),
         });
-        let items = &sink.content_files[0].2;
+        let items = &sink.content_files[0].items;
         assert_eq!(items.len(), 3, "stray + duplicated breaks must not render");
         assert!(matches!(items[0], GrepItem::Match { .. }));
         assert!(matches!(items[1], GrepItem::Break));
@@ -2498,6 +2576,46 @@ mod tests {
         // In-range requests pass through unchanged.
         args.max_results = Some(42);
         assert!(tool.describe_invocation(&args).contains("Max results: 42."));
+    }
+
+    #[test]
+    fn describe_invocation_sanitizes_control_chars() {
+        // The invocation description is line-oriented (logs, TUI); a pattern
+        // containing a control character (hostile or accidental) must render
+        // as an inert escape rather than splitting the line or injecting
+        // terminal escapes.
+        let tool = Grep;
+        let mut args = test_args("needle\u{1b}[31m", None);
+        let desc = tool.describe_invocation(&args);
+        assert!(
+            desc.contains("\\u{1b}"),
+            "pattern ESC must be escaped: {desc}"
+        );
+        assert!(
+            !desc.contains('\u{1b}'),
+            "raw ESC must not pass through: {desc}"
+        );
+
+        // Same for the include glob and path.
+        args.include = Some("*.rs\n".into());
+        args.path = Some("src/\u{2028}evil".into());
+        let desc = tool.describe_invocation(&args);
+        assert!(
+            desc.contains("\\n"),
+            "include newline must be escaped: {desc}"
+        );
+        assert!(
+            !desc.contains('\n'),
+            "raw newline must not pass through: {desc}"
+        );
+        assert!(
+            desc.contains("\\u{2028}"),
+            "path line separator must be escaped: {desc}"
+        );
+        assert!(
+            !desc.contains('\u{2028}'),
+            "raw U+2028 must not pass through: {desc}"
+        );
     }
 
     #[test]

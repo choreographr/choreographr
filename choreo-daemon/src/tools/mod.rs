@@ -1054,14 +1054,23 @@ pub(crate) fn sanitize_text(text: &str, keep_tabs: bool) -> String {
 /// sanitizer and its allocation-free length estimator so the two can never
 /// drift on what counts as "unsafe".
 fn sanitize_keeps(c: char, keep_tabs: bool) -> bool {
-    (c == '\t' && keep_tabs) || (!c.is_control() && !is_unsafe_unicode(c))
+    if c.is_ascii() {
+        // ASCII can never be a Unicode line/paragraph separator or format
+        // char, so skip the general-category lookup entirely: keep only the
+        // printable range (plus TAB under the content policy). This mirrors
+        // the `is_plain_ascii` fast path for the per-char loop, so a
+        // mostly-ASCII line with a stray non-ASCII char does not pay a
+        // category lookup for every ASCII byte.
+        return (c == '\t' && keep_tabs) || (' '..='~').contains(&c);
+    }
+    !c.is_control() && !is_unsafe_unicode(c)
 }
 
 /// Byte length `text` would occupy after [`sanitize_text`] escaping with the
 /// given `keep_tabs` policy — computed *without* allocating. Lets grep's
 /// byte-budget pre-check reject an over-budget line before paying for the
 /// sanitizing copy. Exact, not an estimate: escaping expands a control or
-/// format char to up to ~6 bytes (`\u{1b}`), so a raw-byte count would both
+/// format char to up to 10 bytes (`\u{10ffff}`), so a raw-byte count would both
 /// miss ESC-heavy lines and misjudge the budget threshold.
 pub(crate) fn sanitize_text_len(text: &str, keep_tabs: bool) -> usize {
     // Fast path mirrors `sanitize_text`: all-ASCII printables (plus tabs when
