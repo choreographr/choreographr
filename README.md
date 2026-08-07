@@ -355,6 +355,29 @@ RISC-V VM always has access to all tools.
 listed in the system prompt. When the model calls `load_skill`, the full
 instruction body is injected into the conversation (progressive disclosure).
 
+**Reasoning round-trip.** Reasoning text is both *displayed* in the TUI
+(collapsible per-turn "Reasoning" section) and, for several providers, *sent
+back* to the model on the next request — the tool-call loop otherwise fails
+with a 400. The daemon captures the provider's reasoning payload verbatim at
+the parse boundary (an opaque, provider-owned artifact), stores it on the turn,
+and re-emits it per provider rules on the next request:
+
+- **Anthropic** — thinking blocks (with encrypted `signature`) and
+  `redacted_thinking` blocks are echoed back, complete and unmodified,
+  alongside `tool_use` blocks (a missing or altered block is a 400).
+- **DeepSeek / Kimi (OpenAI-compatible chat)** — `reasoning_content` is passed
+  back on every assistant tool-call message when the request carries `tools`.
+- **Gemini** — the encrypted thought-step `thoughtSignature` values are sent
+  back (the summary text stays display-only).
+- **OpenAI / xAI Responses** — opaque reasoning items are re-emitted into
+  `input`, and reasoning continuity is chained across user turns via
+  `previous_response_id`.
+
+Display-only reasoning (providers/fields that expose no reusable payload) is
+never replayed. Artifacts are model-bound: after a mid-session model switch
+(`/model`), old turns' reasoning is **not** replayed — a turn produced under
+the previous model never has its payload sent to the new one.
+
 ## Configuration
 
 The daemon reads config from `~/.config/choreographr/config.toml` (all fields

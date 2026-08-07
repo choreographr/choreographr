@@ -2322,7 +2322,18 @@ fn turn_has_tool_involvement(turn: &Turn) -> bool {
     !turn.tool_calls.is_empty() || !turn.tool_results.is_empty()
 }
 
-fn build_chat_request_messages(
+/// Build the provider request messages for a session, applying the reasoning
+/// passback policy (phase 4b): the opaque artifact captured on a previous
+/// turn is replayed only when BOTH gates pass — same-model provenance (the
+/// artifact is model-bound; a turn produced by a different model must not
+/// have its payload replayed) and the provider's `reasoning_passback` policy
+/// for this request (`ToolLoop` → tool-involving turns only, `AllTurns` →
+/// every turn, `Signature` → every turn, `ResponseId`/`None` → never via the
+/// message).
+///
+/// Public for the daemon integration tests (the `test-utils` feature); the
+/// production caller is `run_agent_loop`.
+pub fn build_chat_request_messages(
     session: &SessionState,
     system_prompt: Option<&str>,
     provider_slug: &str,

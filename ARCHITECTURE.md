@@ -97,6 +97,8 @@ Defines all shared message types and framing. No dependencies on other workspace
 | `ImageMetadata` | Mime type, dimensions, byte length for streamed images |
 | `DisplayedImageRecord` | Binary image data + `ImageMetadata` for persisted image replay (carried inside `SessionMessageKind::DisplayedImage`) |
 | `ReasoningCapability` | Struct with `available_effort_levels: Vec<String>` — the reasoning effort slugs a model supports (e.g. `"off"`, `"low"`, `"medium"`, `"high"`, `"max"`). Empty means reasoning is not supported. Cycle helper validates/rotates through slugs. |
+| `ReasoningArtifact` | **Opaque reasoning round-trip payload**, captured verbatim by a provider adapter at the parse boundary and re-emitted verbatim on the next request. Variants: `ChatReasoning(Vec<u8>)` (OpenAI-compatible chat `reasoning_content`), `AnthropicThinking(Vec<u8>)` (ordered thinking / redacted_thinking block JSON, signatures + redacted data intact), `GoogleSignatures(Vec<u8>)` (Gemini encrypted thought signatures), `ResponsesItems(Vec<u8>)` (OpenAI/xAI Responses opaque reasoning items). Stored as raw bytes so `choreo-proto` stays dependency-light — only the producing adapter may interpret a payload (each adapter (de)serializes its own wire representation). Carried on `Turn.reasoning_artifact`. |
+| `ReasoningProducer` | `{ provider_slug: String, model: String }` — identity of the model that produced a turn's reasoning artifact, stored on `Turn.reasoning_producer`. The request builder compares it against the current provider+model (same-model provenance): artifacts are model-bound, so a turn produced by a different model must not have its (possibly encrypted) payload replayed after a mid-session model switch. |
 | `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessageKind::AssistantText` and `SessionMessageKind::AssistantToolUse` for per-turn accounting, in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals, and in `DaemonMessage::Done` for per-request usage. |
 | `last_prompt_tokens` | `Option<u32>` field on session metadata and protocol messages tracking the `input_tokens` from the most recent API response — the actual context size being sent to the model, used for context-window progress displays. |
 | `last_modified` | `i64` Unix-epoch-**milliseconds** on `SessionSummary` / `DaemonMessage::SessionStatusChanged` (proto) and `SessionMetadata` / `SessionConfig` / `SessionRecord` (daemon). Bumped on **completed requests**, session creation, and explicit metadata edits (title/model/account/reasoning) — NOT on transient status transitions (Inference/ToolCall/Retrying), which would re-sort the sessions list mid-request. The sessions list is ordered by it (newest first) and it survives restarts via `SessionRecord`. All session-level timestamps (`created_at`, `last_modified`) are milliseconds to match `Turn.created_at` (`TimestampMs`). |
@@ -239,13 +241,13 @@ account configuration, no sessions — so it can be consumed independently of
 | `anthropic/` | Anthropic Messages API client (`AnthropicClient`, `AnthropicConfig`). Implements `ProviderClient`. |
 | `google/` | Google Gemini API client (`GoogleClient`, `GoogleConfig`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
 | `traits.rs` | `ProviderClient` trait, `ChatTurnRequest`, `ToolResultItem` |
-| `types.rs` | `ChatTurnResult`, `ChatToolCall`, `ChatAssistantToolUse`, `FinalTextResult`, `CallerInfo`, `StreamEvent` |
+| `types.rs` | `ChatTurnResult`, `ChatToolCall`, `ChatAssistantToolUse`, `FinalTextResult`, `CallerInfo`, `StreamEvent` — the turn-result structs carry the `reasoning_artifact: Option<ReasoningArtifact>` captured at the parse boundary |
 | `shared.rs` | `ProviderError` (unified error type re-exported as `OpenAiError`/`AnthropicError`/`GoogleError`), `MaxTokensField`, `MAX_TOOL_CALLS`, `build_agent()` (applies three timeouts: connect, idle `request_timeout_secs` per chunk, and a `total_timeout_secs` wall-clock deadline per attempt via ureq's `timeout_global` — each retry restarts it), `provider_error_to_inference()`, `emit_non_streaming_events()`, `list_models_with_fallback()` |
 | `context_window.rs` | `ContextWindowConfig` — per-model/global context window resolution shared by all configs |
 | `overrides.rs` | `ProviderOverrides` — protocol-agnostic account overrides carrier (the daemon converts its `AccountConfig` into this) |
 | `retry.rs` | Shared HTTP retry logic. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, cancellation support, and a per-attempt wall-clock deadline (`AttemptDeadline`, re-armed at the start of every attempt). `AttemptContext` bundles the per-call retry inputs (`on_retry` callback, `cancel_rx`, `attempt_deadline`) so the retry entry points do not grow a parameter per knob. |
 | `stream.rs` | Cancellable SSE reader plumbing: `spawn_sse_reader()` runs the blocking socket read on a dedicated thread and forwards parsed events through a bounded crossbeam channel (backpressure — the reader blocks on `send` instead of buffering unboundedly); an abort signal stops the thread at its next loop boundary on cancel/drop; `recv_sse_event()` waits event-driven with `select_biased!` on the event channel, the cancellation channel, and an exact timer for the remaining budget — no polling, so Escape and deadline expiry interrupt a stalled/trickling stream the moment they happen instead of blocking forever inside `read()`. The per-attempt wall-clock deadline is supplied by the caller (`retry::AttemptDeadline` — armed *before* the request is sent and re-armed on each retry, so it spans DNS → connect → headers → body; the real backstop — ureq's `timeout_global` is floored at ~1 s per socket read, so sub-second keep-alive trickles could otherwise evade it). Deadline expiry surfaces as a dedicated `ProviderError::DeadlineExceeded` (non-retryable, distinct from a socket `Io` error). |
-| `catalog/` | `ProviderProtocol` enum + `ProviderEntry`/`ModelEntry`, `PROVIDER_CATALOG` (bundled TOML, one `catalog/<slug>.toml` per provider), and lookups (`lookup_provider`, `lookup_context_window`, `model_reasoning_capability`, `model_request_format`, `all_slugs`, `all_display_names`) |
+| `catalog/` | `ProviderProtocol` enum + `ProviderEntry`/`ModelEntry`, `PROVIDER_CATALOG` (bundled TOML, one `catalog/<slug>.toml` per provider), and lookups (`lookup_provider`, `lookup_context_window`, `model_reasoning_capability`, `model_reasoning_passback`, `model_request_format`, `all_slugs`, `all_display_names`). `ModelEntry` carries a `reasoning_passback` field (per-model override; `None` derives from the protocol) |
 
 **Root re-exports** give consumers a stable front door: the client types
 (`OpenAiClient`, `AnthropicClient`, `GoogleClient`, …), the trait and shared
@@ -434,6 +436,36 @@ A `ProviderEntry` (loaded from its TOML file) maps each provider slug to:
 - `models` — curated `ModelEntry` list with `context_window`, `reasoning_supported`, explicit `openai_reasoning_levels`, and whether the model uses the Responses API (`openai_responses`)
 
 Model-level reasoning is resolved at runtime by `model_reasoning_capability()`, which returns a `ReasoningCapability` with the model's available effort slugs. Providers without explicit entries fall back to protocol defaults (`off/low/medium/high` for OpenAI & Anthropic, `off/on` for Google).
+
+#### Reasoning round-trip (capture → carry → re-emit)
+
+Reasoning text is not only *displayed* — for several providers it must also be **sent back** on the next request, or the tool-call loop is rejected with a 400 (Anthropic requires the encrypted thinking blocks echoed unmodified; DeepSeek/Kimi require `reasoning_content` on every assistant tool-call message; Gemini requires the encrypted thought signatures back for reasoning continuity). The round-trip payload is an **opaque, provider-owned artifact** handled in three layers, each owning one concern:
+
+| Layer | Owns |
+|---|---|
+| Catalog (`choreo-ai-protocols/src/catalog/`) | `reasoning_passback` format enum (`ReasoningPassback`), per-model + protocol-defaulted — *how* to send |
+| Adapters (`openai/`, `anthropic/`, `google/`) | capture the artifact verbatim at the parse boundary; re-emit it verbatim in their own wire format on request build |
+| Daemon (`build_chat_request_messages` in `choreographr/src/requests.rs`) | derives *whether* to send (same-model provenance + passback policy); never interprets the payload |
+
+**Capture** happens inside each adapter before the display field is consumed: OpenAI chat wraps the raw `reasoning_content` string into `ChatReasoning` bytes; Anthropic serializes the ordered thinking / redacted_thinking blocks (signatures + redacted data intact, order preserved) into `AnthropicThinking`; Google collects the `thoughtSignature` values (the `thought: true` marker may carry a signature on **any** part type — the wire-format fix; there is no separate `thinking` key) into `GoogleSignatures`; Responses collects the opaque reasoning output items (type tag, id, summary, `encrypted_content` in stateless mode) into `ResponsesItems`. The artifact rides out of the provider crate on `ChatAssistantToolUse`/`FinalTextResult.reasoning_artifact` and is stored on the `Turn` by the agent loop (`set_assistant_response`), alongside `Turn.reasoning_producer` (provider slug + model).
+
+**Carry** is a pure store-and-forward: the daemon never reads the payload bytes. The builder's only job is the *whether*: an artifact is attached to an assistant message only when (1) **same-model provenance** holds — `turn.reasoning_producer == {current provider_slug, current model}` — so a turn produced by a different model (mid-session `/model` switch) never replays its possibly-encrypted payload, and (2) the resolved `ReasoningPassback` policy says to:
+
+| `reasoning_passback` | Meaning | Wire behavior |
+|---|---|---|
+| `None` | display-only providers/fields | never replay |
+| `ToolLoop` | echo reasoning on assistant messages that had tool calls (DeepSeek/Kimi chat; the minimum for Anthropic tool loops) | attach artifact on tool-involving turns only |
+| `AllTurns` | echo across all turns of the session (Anthropic keep-all models, GPT-5.6 `all_turns`) | attach artifact on every assistant message |
+| `Signature` | send back encrypted thought signatures (Gemini) | attach artifact on every assistant message; the adapter attaches the final signature to the last part |
+| `ResponseId` | chain via `previous_response_id` / opaque reasoning items (OpenAI/xAI Responses) | never via the message; continuity flows through the response id (see below) |
+
+`model_reasoning_passback(slug, model)` mirrors `model_reasoning_capability`: an explicit per-model TOML override wins, otherwise the protocol default applies — OpenAI-protocol with `responses = true` → `ResponseId`; OpenAI-protocol chat-completions → `ToolLoop`; Anthropic → `AllTurns` (last-turn-only models like `claude-haiku-4-5` carry an explicit `tool_loop` override); Google → `Signature`; unknown providers → `None`. TOMLs set the field only where nuance matters (DeepSeek/Kimi explicitly `tool_loop`).
+
+**Re-emit** is per-adapter, verbatim: OpenAI chat writes the `ChatReasoning` bytes back as `reasoning_content` on the assistant message (the artifact field itself never appears on the wire); Anthropic deserializes the block array and pushes the blocks verbatim (in order, ahead of text/tool_use — never rebuilt or reordered, and only when thinking is enabled for the request, `!thinking_disabled`); Google attaches the captured signatures to the assistant parts; Responses re-emits the opaque items into `input` ahead of the message and chains continuity through `previous_response_id`. A foreign artifact variant (e.g. a `ChatReasoning` payload on an Anthropic request) is dropped by the adapter — payloads stay opaque until their producer decodes them.
+
+**ResponseId continuity:** the agent loop persists the last `response_id` on `SessionConfig.last_response_id` after every model call and restores it at the top of the next `run_agent_loop` invocation, so a new user turn continues the chain (`previous_response_id` + `reasoning.context: all_turns` guidance) instead of resetting it. Other policies reset to `None` so a stale id never leaks into a request that does not understand it. A precondition guard (`warn_on_missing_reasoning_artifacts`) runs before any echo-policy request: a tool-involving turn whose artifact is missing (e.g. pre-migration session state) is logged as a diagnosable warning instead of surfacing as a mysterious provider 400.
+
+Replayed reasoning is billed as input on keep-all models, so `estimate_prompt_tokens` counts the artifact bytes (UTF-8 text when decodable, else a bytes/4 heuristic).
 
 Currently supports 79+ providers. Adding a new OpenAI-compatible provider requires only a catalog TOML file (and a line in `loader.rs`'s `include_str!` list) — zero client code.
 
@@ -1445,6 +1477,10 @@ across snapshot/restore, metadata conversion, and record persistence:
 - `context_window: Option<u32>` — model's context window size, resolved at model selection
 - `last_prompt_tokens: Option<u32>` — `input_tokens` from the most recent API response;
   used for context-window progress displays (separate from the billing counter)
+- `last_response_id: Option<String>` — the `response_id` of the most recent model call,
+  persisted so ResponseId-policy providers (OpenAI/xAI Responses) can chain reasoning
+  continuity across user turns via `previous_response_id` (restored at the top of each
+  `run_agent_loop` invocation); every other policy keeps it `None`
 
 **Runtime fields (not persisted directly):**
 
@@ -1490,6 +1526,11 @@ Sessions support undo/redo via an `undone` boolean flag on each `Turn`:
 - `undone: bool` — soft-delete flag; set to `true` on undo, back to `false` on redo.
 - `user_text: Option<String>` — present for user-initiated turns, `None` for follow-up tool-loop turns.
 - `assistant_text`, `assistant_reasoning`, `tool_calls`, `tool_results`, `displayed_images` — the assistant response.
+- `reasoning_artifact: Option<ReasoningArtifact>` — the opaque reasoning round-trip payload captured by
+  the provider adapter at parse time (see Provider Architecture); forwarded to the next request verbatim
+  when the same model is still active and the passback policy asks for it.
+- `reasoning_producer: Option<ReasoningProducer>` — the `{ provider_slug, model }` that produced the turn's
+  artifact; the builder's same-model provenance check drops the artifact after a mid-session model switch.
 
 **Undo flow (`/undo` → `ClientMessage::Undo` → `SessionCommand::Undo` → `handle_undo`):**
 1. `SessionState::undo_turns()` finds the most recent non-undone turn with `user_text: Some(...)` via reverse scan.
@@ -1854,6 +1895,18 @@ counts survive the attach instead of regressing.
     serves as a sidecar for those async calls via `block_on()`. This simplifies the mental model
     (each thread owns its data, no `Send` bounds on shared state, no `Pin<Box<dyn Future>>`),
     improves stack traces, and avoids the complexity of async cancellation.
+
+13. **Reasoning round-trip as an opaque artifact** — reasoning is not only display text: for
+    Anthropic (thinking blocks + signatures), DeepSeek/Kimi (`reasoning_content`), Gemini
+    (thought signatures), and OpenAI/xAI Responses (opaque reasoning items + `previous_response_id`)
+    it must be sent back on the next request or the tool-call loop fails with a 400. The adapter
+    captures the payload verbatim at the parse boundary into an opaque `ReasoningArtifact`; the
+    daemon stores it on the `Turn` and forwards it untouched; the adapter re-emits it verbatim in
+    its own wire format. *Whether* to send is derived, never configured: same-model provenance
+    (`Turn.reasoning_producer` vs current provider+model, so a mid-session model switch drops every
+    old artifact) plus the catalog's `reasoning_passback` policy (`None` / `ToolLoop` / `AllTurns` /
+    `Signature` / `ResponseId`, per-model override else protocol default). Display text stays in
+    `Turn.assistant_reasoning`; the artifact bytes are never interpreted by the daemon.
 
 
 
