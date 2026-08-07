@@ -6,8 +6,9 @@ use crate::requests::run_agent_loop;
 use crate::tools::ToolRegistry;
 use choreo_ai_protocols::model_reasoning_capability;
 use choreo_proto::{
-    AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, SessionStatus,
-    SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn,
+    AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ReasoningArtifact,
+    ReasoningProducer, SessionStatus, SessionSummary, TimestampMs, TokenUsage, ToolResultRecord,
+    Turn,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -278,6 +279,7 @@ impl From<SessionRecord> for SessionMetadata {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            last_response_id: record.last_response_id,
         };
         let mut meta = SessionMetadata::from(&config);
         meta.turn_count = record.turn_count;
@@ -300,6 +302,9 @@ impl From<SessionMetadata> for SessionRecord {
             active_tool_groups: meta.active_tool_groups,
             context_config: ContextConfig::default(),
             account_name: meta.account_name,
+            // `SessionMetadata` deliberately does not carry response ids; the
+            // state→record conversion below overrides this from the config.
+            last_response_id: None,
         }
     }
 }
@@ -359,6 +364,11 @@ pub struct SessionConfig {
     pub accumulated_usage: TokenUsage,
     pub context_window: Option<u32>,
     pub last_prompt_tokens: Option<u32>,
+    /// Last provider response id, persisted so ResponseId-policy models
+    /// (OpenAI/xAI Responses) can chain `previous_response_id` across user
+    /// turns (phase 4c). Meaningless for other policies; set after every model
+    /// call in the agent loop and restored only under the ResponseId policy.
+    pub last_response_id: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -378,6 +388,7 @@ impl Default for SessionConfig {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            last_response_id: None,
         }
     }
 }
@@ -397,6 +408,10 @@ impl SessionConfig {
         self.accumulated_usage = snapshot.accumulated_usage;
         self.context_window = snapshot.context_window;
         self.last_prompt_tokens = snapshot.last_prompt_tokens;
+        // The worker writes last_response_id after each model call; it must
+        // survive the request boundary so ResponseId-policy chaining works
+        // across user turns (phase 4c).
+        self.last_response_id = snapshot.last_response_id.clone();
     }
 }
 
@@ -433,6 +448,10 @@ impl From<&SessionState> for SessionRecord {
         let meta: SessionMetadata = state.into();
         let mut record: SessionRecord = meta.into();
         record.context_config = state.config.context_config.clone();
+        // last_response_id is worker-owned runtime state that must survive the
+        // record round-trip: it chains ResponseId-policy models across user
+        // turns AND daemon restarts (phase 4c).
+        record.last_response_id = state.config.last_response_id.clone();
         record
     }
 }
@@ -597,6 +616,13 @@ impl SessionState {
     }
 
     /// Set the assistant response on a turn (text or tool-use).
+    ///
+    /// `reasoning_artifact`/`reasoning_producer` record the opaque reasoning
+    /// round-trip payload and the model that produced it (phase 4b/4c). The
+    /// producer is set whenever the model completes a response — even when
+    /// the artifact is None (no reusable payload) — so the builder's
+    /// same-model provenance check is well-defined for every turn.
+    #[expect(clippy::too_many_arguments)]
     pub fn set_assistant_response(
         &mut self,
         turn_id: u32,
@@ -604,12 +630,16 @@ impl SessionState {
         reasoning: Option<String>,
         tool_calls: Vec<AssistantToolCallRecord>,
         token_usage: Option<TokenUsage>,
+        reasoning_artifact: Option<ReasoningArtifact>,
+        reasoning_producer: Option<ReasoningProducer>,
     ) {
         if let Some(turn) = self.turns.get_mut(&turn_id) {
             turn.assistant_text = text;
             turn.assistant_reasoning = reasoning;
             turn.tool_calls = tool_calls;
             turn.token_usage = token_usage;
+            turn.reasoning_artifact = reasoning_artifact;
+            turn.reasoning_producer = reasoning_producer;
         }
     }
 
@@ -880,6 +910,9 @@ pub fn session_main(
         accumulated_usage: TokenUsage::default(),
         context_window: None,
         last_prompt_tokens: None,
+        last_response_id: init_record
+            .as_ref()
+            .and_then(|r| r.last_response_id.clone()),
     };
     let mut state = SessionState {
         config,
@@ -2155,6 +2188,7 @@ mod tests {
                 accumulated_usage: TokenUsage::default(),
                 context_window: None,
                 last_prompt_tokens: None,
+                last_response_id: None,
             },
             next_turn_id: 1,
             last_undo_turn_ids: None,
@@ -2166,6 +2200,63 @@ mod tests {
             active_requests: BTreeMap::new(),
             provider: None,
         }
+    }
+
+    #[test]
+    fn set_assistant_response_stores_artifact_and_producer() {
+        // Phase 4c write-through: the agent loop stores the reasoning
+        // artifact + producing model on the turn so the builder can re-emit it
+        // on the next request (same-model + passback policy gates).
+        let mut state = SessionState::empty();
+        let (tid, _) = state.start_turn(Some("hello".into()));
+        let artifact = ReasoningArtifact::ChatReasoning(b"thinking".to_vec());
+        let producer = ReasoningProducer {
+            provider_slug: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+        };
+        state.set_assistant_response(
+            tid,
+            Some("hi".into()),
+            None,
+            vec![],
+            None,
+            Some(artifact.clone()),
+            Some(producer.clone()),
+        );
+        let turn = state.turns.get(&tid).expect("turn exists");
+        assert_eq!(turn.reasoning_artifact, Some(artifact));
+        assert_eq!(turn.reasoning_producer, Some(producer));
+    }
+
+    #[test]
+    fn set_assistant_response_no_artifact_keeps_turn_clean() {
+        // A turn without an artifact (e.g. the truncated-tool-call fallback)
+        // must leave both round-trip fields None.
+        let mut state = SessionState::empty();
+        let (tid, _) = state.start_turn(Some("hello".into()));
+        state.set_assistant_response(tid, Some("hi".into()), None, vec![], None, None, None);
+        let turn = state.turns.get(&tid).expect("turn exists");
+        assert_eq!(turn.reasoning_artifact, None);
+        assert_eq!(turn.reasoning_producer, None);
+    }
+
+    #[test]
+    fn session_record_carries_last_response_id_from_config() {
+        // Phase 4c: `last_response_id` is worker-owned runtime state that must
+        // survive the state → record conversion (and the reverse on session
+        // load) so ResponseId-policy models chain across user turns and
+        // daemon restarts.
+        let mut state = SessionState::empty();
+        state.config.last_response_id = Some("resp_9".into());
+        let record = SessionRecord::from(&state);
+        assert_eq!(record.last_response_id.as_deref(), Some("resp_9"));
+
+        // Round-trip back into a config (mirrors `session_main` restore).
+        let restored = SessionConfig {
+            last_response_id: record.last_response_id.clone(),
+            ..SessionConfig::default()
+        };
+        assert_eq!(restored.last_response_id.as_deref(), Some("resp_9"));
     }
 
     fn broadcast_setup() -> (SessionState, RequestContext) {

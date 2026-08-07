@@ -58,6 +58,15 @@ pub struct SessionRecord {
     pub account_name: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Last provider response id, persisted so ResponseId-policy models
+    /// (OpenAI/xAI Responses) can chain `previous_response_id` across user
+    /// turns and daemon restarts (phase 4c). `#[serde(default)]` matches the
+    /// convention of the sibling optional fields; the project is unreleased,
+    /// so the postcard blobs holding records are rebuilt in lockstep and old
+    /// blobs are not expected on disk (undecodable entries are skipped with a
+    /// warning by `read_all_sessions`).
+    #[serde(default)]
+    pub last_response_id: Option<String>,
 }
 
 pub fn db_path() -> io::Result<PathBuf> {
@@ -878,6 +887,7 @@ mod tests {
             active_tool_groups: vec!["core".into(), "git".into()],
             context_config: ContextConfig::default(),
             account_name: None,
+            last_response_id: None,
         };
         write_session(&db, id, &record).unwrap();
 
@@ -904,6 +914,35 @@ mod tests {
         assert!(read_turns(&db, id).unwrap().is_empty());
 
         drop(db);
+    }
+
+    #[test]
+    fn session_record_last_response_id_round_trips() {
+        // Phase 4c persistence: the response id written to the record must
+        // survive a write/read cycle so ResponseId-policy models chain across
+        // user turns even after a daemon restart.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let id = 1u64;
+        let record = SessionRecord {
+            title: Some("t".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            turn_count: 0,
+            created_at: 1,
+            last_modified: 1,
+            active_tool_groups: vec![],
+            context_config: ContextConfig::default(),
+            account_name: None,
+            last_response_id: Some("resp_1".into()),
+        };
+        write_session(&db, id, &record).unwrap();
+
+        let read = read_session(&db, id).unwrap().unwrap();
+        assert_eq!(read.last_response_id.as_deref(), Some("resp_1"));
+        assert_eq!(read.title.as_deref(), Some("t"));
     }
 
     #[test]
@@ -959,6 +998,7 @@ mod tests {
             active_tool_groups: vec![],
             context_config: ContextConfig::default(),
             account_name: None,
+            last_response_id: None,
         };
 
         write_session(&db, 5, &record).unwrap();
@@ -995,6 +1035,7 @@ mod tests {
             active_tool_groups: vec![],
             context_config: ContextConfig::default(),
             account_name: None,
+            last_response_id: None,
         };
         write_session(&db, 6, &record).unwrap();
         mark_session_deleted(&db, 6).unwrap();
