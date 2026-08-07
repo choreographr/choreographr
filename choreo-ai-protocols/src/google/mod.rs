@@ -596,6 +596,7 @@ fn response_to_turn_result(
             reasoning,
             usage,
             response_id: None,
+            reasoning_artifact: None,
         }));
     }
 
@@ -609,5 +610,6 @@ fn response_to_turn_result(
         reasoning,
         usage,
         response_id: None,
+        reasoning_artifact: None,
     }))
 }

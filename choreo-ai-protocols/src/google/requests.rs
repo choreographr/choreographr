@@ -311,6 +311,7 @@ where
                 },
                 usage: stream_usage,
                 response_id: None,
+                reasoning_artifact: None,
             },
         ));
     }
@@ -328,6 +329,7 @@ where
         },
         usage: stream_usage,
         response_id: None,
+        reasoning_artifact: None,
     }))
 }
 

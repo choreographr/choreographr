@@ -1,4 +1,4 @@
-use choreo_proto::TokenUsage;
+use choreo_proto::{ReasoningArtifact, TokenUsage};
 
 /// Information about the caller that initiated a tool call.
 /// Stored alongside tool call records for auditing/filtering.
@@ -24,6 +24,7 @@ pub struct ChatAssistantToolUse {
     pub reasoning: Option<String>,
     pub usage: Option<TokenUsage>,
     pub response_id: Option<String>,
+    pub reasoning_artifact: Option<ReasoningArtifact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub struct FinalTextResult {
     pub reasoning: Option<String>,
     pub usage: Option<TokenUsage>,
     pub response_id: Option<String>,
+    pub reasoning_artifact: Option<ReasoningArtifact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

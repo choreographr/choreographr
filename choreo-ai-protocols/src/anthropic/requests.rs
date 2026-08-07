@@ -387,6 +387,7 @@ where
             },
             usage,
             response_id: None,
+            reasoning_artifact: None,
         }));
     }
 
@@ -403,6 +404,7 @@ where
         },
         usage,
         response_id: None,
+        reasoning_artifact: None,
     }))
 }
 

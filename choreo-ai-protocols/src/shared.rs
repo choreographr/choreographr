@@ -252,6 +252,7 @@ mod tests {
             reasoning: None,
             usage: None,
             response_id: None,
+            reasoning_artifact: None,
         });
         assert_eq!(
             collect_events(result),
@@ -266,6 +267,7 @@ mod tests {
             reasoning: Some("thinking...".into()),
             usage: None,
             response_id: None,
+            reasoning_artifact: None,
         });
         assert_eq!(
             collect_events(result),
@@ -283,6 +285,7 @@ mod tests {
             reasoning: None,
             usage: None,
             response_id: None,
+            reasoning_artifact: None,
         });
         assert!(collect_events(result).is_empty());
     }
@@ -294,6 +297,7 @@ mod tests {
             reasoning: Some(String::new()),
             usage: None,
             response_id: None,
+            reasoning_artifact: None,
         });
         assert_eq!(
             collect_events(result),
@@ -310,6 +314,7 @@ mod tests {
             reasoning: reasoning.map(String::from),
             usage: None,
             response_id: None,
+            reasoning_artifact: None,
         })
     }
 
@@ -367,6 +372,7 @@ mod tests {
             reasoning: None,
             usage: None,
             response_id: None,
+            reasoning_artifact: None,
         });
         let mut cb = |_: StreamEvent| Err(io::Error::other("oops"));
         let err = emit_non_streaming_events(result, &mut cb).unwrap_err();
@@ -386,6 +392,7 @@ mod tests {
             reasoning: None,
             usage: None,
             response_id: None,
+            reasoning_artifact: None,
         });
         let mut cb = |_: StreamEvent| Err(io::Error::other("oops"));
         let err = emit_non_streaming_events(result, &mut cb).unwrap_err();

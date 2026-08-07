@@ -582,6 +582,7 @@ pub(crate) fn responses_request_with_tools(
             },
             usage: turn_usage,
             response_id,
+            reasoning_artifact: None,
         }));
     }
 
@@ -598,6 +599,7 @@ pub(crate) fn responses_request_with_tools(
                 },
                 usage: turn_usage,
                 response_id,
+                reasoning_artifact: None,
             }));
         }
         return Err(super::OpenAiError::TruncatedToolCall { discarded });
@@ -616,6 +618,7 @@ pub(crate) fn responses_request_with_tools(
         },
         usage: turn_usage,
         response_id,
+        reasoning_artifact: None,
     }))
 }
 
@@ -889,6 +892,7 @@ where
                 },
                 usage: last_usage,
                 response_id,
+                reasoning_artifact: None,
             }));
         }
 
@@ -904,6 +908,7 @@ where
                 },
                 usage: last_usage,
                 response_id,
+                reasoning_artifact: None,
             }));
         }
         if !discarded.is_empty() {
@@ -927,6 +932,7 @@ where
         },
         usage: last_usage,
         response_id,
+        reasoning_artifact: None,
     }))
 }
 

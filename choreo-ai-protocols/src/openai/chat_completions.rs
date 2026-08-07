@@ -242,6 +242,7 @@ pub(crate) fn chat_completions_request_with_tools(
             reasoning,
             usage: turn_usage,
             response_id: None,
+            reasoning_artifact: None,
         }));
     }
 
@@ -260,6 +261,7 @@ pub(crate) fn chat_completions_request_with_tools(
             reasoning,
             usage: turn_usage,
             response_id: None,
+            reasoning_artifact: None,
         }));
     }
 
@@ -278,6 +280,7 @@ pub(crate) fn chat_completions_request_with_tools(
         reasoning,
         usage: turn_usage,
         response_id: None,
+        reasoning_artifact: None,
     }))
 }
 
@@ -576,6 +579,7 @@ where
                 },
                 usage: last_usage,
                 response_id: None,
+                reasoning_artifact: None,
             }));
         }
         if !discarded.is_empty() {
@@ -590,6 +594,7 @@ where
                 },
                 usage: last_usage,
                 response_id: None,
+                reasoning_artifact: None,
             }));
         }
     }
@@ -603,6 +608,7 @@ where
         },
         usage: last_usage,
         response_id: None,
+        reasoning_artifact: None,
     }))
 }
 
@@ -912,6 +918,7 @@ mod tests {
             reasoning: None,
             usage: None,
             response_id: None,
+            reasoning_artifact: None,
         });
         match result {
             ChatTurnResult::ToolUse(use_) => {
