@@ -349,7 +349,17 @@ fn spawn_single_tool(args: SpawnToolArgs) {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        break exec_error(format!("tool '{}' timed out", tool_call.name));
+                        // A result that landed in the same instant as the
+                        // deadline is still a real result — drain it before
+                        // reporting a timeout, so a tool that finished just
+                        // before its deadline is never reported as timed out.
+                        match exec_rx.try_recv() {
+                            Ok(Ok(output)) => break output,
+                            Ok(Err(e)) => break exec_error(e.to_string()),
+                            Err(_) => {
+                                break exec_error(format!("tool '{}' timed out", tool_call.name));
+                            }
+                        }
                     }
                     // Wait for the tool's result OR an exact timer for the
                     // remaining budget.  `select_biased!` (result arm first)
@@ -1271,12 +1281,10 @@ pub(crate) fn run_agent_loop(
                             invocation_description: invocation_description.clone(),
                             started_at,
                         });
-                        // The collector guarantees every dispatched call's result
-                        // is recorded — it either drains the batch to completion or
-                        // synthesizes the panicked wait-loop threads — so record
-                        // the id now: a mid-batch cancel must not sweep a
-                        // dispatched (and hence recorded) call as unexecuted.
-                        executed_tool_calls.insert(tool_call.id.clone());
+                        // A call counts as executed only once its result is
+                        // actually recorded (`process_tool_handle`): the drain
+                        // below can stop on a cancel, so a dispatched but
+                        // unfinished call must still be swept as unexecuted.
                         spawn_single_tool(SpawnToolArgs {
                             tool_call,
                             timeout,
@@ -1334,6 +1342,10 @@ pub(crate) fn run_agent_loop(
                                 &mut known_hint_paths,
                                 &mut pending_hints,
                             );
+                            // The result is recorded now — this call_id must
+                            // not be swept by the cancelled-turn placeholder
+                            // sweep (`mark_unexecuted_tool_results`).
+                            executed_tool_calls.insert(tool_call.id.clone());
                         };
 
                     // Which call_ids actually delivered, so the disconnected-
@@ -1343,19 +1355,32 @@ pub(crate) fn run_agent_loop(
                     let mut delivered: HashSet<String> = HashSet::with_capacity(batch_size);
                     while delivered.len() < batch_size {
                         // Block until a tool completes OR the request is
-                        // cancelled.  `select!` makes both waits event-driven:
-                        // a cancel wakes this loop the instant it is sent, and
-                        // a quiet batch costs nothing (no 200 ms ticks).  The
-                        // cancel sender cannot disconnect while the worker
-                        // runs (it is dropped only on RequestFinished), so a
-                        // firing cancel arm always means "cancel".
-                        let (cancelled_now, handle_msg) = crossbeam_channel::select! {
-                            recv(batch_rx) -> msg => (false, Some(msg)),
+                        // cancelled.  `select_biased!` (cancel arm first) makes
+                        // both waits event-driven: a cancel wakes this loop the
+                        // instant it is sent and wins over a simultaneously-
+                        // ready result (bias for cancel), and a quiet batch
+                        // costs nothing (no 200 ms ticks).  The cancel sender
+                        // cannot disconnect while the worker runs (it is
+                        // dropped only on RequestFinished), so a firing cancel
+                        // arm always means "cancel".
+                        let (cancelled_now, handle_msg) = crossbeam_channel::select_biased! {
                             recv(cancel_rx) -> _ => (true, None),
+                            recv(batch_rx) -> msg => (false, Some(msg)),
                         };
                         if cancelled_now {
                             cancel_flag.store(true, Ordering::Relaxed);
                             cancelled = true;
+                            // Bias for cancel: stop waiting for the slowest
+                            // tool right now.  But don't discard results that
+                            // already landed in the same instant — drain them
+                            // (non-blocking) so the transcript keeps the real
+                            // output of tools that did complete, and only the
+                            // genuinely-unfinished calls are swept below.
+                            while let Ok(handle) = batch_rx.try_recv() {
+                                delivered.insert(handle.tool_call.id.clone());
+                                process_tool_handle(handle);
+                            }
+                            break;
                         }
                         if let Some(msg) = handle_msg {
                             match msg {
@@ -1415,13 +1440,12 @@ pub(crate) fn run_agent_loop(
                     // model's order. The accumulator sent to the provider on
                     // the next agent-loop iteration should mirror the
                     // assistant message's tool_calls array, so re-sort it now
-                    // the batch is complete.
-                    let tool_calls = session
-                        .turns
-                        .get(&current_turn_id)
-                        .map(|t| t.tool_calls.clone())
-                        .unwrap_or_default();
-                    sort_by_call_order(&tool_calls, &mut tool_results, |r| r.call_id.as_str());
+                    // the batch is complete — reusing `tool_call_records` (the
+                    // same ordered list that seeded the placeholders and the
+                    // assistant message) instead of re-reading the turn.
+                    sort_by_call_order(&tool_call_records, &mut tool_results, |r| {
+                        r.call_id.as_str()
+                    });
                 }
 
                 // ── Phase 3: Mirror session-config changes onto the
@@ -1684,6 +1708,39 @@ fn execute_tool_with_timeout(
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            // A result that landed in the same instant as the deadline is
+            // still a real result — drain it before reporting a timeout, so
+            // a tool that finished just before its deadline is never
+            // reported as timed out.
+            match result_rx.try_recv() {
+                Ok(Ok(output)) => {
+                    crate::metrics::record_tool_execution(
+                        &tool_call.name,
+                        exec_start.elapsed().as_secs_f64(),
+                        output.is_error,
+                    );
+                    return (output, false);
+                }
+                Ok(Err(e)) => {
+                    crate::metrics::record_tool_execution(
+                        &tool_call.name,
+                        exec_start.elapsed().as_secs_f64(),
+                        true,
+                    );
+                    return (
+                        ToolOutput {
+                            content: e.to_string(),
+                            is_error: true,
+                            invocation_description: String::new(),
+                            ..Default::default()
+                        },
+                        false,
+                    );
+                }
+                // No result queued — the tool is still running; report the
+                // timeout below.
+                Err(_) => {}
+            }
             crate::metrics::record_tool_execution(
                 &tool_call.name,
                 exec_start.elapsed().as_secs_f64(),
@@ -1705,20 +1762,58 @@ fn execute_tool_with_timeout(
         }
         crossbeam_channel::select_biased! {
             recv(cancel_rx) -> _ => {
-                crate::metrics::record_tool_execution(
-                    &tool_call.name,
-                    exec_start.elapsed().as_secs_f64(),
-                    true,
-                );
-                return (
-                    ToolOutput {
-                        content: format!("tool '{}' cancelled", tool_call.name),
-                        is_error: true,
-                        invocation_description: String::new(),
-                        ..Default::default()
-                    },
-                    true,
-                );
+                // Bias for cancel: the request stops the instant Escape is
+                // pressed, even if the tool's result was queued in the same
+                // instant.  But a result that actually completed isn't
+                // discarded — drain it so the transcript records the tool's
+                // real outcome and Phase 3 mirrors any config change it made.
+                // `true` is still returned so the caller stops the request:
+                // the cancel signal was consumed, so without the sticky flag
+                // a mid-tool cancel would be silently swallowed.
+                match result_rx.try_recv() {
+                    Ok(Ok(output)) => {
+                        crate::metrics::record_tool_execution(
+                            &tool_call.name,
+                            exec_start.elapsed().as_secs_f64(),
+                            output.is_error,
+                        );
+                        return (output, true);
+                    }
+                    Ok(Err(e)) => {
+                        crate::metrics::record_tool_execution(
+                            &tool_call.name,
+                            exec_start.elapsed().as_secs_f64(),
+                            true,
+                        );
+                        return (
+                            ToolOutput {
+                                content: e.to_string(),
+                                is_error: true,
+                                invocation_description: String::new(),
+                                ..Default::default()
+                            },
+                            true,
+                        );
+                    }
+                    // No result queued — the tool is still running, so
+                    // report the cancel itself.
+                    Err(_) => {
+                        crate::metrics::record_tool_execution(
+                            &tool_call.name,
+                            exec_start.elapsed().as_secs_f64(),
+                            true,
+                        );
+                        return (
+                            ToolOutput {
+                                content: format!("tool '{}' cancelled", tool_call.name),
+                                is_error: true,
+                                invocation_description: String::new(),
+                                ..Default::default()
+                            },
+                            true,
+                        );
+                    }
+                }
             }
             recv(result_rx) -> msg => {
                 match msg {
@@ -2469,9 +2564,17 @@ mod tests {
         cancel_tx.send(()).expect("send cancel");
         drop(cancel_tx);
 
+        // A blocking tool makes the outcome deterministic: the cancel is
+        // pre-sent, so the wait-loop's biased cancel arm fires first and,
+        // with the tool still running, the "cancelled" output is produced
+        // (a just-completed fast tool could otherwise race the cancel drain
+        // and return its real result alongside the sticky cancel flag).
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
         let (result, cancelled, _cmd_rx) = run_exec_tool(
-            FastTestTool,
-            "_test_fast",
+            BlockingTestTool {
+                proceed: std::sync::Mutex::new(Some(proceed_rx)),
+            },
+            "_test_blocking",
             "{}",
             Duration::from_secs(60),
             cancel_rx,
@@ -2481,6 +2584,9 @@ mod tests {
         // The wait observed the cancellation signal; the caller must stop the
         // request (the sticky-cancel contract).
         assert!(cancelled, "cancel must be reported to the caller");
+
+        // Release the still-blocked tool so its execution thread exits.
+        drop(proceed_tx);
     }
 
     #[test]
@@ -2839,10 +2945,17 @@ mod tests {
 
         let (batch_tx, batch_rx) = crossbeam_channel::unbounded::<ToolHandle>();
 
-        // Dispatch the slow tool first, then the fast one.
+        // Dispatch the slow tool first, then the fast one.  The slow tool's
+        // 5s timeout is a deadlock guard only: in the correct implementation
+        // the fast result arrives immediately and the slow tool is released
+        // well before its deadline, so the blocking `recv`s below never wait
+        // on a timer — they are deterministic (AGENTS.md forbids time-based
+        // waits in unit tests).  If a regression made the collector wait in
+        // dispatch order, the slow tool would hit its timeout instead and
+        // the name assertion below would fail the test rather than hang it.
         spawn_single_tool(SpawnToolArgs {
             tool_call: slow_call,
-            timeout: Some(Duration::from_secs(60)),
+            timeout: Some(Duration::from_secs(5)),
             request_id: 1,
             session_id: 1,
             registry: Arc::clone(&registry),
@@ -2870,9 +2983,7 @@ mod tests {
         });
 
         // The fast tool must arrive first despite being dispatched second.
-        let first = batch_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("expected a first tool result");
+        let first = batch_rx.recv().expect("expected a first tool result");
         assert_eq!(first.tool_call.name, "_test_fast");
         assert!(
             first.output.content.contains("fast result"),
@@ -2882,9 +2993,7 @@ mod tests {
 
         // Release the slow tool; its result arrives second.
         drop(proceed_tx);
-        let second = batch_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("expected the slow tool result");
+        let second = batch_rx.recv().expect("expected the slow tool result");
         assert_eq!(second.tool_call.name, "_test_blocking");
         assert!(
             second.output.content.contains("blocked tool done"),

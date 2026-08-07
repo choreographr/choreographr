@@ -1285,12 +1285,20 @@ request stops, so the transcript shows what happened and the next provider reque
 carries empty tool messages for calls that were never executed.
 
 Cancellation during tool execution is fully event-driven: the concurrent collector and
-`execute_tool_with_timeout` (serial phase) block on `crossbeam_channel::select!` between
-their result channels, the request's cancel channel, and (where a timeout applies) an exact
-`after(remaining)` timer — there are no `recv_timeout` poll loops, and timeouts fire
-precisely. The per-tool wait-loop threads bias their result channel ahead of the deadline
-timer (`select_biased!`), so a tool that finished just before its deadline is never
-reported as timed out. The per-tool forwarding threads are event-driven too: they
+`execute_tool_with_timeout` (serial phase) block on `crossbeam_channel::select_biased!`
+between their result channels, the request's cancel channel, and (where a timeout applies)
+an exact `after(remaining)` timer — there are no `recv_timeout` poll loops, and timeouts
+fire precisely. Every wait that involves cancellation biases the cancel arm first, so
+Escape wins over a simultaneously-ready result (bias for cancel); when a cancel wins the
+race, an already-completed result is still drained (non-blocking) rather than discarded, so
+the tool's real output is recorded while the request still stops (sticky `cancelled` flag).
+A cancel observed by the concurrent collector also stops the batch drain immediately:
+pending handles are drained and the still-running tools' placeholders are swept as
+`[cancelled before execution]` instead of making the request wait for the slowest tool.
+Both the per-tool wait-loop threads and the serial-phase wait drain the result channel
+before reporting a timeout, so a tool that finished just before its deadline is never
+reported as timed out (the wait-loops additionally bias their result arm ahead of the
+deadline timer). The per-tool forwarding threads are event-driven too: they
 `select_biased!` on the streaming-output channel and a dedicated kill channel (output arm
 first, so queued chunks drain before a kill is honored), which removed the last poll loop
 from the tool execution path — the streaming channel itself is a crossbeam channel, so the
@@ -1298,7 +1306,8 @@ forwarder blocks until a chunk or kill actually arrives rather than waking on a 
 interval. The per-request cancel channel is a crossbeam channel created in `sessions.rs`
 (`ActiveRequest.cancel_tx`) and threaded through `run_agent_loop` → `ChatTurnRequest` →
 retry/stream, so every wait (provider SSE, retry backoff, serial tool, concurrent
-collector) can `select!` on it directly. The sender is held by `ActiveRequest` and dropped
+collector) can `select_biased!` on it directly (cancel arm first; `sleep_or_cancel` too).
+The sender is held by `ActiveRequest` and dropped
 only at `RequestFinished`, so a firing cancel arm always means a real cancel — never a
 disconnect (the one deliberate exception is `sleep_or_cancel`, which proceeds on the
 unreachable disconnect rather than aborting a retry loop). A cancel observed mid-batch

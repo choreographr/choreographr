@@ -200,9 +200,12 @@ pub fn sleep_or_cancel(
     if let Some(rx) = cancel_rx {
         // Wait on the cancel channel and a delay timer simultaneously, so a
         // cancellation wakes this thread the instant it is sent instead of at
-        // the next poll tick.  `select!` is the event-driven replacement for
-        // the old `recv_timeout(delay)` loop.
-        crossbeam_channel::select! {
+        // the next poll tick.  `select_biased!` (cancel arm first) is the
+        // event-driven replacement for the old `recv_timeout(delay)` loop:
+        // a cancel that arrives just before the backoff timer expires wins
+        // deterministically (bias for cancel) instead of losing the race to
+        // the timer.
+        crossbeam_channel::select_biased! {
             recv(rx) -> msg => match msg {
                 Ok(()) => return Err(ProviderHttpError::Cancelled),
                 Err(_) => {
