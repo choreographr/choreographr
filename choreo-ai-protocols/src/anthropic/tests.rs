@@ -55,8 +55,33 @@ fn content_block_thinking_deserialises() {
     }))
     .unwrap();
     match block {
-        ContentBlock::Thinking { thinking } => {
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
             assert_eq!(thinking, "I should think about this...");
+            // Signature is optional on the wire; default to empty when absent.
+            assert_eq!(signature, "");
+        }
+        other => panic!("expected Thinking, got {other:?}"),
+    }
+}
+
+#[test]
+fn content_block_thinking_parses_signature() {
+    let block: ContentBlock = serde_json::from_value(json!({
+        "type": "thinking",
+        "thinking": "I should think about this...",
+        "signature": "sig_xyz"
+    }))
+    .unwrap();
+    match block {
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            assert_eq!(thinking, "I should think about this...");
+            assert_eq!(signature, "sig_xyz");
         }
         other => panic!("expected Thinking, got {other:?}"),
     }
@@ -144,6 +169,7 @@ fn response_to_turn_result_with_thinking() {
         content: vec![
             ContentBlock::Thinking {
                 thinking: "Let me reason...".into(),
+                signature: "sig_1".into(),
             },
             ContentBlock::Text {
                 text: "Here is the answer.".into(),
@@ -159,8 +185,153 @@ fn response_to_turn_result_with_thinking() {
         ChatTurnResult::FinalText(ft) => {
             assert_eq!(ft.content, "Here is the answer.");
             assert_eq!(ft.reasoning.as_deref(), Some("Let me reason..."));
+            // Thinking was present, so the round-trip artifact must be captured.
+            assert!(ft.reasoning_artifact.is_some());
         }
         other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
+fn response_to_turn_result_captures_thinking_artifact() {
+    // Canned response: a signed thinking block followed by a redacted_thinking
+    // block, in that order, then display text. The artifact must preserve the
+    // order, the signature, and the redacted data byte-for-byte, while the
+    // display text (`reasoning`) keeps working as before.
+    let resp = MessagesResponse {
+        id: "msg_art".into(),
+        r#type: "message".into(),
+        role: "assistant".into(),
+        content: vec![
+            ContentBlock::Thinking {
+                thinking: "Let me reason carefully.".into(),
+                signature: "sig_abc123".into(),
+            },
+            ContentBlock::RedactedThinking {
+                data: "eJxT_opaque_redacted".into(),
+            },
+            ContentBlock::Text {
+                text: "Here is the answer.".into(),
+            },
+        ],
+        stop_reason: Some("end_turn".into()),
+        stop_sequence: None,
+        model: "claude-sonnet-4-20250514".into(),
+        usage: None,
+    };
+    let result = response_to_turn_result(resp).unwrap();
+    match result {
+        ChatTurnResult::FinalText(ft) => {
+            assert_eq!(ft.content, "Here is the answer.");
+            assert_eq!(ft.reasoning.as_deref(), Some("Let me reason carefully."));
+            // Byte-exact: object keys serialize alphabetically (serde_json
+            // default BTreeMap ordering), block order preserved.
+            let expected = br#"[{"signature":"sig_abc123","thinking":"Let me reason carefully.","type":"thinking"},{"data":"eJxT_opaque_redacted","type":"redacted_thinking"}]"#;
+            assert_eq!(
+                ft.reasoning_artifact,
+                Some(ReasoningArtifact::AnthropicThinking(expected.to_vec()))
+            );
+        }
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
+fn response_json_with_thinking_and_redacted_parses_artifact() {
+    // Feed a canned Anthropic response JSON through the parse boundary: the
+    // signature field must deserialize and the ordered blocks must land in the
+    // artifact.
+    let json = json!({
+        "id": "msg_art2",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "Think.", "signature": "sig_xyz"},
+            {"type": "redacted_thinking", "data": "eJxT_redacted"},
+            {"type": "text", "text": "Done."}
+        ],
+        "stop_reason": "end_turn",
+        "model": "claude-sonnet-4-20250514",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    });
+    let resp: MessagesResponse = serde_json::from_value(json).unwrap();
+    let result = response_to_turn_result(resp).unwrap();
+    match result {
+        ChatTurnResult::FinalText(ft) => {
+            assert_eq!(ft.content, "Done.");
+            let expected = br#"[{"signature":"sig_xyz","thinking":"Think.","type":"thinking"},{"data":"eJxT_redacted","type":"redacted_thinking"}]"#;
+            assert_eq!(
+                ft.reasoning_artifact,
+                Some(ReasoningArtifact::AnthropicThinking(expected.to_vec()))
+            );
+        }
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
+fn response_to_turn_result_no_thinking_has_no_artifact() {
+    // Control: a response with no thinking / redacted_thinking blocks must
+    // carry no artifact.
+    let resp = MessagesResponse {
+        id: "msg_ctrl".into(),
+        r#type: "message".into(),
+        role: "assistant".into(),
+        content: vec![ContentBlock::Text {
+            text: "Plain response.".into(),
+        }],
+        stop_reason: Some("end_turn".into()),
+        stop_sequence: None,
+        model: "claude-sonnet-4-20250514".into(),
+        usage: None,
+    };
+    let result = response_to_turn_result(resp).unwrap();
+    match result {
+        ChatTurnResult::FinalText(ft) => {
+            assert!(ft.reasoning.is_none());
+            assert!(ft.reasoning_artifact.is_none());
+        }
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
+fn response_to_turn_result_tool_use_carries_thinking_artifact() {
+    // Tool-use turns must carry the artifact too (the signature is required
+    // back on the tool-loop replay).
+    let resp = MessagesResponse {
+        id: "msg_tu_art".into(),
+        r#type: "message".into(),
+        role: "assistant".into(),
+        content: vec![
+            ContentBlock::Thinking {
+                thinking: "Pick a tool.".into(),
+                signature: "sig_tool".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "tu_1".into(),
+                name: "search".into(),
+                input: json!({"q": "x"}),
+            },
+        ],
+        stop_reason: Some("tool_use".into()),
+        stop_sequence: None,
+        model: "claude-sonnet-4-20250514".into(),
+        usage: None,
+    };
+    let result = response_to_turn_result(resp).unwrap();
+    match result {
+        ChatTurnResult::ToolUse(tu) => {
+            assert_eq!(tu.tool_calls.len(), 1);
+            assert_eq!(tu.reasoning.as_deref(), Some("Pick a tool."));
+            let expected =
+                br#"[{"signature":"sig_tool","thinking":"Pick a tool.","type":"thinking"}]"#;
+            assert_eq!(
+                tu.reasoning_artifact,
+                Some(ReasoningArtifact::AnthropicThinking(expected.to_vec()))
+            );
+        }
+        other => panic!("expected ToolUse, got {other:?}"),
     }
 }
 

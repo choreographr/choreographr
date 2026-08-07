@@ -13,7 +13,7 @@ use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
 use crate::{ChatTurnRequest, ContextWindowConfig};
-use choreo_proto::TokenUsage;
+use choreo_proto::{ReasoningArtifact, TokenUsage};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_API_VERSION: &str = "2023-06-01";
@@ -364,10 +364,67 @@ enum ContentBlock {
         input: serde_json::Value,
     },
     #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+        /// Encrypted signature the provider requires back on replay. Anthropic
+        /// always sends it on thinking blocks; default to empty so an unusual
+        /// (or third-party) provider that omits it still parses.
+        #[serde(default)]
+        signature: String,
+    },
     #[serde(rename = "redacted_thinking")]
-    #[expect(dead_code)]
     RedactedThinking { data: String },
+}
+
+/// One thinking / redacted_thinking content block captured for the opaque
+/// round-trip artifact, kept in original wire order.
+///
+/// The payload is provider-owned: only the Anthropic adapter may interpret it
+/// (re-emission happens in Phase 4a). Display text lives separately in
+/// `FinalTextResult::reasoning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ThinkingArtifactBlock {
+    /// `{"type":"thinking","thinking":…,"signature":…}`
+    Thinking { thinking: String, signature: String },
+    /// `{"type":"redacted_thinking","data":…}`
+    RedactedThinking { data: String },
+}
+
+/// Serialize the ordered thinking / redacted_thinking blocks into the opaque
+/// [`ReasoningArtifact::AnthropicThinking`] payload, or `None` when nothing was
+/// captured. The payload is the JSON serialization of the block array exactly
+/// as received — block order preserved, signatures and redacted data intact —
+/// so a later passback can replay it verbatim.
+fn anthropic_thinking_artifact(
+    blocks: &[ThinkingArtifactBlock],
+) -> Result<Option<ReasoningArtifact>, AnthropicError> {
+    if blocks.is_empty() {
+        return Ok(None);
+    }
+    let values: Vec<serde_json::Value> = blocks
+        .iter()
+        .map(|block| match block {
+            ThinkingArtifactBlock::Thinking {
+                thinking,
+                signature,
+            } => serde_json::json!({
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": signature,
+            }),
+            ThinkingArtifactBlock::RedactedThinking { data } => serde_json::json!({
+                "type": "redacted_thinking",
+                "data": data,
+            }),
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&values).map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
+    debug!(
+        block_count = blocks.len(),
+        payload_bytes = bytes.len(),
+        "captured anthropic thinking artifact",
+    );
+    Ok(Some(ReasoningArtifact::AnthropicThinking(bytes)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,6 +442,9 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_uses: Vec<ChatToolCall> = Vec::new();
     let mut reasoning_parts: Vec<String> = Vec::new();
+    // Thinking / redacted_thinking blocks in original wire order, captured for
+    // the opaque round-trip artifact (signatures + redacted data intact).
+    let mut artifact_blocks: Vec<ThinkingArtifactBlock> = Vec::new();
 
     for block in response.content {
         match block {
@@ -399,14 +459,26 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
                     caller: None,
                 });
             }
-            ContentBlock::Thinking { thinking } => {
-                reasoning_parts.push(thinking);
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                reasoning_parts.push(thinking.clone());
+                artifact_blocks.push(ThinkingArtifactBlock::Thinking {
+                    thinking,
+                    signature,
+                });
             }
-            ContentBlock::RedactedThinking { .. } => {
-                // Redacted thinking blocks are skipped — they contain no usable text.
+            ContentBlock::RedactedThinking { data } => {
+                // Retained for the round-trip artifact: redacted blocks carry
+                // opaque encrypted data the provider requires back on replay,
+                // even though they contain no displayable text.
+                artifact_blocks.push(ThinkingArtifactBlock::RedactedThinking { data });
             }
         }
     }
+
+    let reasoning_artifact = anthropic_thinking_artifact(&artifact_blocks)?;
 
     let reasoning = if reasoning_parts.is_empty() {
         None
@@ -444,7 +516,7 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
             reasoning,
             usage,
             response_id: None,
-            reasoning_artifact: None,
+            reasoning_artifact,
         }));
     }
 
@@ -458,7 +530,7 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
         reasoning,
         usage,
         response_id: None,
-        reasoning_artifact: None,
+        reasoning_artifact,
     }))
 }
 

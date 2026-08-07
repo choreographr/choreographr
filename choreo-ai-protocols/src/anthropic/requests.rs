@@ -14,7 +14,8 @@ use crate::types::{
 
 use super::{
     AnthropicConfig, AnthropicError, MessagesRequest, MessagesResponse, ModelListResponse,
-    build_message_payloads, build_tool_payloads, response_to_turn_result, thinking_payload,
+    ThinkingArtifactBlock, anthropic_thinking_artifact, build_message_payloads,
+    build_tool_payloads, response_to_turn_result, thinking_payload,
 };
 
 /// Endpoint path for the Messages API.
@@ -229,12 +230,18 @@ where
     // Track input/output tokens delivered via message_start and message_delta.
     let mut input_tokens: Option<u32> = None;
     let mut output_tokens: Option<u32> = None;
+    // Reconstructs the thinking / redacted_thinking blocks in wire order for
+    // the opaque round-trip artifact (same shape as the non-streaming path).
+    let mut thinking_blocks = ThinkingBlockAccumulator::new();
 
     while let Some((event_type, data)) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         match event_type.as_str() {
             "content_block_start" => {
                 let start: ContentBlockStart = serde_json::from_str(&data)
                     .map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
+                // Retain thinking / redacted_thinking blocks for the artifact
+                // before the match below consumes the content block.
+                thinking_blocks.on_content_block_start(&start.content_block);
                 match start.content_block {
                     StreamContentBlock::Text { text } => {
                         if !text.is_empty() {
@@ -282,6 +289,9 @@ where
             "content_block_delta" => {
                 let delta: ContentBlockDelta = serde_json::from_str(&data)
                     .map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
+                // Accumulate thinking text / signature fragments for the
+                // artifact before the match below consumes the delta.
+                thinking_blocks.on_content_block_delta(&delta.delta);
                 match delta.delta {
                     StreamDelta::TextDelta { text } => {
                         if !text.is_empty() {
@@ -315,7 +325,15 @@ where
                             on_event(StreamEvent::Reasoning(thinking))?;
                         }
                     }
+                    StreamDelta::SignatureDelta { .. } => {
+                        // No display output; the signature is captured into the
+                        // artifact by the accumulator above.
+                    }
                 }
+            }
+            "content_block_stop" => {
+                // Finalize the open thinking block (if any) into the artifact.
+                thinking_blocks.on_content_block_stop();
             }
             "message_start" => {
                 // Parse input_tokens from the message_start event.
@@ -357,6 +375,10 @@ where
         _ => None,
     };
 
+    // Assemble the round-trip artifact from the blocks collected during the
+    // stream (a thinking block left open at stream end is flushed by `finish`).
+    let reasoning_artifact = anthropic_thinking_artifact(&thinking_blocks.finish())?;
+
     if !has_any_output {
         return Err(AnthropicError::EmptyResponse);
     }
@@ -387,7 +409,7 @@ where
             },
             usage,
             response_id: None,
-            reasoning_artifact: None,
+            reasoning_artifact,
         }));
     }
 
@@ -404,7 +426,7 @@ where
         },
         usage,
         response_id: None,
-        reasoning_artifact: None,
+        reasoning_artifact,
     }))
 }
 
@@ -440,7 +462,6 @@ enum StreamContentBlock {
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
     #[serde(rename = "redacted_thinking")]
-    #[expect(dead_code)]
     RedactedThinking { data: String },
 }
 
@@ -461,6 +482,97 @@ enum StreamDelta {
     InputJsonDelta { partial_json: String },
     #[serde(rename = "thinking_delta")]
     ThinkingDelta { thinking: String },
+    #[serde(rename = "signature_delta")]
+    SignatureDelta { signature: String },
+}
+
+/// Accumulates thinking / redacted_thinking blocks in wire order during
+/// streaming, mirroring the non-streaming artifact assembly in `mod.rs`.
+///
+/// Thinking text arrives piecemeal across a `content_block_start` (initial
+/// text) plus `thinking_delta` fragments, while the encrypted signature
+/// arrives as one or more `signature_delta` fragments before the block's
+/// `content_block_stop`. Redacted blocks carry all their data in the start
+/// event. Text / tool_use blocks never appear in the artifact and are
+/// ignored.
+struct ThinkingBlockAccumulator {
+    /// Completed blocks in original order.
+    blocks: Vec<ThinkingArtifactBlock>,
+    /// The thinking block currently open (between start and stop), being
+    /// filled by thinking_delta / signature_delta fragments.
+    open: Option<StreamThinkingBlock>,
+}
+
+/// A thinking block being filled by streaming deltas.
+#[derive(Default)]
+struct StreamThinkingBlock {
+    thinking: String,
+    signature: String,
+}
+
+impl ThinkingBlockAccumulator {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            open: None,
+        }
+    }
+
+    /// Handle a `content_block_start` event for the artifact.
+    fn on_content_block_start(&mut self, block: &StreamContentBlock) {
+        match block {
+            StreamContentBlock::Thinking { thinking } => {
+                self.open = Some(StreamThinkingBlock {
+                    thinking: thinking.clone(),
+                    signature: String::new(),
+                });
+            }
+            StreamContentBlock::RedactedThinking { data } => {
+                self.blocks
+                    .push(ThinkingArtifactBlock::RedactedThinking { data: data.clone() });
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a `content_block_delta` event for the artifact.
+    fn on_content_block_delta(&mut self, delta: &StreamDelta) {
+        match delta {
+            StreamDelta::ThinkingDelta { thinking } => {
+                if let Some(open) = self.open.as_mut() {
+                    open.thinking.push_str(thinking);
+                }
+            }
+            StreamDelta::SignatureDelta { signature } => {
+                if let Some(open) = self.open.as_mut() {
+                    open.signature.push_str(signature);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a `content_block_stop` event: finalize the open thinking block.
+    fn on_content_block_stop(&mut self) {
+        if let Some(open) = self.open.take() {
+            self.blocks.push(ThinkingArtifactBlock::Thinking {
+                thinking: open.thinking,
+                signature: open.signature,
+            });
+        }
+    }
+
+    /// Consume the accumulator, flushing any thinking block left open at
+    /// stream end (its `content_block_stop` never arrived).
+    fn finish(mut self) -> Vec<ThinkingArtifactBlock> {
+        if let Some(open) = self.open.take() {
+            self.blocks.push(ThinkingArtifactBlock::Thinking {
+                thinking: open.thinking,
+                signature: open.signature,
+            });
+        }
+        self.blocks
+    }
 }
 
 // ── Anthropic-specific SSE reader ────────────────────────────────────
@@ -605,4 +717,119 @@ struct AnthropicStreamUsage {
 #[derive(Debug, Deserialize)]
 struct AnthropicStreamUsageDelta {
     output_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use choreo_proto::ReasoningArtifact;
+    use serde_json::json;
+
+    /// Feed the accumulator the SSE-shaped events for a signed thinking block
+    /// (text split across start + delta, signature split across two deltas)
+    /// followed by a redacted_thinking block, and assert the assembled artifact
+    /// is byte-exact: block order preserved, signature and redacted data
+    /// intact. Object keys serialize alphabetically (serde_json default
+    /// BTreeMap ordering without `preserve_order`).
+    #[test]
+    fn signature_delta_accumulates_into_thinking_artifact() {
+        let mut acc = ThinkingBlockAccumulator::new();
+
+        // content_block_start: thinking block, initial text.
+        let start: ContentBlockStart = serde_json::from_value(json!({
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "Let me"}
+        }))
+        .unwrap();
+        acc.on_content_block_start(&start.content_block);
+
+        // thinking_delta: more thinking text.
+        let delta: ContentBlockDelta = serde_json::from_value(json!({
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": " analyze."}
+        }))
+        .unwrap();
+        acc.on_content_block_delta(&delta.delta);
+
+        // signature_delta x2: the encrypted signature streams in fragments.
+        for part in ["sig_abc", "123"] {
+            let delta: ContentBlockDelta = serde_json::from_value(json!({
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": part}
+            }))
+            .unwrap();
+            acc.on_content_block_delta(&delta.delta);
+        }
+        acc.on_content_block_stop();
+
+        // redacted_thinking: all data arrives in the start block.
+        let start: ContentBlockStart = serde_json::from_value(json!({
+            "index": 1,
+            "content_block": {"type": "redacted_thinking", "data": "eJxT_opaque"}
+        }))
+        .unwrap();
+        acc.on_content_block_start(&start.content_block);
+        acc.on_content_block_stop();
+
+        let artifact = anthropic_thinking_artifact(&acc.finish()).unwrap().unwrap();
+        let expected = br#"[{"signature":"sig_abc123","thinking":"Let me analyze.","type":"thinking"},{"data":"eJxT_opaque","type":"redacted_thinking"}]"#;
+        assert_eq!(
+            artifact,
+            ReasoningArtifact::AnthropicThinking(expected.to_vec())
+        );
+    }
+
+    /// A thinking block left open at stream end (no `content_block_stop`) must
+    /// still be flushed into the artifact, including any signature fragments
+    /// already seen.
+    #[test]
+    fn streaming_thinking_block_left_open_is_flushed() {
+        let mut acc = ThinkingBlockAccumulator::new();
+        let start: ContentBlockStart = serde_json::from_value(json!({
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""}
+        }))
+        .unwrap();
+        acc.on_content_block_start(&start.content_block);
+        let delta: ContentBlockDelta = serde_json::from_value(json!({
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "sig_open"}
+        }))
+        .unwrap();
+        acc.on_content_block_delta(&delta.delta);
+
+        let artifact = anthropic_thinking_artifact(&acc.finish()).unwrap().unwrap();
+        let expected = br#"[{"signature":"sig_open","thinking":"","type":"thinking"}]"#;
+        assert_eq!(
+            artifact,
+            ReasoningArtifact::AnthropicThinking(expected.to_vec())
+        );
+    }
+
+    /// A stream with no thinking blocks captures no artifact.
+    #[test]
+    fn streaming_without_thinking_has_no_artifact() {
+        let acc = ThinkingBlockAccumulator::new();
+        assert!(
+            anthropic_thinking_artifact(&acc.finish())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The SSE handler previously *errored* on `signature_delta` events: the
+    /// variant was missing, so deserialization failed and killed the whole
+    /// stream. Pin that it now parses and carries the signature.
+    #[test]
+    fn signature_delta_deserializes() {
+        let delta: ContentBlockDelta = serde_json::from_value(json!({
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "sig_1"}
+        }))
+        .unwrap();
+        match delta.delta {
+            StreamDelta::SignatureDelta { signature } => assert_eq!(signature, "sig_1"),
+            other => panic!("expected SignatureDelta, got {other:?}"),
+        }
+    }
 }
