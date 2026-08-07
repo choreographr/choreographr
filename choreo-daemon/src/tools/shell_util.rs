@@ -1,14 +1,19 @@
 use super::{ToolExecError, truncate_tool_output};
 use std::{
-    io::{BufRead, BufReader, Read},
-    os::fd::OwnedFd,
+    io::Read,
+    os::fd::{AsRawFd, OwnedFd},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::mpsc,
     time::Duration,
 };
-use tracing::warn;
+use tracing::{debug, trace, warn};
+
+/// Bounded wait used by the pipe-drain helpers: `poll(2)` in 100ms slices so a
+/// stop signal (sent once the direct child is reaped) is observed quickly.
+/// See `poll_readable` for why the drain must be bounded.
+const DRAIN_POLL_MS: i32 = 100;
 
 /// Check whether a binary with the given name exists somewhere in PATH.
 pub(crate) fn binary_exists(name: &str) -> bool {
@@ -83,6 +88,12 @@ fn open_pidfd(pid: u32) -> Option<OwnedFd> {
     if fd >= 0 {
         Some(unsafe { OwnedFd::from_raw_fd(fd as i32) })
     } else {
+        // Expected on kernels < 5.3 and under pidfd-blocking seccomp policies,
+        // and in a narrow race where the child already exited (ESRCH). Timeout
+        // kills then degrade to the leader-checked PID path — that is by
+        // design, so trace (not warn) keeps the common case quiet.
+        let err = nix::errno::Errno::last();
+        trace!(pid, error = %err, "pidfd_open unavailable; timeout kills fall back to PID-based killpg");
         None
     }
 }
@@ -126,8 +137,11 @@ fn pidfd_send_signal(fd: &OwnedFd, sig: nix::libc::c_int) -> nix::Result<()> {
 /// When a pidfd pins the child's identity (Linux), `pidfd_send_signal` is
 /// used first: a successful SIGKILL proves the PID has not been recycled onto
 /// an unrelated process, so the subsequent `killpg(pid)` sweep targets the
-/// right group. If the pidfd signal fails, the pinned process no longer
-/// exists (it finished on its own) and nothing is reported as killed.
+/// right group. If the pinned signal fails with `ESRCH` the child finished on
+/// its own and nothing is reported as killed; any *other* failure (e.g.
+/// EPERM/EINVAL/ENOSYS under seccomp) falls through to the leader-checked
+/// PID-based path below rather than giving up on the timeout — the pidfd still
+/// pins the identity, so the fallback remains safe.
 ///
 /// Without a pidfd (macOS, or pidfd unavailable), `killpg(pid)` is only
 /// attempted when the child is confirmed to be its group's leader
@@ -138,26 +152,43 @@ fn pidfd_send_signal(fd: &OwnedFd, sig: nix::libc::c_int) -> nix::Result<()> {
 /// (normally ESRCH, but a recycled PID could collide with an orphaned group
 /// id and take down an unrelated tree). Non-leaders fall straight back to a
 /// direct kill of the child itself.
-fn kill_child_tree(pid: u32, _pidfd: Option<&OwnedFd>) -> bool {
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
     // Pinned-identity path — reachable only on Linux, where `open_pidfd` can
     // return `Some`.
     #[cfg(target_os = "linux")]
-    if let Some(fd) = _pidfd {
-        // SIGKILL the leader through the pinned fd, then sweep the rest of
-        // the group by pgid (== pid, since setup_child made the child a
-        // leader). The `killpg` is best-effort: if the leader was the only
-        // member the group is already gone and it returns ESRCH harmlessly.
-        if pidfd_send_signal(fd, nix::libc::SIGKILL).is_err() {
-            return false;
+    if let Some(fd) = pidfd {
+        match pidfd_send_signal(fd, nix::libc::SIGKILL) {
+            Ok(()) => {
+                // SIGKILL the leader through the pinned fd, then sweep the
+                // rest of the group by pgid (== pid, since setup_child made
+                // the child a leader). The `killpg` is best-effort: if the
+                // leader was the only member the group is already gone and it
+                // returns ESRCH harmlessly.
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                return true;
+            }
+            Err(nix::errno::Errno::ESRCH) => {
+                // The pinned process exited on its own before the timeout
+                // landed — nothing to kill, so report "not killed".
+                debug!(pid, "pidfd_send_signal: child already exited on its own");
+                return false;
+            }
+            Err(e) => {
+                // Non-ESRCH failure: don't give up on the timeout. Fall
+                // through to the leader-checked killpg below; the pidfd still
+                // pins the identity, so the PID-based signal cannot be
+                // redirected at a recycled process.
+                warn!(pid, error = %e, "pidfd_send_signal failed; falling back to leader-checked killpg");
+            }
         }
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-        return true;
     }
 
-    // Legacy PID-based path (non-Linux, or pidfd unavailable).
+    // Legacy PID-based path (non-Linux, pidfd unavailable, or the pinned
+    // signal failed with a non-ESRCH error above).
     let pid = nix::unistd::Pid::from_raw(pid as i32);
     // True only while the child lives as its group's leader. Once it has
     // exited (even unreaped) getpgid can still succeed — matching kill(2),
@@ -212,32 +243,205 @@ fn spawn_watchdog(
     })
 }
 
+/// Wait up to `poll_ms` for `fd` to become readable or hit EOF, using
+/// `poll(2)`. Returns `true` when a read should be attempted (data or EOF
+/// pending); returns `false` when the stop channel was signalled or `poll`
+/// failed, in which case the caller should stop draining.
+///
+/// The bounded poll is what makes the pipe drain safe: after the direct child
+/// is reaped, a surviving grandchild (e.g. a backgrounded `sleep 10 &` that
+/// inherited the stdout pipe) would otherwise keep a blocking `read(2)` in the
+/// drain thread open until the grandchild exits on its own — turning a 500ms
+/// tool timeout into a multi-second hang. Draining in poll slices lets the
+/// stop signal (sent by the spawn helpers once `child.wait()` returns) cut the
+/// wait short.
+fn poll_readable(fd: nix::libc::c_int, stop_rx: &mpsc::Receiver<()>, poll_ms: i32) -> bool {
+    let mut pfd = nix::libc::pollfd {
+        fd,
+        events: nix::libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // poll(2): -1 on error, 0 on timeout, >0 when data or EOF is pending.
+        let ret = unsafe { nix::libc::poll(&mut pfd, 1, poll_ms) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR: retry the poll
+            }
+            debug!(error = %err, "poll on child pipe failed; stopping drain");
+            return false;
+        }
+        if ret == 0 {
+            // Nothing readable within the slice. If the direct child has been
+            // reaped (stop signalled), stop rather than wait for a survivor.
+            if stop_rx.try_recv().is_ok() {
+                return false;
+            }
+            continue;
+        }
+        // Data available or EOF (POLLHUP|POLLIN) — attempt a read.
+        return true;
+    }
+}
+
+/// Read `reader` (whose raw fd must be `fd`) to EOF, or until `stop_rx` is
+/// signalled, returning everything read. `on_data` is invoked with each chunk
+/// (used for line-streaming). The returned buffer always contains the full
+/// byte stream regardless of what `on_data` does with it.
+///
+/// The fd is put in non-blocking mode first so the drain loop can consume
+/// every byte available per `poll` verdict (full throughput for large
+/// outputs) without ever blocking on an empty pipe whose write end is still
+/// open (a surviving grandchild). If `fcntl` fails — which never happens on a
+/// freshly-created pipe — the code falls back to reading a single chunk per
+/// poll verdict, which is safe but slower.
+fn drain_fd<R: Read + AsRawFd>(
+    mut reader: R,
+    stop_rx: mpsc::Receiver<()>,
+    poll_ms: i32,
+    on_data: &mut dyn FnMut(&[u8]),
+) -> Vec<u8> {
+    let fd = reader.as_raw_fd();
+    let nonblocking = set_nonblocking(fd);
+    if !nonblocking {
+        debug!(
+            fd,
+            "could not set child pipe non-blocking; draining one chunk per poll"
+        );
+    }
+    let mut full: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        if !poll_readable(fd, &stop_rx, poll_ms) {
+            break;
+        }
+        // Drain everything currently buffered (non-blocking reads loop until
+        // EAGAIN). In the blocking-fd fallback, read at most once per poll
+        // verdict so the read is always bounded by the poll result.
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return full, // EOF: all pipe write ends are closed
+                Ok(n) => {
+                    on_data(&buf[..n]);
+                    full.extend_from_slice(&buf[..n]);
+                    if !nonblocking {
+                        break; // blocking fallback: one read per poll
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // drained
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    if !nonblocking {
+                        break; // avoid a blocking re-read on the fallback path
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    debug!(error = %e, "read from child pipe failed; stopping drain");
+                    return full;
+                }
+            }
+        }
+    }
+    full
+}
+
+/// Put `fd` in non-blocking mode. Returns `false` if `fcntl` fails.
+fn set_nonblocking(fd: nix::libc::c_int) -> bool {
+    // SAFETY: fcntl is async-signal-safe and operates on the fd we own.
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+    if flags < 0 {
+        return false;
+    }
+    // SAFETY: F_SETFL with the OR'd O_NONBLOCK flag is the standard way to
+    // make a pipe read end non-blocking; only the read end's own behaviour
+    // changes (the child's writes to the other end are unaffected).
+    unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) >= 0 }
+}
+
+/// Append `chunk` to `pending`, forwarding every complete line (terminated by
+/// `\n`, with a trailing `\r` stripped so CRLF is folded into LF) to
+/// `on_line`. Leftover bytes stay in `pending` for the next chunk, or a final
+/// flush by the caller at EOF — matching `BufRead::lines()` semantics.
+fn forward_complete_lines(chunk: &[u8], pending: &mut Vec<u8>, on_line: &mut dyn FnMut(Vec<u8>)) {
+    for &b in chunk {
+        // Fold CRLF into LF: drop a trailing `\r` when the next byte is `\n`
+        // (matching `BufRead::lines()`, which strips both `\r\n` and `\n`).
+        if b == b'\n' && pending.last() == Some(&b'\r') {
+            pending.pop();
+        }
+        pending.push(b);
+        if b == b'\n' {
+            let line = std::mem::take(pending);
+            on_line(line);
+        }
+    }
+}
+
 /// Spawn the command, run a watchdog thread to enforce the timeout,
 /// and return the process output along with a flag indicating whether
 /// the watchdog killed the process.
 ///
-/// Applies child-process hardening (`setup_child`) before spawning, and pins
-/// the child's identity with a pidfd on Linux so a timeout kill can never be
-/// redirected at a recycled PID (see `open_pidfd` / `kill_child_tree`).
+/// Applies child-process hardening (`setup_child`) before spawning, pins the
+/// child's identity with a pidfd on Linux so a timeout kill can never be
+/// redirected at a recycled PID (see `open_pidfd` / `kill_child_tree`), and
+/// drains stdout/stderr in bounded background threads so a surviving
+/// grandchild cannot hang the tool past the timeout (see `drain_fd`).
 pub(crate) fn spawn_with_watchdog(
     cmd: &mut Command,
     timeout_ms: u64,
 ) -> Result<(Output, bool), ToolExecError> {
     setup_child(cmd);
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let pid = child.id();
     let pidfd = open_pidfd(pid);
 
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let (killed_tx, killed_rx) = mpsc::channel::<()>();
-
     let watchdog = spawn_watchdog(timeout_ms, pid, pidfd, done_rx, killed_tx);
 
-    let output = child.wait_with_output()?;
-    let _ = done_tx.send(());
-    let _ = watchdog.join();
+    // Drain stdout/stderr concurrently so the child can never block on a full
+    // pipe buffer (the classic pipe deadlock). Each drain is bounded by a stop
+    // channel; a pipe that was not piped (None) is skipped, leaving the
+    // Output field empty — matching the old wait_with_output behaviour.
+    let (out_stop_tx, out_stop_rx) = mpsc::channel::<()>();
+    let (err_stop_tx, err_stop_rx) = mpsc::channel::<()>();
+    let stdout_thread = child
+        .stdout
+        .take()
+        .map(|s| std::thread::spawn(move || drain_fd(s, out_stop_rx, DRAIN_POLL_MS, &mut |_| {})));
+    let stderr_thread = child
+        .stderr
+        .take()
+        .map(|s| std::thread::spawn(move || drain_fd(s, err_stop_rx, DRAIN_POLL_MS, &mut |_| {})));
 
-    Ok((output, killed_rx.try_recv().is_ok()))
+    let status = child.wait()?;
+    let _ = done_tx.send(());
+    // The direct child is reaped. Stop the drainers: anything still holding a
+    // pipe write end is a surviving grandchild or backgrounded process, and
+    // waiting for its output could exceed the timeout we were enforcing.
+    let _ = out_stop_tx.send(());
+    let _ = err_stop_tx.send(());
+    if let Err(e) = watchdog.join() {
+        warn!("watchdog thread panicked: {:?}", e);
+    }
+
+    let stdout = stdout_thread
+        .and_then(|t| t.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_thread
+        .and_then(|t| t.join().ok())
+        .unwrap_or_default();
+    let was_killed = killed_rx.try_recv().is_ok();
+
+    Ok((
+        Output {
+            stdout,
+            stderr,
+            status,
+        },
+        was_killed,
+    ))
 }
 
 /// Spawn the command with piped stdout/stderr and stream stdout lines
@@ -245,10 +449,11 @@ pub(crate) fn spawn_with_watchdog(
 /// Enforces a timeout via watchdog and returns the collected output
 /// along with a was-killed flag.
 ///
-/// Applies child-process hardening (`setup_child`) before spawning, and pins
-/// the child's identity with a pidfd on Linux so a timeout kill can never be
-/// redirected at a recycled PID. The caller must still set `Stdio::piped()`
-/// on both stdout and stderr before calling this.
+/// Applies child-process hardening (`setup_child`) before spawning, pins the
+/// child's identity with a pidfd on Linux so a timeout kill can never be
+/// redirected at a recycled PID, and bounds both drains so a surviving
+/// grandchild cannot hang the tool past the timeout. The caller must set
+/// `Stdio::piped()` on both stdout and stderr before calling this.
 ///
 /// IMPORTANT: Both stdout and stderr are drained in background threads
 /// so that the child process can never block on a full pipe buffer
@@ -264,47 +469,44 @@ pub fn spawn_with_streaming(
     let pid = child.id();
     let pidfd = open_pidfd(pid);
 
-    // Take stdout so wait_with_output cannot grab it — we read it
-    // incrementally in a background thread.
+    // Take stdout so wait() cannot grab it — we read it incrementally in a
+    // background thread (see `drain_fd` for the bounded-drain rationale).
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("stdout not piped"))?;
-
-    // Thread: read stdout line by line, forward each line (with its
-    // newline restored) to output_tx, and accumulate the full output.
-    let (full_buf_tx, full_buf_rx) = mpsc::channel::<Vec<u8>>();
-    let stdout_thread = std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        let mut full_buf: Vec<u8> = Vec::new();
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!(error = %e, "error reading stdout from child process");
-                    break;
-                }
-            };
-            let mut line_bytes: Vec<u8> = line.into_bytes();
-            line_bytes.push(b'\n');
-            let _ = output_tx.send(line_bytes.clone());
-            full_buf.extend_from_slice(&line_bytes);
-        }
-        let _ = full_buf_tx.send(full_buf);
-    });
-
-    // Thread: drain stderr concurrently so the child can never block on
-    // a full stderr pipe buffer (classic pipe deadlock).  Not streamed —
-    // just accumulated and returned in the final Output struct.
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| std::io::Error::other("stderr not piped"))?;
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        buf
+
+    let (out_stop_tx, out_stop_rx) = mpsc::channel::<()>();
+    let (err_stop_tx, err_stop_rx) = mpsc::channel::<()>();
+
+    // Thread: read stdout, forward each complete line (newline restored,
+    // CRLF folded to LF) to output_tx, and accumulate the full output.
+    let stdout_thread = std::thread::spawn(move || {
+        let mut pending: Vec<u8> = Vec::new();
+        let full = drain_fd(stdout, out_stop_rx, DRAIN_POLL_MS, &mut |chunk: &[u8]| {
+            forward_complete_lines(chunk, &mut pending, &mut |line| {
+                let _ = output_tx.send(line);
+            });
+        });
+        // Flush any final unterminated line (matches `BufRead::lines()`
+        // yielding a last line without a trailing newline). The bytes are
+        // already included in `full` (drain_fd accumulates everything); this
+        // only forwards the streamed copy.
+        if !pending.is_empty() {
+            let _ = output_tx.send(pending);
+        }
+        full
     });
+
+    // Thread: drain stderr concurrently so the child can never block on a
+    // full stderr pipe buffer.  Not streamed — just accumulated and returned
+    // in the final Output struct.
+    let stderr_thread =
+        std::thread::spawn(move || drain_fd(stderr, err_stop_rx, DRAIN_POLL_MS, &mut |_| {}));
 
     // Watchdog thread: enforce timeout. Shared with the buffered path so the
     // two timeout semantics stay identical (see `spawn_watchdog`).
@@ -316,20 +518,27 @@ pub fn spawn_with_streaming(
     // pipes concurrently, preventing any blocking deadlock).
     let status = child.wait()?;
     let _ = done_tx.send(());
+    // Stop the drainers once the direct child is reaped (see
+    // `spawn_with_watchdog`).
+    let _ = out_stop_tx.send(());
+    let _ = err_stop_tx.send(());
 
-    if let Err(e) = stdout_thread.join() {
-        warn!("stdout reader thread panicked: {:?}", e);
-    }
+    let stdout_buf = match stdout_thread.join() {
+        Ok(buf) => buf,
+        Err(e) => {
+            warn!("stdout reader thread panicked: {:?}", e);
+            Vec::new()
+        }
+    };
     let stderr_buf = stderr_thread.join().unwrap_or_default();
     if let Err(e) = watchdog.join() {
         warn!("watchdog thread panicked: {:?}", e);
     }
-    let full_buf = full_buf_rx.recv().unwrap_or_default();
     let was_killed = killed_rx.try_recv().is_ok();
 
     Ok((
         Output {
-            stdout: full_buf,
+            stdout: stdout_buf,
             stderr: stderr_buf,
             status,
         },
@@ -382,7 +591,7 @@ pub(crate) fn format_shell_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::BufRead;
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::process::ExitStatusExt;
     use std::process::Stdio;
 
@@ -439,10 +648,12 @@ mod tests {
         // a group leader and kill_child_tree must skip killpg (there is no
         // group to target by this pid — and a recycled PID could otherwise
         // collide with an orphaned group id and signal an unrelated tree) and
-        // reap the child via the direct-kill fallback instead. Guards the
-        // fallback branch against silently becoming dead code.
+        // reap the child via the direct-kill fallback instead. `exec` ensures
+        // the shell replaces itself with `sleep`, so no orphan grandchild can
+        // outlive the direct kill. Guards the fallback branch against silently
+        // becoming dead code.
         let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", "sleep 30"]);
+        cmd.args(["-c", "exec sleep 30"]);
         let child = cmd.spawn().expect("spawn child");
         let pid = child.id();
         let mut _reap = ReapOnDrop(child);
@@ -466,8 +677,17 @@ mod tests {
         setup_child(&mut cmd);
         let child = cmd.spawn().expect("spawn child");
         let pid = child.id();
-        let pidfd = open_pidfd(pid).expect("pidfd_open on live child");
+        // Wrap the child before the pidfd-unavailable early return below so it
+        // is always reaped (a `sleep 30` would otherwise linger until the test
+        // process exits).
         let mut _reap = ReapOnDrop(child);
+        // pidfd_open can be unavailable (kernel < 5.3, seccomp policy) even
+        // though the child is alive; production degrades to the PID-based
+        // path in exactly that case, so the test skips rather than failing.
+        let Some(pidfd) = open_pidfd(pid) else {
+            eprintln!("pidfd_open unavailable; skipping pinned-pidfd test");
+            return;
+        };
 
         assert!(
             kill_child_tree(pid, Some(&pidfd)),
@@ -475,6 +695,77 @@ mod tests {
         );
         // The child must have been SIGKILLed, not exited cleanly.
         assert!(!_reap.0.wait().expect("wait on killed child").success());
+    }
+
+    #[test]
+    fn drain_fd_reads_to_eof_without_stop_signal() {
+        // A pipe whose write end is closed immediately: drain_fd must return
+        // everything without needing a stop signal. Deterministic — the data
+        // is buffered and EOF is signalled by drop, so no real time passes
+        // (poll_ms = 0).
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"line1\nline2\n").expect("write");
+        drop(writer); // EOF
+
+        let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+        let got = drain_fd(reader, stop_rx, 0, &mut |_| {});
+        assert_eq!(got, b"line1\nline2\n");
+    }
+
+    #[test]
+    fn drain_fd_captures_output_larger_than_one_chunk() {
+        // More than one 8 KiB drain chunk: the non-blocking inner loop must
+        // consume every buffered byte before EOF without losing any. All the
+        // data is written and the writer closed before the drain starts, so
+        // the test is fully deterministic.
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let payload = vec![b'x'; 20 * 1024];
+        writer.write_all(&payload).expect("write");
+        drop(writer); // EOF
+
+        let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+        let got = drain_fd(reader, stop_rx, 0, &mut |_| {});
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn drain_fd_stops_when_signalled_even_with_open_writer() {
+        // A pipe whose write end stays open simulates a surviving grandchild
+        // holding the shell's stdout pipe after the direct child is reaped.
+        // Signalling the stop channel must end the drain promptly instead of
+        // waiting for the writer to close, and already-buffered data is still
+        // returned. poll_ms = 0 keeps the test free of real-time waits.
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"hello").expect("write");
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        stop_tx.send(()).expect("signal stop");
+
+        let got = drain_fd(reader, stop_rx, 0, &mut |_| {});
+        assert_eq!(
+            got, b"hello",
+            "buffered data must be drained before stopping"
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn forward_complete_lines_splits_lines_and_folds_crlf() {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        forward_complete_lines(b"a\r\nb", &mut pending, &mut |l| lines.push(l));
+        // "a\r\n" is a complete line (CRLF folded to LF); "b" stays pending.
+        assert_eq!(lines, vec![b"a\n".to_vec()]);
+        assert_eq!(pending, b"b");
+
+        forward_complete_lines(b"\nc", &mut pending, &mut |l| lines.push(l));
+        assert_eq!(lines, vec![b"a\n".to_vec(), b"b\n".to_vec()]);
+        assert_eq!(pending, b"c");
+
+        // Final flush at EOF emits the unterminated remainder.
+        if !pending.is_empty() {
+            lines.push(std::mem::take(&mut pending));
+        }
+        assert_eq!(lines, vec![b"a\n".to_vec(), b"b\n".to_vec(), b"c".to_vec()]);
     }
 
     #[test]

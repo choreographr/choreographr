@@ -2033,12 +2033,21 @@ child in its own process group (`setup_child` in `tools/shell_util.rs`, applied
 inside the shared `spawn_with_watchdog` / `spawn_with_streaming` helpers); on
 timeout the watchdog kills the whole group via `killpg(2)`. On Linux the
 child's identity is first pinned with a `pidfd` so a recycled PID can never
-redirect the kill at an unrelated process; on platforms without `pidfd` the
-kill is gated on the child being its group's leader (`getpgid`), with a
-direct-kill fallback otherwise — rather than just killing the direct child.
-This matters for shells that don't `exec` the final command (fish): killing
-only the wrapper would orphan grandchildren like `sleep`, which keep the
-output pipes open and turn a 500ms timeout into a ~10s hang.
+redirect the kill at an unrelated process; on platforms without `pidfd` (or
+when `pidfd_send_signal` fails with a non-ESRCH error such as a seccomp
+policy denying it) the kill is gated on the child being its group's leader
+(`getpgid`), with a direct-kill fallback otherwise — rather than just killing
+the direct child. This matters for shells that don't `exec` the final command
+(fish): killing only the wrapper would orphan grandchildren like `sleep`, which
+keep the output pipes open and turn a 500ms timeout into a ~10s hang.
+
+The stdout/stderr pipes are drained in bounded background threads
+(`drain_fd` / `poll_readable` in `tools/shell_util.rs`): each drain polls in
+100ms slices and is stopped once the direct child is reaped. Without this, a
+surviving grandchild that holds a pipe write end (a backgrounded
+`sleep 10 &`, or a process that raced the killpg sweep) would keep the drain
+thread blocked in `read(2)` past the timeout even though the direct child is
+already gone.
 
 
 | Layer | What's tested | Location |
