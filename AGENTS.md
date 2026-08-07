@@ -50,6 +50,8 @@ In the `choreo-tui` crate specifically, do not use `eprintln!` for diagnostics �
 
 Do not share mutable state between threads. Use message passing (`mpsc` channels) for all cross-thread communication. Shared-state patterns (`Arc<RwLock<…>>`, `Arc<Mutex<…>>`) should be avoided in favor of channel-based designs.
 
+One sanctioned exception: **cooperative cancellation flags** (`Arc<AtomicBool>`, e.g. `ToolContext.cancelled`). A blocking tool call cannot be interrupted by a channel message, so a tiny lock-free flag is used as a best-effort stop hint for work that consults it. Keep such flags single-bit (carry no data), document each use in code, and route all control flow — results, cancellation events, kills, streaming — over channels.
+
 ## Inline Comments
 
 Always write inline comments around new code explaining how it works. Focus on the "why" — the reasoning, intent, and non-obvious details — rather than restating what the code literally does.

@@ -222,10 +222,14 @@ pub(crate) fn recv_sse_event<T>(
         return Err(ProviderError::DeadlineExceeded);
     }
 
-    // Biased selection with cancellation first: a signal that was sent
-    // before this call must win deterministically, even if the reader has
-    // already queued events.  (The cancel sender outlives the worker, so
-    // the arm cannot spuriously fire on disconnect during a live stream.)
+    // Biased selection with cancellation first: a cancel already queued when
+    // this call begins is selected deterministically (the biased fast path
+    // scans arms in order), even if the reader has also queued events; a
+    // cancel that lands mid-block merely *tends* to win over a simultaneous
+    // event, and a lost race just means the event is delivered and the
+    // cancel is observed on the next call.  (The cancel sender outlives the
+    // worker, so the arm cannot spuriously fire on disconnect during a live
+    // stream.)
     match sse.deadline {
         // With a deadline, also wait on an exact timer for the remaining
         // budget — the timer, not a poll interval, bounds the wait.

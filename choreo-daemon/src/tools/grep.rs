@@ -155,7 +155,7 @@ fn regex_mode_hint(pattern: &str, regex: bool, has_results: bool) -> Option<Stri
         return None;
     }
     Some(
-        "Note: pattern matched literally. Set regex:true (the default) to interpret it as a regular expression."
+        "Note: matched literally (regex:false). Re-run with regex:true — the default — to interpret the pattern as a regular expression."
             .to_string(),
     )
 }
@@ -2927,7 +2927,7 @@ mod tests {
             "expected no-match message:\n{result}"
         );
         assert!(
-            !result.contains("Note: pattern matched literally"),
+            !result.contains("Note: matched literally"),
             "expected no hint with regex enabled:\n{result}"
         );
     }

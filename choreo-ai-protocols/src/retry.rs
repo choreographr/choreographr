@@ -202,9 +202,13 @@ pub fn sleep_or_cancel(
         // cancellation wakes this thread the instant it is sent instead of at
         // the next poll tick.  `select_biased!` (cancel arm first) is the
         // event-driven replacement for the old `recv_timeout(delay)` loop:
-        // a cancel that arrives just before the backoff timer expires wins
-        // deterministically (bias for cancel) instead of losing the race to
-        // the timer.
+        // an already-queued cancel is selected deterministically (the biased
+        // fast path scans arms in order), and a cancel that arrives just
+        // before the backoff timer expires is *more likely* to win the race
+        // than it would under an unbiased `select!` (which shuffles the
+        // arms).  Either outcome is correct: a cancel stops the retry loop
+        // here, and a timer expiry leaves the cancel queued for the next
+        // `check_cancelled` call, so it is never silently swallowed.
         crossbeam_channel::select_biased! {
             recv(rx) -> msg => match msg {
                 Ok(()) => return Err(ProviderHttpError::Cancelled),

@@ -83,12 +83,15 @@ fn emit_image(
 /// or a kill signal arrives, so a kill is observed the instant it is sent
 /// instead of at the next poll boundary.  The output arm is listed first and,
 /// when a kill is observed between chunks, the output already queued at that
-/// instant is drained (bounded by `len()`) before the thread stops — output
-/// priority, matching the old recv_timeout semantics.  A continuously-
-/// streaming tool keeps the output arm always-ready, which would starve the
-/// biased-last kill arm, so after every forwarded chunk the thread also
-/// re-checks the kill channel non-blocking: on a busy stream the kill is
-/// honored after one bounded final drain instead of streaming on forever.
+/// instant is drained — bounded by the queue length sampled at kill time —
+/// before the thread stops (output priority, matching the old recv_timeout
+/// semantics; the biased select only makes the output arm *more likely* to
+/// win a simultaneous race, and a chunk is either forwarded or dropped
+/// whole, never partially recorded).  A continuously-streaming tool keeps the
+/// output arm always-ready, which would starve the kill arm's preference, so
+/// after every forwarded chunk the thread also re-checks the kill channel
+/// non-blocking: on a busy stream the kill is honored after one bounded final
+/// drain instead of streaming on forever.
 ///
 /// Returns the spawned `JoinHandle` so tests can deterministically observe
 /// thread exit (no polling); production callers discard it.
@@ -123,16 +126,22 @@ fn spawn_forwarding_thread(
                         // kill channel between chunks (non-blocking): a kill
                         // message OR a dropped kill sender means "stop".
                         // Before stopping, drain the output already queued at
-                        // this instant (bounded by `len()`, so a fast tool
-                        // cannot refill the channel and extend the drain
-                        // forever) — the transcript keeps that produced
-                        // output — then exit.  Chunks the tool produces after
-                        // the kill was observed are dropped.
+                        // this instant — the budget is the queue length
+                        // sampled here, so even a tool that keeps producing
+                        // cannot extend the drain forever: at most
+                        // `drain_budget` chunks are forwarded (the transcript
+                        // keeps that produced output) and then the thread
+                        // exits.  A chunk the tool produces *during* the
+                        // drain may slip in and be forwarded within the
+                        // budget — acceptable, since the total is still
+                        // capped — and everything produced after the drain is
+                        // dropped.
                         if matches!(
                             kill_rx.try_recv(),
                             Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected)
                         ) {
-                            for _ in 0..output_rx.len() {
+                            let drain_budget = output_rx.len();
+                            for _ in 0..drain_budget {
                                 let Ok(data) = output_rx.try_recv() else {
                                     break;
                                 };
@@ -276,6 +285,13 @@ struct CallInfo {
     arguments_json: String,
     invocation_description: String,
     started_at: Instant,
+    /// Collector-side sender of the per-tool kill channel.  Held for the
+    /// whole batch drain and sent to on cancel, so a still-running wait-loop
+    /// stops its forwarder, sets the cooperative `ToolContext.cancelled`
+    /// flag, and delivers a "cancelled" result instead of waiting for the
+    /// tool to finish.  Dropping this sender (the batch drain ended) is
+    /// itself a stop signal to any wait-loop still blocked on the channel.
+    kill_tx: crossbeam_channel::Sender<()>,
 }
 
 /// The subset of dispatched calls whose results were never delivered.
@@ -302,7 +318,16 @@ fn missing_calls<'a>(
 /// never gated by a slower one the model listed before it. The spawned
 /// thread handles all channel wiring, timeouts, and error recording
 /// internally.
-fn spawn_single_tool(args: SpawnToolArgs) {
+///
+/// Returns the collector-side sender of the per-tool *kill* channel.  The
+/// collector keeps one per call and sends to it when the request is
+/// cancelled, so a still-running wait-loop stops its forwarder (streaming
+/// halts promptly), sets the cooperative `ToolContext.cancelled` flag (the
+/// tool can stop early), and delivers a "cancelled" result instead of
+/// waiting for the tool to finish.  Dropping the returned sender is itself
+/// a stop signal — a wait-loop whose kill receiver disconnects selects
+/// immediately — so the sender must live exactly as long as the batch drain.
+fn spawn_single_tool(args: SpawnToolArgs) -> crossbeam_channel::Sender<()> {
     let SpawnToolArgs {
         tool_call,
         timeout,
@@ -325,6 +350,13 @@ fn spawn_single_tool(args: SpawnToolArgs) {
 
     // Kill signal for the forwarding thread — sent when we're done waiting.
     let (kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
+
+    // Kill signal for *this wait-loop* — sent by the collector when the
+    // request is cancelled (a message), or implicitly when it drops the
+    // sender after the batch drain ends (a disconnect).  The wait-loop
+    // selects on it so a cancel stops streaming and flags the tool without
+    // waiting for the tool to finish.
+    let (tool_kill_tx, tool_kill_rx) = crossbeam_channel::unbounded::<()>();
 
     // Image channel — the tool may emit one image during execution.
     let (image_tx, image_rx) = mpsc::channel::<PreparedImage>();
@@ -349,6 +381,13 @@ fn spawn_single_tool(args: SpawnToolArgs) {
     let xc = x_credentials;
     let c = working_dir;
     let tool_ctx = ctx;
+    // Cooperative cancellation flag shared with the tool's context: set when
+    // this wait-loop observes a kill (or the deadline expires), so a tool
+    // that consults `ToolContext.cancelled` can stop early.  This is the one
+    // sanctioned shared-state exception to the repo's channel-only thread-
+    // communication rule (see AGENTS.md): a channel message cannot interrupt
+    // a blocking tool call, so the flag is a best-effort, data-free stop hint.
+    let cancel_flag = Arc::clone(&tool_ctx.cancelled);
     thread::spawn(move || {
         let result = tr.execute_streaming_json(
             &tc,
@@ -366,9 +405,19 @@ fn spawn_single_tool(args: SpawnToolArgs) {
     //
     // Two modes:
     //   Some(dur) — bounded wait with an exact deadline timer.
-    //   None      — unbounded wait; blocks until the tool completes.
+    //   None      — unbounded wait; blocks until the tool completes or a
+    //               kill arrives.
     let deadline = timeout.map(|d| Instant::now() + d);
     thread::spawn(move || {
+        // What woke this wait-loop: the tool's result (delivered through the
+        // exec channel), a collector kill (message or dropped sender), or —
+        // in the bounded mode — the exact deadline timer.
+        enum WaitOutcome {
+            Result(Result<Result<ToolOutput, ToolError>, crossbeam_channel::RecvError>),
+            Kill,
+            Deadline,
+        }
+
         // Dispatch-time instant captured by the caller (not when this thread
         // happened to start), carried on the handle so the collector can log
         // per-tool elapsed independent of batch arrival order.
@@ -379,43 +428,80 @@ fn spawn_single_tool(args: SpawnToolArgs) {
             invocation_description: invocation_description.clone(),
             ..Default::default()
         };
-        let output = match deadline {
-            // No timeout — block indefinitely until the tool finishes.
-            None => match exec_rx.recv() {
+        let outcome = match deadline {
+            // No timeout — block until the tool finishes or the collector
+            // kills this wait-loop.  Result arm first: a tool that finished
+            // in the same instant as the kill still delivers its real result.
+            None => crossbeam_channel::select_biased! {
+                recv(exec_rx) -> msg => WaitOutcome::Result(msg),
+                recv(tool_kill_rx) -> _ => WaitOutcome::Kill,
+            },
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                // Wait for the tool's result, a kill, or an exact timer for
+                // the remaining budget.  Result first: a tool that finished
+                // just before its deadline is not reported as timed out, and
+                // one that finished in the same instant as a kill still
+                // delivers its real result.  A zero `remaining` makes
+                // `after(Duration::ZERO)` fire immediately, so this also
+                // covers the deadline-already-passed case without a separate
+                // pre-check (which could itself miss a result queued in the
+                // same instant).
+                crossbeam_channel::select_biased! {
+                    recv(exec_rx) -> msg => WaitOutcome::Result(msg),
+                    recv(tool_kill_rx) -> _ => WaitOutcome::Kill,
+                    recv(crossbeam_channel::after(remaining)) -> _ => WaitOutcome::Deadline,
+                }
+            }
+        };
+        let output = match outcome {
+            WaitOutcome::Result(msg) => match msg {
                 Ok(Ok(output)) => output,
                 Ok(Err(e)) => exec_error(e.to_string()),
                 Err(_) => exec_error("tool execution thread panicked".to_string()),
             },
-            Some(deadline) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                // Wait for the tool's result OR an exact timer for the
-                // remaining budget.  `select_biased!` (result arm first) makes
-                // the timeout precise and lets a result already queued when
-                // the timer fires win over the deadline, so a tool that
-                // finished just before its deadline is not reported as timed
-                // out.  A zero `remaining` makes `after(Duration::ZERO)` fire
-                // immediately, so this also covers the deadline-already-passed
-                // case without a separate pre-check (which could itself miss a
-                // result queued in the same instant).
-                let received = crossbeam_channel::select_biased! {
-                    recv(exec_rx) -> msg => Some(msg),
-                    recv(crossbeam_channel::after(remaining)) -> _ => None,
-                };
-                match received {
-                    Some(Ok(Ok(output))) => output,
-                    Some(Ok(Err(e))) => exec_error(e.to_string()),
-                    Some(Err(_)) => exec_error("tool execution thread panicked".to_string()),
-                    // The deadline timer fired.  A result that queued in the
-                    // same instant is still a real result — drain it
-                    // (non-blocking) before reporting the timeout, closing the
-                    // finish-vs-deadline race as far as a deadline-based wait
-                    // can.
-                    None => match exec_rx.try_recv() {
-                        Ok(Ok(output)) => output,
-                        Ok(Err(e)) => exec_error(e.to_string()),
-                        Err(_) => exec_error(format!("tool '{}' timed out", tool_call.name)),
-                    },
+            WaitOutcome::Deadline => {
+                // The exact deadline timer fired.  A result that queued in
+                // the same instant is still a real result — drain it
+                // (non-blocking) before reporting the timeout, closing the
+                // finish-vs-deadline race as far as a deadline-based wait
+                // can.  The tool is still running past its budget, so flag
+                // its context to let it stop if it can.
+                cancel_flag.store(true, Ordering::Relaxed);
+                match exec_rx.try_recv() {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(e)) => exec_error(e.to_string()),
+                    Err(_) => exec_error(format!("tool '{}' timed out", tool_call.name)),
                 }
+            }
+            WaitOutcome::Kill => {
+                // The collector killed this wait-loop (or dropped the kill
+                // sender, e.g. the batch drain ended).  Stop the forwarder so
+                // streaming halts promptly, flag the tool so it can stop
+                // early, and deliver a "cancelled" result: the collector
+                // either drains this handle (recording the cancelled outcome
+                // in the transcript) or has already swept the placeholder —
+                // accurate either way.  The tool's *execution thread* keeps
+                // running (Rust threads cannot be interrupted mid-call) but
+                // every channel it would send to — exec, streaming output,
+                // image — has been dropped by this exit, so its late result
+                // is discarded harmlessly.
+                cancel_flag.store(true, Ordering::Relaxed);
+                let _ = kill_tx.send(());
+                let image = image_rx.try_recv().ok();
+                let content = format!("tool '{}' cancelled", tool_call.name);
+                let _ = result_tx.send(ToolHandle {
+                    tool_call,
+                    output: ToolOutput {
+                        content,
+                        is_error: true,
+                        invocation_description: invocation_description.clone(),
+                        ..Default::default()
+                    },
+                    image,
+                    started_at,
+                });
+                return;
             }
         };
 
@@ -433,6 +519,7 @@ fn spawn_single_tool(args: SpawnToolArgs) {
             started_at,
         });
     });
+    tool_kill_tx
 }
 
 /// Resolve the effective reasoning effort for a turn, disabling it if the
@@ -1309,18 +1396,18 @@ pub(crate) fn run_agent_loop(
                         // path) and the CallInfo (panic-synthesis path), so the
                         // collector's per-tool elapsed log is consistent either way.
                         let started_at = Instant::now();
-                        call_infos.push(CallInfo {
-                            call_id: tool_call.id.clone(),
-                            tool_name: tool_call.name.clone(),
-                            arguments_json: tool_call.arguments_json.clone(),
-                            invocation_description: invocation_description.clone(),
-                            started_at,
-                        });
+                        let call_id = tool_call.id.clone();
+                        let tool_name = tool_call.name.clone();
+                        let arguments_json = tool_call.arguments_json.clone();
                         // A call counts as executed only once its result is
                         // actually recorded (`process_tool_handle`): the drain
                         // below can stop on a cancel, so a dispatched but
                         // unfinished call must still be swept as unexecuted.
-                        spawn_single_tool(SpawnToolArgs {
+                        // The spawn returns the collector-side kill sender;
+                        // it is retained in the CallInfo for the whole batch
+                        // drain so a mid-batch cancel can stop every still-
+                        // running wait-loop promptly.
+                        let kill_tx = spawn_single_tool(SpawnToolArgs {
                             tool_call,
                             timeout,
                             request_id,
@@ -1330,9 +1417,17 @@ pub(crate) fn run_agent_loop(
                             x_credentials: None,
                             working_dir: session.config.working_dir.clone(),
                             ctx: tool_ctx.clone(),
-                            invocation_description,
+                            invocation_description: invocation_description.clone(),
                             started_at,
                             result_tx: batch_tx.clone(),
+                        });
+                        call_infos.push(CallInfo {
+                            call_id,
+                            tool_name,
+                            arguments_json,
+                            invocation_description,
+                            started_at,
+                            kill_tx,
                         });
                     }
                     // Drop our own sender: the batch channel disconnects only
@@ -1392,12 +1487,18 @@ pub(crate) fn run_agent_loop(
                         // Block until a tool completes OR the request is
                         // cancelled.  `select_biased!` (cancel arm first) makes
                         // both waits event-driven: a cancel wakes this loop the
-                        // instant it is sent and wins over a simultaneously-
-                        // ready result (bias for cancel), and a quiet batch
-                        // costs nothing (no 200 ms ticks).  The cancel sender
-                        // cannot disconnect while the worker runs (it is
-                        // dropped only on RequestFinished), so a firing cancel
-                        // arm always means "cancel".
+                        // instant it is sent, and a quiet batch costs nothing
+                        // (no 200 ms ticks).  The bias is a preference, not a
+                        // guarantee: an already-queued cancel is selected
+                        // deterministically (the biased fast path scans arms in
+                        // order), while a cancel that lands mid-block only
+                        // *tends* to beat a simultaneously-ready result.  Both
+                        // outcomes are handled correctly — a cancel always
+                        // stops the batch, and any result queued at that
+                        // instant is drained rather than discarded.  The cancel
+                        // sender cannot disconnect while the worker runs (it
+                        // is dropped only on RequestFinished), so a firing
+                        // cancel arm always means "cancel".
                         let (cancelled_now, handle_msg) = crossbeam_channel::select_biased! {
                             recv(cancel_rx) -> _ => (true, None),
                             recv(batch_rx) -> msg => (false, Some(msg)),
@@ -1406,11 +1507,21 @@ pub(crate) fn run_agent_loop(
                             cancel_flag.store(true, Ordering::Relaxed);
                             cancelled = true;
                             // Bias for cancel: stop waiting for the slowest
-                            // tool right now.  But don't discard results that
-                            // already landed in the same instant — drain them
-                            // (non-blocking) so the transcript keeps the real
-                            // output of tools that did complete, and only the
-                            // genuinely-unfinished calls are swept below.
+                            // tool right now.  First, kill every still-running
+                            // wait-loop so its forwarder stops streaming
+                            // promptly, its cooperative
+                            // `ToolContext.cancelled` flag is set, and it
+                            // delivers a "cancelled" result instead of waiting
+                            // for the tool (sends to wait-loops that already
+                            // exited fail silently).  Then don't discard
+                            // results that already landed in the same instant
+                            // — drain them (non-blocking) so the transcript
+                            // keeps the real output of tools that did
+                            // complete, and only the genuinely-unfinished
+                            // calls are swept below.
+                            for info in &call_infos {
+                                let _ = info.kill_tx.send(());
+                            }
                             while let Ok(handle) = batch_rx.try_recv() {
                                 delivered.insert(handle.tool_call.id.clone());
                                 process_tool_handle(handle);
@@ -1659,6 +1770,64 @@ fn record_tool_completion(
     });
 }
 
+/// Wrap a raw tool-execution channel message into the caller-facing
+/// `(ToolOutput, bool)` pair, recording the per-tool execution metric once
+/// for every outcome.
+///
+/// `cancelled` is the sticky-cancel flag to report alongside the output: it is
+/// `true` only when the message was drained *after* a cancel was observed
+/// (the tool's real outcome is recorded, but the request still stops).
+fn tool_result_from_channel(
+    tool_name: &str,
+    exec_start: std::time::Instant,
+    msg: Result<Result<ToolOutput, ToolError>, crossbeam_channel::RecvError>,
+    cancelled: bool,
+) -> (ToolOutput, bool) {
+    match msg {
+        Ok(Ok(output)) => {
+            crate::metrics::record_tool_execution(
+                tool_name,
+                exec_start.elapsed().as_secs_f64(),
+                output.is_error,
+            );
+            (output, cancelled)
+        }
+        Ok(Err(e)) => {
+            crate::metrics::record_tool_execution(
+                tool_name,
+                exec_start.elapsed().as_secs_f64(),
+                true,
+            );
+            (
+                ToolOutput {
+                    content: e.to_string(),
+                    is_error: true,
+                    invocation_description: String::new(),
+                    ..Default::default()
+                },
+                cancelled,
+            )
+        }
+        // The execution thread died without sending a final message.
+        Err(_) => {
+            crate::metrics::record_tool_execution(
+                tool_name,
+                exec_start.elapsed().as_secs_f64(),
+                true,
+            );
+            (
+                ToolOutput {
+                    content: "tool execution thread panicked".to_string(),
+                    is_error: true,
+                    invocation_description: String::new(),
+                    ..Default::default()
+                },
+                cancelled,
+            )
+        }
+    }
+}
+
 #[expect(clippy::too_many_arguments)]
 fn execute_tool_with_timeout(
     tool_call: &ChatToolCall,
@@ -1742,12 +1911,16 @@ fn execute_tool_with_timeout(
 
     // Event-driven wait: `select_biased!` waits on the cancellation channel,
     // the tool's result channel, and an exact timer for the remaining budget
-    // simultaneously — no polling interval, timeouts fire precisely, and a
-    // cancel sent before tool start wins deterministically (cancellation is
-    // the first arm).  Every arm terminates the wait, so no loop is needed; a
-    // zero `remaining` makes the timer fire immediately, covering a deadline
-    // that already passed without a separate pre-check (which could itself
-    // miss a result queued in the same instant).
+    // simultaneously — no polling interval, timeouts fire precisely.  The
+    // cancel arm is listed first because an *already-queued* cancel is
+    // selected deterministically (the biased fast path scans the arms in
+    // order); a cancel that arrives mid-block merely *tends* to beat a
+    // simultaneously-ready result, and both outcomes are handled correctly
+    // below (the request still stops; a completed result is still drained).
+    // Every arm terminates the wait, so no loop is needed; a zero `remaining`
+    // makes the timer fire immediately, covering a deadline that already
+    // passed without a separate pre-check (which could itself miss a result
+    // queued in the same instant).
     let deadline = std::time::Instant::now() + timeout_dur;
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     crossbeam_channel::select_biased! {
@@ -1763,32 +1936,12 @@ fn execute_tool_with_timeout(
             // tool that checks `ToolContext.cancelled` can stop early.
             cancel_flag.store(true, Ordering::Relaxed);
             match result_rx.try_recv() {
-                Ok(Ok(output)) => {
-                    crate::metrics::record_tool_execution(
-                        &tool_call.name,
-                        exec_start.elapsed().as_secs_f64(),
-                        output.is_error,
-                    );
-                    (output, true)
-                }
-                Ok(Err(e)) => {
-                    crate::metrics::record_tool_execution(
-                        &tool_call.name,
-                        exec_start.elapsed().as_secs_f64(),
-                        true,
-                    );
-                    (
-                        ToolOutput {
-                            content: e.to_string(),
-                            is_error: true,
-                            invocation_description: String::new(),
-                            ..Default::default()
-                        },
-                        true,
-                    )
-                }
-                // No result queued — the tool is still running, so
-                // report the cancel itself.
+                // A result queued at the same instant is a real result: wrap
+                // it with the sticky-cancel flag so it is recorded while the
+                // request still stops.
+                Ok(msg) => tool_result_from_channel(&tool_call.name, exec_start, Ok(msg), true),
+                // No result queued — the tool is still running, so report the
+                // cancel itself.
                 Err(_) => {
                     crate::metrics::record_tool_execution(
                         &tool_call.name,
@@ -1807,50 +1960,7 @@ fn execute_tool_with_timeout(
                 }
             }
         }
-        recv(result_rx) -> msg => {
-            match msg {
-                Ok(Ok(output)) => {
-                    crate::metrics::record_tool_execution(
-                        &tool_call.name,
-                        exec_start.elapsed().as_secs_f64(),
-                        output.is_error,
-                    );
-                    (output, false)
-                }
-                Ok(Err(e)) => {
-                    crate::metrics::record_tool_execution(
-                        &tool_call.name,
-                        exec_start.elapsed().as_secs_f64(),
-                        true,
-                    );
-                    (
-                        ToolOutput {
-                            content: e.to_string(),
-                            is_error: true,
-                            invocation_description: String::new(),
-                            ..Default::default()
-                        },
-                        false,
-                    )
-                }
-                Err(_) => {
-                    crate::metrics::record_tool_execution(
-                        &tool_call.name,
-                        exec_start.elapsed().as_secs_f64(),
-                        true,
-                    );
-                    (
-                        ToolOutput {
-                            content: "tool execution thread panicked".to_string(),
-                            is_error: true,
-                            invocation_description: String::new(),
-                            ..Default::default()
-                        },
-                        false,
-                    )
-                }
-            }
-        }
+        recv(result_rx) -> msg => tool_result_from_channel(&tool_call.name, exec_start, msg, false),
         // The exact deadline timer fired.  A result that queued in the same
         // instant is still a real result — drain it (non-blocking) before
         // reporting the timeout, closing the finish-vs-deadline race as far
@@ -1859,30 +1969,7 @@ fn execute_tool_with_timeout(
         recv(crossbeam_channel::after(remaining)) -> _ => {
             cancel_flag.store(true, Ordering::Relaxed);
             match result_rx.try_recv() {
-                Ok(Ok(output)) => {
-                    crate::metrics::record_tool_execution(
-                        &tool_call.name,
-                        exec_start.elapsed().as_secs_f64(),
-                        output.is_error,
-                    );
-                    (output, false)
-                }
-                Ok(Err(e)) => {
-                    crate::metrics::record_tool_execution(
-                        &tool_call.name,
-                        exec_start.elapsed().as_secs_f64(),
-                        true,
-                    );
-                    (
-                        ToolOutput {
-                            content: e.to_string(),
-                            is_error: true,
-                            invocation_description: String::new(),
-                            ..Default::default()
-                        },
-                        false,
-                    )
-                }
+                Ok(msg) => tool_result_from_channel(&tool_call.name, exec_start, Ok(msg), false),
                 Err(_) => {
                     crate::metrics::record_tool_execution(
                         &tool_call.name,
@@ -2945,7 +3032,9 @@ mod tests {
             .unwrap_or_default();
 
         let (result_tx, result_rx) = crossbeam_channel::unbounded::<ToolHandle>();
-        spawn_single_tool(SpawnToolArgs {
+        // Hold the kill sender for the duration of this wait — dropping it
+        // would disconnect the kill channel and stop the wait-loop early.
+        let _kill_tx = spawn_single_tool(SpawnToolArgs {
             tool_call,
             timeout,
             request_id: 1,
@@ -3038,7 +3127,9 @@ mod tests {
         // waits in unit tests).  If a regression made the collector wait in
         // dispatch order, the slow tool would hit its timeout instead and
         // the name assertion below would fail the test rather than hang it.
-        spawn_single_tool(SpawnToolArgs {
+        // The kill senders are held for the drain's lifetime — dropping them
+        // would disconnect the kill channels and stop the wait-loops early.
+        let _slow_kill = spawn_single_tool(SpawnToolArgs {
             tool_call: slow_call,
             timeout: Some(Duration::from_secs(5)),
             request_id: 1,
@@ -3052,7 +3143,7 @@ mod tests {
             started_at: Instant::now(),
             result_tx: batch_tx.clone(),
         });
-        spawn_single_tool(SpawnToolArgs {
+        let _fast_kill = spawn_single_tool(SpawnToolArgs {
             tool_call: fast_call,
             timeout: Some(Duration::from_secs(60)),
             request_id: 1,
@@ -3087,6 +3178,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wait_loop_honors_kill_while_tool_is_still_running() {
+        // A tool that blocks until released; a collector kill must stop the
+        // wait-loop (forwarder + cooperative flag) and deliver a "cancelled"
+        // result immediately, without waiting for the tool to finish — even
+        // with NO timeout, where the wait-loop would otherwise block on the
+        // tool's result channel forever.
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let (ctx, cmd_tx) = spawn_test_ctx();
+        let cancel_flag = Arc::clone(&ctx.cancelled);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(BlockingTestTool {
+            proceed: std::sync::Mutex::new(Some(proceed_rx)),
+        });
+        let registry = registry.build();
+
+        let tool_call = ChatToolCall {
+            id: "call_kill".into(),
+            name: "_test_blocking".into(),
+            arguments_json: "{}".into(),
+            caller: None,
+        };
+
+        let (result_tx, result_rx) = crossbeam_channel::unbounded::<ToolHandle>();
+        let kill_tx = spawn_single_tool(SpawnToolArgs {
+            tool_call,
+            timeout: None, // unbounded — the kill is the only wakeup
+            request_id: 1,
+            session_id: 1,
+            registry,
+            cmd_tx,
+            x_credentials: None,
+            working_dir: None,
+            ctx,
+            invocation_description: String::new(),
+            started_at: Instant::now(),
+            result_tx,
+        });
+
+        // The tool is blocked inside execute_streaming_json; the kill must
+        // reach the wait-loop and produce a cancelled result without the tool
+        // finishing.  Deterministic: `recv` blocks until the cancelled handle
+        // arrives, and the wait-loop sends it only after setting the flag.
+        kill_tx.send(()).expect("send kill");
+
+        let handle = result_rx
+            .recv()
+            .expect("cancelled result must be delivered");
+        assert!(handle.output.is_error, "{}", handle.output.content);
+        assert!(
+            handle.output.content.contains("cancelled"),
+            "{}",
+            handle.output.content
+        );
+        // The cooperative flag must be set so the tool itself can stop early.
+        assert!(
+            cancel_flag.load(Ordering::Relaxed),
+            "cooperative cancel flag must be set"
+        );
+
+        // Release the still-blocked tool so its execution thread exits.
+        drop(proceed_tx);
+    }
+
     // -- missing_calls tests ------------------------------------------------
 
     #[test]
@@ -3104,6 +3260,9 @@ mod tests {
                 arguments_json: "{}".into(),
                 invocation_description: "a".into(),
                 started_at: Instant::now(),
+                // Never sent to — the kill channel is irrelevant to the
+                // missing-call filter under test.
+                kill_tx: crossbeam_channel::unbounded().0,
             },
             CallInfo {
                 call_id: "b".into(),
@@ -3111,6 +3270,7 @@ mod tests {
                 arguments_json: "{}".into(),
                 invocation_description: "b".into(),
                 started_at: Instant::now(),
+                kill_tx: crossbeam_channel::unbounded().0,
             },
             CallInfo {
                 call_id: "c".into(),
@@ -3118,6 +3278,7 @@ mod tests {
                 arguments_json: "{}".into(),
                 invocation_description: "c".into(),
                 started_at: Instant::now(),
+                kill_tx: crossbeam_channel::unbounded().0,
             },
         ];
         let delivered = HashSet::from(["b".to_string()]);
@@ -3135,6 +3296,9 @@ mod tests {
             arguments_json: "{}".into(),
             invocation_description: "a".into(),
             started_at: Instant::now(),
+            // Never sent to — the kill channel is irrelevant to the
+            // missing-call filter under test.
+            kill_tx: crossbeam_channel::unbounded().0,
         }];
         let delivered = HashSet::from(["a".to_string()]);
         assert_eq!(missing_calls(&call_infos, &delivered).count(), 0);

@@ -1288,16 +1288,25 @@ Cancellation during tool execution is fully event-driven: the concurrent collect
 `execute_tool_with_timeout` (serial phase) block on `crossbeam_channel::select_biased!`
 between their result channels, the request's cancel channel, and (where a timeout applies)
 an exact `after(remaining)` timer — there are no `recv_timeout` poll loops, and timeouts
-fire precisely. Every wait that involves cancellation biases the cancel arm first, so
-Escape wins over a simultaneously-ready result (bias for cancel); when a cancel wins the
-race, an already-completed result is still drained (non-blocking) rather than discarded, so
+fire precisely. Every wait that involves cancellation biases the cancel arm first, so a cancel already
+queued when the wait begins is selected deterministically and a cancel that lands mid-block
+is *more likely* to beat a simultaneously-ready result (bias for cancel — a preference,
+not a guarantee, and both outcomes are handled correctly); when a cancel wins the race, an
+already-completed result is still drained (non-blocking) rather than discarded, so
 the tool's real output is recorded while the request still stops (sticky `cancelled` flag).
 A cancel observed by the concurrent collector also stops the batch drain immediately:
-pending handles are drained and the remaining placeholders are swept as
+every still-running wait-loop receives a per-tool kill (its forwarder stops streaming
+promptly and its `ToolContext.cancelled` flag is set so the tool itself can stop early),
+pending handles are drained, and the remaining placeholders are swept as
 `[cancelled — result not recorded]` instead of making the request wait for the slowest tool
 (note that a call dispatched but still running when the cancel lands is swept too — the
 sweep marks everything whose result was not actually recorded; it does not distinguish
-"never started" from "started but unfinished"). Both the per-tool wait-loop threads and the
+"never started" from "started but unfinished"). The tool's *execution thread* cannot be
+interrupted mid-call (Rust threads are not killable) and runs to completion in the
+background, but every channel it would deliver through — exec result, streaming output,
+image — has been dropped by the wait-loop's exit, so its late result is discarded and it
+can no longer affect the transcript; external side effects (file writes, child processes)
+still complete. Both the per-tool wait-loop threads and the
 serial-phase wait drain the result channel before reporting a timeout, so a tool whose
 result was already queued when the deadline fired is not reported as timed out (the
 wait-loops bias their result arm ahead of the deadline timer; the serial wait drains once
@@ -1310,9 +1319,12 @@ kill arm — a busy stream stops after one bounded final drain rather than strea
 forever.
 This removed the last poll loop from the tool execution path — the streaming channel itself
 is a crossbeam channel, so the forwarder blocks until a chunk or kill actually arrives
-rather than waking on a 200 ms interval. The serial phase also shares a
-`ToolContext.cancelled` flag with the running tool, set when the wait observes a cancel or
-the deadline expires, so a tool that consults it can stop early. The per-request cancel
+rather than waking on a 200 ms interval. Both phases share a
+`ToolContext.cancelled` flag with the running tool — the serial wait sets it when it
+observes a cancel or the deadline expires, and the concurrent collector's per-tool kill
+sets it on the wait-loop's behalf — so a tool that consults it can stop early. (This
+lock-free flag is the one sanctioned shared-state exception to the repo's channel-only
+thread-communication rule; see AGENTS.md.) The per-request cancel
 channel is a crossbeam channel created in `sessions.rs`
 (`ActiveRequest.cancel_tx`) and threaded through `run_agent_loop` → `ChatTurnRequest` →
 retry/stream, so every wait (provider SSE, retry backoff, serial tool, concurrent

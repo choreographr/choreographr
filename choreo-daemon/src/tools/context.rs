@@ -30,6 +30,12 @@ pub struct ToolContext {
     /// Cancellation flag: set to `true` when the parent session is cancelled.
     /// Tools that block indefinitely (e.g. `spawn_subsession`) should poll this
     /// and abort when it becomes `true`.
+    ///
+    /// This is the one sanctioned shared-mutable-state exception to the repo's
+    /// channel-only thread-communication rule (see AGENTS.md): a channel
+    /// message cannot interrupt a blocking tool call, so the flag is a
+    /// best-effort, data-free stop hint. All control flow — results,
+    /// cancellation events, kills, streaming — still travels over channels.
     pub cancelled: Arc<AtomicBool>,
     /// Account name used by the parent session (inherited by sub-sessions so
     /// they can resolve the provider for model inference).
