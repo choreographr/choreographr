@@ -10,6 +10,7 @@ use choreo_proto::{
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::Line;
 use tui_prompts::State;
 
@@ -846,6 +847,65 @@ fn is_on_last_visual_line_returns_false_on_first_line() {
     buf.text = "hello\nworld".to_string();
     buf.cursor = 2;
     assert!(!buf.is_on_last_visual_line(80));
+}
+
+// ── byte_offset_at_click (mouse click → cursor) ─────────────
+
+#[test]
+fn byte_offset_at_click_single_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello".to_string();
+    assert_eq!(buf.byte_offset_at_click(80, 0, 0), 0);
+    assert_eq!(buf.byte_offset_at_click(80, 0, 2), 2);
+    assert_eq!(buf.byte_offset_at_click(80, 0, 5), 5);
+    // Past the right edge of the line clamps to the line end.
+    assert_eq!(buf.byte_offset_at_click(80, 0, 100), 5);
+}
+
+#[test]
+fn byte_offset_at_click_multiline_text() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc\ndef".to_string();
+    assert_eq!(buf.byte_offset_at_click(80, 0, 2), 2);
+    assert_eq!(buf.byte_offset_at_click(80, 1, 1), 5); // 'e' in "def" → byte 4+1
+    assert_eq!(buf.byte_offset_at_click(80, 1, 3), 7); // end of "def"
+}
+
+#[test]
+fn byte_offset_at_click_wrapped_lines() {
+    let mut buf = InputBuffer::new();
+    buf.text = "aaa bbb ccc ddd".to_string();
+    // max_width 7 wraps as: line 0 = "aaa bbb" (bytes 0..7), line 1 = "ccc ddd" (bytes 8..15)
+    assert_eq!(buf.byte_offset_at_click(7, 0, 4), 4); // after "aaa " → the space
+    assert_eq!(buf.byte_offset_at_click(7, 1, 3), 11); // after "ccc" → the space
+    assert_eq!(buf.byte_offset_at_click(7, 1, 7), 15); // end of line 1
+}
+
+#[test]
+fn byte_offset_at_click_below_last_line_goes_to_end() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc".to_string();
+    // Row 5 is past the single visual line → cursor at end of buffer.
+    assert_eq!(buf.byte_offset_at_click(80, 5, 0), 3);
+}
+
+#[test]
+fn byte_offset_at_click_uses_scroll_offset() {
+    let mut buf = InputBuffer::new();
+    buf.text = "aaa bbb ccc ddd".to_string();
+    buf.scroll_offset = 1;
+    // Content row 0 now displays visual line 1 ("ccc ddd", bytes 8..15).
+    assert_eq!(buf.byte_offset_at_click(7, 0, 0), 8);
+}
+
+#[test]
+fn byte_offset_at_click_is_grapheme_aware() {
+    let mut buf = InputBuffer::new();
+    buf.text = "a😀b".to_string();
+    // 😀 is 4 bytes wide; clicking at display column 1 places the cursor
+    // between 'a' and the emoji (byte 1), not inside the emoji's bytes.
+    assert_eq!(buf.byte_offset_at_click(80, 0, 1), 1);
+    assert_eq!(buf.byte_offset_at_click(80, 0, 3), 5); // after the emoji, before 'b'
 }
 
 #[test]
@@ -2439,6 +2499,118 @@ fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
     );
 }
 
+// ── Mouse click positions the input cursor ───────────────────
+
+/// Send a left-click at terminal (column, row) through the event pipeline.
+fn click_input(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>, column: u16, row: u16) {
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        app,
+        tx,
+    )
+    .expect("handle mouse click");
+}
+
+#[test]
+fn mouse_click_in_input_box_positions_cursor() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 24));
+    app.input.text = "hello".to_string();
+    app.input.cursor = 0;
+    app.update_viewport_from_terminal_size();
+
+    // 80x24, no status/error, help shown: the input box occupies rows 20..23
+    // with content on row 21, and content starts at column INPUT_PAD (2).
+    // Column 4 is therefore content column 2 → cursor between 'h' and 'e'.
+    click_input(&mut app, &tx, 4, 21);
+    assert_eq!(app.input.cursor, 2);
+}
+
+#[test]
+fn mouse_click_in_input_box_left_padding_clamps_to_start() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 24));
+    app.input.text = "hello".to_string();
+    app.input.cursor = 4;
+    app.update_viewport_from_terminal_size();
+
+    // Column 1 is inside the left padding (before INPUT_PAD=2).
+    click_input(&mut app, &tx, 1, 21);
+    assert_eq!(app.input.cursor, 0);
+}
+
+#[test]
+fn mouse_click_in_input_box_past_line_end_clamps_to_end() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 24));
+    app.input.text = "hello".to_string();
+    app.input.cursor = 0;
+    app.update_viewport_from_terminal_size();
+
+    // Column 79 is well past the text's right edge → cursor at end.
+    click_input(&mut app, &tx, 79, 21);
+    assert_eq!(app.input.cursor, 5);
+}
+
+#[test]
+fn mouse_click_on_input_box_border_does_not_move_cursor() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 24));
+    app.input.text = "hello".to_string();
+    app.input.cursor = 1;
+    app.update_viewport_from_terminal_size();
+
+    // Row 20 is the top border, row 22 the bottom border — neither should
+    // reposition the cursor.
+    click_input(&mut app, &tx, 4, 20);
+    assert_eq!(app.input.cursor, 1);
+    click_input(&mut app, &tx, 4, 22);
+    assert_eq!(app.input.cursor, 1);
+}
+
+#[test]
+fn mouse_click_in_input_box_second_line_of_multiline_text() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 24));
+    app.input.text = "abc\ndef".to_string();
+    app.input.cursor = 0;
+    app.update_viewport_from_terminal_size();
+
+    // Two content lines → box occupies rows 19..23 (content rows 20, 21).
+    click_input(&mut app, &tx, 3, 20); // content row 0, col 1 → 'b' in "abc"
+    assert_eq!(app.input.cursor, 1);
+    click_input(&mut app, &tx, 3, 21); // content row 1, col 1 → 'e' in "def"
+    assert_eq!(app.input.cursor, 5);
+}
+
+#[test]
+fn mouse_click_in_input_box_wrapped_line() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 24));
+    // Two words totalling 101 display columns: at inner width 76 this wraps
+    // as line 0 = 76 'a's (bytes 0..76), line 1 = 24 'b's (bytes 77..101).
+    app.input.text = "a".repeat(76) + " " + &"b".repeat(24);
+    app.input.cursor = 0;
+    app.update_viewport_from_terminal_size();
+
+    // Two content lines → box occupies rows 19..23 (content rows 20, 21).
+    click_input(&mut app, &tx, 30, 20); // visual line 0, content col 28
+    assert_eq!(app.input.cursor, 28);
+    click_input(&mut app, &tx, 10, 21); // visual line 1, content col 8
+    assert_eq!(app.input.cursor, 77 + 8);
+}
+
 // ── AI Providers new-account wizard (2-phase) ─────────────
 
 fn setup_providers_new_account(app: &mut App) {
@@ -3480,6 +3652,73 @@ fn input_bar_height_uses_renderer_inner_width() {
     app.input.text = "hello world".to_string();
     app.input.generation += 1;
     assert_eq!(app.input_bar_content_lines(80), 1);
+}
+
+#[test]
+fn input_box_rect_sits_directly_above_status_bar() {
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 24));
+    app.input.text = "hello".to_string();
+    app.input.generation += 1;
+
+    let r = app.input_box_rect(80, 24);
+    assert_eq!(r.x, 0);
+    assert_eq!(r.width, 80);
+    assert_eq!(r.height, 3); // 1 content line + 2 borders
+    assert_eq!(
+        r.y,
+        24 - r.height - 1,
+        "box sits directly above the status bar"
+    );
+}
+
+#[test]
+fn input_box_rect_unaffected_by_status_and_help_rows() {
+    // The input box is anchored to the status bar at the bottom of the
+    // screen; a status message or the help overlay above it must not shift
+    // its position (only the history area shrinks).
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 30));
+    app.input.text = "hello".to_string();
+    app.input.generation += 1;
+    app.status = Some("some transient status".to_string());
+
+    let r = app.input_box_rect(80, 30);
+    assert_eq!(r.height, 3);
+    assert_eq!(r.y, 30 - r.height - 1);
+    assert!(app.status_error_height(80) > 0, "status must be visible");
+}
+
+#[test]
+fn input_box_rect_matches_renderer_layout() {
+    // Replicate render_chat's layout and assert the input chunk it produces
+    // equals input_box_rect, so mouse hit-testing and rendering can never
+    // drift apart.
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 30));
+    app.input.text = "a".repeat(76) + " b"; // wraps to 2 lines at width 76
+    app.input.generation += 1;
+    app.update_viewport_from_terminal_size();
+
+    let status_error_height = app.status_error_height(80);
+    let help_height = if app.show_ctrl_help { 2u16 } else { 0u16 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(status_error_height),
+            Constraint::Length(help_height),
+            Constraint::Length(app.input_bar_height(80)),
+            Constraint::Length(STATUS_BAR_HEIGHT),
+        ])
+        .split(Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 30,
+        });
+
+    assert_eq!(app.input_box_rect(80, 30), chunks[3]);
 }
 
 #[test]

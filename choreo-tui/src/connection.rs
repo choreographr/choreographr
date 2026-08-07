@@ -1,8 +1,8 @@
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    AIProvidersView, App, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent,
-    find_turn_at_row, input_inner_width,
+    AIProvidersView, App, INPUT_PAD, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView,
+    UiEvent, find_turn_at_row, input_inner_width,
 };
 use choreo_client_core::{
     ClientError, ConnectionMode, broken_pipe, build_add_credential_message,
@@ -1239,6 +1239,43 @@ fn handle_chat_event(
                     }
                 }
                 _ => {}
+            }
+        }
+        // Left-click inside the command input box repositions the text cursor.
+        // The box rect is computed with the same layout math as the renderer
+        // (`App::input_box_rect`), so a click lands on exactly the cell that
+        // was drawn.  Clicks on the box's top/bottom borders are ignored;
+        // clicks in the left/right padding clamp to the first/last column of
+        // the line.  Scrollbar and history-box clicks are handled by the arms
+        // above, whose regions never overlap this box.
+        Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+            if let Some((term_w, term_h)) = app.last_terminal_size {
+                let box_rect = app.input_box_rect(term_w, term_h);
+                let inner_width = input_inner_width(term_w);
+                // Row must fall in the content area, strictly between the two
+                // borders; the column may be anywhere in the box width.
+                if mouse.row >= box_rect.y.saturating_add(1)
+                    && mouse.row < box_rect.y.saturating_add(box_rect.height).saturating_sub(1)
+                    && mouse.column < box_rect.x.saturating_add(box_rect.width)
+                {
+                    let content_row = (mouse.row - box_rect.y - 1) as usize;
+                    // Subtract the left padding, clamping into [0, inner_width]
+                    // so clicks in the padding land at the line start/end.
+                    let content_col = mouse
+                        .column
+                        .saturating_sub(box_rect.x.saturating_add(INPUT_PAD))
+                        .min(inner_width as u16) as usize;
+                    app.input.cursor =
+                        app.input
+                            .byte_offset_at_click(inner_width, content_row, content_col);
+                    app.ensure_input_cursor_visible();
+                    tracing::debug!(
+                        cursor = app.input.cursor,
+                        row = content_row,
+                        col = content_col,
+                        "[choreo-tui] mouse click positioned input cursor"
+                    );
+                }
             }
         }
         Event::Mouse(_) => {}

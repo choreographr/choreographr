@@ -171,14 +171,18 @@ fn render_fullscreen_image(
 fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let status_error_height = app.status_error_height(frame.area().width);
     let help_height = if app.show_ctrl_help { 2u16 } else { 0u16 };
-    let input_height = app.input_bar_height(frame.area().width);
+    // Compute the input box's rect via the shared layout helper so that
+    // rendering and mouse hit-testing (connection.rs click-to-position)
+    // can never drift apart.  The box always sits directly above the status
+    // bar; its height is derived from the wrapped input content.
+    let input_area = app.input_box_rect(frame.area().width, frame.area().height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(status_error_height),
             Constraint::Length(help_height),
-            Constraint::Length(input_height),
+            Constraint::Length(input_area.height),
             Constraint::Length(STATUS_BAR_HEIGHT),
         ])
         .split(frame.area());
@@ -258,8 +262,8 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     // The box draws no left/right borders, so padding is the only loss.
     // This must match input_inner_width() used by the height estimation
     // (input_bar_content_lines) or wrapped lines won't grow the box.
-    let inner_width = input_inner_width(chunks[3].width);
-    let visible_height = (chunks[3].height.saturating_sub(2)) as usize;
+    let inner_width = input_inner_width(input_area.width);
+    let visible_height = (input_area.height.saturating_sub(2)) as usize;
 
     // Compute cursor position first (populates the lines cache) so we
     // can then borrow separate fields of app.input for the cached lines.
@@ -298,14 +302,14 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             .borders(Borders::TOP | Borders::BOTTOM)
             .padding(Padding::new(INPUT_PAD, INPUT_PAD, 0, 0)),
     );
-    frame.render_widget(input, chunks[3]);
+    frame.render_widget(input, input_area);
     // Clamp to visible area so the cursor is always inside the box,
     // even when scroll_offset hasn't been adjusted yet (e.g. after
     // loading a long history entry that ends at scroll_offset = 0).
     let max_display_row = (visible_count as u16).saturating_sub(1);
     let display_vrow = vrow.saturating_sub(offset as u16).min(max_display_row);
-    let cursor_x = chunks[3].x.saturating_add(INPUT_PAD).saturating_add(vcol);
-    let cursor_y = chunks[3].y.saturating_add(1).saturating_add(display_vrow);
+    let cursor_x = input_area.x.saturating_add(INPUT_PAD).saturating_add(vcol);
+    let cursor_y = input_area.y.saturating_add(1).saturating_add(display_vrow);
     frame.set_cursor_position((cursor_x, cursor_y));
 
     // ── Status bar (single line) ───────────────────────────────

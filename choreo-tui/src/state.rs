@@ -1771,6 +1771,42 @@ impl InputBuffer {
 
         self.scroll_offset = self.scroll_offset.min(max_scroll);
     }
+
+    /// Map a mouse click at content `(row, col)` to a byte offset in the text.
+    ///
+    /// Coordinates are relative to the input box's text area (0-indexed),
+    /// *excluding* the box borders and side padding: `row` is the visual line
+    /// within the currently visible window (so `scroll_offset` is added to it)
+    /// and `col` is the display-width column.  Clicks below the last text line
+    /// resolve to the end of the buffer; clicks past the right edge of a line
+    /// resolve to that line's end.
+    pub(crate) fn byte_offset_at_click(
+        &mut self,
+        max_width: usize,
+        row: usize,
+        col: usize,
+    ) -> usize {
+        if max_width < 1 {
+            return 0;
+        }
+        let lines = cached_visual_lines(
+            &self.text,
+            max_width,
+            self.generation,
+            &mut self.lines_cache,
+        );
+        let visual_idx = self.scroll_offset.saturating_add(row);
+        match lines.get(visual_idx) {
+            Some(vl) => {
+                let line_text = &self.text[vl.start_byte..vl.end_byte];
+                let target_col = col.min(vl.display_width);
+                vl.start_byte + byte_offset_at_column(line_text, target_col)
+            }
+            // The click landed below the last visual line (e.g. after a resize
+            // shrank the box); the cursor goes to the very end of the text.
+            None => self.text.len(),
+        }
+    }
 }
 
 /// Return cached visual lines for `max_width`, recomputing only when
@@ -2076,6 +2112,24 @@ impl App {
     /// Total height of the input bar (content + borders).
     pub(crate) fn input_bar_height(&mut self, term_width: u16) -> u16 {
         self.input_bar_content_lines(term_width) + 2
+    }
+
+    /// Rectangle (terminal coordinates) occupied by the command input box on
+    /// the Chat page, including its top/bottom borders.
+    ///
+    /// Must stay in sync with `render_chat`'s layout so mouse hit-testing
+    /// (clicking to position the cursor) agrees with what is drawn.  The input
+    /// box always sits directly above the status bar, so its top edge is
+    /// `term_height - input_bar_height - STATUS_BAR_HEIGHT` regardless of how
+    /// tall the status/error and help rows above it are.
+    pub(crate) fn input_box_rect(&mut self, term_width: u16, term_height: u16) -> Rect {
+        let input_height = self.input_bar_height(term_width);
+        Rect {
+            x: 0,
+            y: term_height.saturating_sub(input_height.saturating_add(STATUS_BAR_HEIGHT)),
+            width: term_width,
+            height: input_height,
+        }
     }
 
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
