@@ -7,7 +7,9 @@ mod sse;
 mod tests;
 pub use crate::shared::MaxTokensField;
 use crate::types::{ChatTurnResult, StreamEvent};
-use tracing::warn;
+use tracing::{debug, warn};
+
+use choreo_proto::ReasoningArtifact;
 
 pub(crate) use config::endpoint_url;
 pub use config::{ServiceConfig, completion, validate_and_list_models};
@@ -95,21 +97,78 @@ pub struct AssistantToolFunction {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ChatRequestMessage {
     pub role: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<AssistantToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_text: Option<String>,
+    /// Opaque reasoning round-trip artifact captured by the producing adapter
+    /// at parse time (see `ReasoningArtifact`). Never serialized as a field of
+    /// its own — each adapter re-emits it in ITS OWN wire format: OpenAI chat
+    /// writes it as `reasoning_content` on assistant messages (see the manual
+    /// `Serialize` impl below), Responses pushes the items into `input`,
+    /// and the Anthropic/Google builders interpret their own variants.
+    pub reasoning_artifact: Option<ReasoningArtifact>,
+}
+
+impl Serialize for ChatRequestMessage {
+    /// Manual impl: the wire shape is byte-identical to the derived one
+    /// (role, content, tool_call_id, tool_calls, reasoning_content,
+    /// reasoning, reasoning_text — `None` fields omitted) EXCEPT that an
+    /// assistant message carrying a `ChatReasoning` artifact re-emits it as
+    /// `reasoning_content`, decoded from the captured bytes. The artifact
+    /// field itself never appears on the wire. DeepSeek/Kimi reject a
+    /// tool-loop turn whose assistant message drops `reasoning_content`, so
+    /// the round-trip payload must survive to the next request.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error as _, SerializeStruct};
+
+        // An explicit `reasoning_content` wins when the daemon populated it
+        // directly; the artifact is the fallback so a message built with only
+        // the opaque payload still round-trips. Only assistant-role messages
+        // may carry provider reasoning — user/tool/system messages never had
+        // any, so the artifact is dropped for them.
+        let mut reasoning_content = self.reasoning_content.clone();
+        if reasoning_content.is_none()
+            && self.role == "assistant"
+            && let Some(ReasoningArtifact::ChatReasoning(bytes)) = &self.reasoning_artifact
+        {
+            let text = std::str::from_utf8(bytes).map_err(|e| {
+                S::Error::custom(format!("chat reasoning artifact is not valid UTF-8: {e}"))
+            })?;
+            debug!(
+                payload_bytes = bytes.len(),
+                "re-emitting chat reasoning_content from artifact"
+            );
+            reasoning_content = Some(text.to_string());
+        }
+
+        let mut msg = serializer.serialize_struct("ChatRequestMessage", 7)?;
+        msg.serialize_field("role", &self.role)?;
+        if let Some(content) = &self.content {
+            msg.serialize_field("content", content)?;
+        }
+        if let Some(tool_call_id) = &self.tool_call_id {
+            msg.serialize_field("tool_call_id", tool_call_id)?;
+        }
+        if let Some(tool_calls) = &self.tool_calls {
+            msg.serialize_field("tool_calls", tool_calls)?;
+        }
+        if let Some(rc) = &reasoning_content {
+            msg.serialize_field("reasoning_content", rc)?;
+        }
+        if let Some(reasoning) = &self.reasoning {
+            msg.serialize_field("reasoning", reasoning)?;
+        }
+        if let Some(reasoning_text) = &self.reasoning_text {
+            msg.serialize_field("reasoning_text", reasoning_text)?;
+        }
+        msg.end()
+    }
 }
 
 impl ChatRequestMessage {
@@ -122,6 +181,7 @@ impl ChatRequestMessage {
             reasoning_content: None,
             reasoning: None,
             reasoning_text: None,
+            reasoning_artifact: None,
         }
     }
 }
@@ -392,31 +452,65 @@ pub(crate) fn reasoning_effort_api_value(slug: &str) -> Option<&str> {
     if slug == "off" { None } else { Some(slug) }
 }
 
+/// Serialize a Responses input item to its wire JSON value. Kept as a tiny
+/// helper because the Responses adapter owns the item type but the conversion
+/// happens here, in the shared messages→input builder.
+fn responses_input_item_value(
+    item: responses::ResponsesInputItem,
+) -> Result<serde_json::Value, OpenAiError> {
+    serde_json::to_value(&item).map_err(|e| OpenAiError::Io(io::Error::other(e)))
+}
+
 /// Convert ChatRequestMessage slice to Responses API input format.
 /// System messages go into `input` as `{role: "system"}` items (not the
 /// `instructions` field); the `instructions` field is a separate top-level
 /// parameter set via explicit provider configuration.
+///
+/// Assistant messages additionally re-emit the opaque reasoning items from
+/// the round-trip artifact (if any) directly into `input`, BEFORE the message
+/// content item — mirroring the provider's output ordering where a reasoning
+/// item precedes its message. `reasoning_content` is never emitted here:
+/// that field is chat-completions-only and invalid on Responses messages.
 pub(crate) fn messages_to_responses_input(
     messages: &[ChatRequestMessage],
-) -> Vec<responses::ResponsesInputItem> {
-    let mut items = Vec::new();
+) -> Result<Vec<serde_json::Value>, OpenAiError> {
+    let mut items: Vec<serde_json::Value> = Vec::new();
 
     for msg in messages {
         match msg.role {
             "system" => {
                 if let Some(ref content) = msg.content {
-                    items.push(responses::ResponsesInputItem::Message {
-                        role: "system".to_string(),
-                        content: content.clone(),
-                    });
+                    items.push(responses_input_item_value(
+                        responses::ResponsesInputItem::Message {
+                            role: "system".to_string(),
+                            content: content.clone(),
+                        },
+                    )?);
                 }
             }
             "user" | "assistant" => {
+                // Assistant turns replay their opaque reasoning items (type
+                // tag, id, summary, encrypted_content) verbatim, placed ahead
+                // of the message content exactly as the provider emitted them
+                // in the original output array.
+                if msg.role == "assistant"
+                    && let Some(ReasoningArtifact::ResponsesItems(bytes)) = &msg.reasoning_artifact
+                {
+                    let reasoning_items: Vec<serde_json::Value> = serde_json::from_slice(bytes)
+                        .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
+                    debug!(
+                        item_count = reasoning_items.len(),
+                        "re-emitting responses reasoning items from artifact"
+                    );
+                    items.extend(reasoning_items);
+                }
                 if let Some(ref content) = msg.content {
-                    items.push(responses::ResponsesInputItem::Message {
-                        role: msg.role.to_string(),
-                        content: content.clone(),
-                    });
+                    items.push(responses_input_item_value(
+                        responses::ResponsesInputItem::Message {
+                            role: msg.role.to_string(),
+                            content: content.clone(),
+                        },
+                    )?);
                 }
             }
             "tool" => {
@@ -424,15 +518,17 @@ pub(crate) fn messages_to_responses_input(
                 if let Some(ref call_id) = msg.tool_call_id
                     && let Some(ref content) = msg.content
                 {
-                    items.push(responses::ResponsesInputItem::FunctionCallOutput {
-                        call_id: call_id.clone(),
-                        output: content.clone(),
-                        caller: None,
-                    });
+                    items.push(responses_input_item_value(
+                        responses::ResponsesInputItem::FunctionCallOutput {
+                            call_id: call_id.clone(),
+                            output: content.clone(),
+                            caller: None,
+                        },
+                    )?);
                 }
             }
             _ => {
-                tracing::warn!(
+                warn!(
                     "unexpected message role in messages_to_responses_input: {}",
                     msg.role
                 );
@@ -440,9 +536,9 @@ pub(crate) fn messages_to_responses_input(
         }
     }
 
-    tracing::debug!("messages_to_responses_input: {} items", items.len());
+    debug!("messages_to_responses_input: {} items", items.len());
 
-    items
+    Ok(items)
 }
 
 /// Filter tool calls whose `arguments_json` is not valid JSON (e.g. truncated

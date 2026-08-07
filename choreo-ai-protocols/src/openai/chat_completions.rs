@@ -1331,4 +1331,79 @@ mod tests {
             other => panic!("expected FinalText, got {other:?}"),
         }
     }
+
+    // -- reasoning artifact re-emission (phase 4a) -------------------------
+
+    #[test]
+    fn chat_request_message_reemits_chat_reasoning_artifact() {
+        // An assistant message carrying the opaque ChatReasoning artifact must
+        // re-emit it as `reasoning_content` on the wire (DeepSeek/Kimi reject
+        // a tool-loop turn that drops it).
+        let msg = ChatRequestMessage {
+            role: "assistant",
+            content: Some("answer".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_text: None,
+            reasoning_artifact: Some(ReasoningArtifact::ChatReasoning(
+                b"Let me think step-by-step".to_vec(),
+            )),
+        };
+        let body = serde_json::to_value(&msg).unwrap();
+        assert_eq!(body["reasoning_content"], "Let me think step-by-step");
+        // The artifact field itself never appears on the wire.
+        assert!(body.get("reasoning_artifact").is_none());
+    }
+
+    #[test]
+    fn chat_request_message_without_artifact_omits_reasoning_content() {
+        // Control: no artifact → no `reasoning_content` on the wire.
+        let msg = ChatRequestMessage::simple("assistant", "plain".into());
+        let body = serde_json::to_value(&msg).unwrap();
+        assert!(body.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn chat_request_message_non_assistant_role_drops_artifact() {
+        // The artifact is assistant-only: a user message must never carry
+        // `reasoning_content`, even if an artifact were attached.
+        let msg = ChatRequestMessage {
+            role: "user",
+            content: Some("hi".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_text: None,
+            reasoning_artifact: Some(ReasoningArtifact::ChatReasoning(
+                b"should not leak".to_vec(),
+            )),
+        };
+        let body = serde_json::to_value(&msg).unwrap();
+        assert!(body.get("reasoning_content").is_none());
+        assert!(body.get("reasoning_artifact").is_none());
+    }
+
+    #[test]
+    fn chat_request_message_wrong_artifact_variant_does_not_leak() {
+        // A non-ChatReasoning artifact is foreign to this adapter — it must
+        // not be misinterpreted as chat reasoning.
+        let msg = ChatRequestMessage {
+            role: "assistant",
+            content: Some("answer".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_text: None,
+            reasoning_artifact: Some(ReasoningArtifact::GoogleSignatures(
+                b"encrypted-sig".to_vec(),
+            )),
+        };
+        let body = serde_json::to_value(&msg).unwrap();
+        assert!(body.get("reasoning_content").is_none());
+        assert!(body.get("reasoning_artifact").is_none());
+    }
 }

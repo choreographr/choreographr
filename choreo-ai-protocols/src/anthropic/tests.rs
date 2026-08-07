@@ -439,7 +439,7 @@ fn config_context_window_for_model_resolves_per_model() {
 #[test]
 fn build_message_payloads_simple() {
     let msgs = vec![ChatRequestMessage::simple("user", "Hello".to_string())];
-    let (payloads, system) = build_message_payloads(&msgs, &[]);
+    let (payloads, system) = build_message_payloads(&msgs, &[], true).unwrap();
     assert!(system.is_none());
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].role, "user");
@@ -502,8 +502,128 @@ fn build_message_payloads_with_system() {
         ChatRequestMessage::simple("system", "You are a helpful assistant.".to_string()),
         ChatRequestMessage::simple("user", "Hi!".to_string()),
     ];
-    let (payloads, system) = build_message_payloads(&msgs, &[]);
+    let (payloads, system) = build_message_payloads(&msgs, &[], true).unwrap();
     assert_eq!(system.as_deref(), Some("You are a helpful assistant."));
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].role, "user");
+}
+
+// ── reasoning artifact re-emission (phase 4a) ───────────────────────────
+
+#[test]
+fn build_message_payloads_reemits_thinking_blocks_verbatim() {
+    use crate::openai::{AssistantToolCall, AssistantToolFunction};
+    use choreo_proto::ReasoningArtifact;
+
+    // A thinking block + a redacted_thinking block exactly as captured by the
+    // non-streaming / streaming paths (signature + redacted data intact).
+    let msgs = vec![ChatRequestMessage {
+        role: "assistant",
+        content: Some("Here is the answer".to_string()),
+        tool_call_id: None,
+        tool_calls: Some(vec![AssistantToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: AssistantToolFunction {
+                name: "get_weather".to_string(),
+                arguments: r#"{"city":"London"}"#.to_string(),
+            },
+        }]),
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+        reasoning_artifact: Some(ReasoningArtifact::AnthropicThinking(
+            br#"[{"type":"thinking","thinking":"Let me analyze.","signature":"sig_abc"},{"type":"redacted_thinking","data":"eJxT_opaque"}]"#
+                .to_vec(),
+        )),
+    }];
+    let (payloads, system) = build_message_payloads(&msgs, &[], true).unwrap();
+    assert!(system.is_none());
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].role, "assistant");
+
+    // Serialize and inspect the content array: blocks are replayed verbatim,
+    // in original order, ahead of text/tool_use (thinking → redacted_thinking
+    // → text → tool_use). Value equality is key-order-insensitive, so the
+    // object content (not byte layout) is what's pinned here.
+    let blocks = serde_json::to_value(&payloads[0].content).unwrap();
+    let blocks = blocks.as_array().unwrap();
+    assert_eq!(blocks.len(), 4);
+    assert_eq!(
+        blocks[0],
+        json!({"type": "thinking", "thinking": "Let me analyze.", "signature": "sig_abc"})
+    );
+    assert_eq!(
+        blocks[1],
+        json!({"type": "redacted_thinking", "data": "eJxT_opaque"})
+    );
+    assert_eq!(
+        blocks[2],
+        json!({"type": "text", "text": "Here is the answer"})
+    );
+    assert_eq!(
+        blocks[3],
+        json!({"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "London"}})
+    );
+}
+
+#[test]
+fn build_message_payloads_drops_thinking_blocks_when_thinking_disabled() {
+    use choreo_proto::ReasoningArtifact;
+
+    // Same artifact, but the request has thinking OFF: Anthropic rejects
+    // thinking blocks sent without a matching thinking config, so they must
+    // be dropped entirely (goose's `!thinking_disabled` gate).
+    let msgs = vec![ChatRequestMessage {
+        role: "assistant",
+        content: Some("answer".to_string()),
+        tool_call_id: None,
+        tool_calls: None,
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+        reasoning_artifact: Some(ReasoningArtifact::AnthropicThinking(
+            br#"[{"type":"thinking","thinking":"secret","signature":"sig_1"}]"#.to_vec(),
+        )),
+    }];
+    let (payloads, _) = build_message_payloads(&msgs, &[], false).unwrap();
+    let blocks = serde_json::to_value(&payloads[0].content).unwrap();
+    let blocks = blocks.as_array().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0], json!({"type": "text", "text": "answer"}));
+}
+
+#[test]
+fn build_message_payloads_no_artifact_no_thinking_blocks() {
+    // Control: no artifact → the assistant content has no thinking blocks
+    // even when thinking is enabled.
+    let msgs = vec![ChatRequestMessage::simple("assistant", "plain".to_string())];
+    let (payloads, _) = build_message_payloads(&msgs, &[], true).unwrap();
+    let blocks = serde_json::to_value(&payloads[0].content).unwrap();
+    let blocks = blocks.as_array().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0], json!({"type": "text", "text": "plain"}));
+}
+
+#[test]
+fn build_message_payloads_foreign_artifact_variant_is_dropped() {
+    use choreo_proto::ReasoningArtifact;
+
+    // A non-Anthropic artifact is foreign — the payload stays opaque and
+    // must not be misinterpreted as thinking blocks.
+    let msgs = vec![ChatRequestMessage {
+        role: "assistant",
+        content: Some("answer".to_string()),
+        tool_call_id: None,
+        tool_calls: None,
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+        reasoning_artifact: Some(ReasoningArtifact::ChatReasoning(b"not anthropic".to_vec())),
+    }];
+    let (payloads, _) = build_message_payloads(&msgs, &[], true).unwrap();
+    let blocks = serde_json::to_value(&payloads[0].content).unwrap();
+    let blocks = blocks.as_array().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0], json!({"type": "text", "text": "answer"}));
 }

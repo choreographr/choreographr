@@ -101,13 +101,10 @@ pub(super) fn messages_request(
         max_backoff_ms: config.retry_max_backoff_ms,
     };
 
-    let (payloads, system) = build_message_payloads(messages, tools);
-    let tool_payloads = if tools.is_empty() {
-        None
-    } else {
-        Some(build_tool_payloads(tools))
-    };
-
+    // Thinking blocks are replayed from the round-trip artifact only when
+    // thinking is enabled for this request (goose's `!thinking_disabled`
+    // gate) — Anthropic rejects thinking blocks sent without a thinking
+    // config. Compute the payload first so the builder sees the gate.
     let thinking = thinking_payload(thinking_effort, config.max_tokens);
     if thinking.is_some() {
         debug!(
@@ -115,6 +112,13 @@ pub(super) fn messages_request(
             "Anthropic thinking enabled"
         );
     }
+
+    let (payloads, system) = build_message_payloads(messages, tools, thinking.is_some())?;
+    let tool_payloads = if tools.is_empty() {
+        None
+    } else {
+        Some(build_tool_payloads(tools))
+    };
 
     let body = serde_json::to_value(&MessagesRequest {
         model,
@@ -173,13 +177,9 @@ where
         max_backoff_ms: config.retry_max_backoff_ms,
     };
 
-    let (payloads, system) = build_message_payloads(messages, tools);
-    let tool_payloads = if tools.is_empty() {
-        None
-    } else {
-        Some(build_tool_payloads(tools))
-    };
-
+    // Thinking blocks are replayed from the round-trip artifact only when
+    // thinking is enabled for this request (see the non-streaming path for
+    // the reasoning). Compute the payload first so the builder sees the gate.
     let thinking = thinking_payload(thinking_effort, config.max_tokens);
     if thinking.is_some() {
         debug!(
@@ -187,6 +187,13 @@ where
             "Anthropic thinking enabled"
         );
     }
+
+    let (payloads, system) = build_message_payloads(messages, tools, thinking.is_some())?;
+    let tool_payloads = if tools.is_empty() {
+        None
+    } else {
+        Some(build_tool_payloads(tools))
+    };
 
     let body = serde_json::to_value(&MessagesRequest {
         model,

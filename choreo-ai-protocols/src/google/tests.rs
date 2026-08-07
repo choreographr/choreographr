@@ -25,7 +25,7 @@ fn build_message_payloads_simple() {
         ChatRequestMessage::simple("user", "Hello".to_string()),
         ChatRequestMessage::simple("assistant", "Hi there!".to_string()),
     ];
-    let (payloads, system) = build_message_payloads(&msgs);
+    let (payloads, system) = build_message_payloads(&msgs).unwrap();
     assert!(system.is_none());
     assert_eq!(payloads.len(), 2);
     assert_eq!(payloads[0].role, "user");
@@ -43,7 +43,7 @@ fn build_message_payloads_with_system() {
         ChatRequestMessage::simple("system", "Be concise.".to_string()),
         ChatRequestMessage::simple("user", "Hi!".to_string()),
     ];
-    let (payloads, system) = build_message_payloads(&msgs);
+    let (payloads, system) = build_message_payloads(&msgs).unwrap();
     assert_eq!(
         system.as_deref(),
         Some("You are a helpful assistant.\nBe concise.")
@@ -66,8 +66,9 @@ fn build_message_payloads_tool_result() {
         reasoning_content: None,
         reasoning: None,
         reasoning_text: None,
+        reasoning_artifact: None,
     }];
-    let (payloads, system) = build_message_payloads(&msgs);
+    let (payloads, system) = build_message_payloads(&msgs).unwrap();
     assert!(system.is_none());
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].role, "user");
@@ -95,8 +96,9 @@ fn build_message_payloads_tool_call() {
         reasoning_content: None,
         reasoning: None,
         reasoning_text: None,
+        reasoning_artifact: None,
     }];
-    let (payloads, system) = build_message_payloads(&msgs);
+    let (payloads, system) = build_message_payloads(&msgs).unwrap();
     assert!(system.is_none());
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].role, "model");
@@ -827,4 +829,105 @@ fn response_part_function_call_no_args() {
         }
         other => panic!("expected FunctionCall, got {other:?}"),
     }
+}
+
+// ── reasoning artifact re-emission (phase 4a) ───────────────────────────
+
+#[test]
+fn build_message_payloads_attaches_thought_signature_to_last_part() {
+    use choreo_proto::ReasoningArtifact;
+
+    // A tool-loop assistant turn carrying captured thought signatures. The
+    // final signature attaches to the LAST part (the functionCall), per the
+    // documented policy in `attach_thought_signatures`.
+    let msgs = vec![ChatRequestMessage {
+        role: "assistant",
+        content: Some("Checking the weather.".to_string()),
+        tool_call_id: None,
+        tool_calls: Some(vec![AssistantToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: AssistantToolFunction {
+                name: "get_weather".to_string(),
+                arguments: r#"{"location":"NYC"}"#.to_string(),
+            },
+        }]),
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+        reasoning_artifact: Some(ReasoningArtifact::GoogleSignatures(
+            br#"["encrypted-sig-1","encrypted-sig-2"]"#.to_vec(),
+        )),
+    }];
+    let (payloads, system) = build_message_payloads(&msgs).unwrap();
+    assert!(system.is_none());
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].role, "model");
+
+    let json_val = serde_json::to_value(&payloads[0]).unwrap();
+    let parts = json_val["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    // Only the last part carries the final signature; the text part is clean.
+    assert!(parts[0].get("thoughtSignature").is_none());
+    assert_eq!(parts[1]["thoughtSignature"], "encrypted-sig-2");
+    assert_eq!(parts[1]["function_call"]["name"], "get_weather");
+}
+
+#[test]
+fn build_message_payloads_thought_signature_on_single_text_part() {
+    use choreo_proto::ReasoningArtifact;
+
+    // A turn with no tool calls: the signature attaches to the only part.
+    let msgs = vec![ChatRequestMessage {
+        role: "assistant",
+        content: Some("Done.".to_string()),
+        tool_call_id: None,
+        tool_calls: None,
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+        reasoning_artifact: Some(ReasoningArtifact::GoogleSignatures(
+            br#"["encrypted-sig-1"]"#.to_vec(),
+        )),
+    }];
+    let (payloads, _) = build_message_payloads(&msgs).unwrap();
+    let json_val = serde_json::to_value(&payloads[0]).unwrap();
+    let parts = json_val["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["thoughtSignature"], "encrypted-sig-1");
+}
+
+#[test]
+fn build_message_payloads_no_artifact_no_thought_signature() {
+    // Control: no artifact → no `thoughtSignature` anywhere on the wire.
+    let msgs = vec![ChatRequestMessage::simple("assistant", "plain".to_string())];
+    let (payloads, _) = build_message_payloads(&msgs).unwrap();
+    let json_val = serde_json::to_value(&payloads[0]).unwrap();
+    let parts = json_val["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert!(parts[0].get("thoughtSignature").is_none());
+}
+
+#[test]
+fn build_message_payloads_foreign_artifact_variant_is_dropped() {
+    use choreo_proto::ReasoningArtifact;
+
+    // A non-Google artifact is foreign — never interpreted as signatures.
+    let msgs = vec![ChatRequestMessage {
+        role: "assistant",
+        content: Some("answer".to_string()),
+        tool_call_id: None,
+        tool_calls: None,
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+        reasoning_artifact: Some(ReasoningArtifact::ChatReasoning(
+            b"not a signature".to_vec(),
+        )),
+    }];
+    let (payloads, _) = build_message_payloads(&msgs).unwrap();
+    let json_val = serde_json::to_value(&payloads[0]).unwrap();
+    let parts = json_val["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert!(parts[0].get("thoughtSignature").is_none());
 }

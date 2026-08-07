@@ -97,7 +97,7 @@ pub(super) fn generate_content_request(
         max_backoff_ms: config.retry_max_backoff_ms,
     };
 
-    let (payloads, system_instruction) = build_message_payloads(messages);
+    let (payloads, system_instruction) = build_message_payloads(messages)?;
     let tool_payloads = if tools.is_empty() {
         None
     } else {
@@ -172,7 +172,7 @@ where
         max_backoff_ms: config.retry_max_backoff_ms,
     };
 
-    let (payloads, system_instruction) = build_message_payloads(messages);
+    let (payloads, system_instruction) = build_message_payloads(messages)?;
     let tool_payloads = if tools.is_empty() {
         None
     } else {

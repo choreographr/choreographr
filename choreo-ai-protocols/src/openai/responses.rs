@@ -186,7 +186,7 @@ fn build_responses_input(
     if tool_results.is_empty() {
         // First call in a turn: convert messages to Responses input items.
         // System messages go into `input` as `{role: "system"}` items.
-        let items = messages_to_responses_input(messages);
+        let items = messages_to_responses_input(messages)?;
         let input_value = if items.is_empty() {
             serde_json::Value::String(String::new())
         } else {
@@ -1675,5 +1675,73 @@ mod tests {
         "#;
         let response: ResponsesResponse = serde_json::from_str(json_str).unwrap();
         assert_eq!(response.output.len(), 2);
+    }
+
+    // ── Reasoning artifact re-emission (phase 4a) ────────────────────────
+
+    #[test]
+    fn messages_to_responses_input_reemits_reasoning_items() {
+        // An assistant message carrying the opaque ResponsesItems artifact must
+        // replay those items verbatim into `input`, ahead of the message
+        // content item (provider output ordering).
+        let msg = ChatRequestMessage {
+            role: "assistant",
+            content: Some("Here is the answer".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_text: None,
+            reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(
+                br#"[{"type":"reasoning","id":"re_1","summary":[{"text":"think carefully"}]}]"#
+                    .to_vec(),
+            )),
+        };
+        let items = messages_to_responses_input(&[msg]).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "reasoning");
+        assert_eq!(items[0]["id"], "re_1");
+        assert_eq!(items[0]["summary"][0]["text"], "think carefully");
+        assert_eq!(items[1]["type"], "message");
+        assert_eq!(items[1]["content"], "Here is the answer");
+        // `reasoning_content` is chat-completions-only — never on Responses
+        // messages (neither the replayed reasoning items nor the message).
+        assert!(items[0].get("reasoning_content").is_none());
+        assert!(items[1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn messages_to_responses_input_reasoning_items_preserve_order() {
+        // Multiple reasoning items + tool calls: item order must be preserved.
+        let msg = ChatRequestMessage {
+            role: "assistant",
+            content: Some("Let me check".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_text: None,
+            reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(
+                br#"[{"type":"reasoning","id":"re_1"},{"type":"reasoning","id":"re_2","encrypted_content":"eJxT_opaque"}]"#
+                    .to_vec(),
+            )),
+        };
+        let items = messages_to_responses_input(&[msg]).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["id"], "re_1");
+        assert_eq!(items[1]["id"], "re_2");
+        assert_eq!(items[1]["encrypted_content"], "eJxT_opaque");
+        assert_eq!(items[2]["type"], "message");
+    }
+
+    #[test]
+    fn messages_to_responses_input_no_artifact_plain_message() {
+        // Control: no artifact → plain message item, no reasoning on the wire.
+        let msg = ChatRequestMessage::simple("assistant", "plain".into());
+        let items = messages_to_responses_input(&[msg]).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+        assert!(items[0].get("reasoning_content").is_none());
+        assert!(items[0].get("reasoning_artifact").is_none());
     }
 }

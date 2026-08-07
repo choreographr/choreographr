@@ -2226,6 +2226,10 @@ fn build_chat_request_messages(
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_text: None,
+                // TODO(phase-4b): the reasoning passback policy will populate
+                // this from the turn's `reasoning_artifact` (same-model +
+                // tool-loop/keep-all gates).
+                reasoning_artifact: None,
             });
         }
         // Tool result messages
@@ -2238,6 +2242,7 @@ fn build_chat_request_messages(
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_text: None,
+                reasoning_artifact: None,
             });
         }
     }
@@ -2676,6 +2681,7 @@ mod tests {
             reasoning_content: None,
             reasoning: None,
             reasoning_text: None,
+            reasoning_artifact: None,
         }];
         let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[]);
         assert!(

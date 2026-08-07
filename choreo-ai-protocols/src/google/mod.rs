@@ -308,9 +308,16 @@ struct ContentPayload<'a> {
 enum PartPayload<'a> {
     Text {
         text: &'a str,
+        /// Encrypted thought signature echoed back from a previous turn
+        /// (Gemini allows `thoughtSignature` on ANY part; see
+        /// `attach_thought_signatures`). Absent on ordinary parts.
+        #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
+        thought_signature: Option<String>,
     },
     FunctionCall {
         function_call: FunctionCallPayload<'a>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         function_response: FunctionResponsePayload<'a>,
@@ -512,6 +519,52 @@ fn model_url(base_url: &str, model: &str, action: &str) -> io::Result<String> {
     Ok(format!("{}/models/{}:{}", base, model, action))
 }
 
+/// Attach the captured thought signatures from the round-trip artifact to the
+/// assistant parts, per Gemini's `thoughtSignature` contract.
+///
+/// The artifact stores signatures in wire order but NOT the part each came
+/// from, and this adapter does not re-emit thinking text (display-only), so
+/// the wire cannot attach them to their original thinking parts. Gemini
+/// allows `thoughtSignature` on ANY part (pi's google-shared.ts:199), so the
+/// turn's FINAL signature is attached to the LAST part — in a tool loop that
+/// is the functionCall part, exactly where pi attaches a tool-call signature.
+/// Attaching the final signature keeps the most recent thinking step's
+/// continuity token on the wire.
+fn attach_thought_signatures(
+    parts: &mut [PartPayload<'_>],
+    artifact: Option<&ReasoningArtifact>,
+) -> Result<(), GoogleError> {
+    let Some(ReasoningArtifact::GoogleSignatures(bytes)) = artifact else {
+        return Ok(());
+    };
+    let signatures: Vec<String> =
+        serde_json::from_slice(bytes).map_err(|e| GoogleError::Io(io::Error::other(e)))?;
+    let Some(last_signature) = signatures.last() else {
+        return Ok(());
+    };
+    let Some(last) = parts.last_mut() else {
+        // No parts to carry the signature (e.g. an assistant message with
+        // nothing but a signature) — nothing to attach to.
+        return Ok(());
+    };
+    debug!(
+        signature_count = signatures.len(),
+        "re-emitting google thought signatures from artifact"
+    );
+    match last {
+        PartPayload::Text {
+            thought_signature, ..
+        }
+        | PartPayload::FunctionCall {
+            thought_signature, ..
+        } => *thought_signature = Some(last_signature.clone()),
+        // Tool results are user-role parts and never appear in assistant
+        // content, so this arm is unreachable in practice.
+        PartPayload::FunctionResponse { .. } => {}
+    }
+    Ok(())
+}
+
 /// Convert a list of messages into Gemini contents format.
 ///
 /// System messages are collected into the `system_instruction` field and are
@@ -523,7 +576,7 @@ fn model_url(base_url: &str, model: &str, action: &str) -> io::Result<String> {
 /// because Gemini requires tool responses to be sent under the user role.
 fn build_message_payloads<'a>(
     messages: &'a [ChatRequestMessage],
-) -> (Vec<ContentPayload<'a>>, Option<String>) {
+) -> Result<(Vec<ContentPayload<'a>>, Option<String>), GoogleError> {
     let mut system_texts: Vec<String> = Vec::new();
     let mut payloads: Vec<ContentPayload<'a>> = Vec::new();
 
@@ -550,7 +603,10 @@ fn build_message_payloads<'a>(
             "assistant" => {
                 let mut parts: Vec<PartPayload<'a>> = Vec::new();
                 if let Some(text) = msg.content.as_deref().filter(|t| !t.is_empty()) {
-                    parts.push(PartPayload::Text { text });
+                    parts.push(PartPayload::Text {
+                        text,
+                        thought_signature: None,
+                    });
                 }
                 if let Some(ref calls) = msg.tool_calls {
                     for tc in calls {
@@ -561,9 +617,15 @@ fn build_message_payloads<'a>(
                                 name: &tc.function.name,
                                 args,
                             },
+                            thought_signature: None,
                         });
                     }
                 }
+                // Echo the previous turn's encrypted thought signatures back
+                // to the provider (Gemini requires them for reasoning
+                // continuity across turns). See `attach_thought_signatures`
+                // for the attachment policy.
+                attach_thought_signatures(&mut parts, msg.reasoning_artifact.as_ref())?;
                 payloads.push(ContentPayload {
                     role: "model",
                     parts,
@@ -573,7 +635,10 @@ fn build_message_payloads<'a>(
                 let content = msg.content.as_deref().unwrap_or("");
                 payloads.push(ContentPayload {
                     role,
-                    parts: vec![PartPayload::Text { text: content }],
+                    parts: vec![PartPayload::Text {
+                        text: content,
+                        thought_signature: None,
+                    }],
                 });
             }
         }
@@ -585,7 +650,7 @@ fn build_message_payloads<'a>(
         Some(system_texts.join("\n"))
     };
 
-    (payloads, system_instruction)
+    Ok((payloads, system_instruction))
 }
 
 /// Map tool definitions to Gemini's tool format.

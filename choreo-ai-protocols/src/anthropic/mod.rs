@@ -317,6 +317,11 @@ enum ContentBlockPayload<'a> {
         tool_use_id: &'a str,
         content: &'a str,
     },
+    /// Provider-owned thinking / redacted_thinking block, replayed verbatim
+    /// from the round-trip artifact (never rebuilt or reordered). Serializes
+    /// as the embedded JSON value; untagged serialization delegates to the
+    /// actual variant, so the raw block passes through unchanged.
+    Raw(serde_json::Value),
 }
 
 #[derive(Debug, Serialize)]
@@ -534,12 +539,37 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
     }))
 }
 
+/// Decode the opaque Anthropic thinking artifact into verbatim content blocks
+/// (thinking + redacted_thinking, signatures and redacted data intact, order
+/// preserved). Returns an empty vec when the artifact is absent or owned by a
+/// different adapter — payloads stay opaque until their producer decodes them.
+fn artifact_thinking_blocks(
+    artifact: Option<&ReasoningArtifact>,
+) -> Result<Vec<ContentBlockPayload<'static>>, AnthropicError> {
+    let Some(ReasoningArtifact::AnthropicThinking(bytes)) = artifact else {
+        return Ok(Vec::new());
+    };
+    let blocks: Vec<serde_json::Value> =
+        serde_json::from_slice(bytes).map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
+    debug!(
+        block_count = blocks.len(),
+        "re-emitting anthropic thinking blocks from artifact"
+    );
+    Ok(blocks.into_iter().map(ContentBlockPayload::Raw).collect())
+}
+
 /// Convert a list of messages + tools into the format expected by the
 /// Anthropic Messages API.
+///
+/// `thinking_enabled` gates the replay of thinking / redacted_thinking blocks
+/// from the round-trip artifact: Anthropic rejects thinking blocks sent
+/// without a matching thinking config, so they are dropped when thinking is
+/// off for this request (goose's `!thinking_disabled` gate).
 fn build_message_payloads<'a>(
     messages: &'a [ChatRequestMessage],
     _tools: &'a [ChatToolDefinition],
-) -> (Vec<MessagePayload<'a>>, Option<String>) {
+    thinking_enabled: bool,
+) -> Result<(Vec<MessagePayload<'a>>, Option<String>), AnthropicError> {
     let mut system: Option<String> = None;
     let mut payloads: Vec<MessagePayload> = Vec::new();
 
@@ -569,8 +599,19 @@ fn build_message_payloads<'a>(
                 });
             }
             "assistant" => {
-                // Assistant messages may contain text + tool_use content blocks.
+                // Assistant messages may contain thinking + text + tool_use
+                // content blocks. The thinking / redacted_thinking blocks are
+                // replayed VERBATIM from the round-trip artifact, in original
+                // order, ahead of text/tool_use — Anthropic requires thinking
+                // blocks to precede tool_use within a turn and the encrypted
+                // signature must be echoed back unmodified (a missing or
+                // altered block is a 400 on the next tool-loop request).
                 let mut blocks: Vec<ContentBlockPayload<'a>> = Vec::new();
+                if thinking_enabled {
+                    for block in artifact_thinking_blocks(msg.reasoning_artifact.as_ref())? {
+                        blocks.push(block);
+                    }
+                }
                 // Add text content if present.
                 if let Some(text) = msg.content.as_deref().filter(|t| !t.is_empty()) {
                     blocks.push(ContentBlockPayload::Text {
@@ -616,7 +657,7 @@ fn build_message_payloads<'a>(
         payloads.pop();
     }
 
-    (payloads, system)
+    Ok((payloads, system))
 }
 
 /// Map tool definitions to Anthropic tool format.
