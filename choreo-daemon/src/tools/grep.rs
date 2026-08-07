@@ -323,11 +323,18 @@ struct GrepSink {
     /// `render_content` can render without recomputing it.
     current_label: String,
 
-    // Content-mode state: per-file (label, ordered items, charged byte
+    // Content-mode state: per-file (label, path, ordered items, charged byte
     // total), capped by match count. Buckets are opened lazily by
     // `push_item`; the charged total lets `drop_current_bucket` refund the
     // exact bytes so the budget stays precise across aborted files.
-    content_files: Vec<(String, Vec<GrepItem>, usize)>,
+    //
+    // Bucket identity is keyed on the **raw path**, not the sanitized label:
+    // distinct files can sanitize to the same display string (a literal TAB
+    // in a name escapes to the two characters `\t`, identical to a file
+    // literally named `\t`), so a label-keyed check would let one file's
+    // items bleed into the other's bucket — and an abort of the later file
+    // would drop the earlier file's legitimate matches.
+    content_files: Vec<(String, PathBuf, Vec<GrepItem>, usize)>,
     content_match_count: usize,
     /// Running byte total of the *rendered* output buffered in `content_files`
     /// — each item charges `label + separator + line number + content +
@@ -460,8 +467,11 @@ impl GrepSink {
     /// output and the byte budget stays exact. Match counts are refunded too,
     /// keeping `result_count` in line with what will actually render.
     fn drop_current_bucket(&mut self) {
-        if let Some((label, items, charged)) = self.content_files.last()
-            && label == &self.current_label
+        // Keyed on the raw path (see `content_files`): the sanitized label is
+        // not unique across files, so a label match could drop a *previous*
+        // file's bucket on this file's abort.
+        if let Some((_, path, items, charged)) = self.content_files.last()
+            && path == &self.current_path
         {
             self.content_bytes -= *charged;
             // Refund the match tally so a file whose matches were all dropped
@@ -561,7 +571,10 @@ impl GrepSink {
         let matches_current = self
             .content_files
             .last()
-            .map(|(label, _, _)| label == &self.current_label)
+            // Path-keyed for the same reason as `drop_current_bucket`: the
+            // label can collide across distinct files, so it must not decide
+            // whether this item belongs to the open bucket.
+            .map(|(_, path, _, _)| path == &self.current_path)
             .unwrap_or(false);
         // A `Break` with no open bucket for the current file has nothing to
         // separate — dropped rather than rendered as a stray `--`. (This also
@@ -589,8 +602,12 @@ impl GrepSink {
         // behind (`render_content` renders every bucket, and `push_item`'s
         // collapse logic treats the last bucket as the current file's).
         if !matches_current {
-            self.content_files
-                .push((self.current_label.clone(), Vec::new(), 0));
+            self.content_files.push((
+                self.current_label.clone(),
+                self.current_path.clone(),
+                Vec::new(),
+                0,
+            ));
         }
         // Collapse consecutive Breaks: a separator directly after another
         // separator (grep-searcher never does this, but defend against it)
@@ -598,13 +615,13 @@ impl GrepSink {
         // to be the current file's so it never inspects the previous file's
         // trailing break.
         if matches!(item, GrepItem::Break)
-            && self.content_files.last().is_some_and(|(_, items, _)| {
+            && self.content_files.last().is_some_and(|(_, _, items, _)| {
                 items.last().is_some_and(|i| matches!(i, GrepItem::Break))
             })
         {
             return true;
         }
-        if let Some((_, items, charged)) = self.content_files.last_mut() {
+        if let Some((_, _, items, charged)) = self.content_files.last_mut() {
             *charged += rendered;
             self.content_bytes += rendered;
             items.push(item);
@@ -834,7 +851,7 @@ fn render_content(sink: &GrepSink) -> String {
     // Buckets are never empty (push_item opens one only to fill it), so no
     // empty-skip is needed here. The label was precomputed at push time so
     // the byte budget could charge exact rendered bytes; reuse it verbatim.
-    for (label, items, _) in &sink.content_files {
+    for (label, _, items, _) in &sink.content_files {
         lines.extend(items.iter().map(|item| item.render(label)));
     }
     lines.join("\n")
@@ -1314,6 +1331,49 @@ mod tests {
         }
 
         dir
+    }
+
+    #[test]
+    fn label_collision_does_not_merge_or_drop_buckets() {
+        // Two distinct files whose *sanitized* labels collide — a literal TAB
+        // in a name escapes to the two chars `\t`, identical to a file
+        // literally named `\t`. Bucket identity must be keyed on the raw
+        // path: the later file's items belong in their own bucket, and an
+        // abort of that file (binary NUL / read error) must drop only its own
+        // bucket, never the earlier file's legitimate match.
+        let mut sink = GrepSink::new(GrepOutputMode::Content, 10, 0, Path::new("root"), false);
+        // File A first: name contains a literal TAB.
+        sink.begin_file(Path::new("evil\tname.rs"));
+        assert!(sink.push_item(GrepItem::Match {
+            line_number: 1,
+            content: "needle A".into(),
+        }));
+        sink.content_match_count += 1;
+        sink.end_file();
+        assert_eq!(sink.content_files.len(), 1, "file A bucket open");
+
+        // File B: literal backslash + 't' — same sanitized label, different
+        // path. Its first item must open its OWN bucket.
+        sink.begin_file(Path::new("evil\\tname.rs"));
+        assert!(sink.push_item(GrepItem::Match {
+            line_number: 1,
+            content: "needle B".into(),
+        }));
+        sink.content_match_count += 1;
+        assert_eq!(
+            sink.content_files.len(),
+            2,
+            "colliding labels must still open separate buckets"
+        );
+
+        // Abort file B: only B's bucket is dropped; A's match survives.
+        sink.abort_file();
+        sink.end_file();
+        assert_eq!(sink.content_files.len(), 1, "only file B's bucket dropped");
+        assert_eq!(sink.result_count(), 1, "file A's match must survive");
+        let rendered = render_content(&sink);
+        assert!(rendered.contains("needle A"), "rendered: {rendered}");
+        assert!(!rendered.contains("needle B"), "rendered: {rendered}");
     }
 
     #[test]
@@ -2219,7 +2279,7 @@ mod tests {
             line_number: 2,
             content: "c".into(),
         });
-        let items = &sink.content_files[0].1;
+        let items = &sink.content_files[0].2;
         assert_eq!(items.len(), 3, "stray + duplicated breaks must not render");
         assert!(matches!(items[0], GrepItem::Match { .. }));
         assert!(matches!(items[1], GrepItem::Break));
