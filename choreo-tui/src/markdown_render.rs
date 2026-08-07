@@ -873,10 +873,11 @@ fn render_markdown_block(
             //
             // The list also shares a single indentation unit: the width of the
             // *widest* marker (the item with the highest number, e.g. 4 columns
-            // for "10. ").  Every item's content is wrapped to that budget and
-            // every continuation line is indented to it, so wrapped text lines
-            // up across items regardless of how many digits each marker has.
-            // The marker text itself stays natural ("1. ", "10. ").
+            // for "10. ").  Every marker is padded with trailing spaces up to
+            // that width ("9. " -> "9.  ") so every item's *content* starts at
+            // the same column, and every continuation line is indented to that
+            // same column — so first lines and wrapped lines all line up as one
+            // block regardless of how many digits each marker has.
             let max_marker_width = if *ordered {
                 // Item numbers run start..=start + len - 1, so the widest marker
                 // is always the last one — O(1) per list, no per-item scan.
@@ -902,11 +903,17 @@ fn render_markdown_block(
                 } else {
                     "• ".to_string()
                 };
+                // Pad the marker to the list-wide width so first-line content
+                // aligns with every other item's first line (and with the
+                // continuation lines below).  Without this, "9. " content sits
+                // one column left of its "10. " sibling — the wrapped lines
+                // lined up, but the visible first line was still misaligned.
+                let marker = pad_marker(&marker, max_marker_width);
                 let mut rendered = Vec::new();
-                // Content is rendered at (width - indent - max_marker_width) so
-                // that when the marker and outer indent are prepended the total
-                // fits within `width` for *every* item, even ones whose own
-                // marker is narrower (their first line just ends early).
+                // Content is rendered at (width - indent - max_marker_width):
+                // with every marker padded to that width, a first line totals
+                // exactly `width`, and continuation lines (indented to the same
+                // column) fit as well.
                 render_markdown_blocks(
                     item,
                     &mut rendered,
@@ -1256,6 +1263,17 @@ fn pad_aligned(text: &str, width: usize, alignment: MarkdownAlignment) -> String
 
 pub(crate) fn display_width(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// Right-pad a list marker with trailing spaces to `width` display columns so
+/// every item's content starts at the same column regardless of how wide the
+/// marker text is ("9. " -> "9.  " when a sibling is "10. ").  The pad is pure
+/// alignment whitespace: it carries no meaning and is simply what makes the
+/// whole list read as one block.  Markers are short ASCII (digits + ". " or
+/// "• "), so column padding via spaces is exact.
+fn pad_marker(marker: &str, width: usize) -> String {
+    let pad = width.saturating_sub(display_width(marker));
+    format!("{}{}", marker, " ".repeat(pad))
 }
 
 fn grapheme_width(grapheme: &str) -> usize {
@@ -1950,6 +1968,32 @@ mod tests {
         line.chars().take_while(|ch| *ch == ' ').count()
     }
 
+    /// Column (byte index, ASCII-only test input) where the first non-marker
+    /// text of a rendered list line begins — i.e. where the content starts.
+    fn first_content_column(line: &str) -> usize {
+        line.char_indices()
+            .find(|(_, ch)| ch.is_alphabetic())
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn ordered_list_items_share_content_column() {
+        // The reported repro: a list spanning the 9/10/11 digit boundary must
+        // render every item's content at the same column (the widest marker's
+        // 4 columns) — not just the wrapped lines, but the first lines too.
+        let md = "9. Thread Communication\n10. Inline Comments\n11. Pre-Commit Workflow";
+        let result = markdown_lines(md, 80);
+        let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        for line in &text {
+            assert_eq!(
+                first_content_column(line),
+                4,
+                "content should start at column 4 (widest marker \"10. \"), got {line:?}"
+            );
+        }
+    }
+
     #[test]
     fn ordered_list_wrapped_lines_share_widest_marker_indent() {
         // Item 1's marker is 3 columns wide but item 10's is 4; every item's
@@ -1959,12 +2003,19 @@ mod tests {
         let md = format!("1. {long}\n2. x\n3. x\n4. x\n5. x\n6. x\n7. x\n8. x\n9. x\n10. {long}");
         let result = markdown_lines(&md, 20);
         let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
-        // Both wrapped items must continue under the widest marker.
+        // Both wrapped items must continue under the widest marker, and their
+        // first-line content must start at the same column as well.
         for marker in ["1. ", "10. "] {
             let idx = text
                 .iter()
                 .position(|l| l.starts_with(marker))
                 .unwrap_or_else(|| panic!("marker {marker:?} not found: {text:?}"));
+            assert_eq!(
+                first_content_column(&text[idx]),
+                4,
+                "first-line content of {marker:?} should start at col 4, got {:?}",
+                text[idx]
+            );
             let cont = text
                 .get(idx + 1)
                 .expect("wrapped item should have a continuation line");
