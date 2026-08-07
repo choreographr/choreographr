@@ -1,7 +1,7 @@
 use super::{ToolExecError, truncate_tool_output};
 use std::{
     io::Read,
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -128,6 +128,14 @@ fn open_pidfd(_pid: u32) -> Option<OwnedFd> {
 /// direct kill of the child itself.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
+    // `child.id()` is never 0, but rustix's `Pid::from_raw` returns an
+    // `Option` and production code must not unwrap — keep the conversion
+    // defensive rather than assuming.
+    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
+        debug!(raw_pid = pid, "refusing to signal pid 0");
+        return false;
+    };
+
     // Pinned-identity path — reachable only on Linux, where `open_pidfd` can
     // return `Some`.
     #[cfg(target_os = "linux")]
@@ -140,19 +148,19 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
             Ok(()) => {
                 // SIGKILL the leader through the pinned fd, then sweep the
                 // rest of the group by pgid (== pid, since setup_child made
-                // the child a leader). The `killpg` is best-effort: if the
-                // leader was the only member the group is already gone and it
-                // returns ESRCH harmlessly.
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
+                // the child a leader). The `kill_process_group` is
+                // best-effort: if the leader was the only member the group is
+                // already gone and it returns ESRCH harmlessly.
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
                 return true;
             }
             Err(rustix::io::Errno::SRCH) => {
                 // The pinned process exited on its own before the timeout
                 // landed — nothing to kill, so report "not killed".
-                debug!(pid, "pidfd_send_signal: child already exited on its own");
+                debug!(
+                    pid = pid.as_raw_pid(),
+                    "pidfd_send_signal: child already exited on its own"
+                );
                 return false;
             }
             Err(e) => {
@@ -160,25 +168,31 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
                 // through to the leader-checked killpg below; the pidfd still
                 // pins the identity, so the PID-based signal cannot be
                 // redirected at a recycled process.
-                warn!(pid, error = %e, "pidfd_send_signal failed; falling back to leader-checked killpg");
+                warn!(
+                    pid = pid.as_raw_pid(),
+                    error = %e,
+                    "pidfd_send_signal failed; falling back to leader-checked killpg"
+                );
             }
         }
     }
 
     // Legacy PID-based path (non-Linux, pidfd unavailable, or the pinned
     // signal failed with a non-ESRCH error above).
-    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    //
     // True only while the child lives as its group's leader. Once it has
     // exited (even unreaped) getpgid can still succeed — matching kill(2),
     // which also "succeeds" on zombies — so the was_killed flag stays accurate
     // for the narrow finish-vs-timeout race exactly as before.
-    let is_group_leader = nix::unistd::getpgid(Some(pid))
+    let is_group_leader = rustix::process::getpgid(Some(pid))
         .map(|pgid| pgid == pid)
         .unwrap_or(false);
-    if is_group_leader && nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL).is_ok() {
+    if is_group_leader
+        && rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).is_ok()
+    {
         return true;
     }
-    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).is_ok()
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL).is_ok()
 }
 
 /// Spawn the watchdog thread that enforces `timeout_ms` on a child process.
@@ -233,33 +247,45 @@ fn spawn_watchdog(
 /// tool timeout into a multi-second hang. Draining in poll slices lets the
 /// stop signal (sent by the spawn helpers once `child.wait()` returns) cut the
 /// wait short.
-fn poll_readable(fd: nix::libc::c_int, stop_rx: &mpsc::Receiver<()>, poll_ms: i32) -> bool {
-    let mut pfd = nix::libc::pollfd {
-        fd,
-        events: nix::libc::POLLIN,
-        revents: 0,
+fn poll_readable(
+    fd: rustix::fd::BorrowedFd<'_>,
+    stop_rx: &mpsc::Receiver<()>,
+    poll_ms: i32,
+) -> bool {
+    // Poll for readability/EOF on the pipe fd. The PollFd borrows the fd for
+    // the duration of each call, so no raw-fd/unsafe handling is needed.
+    let mut pfds = [rustix::event::PollFd::new(
+        &fd,
+        rustix::event::PollFlags::IN,
+    )];
+    // poll(2) takes a timespec; the drain slices come in as i32 milliseconds.
+    // (`Timespec` is re-exported from rustix::event; rustix::timespec is private.)
+    let timeout = rustix::event::Timespec {
+        tv_sec: i64::from(poll_ms / 1000),
+        tv_nsec: i64::from(poll_ms % 1000) * 1_000_000,
     };
     loop {
-        // poll(2): -1 on error, 0 on timeout, >0 when data or EOF is pending.
-        let ret = unsafe { nix::libc::poll(&mut pfd, 1, poll_ms) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue; // EINTR: retry the poll
+        // rustix does not auto-retry EINTR, so the INTR branch loops back to
+        // match the previous libc behaviour.
+        match rustix::event::poll(&mut pfds, Some(&timeout)) {
+            // Ok(0): nothing readable within the slice. If the direct child
+            // has been reaped (stop signalled), stop rather than wait for a
+            // survivor.
+            Ok(0) => {
+                if stop_rx.try_recv().is_ok() {
+                    return false;
+                }
+                continue;
             }
-            debug!(error = %err, "poll on child pipe failed; stopping drain");
-            return false;
-        }
-        if ret == 0 {
-            // Nothing readable within the slice. If the direct child has been
-            // reaped (stop signalled), stop rather than wait for a survivor.
-            if stop_rx.try_recv().is_ok() {
+            // Data available or EOF (POLLHUP|POLLIN) — attempt a read.
+            Ok(_) => return true,
+            // EINTR: retry the poll.
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => {
+                debug!(error = %e, "poll on child pipe failed; stopping drain");
                 return false;
             }
-            continue;
         }
-        // Data available or EOF (POLLHUP|POLLIN) — attempt a read.
-        return true;
     }
 }
 
@@ -274,14 +300,16 @@ fn poll_readable(fd: nix::libc::c_int, stop_rx: &mpsc::Receiver<()>, poll_ms: i3
 /// open (a surviving grandchild). If `fcntl` fails — which never happens on a
 /// freshly-created pipe — the code falls back to reading a single chunk per
 /// poll verdict, which is safe but slower.
-fn drain_fd<R: Read + AsRawFd>(
+fn drain_fd<R: Read + AsFd>(
     mut reader: R,
     stop_rx: mpsc::Receiver<()>,
     poll_ms: i32,
     on_data: &mut dyn FnMut(&[u8]),
 ) -> Vec<u8> {
-    let fd = reader.as_raw_fd();
-    let nonblocking = set_nonblocking(fd);
+    // Keep the raw fd around purely for the trace log below; all syscalls use
+    // the BorrowedFd from `reader.as_fd()`, so there is no raw-fd unsafe.
+    let fd = reader.as_fd().as_raw_fd();
+    let nonblocking = set_nonblocking(reader.as_fd());
     if !nonblocking {
         debug!(
             fd,
@@ -291,7 +319,7 @@ fn drain_fd<R: Read + AsRawFd>(
     let mut full: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        if !poll_readable(fd, &stop_rx, poll_ms) {
+        if !poll_readable(reader.as_fd(), &stop_rx, poll_ms) {
             break;
         }
         // Drain everything currently buffered (non-blocking reads loop until
@@ -325,16 +353,15 @@ fn drain_fd<R: Read + AsRawFd>(
 }
 
 /// Put `fd` in non-blocking mode. Returns `false` if `fcntl` fails.
-fn set_nonblocking(fd: nix::libc::c_int) -> bool {
-    // SAFETY: fcntl is async-signal-safe and operates on the fd we own.
-    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
-    if flags < 0 {
-        return false;
+fn set_nonblocking(fd: rustix::fd::BorrowedFd<'_>) -> bool {
+    // F_GETFL then F_SETFL with O_NONBLOCK is the standard way to make a pipe
+    // read end non-blocking; only the read end's own behaviour changes (the
+    // child's writes to the other end are unaffected). rustix's typed fcntl
+    // wrappers remove the two unsafe libc blocks the old code needed.
+    match rustix::fs::fcntl_getfl(fd) {
+        Ok(flags) => rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK).is_ok(),
+        Err(_) => false,
     }
-    // SAFETY: F_SETFL with the OR'd O_NONBLOCK flag is the standard way to
-    // make a pipe read end non-blocking; only the read end's own behaviour
-    // changes (the child's writes to the other end are unaffected).
-    unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) >= 0 }
 }
 
 /// Append `chunk` to `pending`, forwarding every complete line (terminated by
@@ -611,10 +638,12 @@ mod tests {
         reader.read_line(&mut pid_line).expect("read child pid");
         let child_pid = pid_line.trim().parse::<i32>().expect("parse child pid");
 
-        let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(child_pid)))
-            .expect("getpgid on live child");
+        let pgid = rustix::process::getpgid(Some(
+            rustix::process::Pid::from_raw(child_pid).expect("parsed child pid is nonzero"),
+        ))
+        .expect("getpgid on live child");
         assert_eq!(
-            pgid.as_raw(),
+            pgid.as_raw_pid(),
             child_pid,
             "child must be leader of its own process group"
         );
