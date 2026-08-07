@@ -55,6 +55,11 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 unicode-segmentation.workspace = true
+# Unicode general-category property (see `is_unsafe_unicode` in tools/mod.rs):
+# generated from the Unicode data tables (v1.1.0 ships Unicode 16.0), so the
+# sanitizer's Cf set stays complete across Unicode releases without a
+# hand-maintained enumeration.
+unicode-general-category = "1.1"
 # OpenMetrics / Prometheus monitoring.
 # The `process` feature exposes process-level metrics (RSS, CPU, FD count)
 # alongside our application-level gauges, counters, and histograms.

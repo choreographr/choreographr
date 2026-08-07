@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::mpsc;
+use unicode_general_category::{GeneralCategory, get_general_category};
 
 /// Helper: encode Result<Result<R, E>, ToolError> as postcard bytes.
 /// Used by `execute_postcard` to produce a single byte buffer containing
@@ -1011,8 +1012,9 @@ pub(crate) fn truncate_tool_output(content: &str) -> String {
 /// - Unicode format characters (category Cf) are invisible but can reorder,
 ///   hide, or spoof rendered text: bidi marks/overrides/isolates, zero-width
 ///   space and word joiner, invisible operators, the BOM, and more (see
-///   [`is_format_char`]). The joiners U+200C/U+200D (ZWNJ/ZWJ) do not reorder
-///   or hide text and are legitimate in some scripts, so they pass through.
+///   [`is_unsafe_unicode`]). The joiners U+200C/U+200D (ZWNJ/ZWJ) do not
+///   reorder or hide text and are legitimate in some scripts, so they pass
+///   through.
 ///
 /// `keep_tabs` leaves TAB literal — legitimate in source-line *content* (grep
 /// match/context lines) — while names still escape it.
@@ -1079,16 +1081,17 @@ pub(crate) fn sanitize_text_len(text: &str, keep_tabs: bool) -> usize {
 /// the joiners (see [`sanitize_text`]).
 ///
 /// U+2028/U+2029 are Zl/Zp — not `is_control` — yet terminals render them
-/// as line breaks, breaking the one-line-per-result invariant. The Cf set is
-/// otherwise the full invisible-formatting surface: bidi marks/overrides/
-/// isolates (U+061C, U+200E/U+200F, U+202A..=U+202E, U+2066..=U+206F),
-/// zero-width space and word joiner (U+200B, U+2060), invisible operators
-/// (U+2061..=U+2064), the BOM (U+FEFF), soft hyphen, the Mongolian vowel
-/// separator (U+180E), and the rarer format controls (tags, musical/phonetic,
-/// Egyptian hieroglyph, …). All of these
-/// are invisible or spoofing-capable — they can hide text in identifiers,
-/// split tokens, or reorder rendered output — so they are escaped rather
-/// than passed through.
+/// as line breaks, breaking the one-line-per-result invariant.
+///
+/// The Cf set itself is not enumerated here: it is taken from the Unicode
+/// general-category property via `unicode-general-category` (generated from
+/// the Unicode data tables, currently Unicode 16.0), so newly-assigned
+/// format characters are escaped automatically on a crate bump instead of
+/// drifting until someone re-reads the tables. Format characters are
+/// invisible but spoofing-capable — bidi marks/overrides/isolates, ZWSP and
+/// word joiner, invisible operators, the BOM, soft hyphen, Mongolian vowel
+/// separator, tags, and the rarer format controls — they can hide text in
+/// identifiers, split tokens, or reorder rendered output.
 ///
 /// The joiners U+200C/U+200D are deliberately excluded: they affect
 /// ligation, not ordering or visibility, and are required by scripts like
@@ -1100,53 +1103,8 @@ fn is_unsafe_unicode(c: char) -> bool {
     matches!(c, '\u{2028}' | '\u{2029}')
         // The rest of the unsafe set is Unicode format characters minus
         // the two joiners (which pass through, see above).
-        || (is_format_char(c) && !matches!(c, '\u{200c}' | '\u{200d}'))
-}
-
-/// The Unicode format characters (general category Cf): invisible
-/// codepoints that alter how surrounding text renders — direction, joining,
-/// width, or absence. `char::is_control` does not cover them (they are
-/// category Cf, not Cc), so they must be enumerated. The joiners U+200C /
-/// U+200D are intentionally included here and excluded by the caller.
-fn is_format_char(c: char) -> bool {
-    matches!(c,
-        // SOFT HYPHEN — renders as a hyphen at a line break.
-        '\u{00ad}'
-        // ARABIC NUMBER SIGN .. ARABIC NUMBER MARK ABOVE, ARABIC LETTER
-        // MARK, ARABIC END OF AYAH, SYRIAC ABBREVIATION MARK, ARABIC
-        // POUND/PIASTRE MARK ABOVE, ARABIC DISCONTINUED EUDOXIA.
-        | '\u{0600}'..='\u{0605}'
-        | '\u{061c}'
-        | '\u{06dd}'
-        | '\u{070f}'
-        | '\u{0890}'..='\u{0891}'
-        | '\u{08e2}'
-        // ZERO WIDTH SPACE; LRM / RLM; bidi embeddings and overrides.
-        | '\u{200b}'
-        | '\u{200e}'..='\u{200f}'
-        | '\u{202a}'..='\u{202e}'
-        // WORD JOINER, INVISIBLE (FUNCTION APPLICATION, TIMES, SEPARATOR,
-        // PLUS); isolates and deprecated bidi format characters.
-        | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{206f}'
-        // ZERO WIDTH NO-BREAK SPACE (BOM); INTERLINEAR ANNOTATION …
-        | '\u{feff}'
-        | '\u{fff9}'..='\u{fffb}'
-        // MONGOLIAN VOWEL SEPARATOR — a Cf that affects line-initial
-        // rendering of Mongolian vowels; invisible.
-        | '\u{180e}'
-        // KAITHI NUMBER SIGN (ABOVE); EGYPTIAN HIEROGLYPH FORMAT CONTROLS;
-        // SHORTHAND FORMAT CONTROLS; MUSICAL SYMBOL FORMAT CONTROLS.
-        | '\u{110bd}'
-        | '\u{110cd}'
-        | '\u{13430}'..='\u{1343f}'
-        | '\u{1bca0}'..='\u{1bca3}'
-        | '\u{1d173}'..='\u{1d17a}'
-        // LANGUAGE TAG; TAG CHARACTERS (deprecated, but still invisible
-        // and spoofable).
-        | '\u{e0001}'
-        | '\u{e0020}'..='\u{e007f}'
-    )
+        || (get_general_category(c) == GeneralCategory::Format
+            && !matches!(c, '\u{200c}' | '\u{200d}'))
 }
 
 /// Escape control characters in a name so a pathological name (e.g. one
@@ -2471,6 +2429,39 @@ mod tests {
                 "{s:?}"
             );
             assert_eq!(sanitize_text_len(s, false), sanitize_name(s).len(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_matches_policy_for_all_chars() {
+        // The keep-predicate must agree with the policy for *every* char:
+        // escape C0/C1 controls, the line/paragraph separators U+2028/U+2029,
+        // and every Unicode format character except the joiners; pass through
+        // everything else (plus tabs under the content policy). Sweeping the
+        // full code space makes the contract explicit and keeps it honest as
+        // the `unicode-general-category` tables are updated by a future crate
+        // bump — a newly-assigned format char is escaped here, never silently
+        // passed through.
+        for c in '\u{0}'..=char::MAX {
+            let is_control = c.is_control();
+            let is_separator = matches!(c, '\u{2028}' | '\u{2029}');
+            let is_cf = get_general_category(c) == GeneralCategory::Format;
+            let is_joiner = matches!(c, '\u{200c}' | '\u{200d}');
+            // Name policy (tabs escaped): every control, separator, and
+            // non-joiner format char is escaped; nothing else.
+            assert_eq!(
+                sanitize_keeps(c, false),
+                !is_control && !is_separator && !(is_cf && !is_joiner),
+                "name-policy keep drift for U+{:04X}",
+                c as u32
+            );
+            // Content policy (tabs literal): identical, but TAB passes through.
+            assert_eq!(
+                sanitize_keeps(c, true),
+                (c == '\t') || (!is_control && !is_separator && !(is_cf && !is_joiner)),
+                "content-policy keep drift for U+{:04X}",
+                c as u32
+            );
         }
     }
 
