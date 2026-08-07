@@ -1,5 +1,5 @@
 use super::render::*;
-use choreo_proto::{SessionStatus, SessionSummary};
+use choreo_proto::{SessionStatus, SessionSummary, TokenUsage};
 
 // ── format_status tests ──
 
@@ -31,6 +31,65 @@ fn format_status_retrying_second() {
         delay_ms: 2000,
     };
     assert_eq!(format_status(&status), "retrying (2/3, 2s)");
+}
+
+// ── Cumulative token readouts (status bar + session detail) ──
+
+#[test]
+fn status_token_readout_small_counts_pass_through() {
+    // Below the 1_000 compact threshold humfmt renders verbatim, so small
+    // sessions read exactly like the raw counts used to.
+    let usage = TokenUsage {
+        input_tokens: 847,
+        output_tokens: 23,
+        total_tokens: 870,
+    };
+    assert_eq!(status_token_readout(&usage), "↑847 ↓23");
+}
+
+#[test]
+fn status_token_readout_compacts_large_counts() {
+    // Above the threshold humfmt compacts with K/M suffixes, matching the
+    // context-fill readout beside it (e.g. "1.5K / 32K").  Values chosen
+    // from humfmt's documented outputs: 15_320 -> "15.3K", 1_280 -> "1.3K"
+    // (HalfUp at precision 1, trailing zero trimmed).
+    let usage = TokenUsage {
+        input_tokens: 15_320,
+        output_tokens: 1_280,
+        total_tokens: 16_600,
+    };
+    assert_eq!(status_token_readout(&usage), "↑15.3K ↓1.3K");
+}
+
+#[test]
+fn status_token_readout_zero() {
+    assert_eq!(status_token_readout(&TokenUsage::default()), "↑0 ↓0");
+}
+
+#[test]
+fn session_detail_tokens_line_compacts_and_keeps_label_alignment() {
+    let usage = TokenUsage {
+        input_tokens: 15_320,
+        output_tokens: 1_280,
+        total_tokens: 16_600,
+    };
+    assert_eq!(
+        session_detail_tokens_line(&usage),
+        "Tokens:        15.3K in / 1.3K out (16.6K total)"
+    );
+}
+
+#[test]
+fn session_detail_tokens_line_small_counts_pass_through() {
+    let usage = TokenUsage {
+        input_tokens: 42,
+        output_tokens: 7,
+        total_tokens: 49,
+    };
+    assert_eq!(
+        session_detail_tokens_line(&usage),
+        "Tokens:        42 in / 7 out (49 total)"
+    );
 }
 
 // ── Model selector popup rendering ──

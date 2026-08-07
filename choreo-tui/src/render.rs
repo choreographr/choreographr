@@ -6,7 +6,7 @@ use crate::state::{
     PROVIDER_OPTIONS, Page, SessionManagerView, cached_or_compute_lines, cached_visual_lines,
     input_inner_width,
 };
-use choreo_proto::SessionStatus;
+use choreo_proto::{SessionStatus, TokenUsage};
 use choreo_tui::RenderedImage;
 use ratatui::{
     Frame,
@@ -331,7 +331,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
         // Runtime metrics: tokens flow and context-window fill.
         let tokens = match &app.display_token_usage() {
-            Some(usage) => format!("↑{} ↓{}", usage.input_tokens, usage.output_tokens),
+            Some(usage) => status_token_readout(usage),
             None => String::new(),
         };
         let context = match (
@@ -922,10 +922,7 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                 detail.account_name.as_deref().unwrap_or("-")
             )),
             Line::from(match &detail.accumulated_usage {
-                Some(usage) => format!(
-                    "Tokens:        {} in / {} out ({} total)",
-                    usage.input_tokens, usage.output_tokens, usage.total_tokens
-                ),
+                Some(usage) => session_detail_tokens_line(usage),
                 None => "Tokens:        -".to_string(),
             }),
             Line::from(match (detail.context_window, detail.last_prompt_tokens) {
@@ -1367,6 +1364,35 @@ pub(crate) fn status_display(status: &SessionStatus) -> (String, Color) {
 
 pub(crate) fn format_status(status: &SessionStatus) -> String {
     status_display(status).0
+}
+
+/// The status bar's cumulative token readout, e.g. `↑15.3K ↓1.2K`.
+///
+/// Both counters pass through humfmt's compact number formatter so the
+/// readout stays consistent with the context-window fill rendered beside it
+/// (which already uses `humfmt::number`/`humfmt::percent`): small sessions
+/// (< 1_000 tokens) render verbatim, large ones get K/M suffixes.
+pub(crate) fn status_token_readout(usage: &TokenUsage) -> String {
+    format!(
+        "↑{} ↓{}",
+        humfmt::number(usage.input_tokens),
+        humfmt::number(usage.output_tokens),
+    )
+}
+
+/// The session-detail "Tokens:" line, e.g.
+/// `Tokens:        15.3K in / 1.2K out (16.5K total)`.
+///
+/// Same humfmt treatment as the status bar's readout so the two token
+/// surfaces agree; the `Tokens:        ` label keeps the column aligned with
+/// its neighbours (`Working Dir:`, `Turn Count:`, …).
+pub(crate) fn session_detail_tokens_line(usage: &TokenUsage) -> String {
+    format!(
+        "Tokens:        {} in / {} out ({} total)",
+        humfmt::number(usage.input_tokens),
+        humfmt::number(usage.output_tokens),
+        humfmt::number(usage.total_tokens),
+    )
 }
 
 /// Centered popup listing the models available on the attached session's
