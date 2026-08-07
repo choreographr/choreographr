@@ -1256,6 +1256,7 @@ fn handle_chat_event(
                 // borders; the column may be anywhere in the box width.
                 if mouse.row >= box_rect.y.saturating_add(1)
                     && mouse.row < box_rect.y.saturating_add(box_rect.height).saturating_sub(1)
+                    && mouse.column >= box_rect.x
                     && mouse.column < box_rect.x.saturating_add(box_rect.width)
                 {
                     let content_row = (mouse.row - box_rect.y - 1) as usize;

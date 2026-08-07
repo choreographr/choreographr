@@ -1779,7 +1779,8 @@ impl InputBuffer {
     /// within the currently visible window (so `scroll_offset` is added to it)
     /// and `col` is the display-width column.  Clicks below the last text line
     /// resolve to the end of the buffer; clicks past the right edge of a line
-    /// resolve to that line's end.
+    /// resolve to that line's end.  Within a line the offset is grapheme-aware
+    /// (see [`grapheme_offset_at_column`]).
     pub(crate) fn byte_offset_at_click(
         &mut self,
         max_width: usize,
@@ -1800,7 +1801,7 @@ impl InputBuffer {
             Some(vl) => {
                 let line_text = &self.text[vl.start_byte..vl.end_byte];
                 let target_col = col.min(vl.display_width);
-                vl.start_byte + byte_offset_at_column(line_text, target_col)
+                vl.start_byte + grapheme_offset_at_column(line_text, target_col)
             }
             // The click landed below the last visual line (e.g. after a resize
             // shrank the box); the cursor goes to the very end of the text.
@@ -1992,6 +1993,40 @@ pub(crate) fn byte_offset_at_column(s: &str, target_col: usize) -> usize {
             return byte_i;
         }
         col += ch_w;
+    }
+    s.len()
+}
+
+/// Find the byte offset within `s` for a click at display column `target_col`.
+///
+/// A click is a direct placement intent, so unlike [`byte_offset_at_column`]
+/// (which cursor up/down use to *preserve* a column "at or before" the target)
+/// this is grapheme-cluster aware:
+///
+/// - The cursor is always placed on a grapheme boundary — it can never land
+///   inside a ZWJ family emoji or a base+combining sequence.
+/// - For a wide grapheme, a click on its leftmost cell places the cursor
+///   before it and a click on any later cell places it after — matching how
+///   editors treat wide characters.
+/// - Clicks past the end of the string's display width resolve to the end.
+///
+/// Returns `s.len()` when `target_col` is larger than the string's display
+/// width.
+fn grapheme_offset_at_column(s: &str, target_col: usize) -> usize {
+    let mut col = 0;
+    for (byte_i, g) in s.grapheme_indices(true) {
+        let g_w = UnicodeWidthStr::width(g);
+        if col + g_w > target_col {
+            // The click fell inside this grapheme's cells.  A 1-column
+            // grapheme's only cell places the cursor before it; a wide
+            // grapheme's first cell does the same, but its remaining cells
+            // place the cursor after the whole cluster.
+            if g_w >= 2 && target_col > col {
+                return byte_i + g.len();
+            }
+            return byte_i;
+        }
+        col += g_w;
     }
     s.len()
 }
@@ -2468,19 +2503,29 @@ impl App {
         }
         if self.history_index.is_none() {
             self.saved_draft = self.input.text.clone();
-            self.history_index = Some(0);
-            self.input.text = texts[0].to_string();
-            self.input.generation += 1;
-            self.input.cursor = self.input.text.len();
-            self.ensure_input_cursor_visible();
-        } else if let Some(idx) = self.history_index {
+            self.load_history_entry(0, &texts);
+            return;
+        }
+        if let Some(raw_idx) = self.history_index {
+            // history_index was recorded against the turn list as it existed
+            // when the user first pressed Up. The list may have shrunk since
+            // (turns replaced, session switched), leaving the index past the
+            // oldest remaining entry — clamp it and resync the displayed text
+            // so Up mirrors Down (which clamps too) instead of silently
+            // no-op'ing on a stale index.
+            let idx = raw_idx.min(texts.len().saturating_sub(1));
+            if idx != raw_idx {
+                tracing::debug!(
+                    stale = raw_idx,
+                    clamped = idx,
+                    "[choreo-tui] history index stale on Up; clamped to oldest remaining entry"
+                );
+                self.load_history_entry(idx, &texts);
+                return;
+            }
             let next = idx + 1;
             if next < texts.len() {
-                self.history_index = Some(next);
-                self.input.text = texts[next].to_string();
-                self.input.generation += 1;
-                self.input.cursor = self.input.text.len();
-                self.ensure_input_cursor_visible();
+                self.load_history_entry(next, &texts);
             }
         }
     }
@@ -2506,21 +2551,36 @@ impl App {
             // can land past the end — clamp to the newest remaining entry
             // instead of indexing out of bounds.
             let prev = (idx - 1).min(texts.len() - 1);
-            self.history_index = Some(prev);
-            self.input.text = texts[prev].to_string();
-            self.input.generation += 1;
-            self.input.cursor = self.input.text.len();
-            self.ensure_input_cursor_visible();
+            if idx >= texts.len() {
+                tracing::debug!(
+                    stale = idx,
+                    clamped = prev,
+                    "[choreo-tui] history index stale on Down; clamped to newest remaining entry"
+                );
+            }
+            self.load_history_entry(prev, &texts);
         }
+    }
+
+    /// Load the history entry at `idx` into the input: stash the index, set
+    /// the text, move the cursor to the end, and keep it visible.  Shared by
+    /// all the "step through history" paths so they can't drift apart.
+    fn load_history_entry(&mut self, idx: usize, texts: &[String]) {
+        self.history_index = Some(idx);
+        self.input.text = texts[idx].to_string();
+        self.input.generation += 1;
+        self.input.cursor = self.input.text.len();
+        self.ensure_input_cursor_visible();
     }
 
     /// Drop history navigation and put the user's saved draft back in the
     /// input, clearing the stash. Shared by all the "exit to draft" paths.
     fn restore_history_draft(&mut self) {
         self.history_index = None;
-        self.input.text = self.saved_draft.clone();
+        // Move the draft out of its stash rather than cloning it: the stash
+        // is consumed here and the input buffer takes ownership of the bytes.
+        self.input.text = std::mem::take(&mut self.saved_draft);
         self.input.generation += 1;
-        self.saved_draft.clear();
         self.input.cursor = self.input.text.len();
         self.ensure_input_cursor_visible();
     }

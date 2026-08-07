@@ -909,6 +909,32 @@ fn byte_offset_at_click_is_grapheme_aware() {
 }
 
 #[test]
+fn byte_offset_at_click_right_half_of_wide_char_places_after() {
+    let mut buf = InputBuffer::new();
+    buf.text = "a😀b".to_string();
+    // 😀 occupies display columns 1..3.  A click on its left cell (col 1)
+    // places the cursor before it; a click on its right cell (col 2) or one
+    // column past it (col 3) places the cursor after it.
+    assert_eq!(buf.byte_offset_at_click(80, 0, 1), 1); // left cell → before
+    assert_eq!(buf.byte_offset_at_click(80, 0, 2), 5); // right cell → after
+    assert_eq!(buf.byte_offset_at_click(80, 0, 3), 5); // one past → after
+}
+
+#[test]
+fn byte_offset_at_click_never_splits_zwj_grapheme_cluster() {
+    let mut buf = InputBuffer::new();
+    // The ZWJ family emoji is a single extended grapheme cluster of 7
+    // codepoints (bytes 0..25) occupying 2 display cells, followed by 'x'.
+    buf.text = "👨‍👩‍👧‍👦x".to_string();
+    // Any click inside the cluster's cells must land on a grapheme boundary —
+    // before the cluster (byte 0) or after it (byte 25), never mid-cluster.
+    assert_eq!(buf.byte_offset_at_click(80, 0, 0), 0); // left cell → before
+    assert_eq!(buf.byte_offset_at_click(80, 0, 1), 25); // right cell → after
+    assert_eq!(buf.byte_offset_at_click(80, 0, 2), 25); // 'x' (byte 25)
+    assert_eq!(buf.byte_offset_at_click(80, 0, 3), 26); // end of buffer
+}
+
+#[test]
 fn handle_key_enter_submits_without_shift() {
     let mut buf = InputBuffer::new();
     buf.text = "hello".to_string();
@@ -2197,6 +2223,59 @@ fn navigate_history_down_empty_history_restores_draft() {
     app.input.text = "stale".to_string();
 
     // No turns at all: Down must fall back to the draft, not panic.
+    app.navigate_history_down();
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input.text, "draft");
+    assert!(app.saved_draft.is_empty());
+}
+
+#[test]
+fn navigate_history_up_survives_shrunk_history() {
+    let mut app = test_app();
+    add_user_text(&mut app, "oldest");
+    add_user_text(&mut app, "older");
+    add_user_text(&mut app, "recent");
+    // Browsed all the way to the oldest entry...
+    app.history_index = Some(2);
+    app.input.text = "oldest".to_string();
+    app.saved_draft = "draft".to_string();
+
+    // ...then the turn list shrinks to a single entry underneath us (e.g. a
+    // session switch mid-nav).
+    {
+        let view = &mut app.display_for(0).view;
+        view.turns.clear();
+        view.turns.insert(
+            0,
+            Turn {
+                created_at: choreo_proto::TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("recent".to_string()),
+                assistant_text: None,
+                assistant_reasoning: None,
+                tool_calls: vec![],
+                token_usage: None,
+                tool_results: vec![],
+                displayed_images: vec![],
+            },
+        );
+    }
+    app.rebuild_height_prefix();
+
+    // The stale index (2) must clamp to the oldest remaining entry (0) and
+    // resync the displayed text — not silently no-op while showing stale text
+    // from the pre-shrink list.
+    app.navigate_history_up();
+    assert_eq!(app.history_index, Some(0));
+    assert_eq!(app.input.text, "recent");
+
+    // Further Up presses stay at the oldest remaining entry.
+    app.navigate_history_up();
+    assert_eq!(app.history_index, Some(0));
+    assert_eq!(app.input.text, "recent");
+
+    // Down still walks back to the saved draft.
     app.navigate_history_down();
     assert!(app.history_index.is_none());
     assert_eq!(app.input.text, "draft");
