@@ -1253,7 +1253,13 @@ For concurrent tools, each call gets:
    real time through the session command channel. It is fully event-driven — a
    `crossbeam_channel::select_biased!` on the streaming-output receiver (first arm) and
    the per-call kill receiver — so a kill signal is honored the instant it is sent and
-   chunks already queued are still drained before the thread exits.
+   chunks already queued are still drained before the thread exits. The streaming-output
+   channel between the execution thread and the forwarder is *bounded* (64 chunks), so a
+   tool that out-produces the forwarder applies backpressure (blocks on `send`) instead of
+   buffering an unbounded number of chunks in memory — the same bounded-channel design the
+   SSE reader uses. It cannot deadlock: the forwarder drains continuously into the
+   unbounded session command channel, and when it exits it drops the receiver, failing any
+   blocked `send`.
 3. A **wait-loop thread** that enforces the per-tool timeout (300s for shell tools, 60s for
    others, no limit for sub-sessions).
 4. A dedicated **image channel** — the tool emits any produced image through this channel,
@@ -1294,14 +1300,17 @@ is *more likely* to beat a simultaneously-ready result (bias for cancel — a pr
 not a guarantee, and both outcomes are handled correctly); when a cancel wins the race, an
 already-completed result is still drained (non-blocking) rather than discarded, so
 the tool's real output is recorded while the request still stops (sticky `cancelled` flag).
-A cancel observed by the concurrent collector also stops the batch drain immediately:
-every still-running wait-loop receives a per-tool kill (its forwarder stops streaming
-promptly and its `ToolContext.cancelled` flag is set so the tool itself can stop early),
-pending handles are drained, and the remaining placeholders are swept as
-`[cancelled — result not recorded]` instead of making the request wait for the slowest tool
-(note that a call dispatched but still running when the cancel lands is swept too — the
-sweep marks everything whose result was not actually recorded; it does not distinguish
-"never started" from "started but unfinished"). The tool's *execution thread* cannot be
+A cancel observed by the concurrent collector stops waiting for the slowest tool without
+making the transcript nondeterministic: every still-running wait-loop receives a per-tool
+kill (its forwarder stops streaming promptly and its `ToolContext.cancelled` flag is set
+so the tool itself can stop early), pending handles are drained, and — because every
+wait-loop selects on its kill channel — the collector keeps draining until all batch
+handles have arrived. Each unfinished call therefore records a deterministic
+`"tool '<name>' cancelled"` outcome instead of racing the placeholder sweep; the sweep
+(`mark_unexecuted_tool_results`) remains as a safety net for wait-loop threads that die
+before delivering (those are synthesized as panics) and for the serial phase. The drain
+is bounded by thread scheduling, not by the slowest tool — its execution thread keeps
+running in the background either way. The tool's *execution thread* cannot be
 interrupted mid-call (Rust threads are not killable) and runs to completion in the
 background, but every channel it would deliver through — exec result, streaming output,
 image — has been dropped by the wait-loop's exit, so its late result is discarded and it
@@ -1318,8 +1327,9 @@ kill channel after every forwarded chunk, so a continuously-streaming tool canno
 kill arm — a busy stream stops after one bounded final drain rather than streaming on
 forever.
 This removed the last poll loop from the tool execution path — the streaming channel itself
-is a crossbeam channel, so the forwarder blocks until a chunk or kill actually arrives
-rather than waking on a 200 ms interval. Both phases share a
+is a bounded crossbeam channel, so the forwarder blocks until a chunk or kill actually
+arrives rather than waking on a 200 ms interval (and a tool that out-produces the
+forwarder is throttled rather than buffered unboundedly). Both phases share a
 `ToolContext.cancelled` flag with the running tool — the serial wait sets it when it
 observes a cancel or the deadline expires, and the concurrent collector's per-tool kill
 sets it on the wait-loop's behalf — so a tool that consults it can stop early. (This

@@ -1,4 +1,7 @@
-use super::{Tool, ToolExecError, ToolOutputFormat, ToolRegistry, context::ToolContext};
+use super::{
+    STREAMING_CHANNEL_CAPACITY, Tool, ToolExecError, ToolOutputFormat, ToolRegistry,
+    context::ToolContext,
+};
 use choreo_ai_protocols::ChatToolCall;
 use choreo_keystore::ServiceCredential;
 use crossbeam_channel;
@@ -218,7 +221,15 @@ fn execute_series(
         // Pipe sub-tool streaming output through the relay thread to the
         // parent output channel so subscribers see output in real-time.
         let output = if let Some(parent_tx) = output_tx.as_ref() {
-            let (sub_tx, sub_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+            // Bounded like the parent streaming channel (see
+            // `STREAMING_CHANNEL_CAPACITY`): a sub-tool that out-produces the
+            // relay — which in turn blocks on the bounded parent channel —
+            // applies backpressure instead of buffering unboundedly in
+            // memory.  The relay drains continuously, so this cannot
+            // deadlock; if the parent channel is gone the relay exits and
+            // drops the receiver, failing any blocked `send`.
+            let (sub_tx, sub_rx) =
+                crossbeam_channel::bounded::<Vec<u8>>(STREAMING_CHANNEL_CAPACITY);
             let relay_handle = thread::spawn({
                 let parent_tx = parent_tx.clone();
                 move || {

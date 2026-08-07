@@ -323,9 +323,10 @@ where
     let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // The blocking socket read lives on a dedicated thread (see
-    // `crate::stream`): `recv_sse_event` below polls the channel with a short
-    // timeout, so an Escape during a stalled stream is noticed within ~200 ms
-    // instead of never (the old code only checked cancellation between reads).
+    // `crate::stream`): `recv_sse_event` below is fully event-driven — it
+    // `select_biased!`s on the event channel, the cancellation channel, and
+    // (when a deadline is set) an exact timer, so an Escape during a stalled
+    // stream is noticed the moment it is sent instead of on a poll tick.
     // Cancelling also arms the reader thread's abort flag, so it stops at its
     // next loop boundary instead of parsing the remainder of the stream.
     let sse = crate::stream::spawn_sse_reader(move || reader.next_event(), deadline.current());

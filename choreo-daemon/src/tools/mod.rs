@@ -83,6 +83,20 @@ pub use error::ToolError;
 pub use error::ToolExecError;
 pub(crate) use error::{tool_err, tool_ok};
 
+/// Capacity of the bounded channel between a tool's execution thread and its
+/// forwarding thread (`requests.rs`'s `spawn_tool_execution`), and between a
+/// `run_series` sub-tool and its relay thread (`series.rs`).
+///
+/// Bounding the channel applies backpressure: a tool that streams output
+/// faster than the forwarder can broadcast to subscribers blocks on `send`
+/// instead of buffering an unbounded number of chunks in memory. The
+/// forwarder drains continuously and the session command channel it forwards
+/// into is unbounded (std `mpsc::Sender::send` never blocks), so this cannot
+/// deadlock; on kill the forwarder exits and drops the receiver, failing any
+/// blocked `send`. Matches the SSE reader's bounded-channel design
+/// (`SSE_CHANNEL_CAPACITY` in choreo-ai-protocols).
+pub(crate) const STREAMING_CHANNEL_CAPACITY: usize = 64;
+
 /// Tool arguments for tools that take no parameters.
 ///
 /// Accepts both `null` and `{}` from JSON (serde_json deserializes `()` only
