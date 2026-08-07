@@ -1028,7 +1028,7 @@ pub(crate) fn sanitize_text(text: &str, keep_tabs: bool) -> String {
     }
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if (c == '\t' && keep_tabs) || (!c.is_control() && !is_unsafe_unicode(c)) {
+        if sanitize_keeps(c, keep_tabs) {
             out.push(c);
         } else {
             // escape_default renders the special escapes (`\t`, `\r`, `\n`,
@@ -1040,6 +1040,40 @@ pub(crate) fn sanitize_text(text: &str, keep_tabs: bool) -> String {
     out
 }
 
+/// Whether `c` passes through [`sanitize_text`] unchanged under `keep_tabs`
+/// (tabs are kept in line *content*, escaped in names). Shared by the
+/// sanitizer and its allocation-free length estimator so the two can never
+/// drift on what counts as "unsafe".
+fn sanitize_keeps(c: char, keep_tabs: bool) -> bool {
+    (c == '\t' && keep_tabs) || (!c.is_control() && !is_unsafe_unicode(c))
+}
+
+/// Byte length `text` would occupy after [`sanitize_text`] escaping with the
+/// given `keep_tabs` policy — computed *without* allocating. Lets grep's
+/// byte-budget pre-check reject an over-budget line before paying for the
+/// sanitizing copy. Exact, not an estimate: escaping expands a control or
+/// format char to up to ~6 bytes (`\u{1b}`), so a raw-byte count would both
+/// miss ESC-heavy lines and misjudge the budget threshold.
+pub(crate) fn sanitize_text_len(text: &str, keep_tabs: bool) -> usize {
+    // Fast path mirrors `sanitize_text`: all-ASCII printables (plus tabs when
+    // kept) pass through untouched, so the length is just the byte count.
+    if text
+        .bytes()
+        .all(|b| (b == b'\t' && keep_tabs) || (0x20..=0x7e).contains(&b))
+    {
+        return text.len();
+    }
+    text.chars()
+        .map(|c| {
+            if sanitize_keeps(c, keep_tabs) {
+                c.len_utf8()
+            } else {
+                c.escape_default().count()
+            }
+        })
+        .sum()
+}
+
 /// The non-control Unicode that must still be escaped: line / paragraph
 /// separators and Unicode *format* characters (general category Cf) except
 /// the joiners (see [`sanitize_text`]).
@@ -1049,8 +1083,9 @@ pub(crate) fn sanitize_text(text: &str, keep_tabs: bool) -> String {
 /// otherwise the full invisible-formatting surface: bidi marks/overrides/
 /// isolates (U+061C, U+200E/U+200F, U+202A..=U+202E, U+2066..=U+206F),
 /// zero-width space and word joiner (U+200B, U+2060), invisible operators
-/// (U+2061..=U+2064), the BOM (U+FEFF), soft hyphen, and the rarer format
-/// controls (tags, musical/phonetic, Egyptian hieroglyph, …). All of these
+/// (U+2061..=U+2064), the BOM (U+FEFF), soft hyphen, the Mongolian vowel
+/// separator (U+180E), and the rarer format controls (tags, musical/phonetic,
+/// Egyptian hieroglyph, …). All of these
 /// are invisible or spoofing-capable — they can hide text in identifiers,
 /// split tokens, or reorder rendered output — so they are escaped rather
 /// than passed through.
@@ -1097,6 +1132,9 @@ fn is_format_char(c: char) -> bool {
         // ZERO WIDTH NO-BREAK SPACE (BOM); INTERLINEAR ANNOTATION …
         | '\u{feff}'
         | '\u{fff9}'..='\u{fffb}'
+        // MONGOLIAN VOWEL SEPARATOR — a Cf that affects line-initial
+        // rendering of Mongolian vowels; invisible.
+        | '\u{180e}'
         // KAITHI NUMBER SIGN (ABOVE); EGYPTIAN HIEROGLYPH FORMAT CONTROLS;
         // SHORTHAND FORMAT CONTROLS; MUSICAL SYMBOL FORMAT CONTROLS.
         | '\u{110bd}'
@@ -2381,6 +2419,8 @@ mod tests {
         assert_eq!(sanitize_name("a\u{200b}b"), "a\\u{200b}b");
         assert_eq!(sanitize_name("a\u{2060}b"), "a\\u{2060}b");
         assert_eq!(sanitize_name("a\u{feff}b"), "a\\u{feff}b");
+        // Mongolian vowel separator is a Cf too — escaped, not passed through.
+        assert_eq!(sanitize_name("a\u{180e}b"), "a\\u{180e}b");
         // Joiners do not reorder or hide text and are legitimate in some
         // scripts (Persian ZWNJ, Indic conjuncts) — they pass through.
         assert_eq!(sanitize_name("a\u{200c}b"), "a\u{200c}b");
@@ -2403,7 +2443,35 @@ mod tests {
         assert_eq!(sanitize_content("a\u{200b}b"), "a\\u{200b}b");
         assert_eq!(sanitize_content("a\u{2060}b"), "a\\u{2060}b");
         assert_eq!(sanitize_content("a\u{feff}b"), "a\\u{feff}b");
+        assert_eq!(sanitize_content("a\u{180e}b"), "a\\u{180e}b");
         assert_eq!(sanitize_content("a\u{200c}b"), "a\u{200c}b");
+    }
+
+    #[test]
+    fn sanitize_text_len_matches_actual_sanitized_length() {
+        // The grep byte-budget pre-check must predict the exact rendered
+        // length with no allocation: equal to what the sanitizer produces,
+        // for both the content policy (tabs kept) and the name policy
+        // (tabs escaped), across controls, separators, format chars, and
+        // multi-byte text.
+        for s in [
+            "plain ascii",
+            "tab\there",
+            "new\nline",
+            "esc \u{1b}[31m",
+            "sep\u{2028}arator",
+            "bidi\u{202e}evil",
+            "mongolian\u{180e}vowel",
+            "café \u{200b} zwsp",
+            "",
+        ] {
+            assert_eq!(
+                sanitize_text_len(s, true),
+                sanitize_content(s).len(),
+                "{s:?}"
+            );
+            assert_eq!(sanitize_text_len(s, false), sanitize_name(s).len(), "{s:?}");
+        }
     }
 
     #[cfg(unix)]

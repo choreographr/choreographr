@@ -1,7 +1,8 @@
 use super::glob_util::GlobFilter;
 use super::{
     MAX_LINE_DISPLAY_BYTES, MAX_TOOL_OUTPUT_BYTES, Tool, ToolExecError, context::ToolContext,
-    finish_tool_output, sanitize_content, sanitize_name, truncation_marker,
+    finish_tool_output, human_size, sanitize_content, sanitize_name, sanitize_text_len,
+    truncation_marker,
 };
 use choreo_keystore::ServiceCredential;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -154,37 +155,50 @@ fn empty_result(pattern: &str, regex: bool) -> String {
     }
 }
 
+/// Window a raw line from grep-searcher to [`MAX_LINE_DISPLAY_BYTES`] plus
+/// terminator slop, then convert lossily. The returned `Cow` borrows the
+/// input for valid UTF-8 (the common case) and owns only for invalid input —
+/// so multi-MiB one-liners never trigger an eager full-line copy.
+///
+/// grep-searcher hands back each line *including* exactly one terminator —
+/// `\n` for LF files, `\r\n` for CRLF.
+fn lossy_window(bytes: &[u8]) -> Cow<'_, str> {
+    // The window is the display cap plus the CRLF terminator and a couple of
+    // bytes of UTF-8 slop; `prepare_line`'s `cap_line` re-cuts it to the
+    // exact cap on a char boundary, so the slop only bounds the
+    // lossy-conversion cost.
+    let window = &bytes[..bytes.len().min(MAX_LINE_DISPLAY_BYTES + 4)];
+    String::from_utf8_lossy(window)
+}
+
+/// Strip exactly one line terminator, then apply the line cap — the shared
+/// preprocessing for both the displayed line and its byte-budget estimate,
+/// so the two can never drift. Borrows `lossy` for under-cap lines (no
+/// allocation); over-cap lines allocate the capped prefix + marker. The
+/// caller keeps `lossy` alive, so the returned `Cow` may borrow it.
+///
+/// Strip precisely one terminator sequence (not *all* trailing CR/LF bytes)
+/// so a line whose data legitimately ends in `\r` before a CRLF terminator
+/// keeps that `\r` (escaped) instead of losing it.
+fn prepare_line(lossy: &str) -> (Cow<'_, str>, bool) {
+    let line = lossy
+        .strip_suffix("\r\n")
+        .or_else(|| lossy.strip_suffix('\n'))
+        .unwrap_or(lossy);
+    cap_line(line)
+}
+
 /// Normalize one line from grep-searcher for display: strip exactly the
 /// trailing line terminator, escape control characters (via the shared
 /// [`sanitize_content`], which keeps tabs literal), and cap over-long lines
 /// so a giant one-liner cannot balloon the result into memory.
 ///
-/// grep-searcher hands back each line *including* exactly one terminator —
-/// `\n` for LF files, `\r\n` for CRLF. Strip precisely that one sequence
-/// (not *all* trailing CR/LF bytes) so a line whose data legitimately ends in
-/// `\r` before a CRLF terminator keeps that `\r` (escaped) instead of losing
-/// it.
-///
-/// Memory stays bounded per line even for pathological input: the byte window
-/// is cut *before* `from_utf8_lossy`, because lossy conversion eagerly copies
-/// a line containing any invalid UTF-8 into an owned String (replacement
-/// chars). For a multi-MiB binary-ish one-liner that copy would dwarf every
-/// allocation the output byte budget ever sees.
-///
 /// Returns the display string and whether the line was truncated by the line
 /// cap — callers use the flag to detect pathological over-cap lines (e.g. to
 /// bound the after-context drain).
 fn sanitized_line(bytes: &[u8]) -> (String, bool) {
-    // The window is the display cap plus the CRLF terminator and a couple of
-    // bytes of UTF-8 slop; `cap_line` below re-cuts it to the exact cap on a
-    // char boundary, so the slop only bounds the lossy-conversion cost.
-    let window = &bytes[..bytes.len().min(MAX_LINE_DISPLAY_BYTES + 4)];
-    let lossy = String::from_utf8_lossy(window);
-    let line = lossy
-        .strip_suffix("\r\n")
-        .or_else(|| lossy.strip_suffix('\n'))
-        .unwrap_or(&lossy);
-    let (line, truncated) = cap_line(line);
+    let lossy = lossy_window(bytes);
+    let (line, truncated) = prepare_line(&lossy);
     (sanitize_content(&line), truncated)
 }
 
@@ -462,28 +476,33 @@ impl GrepSink {
     }
 
     /// Cheap byte-budget pre-check for a *raw* line (not yet sanitized).
-    /// Estimates the rendered size from the raw byte count capped at the
-    /// per-line display cap: an over-cap line renders as at most
-    /// [`MAX_LINE_DISPLAY_BYTES`] of content plus the truncation marker, so
-    /// a multi-MiB line does not actually consume its raw length of the
-    /// budget. Sanitization only ever *expands* an under-cap line (trimming
-    /// the ≤2 terminator bytes is the sole shrink), so the raw count is a
-    /// tight approximation there. If the estimate exceeds the budget, stop
-    /// without allocating a sanitized copy that `push_item` would reject a
-    /// moment later. Returns `false` to stop the searcher.
-    fn budget_allows_raw(&mut self, line_number: u64, raw_len: usize) -> bool {
-        // Content estimate = raw minus the terminator, capped at the line
-        // cap (the marker appended by `cap_line` for over-cap lines is
-        // omitted — a conservative under-count that never false-rejects).
-        let content_est = raw_len.saturating_sub(2).min(MAX_LINE_DISPLAY_BYTES);
-        // Rendered size ≈ label + separator + line digits + content +
-        // newline (matches `render_len` + the joining newline).
+    /// Computes the exact rendered size — label + separator + line digits +
+    /// sanitized content + joining newline — without allocating, so an
+    /// over-budget line is rejected *before* `sanitized_line` pays for the
+    /// sanitizing copy. Exactness matters: escaping expands a control or
+    /// format char to up to ~6 bytes (`\u{1b}`), so a raw-length estimate
+    /// would let an ESC-heavy line slip through the pre-check only to be
+    /// rejected inside `push_item` after the allocation. Because the estimate
+    /// and `push_item` share the same threshold, the pre-check is a perfect
+    /// predictor: no line that would fit is rejected, no line that would
+    /// overflow is sanitized first. Returns `false` to stop the searcher.
+    fn budget_allows_raw(&mut self, line_number: u64, bytes: &[u8]) -> bool {
+        // Reuse `lossy_window` + `prepare_line` so the window/strip/cap match
+        // `sanitized_line` exactly, then sum per-char escaped lengths without
+        // allocating.
+        let lossy = lossy_window(bytes);
+        let (line, _) = prepare_line(&lossy);
+        let content_len = sanitize_text_len(&line, true);
+        // Newline joins every rendered line but the very first of the output
+        // (`render_content`'s join emits n-1 separators), matching
+        // `push_item`'s charge.
+        let newline = usize::from(self.content_bytes != 0);
         let estimate = self.content_bytes
             + self.current_label.len()
             + 2
             + decimal_len(line_number)
-            + content_est
-            + 1;
+            + content_len
+            + newline;
         if estimate > MAX_TOOL_OUTPUT_BYTES {
             self.stop = Some(StopReason::ByteBudget);
             return false;
@@ -502,6 +521,12 @@ impl GrepSink {
         line_number: u64,
         bytes: &[u8],
     ) -> Result<bool, std::io::Error> {
+        // Same exact pre-check as `matched`/`context`: reject an over-budget
+        // line before the sanitizing allocation (`push_item` would reject it
+        // too, but only after paying for the copy).
+        if !self.budget_allows_raw(line_number, bytes) {
+            return Ok(false);
+        }
         let (content, truncated) = sanitized_line(bytes);
         if !self.push_item(GrepItem::Context {
             line_number,
@@ -538,21 +563,12 @@ impl GrepSink {
             .last()
             .map(|(label, _, _)| label == &self.current_label)
             .unwrap_or(false);
-        if !matches_current {
-            if matches!(item, GrepItem::Break) {
-                return true;
-            }
-            self.content_files
-                .push((self.current_label.clone(), Vec::new(), 0));
-        }
-        // Collapse consecutive Breaks: a separator directly after another
-        // separator (grep-searcher never does this, but defend against it)
-        // would render doubled `--` lines.
-        if matches!(item, GrepItem::Break)
-            && self.content_files.last().is_some_and(|(_, items, _)| {
-                items.last().is_some_and(|i| matches!(i, GrepItem::Break))
-            })
-        {
+        // A `Break` with no open bucket for the current file has nothing to
+        // separate — dropped rather than rendered as a stray `--`. (This also
+        // keeps a new file from inheriting the previous file's trailing
+        // break: the collapse check below only ever inspects the *current*
+        // file's bucket.)
+        if !matches_current && matches!(item, GrepItem::Break) {
             return true;
         }
         // Exact byte-budget guard (Content mode only): charge the rendered
@@ -567,6 +583,26 @@ impl GrepSink {
         if self.content_bytes + rendered > MAX_TOOL_OUTPUT_BYTES {
             self.stop = Some(StopReason::ByteBudget);
             return false;
+        }
+        // Open the per-file bucket lazily, and only once the budget accepted
+        // the item — a rejected first item must not leave an empty bucket
+        // behind (`render_content` renders every bucket, and `push_item`'s
+        // collapse logic treats the last bucket as the current file's).
+        if !matches_current {
+            self.content_files
+                .push((self.current_label.clone(), Vec::new(), 0));
+        }
+        // Collapse consecutive Breaks: a separator directly after another
+        // separator (grep-searcher never does this, but defend against it)
+        // would render doubled `--` lines. Runs after the bucket is ensured
+        // to be the current file's so it never inspects the previous file's
+        // trailing break.
+        if matches!(item, GrepItem::Break)
+            && self.content_files.last().is_some_and(|(_, items, _)| {
+                items.last().is_some_and(|i| matches!(i, GrepItem::Break))
+            })
+        {
+            return true;
         }
         if let Some((_, items, charged)) = self.content_files.last_mut() {
             *charged += rendered;
@@ -645,7 +681,7 @@ impl Sink for GrepSink {
                 // Reject a line that would blow the byte budget before
                 // sanitizing it — `sanitized_line` can allocate up to the
                 // line cap, and `push_item` would discard the result anyway.
-                if !self.budget_allows_raw(line_number, mat.bytes().len()) {
+                if !self.budget_allows_raw(line_number, mat.bytes()) {
                     return Ok(false);
                 }
                 // SinkMatch bytes include the line terminator — strip it (and
@@ -727,7 +763,7 @@ impl Sink for GrepSink {
         }
         // Same pre-check as `matched`: a line that would exceed the byte
         // budget is rejected before the sanitizing allocation.
-        if !self.budget_allows_raw(ctx.line_number().unwrap_or(0), ctx.bytes().len()) {
+        if !self.budget_allows_raw(ctx.line_number().unwrap_or(0), ctx.bytes()) {
             return Ok(false);
         }
         let (content, _) = sanitized_line(ctx.bytes());
@@ -852,6 +888,18 @@ fn finish_grep(sink: GrepSink, pattern: &str, regex: bool) -> String {
         truncated = sink.truncated(),
         "grep search finished"
     );
+    // The byte budget can stop the walk before anything is collected when a
+    // single match's *sanitized* line alone exceeds the budget (e.g. a line
+    // dense with control characters, each escaping to ~6 bytes). A match
+    // exists, so "No matches found." would be wrong — report the budget
+    // truncation explicitly so the model knows the pattern matched but the
+    // result could not fit.
+    if sink.stop == Some(StopReason::ByteBudget) && result_count == 0 {
+        return format!(
+            "...[truncated: matches exceed the {} output budget]",
+            human_size(MAX_TOOL_OUTPUT_BYTES as u64)
+        );
+    }
     if result_count == 0 {
         // If the walk never actually searched a file (an include glob filtered
         // everything out, an empty directory, …), the regex hint would
@@ -1176,14 +1224,17 @@ impl Tool for Grep {
             Some(p) => parts.push(format!(" In path: `{}`.", p)),
             None => parts.push(" In working directory.".to_string()),
         }
-        if let Some(max) = args.max_results {
-            // Report the value the tool will actually apply — out-of-range
-            // requests are clamped to MAX_RESULTS_CAP at execution, so
-            // advertising e.g. "5000" while 200 are returned would mislead
-            // the model.
-            let shown = max.clamp(1, MAX_RESULTS_CAP);
-            parts.push(format!(" Max results: {shown}."));
-        }
+        // Always report the effective result cap the tool will apply — the
+        // default when the caller omits it, clamped when they over-request —
+        // so the model knows the result set is bounded even for default
+        // searches. Out-of-range requests are clamped to MAX_RESULTS_CAP at
+        // execution, so advertising e.g. "5000" while 200 are returned would
+        // mislead the model.
+        let shown = args
+            .max_results
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(1, MAX_RESULTS_CAP);
+        parts.push(format!(" Max results: {shown}."));
         parts.concat()
     }
 
@@ -1653,6 +1704,75 @@ mod tests {
     }
 
     #[test]
+    fn budget_precheck_matches_push_item_threshold() {
+        // The pre-check must be a perfect predictor of `push_item`'s
+        // byte-budget decision (same threshold, exact rendered size), so a
+        // line rejected here is exactly a line `push_item` would reject — and
+        // never one it would accept. Exercise both under- and over-cap raw
+        // lines and a range of already-buffered byte totals.
+        for content_bytes in [
+            0usize,
+            1,
+            100,
+            MAX_TOOL_OUTPUT_BYTES / 2,
+            MAX_TOOL_OUTPUT_BYTES - 10,
+        ] {
+            for raw_len in [1usize, 100, 10_000, 100_000, 1_000_000] {
+                let bytes = vec![b'x'; raw_len];
+
+                let mut pre =
+                    GrepSink::new(GrepOutputMode::Content, 10, 0, Path::new("root"), false);
+                pre.begin_file(Path::new("a.txt"));
+                pre.content_bytes = content_bytes;
+                let pre_allows = pre.budget_allows_raw(1, &bytes);
+
+                let mut exact =
+                    GrepSink::new(GrepOutputMode::Content, 10, 0, Path::new("root"), false);
+                exact.begin_file(Path::new("a.txt"));
+                exact.content_bytes = content_bytes;
+                let accepted = exact.push_item(GrepItem::Match {
+                    line_number: 1,
+                    content: sanitized_line(&bytes).0,
+                });
+                assert_eq!(
+                    pre_allows, accepted,
+                    "pre-check must predict push_item: content_bytes={content_bytes} raw_len={raw_len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn over_budget_first_match_reports_budget_truncation() {
+        // A single matching line whose *sanitized* size alone exceeds the
+        // output budget (each ESC byte escapes to ~6 bytes: 25 KiB → ~150
+        // KiB) must not report "No matches found." — a match exists, it just
+        // cannot fit. The result must say the output budget truncated it.
+        let dir = TempDir::new().expect("temp dir");
+        let mut line = String::with_capacity(30 * 1024);
+        line.push_str("needle");
+        line.push_str(&"\u{1b}".repeat(25 * 1024));
+        line.push('\n');
+        std::fs::write(dir.path().join("esc.txt"), line).expect("write");
+
+        let tool = Grep;
+        let args = test_args("needle", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            !result.contains("No matches found."),
+            "a match existed; the budget, not the pattern, stopped the walk:\n{result}"
+        );
+        assert!(
+            result.contains("...[truncated: matches exceed the"),
+            "expected an explicit budget-truncation message:\n{result}"
+        );
+        assert!(
+            result.contains("128 KiB"),
+            "budget message should name the 128 KiB budget:\n{result}"
+        );
+    }
+
+    #[test]
     fn test_over_cap_line_truncated_with_marker() {
         // A 256 KiB one-liner is far past the 64 KiB line display cap. The
         // match must render capped with the shared marker instead of being
@@ -2107,12 +2227,49 @@ mod tests {
     }
 
     #[test]
+    fn push_item_rejected_first_item_leaves_no_empty_bucket() {
+        // A first item rejected by the byte-budget guard must not leave an
+        // empty per-file bucket behind (`render_content` renders every bucket,
+        // and the collapse logic treats the last bucket as the current file's
+        // — an empty leftover would be a latent inconsistency even though it
+        // renders as nothing).
+        let mut sink = GrepSink::new(GrepOutputMode::Content, 10, 0, Path::new("root"), false);
+        sink.begin_file(Path::new("a.txt"));
+        let huge = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1);
+        let accepted = sink.push_item(GrepItem::Match {
+            line_number: 1,
+            content: huge,
+        });
+        assert!(!accepted, "over-budget item must be rejected");
+        assert_eq!(sink.stop, Some(StopReason::ByteBudget));
+        assert!(
+            sink.content_files.is_empty(),
+            "a rejected first item must not leave an empty bucket behind"
+        );
+        assert_eq!(sink.content_bytes, 0, "nothing charged for a rejected item");
+    }
+
+    #[test]
     fn describe_invocation_includes_pattern_and_path() {
         let tool = Grep;
         let args = test_args("fn main", Some(Path::new("src")));
         let desc = tool.describe_invocation(&args);
         assert!(desc.contains("Searching for `fn main`."));
         assert!(desc.contains("In path: `src`."));
+    }
+
+    #[test]
+    fn describe_invocation_advertises_default_max_results() {
+        // max_results omitted → the tool applies DEFAULT_MAX_RESULTS; the
+        // invocation description must say so (the model reads it to predict
+        // the result-set size).
+        let tool = Grep;
+        let args = test_args("foo", None);
+        let desc = tool.describe_invocation(&args);
+        assert!(
+            desc.contains("Max results: 50."),
+            "default cap must be advertised: {desc}"
+        );
     }
 
     #[test]
