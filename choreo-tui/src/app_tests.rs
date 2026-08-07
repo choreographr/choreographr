@@ -2143,6 +2143,67 @@ fn navigate_history_down_moves_to_newer() {
 }
 
 #[test]
+fn navigate_history_down_survives_shrunk_history() {
+    let mut app = test_app();
+    add_user_text(&mut app, "oldest");
+    add_user_text(&mut app, "older");
+    add_user_text(&mut app, "recent");
+    // Simulate having browsed back to the oldest entry...
+    app.history_index = Some(2);
+    app.input.text = "oldest".to_string();
+    app.saved_draft = "draft".to_string();
+
+    // ...then the conversation changes underneath us: the turn list is reset
+    // so only a single user text remains (e.g. a session switch mid-nav).
+    {
+        let view = &mut app.display_for(0).view;
+        view.turns.clear();
+        view.turns.insert(
+            0,
+            Turn {
+                created_at: choreo_proto::TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("recent".to_string()),
+                assistant_text: None,
+                assistant_reasoning: None,
+                tool_calls: vec![],
+                token_usage: None,
+                tool_results: vec![],
+                displayed_images: vec![],
+            },
+        );
+    }
+    app.rebuild_height_prefix();
+
+    // The stale index (2) must be clamped down to the newest remaining entry
+    // (index 0) instead of panicking with an out-of-bounds index.
+    app.navigate_history_down();
+    assert_eq!(app.history_index, Some(0));
+    assert_eq!(app.input.text, "recent");
+
+    // And the next Down still exits back to the saved draft.
+    app.navigate_history_down();
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input.text, "draft");
+    assert!(app.saved_draft.is_empty());
+}
+
+#[test]
+fn navigate_history_down_empty_history_restores_draft() {
+    let mut app = test_app();
+    app.history_index = Some(3);
+    app.saved_draft = "draft".to_string();
+    app.input.text = "stale".to_string();
+
+    // No turns at all: Down must fall back to the draft, not panic.
+    app.navigate_history_down();
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input.text, "draft");
+    assert!(app.saved_draft.is_empty());
+}
+
+#[test]
 fn history_nav_resets_after_commit() {
     let mut app = test_app();
     add_user_text(&mut app, "old");

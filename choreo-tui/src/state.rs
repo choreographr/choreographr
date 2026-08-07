@@ -2488,22 +2488,41 @@ impl App {
     pub(crate) fn navigate_history_down(&mut self) {
         if let Some(idx) = self.history_index {
             let texts = self.user_texts();
-            if idx > 0 {
-                let prev = idx - 1;
-                self.history_index = Some(prev);
-                self.input.text = texts[prev].to_string();
-                self.input.generation += 1;
-                self.input.cursor = self.input.text.len();
-                self.ensure_input_cursor_visible();
-            } else {
-                self.history_index = None;
-                self.input.text = self.saved_draft.clone();
-                self.input.generation += 1;
-                self.saved_draft.clear();
-                self.input.cursor = self.input.text.len();
-                self.ensure_input_cursor_visible();
+            if texts.is_empty() {
+                // The conversation changed out from under us (e.g. the user
+                // switched sessions mid-navigation) and no history remains to
+                // walk back through — fall straight to the saved draft.
+                self.restore_history_draft();
+                return;
             }
+            if idx == 0 {
+                // Already at the newest entry: Down exits back to the draft.
+                self.restore_history_draft();
+                return;
+            }
+            // history_index was recorded against the turn list as it existed
+            // when the user pressed Up. The list may have shrunk since (turns
+            // replaced, session switched), so a step toward the newest entry
+            // can land past the end — clamp to the newest remaining entry
+            // instead of indexing out of bounds.
+            let prev = (idx - 1).min(texts.len() - 1);
+            self.history_index = Some(prev);
+            self.input.text = texts[prev].to_string();
+            self.input.generation += 1;
+            self.input.cursor = self.input.text.len();
+            self.ensure_input_cursor_visible();
         }
+    }
+
+    /// Drop history navigation and put the user's saved draft back in the
+    /// input, clearing the stash. Shared by all the "exit to draft" paths.
+    fn restore_history_draft(&mut self) {
+        self.history_index = None;
+        self.input.text = self.saved_draft.clone();
+        self.input.generation += 1;
+        self.saved_draft.clear();
+        self.input.cursor = self.input.text.len();
+        self.ensure_input_cursor_visible();
     }
 
     pub(crate) fn commit_to_history(&mut self) {
