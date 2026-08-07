@@ -570,9 +570,9 @@ cargo nextest run --workspace --retries 2          # retry flaky tests
 cargo nextest run --workspace --partition count:1/2   # shard for CI
 ```
 
-Note that the `test-*` aliases bake in `--workspace`, so `-p <crate>` passed to
-them is swallowed — run `cargo nextest run -p <crate>` directly to scope a run
-to a single crate.
+Note that the `test-*` aliases bake in `--workspace`, so passing `-p <crate>`
+to them is rejected by cargo (conflicting flags) — run
+`cargo nextest run -p <crate>` directly to scope a run to a single crate.
 
 ## Troubleshooting
 

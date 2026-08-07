@@ -1,6 +1,7 @@
 use super::{ToolExecError, truncate_tool_output};
 use std::{
     io::{BufRead, BufReader, Read},
+    os::fd::OwnedFd,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -41,54 +42,122 @@ pub(crate) fn sanitize_env(cmd: &mut Command) {
     }
 }
 
-/// Attach resource limits (AS, FSIZE) via a pre-exec hook.
-/// Must be called inside an `unsafe { cmd.pre_exec(|| …) }` block.
-pub(crate) fn apply_rlimits() -> Result<(), std::io::Error> {
-    // use nix::sys::resource::{Resource, setrlimit};
-    //
-    // let limits = [
-    //     (Resource::RLIMIT_AS, 4 * 1024 * 1024 * 1024),
-    //     (Resource::RLIMIT_FSIZE, 100 * 1024 * 1024),
-    // ];
-    // for (resource, value) in limits {
-    //     setrlimit(resource, value, value)?;
-    // }
-    Ok(())
+/// Apply all child-process hardening (env sanitization + process-group
+/// isolation).
+///
+/// Every shell-tool spawn funnels through this hook: `spawn_with_watchdog`
+/// and `spawn_with_streaming` call it before spawning, so placing the child
+/// in its own process group here covers `sh`, `fish`, `nu`, `exec`, and the
+/// streaming variants in one place.
+///
+/// Resource limits are deliberately not applied here — the OS-level sandbox
+/// (Landlock on Linux, Seatbelt on macOS) is the confinement boundary. A
+/// `setrlimit` pre-exec hook was removed as dead code; see git history if
+/// in-process rlimits are ever needed again.
+fn setup_child(cmd: &mut Command) {
+    sanitize_env(cmd);
+    // Put the child in its own process group (pgid == child pid) so a
+    // timeout watchdog can kill the entire tree via killpg(2) instead of
+    // only the direct child. Without this, a timeout on
+    // `fish -c "sleep 10"` SIGKILLs the fish wrapper but leaves the
+    // orphaned `sleep` grandchild holding the stdout/stderr pipes — the
+    // tool then blocks until the grandchild exits on its own, so a
+    // "timed out" result takes 10s instead of the configured 500ms (and
+    // in production, an LLM tool call would hang for the same duration).
+    // `process_group(0)` is a safe API (the child calls setpgid(0, 0) before
+    // exec), so no `unsafe` / pre_exec hook is needed here.
+    cmd.process_group(0);
 }
 
-/// Apply all child-process hardening (env sanitization + process-group
-/// isolation + resource limits).
+/// Open a pidfd pinning `pid`, so a later timeout kill can prove the PID
+/// still refers to the child we spawned (see `kill_child_tree`). Linux-only
+/// (pidfd(2), available since kernel 5.3); returns `None` when the syscall is
+/// unavailable (older kernel, seccomp policy) or the child has already
+/// exited — callers then fall back to the PID-based kill path.
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> Option<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // pidfd_open(2): flags must be 0. The fd is wrapped in an OwnedFd so it is
+    // closed automatically when the watchdog thread exits (see `spawn_watchdog`).
+    let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid as nix::libc::pid_t, 0) };
+    if fd >= 0 {
+        Some(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    } else {
+        None
+    }
+}
+
+/// Non-Linux platforms have no pidfd(2); timeout kills stay PID-based there.
+#[cfg(not(target_os = "linux"))]
+fn open_pidfd(_pid: u32) -> Option<OwnedFd> {
+    None
+}
+
+/// Send `sig` to the process pinned by `fd` (pidfd_send_signal(2)).
 ///
-/// Every shell tool (`sh`, `fish`, `nu`, `exec`) funnels through this hook,
-/// so placing the child in its own process group here covers all of them.
-pub(crate) fn setup_child(cmd: &mut Command) {
-    sanitize_env(cmd);
-    unsafe {
-        // Put the child in its own process group (pgid == child pid) so a
-        // timeout watchdog can kill the entire tree via killpg(2) instead of
-        // only the direct child. Without this, a timeout on
-        // `fish -c "sleep 10"` SIGKILLs the fish wrapper but leaves the
-        // orphaned `sleep` grandchild holding the stdout/stderr pipes — the
-        // tool then blocks until the grandchild exits on its own, so a
-        // "timed out" result takes 10s instead of the configured 500ms (and
-        // in production, an LLM tool call would hang for the same duration).
-        cmd.process_group(0);
-        cmd.pre_exec(apply_rlimits);
+/// Fails with `ESRCH` when the pinned process no longer exists — which is the
+/// property `kill_child_tree` relies on to detect that the child finished on
+/// its own. A PID recycled onto an unrelated process can never satisfy this,
+/// because the fd pins the original process identity.
+#[cfg(target_os = "linux")]
+fn pidfd_send_signal(fd: &OwnedFd, sig: nix::libc::c_int) -> nix::Result<()> {
+    use std::os::fd::AsRawFd;
+    // info = NULL delivers the signal with the default siginfo_t; flags must
+    // be 0.
+    let ret = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            sig,
+            std::ptr::null::<nix::libc::siginfo_t>(),
+            0,
+        )
+    };
+    if ret < 0 {
+        Err(nix::errno::Errno::last())
+    } else {
+        Ok(())
     }
 }
 
 /// Kill a spawned child, preferring its whole process group so descendants
 /// (e.g. a shell's `sleep`) are reaped too.
 ///
-/// `killpg(pid)` is only attempted when the child is confirmed to be its
-/// group's leader (`getpgid(pid) == pid`). That confirmation is what makes the
-/// syscall safe: when the child is *not* a leader — the caller spawned without
+/// When a pidfd pins the child's identity (Linux), `pidfd_send_signal` is
+/// used first: a successful SIGKILL proves the PID has not been recycled onto
+/// an unrelated process, so the subsequent `killpg(pid)` sweep targets the
+/// right group. If the pidfd signal fails, the pinned process no longer
+/// exists (it finished on its own) and nothing is reported as killed.
+///
+/// Without a pidfd (macOS, or pidfd unavailable), `killpg(pid)` is only
+/// attempted when the child is confirmed to be its group's leader
+/// (`getpgid(pid) == pid`). That confirmation is what makes the syscall safe:
+/// when the child is *not* a leader — the caller spawned without
 /// `setup_child`, or the timeout landed in the fork→setpgid window —
 /// `killpg(pid)` would signal whatever process group happens to have that id
-/// (normally ESRCH, but a recycled PID could collide with an orphaned group id
-/// and take down an unrelated tree). Non-leaders fall straight back to a
+/// (normally ESRCH, but a recycled PID could collide with an orphaned group
+/// id and take down an unrelated tree). Non-leaders fall straight back to a
 /// direct kill of the child itself.
-fn kill_child_tree(pid: u32) -> bool {
+fn kill_child_tree(pid: u32, _pidfd: Option<&OwnedFd>) -> bool {
+    // Pinned-identity path — reachable only on Linux, where `open_pidfd` can
+    // return `Some`.
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = _pidfd {
+        // SIGKILL the leader through the pinned fd, then sweep the rest of
+        // the group by pgid (== pid, since setup_child made the child a
+        // leader). The `killpg` is best-effort: if the leader was the only
+        // member the group is already gone and it returns ESRCH harmlessly.
+        if pidfd_send_signal(fd, nix::libc::SIGKILL).is_err() {
+            return false;
+        }
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        return true;
+    }
+
+    // Legacy PID-based path (non-Linux, or pidfd unavailable).
     let pid = nix::unistd::Pid::from_raw(pid as i32);
     // True only while the child lives as its group's leader. Once it has
     // exited (even unreaped) getpgid can still succeed — matching kill(2),
@@ -103,43 +172,66 @@ fn kill_child_tree(pid: u32) -> bool {
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).is_ok()
 }
 
-/// Spawn the command, run a watchdog thread to enforce the timeout,
-/// and return the process output along with a flag indicating whether
-/// the watchdog killed the process.
+/// Spawn the watchdog thread that enforces `timeout_ms` on a child process.
 ///
-/// The watchdog blocks on a channel receive with the given timeout.
-/// When the child finishes, the main thread sends a signal through the
-/// channel, waking the watchdog early — no polling required.
-pub(crate) fn spawn_with_watchdog(
-    cmd: &mut Command,
+/// The watchdog blocks on a channel receive with the given timeout. When the
+/// child finishes, the main thread signals completion through `done_tx`,
+/// waking the watchdog early — no polling required. If the timeout expires
+/// first, the child's whole process tree is killed (see `kill_child_tree`),
+/// and `killed_tx` is signalled so the caller can report `was_killed`. Shared
+/// by the buffered and streaming spawn paths so their timeout semantics stay
+/// identical.
+///
+/// `pidfd` pins the child's identity for the kill (see `open_pidfd`) and is
+/// closed when the watchdog thread exits.
+fn spawn_watchdog(
     timeout_ms: u64,
-) -> Result<(Output, bool), ToolExecError> {
-    let child = cmd.spawn()?;
-    let pid = child.id();
-
-    let (done_tx, done_rx) = mpsc::channel::<()>();
-    let (killed_tx, killed_rx) = mpsc::channel::<()>();
-
-    let watchdog = std::thread::spawn(move || {
+    pid: u32,
+    pidfd: Option<OwnedFd>,
+    done_rx: mpsc::Receiver<()>,
+    killed_tx: mpsc::Sender<()>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
         if done_rx
             .recv_timeout(Duration::from_millis(timeout_ms))
             .is_err()
-        {
             // Timeout expired before the main thread signalled completion —
             // kill the child's process tree (see `kill_child_tree`). Only set
             // was_killed when a kill actually lands (both killpg and kill
             // return ESRCH when everything already exited, which can happen in
             // a narrow race where the timeout fires at the same instant the
             // child finishes).
-            if kill_child_tree(pid) {
-                warn!(
-                    pid,
-                    timeout_ms, "shell tool timed out; killed child process group"
-                );
-                let _ = killed_tx.send(());
-            }
+            && kill_child_tree(pid, pidfd.as_ref())
+        {
+            warn!(
+                pid,
+                timeout_ms, "shell tool timed out; killed child process group"
+            );
+            let _ = killed_tx.send(());
         }
-    });
+    })
+}
+
+/// Spawn the command, run a watchdog thread to enforce the timeout,
+/// and return the process output along with a flag indicating whether
+/// the watchdog killed the process.
+///
+/// Applies child-process hardening (`setup_child`) before spawning, and pins
+/// the child's identity with a pidfd on Linux so a timeout kill can never be
+/// redirected at a recycled PID (see `open_pidfd` / `kill_child_tree`).
+pub(crate) fn spawn_with_watchdog(
+    cmd: &mut Command,
+    timeout_ms: u64,
+) -> Result<(Output, bool), ToolExecError> {
+    setup_child(cmd);
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    let pidfd = open_pidfd(pid);
+
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (killed_tx, killed_rx) = mpsc::channel::<()>();
+
+    let watchdog = spawn_watchdog(timeout_ms, pid, pidfd, done_rx, killed_tx);
 
     let output = child.wait_with_output()?;
     let _ = done_tx.send(());
@@ -153,8 +245,10 @@ pub(crate) fn spawn_with_watchdog(
 /// Enforces a timeout via watchdog and returns the collected output
 /// along with a was-killed flag.
 ///
-/// The caller is responsible for calling `setup_child` and setting
-/// `Stdio::piped()` on both stdout and stderr before calling this.
+/// Applies child-process hardening (`setup_child`) before spawning, and pins
+/// the child's identity with a pidfd on Linux so a timeout kill can never be
+/// redirected at a recycled PID. The caller must still set `Stdio::piped()`
+/// on both stdout and stderr before calling this.
 ///
 /// IMPORTANT: Both stdout and stderr are drained in background threads
 /// so that the child process can never block on a full pipe buffer
@@ -165,8 +259,10 @@ pub fn spawn_with_streaming(
     timeout_ms: u64,
     output_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(Output, bool), ToolExecError> {
+    setup_child(cmd);
     let mut child = cmd.spawn()?;
     let pid = child.id();
+    let pidfd = open_pidfd(pid);
 
     // Take stdout so wait_with_output cannot grab it — we read it
     // incrementally in a background thread.
@@ -210,24 +306,11 @@ pub fn spawn_with_streaming(
         buf
     });
 
-    // Watchdog thread: enforce timeout.
+    // Watchdog thread: enforce timeout. Shared with the buffered path so the
+    // two timeout semantics stay identical (see `spawn_watchdog`).
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let (killed_tx, killed_rx) = mpsc::channel::<()>();
-    let watchdog = std::thread::spawn(move || {
-        // Same process-tree kill as `spawn_with_watchdog` — the streaming
-        // path must reap grandchildren too (see `kill_child_tree`).
-        if done_rx
-            .recv_timeout(Duration::from_millis(timeout_ms))
-            .is_err()
-            && kill_child_tree(pid)
-        {
-            warn!(
-                pid,
-                timeout_ms, "shell tool timed out; killed child process group"
-            );
-            let _ = killed_tx.send(());
-        }
-    });
+    let watchdog = spawn_watchdog(timeout_ms, pid, pidfd, done_rx, killed_tx);
 
     // Wait for the process to finish (both background threads drain the
     // pipes concurrently, preventing any blocking deadlock).
@@ -254,10 +337,10 @@ pub fn spawn_with_streaming(
     ))
 }
 
-/// Convenience wrapper that combines `setup_child`, `spawn_with_streaming`,
-/// and `format_shell_output` into a single call — used by shell tool
-/// `execute_streaming` implementations to avoid repeating the same 4-line
-/// pattern across `sh`, `fish`, `nu`, and `exec`.
+/// Convenience wrapper that combines `spawn_with_streaming` (which applies
+/// `setup_child` hardening itself) and `format_shell_output` into a single
+/// call — used by shell tool `execute_streaming` implementations to avoid
+/// repeating the same 3-line pattern across `sh`, `fish`, `nu`, and `exec`.
 ///
 /// The caller must have set `Stdio::piped()` on both stdout and stderr.
 pub fn run_shell_streaming(
@@ -266,7 +349,6 @@ pub fn run_shell_streaming(
     timeout_ms: u64,
     output_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<String, ToolExecError> {
-    setup_child(cmd);
     let (output, was_killed) = spawn_with_streaming(cmd, timeout_ms, output_tx)?;
     Ok(format_shell_output(
         display_cmd,
@@ -366,8 +448,30 @@ mod tests {
         let mut _reap = ReapOnDrop(child);
 
         assert!(
-            kill_child_tree(pid),
+            kill_child_tree(pid, None),
             "direct-kill fallback must reap a non-leader child"
+        );
+        // The child must have been SIGKILLed, not exited cleanly.
+        assert!(!_reap.0.wait().expect("wait on killed child").success());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn kill_child_tree_kills_group_through_pinned_pidfd() {
+        // With a pidfd pinning the child's identity, kill_child_tree must kill
+        // the leader via pidfd_send_signal and then sweep the group. Guards
+        // the Linux-only pidfd branch against silently becoming dead code.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30"]).stdout(Stdio::piped());
+        setup_child(&mut cmd);
+        let child = cmd.spawn().expect("spawn child");
+        let pid = child.id();
+        let pidfd = open_pidfd(pid).expect("pidfd_open on live child");
+        let mut _reap = ReapOnDrop(child);
+
+        assert!(
+            kill_child_tree(pid, Some(&pidfd)),
+            "pinned pidfd kill must reap a leader child"
         );
         // The child must have been SIGKILLed, not exited cleanly.
         assert!(!_reap.0.wait().expect("wait on killed child").success());

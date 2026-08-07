@@ -1,9 +1,7 @@
 use super::{
     Tool, ToolExecError,
     context::ToolContext,
-    shell_util::{
-        format_shell_output, resolve_workdir, run_shell_streaming, setup_child, spawn_with_watchdog,
-    },
+    shell_util::{format_shell_output, resolve_workdir, run_shell_streaming, spawn_with_watchdog},
 };
 use choreo_keystore::ServiceCredential;
 use schemars::JsonSchema;
@@ -235,8 +233,6 @@ pub fn execute_exec_tool(
         .current_dir(&resolved)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-
-    setup_child(&mut cmd);
 
     let (output, was_killed) = spawn_with_watchdog(&mut cmd, timeout_ms)?;
 

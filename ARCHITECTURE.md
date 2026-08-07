@@ -2029,13 +2029,16 @@ itself is the kernel's responsibility.
 `fish` runs commands in a child `fish -c` process with the same sandboxing as `sh`. Registered only when the `fish` binary is found in `PATH`.
 
 Shell tools (`sh`, `fish`, `nu`, `exec`, and the streaming variants) put the
-child in its own process group (`setup_child` in `tools/shell_util.rs`); on
-timeout the watchdog kills the whole group via `killpg(2)` — after verifying
-the child is its group's leader, with a direct-kill fallback otherwise —
-rather than just the direct child. This matters for shells that don't `exec`
-the final command (fish): killing only the wrapper would orphan grandchildren
-like `sleep`, which keep the output pipes open and turn a 500ms timeout into a
-~10s hang.
+child in its own process group (`setup_child` in `tools/shell_util.rs`, applied
+inside the shared `spawn_with_watchdog` / `spawn_with_streaming` helpers); on
+timeout the watchdog kills the whole group via `killpg(2)`. On Linux the
+child's identity is first pinned with a `pidfd` so a recycled PID can never
+redirect the kill at an unrelated process; on platforms without `pidfd` the
+kill is gated on the child being its group's leader (`getpgid`), with a
+direct-kill fallback otherwise — rather than just killing the direct child.
+This matters for shells that don't `exec` the final command (fish): killing
+only the wrapper would orphan grandchildren like `sleep`, which keep the
+output pipes open and turn a 500ms timeout into a ~10s hang.
 
 
 | Layer | What's tested | Location |
