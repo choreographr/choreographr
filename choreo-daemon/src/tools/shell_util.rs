@@ -81,20 +81,21 @@ fn setup_child(cmd: &mut Command) {
 /// exited — callers then fall back to the PID-based kill path.
 #[cfg(target_os = "linux")]
 fn open_pidfd(pid: u32) -> Option<OwnedFd> {
-    use std::os::fd::FromRawFd;
-    // pidfd_open(2): flags must be 0. The fd is wrapped in an OwnedFd so it is
-    // closed automatically when the watchdog thread exits (see `spawn_watchdog`).
-    let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid as nix::libc::pid_t, 0) };
-    if fd >= 0 {
-        Some(unsafe { OwnedFd::from_raw_fd(fd as i32) })
-    } else {
-        // Expected on kernels < 5.3 and under pidfd-blocking seccomp policies,
-        // and in a narrow race where the child already exited (ESRCH). Timeout
-        // kills then degrade to the leader-checked PID path — that is by
-        // design, so trace (not warn) keeps the common case quiet.
-        let err = nix::errno::Errno::last();
-        trace!(pid, error = %err, "pidfd_open unavailable; timeout kills fall back to PID-based killpg");
-        None
+    // rustix wraps pidfd_open(2) (flags must be empty) and returns the fd as
+    // an OwnedFd, so it is closed automatically when the watchdog thread
+    // exits. `Pid::from_raw` yields None only for pid 0, which child.id()
+    // never produces — kept defensive rather than unwrapping.
+    let pid = rustix::process::Pid::from_raw(pid as i32)?;
+    match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+        Ok(fd) => Some(fd),
+        Err(e) => {
+            // Expected on kernels < 5.3 and under pidfd-blocking seccomp policies,
+            // and in a narrow race where the child already exited (ESRCH). Timeout
+            // kills then degrade to the leader-checked PID path — that is by
+            // design, so trace (not warn) keeps the common case quiet.
+            trace!(pid = pid.as_raw_pid(), error = %e, "pidfd_open unavailable; timeout kills fall back to PID-based killpg");
+            None
+        }
     }
 }
 
@@ -102,33 +103,6 @@ fn open_pidfd(pid: u32) -> Option<OwnedFd> {
 #[cfg(not(target_os = "linux"))]
 fn open_pidfd(_pid: u32) -> Option<OwnedFd> {
     None
-}
-
-/// Send `sig` to the process pinned by `fd` (pidfd_send_signal(2)).
-///
-/// Fails with `ESRCH` when the pinned process no longer exists — which is the
-/// property `kill_child_tree` relies on to detect that the child finished on
-/// its own. A PID recycled onto an unrelated process can never satisfy this,
-/// because the fd pins the original process identity.
-#[cfg(target_os = "linux")]
-fn pidfd_send_signal(fd: &OwnedFd, sig: nix::libc::c_int) -> nix::Result<()> {
-    use std::os::fd::AsRawFd;
-    // info = NULL delivers the signal with the default siginfo_t; flags must
-    // be 0.
-    let ret = unsafe {
-        nix::libc::syscall(
-            nix::libc::SYS_pidfd_send_signal,
-            fd.as_raw_fd(),
-            sig,
-            std::ptr::null::<nix::libc::siginfo_t>(),
-            0,
-        )
-    };
-    if ret < 0 {
-        Err(nix::errno::Errno::last())
-    } else {
-        Ok(())
-    }
 }
 
 /// Kill a spawned child, preferring its whole process group so descendants
@@ -158,7 +132,11 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
     // return `Some`.
     #[cfg(target_os = "linux")]
     if let Some(fd) = pidfd {
-        match pidfd_send_signal(fd, nix::libc::SIGKILL) {
+        // rustix::process::pidfd_send_signal fails with `Errno::SRCH` (ESRCH)
+        // when the pinned process has exited — the property used to detect the
+        // child finished on its own. A PID recycled onto an unrelated process
+        // can never satisfy this, because the fd pins the original identity.
+        match rustix::process::pidfd_send_signal(fd, rustix::process::Signal::KILL) {
             Ok(()) => {
                 // SIGKILL the leader through the pinned fd, then sweep the
                 // rest of the group by pgid (== pid, since setup_child made
@@ -171,7 +149,7 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
                 );
                 return true;
             }
-            Err(nix::errno::Errno::ESRCH) => {
+            Err(rustix::io::Errno::SRCH) => {
                 // The pinned process exited on its own before the timeout
                 // landed — nothing to kill, so report "not killed".
                 debug!(pid, "pidfd_send_signal: child already exited on its own");

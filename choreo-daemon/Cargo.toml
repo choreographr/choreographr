@@ -23,6 +23,7 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 hex = "0.4"
 nix = { workspace = true, features = ["signal"] }
+rustix = { version = "1.1.4", features = ["process"] }
 
 gix = { version = "0.86", features = ["tree-editor", "revision"] }
 gix-imara-diff = { version = "0.2", features = ["unified_diff"] }
