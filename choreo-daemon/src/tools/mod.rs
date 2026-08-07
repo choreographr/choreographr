@@ -1008,11 +1008,11 @@ pub(crate) fn truncate_tool_output(content: &str) -> String {
 ///   `is_control` (categories Zl/Zp), yet terminals render them as line
 ///   breaks — they must be escaped to preserve the one-line-per-result
 ///   invariant.
-/// - Bidi format characters (category Cf) are invisible but can reorder or
-///   spoof rendered text: the marks U+200E/U+200F/U+061C, the embeddings and
-///   overrides U+202A..=U+202E, and the isolates U+2066..=U+2069. The joiners
-///   U+200C/U+200D (ZWNJ/ZWJ) do not reorder text and are legitimate in some
-///   scripts, so they pass through.
+/// - Unicode format characters (category Cf) are invisible but can reorder,
+///   hide, or spoof rendered text: bidi marks/overrides/isolates, zero-width
+///   space and word joiner, invisible operators, the BOM, and more (see
+///   [`is_format_char`]). The joiners U+200C/U+200D (ZWNJ/ZWJ) do not reorder
+///   or hide text and are legitimate in some scripts, so they pass through.
 ///
 /// `keep_tabs` leaves TAB literal — legitimate in source-line *content* (grep
 /// match/context lines) — while names still escape it.
@@ -1040,21 +1040,75 @@ pub(crate) fn sanitize_text(text: &str, keep_tabs: bool) -> String {
     out
 }
 
-/// The subset of non-control Unicode that must still be escaped: line /
-/// paragraph separators and bidi format characters (see [`sanitize_text`]).
+/// The non-control Unicode that must still be escaped: line / paragraph
+/// separators and Unicode *format* characters (general category Cf) except
+/// the joiners (see [`sanitize_text`]).
 ///
-/// This is the full bidi *format* set that can change how surrounding text
-/// renders — the direction marks LRM/RLM/ALM (U+200E/U+200F/U+061C), the
-/// embeddings and overrides (U+202A..=U+202E), and the isolates
-/// (U+2066..=U+2069). The joiners U+200C/U+200D are deliberately excluded:
-/// they affect ligation, not ordering, and are required by scripts like
-/// Persian (ZWNJ) and Devanagari (ZWJ/ZWNJ conjuncts), so escaping them would
-/// mangle legitimate text for no safety gain.
+/// U+2028/U+2029 are Zl/Zp — not `is_control` — yet terminals render them
+/// as line breaks, breaking the one-line-per-result invariant. The Cf set is
+/// otherwise the full invisible-formatting surface: bidi marks/overrides/
+/// isolates (U+061C, U+200E/U+200F, U+202A..=U+202E, U+2066..=U+206F),
+/// zero-width space and word joiner (U+200B, U+2060), invisible operators
+/// (U+2061..=U+2064), the BOM (U+FEFF), soft hyphen, and the rarer format
+/// controls (tags, musical/phonetic, Egyptian hieroglyph, …). All of these
+/// are invisible or spoofing-capable — they can hide text in identifiers,
+/// split tokens, or reorder rendered output — so they are escaped rather
+/// than passed through.
+///
+/// The joiners U+200C/U+200D are deliberately excluded: they affect
+/// ligation, not ordering or visibility, and are required by scripts like
+/// Persian (ZWNJ) and Devanagari (ZWJ/ZWNJ conjuncts), so escaping them
+/// would mangle legitimate text for no safety gain.
 fn is_unsafe_unicode(c: char) -> bool {
+    // Line/paragraph separators are escaped unconditionally (they split
+    // lines, which no format char should be able to do).
     matches!(c, '\u{2028}' | '\u{2029}')
-        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}')
-        || ('\u{202a}'..='\u{202e}').contains(&c)
-        || ('\u{2066}'..='\u{2069}').contains(&c)
+        // The rest of the unsafe set is Unicode format characters minus
+        // the two joiners (which pass through, see above).
+        || (is_format_char(c) && !matches!(c, '\u{200c}' | '\u{200d}'))
+}
+
+/// The Unicode format characters (general category Cf): invisible
+/// codepoints that alter how surrounding text renders — direction, joining,
+/// width, or absence. `char::is_control` does not cover them (they are
+/// category Cf, not Cc), so they must be enumerated. The joiners U+200C /
+/// U+200D are intentionally included here and excluded by the caller.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        // SOFT HYPHEN — renders as a hyphen at a line break.
+        '\u{00ad}'
+        // ARABIC NUMBER SIGN .. ARABIC NUMBER MARK ABOVE, ARABIC LETTER
+        // MARK, ARABIC END OF AYAH, SYRIAC ABBREVIATION MARK, ARABIC
+        // POUND/PIASTRE MARK ABOVE, ARABIC DISCONTINUED EUDOXIA.
+        | '\u{0600}'..='\u{0605}'
+        | '\u{061c}'
+        | '\u{06dd}'
+        | '\u{070f}'
+        | '\u{0890}'..='\u{0891}'
+        | '\u{08e2}'
+        // ZERO WIDTH SPACE; LRM / RLM; bidi embeddings and overrides.
+        | '\u{200b}'
+        | '\u{200e}'..='\u{200f}'
+        | '\u{202a}'..='\u{202e}'
+        // WORD JOINER, INVISIBLE (FUNCTION APPLICATION, TIMES, SEPARATOR,
+        // PLUS); isolates and deprecated bidi format characters.
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206f}'
+        // ZERO WIDTH NO-BREAK SPACE (BOM); INTERLINEAR ANNOTATION …
+        | '\u{feff}'
+        | '\u{fff9}'..='\u{fffb}'
+        // KAITHI NUMBER SIGN (ABOVE); EGYPTIAN HIEROGLYPH FORMAT CONTROLS;
+        // SHORTHAND FORMAT CONTROLS; MUSICAL SYMBOL FORMAT CONTROLS.
+        | '\u{110bd}'
+        | '\u{110cd}'
+        | '\u{13430}'..='\u{1343f}'
+        | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}'
+        // LANGUAGE TAG; TAG CHARACTERS (deprecated, but still invisible
+        // and spoofable).
+        | '\u{e0001}'
+        | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 /// Escape control characters in a name so a pathological name (e.g. one
@@ -2309,12 +2363,13 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_name_escapes_unicode_separators_and_bidi() {
+    fn sanitize_name_escapes_unicode_separators_and_format_chars() {
         // U+2028/U+2029 are Zl/Zp — not is_control — but terminals render
         // them as line breaks, so they must be escaped to keep the
-        // one-line-per-result invariant. Bidi format chars are invisible but
-        // can reorder rendered text: the marks, embeddings/overrides, and
-        // isolates must all be escaped.
+        // one-line-per-result invariant. Unicode format chars (Cf) are
+        // invisible but can reorder, hide, or spoof rendered text: the bidi
+        // marks/embeddings/overrides/isolates, zero-width space, word joiner,
+        // invisible operators, and BOM must all be escaped.
         assert_eq!(sanitize_name("a\u{2028}b"), "a\\u{2028}b");
         assert_eq!(sanitize_name("a\u{2029}b"), "a\\u{2029}b");
         assert_eq!(sanitize_name("a\u{200e}b"), "a\\u{200e}b");
@@ -2322,8 +2377,12 @@ mod tests {
         assert_eq!(sanitize_name("a\u{061c}b"), "a\\u{61c}b");
         assert_eq!(sanitize_name("a\u{202e}b"), "a\\u{202e}b");
         assert_eq!(sanitize_name("a\u{2066}b"), "a\\u{2066}b");
-        // Joiners do not reorder text and are legitimate in some scripts
-        // (Persian ZWNJ, Indic conjuncts) — they pass through untouched.
+        // Zero-width space / word joiner / BOM hide or split text — escaped.
+        assert_eq!(sanitize_name("a\u{200b}b"), "a\\u{200b}b");
+        assert_eq!(sanitize_name("a\u{2060}b"), "a\\u{2060}b");
+        assert_eq!(sanitize_name("a\u{feff}b"), "a\\u{feff}b");
+        // Joiners do not reorder or hide text and are legitimate in some
+        // scripts (Persian ZWNJ, Indic conjuncts) — they pass through.
         assert_eq!(sanitize_name("a\u{200c}b"), "a\u{200c}b");
         assert_eq!(sanitize_name("a\u{200d}b"), "a\u{200d}b");
         // Non-ASCII but safe chars pass through untouched.
@@ -2331,9 +2390,9 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_content_keeps_tabs_but_escapes_separators() {
+    fn sanitize_content_keeps_tabs_but_escapes_separators_and_format_chars() {
         // Content keeps tabs literal (legitimate in source) but still escapes
-        // every other control/separator.
+        // every other control/separator and every invisible format char.
         assert_eq!(sanitize_content("a\tb"), "a\tb");
         assert_eq!(sanitize_content("a\nb"), "a\\nb");
         assert_eq!(sanitize_content("a\u{2028}b"), "a\\u{2028}b");
@@ -2341,6 +2400,10 @@ mod tests {
         assert_eq!(sanitize_content("a\u{200f}b"), "a\\u{200f}b");
         assert_eq!(sanitize_content("a\u{202e}b"), "a\\u{202e}b");
         assert_eq!(sanitize_content("a\u{1b}b"), "a\\u{1b}b");
+        assert_eq!(sanitize_content("a\u{200b}b"), "a\\u{200b}b");
+        assert_eq!(sanitize_content("a\u{2060}b"), "a\\u{2060}b");
+        assert_eq!(sanitize_content("a\u{feff}b"), "a\\u{feff}b");
+        assert_eq!(sanitize_content("a\u{200c}b"), "a\u{200c}b");
     }
 
     #[cfg(unix)]

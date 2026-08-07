@@ -250,10 +250,18 @@ impl GrepItem {
             | GrepItem::Context {
                 line_number,
                 content,
-            } => label.len() + 2 + line_number.to_string().len() + content.len(),
+            } => label.len() + 2 + decimal_len(*line_number) + content.len(),
             GrepItem::Break => 2,
         }
     }
+}
+
+/// Decimal digit count of `n` (0 → 1, 9 → 1, 10 → 2, 100 → 3) — sizes the
+/// byte-budget accounting without allocating a `String` (which the previous
+/// `line_number.to_string().len()` did per buffered item).
+fn decimal_len(n: u64) -> usize {
+    // ilog10(0) is None (one digit); otherwise digits = floor(log10(n)) + 1.
+    n.checked_ilog10().map_or(1, |d| d as usize + 1)
 }
 
 /// Why the walk stopped searching early. Drives the `...[truncated at N …]`
@@ -301,9 +309,11 @@ struct GrepSink {
     /// `render_content` can render without recomputing it.
     current_label: String,
 
-    // Content-mode state: per-file (label, ordered items), capped by match
-    // count. Buckets are opened lazily by `push_item`.
-    content_files: Vec<(String, Vec<GrepItem>)>,
+    // Content-mode state: per-file (label, ordered items, charged byte
+    // total), capped by match count. Buckets are opened lazily by
+    // `push_item`; the charged total lets `drop_current_bucket` refund the
+    // exact bytes so the budget stays precise across aborted files.
+    content_files: Vec<(String, Vec<GrepItem>, usize)>,
     content_match_count: usize,
     /// Running byte total of the *rendered* output buffered in `content_files`
     /// — each item charges `label + separator + line number + content +
@@ -338,12 +348,13 @@ struct GrepSink {
     /// when zero files were searched (include glob filtered everything, empty
     /// directory), the empty result cannot be blamed on the pattern.
     files_searched: usize,
-    /// Set when the current file's search stopped early for a reason that
-    /// makes an observed-so-far count-mode tally unreliable — a read error or
-    /// binary-data truncation. The partial tally is discarded at `end_file`.
-    /// This is the only tally-abort signal: `end_file` takes no `completed`
-    /// argument, callers set this via [`GrepSink::abort_tally`].
-    tally_aborted: bool,
+    /// Set when the current file's search stopped early — a read error (from
+    /// the walk loop) or binary-data truncation (from the searcher's
+    /// `binary_data` callback). Partial output observed before the stop is
+    /// not the file's true result, so `end_file` discards it: the count-mode
+    /// tally is dropped and the content-mode bucket is removed. Callers set
+    /// this via [`GrepSink::abort_file`]; `end_file` clears it.
+    file_aborted: bool,
 }
 
 impl GrepSink {
@@ -371,7 +382,7 @@ impl GrepSink {
             after_context,
             after_context_remaining: after_context,
             files_searched: 0,
-            tally_aborted: false,
+            file_aborted: false,
         }
     }
 
@@ -387,37 +398,97 @@ impl GrepSink {
         // Per-file abort/drain state is consumed by `end_file` and the capped
         // match's after-context drain; reset defensively so a stale flag can
         // never poison a later file.
-        self.tally_aborted = false;
+        self.file_aborted = false;
         self.after_context_remaining = self.after_context;
     }
 
     /// Called by the walk loop after searching each file. Count mode flushes
     /// the completed tally here — a per-file count must reflect the whole
-    /// file, not just the lines seen before some other cap applied. A tally
-    /// observed after an aborted search (see [`GrepSink::abort_tally`]) is
-    /// discarded: the searcher may have stopped mid-file, so the observed
-    /// lines are not the file's true count.
+    /// file, not just the lines seen before some other cap applied. When the
+    /// file's search was aborted (see [`GrepSink::abort_file`]), the partial
+    /// output is discarded instead: the searcher may have stopped mid-file,
+    /// so neither the count-mode tally nor the content-mode bucket collected
+    /// before the stop is the file's true result. (This is what makes a file
+    /// with a NUL byte past its head render as "skipped" in *every* output
+    /// mode, matching ripgrep's `quit` semantics — not just count mode.)
     fn end_file(&mut self) {
-        if self.output_mode == GrepOutputMode::Count {
-            if !self.tally_aborted && self.count_file_lines > 0 {
-                self.count_entries
-                    .push((self.current_path.clone(), self.count_file_lines));
-                if self.count_entries.len() >= self.max_results {
-                    self.stop = Some(StopReason::Cap);
-                }
+        if self.file_aborted {
+            if self.output_mode == GrepOutputMode::Content {
+                // Drop the current file's bucket (and refund its charged
+                // bytes) so matches observed before a NUL byte or read error
+                // never render.
+                self.drop_current_bucket();
             }
+        } else if self.output_mode == GrepOutputMode::Count && self.count_file_lines > 0 {
+            self.count_entries
+                .push((self.current_path.clone(), self.count_file_lines));
+            if self.count_entries.len() >= self.max_results {
+                self.stop = Some(StopReason::Cap);
+            }
+        }
+        if self.output_mode == GrepOutputMode::Count {
             // Always reset, so a partial tally never leaks into the next file.
             self.count_file_lines = 0;
         }
-        self.tally_aborted = false;
+        self.file_aborted = false;
     }
 
     /// Mark the current file's search as not running to completion — a read
-    /// error or binary-data truncation. The count-mode tally observed so far
-    /// is then discarded at [`GrepSink::end_file`] rather than reported as
-    /// the file's true count.
-    fn abort_tally(&mut self) {
-        self.tally_aborted = true;
+    /// error (from the walk loop) or binary-data truncation (from the
+    /// searcher). At [`GrepSink::end_file`] the file's partial output is
+    /// discarded rather than reported as its true result.
+    fn abort_file(&mut self) {
+        self.file_aborted = true;
+    }
+
+    /// Drop the current file's content bucket (if any) and refund its charged
+    /// bytes, so a file whose search was aborted contributes nothing to the
+    /// output and the byte budget stays exact. Match counts are refunded too,
+    /// keeping `result_count` in line with what will actually render.
+    fn drop_current_bucket(&mut self) {
+        if let Some((label, items, charged)) = self.content_files.last()
+            && label == &self.current_label
+        {
+            self.content_bytes -= *charged;
+            // Refund the match tally so a file whose matches were all dropped
+            // does not count as "has results" in `finish_grep`.
+            let matches = items
+                .iter()
+                .filter(|i| matches!(i, GrepItem::Match { .. }))
+                .count();
+            self.content_match_count -= matches;
+            self.content_files.pop();
+        }
+    }
+
+    /// Cheap byte-budget pre-check for a *raw* line (not yet sanitized).
+    /// Estimates the rendered size from the raw byte count capped at the
+    /// per-line display cap: an over-cap line renders as at most
+    /// [`MAX_LINE_DISPLAY_BYTES`] of content plus the truncation marker, so
+    /// a multi-MiB line does not actually consume its raw length of the
+    /// budget. Sanitization only ever *expands* an under-cap line (trimming
+    /// the ≤2 terminator bytes is the sole shrink), so the raw count is a
+    /// tight approximation there. If the estimate exceeds the budget, stop
+    /// without allocating a sanitized copy that `push_item` would reject a
+    /// moment later. Returns `false` to stop the searcher.
+    fn budget_allows_raw(&mut self, line_number: u64, raw_len: usize) -> bool {
+        // Content estimate = raw minus the terminator, capped at the line
+        // cap (the marker appended by `cap_line` for over-cap lines is
+        // omitted — a conservative under-count that never false-rejects).
+        let content_est = raw_len.saturating_sub(2).min(MAX_LINE_DISPLAY_BYTES);
+        // Rendered size ≈ label + separator + line digits + content +
+        // newline (matches `render_len` + the joining newline).
+        let estimate = self.content_bytes
+            + self.current_label.len()
+            + 2
+            + decimal_len(line_number)
+            + content_est
+            + 1;
+        if estimate > MAX_TOOL_OUTPUT_BYTES {
+            self.stop = Some(StopReason::ByteBudget);
+            return false;
+        }
+        true
     }
 
     /// Deliver one line of the capped match's after-context window (Content
@@ -465,20 +536,20 @@ impl GrepSink {
         let matches_current = self
             .content_files
             .last()
-            .map(|(label, _)| label == &self.current_label)
+            .map(|(label, _, _)| label == &self.current_label)
             .unwrap_or(false);
         if !matches_current {
             if matches!(item, GrepItem::Break) {
                 return true;
             }
             self.content_files
-                .push((self.current_label.clone(), Vec::new()));
+                .push((self.current_label.clone(), Vec::new(), 0));
         }
         // Collapse consecutive Breaks: a separator directly after another
         // separator (grep-searcher never does this, but defend against it)
         // would render doubled `--` lines.
         if matches!(item, GrepItem::Break)
-            && self.content_files.last().is_some_and(|(_, items)| {
+            && self.content_files.last().is_some_and(|(_, items, _)| {
                 items.last().is_some_and(|i| matches!(i, GrepItem::Break))
             })
         {
@@ -486,15 +557,19 @@ impl GrepSink {
         }
         // Exact byte-budget guard (Content mode only): charge the rendered
         // bytes this item will occupy — label + separator + line number +
-        // content, plus the joining newline — so collection stops once the
-        // buffered output would exceed the budget the renderer keeps anyway.
-        // Breaks are charged too (they render as `--`).
-        let rendered = item.render_len(&self.current_label) + 1;
+        // content, plus the joining newline for every item but the very
+        // first (`render_content` joins with "\n", so the first item has no
+        // preceding newline). This matches the bytes the renderer produces
+        // exactly, so collection stops at the same threshold the renderer
+        // caps at.
+        let first_item = self.content_bytes == 0;
+        let rendered = item.render_len(&self.current_label) + usize::from(!first_item);
         if self.content_bytes + rendered > MAX_TOOL_OUTPUT_BYTES {
             self.stop = Some(StopReason::ByteBudget);
             return false;
         }
-        if let Some((_, items)) = self.content_files.last_mut() {
+        if let Some((_, items, charged)) = self.content_files.last_mut() {
+            *charged += rendered;
             self.content_bytes += rendered;
             items.push(item);
         }
@@ -567,6 +642,12 @@ impl Sink for GrepSink {
 
         match self.output_mode {
             GrepOutputMode::Content => {
+                // Reject a line that would blow the byte budget before
+                // sanitizing it — `sanitized_line` can allocate up to the
+                // line cap, and `push_item` would discard the result anyway.
+                if !self.budget_allows_raw(line_number, mat.bytes().len()) {
+                    return Ok(false);
+                }
                 // SinkMatch bytes include the line terminator — strip it (and
                 // a CR for CRLF files) so joining results with "\n" does not
                 // produce blank lines, then escape any remaining control
@@ -644,6 +725,11 @@ impl Sink for GrepSink {
         if self.stop.is_some() {
             return Ok(false);
         }
+        // Same pre-check as `matched`: a line that would exceed the byte
+        // budget is rejected before the sanitizing allocation.
+        if !self.budget_allows_raw(ctx.line_number().unwrap_or(0), ctx.bytes().len()) {
+            return Ok(false);
+        }
         let (content, _) = sanitized_line(ctx.bytes());
         if !self.push_item(GrepItem::Context {
             line_number: ctx.line_number().unwrap_or(0),
@@ -676,12 +762,14 @@ impl Sink for GrepSink {
         _searcher: &Searcher,
         _binary_byte_offset: u64,
     ) -> Result<bool, Self::Error> {
-        // With `BinaryDetection::quit`, the searcher stops the file here
-        // regardless of our response. Abort the tally so a count-mode tally
-        // observed before the NUL is discarded — the lines before a binary
-        // truncation are not the file's true count. Returning false is the
-        // explicit "stop" signal for the searcher.
-        self.abort_tally();
+        // With `BinaryDetection::quit` the searcher stops the file here
+        // regardless of our response. Mark the file aborted so *any* output
+        // observed before the NUL — a count-mode tally or a content-mode
+        // bucket of matches — is discarded at `end_file`: the lines before a
+        // binary truncation are not the file's true content, and the tool
+        // documents binary files as skipped. Returning false is the explicit
+        // "stop" signal for the searcher.
+        self.abort_file();
         Ok(false)
     }
 }
@@ -710,7 +798,7 @@ fn render_content(sink: &GrepSink) -> String {
     // Buckets are never empty (push_item opens one only to fill it), so no
     // empty-skip is needed here. The label was precomputed at push time so
     // the byte budget could charge exact rendered bytes; reuse it verbatim.
-    for (label, items) in &sink.content_files {
+    for (label, items, _) in &sink.content_files {
         lines.extend(items.iter().map(|item| item.render(label)));
     }
     lines.join("\n")
@@ -952,9 +1040,9 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
                 resolved.display()
             )));
         }
-        // The search completed, so the count-mode tally is authoritative
-        // (abort_tally would have been set by binary_data if the file was
-        // cut short, and the error path above returns before this point).
+        // The search completed, so the file's output is authoritative
+        // (abort_file would have been set by binary_data if the file was cut
+        // short, and the error path above returns before this point).
         sink.end_file();
         return Ok(finish_grep(sink, pattern, regex));
     }
@@ -995,12 +1083,12 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
                     error = %e,
                     "grep search error on file, skipping"
                 );
-                // A failed read must not flush a partial count-mode tally —
-                // the searcher may have stopped mid-file, so the observed
-                // lines are not the file's true count. (`binary_data` sets the
-                // same abort flag internally when a NUL byte cuts the file
-                // short.)
-                sink.abort_tally();
+                // A failed read must not flush partial output for this file —
+                // the searcher may have stopped mid-file, so neither the
+                // count-mode tally nor the content-mode bucket collected so
+                // far is the file's true result. (`binary_data` sets the same
+                // abort flag internally when a NUL byte cuts the file short.)
+                sink.abort_file();
             }
             sink.end_file();
 
@@ -1459,6 +1547,112 @@ mod tests {
     }
 
     #[test]
+    fn content_mode_discards_binary_partial_matches() {
+        // A file with a NUL byte mid-way is truncated by binary detection
+        // before the search completes. Matches observed before the NUL are
+        // not the file's true content — a binary file must render as skipped
+        // in *every* output mode (the tool documents that it respects binary
+        // files), not leak pre-NUL text matches.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("bin.txt"), b"hello\nhello\n\0hello\n").expect("write");
+
+        let tool = Grep;
+        let args = test_args("hello", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "No matches found.", "{result}");
+    }
+
+    #[test]
+    fn binary_file_skipped_among_text_files() {
+        // A binary file between two text files must be skipped entirely in
+        // content mode — its pre-NUL matches must not render, and the text
+        // files' matches must survive.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("a.txt"), "hello one\n").expect("write");
+        std::fs::write(dir.path().join("bin.txt"), b"hello\n\0\n").expect("write");
+        std::fs::write(dir.path().join("c.txt"), "hello three\n").expect("write");
+
+        let tool = Grep;
+        let args = test_args("hello", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(result.contains("a.txt:1:hello one"), "{result}");
+        assert!(result.contains("c.txt:1:hello three"), "{result}");
+        assert!(
+            !result.contains("bin.txt"),
+            "binary file must not appear:\n{result}"
+        );
+    }
+
+    #[test]
+    fn drop_current_bucket_refunds_exact_charged_bytes() {
+        // An aborted file's bucket is removed wholesale: the charged bytes
+        // and the match tally must be refunded so `result_count` and the
+        // byte budget stay consistent with what will actually render.
+        let mut sink = GrepSink::new(GrepOutputMode::Content, 10, 0, Path::new("root"), false);
+        sink.begin_file(Path::new("a.txt"));
+        sink.push_item(GrepItem::Match {
+            line_number: 1,
+            content: "x".into(),
+        });
+        // push_item does not tally matches — the `matched` handler does.
+        sink.content_match_count += 1;
+        sink.push_item(GrepItem::Context {
+            line_number: 2,
+            content: "y".into(),
+        });
+        assert!(sink.content_bytes > 0, "items must charge bytes");
+        assert_eq!(sink.result_count(), 1);
+
+        sink.abort_file();
+        sink.end_file();
+        assert!(sink.content_files.is_empty(), "bucket must be dropped");
+        assert_eq!(sink.content_bytes, 0, "charged bytes must be refunded");
+        assert_eq!(sink.result_count(), 0, "match tally must be refunded");
+    }
+
+    #[test]
+    fn byte_budget_charges_exact_rendered_size() {
+        // `push_item` charges `render_len` + a joining newline for every item
+        // except the first (which `render_content`'s join emits with no
+        // preceding newline). The charged total must equal the bytes
+        // `render_content` actually produces, so the guard and the renderer
+        // agree on the threshold.
+        let mut sink = GrepSink::new(GrepOutputMode::Content, 10, 0, Path::new("root"), false);
+        sink.begin_file(Path::new("a.txt"));
+        sink.push_item(GrepItem::Match {
+            line_number: 1,
+            content: "x".into(),
+        });
+        sink.push_item(GrepItem::Context {
+            line_number: 2,
+            content: "y".into(),
+        });
+        sink.push_item(GrepItem::Break);
+        sink.push_item(GrepItem::Match {
+            line_number: 4,
+            content: "z".into(),
+        });
+
+        let rendered = render_content(&sink);
+        assert_eq!(
+            sink.content_bytes,
+            rendered.len(),
+            "charged bytes must match rendered output"
+        );
+    }
+
+    #[test]
+    fn decimal_len_counts_digits_without_allocation() {
+        assert_eq!(decimal_len(0), 1);
+        assert_eq!(decimal_len(1), 1);
+        assert_eq!(decimal_len(9), 1);
+        assert_eq!(decimal_len(10), 2);
+        assert_eq!(decimal_len(99), 2);
+        assert_eq!(decimal_len(100), 3);
+        assert_eq!(decimal_len(u64::MAX), 20);
+    }
+
+    #[test]
     fn test_over_cap_line_truncated_with_marker() {
         // A 256 KiB one-liner is far past the 64 KiB line display cap. The
         // match must render capped with the shared marker instead of being
@@ -1870,7 +2064,7 @@ mod tests {
         let mut sink = GrepSink::new(GrepOutputMode::Count, 10, 0, Path::new("root"), false);
         sink.begin_file(Path::new("a.txt"));
         sink.count_file_lines = 3; // matches observed before the read failed
-        sink.abort_tally();
+        sink.abort_file();
         sink.end_file();
         assert!(
             sink.count_entries.is_empty(),
