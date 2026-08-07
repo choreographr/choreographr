@@ -12,11 +12,11 @@ When making changes, ensure [ARCHITECTURE.md](./ARCHITECTURE.md) and [README.md]
 
 - **Unit tests** (in <code>src/</code> <code>#[cfg(test)]</code> modules) must never use time-based waits (`sleep`, `delay_for`, etc.). Use deterministic patterns only.
 - **Integration tests** (tests that bind network sockets, spawn external processes, use `UnixStream::pair()` to exercise the full handler pipeline, or perform filesystem I/O exercising the system boundary) belong in crate-level `tests/` directories, not in `src/`.
-- Integration tests are marked <code>#[ignore]</code>. <code>cargo test</code> runs only unit tests. To run integration tests: <code>cargo test -- --ignored</code>.
+- Integration tests are marked <code>#[ignore]</code>. Use the nextest aliases defined in <code>.cargo/config.toml</code>: <code>cargo test-fast</code> (unit tests), <code>cargo test-integration</code> (the <code>#[ignore]</code> suite), and <code>cargo test-all</code> (everything in one pass). Plain <code>cargo test</code> runs libtest (serialized) and is only a fallback when nextest is unavailable.
 
 ## Task Execution
 
-When implementing a list of code changes across multiple files, delegate each task to a subagent and run them in series (one at a time), not in parallel. This avoids filesystem conflicts from concurrent edits to overlapping files and keeps each subagent's context focused. Subagents should verify their work by running `cargo test -p <crates>` on only the crates they modified.
+When implementing a list of code changes across multiple files, delegate each task to a subagent and run them in series (one at a time), not in parallel. This avoids filesystem conflicts from concurrent edits to overlapping files and keeps each subagent's context focused. Subagents should verify their work by running `cargo nextest run -p <crates>` on only the crates they modified. (The `cargo test-*` aliases bake in `--workspace` and reject `-p`, so call nextest directly when targeting specific crates.)
 
 ## Dependency Management
 
@@ -57,7 +57,7 @@ Always write inline comments around new code explaining how it works. Focus on t
 ## Pre-Commit Workflow
 
 Before committing:
-1. Run `cargo test --workspace` — full test suite must pass
+1. Run `cargo test-all` — full suite (unit + integration) via nextest must pass
 2. Stage changes with `git add`
 3. Commit with `git commit`
 
