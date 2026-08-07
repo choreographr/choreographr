@@ -1279,10 +1279,10 @@ caught and reported as a `ToolOutput` with `is_error: true` instead of crashing 
 The `invocation_description` is generated before spawning (via
 `ToolRegistry::describe_invocation`) and passed through `SpawnToolArgs`, so even timeout
 and panic error paths carry a meaningful description in the `ToolOutput`. If the request
-is cancelled before every tool ran, the never-executed placeholders are marked
-`[cancelled before execution]` (`SessionState::mark_unexecuted_tool_results`) before the
+is cancelled before every tool's outcome was recorded, the unfilled placeholders are marked
+`[cancelled — result not recorded]` (`SessionState::mark_unexecuted_tool_results`) before the
 request stops, so the transcript shows what happened and the next provider request never
-carries empty tool messages for calls that were never executed.
+carries empty tool messages for calls whose outcome is unknown.
 
 Cancellation during tool execution is fully event-driven: the concurrent collector and
 `execute_tool_with_timeout` (serial phase) block on `crossbeam_channel::select_biased!`
@@ -1293,17 +1293,27 @@ Escape wins over a simultaneously-ready result (bias for cancel); when a cancel 
 race, an already-completed result is still drained (non-blocking) rather than discarded, so
 the tool's real output is recorded while the request still stops (sticky `cancelled` flag).
 A cancel observed by the concurrent collector also stops the batch drain immediately:
-pending handles are drained and the still-running tools' placeholders are swept as
-`[cancelled before execution]` instead of making the request wait for the slowest tool.
-Both the per-tool wait-loop threads and the serial-phase wait drain the result channel
-before reporting a timeout, so a tool that finished just before its deadline is never
-reported as timed out (the wait-loops additionally bias their result arm ahead of the
-deadline timer). The per-tool forwarding threads are event-driven too: they
+pending handles are drained and the remaining placeholders are swept as
+`[cancelled — result not recorded]` instead of making the request wait for the slowest tool
+(note that a call dispatched but still running when the cancel lands is swept too — the
+sweep marks everything whose result was not actually recorded; it does not distinguish
+"never started" from "started but unfinished"). Both the per-tool wait-loop threads and the
+serial-phase wait drain the result channel before reporting a timeout, so a tool whose
+result was already queued when the deadline fired is not reported as timed out (the
+wait-loops bias their result arm ahead of the deadline timer; the serial wait drains once
+the timer fires). The per-tool forwarding threads are event-driven too: they
 `select_biased!` on the streaming-output channel and a dedicated kill channel (output arm
-first, so queued chunks drain before a kill is honored), which removed the last poll loop
-from the tool execution path — the streaming channel itself is a crossbeam channel, so the
-forwarder blocks until a chunk or kill actually arrives rather than waking on a 200 ms
-interval. The per-request cancel channel is a crossbeam channel created in `sessions.rs`
+first, so the burst queued when a kill is observed is drained — bounded by the queue length
+at that instant — before the kill is honored) and additionally re-check the
+kill channel after every forwarded chunk, so a continuously-streaming tool cannot starve the
+kill arm — a busy stream stops after one bounded final drain rather than streaming on
+forever.
+This removed the last poll loop from the tool execution path — the streaming channel itself
+is a crossbeam channel, so the forwarder blocks until a chunk or kill actually arrives
+rather than waking on a 200 ms interval. The serial phase also shares a
+`ToolContext.cancelled` flag with the running tool, set when the wait observes a cancel or
+the deadline expires, so a tool that consults it can stop early. The per-request cancel
+channel is a crossbeam channel created in `sessions.rs`
 (`ActiveRequest.cancel_tx`) and threaded through `run_agent_loop` → `ChatTurnRequest` →
 retry/stream, so every wait (provider SSE, retry backoff, serial tool, concurrent
 collector) can `select_biased!` on it directly (cancel arm first; `sleep_or_cancel` too).

@@ -810,10 +810,14 @@ fn render_markdown_block(
             let max_marker_width = if *ordered {
                 // Item numbers run start..=start + len - 1, so the widest marker
                 // is always the last one — O(1) per list, no per-item scan.
+                // `saturating_add` is cheap overflow hardening: CommonMark caps
+                // marker digits at 9, so `start` is small today, but the marker
+                // arithmetic must never be able to overflow (and panic in debug)
+                // if a parser or future input ever allows a larger start.
                 items
                     .len()
                     .checked_sub(1)
-                    .map(|last| display_width(&format!("{}. ", start + last)))
+                    .map(|last| display_width(&format!("{}. ", start.saturating_add(last))))
                     .unwrap_or(0)
             } else {
                 display_width("• ")
@@ -822,7 +826,9 @@ fn render_markdown_block(
                 Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
                 let marker = if *ordered {
-                    format!("{}. ", start + index)
+                    // saturating_add: a huge literal list start must render,
+                    // not overflow (see max_marker_width above).
+                    format!("{}. ", start.saturating_add(index))
                 } else {
                     "• ".to_string()
                 };

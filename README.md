@@ -441,7 +441,7 @@ override any field per-account:
 | `retry_max_backoff_ms` | Max backoff between retries (ms) |
 | `connect_timeout_secs` | TCP connect timeout |
 | `request_timeout_secs` | HTTP request timeout |
-| `total_timeout_secs` | Wall-clock deadline for a single request attempt including the streaming body (default 3600s; 0 disables). Complements `request_timeout_secs` (idle/no-progress): armed before the request is sent and re-armed on each retry, so one attempt's budget spans DNS → connect → headers → body (ureq's `timeout_global` bounds it from DNS through the first body byte, and the SSE consumer enforces the same deadline on every poll so it fires even when keep-alive bytes trickle in). Expiry surfaces as a dedicated `deadline_exceeded` error. Each retry restarts the deadline, so retries + backoff can exceed it in aggregate. |
+| `total_timeout_secs` | Wall-clock deadline for a single request attempt including the streaming body (default 3600s; 0 disables). Complements `request_timeout_secs` (idle/no-progress): armed before the request is sent and re-armed on each retry, so one attempt's budget spans DNS → connect → headers → body (ureq's `timeout_global` bounds it from DNS through the first body byte, and the SSE consumer enforces the same deadline with an exact timer, so it fires even when keep-alive bytes trickle in). Expiry surfaces as a dedicated `deadline_exceeded` error. Each retry restarts the deadline, so retries + backoff can exceed it in aggregate. |
 | `model_list_path` | Custom models list endpoint path |
 | `responses_path` | Custom responses endpoint path |
 | `chat_completions_path` | Custom chat completions endpoint path |

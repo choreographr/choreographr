@@ -654,21 +654,22 @@ impl SessionState {
         }
     }
 
-    /// Mark the tool results whose tools never ran because the request was
-    /// cancelled.
+    /// Mark the tool results whose outcome was never recorded because the
+    /// request was cancelled.
     ///
     /// Placeholders are seeded for every call before any tool executes, so a
     /// request cancelled mid-execution (e.g. Escape during the serial phase)
-    /// leaves empty slots for the tools that were never dispatched. Fill them
-    /// with an explicit marker so the transcript shows what happened and the
-    /// next provider request does not carry empty tool messages for calls that
-    /// were never executed. `executed` holds the call_ids whose results were
+    /// leaves empty slots for calls that never ran *and* for calls that were
+    /// dispatched but still running when the request stopped. Fill them with
+    /// an explicit marker so the transcript shows what happened and the next
+    /// provider request does not carry empty tool messages for calls whose
+    /// outcome is unknown. `executed` holds the call_ids whose results were
     /// actually recorded; every other placeholder is marked.
     pub fn mark_unexecuted_tool_results(&mut self, turn_id: u32, executed: &HashSet<String>) {
         if let Some(turn) = self.turns.get_mut(&turn_id) {
             for record in &mut turn.tool_results {
                 if !executed.contains(&record.call_id) {
-                    record.content = "[cancelled before execution]".to_string();
+                    record.content = "[cancelled — result not recorded]".to_string();
                     record.is_error = true;
                 }
             }
@@ -3092,10 +3093,11 @@ mod tests {
 
     #[test]
     fn mark_unexecuted_tool_results_marks_only_unexecuted() {
-        // The model issued calls a, b, c; only a executed before the request
-        // was cancelled. b and c must be marked "[cancelled before
-        // execution]" so the transcript and the next provider request don't
-        // carry empty tool messages for calls that never ran.
+        // The model issued calls a, b, c; only a's result was recorded before
+        // the request was cancelled. b and c must be marked "[cancelled —
+        // result not recorded]" so the transcript and the next provider
+        // request don't carry empty tool messages for calls whose outcome is
+        // unknown.
         let mut state = SessionState::empty();
         let (tid, _) = state.start_turn(Some("run tools".into()));
         let calls = vec![
@@ -3131,9 +3133,9 @@ mod tests {
         let results = &state.turns[&tid].tool_results;
         assert_eq!(results[0].content, "a-out");
         assert!(!results[0].is_error);
-        assert_eq!(results[1].content, "[cancelled before execution]");
+        assert_eq!(results[1].content, "[cancelled — result not recorded]");
         assert!(results[1].is_error);
-        assert_eq!(results[2].content, "[cancelled before execution]");
+        assert_eq!(results[2].content, "[cancelled — result not recorded]");
         assert!(results[2].is_error);
     }
 
