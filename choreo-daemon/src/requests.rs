@@ -215,6 +215,11 @@ struct SpawnToolArgs {
     working_dir: Option<PathBuf>,
     ctx: ToolContext,
     invocation_description: String,
+    /// Dispatch-time instant, threaded through the wait-loop thread onto the
+    /// handle so the collector logs per-tool elapsed from dispatch (not from
+    /// whenever the wait-loop thread happened to start), and reused by the
+    /// panic-synthesis fallback so both paths agree on the timestamp.
+    started_at: Instant,
     /// Shared batch channel: the wait-loop thread delivers its final
     /// `ToolHandle` here the moment the tool completes, so the caller can
     /// collect results in completion order without joining.
@@ -269,6 +274,7 @@ fn spawn_single_tool(args: SpawnToolArgs) {
         working_dir,
         ctx,
         invocation_description,
+        started_at,
         result_tx,
     } = args;
     // Channel for the execution thread to deliver its final result.
@@ -323,9 +329,9 @@ fn spawn_single_tool(args: SpawnToolArgs) {
     //   None      — unbounded wait; blocks until the tool completes.
     let deadline = timeout.map(|d| Instant::now() + d);
     thread::spawn(move || {
-        // Dispatch-time instant, carried on the handle so the collector can
-        // log per-tool elapsed independent of batch arrival order.
-        let started_at = Instant::now();
+        // Dispatch-time instant captured by the caller (not when this thread
+        // happened to start), carried on the handle so the collector can log
+        // per-tool elapsed independent of batch arrival order.
         // Wrap a failed execution into the error `ToolOutput` the turn records.
         let exec_error = |content: String| ToolOutput {
             content,
@@ -346,9 +352,12 @@ fn spawn_single_tool(args: SpawnToolArgs) {
                         break exec_error(format!("tool '{}' timed out", tool_call.name));
                     }
                     // Wait for the tool's result OR an exact timer for the
-                    // remaining budget.  `select!` removes the old 200 ms
-                    // `recv_timeout` poll and makes the timeout precise.
-                    let received = crossbeam_channel::select! {
+                    // remaining budget.  `select_biased!` (result arm first)
+                    // removes the old 200 ms `recv_timeout` poll, makes the
+                    // timeout precise, and guarantees that a result already
+                    // queued when the timer fires wins — a tool that finished
+                    // just before its deadline is never reported as timed out.
+                    let received = crossbeam_channel::select_biased! {
                         recv(exec_rx) -> msg => Some(msg),
                         recv(crossbeam_channel::after(remaining)) -> _ => None,
                     };
@@ -1081,6 +1090,11 @@ pub(crate) fn run_agent_loop(
                 // ran — the same ordering the no-cancel path uses.
                 let mut cancelled = false;
 
+                // call_ids whose results were actually recorded, so a
+                // cancelled request can mark the never-executed placeholders
+                // (see `SessionState::mark_unexecuted_tool_results`).
+                let mut executed_tool_calls: HashSet<String> = HashSet::new();
+
                 // ── Phase 1: Session-config tools (serial) ────────
                 for tool_call in mutators.into_iter() {
                     if is_cancelled_once(cancel_rx) {
@@ -1144,33 +1158,20 @@ pub(crate) fn run_agent_loop(
                         cancelled = true;
                     }
 
-                    if let Ok(image) = image_rx.try_recv() {
-                        emit_image(
-                            &ctx.cmd_tx,
-                            image,
-                            Some(tool_call.id.clone()),
-                            session,
-                            ctx.session_id,
-                            current_turn_id,
-                        );
-                    }
-
-                    finish_tool_call(
+                    let image = image_rx.try_recv().ok();
+                    record_tool_completion(
                         request_id,
                         session,
                         &tool_call,
                         &mut output,
+                        image,
                         ctx,
                         current_turn_id,
+                        &mut tool_results,
+                        &mut known_hint_paths,
+                        &mut pending_hints,
                     );
-                    collect_tool_result(CollectToolResultParams {
-                        tool_results: &mut tool_results,
-                        session,
-                        tool_call: &tool_call,
-                        output: &output,
-                        known_hint_paths: &mut known_hint_paths,
-                        pending_hints: &mut pending_hints,
-                    });
+                    executed_tool_calls.insert(tool_call.id.clone());
 
                     // Only mirror mutations that were actually accepted: an
                     // error (e.g. inactive session, daemon communication
@@ -1259,13 +1260,23 @@ pub(crate) fn run_agent_loop(
                     for tool_call in concurrent.into_iter() {
                         let timeout = determine_tool_timeout(&tool_call.name);
                         let invocation_description = reg.describe_invocation(&tool_call);
+                        // One dispatch-time instant for both the handle (delivered
+                        // path) and the CallInfo (panic-synthesis path), so the
+                        // collector's per-tool elapsed log is consistent either way.
+                        let started_at = Instant::now();
                         call_infos.push(CallInfo {
                             call_id: tool_call.id.clone(),
                             tool_name: tool_call.name.clone(),
                             arguments_json: tool_call.arguments_json.clone(),
                             invocation_description: invocation_description.clone(),
-                            started_at: Instant::now(),
+                            started_at,
                         });
+                        // The collector guarantees every dispatched call's result
+                        // is recorded — it either drains the batch to completion or
+                        // synthesizes the panicked wait-loop threads — so record
+                        // the id now: a mid-batch cancel must not sweep a
+                        // dispatched (and hence recorded) call as unexecuted.
+                        executed_tool_calls.insert(tool_call.id.clone());
                         spawn_single_tool(SpawnToolArgs {
                             tool_call,
                             timeout,
@@ -1277,6 +1288,7 @@ pub(crate) fn run_agent_loop(
                             working_dir: session.config.working_dir.clone(),
                             ctx: tool_ctx.clone(),
                             invocation_description,
+                            started_at,
                             result_tx: batch_tx.clone(),
                         });
                     }
@@ -1310,33 +1322,18 @@ pub(crate) fn run_agent_loop(
                                 "tool finished (concurrent)",
                             );
 
-                            if let Some(image) = image {
-                                emit_image(
-                                    &ctx.cmd_tx,
-                                    image,
-                                    Some(tool_call.id.clone()),
-                                    session,
-                                    ctx.session_id,
-                                    current_turn_id,
-                                );
-                            }
-
-                            finish_tool_call(
+                            record_tool_completion(
                                 request_id,
                                 session,
                                 &tool_call,
                                 &mut output,
+                                image,
                                 ctx,
                                 current_turn_id,
+                                &mut tool_results,
+                                &mut known_hint_paths,
+                                &mut pending_hints,
                             );
-                            collect_tool_result(CollectToolResultParams {
-                                tool_results: &mut tool_results,
-                                session,
-                                tool_call: &tool_call,
-                                output: &output,
-                                known_hint_paths: &mut known_hint_paths,
-                                pending_hints: &mut pending_hints,
-                            });
                         };
 
                     // Which call_ids actually delivered, so the disconnected-
@@ -1344,8 +1341,7 @@ pub(crate) fn run_agent_loop(
                     // missing tools (handles arrive in completion order, NOT
                     // dispatch order).
                     let mut delivered: HashSet<String> = HashSet::with_capacity(batch_size);
-                    let mut received = 0usize;
-                    while received < batch_size {
+                    while delivered.len() < batch_size {
                         // Block until a tool completes OR the request is
                         // cancelled.  `select!` makes both waits event-driven:
                         // a cancel wakes this loop the instant it is sent, and
@@ -1364,7 +1360,6 @@ pub(crate) fn run_agent_loop(
                         if let Some(msg) = handle_msg {
                             match msg {
                                 Ok(handle) => {
-                                    received += 1;
                                     delivered.insert(handle.tool_call.id.clone());
                                     process_tool_handle(handle);
                                 }
@@ -1379,7 +1374,7 @@ pub(crate) fn run_agent_loop(
                                     warn!(
                                         session_id = ctx.session_id,
                                         request_id,
-                                        delivered = received,
+                                        delivered = delivered.len(),
                                         expected = batch_size,
                                         "concurrent tool batch ended early; synthesizing missing tool results",
                                     );
@@ -1452,6 +1447,13 @@ pub(crate) fn run_agent_loop(
                 // here — after Phase 3 has mirrored the config changes from
                 // the tools that already ran, matching the no-cancel ordering.
                 if cancelled {
+                    // Tools that never ran still hold empty seeded placeholders;
+                    // mark them so the transcript and the next provider request
+                    // don't carry empty tool messages for calls that were never
+                    // executed (the cancelled turn is not finalized, so it
+                    // survives into the next request's history).
+                    session.mark_unexecuted_tool_results(current_turn_id, &executed_tool_calls);
+                    broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, current_turn_id);
                     return Ok(true);
                 }
             }
@@ -1555,6 +1557,47 @@ fn finish_tool_call(
     if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(event)) {
         warn!(%request_id, error = %e, "failed to broadcast tool call finished/failed event");
     }
+}
+
+/// Record a completed tool in the session and the next-call accumulator.
+///
+/// Shared by the serial and concurrent completion paths so both record a
+/// result identically: emit any produced image, fill the tool's seeded
+/// placeholder result in place (see [`SessionState::update_tool_result`]),
+/// and collect the output for the provider's next request.
+#[expect(clippy::too_many_arguments)]
+fn record_tool_completion(
+    request_id: u32,
+    session: &mut SessionState,
+    tool_call: &ChatToolCall,
+    output: &mut ToolOutput,
+    image: Option<PreparedImage>,
+    ctx: &RequestContext,
+    current_turn_id: u32,
+    tool_results: &mut Vec<ToolResultItem>,
+    known_hint_paths: &mut Vec<PathBuf>,
+    pending_hints: &mut Vec<String>,
+) {
+    if let Some(image) = image {
+        emit_image(
+            &ctx.cmd_tx,
+            image,
+            Some(tool_call.id.clone()),
+            session,
+            ctx.session_id,
+            current_turn_id,
+        );
+    }
+
+    finish_tool_call(request_id, session, tool_call, output, ctx, current_turn_id);
+    collect_tool_result(CollectToolResultParams {
+        tool_results,
+        session,
+        tool_call,
+        output,
+        known_hint_paths,
+        pending_hints,
+    });
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -2722,6 +2765,7 @@ mod tests {
             working_dir: None,
             ctx,
             invocation_description,
+            started_at: Instant::now(),
             result_tx,
         });
 
@@ -2807,6 +2851,7 @@ mod tests {
             working_dir: None,
             ctx: ctx.clone(),
             invocation_description: String::new(),
+            started_at: Instant::now(),
             result_tx: batch_tx.clone(),
         });
         spawn_single_tool(SpawnToolArgs {
@@ -2820,6 +2865,7 @@ mod tests {
             working_dir: None,
             ctx,
             invocation_description: String::new(),
+            started_at: Instant::now(),
             result_tx: batch_tx,
         });
 

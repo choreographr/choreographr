@@ -206,6 +206,12 @@ pub fn sleep_or_cancel(
             recv(rx) -> msg => match msg {
                 Ok(()) => return Err(ProviderHttpError::Cancelled),
                 Err(_) => {
+                    // The cancel sender is held by `ActiveRequest` and dropped
+                    // only at `RequestFinished`, so a disconnect here is
+                    // unreachable while the worker waits (see the invariant
+                    // documented on `ActiveRequest.cancel_tx`). Proceeding —
+                    // rather than aborting the retry loop — is the safe
+                    // fallback either way.
                     tracing::trace!("cancel_rx sender dropped — proceeding without cancellation");
                 }
             },

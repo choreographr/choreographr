@@ -447,6 +447,14 @@ pub struct SessionSnapshot {
 }
 
 pub(crate) struct ActiveRequest {
+    /// Cancellation channel for this request. The sender is held here and
+    /// dropped only when the request is torn down (`RequestFinished`), so it
+    /// outlives every worker wait that `select!`s on it: a firing cancel arm
+    /// in `recv_sse_event`/the concurrent collector always means a real
+    /// cancel message, never a disconnect. `sleep_or_cancel` (retry backoff)
+    /// is the one deliberate exception — it treats a (theoretically
+    /// unreachable) disconnect as "proceed without cancellation" rather than
+    /// aborting a retry loop.
     pub(crate) cancel_tx: crossbeam_channel::Sender<()>,
     /// The turn_id associated with this request, so that late-joining
     /// subscribers can route streaming chunks to the correct turn.
@@ -643,6 +651,27 @@ impl SessionState {
             record.content = content;
             record.is_error = is_error;
             record.invocation_description = invocation_description;
+        }
+    }
+
+    /// Mark the tool results whose tools never ran because the request was
+    /// cancelled.
+    ///
+    /// Placeholders are seeded for every call before any tool executes, so a
+    /// request cancelled mid-execution (e.g. Escape during the serial phase)
+    /// leaves empty slots for the tools that were never dispatched. Fill them
+    /// with an explicit marker so the transcript shows what happened and the
+    /// next provider request does not carry empty tool messages for calls that
+    /// were never executed. `executed` holds the call_ids whose results were
+    /// actually recorded; every other placeholder is marked.
+    pub fn mark_unexecuted_tool_results(&mut self, turn_id: u32, executed: &HashSet<String>) {
+        if let Some(turn) = self.turns.get_mut(&turn_id) {
+            for record in &mut turn.tool_results {
+                if !executed.contains(&record.call_id) {
+                    record.content = "[cancelled before execution]".to_string();
+                    record.is_error = true;
+                }
+            }
         }
     }
 
@@ -3059,6 +3088,79 @@ mod tests {
             String::new(),
         );
         assert!(state.turns[&tid].tool_results.is_empty());
+    }
+
+    #[test]
+    fn mark_unexecuted_tool_results_marks_only_unexecuted() {
+        // The model issued calls a, b, c; only a executed before the request
+        // was cancelled. b and c must be marked "[cancelled before
+        // execution]" so the transcript and the next provider request don't
+        // carry empty tool messages for calls that never ran.
+        let mut state = SessionState::empty();
+        let (tid, _) = state.start_turn(Some("run tools".into()));
+        let calls = vec![
+            AssistantToolCallRecord {
+                call_id: "a".into(),
+                name: "read_file".into(),
+                arguments_json: "{}".into(),
+            },
+            AssistantToolCallRecord {
+                call_id: "b".into(),
+                name: "grep".into(),
+                arguments_json: "{}".into(),
+            },
+            AssistantToolCallRecord {
+                call_id: "c".into(),
+                name: "sh".into(),
+                arguments_json: "{}".into(),
+            },
+        ];
+        state.seed_tool_results(tid, &calls);
+        // Only a's result was recorded before the cancel.
+        state.update_tool_result(
+            tid,
+            "a",
+            "read_file".into(),
+            "a-out".into(),
+            false,
+            String::new(),
+        );
+        let executed = HashSet::from(["a".to_string()]);
+        state.mark_unexecuted_tool_results(tid, &executed);
+
+        let results = &state.turns[&tid].tool_results;
+        assert_eq!(results[0].content, "a-out");
+        assert!(!results[0].is_error);
+        assert_eq!(results[1].content, "[cancelled before execution]");
+        assert!(results[1].is_error);
+        assert_eq!(results[2].content, "[cancelled before execution]");
+        assert!(results[2].is_error);
+    }
+
+    #[test]
+    fn mark_unexecuted_tool_results_preserves_recorded_error_results() {
+        // A result that WAS recorded — even an error like a timeout — has its
+        // call_id in the executed set and must not be overwritten by the
+        // sweep.
+        let mut state = SessionState::empty();
+        let (tid, _) = state.start_turn(Some("run tools".into()));
+        let calls = vec![AssistantToolCallRecord {
+            call_id: "a".into(),
+            name: "sh".into(),
+            arguments_json: "{}".into(),
+        }];
+        state.seed_tool_results(tid, &calls);
+        state.update_tool_result(
+            tid,
+            "a",
+            "sh".into(),
+            "timed out".into(),
+            true,
+            String::new(),
+        );
+        state.mark_unexecuted_tool_results(tid, &HashSet::from(["a".to_string()]));
+        assert_eq!(state.turns[&tid].tool_results[0].content, "timed out");
+        assert!(state.turns[&tid].tool_results[0].is_error);
     }
 
     #[test]

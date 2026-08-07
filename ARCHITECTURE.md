@@ -1278,22 +1278,32 @@ messages mirror the assistant's `tool_calls` array. If a tool thread panics, the
 caught and reported as a `ToolOutput` with `is_error: true` instead of crashing the daemon.
 The `invocation_description` is generated before spawning (via
 `ToolRegistry::describe_invocation`) and passed through `SpawnToolArgs`, so even timeout
-and panic error paths carry a meaningful description in the `ToolOutput`.
+and panic error paths carry a meaningful description in the `ToolOutput`. If the request
+is cancelled before every tool ran, the never-executed placeholders are marked
+`[cancelled before execution]` (`SessionState::mark_unexecuted_tool_results`) before the
+request stops, so the transcript shows what happened and the next provider request never
+carries empty tool messages for calls that were never executed.
 
 Cancellation during tool execution is fully event-driven: the concurrent collector and
 `execute_tool_with_timeout` (serial phase) block on `crossbeam_channel::select!` between
 their result channels, the request's cancel channel, and (where a timeout applies) an exact
 `after(remaining)` timer — there are no `recv_timeout` poll loops, and timeouts fire
-precisely. The per-tool forwarding threads are event-driven too: they `select_biased!` on
-the streaming-output channel and a dedicated kill channel (output arm first, so queued
-chunks drain before a kill is honored), which removed the last poll loop from the tool
-execution path — the streaming channel itself is a crossbeam channel, so the forwarder
-blocks until a chunk or kill actually arrives rather than waking on a 200 ms interval. The
-per-request cancel channel is a crossbeam channel created in `sessions.rs`
+precisely. The per-tool wait-loop threads bias their result channel ahead of the deadline
+timer (`select_biased!`), so a tool that finished just before its deadline is never
+reported as timed out. The per-tool forwarding threads are event-driven too: they
+`select_biased!` on the streaming-output channel and a dedicated kill channel (output arm
+first, so queued chunks drain before a kill is honored), which removed the last poll loop
+from the tool execution path — the streaming channel itself is a crossbeam channel, so the
+forwarder blocks until a chunk or kill actually arrives rather than waking on a 200 ms
+interval. The per-request cancel channel is a crossbeam channel created in `sessions.rs`
 (`ActiveRequest.cancel_tx`) and threaded through `run_agent_loop` → `ChatTurnRequest` →
 retry/stream, so every wait (provider SSE, retry backoff, serial tool, concurrent
-collector) can `select!` on it directly. A cancel observed mid-batch stops the request
-(sticky `cancelled` flag) after Phase 3 has mirrored the already-executed config changes.
+collector) can `select!` on it directly. The sender is held by `ActiveRequest` and dropped
+only at `RequestFinished`, so a firing cancel arm always means a real cancel — never a
+disconnect (the one deliberate exception is `sleep_or_cancel`, which proceeds on the
+unreachable disconnect rather than aborting a retry loop). A cancel observed mid-batch
+stops the request (sticky `cancelled` flag) after Phase 3 has mirrored the already-executed
+config changes and the never-executed placeholders have been marked.
 
 ### spawn_subsession
 
