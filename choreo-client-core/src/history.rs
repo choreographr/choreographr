@@ -94,6 +94,18 @@ impl SessionView {
             tracing::warn!(%turn_id, "tool_call_started: unknown turn");
             return;
         };
+        // Backfill the tool name onto a stub tool result created out of
+        // order (a chunk that arrived before this event).  The stub's name
+        // is unresolvable at chunk time if the tool_call hasn't landed yet;
+        // filling it in here keeps the TUI's quiet/default-collapse
+        // decision correct without waiting for the full turn to replace
+        // the record.  Only fills empty names — a seeded placeholder or an
+        // earlier backfill already carries the right value.
+        if let Some(result) = turn.tool_results.iter_mut().find(|r| r.call_id == call_id)
+            && result.name.is_empty()
+        {
+            result.name = name.clone();
+        }
         turn.tool_calls.push(AssistantToolCallRecord {
             call_id,
             name,
@@ -227,5 +239,28 @@ mod tests {
         let turn = view.get(1).unwrap();
         assert_eq!(turn.tool_results.len(), 1);
         assert_eq!(turn.tool_results[0].name, "");
+    }
+
+    #[test]
+    fn tool_call_started_backfills_stub_name() {
+        // A chunk arriving before ToolCallStarted creates a stub whose name
+        // is unresolvable at chunk time; the start event must backfill it
+        // so the TUI's quiet/default-collapse decision is correct once the
+        // name is known — without waiting for the full turn to replace the
+        // record.
+        let mut view = SessionView::new();
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
+        view.request_to_turn.insert(7, 1);
+
+        // Stub for a call whose tool_call has not landed yet → empty name.
+        view.tool_result_chunk(7, "call-2", "data\n");
+        assert_eq!(view.get(1).unwrap().tool_results[0].name, "");
+
+        // The start event arrives: the name is backfilled onto the stub.
+        view.tool_call_started(7, "call-2".into(), "read_file".into(), "{}".into());
+
+        let turn = view.get(1).unwrap();
+        assert_eq!(turn.tool_results[0].name, "read_file");
+        assert_eq!(turn.tool_calls.len(), 2, "the call is recorded as usual");
     }
 }

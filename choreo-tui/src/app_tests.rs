@@ -2571,7 +2571,8 @@ fn click_on_tool_result_header_toggles_collapse() {
         app.active_display()
             .unwrap()
             .tool_collapse_override
-            .get(&(1, "call-1".into())),
+            .get(&1)
+            .and_then(|m| m.get("call-1")),
         Some(&false),
         "clicking the header of a collapsed quiet result should expand it"
     );
@@ -2592,7 +2593,8 @@ fn click_on_tool_result_header_toggles_collapse() {
         app.active_display()
             .unwrap()
             .tool_collapse_override
-            .get(&(1, "call-1".into())),
+            .get(&1)
+            .and_then(|m| m.get("call-1")),
         Some(&true),
         "clicking the header again should collapse the result"
     );

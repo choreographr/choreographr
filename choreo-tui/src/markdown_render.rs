@@ -285,11 +285,13 @@ pub(crate) struct RenderedTurnLines {
     /// Semantic-line index of each tool result's header line within `lines`,
     /// one entry per result in `turn.tool_results` order (empty when the
     /// turn has no tool results or short-circuits on the error block).
-    /// Every result renders exactly one header row.  A result's header index
-    /// depends on the body lengths of the results *before* it, so indexes are
-    /// only meaningful for the collapse state they were rendered with — the
-    /// cache key (and the per-state `TurnLayout` ranges) guard against reuse
-    /// across states.
+    /// Every result renders exactly one header row — the first line of the
+    /// invocation description (or the label fallback); any continuation
+    /// lines of a multi-line description follow it in `lines` and are
+    /// always visible.  A result's header index depends on the body lengths
+    /// of the results *before* it, so indexes are only meaningful for the
+    /// collapse state they were rendered with — the cache key (and the
+    /// per-state `TurnLayout` ranges) guard against reuse across states.
     pub tool_result_header_idxs: Vec<usize>,
 }
 
@@ -465,13 +467,20 @@ pub(crate) fn render_turn_lines(
 
         // Invocation description rendered as markdown so inline code and
         // emphasis highlight properly.  Its first line becomes the header
-        // row (triangle + description); any continuation lines join the
-        // expanded body below the header.
+        // row (triangle + description); any continuation lines are part of
+        // the always-visible summary (see below).  Wrapped two columns
+        // narrower than the content width because the header prepends the
+        // triangle glyph ("▶ ") to the first line — wrapping at the full
+        // width would push the header row past the right edge.
         let desc_lines = if tr.invocation_description.is_empty() {
             Vec::new()
         } else {
-            markdown_lines(&tr.invocation_description, tool_content_width)
+            markdown_lines(
+                &tr.invocation_description,
+                tool_content_width.saturating_sub(2),
+            )
         };
+        let desc_len = desc_lines.len();
 
         // Header row — always rendered so its position is stable across
         // collapse/expand (mirroring the reasoning header).  The triangle
@@ -493,16 +502,17 @@ pub(crate) fn render_turn_lines(
         body.push(Line::from(header_spans));
         tool_result_header_idxs.push(all_lines.len() + header_idx_in_body);
 
-        // Expanded body only — a collapsed result is just its header row.
+        // Continuation lines of a multi-line invocation description are
+        // part of the always-visible summary: the full description shows
+        // even when the body (label row + content) is collapsed behind the
+        // triangle.  Only the label + content are toggled by a click.
+        if desc_len > 1 {
+            body.extend(desc_lines.into_iter().skip(1));
+        }
+
+        // Expanded body only — a collapsed result is its header row plus
+        // the full description; expanding adds the label row and content.
         if !collapsed {
-            // Capture the description's line count before consuming it, so
-            // the continuation-line check and the label-row decision both
-            // work after the `into_iter()` move below.
-            let desc_len = desc_lines.len();
-            // Continuation lines of a multi-line invocation description.
-            if desc_len > 1 {
-                body.extend(desc_lines.into_iter().skip(1));
-            }
             // The label row is redundant when the header already shows it
             // (the no-description fallback above), so it appears only when
             // the description carried the header.
@@ -2682,6 +2692,80 @@ mod tests {
         assert!(text.contains("▼ Reading file src/main.rs."), "{text}");
         assert!(text.contains("tool result: read_file"), "{text}");
         assert!(text.contains("file contents"), "{text}");
+    }
+
+    #[test]
+    fn render_turn_lines_collapsed_shows_full_invocation_description() {
+        // Collapsing hides the label row + verbatim content, but the whole
+        // invocation description stays visible: continuation lines of a
+        // multi-line description are part of the always-visible summary, so
+        // the user sees the full context without expanding.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "sh".into(),
+                content: "secret body".into(),
+                is_error: false,
+                invocation_description: "Running `sh` with an extremely long argument list that keeps going well past the wrap width and continues onto a second line of description text.".into(),
+            }],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false, &[true]).lines;
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Header row opens the description; the wrapped tail is still
+        // visible while the label row and content stay hidden.
+        assert!(text.contains("▶ Running sh with"), "{text}");
+        assert!(
+            text.contains("second line of description text."),
+            "full description must appear when collapsed: {text}"
+        );
+        assert!(!text.contains("tool result: sh"), "{text}");
+        assert!(!text.contains("secret body"), "{text}");
+    }
+
+    #[test]
+    fn render_turn_lines_description_header_fits_content_width() {
+        // The header prepends "▶ " to the first description line; the
+        // description is wrapped two columns narrower than the content
+        // width so the header row never overflows the viewport.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "sh".into(),
+                content: "x".into(),
+                is_error: false,
+                invocation_description: "lorem ipsum dolor sit amet ".repeat(10),
+            }],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 40, 45, false, &[true]).lines;
+        // tool_content_width = 45 → rows are padded to exactly 49 columns;
+        // the header must never exceed that.
+        assert!(
+            lines[0].width() <= 49,
+            "header row must fit the viewport width: {}",
+            lines[0].width()
+        );
     }
 
     #[test]

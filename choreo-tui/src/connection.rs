@@ -1205,59 +1205,67 @@ fn handle_chat_event(
                 // the correct image index — no text-height recomputation
                 // or cache dependency needed.
                 MouseEventKind::Down(MouseButton::Left) => {
-                    // A click on the reasoning header row toggles the
-                    // collapsible reasoning section.  Checked before image
-                    // hit-testing so the header wins when they overlap.
-                    let reasoning_toggle =
-                        find_turn_at_row(app, mouse.row).and_then(|(turn_idx, offset)| {
-                            let display = app.active_display_ref()?;
-                            let layout = display.turn_layouts.get(turn_idx)?;
-                            let (start, end) = layout.reasoning_header_range?;
-                            (offset >= start && offset < end)
-                                .then(|| display.visible_turn_ids.get(turn_idx).copied())
-                                .flatten()
-                        });
-                    // A click on a tool result's header row toggles that
-                    // result's collapsible body.  The range index maps
-                    // directly onto `turn.tool_results`, whose `call_id`
-                    // keys the per-result collapse override.  Checked
-                    // before image hit-testing, after the reasoning header.
-                    let tool_toggle =
-                        find_turn_at_row(app, mouse.row).and_then(|(turn_idx, offset)| {
-                            let display = app.active_display_ref()?;
-                            let layout = display.turn_layouts.get(turn_idx)?;
-                            let range_idx = layout
-                                .tool_result_header_ranges
-                                .iter()
-                                .position(|&(start, end)| offset >= start && offset < end)?;
-                            let turn_id = display.visible_turn_ids.get(turn_idx).copied()?;
-                            let turn = display.view.turns.get(&turn_id)?;
-                            let call_id = turn.tool_results.get(range_idx)?.call_id.clone();
-                            Some((turn_id, call_id))
-                        });
-                    if let Some(turn_id) = reasoning_toggle {
-                        if let Some(display) = app.active_display() {
-                            display.toggle_reasoning(turn_id);
-                        }
-                    } else if let Some((turn_id, call_id)) = tool_toggle {
-                        if let Some(display) = app.active_display() {
-                            display.toggle_tool_result(turn_id, &call_id);
-                        }
-                    } else if let Some((turn_idx, offset)) = find_turn_at_row(app, mouse.row)
-                        && let Some(layout) = app
+                    // Resolve the clicked (turn, offset) once and share it
+                    // across the three hit-tests below (reasoning header,
+                    // tool-result header, image) instead of re-running the
+                    // row→turn binary search per target.
+                    if let Some((turn_idx, offset)) = find_turn_at_row(app, mouse.row) {
+                        // A click on the reasoning header row toggles the
+                        // collapsible reasoning section.  Checked before the
+                        // other targets so the header wins when they overlap.
+                        let reasoning_toggle = app
                             .active_display_ref()
                             .and_then(|d| d.turn_layouts.get(turn_idx))
-                        && let Some(img_idx) = layout
-                            .image_ranges
-                            .iter()
-                            .position(|&(start, end)| offset >= start && offset < end)
-                        && let Some(turn_id) = app
+                            .and_then(|l| l.reasoning_header_range)
+                            .filter(|&(start, end)| offset >= start && offset < end)
+                            .and_then(|_| {
+                                app.active_display_ref()
+                                    .and_then(|d| d.visible_turn_ids.get(turn_idx))
+                                    .copied()
+                            });
+                        // A click on a tool result's header row toggles that
+                        // result's collapsible body.  The range index maps
+                        // directly onto `turn.tool_results`, whose `call_id`
+                        // keys the per-result collapse override.  Checked
+                        // before image hit-testing, after the reasoning header.
+                        let tool_toggle = app
                             .active_display_ref()
-                            .and_then(|d| d.visible_turn_ids.get(turn_idx))
-                            .copied()
-                        && let Some(session_id) = app.active_session_id
-                    {
-                        app.fullscreen_image_target = Some((session_id, turn_id, img_idx));
+                            .and_then(|d| d.turn_layouts.get(turn_idx))
+                            .and_then(|l| {
+                                l.tool_result_header_ranges
+                                    .iter()
+                                    .position(|&(start, end)| offset >= start && offset < end)
+                            })
+                            .and_then(|range_idx| {
+                                let display = app.active_display_ref()?;
+                                let turn_id = display.visible_turn_ids.get(turn_idx).copied()?;
+                                let turn = display.view.turns.get(&turn_id)?;
+                                let call_id = turn.tool_results.get(range_idx)?.call_id.clone();
+                                Some((turn_id, call_id))
+                            });
+                        if let Some(turn_id) = reasoning_toggle {
+                            if let Some(display) = app.active_display() {
+                                display.toggle_reasoning(turn_id);
+                            }
+                        } else if let Some((turn_id, call_id)) = tool_toggle {
+                            if let Some(display) = app.active_display() {
+                                display.toggle_tool_result(turn_id, &call_id);
+                            }
+                        } else if let Some(layout) = app
+                            .active_display_ref()
+                            .and_then(|d| d.turn_layouts.get(turn_idx))
+                            && let Some(img_idx) = layout
+                                .image_ranges
+                                .iter()
+                                .position(|&(start, end)| offset >= start && offset < end)
+                            && let Some(turn_id) = app
+                                .active_display_ref()
+                                .and_then(|d| d.visible_turn_ids.get(turn_idx))
+                                .copied()
+                            && let Some(session_id) = app.active_session_id
+                        {
+                            app.fullscreen_image_target = Some((session_id, turn_id, img_idx));
+                        }
                     }
                 }
                 _ => {}

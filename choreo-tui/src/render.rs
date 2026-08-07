@@ -3,8 +3,8 @@ use crate::markdown_render::{display_width, reasoning_expanded_default, render_t
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, CTRL_HELP_LINE1, CTRL_HELP_LINE2, INPUT_PAD,
-    PROVIDER_OPTIONS, Page, SessionManagerView, cached_or_compute_lines, cached_visual_lines,
-    input_inner_width,
+    PROVIDER_OPTIONS, Page, RenderCacheKey, SessionManagerView, cached_or_compute_lines,
+    cached_visual_lines, input_inner_width,
 };
 use choreo_proto::{SessionStatus, TokenUsage};
 use choreo_tui::RenderedImage;
@@ -468,33 +468,41 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     .unwrap_or_else(|| reasoning_expanded_default(turn));
                 display.effective_reasoning_expanded(turn_id, default)
             };
-            // Effective per-result collapse state (aligned with `turn.tool_results`),
-            // part of the render-cache key like `reasoning_expanded`.
-            let tool_results_collapsed: Vec<bool> = turn
-                .tool_results
-                .iter()
-                .map(|r| display.effective_tool_result_collapsed(turn_id, r))
-                .collect();
-            let (arc, height, offsets, _reasoning_header_idx, _tool_result_header_idxs) =
-                cached_or_compute_lines(
-                    &mut display.render_cache,
-                    i,
-                    turn_id,
+            // Effective per-result collapse state (aligned with
+            // `turn.tool_results`), part of the render-cache key like
+            // `reasoning_expanded`.  Built only for turns that actually
+            // have tool results — the common case allocates nothing and the
+            // key comparison short-circuits on the empty slice.
+            let tool_results_collapsed: Vec<bool> = if turn.tool_results.is_empty() {
+                Vec::new()
+            } else {
+                turn.tool_results
+                    .iter()
+                    .map(|r| display.effective_tool_result_collapsed(turn_id, r))
+                    .collect()
+            };
+            let key = RenderCacheKey {
+                turn_id,
+                width: content_width,
+                viewport_width: area.width,
+                reasoning_expanded,
+                tool_results_collapsed,
+            };
+            let rendered = cached_or_compute_lines(&mut display.render_cache, i, &key, || {
+                render_turn_lines(
+                    turn,
                     content_width,
-                    area.width,
-                    reasoning_expanded,
-                    &tool_results_collapsed,
-                    || {
-                        render_turn_lines(
-                            turn,
-                            content_width,
-                            tool_content_width,
-                            reasoning_expanded,
-                            &tool_results_collapsed,
-                        )
-                    },
-                );
-            (arc, height, offsets, count)
+                    tool_content_width,
+                    key.reasoning_expanded,
+                    &key.tool_results_collapsed,
+                )
+            });
+            (
+                rendered.lines,
+                rendered.height,
+                rendered.visual_offsets,
+                count,
+            )
         };
 
         // ── Images (rendered first so they sit below text) ──
@@ -1563,7 +1571,7 @@ fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
 mod tests {
     use super::*;
     use crate::markdown_render::{RenderedTurnLines, compute_visual_offsets, lines_height};
-    use crate::state::RenderedCache;
+    use crate::state::{RenderCacheKey, RenderedCache, RenderedTurn};
 
     /// Wrap a line vector as a rendered turn with no headers.
     fn rendered(lines: Vec<Line<'static>>) -> RenderedTurnLines {
@@ -1571,6 +1579,38 @@ mod tests {
             lines,
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
+        }
+    }
+
+    /// Build a cache entry with the given key/output pieces, defaulting the
+    /// rest, so tests can focus on the field under test.
+    fn cache_entry(
+        key: RenderCacheKey,
+        lines: Arc<[Line<'static>]>,
+        height: usize,
+        visual_offsets: Arc<[usize]>,
+    ) -> RenderedCache {
+        RenderedCache {
+            key,
+            rendered: RenderedTurn {
+                lines,
+                height,
+                visual_offsets,
+                reasoning_header_idx: None,
+                tool_result_header_idxs: Vec::new(),
+            },
+        }
+    }
+
+    /// A key for a one-line entry rendered at content width 80 in a
+    /// viewport of width 100, reasoning collapsed, no tool results.
+    fn base_key() -> RenderCacheKey {
+        RenderCacheKey {
+            turn_id: 0,
+            width: 80,
+            viewport_width: 100,
+            reasoning_expanded: false,
+            tool_results_collapsed: Vec::new(),
         }
     }
 
@@ -1766,83 +1806,70 @@ mod tests {
     #[test]
     fn cached_or_compute_lines_cache_miss_stores_result() {
         let mut cache = vec![None];
-        let (lines, height, offsets, header_idx, _tool_idxs) =
-            cached_or_compute_lines(&mut cache, 0, 0, 80, 100, false, &[], compute_one_line);
-        assert_eq!(lines.len(), 1, "should return computed lines");
-        assert_eq!(height, 1, "single line at any viewport width has height 1");
+        let rendered = cached_or_compute_lines(&mut cache, 0, &base_key(), compute_one_line);
+        assert_eq!(rendered.lines.len(), 1, "should return computed lines");
         assert_eq!(
-            &*offsets,
+            rendered.height, 1,
+            "single line at any viewport width has height 1"
+        );
+        assert_eq!(
+            &*rendered.visual_offsets,
             &[1],
             "single short line should occupy one visual row"
         );
-        assert_eq!(header_idx, None, "no reasoning → no header index");
+        assert_eq!(
+            rendered.reasoning_header_idx, None,
+            "no reasoning → no header index"
+        );
         // Cache should be filled
         let cached = cache[0].as_ref().unwrap();
-        assert_eq!(cached.width, 80);
-        assert_eq!(cached.viewport_width, 100);
-        assert_eq!(cached.height, 1);
-        assert_eq!(cached.lines.len(), 1);
-        assert_eq!(&*cached.visual_offsets, &[1]);
+        assert_eq!(cached.key.width, 80);
+        assert_eq!(cached.key.viewport_width, 100);
+        assert_eq!(cached.rendered.height, 1);
+        assert_eq!(cached.rendered.lines.len(), 1);
+        assert_eq!(&*cached.rendered.visual_offsets, &[1]);
         assert!(
-            !cached.reasoning_expanded,
+            !cached.key.reasoning_expanded,
             "cache should record the reasoning state it was rendered with"
         );
     }
 
     #[test]
     fn cached_or_compute_lines_cache_hit_returns_stored_height() {
-        let mut cache = vec![Some(RenderedCache {
-            turn_id: 0,
-            reasoning_expanded: false,
-            reasoning_header_idx: None,
-            tool_results_collapsed: vec![],
-            tool_result_header_idxs: vec![],
-            lines: Arc::from(vec![Line::from("cached")]),
-            width: 80,
-            viewport_width: 100,
-            height: 42,
-            visual_offsets: Arc::from([99]),
-        })];
+        let mut cache = vec![Some(cache_entry(
+            base_key(),
+            Arc::from(vec![Line::from("cached")]),
+            42,
+            Arc::from([99]),
+        ))];
         // Cache hit — should return stored height without recomputing
-        let (lines, height, offsets, header_idx, _tool_idxs) = cached_or_compute_lines(
-            &mut cache,
-            0,
-            0,
-            80,
-            100,
-            false, // matches the cached reasoning_expanded
-            &[],
-            || panic!("should not be called on cache hit"),
+        let rendered = cached_or_compute_lines(&mut cache, 0, &base_key(), || {
+            panic!("should not be called on cache hit")
+        });
+        assert_eq!(rendered.height, 42, "should return cached height");
+        assert_eq!(rendered.lines.len(), 1, "should return cached lines");
+        assert_eq!(rendered.lines[0], Line::from("cached"));
+        assert_eq!(
+            &*rendered.visual_offsets,
+            &[99],
+            "should return cached offsets"
         );
-        assert_eq!(height, 42, "should return cached height");
-        assert_eq!(lines.len(), 1, "should return cached lines");
-        assert_eq!(lines[0], Line::from("cached"));
-        assert_eq!(&*offsets, &[99], "should return cached offsets");
-        assert_eq!(header_idx, None, "should return the cached header index");
+        assert_eq!(
+            rendered.reasoning_header_idx, None,
+            "should return the cached header index"
+        );
     }
 
     #[test]
     fn cached_or_compute_lines_cache_hit_arc_shares_allocation() {
         let stored = Arc::from(vec![Line::from("shared")]);
         let stored_ptr = Arc::as_ptr(&stored);
-        let mut cache = vec![Some(RenderedCache {
-            turn_id: 0,
-            reasoning_expanded: false,
-            reasoning_header_idx: None,
-            tool_results_collapsed: vec![],
-            tool_result_header_idxs: vec![],
-            lines: stored,
-            width: 80,
-            viewport_width: 100,
-            height: 7,
-            visual_offsets: Arc::from([1]),
-        })];
-        let (returned, _, _, _, _) =
-            cached_or_compute_lines(&mut cache, 0, 0, 80, 100, false, &[], || {
-                panic!("should not recompute")
-            });
+        let mut cache = vec![Some(cache_entry(base_key(), stored, 7, Arc::from([1])))];
+        let returned = cached_or_compute_lines(&mut cache, 0, &base_key(), || {
+            panic!("should not recompute")
+        });
         assert_eq!(
-            Arc::as_ptr(&returned),
+            Arc::as_ptr(&returned.lines),
             stored_ptr,
             "returned Arc should point to the same allocation as cache entry"
         );
@@ -1850,92 +1877,92 @@ mod tests {
 
     #[test]
     fn cached_or_compute_lines_width_mismatch_recomputes() {
-        let mut cache = vec![Some(RenderedCache {
-            turn_id: 0,
-            reasoning_expanded: false,
-            reasoning_header_idx: None,
-            tool_results_collapsed: vec![],
-            tool_result_header_idxs: vec![],
-            lines: Arc::from(vec![Line::from("stale")]),
-            width: 40, // different from requested width 80
-            viewport_width: 100,
-            height: 99,
-            visual_offsets: Arc::from([1]),
-        })];
+        let mut cache = vec![Some(cache_entry(
+            RenderCacheKey {
+                width: 40, // different from requested width 80
+                ..base_key()
+            },
+            Arc::from(vec![Line::from("stale")]),
+            99,
+            Arc::from([1]),
+        ))];
         let compute_called = std::cell::Cell::new(false);
-        let (lines, height, offsets, _header_idx, _tool_idxs) =
-            cached_or_compute_lines(&mut cache, 0, 0, 80, 100, false, &[], || {
-                compute_called.set(true);
-                rendered(vec![Line::from("fresh")])
-            });
+        let rendered = cached_or_compute_lines(&mut cache, 0, &base_key(), || {
+            compute_called.set(true);
+            rendered(vec![Line::from("fresh")])
+        });
         assert!(compute_called.get(), "should recompute on width mismatch");
-        assert_eq!(lines[0], Line::from("fresh"));
+        assert_eq!(rendered.lines[0], Line::from("fresh"));
         // Height of a single "fresh" line at viewport width 100 is 1
-        assert_eq!(height, 1);
-        assert_eq!(&*offsets, &[1], "offsets recomputed for fresh lines");
+        assert_eq!(rendered.height, 1);
+        assert_eq!(
+            &*rendered.visual_offsets,
+            &[1],
+            "offsets recomputed for fresh lines"
+        );
         // Cache should be updated
         let cached = cache[0].as_ref().unwrap();
-        assert_eq!(cached.width, 80);
-        assert_eq!(cached.viewport_width, 100);
-        assert_eq!(cached.lines[0], Line::from("fresh"));
-        assert_eq!(&*cached.visual_offsets, &[1]);
+        assert_eq!(cached.key.width, 80);
+        assert_eq!(cached.key.viewport_width, 100);
+        assert_eq!(cached.rendered.lines[0], Line::from("fresh"));
+        assert_eq!(&*cached.rendered.visual_offsets, &[1]);
     }
 
     #[test]
     fn cached_or_compute_lines_viewport_width_mismatch_recomputes() {
-        let mut cache = vec![Some(RenderedCache {
-            turn_id: 0,
-            reasoning_expanded: false,
-            reasoning_header_idx: None,
-            tool_results_collapsed: vec![],
-            tool_result_header_idxs: vec![],
-            lines: Arc::from(vec![Line::from("stale")]),
-            width: 80,
-            viewport_width: 40, // different from requested viewport_width 100
-            height: 99,
-            visual_offsets: Arc::from([1]),
-        })];
+        let mut cache = vec![Some(cache_entry(
+            RenderCacheKey {
+                viewport_width: 40, // different from requested viewport_width 100
+                ..base_key()
+            },
+            Arc::from(vec![Line::from("stale")]),
+            99,
+            Arc::from([1]),
+        ))];
         let compute_called = std::cell::Cell::new(false);
-        let (lines, _height, _offsets, _header_idx, _tool_idxs) =
-            cached_or_compute_lines(&mut cache, 0, 0, 80, 100, false, &[], || {
-                compute_called.set(true);
-                rendered(vec![Line::from("fresh")])
-            });
+        let rendered = cached_or_compute_lines(&mut cache, 0, &base_key(), || {
+            compute_called.set(true);
+            rendered(vec![Line::from("fresh")])
+        });
         assert!(
             compute_called.get(),
             "should recompute on viewport_width mismatch"
         );
-        assert_eq!(lines[0], Line::from("fresh"));
+        assert_eq!(rendered.lines[0], Line::from("fresh"));
         let cached = cache[0].as_ref().unwrap();
-        assert_eq!(cached.viewport_width, 100);
+        assert_eq!(cached.key.viewport_width, 100);
     }
 
     #[test]
     fn cached_or_compute_lines_turn_id_mismatch_recomputes() {
-        let mut cache = vec![Some(RenderedCache {
-            turn_id: 7, // cached entry is for turn 7
-            reasoning_expanded: false,
-            reasoning_header_idx: None,
-            tool_results_collapsed: vec![],
-            tool_result_header_idxs: vec![],
-            lines: Arc::from(vec![Line::from("stale")]),
-            width: 80,
-            viewport_width: 100,
-            height: 99,
-            visual_offsets: Arc::from([1]),
-        })];
+        let mut cache = vec![Some(cache_entry(
+            RenderCacheKey {
+                turn_id: 7, // cached entry is for turn 7
+                ..base_key()
+            },
+            Arc::from(vec![Line::from("stale")]),
+            99,
+            Arc::from([1]),
+        ))];
         // Request turn_id 42 at the same index — should be a miss.
         let compute_called = std::cell::Cell::new(false);
-        let (lines, _height, _offsets, _header_idx, _tool_idxs) =
-            cached_or_compute_lines(&mut cache, 0, 42, 80, 100, false, &[], || {
+        let rendered = cached_or_compute_lines(
+            &mut cache,
+            0,
+            &RenderCacheKey {
+                turn_id: 42,
+                ..base_key()
+            },
+            || {
                 compute_called.set(true);
                 rendered(vec![Line::from("fresh")])
-            });
+            },
+        );
         assert!(compute_called.get(), "should recompute on turn_id mismatch");
-        assert_eq!(lines[0], Line::from("fresh"));
+        assert_eq!(rendered.lines[0], Line::from("fresh"));
         let cached = cache[0].as_ref().unwrap();
         assert_eq!(
-            cached.turn_id, 42,
+            cached.key.turn_id, 42,
             "cache entry should be updated to new turn_id"
         );
     }
@@ -1944,11 +1971,14 @@ mod tests {
     fn cached_or_compute_lines_out_of_range_index_does_not_store() {
         let mut cache = vec![None]; // length 1
         // Request index 5 which is out of range
-        let (lines, height, offsets, _header_idx, _tool_idxs) =
-            cached_or_compute_lines(&mut cache, 5, 0, 80, 100, false, &[], compute_one_line);
-        assert_eq!(lines.len(), 1, "should still return computed result");
-        assert_eq!(height, 1);
-        assert_eq!(&*offsets, &[1]);
+        let rendered = cached_or_compute_lines(&mut cache, 5, &base_key(), compute_one_line);
+        assert_eq!(
+            rendered.lines.len(),
+            1,
+            "should still return computed result"
+        );
+        assert_eq!(rendered.height, 1);
+        assert_eq!(&*rendered.visual_offsets, &[1]);
         // Cache should remain unchanged (all entries still None since index 5 doesn't exist)
         assert!(
             cache[0].is_none(),
@@ -1965,29 +1995,32 @@ mod tests {
             Line::from("line three"),
         ];
         let expected_h = lines_height(&lines, 80);
-        let (_, height, offsets, _header_idx, _tool_idxs) = cached_or_compute_lines(
+        let rendered = cached_or_compute_lines(
             &mut cache,
             0,
-            0,
-            70, // content_width
-            80, // viewport_width
-            false,
-            &[],
+            &RenderCacheKey {
+                width: 70, // content_width
+                viewport_width: 80,
+                ..base_key()
+            },
             || rendered(lines.clone()),
         );
         assert_eq!(
-            height, expected_h,
+            rendered.height, expected_h,
             "returned height should match lines_height"
         );
         assert_eq!(
-            *offsets.last().unwrap(),
+            *rendered.visual_offsets.last().unwrap(),
             expected_h,
             "last offset should equal total visual height"
         );
         let cached = cache[0].as_ref().unwrap();
-        assert_eq!(cached.height, expected_h, "stored height should match");
         assert_eq!(
-            *cached.visual_offsets.last().unwrap(),
+            cached.rendered.height, expected_h,
+            "stored height should match"
+        );
+        assert_eq!(
+            *cached.rendered.visual_offsets.last().unwrap(),
             expected_h,
             "stored last offset should equal total height"
         );
@@ -1997,45 +2030,48 @@ mod tests {
     fn cached_or_compute_lines_none_slot_treated_as_miss() {
         let mut cache: Vec<Option<RenderedCache>> = vec![None];
         let compute_called = std::cell::Cell::new(false);
-        let (lines, _height, _offsets, _header_idx, _tool_idxs) =
-            cached_or_compute_lines(&mut cache, 0, 0, 80, 100, false, &[], || {
-                compute_called.set(true);
-                compute_one_line()
-            });
+        let rendered = cached_or_compute_lines(&mut cache, 0, &base_key(), || {
+            compute_called.set(true);
+            compute_one_line()
+        });
         assert!(compute_called.get(), "should compute when slot is None");
         assert!(cache[0].is_some(), "should fill the slot");
-        drop(lines);
+        drop(rendered.lines);
     }
 
     #[test]
     fn cached_or_compute_lines_reasoning_expanded_mismatch_recomputes() {
-        let mut cache = vec![Some(RenderedCache {
-            turn_id: 0,
-            reasoning_expanded: false, // cached as collapsed
-            reasoning_header_idx: None,
-            tool_results_collapsed: vec![],
-            tool_result_header_idxs: vec![],
-            lines: Arc::from(vec![Line::from("stale")]),
-            width: 80,
-            viewport_width: 100,
-            height: 99,
-            visual_offsets: Arc::from([1]),
-        })];
+        let mut cache = vec![Some(cache_entry(
+            RenderCacheKey {
+                reasoning_expanded: false, // cached as collapsed
+                ..base_key()
+            },
+            Arc::from(vec![Line::from("stale")]),
+            99,
+            Arc::from([1]),
+        ))];
         // Request with reasoning expanded — should be a miss.
         let compute_called = std::cell::Cell::new(false);
-        let (lines, _height, _offsets, _header_idx, _tool_idxs) =
-            cached_or_compute_lines(&mut cache, 0, 0, 80, 100, true, &[], || {
+        let rendered = cached_or_compute_lines(
+            &mut cache,
+            0,
+            &RenderCacheKey {
+                reasoning_expanded: true,
+                ..base_key()
+            },
+            || {
                 compute_called.set(true);
                 rendered(vec![Line::from("fresh")])
-            });
+            },
+        );
         assert!(
             compute_called.get(),
             "should recompute when reasoning_expanded differs"
         );
-        assert_eq!(lines[0], Line::from("fresh"));
+        assert_eq!(rendered.lines[0], Line::from("fresh"));
         let cached = cache[0].as_ref().unwrap();
         assert!(
-            cached.reasoning_expanded,
+            cached.key.reasoning_expanded,
             "cache entry should record the new reasoning state"
         );
     }
@@ -2043,32 +2079,40 @@ mod tests {
     #[test]
     fn cached_or_compute_lines_tool_results_collapsed_mismatch_recomputes() {
         let mut cache = vec![Some(RenderedCache {
-            turn_id: 0,
-            reasoning_expanded: false,
-            reasoning_header_idx: None,
-            tool_results_collapsed: vec![true], // cached as collapsed
-            tool_result_header_idxs: vec![0],
-            lines: Arc::from(vec![Line::from("stale")]),
-            width: 80,
-            viewport_width: 100,
-            height: 99,
-            visual_offsets: Arc::from([1]),
+            key: RenderCacheKey {
+                tool_results_collapsed: vec![true], // cached as collapsed
+                ..base_key()
+            },
+            rendered: RenderedTurn {
+                lines: Arc::from(vec![Line::from("stale")]),
+                height: 99,
+                visual_offsets: Arc::from([1]),
+                reasoning_header_idx: None,
+                tool_result_header_idxs: vec![0],
+            },
         })];
         // Request with the result expanded — should be a miss.
         let compute_called = std::cell::Cell::new(false);
-        let (lines, _height, _offsets, _header_idx, _tool_idxs) =
-            cached_or_compute_lines(&mut cache, 0, 0, 80, 100, false, &[false], || {
+        let rendered = cached_or_compute_lines(
+            &mut cache,
+            0,
+            &RenderCacheKey {
+                tool_results_collapsed: vec![false],
+                ..base_key()
+            },
+            || {
                 compute_called.set(true);
                 rendered(vec![Line::from("fresh")])
-            });
+            },
+        );
         assert!(
             compute_called.get(),
             "should recompute when tool_results_collapsed differs"
         );
-        assert_eq!(lines[0], Line::from("fresh"));
+        assert_eq!(rendered.lines[0], Line::from("fresh"));
         let cached = cache[0].as_ref().unwrap();
         assert_eq!(
-            cached.tool_results_collapsed,
+            cached.key.tool_results_collapsed,
             vec![false],
             "cache entry should record the new collapse state"
         );
