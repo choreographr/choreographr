@@ -2028,6 +2028,13 @@ itself is the kernel's responsibility.
 
 `fish` runs commands in a child `fish -c` process with the same sandboxing as `sh`. Registered only when the `fish` binary is found in `PATH`.
 
+Shell tools (`sh`, `fish`, `nu`, `exec`, and the streaming variants) put the
+child in its own process group (`setup_child` in `tools/shell_util.rs`); on
+timeout the watchdog kills the whole group via `killpg(2)` rather than just the
+direct child. This matters for shells that don't `exec` the final command
+(fish): killing only the wrapper would orphan grandchildren like `sleep`, which
+keep the output pipes open and turn a 500ms timeout into a ~10s hang.
+
 
 | Layer | What's tested | Location |
 |---|---|---|
@@ -2043,9 +2050,24 @@ itself is the kernel's responsibility.
 **Test infrastructure:** Tests use `UnixStream::pair()` for socket-less daemon↔client
 communication, and mock HTTP servers for API simulation.
 
+**Test runner:** The recommended runner is cargo-nextest, configured in
+`.config/nextest.toml` (`fail-fast = false`; 120s `slow-timeout` that kills hung
+tests). Cargo aliases `test-fast` (unit tests), `test-integration` (the
+`#[ignore]` suite), and `test-all` (both) invoke it with `--workspace`; plain
+`cargo test` / `cargo test -- --ignored` still work via libtest. Nextest runs
+every test in its own process — a large wall-time win for this 12-crate
+workspace, since libtest serializes test binaries and threads their tests
+within one process. Unit tests with `#[serial]` (global state, e.g. metrics port
+or keystore root overrides) need no special handling under nextest's
+process-per-test model.
+
 Run all tests:
 ```bash
-cargo test
+cargo test-all            # nextest: unit + integration, parallel
+cargo test-fast           # nextest: unit tests only
+cargo test-integration    # nextest: integration tests only
+cargo test                # libtest unit tests
+cargo test -- --ignored   # libtest integration tests
 ```
 
 

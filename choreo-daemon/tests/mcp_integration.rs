@@ -27,6 +27,10 @@ fn mcp_server_everything_tools_are_discovered_and_callable() {
     // MCP stack (e.g. a shutdown that blocks) would hang CI forever. Install a
     // watchdog that aborts the process if the test body outlives its budget;
     // the internal protocol timeouts bound a healthy run to well under this.
+    // When run under cargo-nextest this is belt-and-braces only: nextest's
+    // slow-timeout in .config/nextest.toml (120s) kills the test process
+    // itself. This thread exists to protect plain `cargo test -- --ignored`
+    // runs, which have no per-test timeout at all.
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(120));
         eprintln!("mcp_integration: test exceeded 120s; aborting to avoid an indefinite hang");

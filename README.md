@@ -536,11 +536,36 @@ file descriptors).
 
 ## Testing & development
 
+The workspace uses [cargo-nextest](https://nexte.st) as its primary test runner:
+it executes every test in its own process, in parallel across all cores, and
+gives per-test timeouts and retries. The unit-vs-integration split is the same
+as libtest's — integration tests live in crate-level `tests/` and are marked
+`#[ignore]` (see AGENTS.md):
+
 ```bash
-cargo test                  # unit tests
-cargo test -- --ignored     # integration tests
+cargo test-fast          # unit tests (nextest, parallel)
+cargo test-integration   # integration tests — the #[ignore] suite (nextest)
+cargo test-all           # everything in one pass (nextest)
+
+cargo test                  # unit tests (libtest, serialized across binaries)
+cargo test -- --ignored     # integration tests (libtest)
 cargo clippy --workspace    # lints
 cargo fmt --all             # formatting
+```
+
+The nextest profile lives in `.config/nextest.toml`: `fail-fast = false` (run
+the whole suite even after a failure) and a 120s `slow-timeout` that aborts any
+hung test. On a 16-core machine `cargo test-all` runs the entire suite (~2,050
+tests, unit + integration) in ~6s wall, versus ~22s for the two equivalent
+libtest commands (`cargo test` + `cargo test -- --ignored`) on a warm build.
+Nextest wins on two fronts: it parallelizes across test binaries (libtest runs
+them one at a time) and runs every test in its own process. Useful raw nextest
+invocations:
+
+```bash
+cargo nextest run --workspace -E 'test(ignored)'   # filterset: integration only
+cargo nextest run --workspace --retries 2          # retry flaky tests
+cargo nextest run --workspace --partition count:1/2   # shard for CI
 ```
 
 ## Troubleshooting

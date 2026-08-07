@@ -5,3 +5,14 @@
 # and emit a warning instead of failing the build.
 [resolver]
 incompatible-rust-versions = "fallback"
+
+# cargo-nextest convenience aliases (the parallel test runner). They mirror the
+# README's libtest split (`cargo test` = unit tests, `-- --ignored` = integration
+# tests) while running every test in its own process, in parallel, across all
+# 16-ish cores. `--run-ignored only` matches libtest's `--ignored` semantics.
+[alias]
+test-fast = "nextest run --workspace"                 # unit tests
+# integration tests (the #[ignore] suite)
+test-integration = "nextest run --workspace --run-ignored only"
+# everything: unit + integration in one pass
+test-all = "nextest run --workspace --run-ignored all"

@@ -56,12 +56,38 @@ pub(crate) fn apply_rlimits() -> Result<(), std::io::Error> {
     Ok(())
 }
 
-/// Apply all child-process hardening (env sanitization + resource limits).
+/// Apply all child-process hardening (env sanitization + process-group
+/// isolation + resource limits).
+///
+/// Every shell tool (`sh`, `fish`, `nu`, `exec`) funnels through this hook,
+/// so placing the child in its own process group here covers all of them.
 pub(crate) fn setup_child(cmd: &mut Command) {
     sanitize_env(cmd);
     unsafe {
+        // Put the child in its own process group (pgid == child pid) so a
+        // timeout watchdog can kill the entire tree via killpg(2) instead of
+        // only the direct child. Without this, a timeout on
+        // `fish -c "sleep 10"` SIGKILLs the fish wrapper but leaves the
+        // orphaned `sleep` grandchild holding the stdout/stderr pipes — the
+        // tool then blocks until the grandchild exits on its own, so a
+        // "timed out" result takes 10s instead of the configured 500ms (and
+        // in production, an LLM tool call would hang for the same duration).
+        cmd.process_group(0);
         cmd.pre_exec(apply_rlimits);
     }
+}
+
+/// Kill a spawned child, preferring its whole process group so descendants
+/// (e.g. a shell's `sleep`) are reaped too.
+///
+/// Falls back to killing just the direct child for callers that spawn without
+/// `setup_child` — then the child shares our process group, so `killpg(pid)`
+/// legitimately returns ESRCH (no group has that pid as its leader) and we
+/// would otherwise fail to kill anything at all.
+fn kill_child_tree(pid: u32) -> bool {
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL).is_ok()
+        || nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).is_ok()
 }
 
 /// Spawn the command, run a watchdog thread to enforce the timeout,
@@ -86,16 +112,13 @@ pub(crate) fn spawn_with_watchdog(
             .recv_timeout(Duration::from_millis(timeout_ms))
             .is_err()
         {
-            // Timeout expired before the main thread signalled completion — kill.
-            // Only set was_killed when kill actually succeeds (ESRCH means the
-            // child already exited normally, which can happen in a narrow race
-            // where the timeout fires at the same instant the child finishes).
-            if nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            )
-            .is_ok()
-            {
+            // Timeout expired before the main thread signalled completion —
+            // kill the child's process tree (see `kill_child_tree`). Only set
+            // was_killed when a kill actually lands (both killpg and kill
+            // return ESRCH when everything already exited, which can happen in
+            // a narrow race where the timeout fires at the same instant the
+            // child finishes).
+            if kill_child_tree(pid) {
                 let _ = killed_tx.send(());
             }
         }
@@ -174,14 +197,12 @@ pub fn spawn_with_streaming(
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let (killed_tx, killed_rx) = mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
+        // Same process-tree kill as `spawn_with_watchdog` — the streaming
+        // path must reap grandchildren too (see `kill_child_tree`).
         if done_rx
             .recv_timeout(Duration::from_millis(timeout_ms))
             .is_err()
-            && nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            )
-            .is_ok()
+            && kill_child_tree(pid)
         {
             let _ = killed_tx.send(());
         }
@@ -258,7 +279,40 @@ pub(crate) fn format_shell_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
     use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    #[test]
+    fn setup_child_places_child_in_its_own_process_group() {
+        // `sh -c 'echo $$; …'` reports its own PID, then busy-spins forever
+        // so the parent can inspect the process group before killing it.
+        // Deterministic — no sleeps. Without `process_group(0)`, the child
+        // inherits the parent's group (pgid == parent pid) and the assertion
+        // fails; the own-group property is what lets a timeout watchdog reap
+        // grandchildren via killpg(2).
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo $$; while :; do :; done"])
+            .stdout(Stdio::piped());
+        setup_child(&mut cmd);
+
+        let mut child = cmd.spawn().expect("spawn child");
+        let mut reader = BufReader::new(child.stdout.take().expect("take stdout"));
+        let mut pid_line = String::new();
+        reader.read_line(&mut pid_line).expect("read child pid");
+        let child_pid = pid_line.trim().parse::<i32>().expect("parse child pid");
+
+        let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(child_pid)))
+            .expect("getpgid on live child");
+        assert_eq!(
+            pgid.as_raw(),
+            child_pid,
+            "child must be leader of its own process group"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn format_shell_output_was_killed_shows_timeout() {
