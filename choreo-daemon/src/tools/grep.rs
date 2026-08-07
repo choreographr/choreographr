@@ -196,6 +196,12 @@ fn prepare_line(lossy: &str) -> (Cow<'_, str>, bool) {
 /// Returns the display string and whether the line was truncated by the line
 /// cap — callers use the flag to detect pathological over-cap lines (e.g. to
 /// bound the after-context drain).
+///
+/// The production call sites inline the `lossy_window` + `prepare_line`
+/// composition themselves (they need the prepared line for the byte-budget
+/// pre-check anyway, and the intermediate Cow may own the string, so it must
+/// stay local); this convenience wrapper exists for tests.
+#[cfg(test)]
 fn sanitized_line(bytes: &[u8]) -> (String, bool) {
     let lossy = lossy_window(bytes);
     let (line, truncated) = prepare_line(&lossy);
@@ -430,8 +436,13 @@ impl GrepSink {
     /// output is discarded instead: the searcher may have stopped mid-file,
     /// so neither the count-mode tally nor the content-mode bucket collected
     /// before the stop is the file's true result. (This is what makes a file
-    /// with a NUL byte past its head render as "skipped" in *every* output
-    /// mode, matching ripgrep's `quit` semantics — not just count mode.)
+    /// with a NUL byte past its head render as "skipped" in Content and
+    /// Count modes. FilesWithMatches is the deliberate exception: the
+    /// searcher stops at the first hit — rg `-l` semantics — before it can
+    /// observe a later NUL, so a file that matched before binary data is
+    /// still listed, exactly as ripgrep does. `file_aborted` can only be set
+    /// by the `binary_data` callback, which never fires in that mode after a
+    /// match, so there is no pre-NUL output to discard there.)
     fn end_file(&mut self) {
         if self.file_aborted {
             if self.output_mode == GrepOutputMode::Content {
@@ -485,24 +496,22 @@ impl GrepSink {
         }
     }
 
-    /// Cheap byte-budget pre-check for a *raw* line (not yet sanitized).
-    /// Computes the exact rendered size — label + separator + line digits +
-    /// sanitized content + joining newline — without allocating, so an
-    /// over-budget line is rejected *before* `sanitized_line` pays for the
-    /// sanitizing copy. Exactness matters: escaping expands a control or
-    /// format char to up to ~6 bytes (`\u{1b}`), so a raw-length estimate
-    /// would let an ESC-heavy line slip through the pre-check only to be
-    /// rejected inside `push_item` after the allocation. Because the estimate
-    /// and `push_item` share the same threshold, the pre-check is a perfect
-    /// predictor: no line that would fit is rejected, no line that would
-    /// overflow is sanitized first. Returns `false` to stop the searcher.
-    fn budget_allows_raw(&mut self, line_number: u64, bytes: &[u8]) -> bool {
-        // Reuse `lossy_window` + `prepare_line` so the window/strip/cap match
-        // `sanitized_line` exactly, then sum per-char escaped lengths without
-        // allocating.
-        let lossy = lossy_window(bytes);
-        let (line, _) = prepare_line(&lossy);
-        let content_len = sanitize_text_len(&line, true);
+    /// Whether buffering a line with `content_len` sanitized bytes would
+    /// exceed the output budget — label + separator + line digits + sanitized
+    /// content + joining newline, exactly what `push_item` charges — so the
+    /// threshold can never drift from the renderer's. Shared by
+    /// `matched`/`context`/`drain_after_context`, each of which passes the
+    /// length computed on its *prepared* line (windowed/stripped/capped
+    /// exactly as the display path) so an over-budget line is rejected
+    /// *before* `sanitize_content` pays for the sanitizing copy. Exactness
+    /// matters: escaping expands a control or format char to up to ~6 bytes
+    /// (`\u{1b}`), so a raw-length estimate would let an ESC-heavy line slip
+    /// through the pre-check only to be rejected inside `push_item` after the
+    /// allocation. Because the estimate and `push_item` share the same
+    /// threshold, the pre-check is a perfect predictor: no line that would fit
+    /// is rejected, no line that would overflow is sanitized first. Returns
+    /// `false` (setting the stop) when the estimate exceeds the budget.
+    fn budget_allows_len(&mut self, line_number: u64, content_len: usize) -> bool {
         // Newline joins every rendered line but the very first of the output
         // (`render_content`'s join emits n-1 separators), matching
         // `push_item`'s charge.
@@ -533,11 +542,14 @@ impl GrepSink {
     ) -> Result<bool, std::io::Error> {
         // Same exact pre-check as `matched`/`context`: reject an over-budget
         // line before the sanitizing allocation (`push_item` would reject it
-        // too, but only after paying for the copy).
-        if !self.budget_allows_raw(line_number, bytes) {
+        // too, but only after paying for the copy). The window/strip/cap runs
+        // once here, feeding both the length estimate and the display content.
+        let lossy = lossy_window(bytes);
+        let (line, truncated) = prepare_line(&lossy);
+        if !self.budget_allows_len(line_number, sanitize_text_len(&line, true)) {
             return Ok(false);
         }
-        let (content, truncated) = sanitized_line(bytes);
+        let content = sanitize_content(&line);
         if !self.push_item(GrepItem::Context {
             line_number,
             content,
@@ -661,6 +673,13 @@ impl GrepSink {
     /// stopped collection before the requested cap, the honest "at least N
     /// exist" figure is the number actually collected; otherwise the
     /// max_results cap itself.
+    ///
+    /// Note: a file whose match hit the cap can still be aborted afterwards
+    /// (Content mode's after-context drain can be cut short by a read error
+    /// or a NUL byte), which refunds its matches from `result_count` — the
+    /// marker then reports more than the rendered body shows. That is
+    /// deliberate: the "at least N exist" claim stays true (the capped file
+    /// did produce N matches), so the cap is still the honest figure.
     fn marker_count(&self) -> usize {
         if self.stop == Some(StopReason::ByteBudget) {
             self.result_count()
@@ -696,9 +715,13 @@ impl Sink for GrepSink {
         match self.output_mode {
             GrepOutputMode::Content => {
                 // Reject a line that would blow the byte budget before
-                // sanitizing it — `sanitized_line` can allocate up to the
+                // sanitizing it — `sanitize_content` can allocate up to the
                 // line cap, and `push_item` would discard the result anyway.
-                if !self.budget_allows_raw(line_number, mat.bytes()) {
+                // The window/strip/cap runs once here; the prepared line feeds
+                // both the length estimate and the display content.
+                let lossy = lossy_window(mat.bytes());
+                let (line, _) = prepare_line(&lossy);
+                if !self.budget_allows_len(line_number, sanitize_text_len(&line, true)) {
                     return Ok(false);
                 }
                 // SinkMatch bytes include the line terminator — strip it (and
@@ -706,7 +729,7 @@ impl Sink for GrepSink {
                 // produce blank lines, then escape any remaining control
                 // characters so a hostile line cannot inject terminal escapes
                 // into the tool result.
-                let (content, _) = sanitized_line(mat.bytes());
+                let content = sanitize_content(&line);
                 if !self.push_item(GrepItem::Match {
                     line_number,
                     content,
@@ -779,11 +802,18 @@ impl Sink for GrepSink {
             return Ok(false);
         }
         // Same pre-check as `matched`: a line that would exceed the byte
-        // budget is rejected before the sanitizing allocation.
-        if !self.budget_allows_raw(ctx.line_number().unwrap_or(0), ctx.bytes()) {
+        // budget is rejected before the sanitizing allocation (and the
+        // window/strip/cap runs once here, feeding both the estimate and the
+        // display content).
+        let lossy = lossy_window(ctx.bytes());
+        let (line, _) = prepare_line(&lossy);
+        if !self.budget_allows_len(
+            ctx.line_number().unwrap_or(0),
+            sanitize_text_len(&line, true),
+        ) {
             return Ok(false);
         }
-        let (content, _) = sanitized_line(ctx.bytes());
+        let content = sanitize_content(&line);
         if !self.push_item(GrepItem::Context {
             line_number: ctx.line_number().unwrap_or(0),
             content,
@@ -1661,9 +1691,9 @@ mod tests {
     fn content_mode_discards_binary_partial_matches() {
         // A file with a NUL byte mid-way is truncated by binary detection
         // before the search completes. Matches observed before the NUL are
-        // not the file's true content — a binary file must render as skipped
-        // in *every* output mode (the tool documents that it respects binary
-        // files), not leak pre-NUL text matches.
+        // not the file's true content — the file must render as skipped in
+        // content mode (and count mode, per `files_mode_reports_pre_nul_...`,
+        // which pins the rg `-l` exception), not leak pre-NUL text matches.
         let dir = TempDir::new().expect("temp dir");
         std::fs::write(dir.path().join("bin.txt"), b"hello\nhello\n\0hello\n").expect("write");
 
@@ -1692,6 +1722,47 @@ mod tests {
             !result.contains("bin.txt"),
             "binary file must not appear:\n{result}"
         );
+    }
+
+    #[test]
+    fn files_mode_reports_pre_nul_match_like_rg_l() {
+        // A file with a match *before* a NUL byte, with the NUL far enough
+        // past the head that binary detection fires only after the match line
+        // was delivered (it triggers when the NUL-containing read chunk is
+        // processed). Content and Count modes discard the pre-NUL output (the
+        // file renders as skipped), but FilesWithMatches reports the file:
+        // the searcher stops at the first hit — rg `-l` semantics — before it
+        // can observe the later NUL, so `binary_data` never fires and there is
+        // no abort to discard. This matches ripgrep, which also lists a file
+        // that matched before binary data.
+        let dir = TempDir::new().expect("temp dir");
+        let mut content = Vec::with_capacity(3 * 1024 * 1024);
+        content.extend_from_slice(b"hello\n");
+        for _ in 0..120_000 {
+            content.extend_from_slice(b"filler line 000000\n");
+        }
+        content.extend_from_slice(b"\0hello\n");
+        std::fs::write(dir.path().join("bin.txt"), &content).expect("write");
+
+        let tool = Grep;
+
+        // Content mode: the pre-NUL match bucket is dropped at `end_file`.
+        let args = test_args("hello", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "No matches found.", "{result}");
+
+        // Count mode: the pre-NUL tally is discarded too.
+        let mut args = test_args("hello", Some(dir.path()));
+        args.output_mode = GrepOutputMode::Count;
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "No matches found.", "{result}");
+
+        // FilesWithMatches: the file matched before the NUL, so it is listed
+        // (rg `-l` semantics — the documented exception).
+        let mut args = test_args("hello", Some(dir.path()));
+        args.output_mode = GrepOutputMode::FilesWithMatches;
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "bin.txt", "{result}");
     }
 
     #[test]
@@ -1784,7 +1855,11 @@ mod tests {
                     GrepSink::new(GrepOutputMode::Content, 10, 0, Path::new("root"), false);
                 pre.begin_file(Path::new("a.txt"));
                 pre.content_bytes = content_bytes;
-                let pre_allows = pre.budget_allows_raw(1, &bytes);
+                // The pre-check consumes the same prepared line the display
+                // path builds, so mirror that composition here.
+                let lossy = lossy_window(&bytes);
+                let (line, _) = prepare_line(&lossy);
+                let pre_allows = pre.budget_allows_len(1, sanitize_text_len(&line, true));
 
                 let mut exact =
                     GrepSink::new(GrepOutputMode::Content, 10, 0, Path::new("root"), false);

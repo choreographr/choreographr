@@ -998,6 +998,16 @@ pub(crate) fn truncate_tool_output(content: &str) -> String {
     truncated
 }
 
+/// Whether every byte is an ASCII printable (`0x20..=0x7e`), or a TAB when
+/// `keep_tabs` — the fast path shared by [`sanitize_text`] and
+/// [`sanitize_text_len`] so both stay in sync on when escaping is needed.
+/// Multi-byte UTF-8 bytes are all `>= 0x80`, so any non-ASCII text falls
+/// through to the slow path, where it may hide a separator or format char.
+fn is_plain_ascii(text: &str, keep_tabs: bool) -> bool {
+    text.bytes()
+        .all(|b| (b == b'\t' && keep_tabs) || (0x20..=0x7e).contains(&b))
+}
+
 /// Escape control characters and Unicode line/paragraph separators in a
 /// string so a hostile name or content cannot corrupt the line-oriented tool
 /// output (every entry must stay on exactly one line) or inject terminal
@@ -1022,10 +1032,7 @@ pub(crate) fn sanitize_text(text: &str, keep_tabs: bool) -> String {
     // Fast path: ASCII printables (plus tabs when kept) — nothing to escape.
     // Multi-byte UTF-8 bytes are all >= 0x80, so any non-ASCII text falls
     // through to the slow path (it may hide a separator or bidi char).
-    if text
-        .bytes()
-        .all(|b| (b == b'\t' && keep_tabs) || (0x20..=0x7e).contains(&b))
-    {
+    if is_plain_ascii(text, keep_tabs) {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
@@ -1059,10 +1066,7 @@ fn sanitize_keeps(c: char, keep_tabs: bool) -> bool {
 pub(crate) fn sanitize_text_len(text: &str, keep_tabs: bool) -> usize {
     // Fast path mirrors `sanitize_text`: all-ASCII printables (plus tabs when
     // kept) pass through untouched, so the length is just the byte count.
-    if text
-        .bytes()
-        .all(|b| (b == b'\t' && keep_tabs) || (0x20..=0x7e).contains(&b))
-    {
+    if is_plain_ascii(text, keep_tabs) {
         return text.len();
     }
     text.chars()
