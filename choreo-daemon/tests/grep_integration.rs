@@ -1,10 +1,12 @@
 use choreographr::{GrepArgs, GrepOutputMode, execute_grep_tool};
 
 /// Build args with defaults for a directory search so tests stay focused.
+/// `regex: true` mirrors the production default (regex is on unless the
+/// caller opts out).
 fn dir_args(pattern: &str, dir: &tempfile::TempDir) -> GrepArgs {
     GrepArgs {
         pattern: pattern.to_string(),
-        regex: false,
+        regex: true,
         ignore_case: false,
         context: 0,
         output_mode: GrepOutputMode::Content,
@@ -50,8 +52,8 @@ fn grep_regex_mode() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.rs"), "fn hello() {}\nfn world() {}").unwrap();
 
-    let mut args = dir_args(r"fn \w+", &dir);
-    args.regex = true;
+    // Regex is the default — no need to opt in for `fn \w+`.
+    let args = dir_args(r"fn \w+", &dir);
     let result = execute_grep_tool(&args, None);
     let content = result.unwrap_or_default();
     assert!(content.contains("fn hello()"), "{}", content);
@@ -203,7 +205,7 @@ fn grep_single_file_include_filters_by_basename() {
 
     let file_arg = |include: &str| GrepArgs {
         pattern: "hello".to_string(),
-        regex: false,
+        regex: true,
         ignore_case: false,
         context: 0,
         output_mode: GrepOutputMode::Content,

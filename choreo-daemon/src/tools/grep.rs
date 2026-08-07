@@ -75,12 +75,27 @@ impl GrepOutputMode {
     }
 }
 
+/// Serde default for [`GrepArgs::regex`] — regex is on unless the caller
+/// explicitly opts out with `regex: false`.
+///
+/// The LLM writes regex patterns (alternation, anchors, character classes,
+/// escapes) far more often than it needs a literal substring search, so a
+/// regex default removes the classic silent failure of a regex pattern being
+/// matched literally (the tool returns nothing and the caller is left guessing
+/// why). schemars reflects this default in the tool schema, so the model sees
+/// `"default": true` next to the field.
+fn default_regex_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GrepArgs {
-    /// Search pattern (plain text or regex)
+    /// Search pattern. Treated as a regular expression by default; set
+    /// `regex: false` to match it as a literal substring.
     pub pattern: String,
-    /// When true, treat pattern as a regular expression
-    #[serde(default)]
+    /// When true (the default), treat the pattern as a regular expression.
+    /// Set to false to match the pattern as a literal substring.
+    #[serde(default = "default_regex_enabled")]
     pub regex: bool,
     /// When true, match case-insensitively. Applies to both literal and
     /// regex patterns (mirrors ripgrep's `--ignore-case`).
@@ -112,8 +127,9 @@ pub struct GrepArgs {
 pub struct Grep;
 
 /// Produce a hint string when the pattern looks like a regex but `regex` is
-/// not enabled and no results were found.  Returns `None` when there is no
-/// hint to give (results found, regex enabled, or pattern is plain text).
+/// explicitly disabled and no results were found.  Returns `None` when there
+/// is no hint to give (results found, regex enabled, or pattern is plain
+/// text).
 ///
 /// The message is deliberately short: the LLM reads this as an explanation
 /// for a surprising empty result, so it states the one actionable fix and
@@ -139,7 +155,7 @@ fn regex_mode_hint(pattern: &str, regex: bool, has_results: bool) -> Option<Stri
         return None;
     }
     Some(
-        "Note: pattern matched literally. Set regex:true to interpret it as a regular expression."
+        "Note: pattern matched literally. Set regex:true (the default) to interpret it as a regular expression."
             .to_string(),
     )
 }
@@ -1267,7 +1283,7 @@ impl Tool for Grep {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents for a pattern. Patterns are matched literally by default — set regex:true to use a regular expression, ignore_case:true to ignore case, and context to show surrounding lines. Use output_mode (content, files_with_matches, or count) to change the result format. Use include to filter files by glob (e.g. \"*.rs\"); globs with '/' match root-relative paths (e.g. 'src/*.rs') and bare globs match file names. path scopes the search (a file or directory), and max_results caps matches — a '...[truncated at N matches]' line is appended when the cap is hit (it means *at least* N exist). Results in file:line:content format (context lines use file-line-content). Respects .gitignore, hidden, and binary files."
+        "Search file contents for a pattern. Patterns are treated as regular expressions by default — set regex:false to match literally, ignore_case:true to ignore case, and context to show surrounding lines. Use output_mode (content, files_with_matches, or count) to change the result format. Use include to filter files by glob (e.g. \"*.rs\"); globs with '/' match root-relative paths (e.g. 'src/*.rs') and bare globs match file names. path scopes the search (a file or directory), and max_results caps matches — a '...[truncated at N matches]' line is appended when the cap is hit (it means *at least* N exist). Results in file:line:content format (context lines use file-line-content). Respects .gitignore, hidden, and binary files."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
@@ -1278,8 +1294,11 @@ impl Tool for Grep {
             "Searching for `{}`.",
             sanitize_content(&args.pattern)
         )];
-        if args.regex {
-            parts.push(" Using regex.".to_string());
+        // Regex is the default, so only an explicit literal search (regex:false)
+        // is flagged — the model needs to notice when it accidentally got
+        // literal matching, the exact failure a regex default prevents.
+        if !args.regex {
+            parts.push(" Using literal matching.".to_string());
         }
         if args.ignore_case {
             parts.push(" Ignoring case.".to_string());
@@ -1345,15 +1364,17 @@ fn assemble_grep_output(body: String, truncated: bool, max_results: usize, noun:
 mod tests {
     use super::*;
     use crate::tools::Tool;
+    use serde_json;
     use std::io::Write;
     use tempfile::TempDir;
 
     /// A `GrepArgs` with sensible defaults so tests only override the fields
-    /// they exercise.
+    /// they exercise. `regex: true` mirrors the production default (regex is
+    /// on unless the caller opts out).
     fn test_args(pattern: &str, path: Option<&Path>) -> GrepArgs {
         GrepArgs {
             pattern: pattern.to_string(),
-            regex: false,
+            regex: true,
             ignore_case: false,
             context: 0,
             output_mode: GrepOutputMode::Content,
@@ -1361,6 +1382,37 @@ mod tests {
             path: path.map(|p| p.to_string_lossy().into_owned()),
             max_results: None,
         }
+    }
+
+    #[test]
+    fn omitted_regex_defaults_to_enabled() {
+        // A real tool call (JSON, missing `regex`) must run in regex mode — the
+        // whole point of the default flip. An empty args object deserializes
+        // to regex on.
+        let args: GrepArgs = serde_json::from_value(serde_json::json!({ "pattern": "fn \\w+" }))
+            .expect("deserialize args without regex");
+        assert!(args.regex, "omitted regex must default to true");
+        // And an explicit opt-out must still win.
+        let args: GrepArgs = serde_json::from_value(serde_json::json!({
+            "pattern": "foo.bar",
+            "regex": false
+        }))
+        .expect("deserialize args with regex:false");
+        assert!(!args.regex, "explicit regex:false must be honored");
+    }
+
+    #[test]
+    fn regex_field_schema_advertises_true_default() {
+        // The LLM reads the tool's JSON Schema (Tool::schema, which sanitizes
+        // the raw schemars output) to decide how to call grep; the
+        // `default: true` next to the regex field is what tells the model
+        // regex is the default mode.
+        let schema = Grep.schema();
+        assert_eq!(
+            schema["properties"]["regex"]["default"],
+            serde_json::json!(true),
+            "regex default must be advertised in the schema: {schema}"
+        );
     }
 
     /// Create a temporary directory with a known set of files for testing.
@@ -1466,8 +1518,9 @@ mod tests {
     fn test_regex_match() {
         let dir = setup_test_dir();
         let tool = Grep;
+        // Regex is the default — no need to opt in. `fn \w+` must match both
+        // function lines, which literal mode could never do.
         let mut args = test_args(r"fn \w+", Some(dir.path()));
-        args.regex = true;
         args.include = Some("*.rs".to_string());
         let result = tool.execute(args, None, None, None).unwrap();
 
@@ -1552,11 +1605,12 @@ mod tests {
     fn test_case_sensitivity() {
         let dir = setup_test_dir();
         let tool = Grep;
-        let args = test_args("HELLO", Some(dir.path()));
+        // Literal mode, exercised explicitly: fixed_string(true) performs an
+        // exact case-sensitive match. "HELLO" (uppercase) should not match
+        // "hello" (lowercase).
+        let mut args = test_args("HELLO", Some(dir.path()));
+        args.regex = false;
         let result = tool.execute(args, None, None, None).unwrap();
-
-        // fixed_string(true) performs an exact case-sensitive match by default.
-        // "HELLO" (uppercase) should not match "hello" (lowercase).
         assert!(result.contains("No matches found."), "got:\n{result}");
     }
 
@@ -1581,8 +1635,9 @@ mod tests {
         std::fs::write(dir.path().join("test.txt"), "Hello World\n").expect("write");
 
         let tool = Grep;
+        // Regex is the default, so `^hello` is interpreted as a regex anchor
+        // unless literal mode were requested.
         let mut args = test_args("^hello", Some(dir.path()));
-        args.regex = true;
         args.ignore_case = true;
         let result = tool.execute(args, None, None, None).unwrap();
         assert!(
@@ -2486,31 +2541,49 @@ mod tests {
     }
 
     #[test]
-    fn describe_invocation_includes_regex_and_include() {
+    fn describe_invocation_reports_include_and_max_results() {
         let tool = Grep;
         let mut args = test_args("fn \\w+", None);
-        args.regex = true;
         args.include = Some("*.rs".into());
         args.max_results = Some(50);
         let desc = tool.describe_invocation(&args);
         assert!(desc.contains("Searching for `fn \\w+`."));
-        assert!(desc.contains("Using regex."));
         assert!(desc.contains("Include pattern: `*.rs`."));
         assert!(desc.contains("Max results: 50."));
+        // Regex is the default — no mode annotation when it's in effect.
+        assert!(
+            !desc.contains("regex"),
+            "default regex mode is not flagged: {desc}"
+        );
+        assert!(
+            !desc.contains("literal"),
+            "default regex mode is not flagged: {desc}"
+        );
+    }
+
+    #[test]
+    fn describe_invocation_flags_literal_matching() {
+        // Regex is the default, so a search that ran in literal mode
+        // (regex:false) must be flagged — the model needs to spot when it
+        // accidentally got literal matching, the exact failure a regex default
+        // prevents.
+        let tool = Grep;
+        let mut args = test_args("foo", None);
+        args.regex = false;
+        let desc = tool.describe_invocation(&args);
+        assert!(desc.contains("Using literal matching."), "{desc}");
     }
 
     #[test]
     fn describe_invocation_includes_new_options() {
         let tool = Grep;
         let mut args = test_args("fn \\w+", None);
-        args.regex = true;
         args.ignore_case = true;
         args.output_mode = GrepOutputMode::Count;
         args.include = Some("*.rs".into());
         args.max_results = Some(25);
         let desc = tool.describe_invocation(&args);
         assert!(desc.contains("Searching for `fn \\w+`."));
-        assert!(desc.contains("Using regex."));
         assert!(desc.contains("Ignoring case."));
         assert!(desc.contains("Output mode: count."));
         assert!(desc.contains("Include pattern: `*.rs`."));
@@ -2824,7 +2897,9 @@ mod tests {
         let dir = setup_test_dir();
         let tool = Grep;
         // Pattern contains | but regex:false — no file contains literal "foo|bar".
-        let args = test_args("foo|bar", Some(dir.path()));
+        // (regex is the default, so literal mode must be requested explicitly.)
+        let mut args = test_args("foo|bar", Some(dir.path()));
+        args.regex = false;
         let result = tool.execute(args, None, None, None).unwrap();
         // Should get the message plus a hint, not an empty string.
         assert!(
@@ -2838,13 +2913,13 @@ mod tests {
     }
 
     #[test]
-    fn test_no_hint_when_regex_enabled() {
+    fn test_no_hint_when_regex_default_enabled() {
         let dir = setup_test_dir();
         let tool = Grep;
-        // regex:true, so no hint should be given even if pattern has
-        // metacharacters. Pattern doesn't match anything as a regex either.
-        let mut args = test_args("zxyz|quux", Some(dir.path()));
-        args.regex = true;
+        // Regex is the default, so no hint should be given even if the pattern
+        // has metacharacters — it was already matched as a regex (and matches
+        // nothing even then).
+        let args = test_args("zxyz|quux", Some(dir.path()));
         let result = tool.execute(args, None, None, None).unwrap();
         // Explicit no-match message, but no "matched literally" hint.
         assert!(
@@ -2853,7 +2928,7 @@ mod tests {
         );
         assert!(
             !result.contains("Note: pattern matched literally"),
-            "expected no hint with regex:true:\n{result}"
+            "expected no hint with regex enabled:\n{result}"
         );
     }
 
