@@ -1,4 +1,4 @@
-use choreo_proto::Turn;
+use choreo_proto::{ToolResultRecord, Turn};
 use choreo_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -282,6 +282,32 @@ pub(crate) struct RenderedTurnLines {
     /// first reasoning line; expansion only appends body lines *after* it),
     /// so it can be cached alongside the rendered lines.
     pub reasoning_header_idx: Option<usize>,
+    /// Semantic-line index of each tool result's header line within `lines`,
+    /// one entry per result in `turn.tool_results` order (empty when the
+    /// turn has no tool results or short-circuits on the error block).
+    /// Every result renders exactly one header row.  A result's header index
+    /// depends on the body lengths of the results *before* it, so indexes are
+    /// only meaningful for the collapse state they were rendered with — the
+    /// cache key (and the per-state `TurnLayout` ranges) guard against reuse
+    /// across states.
+    pub tool_result_header_idxs: Vec<usize>,
+}
+
+/// Tools whose result content is only meaningful to the LLM (verbatim file
+/// contents, raw HTTP responses) and would spam the user's session history
+/// if rendered in full by default.  Their invocation description (e.g.
+/// "Reading file `main.rs`.") is the primary UI summary; the full body is
+/// one triangle-click away.
+const QUIET_TOOLS: &[&str] = &["read_file", "read_file_range", "http_request"];
+
+/// Whether a tool result should default to collapsed in the TUI.
+///
+/// Quiet tools default to collapsed so the header (triangle + invocation
+/// description) is the primary view; clicking the triangle reveals the
+/// verbatim body.  Error results are never quiet — the error message is
+/// the point — and remain expanded by default.
+pub(crate) fn tool_result_default_collapsed(record: &ToolResultRecord) -> bool {
+    !record.is_error && QUIET_TOOLS.contains(&record.name.as_str())
 }
 
 /// Render a complete Turn as styled lines suitable for the chat history.
@@ -292,11 +318,16 @@ pub(crate) struct RenderedTurnLines {
 /// `reasoning_expanded` controls whether the turn's reasoning body is shown
 /// below its collapsible header (the caller derives this from the default
 /// plus any user override — see [`reasoning_expanded_default`]).
+///
+/// `tool_results_collapsed` holds the per-result collapse state, aligned
+/// with `turn.tool_results` (the caller derives it from the default — see
+/// [`tool_result_default_collapsed`] — plus any user override).
 pub(crate) fn render_turn_lines(
     turn: &Turn,
     content_width: u16,
     tool_content_width: u16,
     reasoning_expanded: bool,
+    tool_results_collapsed: &[bool],
 ) -> RenderedTurnLines {
     let mut all_lines: Vec<Line<'static>> = Vec::new();
 
@@ -311,6 +342,7 @@ pub(crate) fn render_turn_lines(
         return RenderedTurnLines {
             lines: all_lines,
             reasoning_header_idx: None,
+            tool_result_header_idxs: Vec::new(),
         };
     }
 
@@ -393,12 +425,13 @@ pub(crate) fn render_turn_lines(
 
     // ── Tool results block (red accent if error, gray otherwise) ─
     //
-    // Quiet tools are those whose content is only meaningful to the LLM
-    // and would spam the user's session history if rendered in full.
-    // Their invocation description (e.g. "Reading file `main.rs`.") is
-    // shown instead, giving the user enough context without the verbatim
-    // content.
-    const QUIET_TOOLS: &[&str] = &["read_file", "read_file_range"];
+    // Each tool result is collapsible: a header row (triangle + invocation
+    // description, or the standard label when the description is empty)
+    // is always rendered, with the body (label row + content) below it only
+    // when the result is expanded.  Quiet tools (see
+    // `tool_result_default_collapsed`) default to collapsed; everything
+    // else — including errors — defaults to expanded.
+    let mut tool_result_header_idxs: Vec<usize> = Vec::new();
 
     // Tools whose output is never a diff. The diff auto-detection heuristic
     // in `diff_render::is_diff_text` keys on lines starting with `--- ` (a
@@ -411,57 +444,93 @@ pub(crate) fn render_turn_lines(
     // always fall through to the regular markdown path.
     const DIFF_EXCLUDED_TOOLS: &[&str] = &["pdf_to_markdown"];
 
-    for tr in &turn.tool_results {
+    for (i, tr) in turn.tool_results.iter().enumerate() {
         let accent = if tr.is_error {
             Color::Red
         } else {
             Color::Reset
         };
-        // Quiet tools suppress their full content body from the UI (the
-        // invocation description is sufficient context), but the label
-        // remains the standard "tool result" — only error results get
-        // a distinct label.
-        let is_quiet = !tr.is_error && QUIET_TOOLS.contains(&tr.name.as_str());
         let label = if tr.is_error {
             "tool error"
         } else {
             "tool result"
         };
+        // Per-result collapse state from the caller (aligned with
+        // `turn.tool_results`); a missing entry (defensive fallback) is
+        // rendered expanded.
+        let collapsed = tool_results_collapsed.get(i).copied().unwrap_or(false);
+        let arrow = if collapsed { "▶" } else { "▼" };
 
         let mut body: Vec<Line<'static>> = Vec::new();
 
-        // Invocation description (rendered as markdown so code blocks
-        // highlight properly) appears before the tool result/error label.
-        if !tr.invocation_description.is_empty() {
-            body.extend(markdown_lines(
-                &tr.invocation_description,
-                tool_content_width,
+        // Invocation description rendered as markdown so inline code and
+        // emphasis highlight properly.  Its first line becomes the header
+        // row (triangle + description); any continuation lines join the
+        // expanded body below the header.
+        let desc_lines = if tr.invocation_description.is_empty() {
+            Vec::new()
+        } else {
+            markdown_lines(&tr.invocation_description, tool_content_width)
+        };
+
+        // Header row — always rendered so its position is stable across
+        // collapse/expand (mirroring the reasoning header).  The triangle
+        // sits left of the description; when no description exists (common
+        // while streaming) the standard label carries the row instead.
+        let header_idx_in_body = body.len();
+        let mut header_spans = vec![Span::styled(
+            format!("{arrow} "),
+            Style::default().fg(Color::Gray),
+        )];
+        if let Some(first) = desc_lines.first() {
+            header_spans.extend(first.spans.iter().cloned());
+        } else {
+            header_spans.push(Span::styled(
+                format!("{label}: {}", tr.name),
+                Style::default().fg(accent),
             ));
-            body.push(Line::from(Span::styled(String::new(), Style::default())));
         }
+        body.push(Line::from(header_spans));
+        tool_result_header_idxs.push(all_lines.len() + header_idx_in_body);
 
-        // Header line
-        body.push(Line::from(Span::styled(
-            format!("{label}: {}", tr.name),
-            Style::default().fg(accent),
-        )));
-
-        // Skip rendering the full content body for quiet tools — the
-        // invocation description above already tells the user what was
-        // read, and the raw file contents are only needed by the LLM.
-        if !is_quiet && !tr.content.is_empty() {
-            body.push(Line::from(Span::styled(String::new(), Style::default())));
-            // Content with ANSI escape codes gets colored rendering.
-            if tr.content.contains("\x1b[") {
-                body.extend(ansi_lines(&tr.content, tool_content_width));
-            } else if tr.is_error {
-                body.extend(plain_text_lines(&tr.content));
-            } else if !DIFF_EXCLUDED_TOOLS.contains(&tr.name.as_str())
-                && let Some(diff_lines) = try_render_diff_content(&tr.content, tool_content_width)
-            {
-                body.extend(diff_lines);
-            } else {
-                body.extend(markdown_lines(&tr.content, tool_content_width));
+        // Expanded body only — a collapsed result is just its header row.
+        if !collapsed {
+            // Capture the description's line count before consuming it, so
+            // the continuation-line check and the label-row decision both
+            // work after the `into_iter()` move below.
+            let desc_len = desc_lines.len();
+            // Continuation lines of a multi-line invocation description.
+            if desc_len > 1 {
+                body.extend(desc_lines.into_iter().skip(1));
+            }
+            // The label row is redundant when the header already shows it
+            // (the no-description fallback above), so it appears only when
+            // the description carried the header.
+            if desc_len > 0 {
+                body.push(Line::from(Span::styled(String::new(), Style::default())));
+                body.push(Line::from(Span::styled(
+                    format!("{label}: {}", tr.name),
+                    Style::default().fg(accent),
+                )));
+            }
+            // Full content body — rendered for every expanded result.  The
+            // old hard "quiet" suppression is now just the default collapse
+            // state: expanding a quiet tool reveals the verbatim content.
+            if !tr.content.is_empty() {
+                body.push(Line::from(Span::styled(String::new(), Style::default())));
+                // Content with ANSI escape codes gets colored rendering.
+                if tr.content.contains("\x1b[") {
+                    body.extend(ansi_lines(&tr.content, tool_content_width));
+                } else if tr.is_error {
+                    body.extend(plain_text_lines(&tr.content));
+                } else if !DIFF_EXCLUDED_TOOLS.contains(&tr.name.as_str())
+                    && let Some(diff_lines) =
+                        try_render_diff_content(&tr.content, tool_content_width)
+                {
+                    body.extend(diff_lines);
+                } else {
+                    body.extend(markdown_lines(&tr.content, tool_content_width));
+                }
             }
         }
 
@@ -486,6 +555,7 @@ pub(crate) fn render_turn_lines(
     RenderedTurnLines {
         lines: all_lines,
         reasoning_header_idx,
+        tool_result_header_idxs,
     }
 }
 
@@ -2041,7 +2111,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         assert!(!lines.is_empty());
         let text = lines
             .iter()
@@ -2065,7 +2135,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2089,7 +2159,7 @@ mod tests {
             displayed_images: vec![],
         };
         // Default state for a turn with a response: reasoning collapsed.
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2134,7 +2204,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2174,7 +2244,7 @@ mod tests {
         };
         // User re-expanded the reasoning: the header points down and the
         // reasoning body appears BELOW the response.
-        let lines = render_turn_lines(&turn, 80, 85, true).lines;
+        let lines = render_turn_lines(&turn, 80, 85, true, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2213,7 +2283,7 @@ mod tests {
             displayed_images: vec![],
         };
         // No response text: reasoning defaults to expanded.
-        let lines = render_turn_lines(&turn, 80, 85, true).lines;
+        let lines = render_turn_lines(&turn, 80, 85, true, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2247,7 +2317,7 @@ mod tests {
             displayed_images: vec![],
         };
         // Turn with a response: reasoning collapsed by default.
-        let rendered = render_turn_lines(&turn, 80, 85, false);
+        let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
         let idx = rendered
             .reasoning_header_idx
             .expect("turn with reasoning must report a header index");
@@ -2286,8 +2356,8 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let collapsed = render_turn_lines(&turn, 80, 85, false);
-        let expanded = render_turn_lines(&turn, 80, 85, true);
+        let collapsed = render_turn_lines(&turn, 80, 85, false, &[]);
+        let expanded = render_turn_lines(&turn, 80, 85, true, &[]);
         assert_eq!(
             collapsed.reasoning_header_idx, expanded.reasoning_header_idx,
             "the header index must not depend on the collapsed/expanded state"
@@ -2309,7 +2379,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let rendered = render_turn_lines(&turn, 80, 85, false);
+        let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
         assert!(
             rendered.reasoning_header_idx.is_none(),
             "no reasoning → no header index"
@@ -2330,7 +2400,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let rendered = render_turn_lines(&turn, 80, 85, false);
+        let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
         assert!(
             rendered.reasoning_header_idx.is_none(),
             "whitespace-only reasoning is treated as absent"
@@ -2351,7 +2421,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2388,7 +2458,7 @@ mod tests {
             displayed_images: vec![],
         };
         // No response text: reasoning defaults to expanded.
-        let lines = render_turn_lines(&turn, 80, 85, true).lines;
+        let lines = render_turn_lines(&turn, 80, 85, true, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2480,7 +2550,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2493,7 +2563,11 @@ mod tests {
     }
 
     #[test]
-    fn render_turn_lines_tool_results() {
+    fn render_turn_lines_quiet_tool_collapsed_by_default_hides_content() {
+        // Quiet tools (read_file, read_file_range, http_request) default to
+        // collapsed: the header row (triangle + invocation description) is
+        // shown, but the label row and verbatim content are hidden behind
+        // the triangle until the user expands the result.
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
@@ -2512,18 +2586,186 @@ mod tests {
             }],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[true]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        // Quiet tools show the standard "tool result" label and the
-        // invocation description but suppress the full content body
-        // — the LLM still gets it.
-        assert!(text.contains("tool result: read_file"));
-        assert!(text.contains("src/main.rs"));
-        assert!(!text.contains("file contents"));
+        // Collapsed: triangle + description header only — no label row, no
+        // verbatim content (the LLM still gets it; the user can expand).
+        assert!(text.contains("▶ Reading file src/main.rs."), "{text}");
+        assert!(!text.contains("tool result: read_file"), "{text}");
+        assert!(!text.contains("file contents"), "{text}");
+    }
+
+    #[test]
+    fn render_turn_lines_quiet_tool_expanded_reveals_content() {
+        // Expanding a quiet tool (user clicked the triangle) reveals the
+        // label row and the verbatim content the old hard suppression
+        // always hid.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "read_file".into(),
+                content: "file contents".into(),
+                is_error: false,
+                invocation_description: "Reading file `src/main.rs`.".into(),
+            }],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false, &[false]).lines;
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("▼ Reading file src/main.rs."), "{text}");
+        assert!(text.contains("tool result: read_file"), "{text}");
+        assert!(text.contains("file contents"), "{text}");
+    }
+
+    #[test]
+    fn tool_result_default_collapsed_quiet_and_error_rules() {
+        // Quiet tools default collapsed; everything else — including error
+        // results of quiet tools — defaults expanded.
+        let mk = |name: &str, is_error: bool| choreo_proto::ToolResultRecord {
+            call_id: "c".into(),
+            name: name.into(),
+            content: "x".into(),
+            is_error,
+            invocation_description: String::new(),
+        };
+        assert!(tool_result_default_collapsed(&mk("read_file", false)));
+        assert!(tool_result_default_collapsed(&mk("read_file_range", false)));
+        assert!(tool_result_default_collapsed(&mk("http_request", false)));
+        assert!(!tool_result_default_collapsed(&mk("sh", false)));
+        assert!(!tool_result_default_collapsed(&mk("read_file", true)));
+        assert!(!tool_result_default_collapsed(&mk("http_request", true)));
+    }
+
+    #[test]
+    fn render_turn_lines_tool_result_header_falls_back_to_label_without_description() {
+        // Streaming stubs (and tools with no invocation description) carry
+        // the standard label in the header row; expanding still shows the
+        // content body, and the label is not duplicated.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "run".into(),
+                content: "progress".into(),
+                is_error: false,
+                invocation_description: String::new(),
+            }],
+            displayed_images: vec![],
+        };
+        let join = |lines: Vec<ratatui::text::Line<'static>>| {
+            lines
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let collapsed = render_turn_lines(&turn, 80, 85, false, &[true]);
+        let text = join(collapsed.lines);
+        assert!(text.contains("▶ tool result: run"), "{text}");
+        assert!(!text.contains("progress"), "{text}");
+        let expanded = render_turn_lines(&turn, 80, 85, false, &[false]);
+        let text = join(expanded.lines);
+        assert!(text.contains("▼ tool result: run"), "{text}");
+        assert!(text.contains("progress"), "{text}");
+    }
+
+    #[test]
+    fn render_turn_lines_tool_result_header_idxs_aligned_and_stable() {
+        // Each tool result reports a header index in tool_results order.  A
+        // result's header index shifts when an earlier result's body grows or
+        // shrinks (collapse changes body lengths), so the indexes describe the
+        // rendered state they were computed with — exactly what the layout
+        // ranges and the cache key need.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![
+                choreo_proto::ToolResultRecord {
+                    call_id: "c1".into(),
+                    name: "read_file".into(),
+                    content: "a".into(),
+                    is_error: false,
+                    invocation_description: "Reading `a`.".into(),
+                },
+                choreo_proto::ToolResultRecord {
+                    call_id: "c2".into(),
+                    name: "sh".into(),
+                    content: "b".into(),
+                    is_error: false,
+                    invocation_description: "Running `b`.".into(),
+                },
+            ],
+            displayed_images: vec![],
+        };
+        let collapsed = render_turn_lines(&turn, 80, 85, false, &[true, true]);
+        let expanded = render_turn_lines(&turn, 80, 85, false, &[false, false]);
+        assert_eq!(collapsed.tool_result_header_idxs.len(), 2);
+        assert_eq!(expanded.tool_result_header_idxs.len(), 2);
+        // No other sections in this turn: the collapsed headers are the first
+        // two lines, each carrying its triangle + description.
+        assert_eq!(collapsed.tool_result_header_idxs[0], 0);
+        assert_eq!(collapsed.tool_result_header_idxs[1], 1);
+        assert!(collapsed.lines[0].to_string().contains("▶ Reading a."));
+        assert!(collapsed.lines[1].to_string().contains("▶ Running b."));
+        // Expanding the first result pushes the second result's header down
+        // past the first result's body (label + content); the header indexes
+        // must reflect that shift, pointing at the real header rows.
+        assert_eq!(expanded.tool_result_header_idxs[0], 0);
+        let second = expanded.tool_result_header_idxs[1];
+        assert!(
+            second > 1,
+            "expanded first result pushes the second header down"
+        );
+        assert!(expanded.lines[second].to_string().contains("▼ Running b."));
+        // Expanded has strictly more lines than collapsed (bodies added).
+        assert!(collapsed.lines.len() < expanded.lines.len());
+    }
+
+    #[test]
+    fn render_turn_lines_tool_result_header_idxs_empty_without_results() {
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
+        assert!(rendered.tool_result_header_idxs.is_empty());
     }
 
     #[test]
@@ -2557,7 +2799,7 @@ content ---"
             }],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2605,7 +2847,7 @@ content ---"
             }],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2637,7 +2879,7 @@ content ---"
             }],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2661,7 +2903,7 @@ content ---"
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].width(), 0);
     }
@@ -2680,7 +2922,7 @@ content ---"
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2722,7 +2964,7 @@ content ---"
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())

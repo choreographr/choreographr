@@ -115,9 +115,21 @@ impl SessionView {
         match turn.tool_results.iter_mut().find(|r| r.call_id == call_id) {
             Some(result) => result.content.push_str(data),
             None => {
+                // Stub created out of order (chunk before ToolCallStarted).
+                // Resolve the tool name from the turn's tool_calls so the
+                // quiet/derived-default decision (which keys on the name)
+                // is correct from the first chunk instead of flipping when
+                // the real record lands.  Falls back to empty when the call
+                // is unknown, which is never quiet → default expanded.
+                let name = turn
+                    .tool_calls
+                    .iter()
+                    .find(|tc| tc.call_id == call_id)
+                    .map(|tc| tc.name.clone())
+                    .unwrap_or_default();
                 turn.tool_results.push(ToolResultRecord {
                     call_id: call_id.to_string(),
-                    name: String::new(),
+                    name,
                     content: data.to_string(),
                     is_error: false,
                     invocation_description: String::new(),
@@ -134,5 +146,86 @@ impl SessionView {
 impl Default for SessionView {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn_with_tool_call(call_id: &str, name: &str) -> Turn {
+        Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: call_id.into(),
+                name: name.into(),
+                arguments_json: "{}".into(),
+            }],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        }
+    }
+
+    #[test]
+    fn tool_result_chunk_stub_resolves_name_from_tool_calls() {
+        // A chunk arriving before the real record (or before
+        // ToolCallStarted) creates a stub.  The stub must carry the tool
+        // name — resolved from `tool_calls` — so the TUI's quiet/
+        // derived-default decision is correct from the first chunk instead
+        // of flipping when the real record lands.
+        let mut view = SessionView::new();
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "read_file"));
+        view.request_to_turn.insert(7, 1);
+
+        view.tool_result_chunk(7, "call-1", "line one\n");
+
+        let turn = view.get(1).unwrap();
+        assert_eq!(turn.tool_results.len(), 1);
+        assert_eq!(turn.tool_results[0].name, "read_file");
+        assert_eq!(turn.tool_results[0].call_id, "call-1");
+        assert_eq!(turn.tool_results[0].content, "line one\n");
+    }
+
+    #[test]
+    fn tool_result_chunk_appends_to_existing_record() {
+        let mut view = SessionView::new();
+        let mut turn = turn_with_tool_call("call-1", "sh");
+        turn.tool_results.push(ToolResultRecord {
+            call_id: "call-1".into(),
+            name: "sh".into(),
+            content: "first".into(),
+            is_error: false,
+            invocation_description: String::new(),
+        });
+        view.insert_or_replace(1, turn);
+        view.request_to_turn.insert(7, 1);
+
+        view.tool_result_chunk(7, "call-1", "second");
+
+        let turn = view.get(1).unwrap();
+        assert_eq!(turn.tool_results.len(), 1, "chunks append, never duplicate");
+        assert_eq!(turn.tool_results[0].content, "firstsecond");
+    }
+
+    #[test]
+    fn tool_result_chunk_unknown_call_keeps_empty_name() {
+        // A chunk for a call_id with no matching tool_call creates a stub
+        // with an empty name — never quiet, so the TUI defaults it to
+        // expanded.
+        let mut view = SessionView::new();
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
+        view.request_to_turn.insert(7, 1);
+
+        view.tool_result_chunk(7, "nope", "data");
+
+        let turn = view.get(1).unwrap();
+        assert_eq!(turn.tool_results.len(), 1);
+        assert_eq!(turn.tool_results[0].name, "");
     }
 }

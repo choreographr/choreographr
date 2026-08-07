@@ -2508,6 +2508,97 @@ fn click_on_reasoning_header_toggles_collapse_when_content_fits_viewport() {
 }
 
 #[test]
+fn click_on_tool_result_header_toggles_collapse() {
+    // Clicking a tool result's header row (triangle + description) toggles
+    // that result's collapsible body.  A quiet tool (read_file) defaults to
+    // collapsed, so the first click expands it and the second collapses it.
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 20;
+
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![choreo_proto::ToolResultRecord {
+            call_id: "call-1".into(),
+            name: "read_file".into(),
+            content: "file contents".into(),
+            is_error: false,
+            invocation_description: "Reading file `src/main.rs`.".into(),
+        }],
+        displayed_images: vec![],
+    };
+    app.active_display()
+        .unwrap()
+        .view
+        .insert_or_replace(1, turn);
+    app.rebuild_height_prefix();
+
+    // The collapsed quiet result renders a single header line, so its click
+    // range is content lines [0, 1).
+    let (start, end) = app.active_display().unwrap().turn_layouts[0]
+        .tool_result_header_ranges
+        .first()
+        .copied()
+        .expect("quiet tool result must have a header range");
+    assert_eq!((start, end), (0, 1));
+
+    // Size the viewport to the content so screen row == content line.
+    let total = app.active_display().unwrap().total_history_height();
+    app.history_viewport.height = total as u16;
+    let row = start as u16;
+
+    // First click: expands the collapsed quiet result.
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle click");
+    assert_eq!(
+        app.active_display()
+            .unwrap()
+            .tool_collapse_override
+            .get(&(1, "call-1".into())),
+        Some(&false),
+        "clicking the header of a collapsed quiet result should expand it"
+    );
+
+    // Second click: collapses again.
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle click");
+    assert_eq!(
+        app.active_display()
+            .unwrap()
+            .tool_collapse_override
+            .get(&(1, "call-1".into())),
+        Some(&true),
+        "clicking the header again should collapse the result"
+    );
+}
+
+#[test]
 fn click_on_reasoning_header_toggles_collapse_when_scrolled() {
     // Regression: on sessions with a scrollbar, once the user scrolls away
     // from the bottom the click mapping must account for the scroll offset

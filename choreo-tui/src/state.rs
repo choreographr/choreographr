@@ -2,7 +2,7 @@ use choreo_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use choreo_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
 use choreo_proto::{
     AccountInfo, ClientMessage, OutputStream, ReasoningCapability, SessionStatus, SessionSummary,
-    TokenUsage, Turn,
+    TokenUsage, ToolResultRecord, Turn,
 };
 use choreo_tui::RenderedImage;
 use choreo_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
@@ -16,7 +16,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::markdown_render::{
     RenderedTurnLines, compute_visual_offsets, lines_height, plain_text_lines,
-    reasoning_expanded_default, render_turn_lines,
+    reasoning_expanded_default, render_turn_lines, tool_result_default_collapsed,
 };
 use ratatui::text::Line;
 use tui_prompts::{State, TextState};
@@ -684,6 +684,12 @@ pub(crate) struct TurnLayout {
     /// (start, end) content-line ranges for each displayed image,
     /// relative to the turn's start.  Empty when the turn has no images.
     pub image_ranges: Vec<(usize, usize)>,
+    /// (start, end) content-line ranges for each tool result's collapsible
+    /// header row, relative to the turn's start, aligned with
+    /// `turn.tool_results`.  Empty when the turn has no tool results (or
+    /// short-circuits on the error block).  Populated in lockstep with
+    /// `height_prefix` and kept in sync by the streaming fast path.
+    pub tool_result_header_ranges: Vec<(usize, usize)>,
 }
 
 #[derive(Clone)]
@@ -696,10 +702,19 @@ pub(crate) struct RenderedCache {
     /// invalidation, the stale entry is treated as a miss instead of being
     /// served.
     pub reasoning_expanded: bool,
+    /// Collapse state of each tool result (aligned with `turn.tool_results`)
+    /// the cached lines were rendered with.  Part of the cache key: if the
+    /// effective state changes without a cache invalidation, the stale entry
+    /// is treated as a miss instead of being served.
+    pub tool_results_collapsed: Vec<bool>,
     /// Semantic-line index of the reasoning header within `lines` (see
     /// [`RenderedTurnLines`]), so click hit-testing never re-scans the
     /// rendered output.
     pub reasoning_header_idx: Option<usize>,
+    /// Semantic-line index of each tool result header within `lines` (see
+    /// [`RenderedTurnLines`]), so click hit-testing never re-scans the
+    /// rendered output.
+    pub tool_result_header_idxs: Vec<usize>,
     pub lines: Arc<[Line<'static>]>,
     pub width: u16,
     /// Full viewport width when this cache entry was computed.
@@ -719,15 +734,22 @@ pub(crate) struct RenderedCache {
 /// cumulative visual offsets, and reasoning-header semantic index.  Returned
 /// from [`cached_or_compute_lines`] so callers can render and hit-test without
 /// re-walking the lines.
-pub(crate) type RenderedTurnCache = (Arc<[Line<'static>]>, usize, Arc<[usize]>, Option<usize>);
+pub(crate) type RenderedTurnCache = (
+    Arc<[Line<'static>]>,
+    usize,
+    Arc<[usize]>,
+    Option<usize>,
+    Vec<usize>,
+);
 
 /// Check `render_cache[index]` for a valid entry matching `turn_id`, `width`,
-/// `viewport_width`, and `reasoning_expanded`.  On hit, return the cached
-/// [`RenderedTurnCache`].  On miss, call `compute`, store the result in
-/// `render_cache[index]`, and return it.
+/// `viewport_width`, `reasoning_expanded`, and `tool_results_collapsed`.  On
+/// hit, return the cached [`RenderedTurnCache`].  On miss, call `compute`,
+/// store the result in `render_cache[index]`, and return it.
 ///
 /// When `index` is out of bounds (in-band or because the cache is shorter than
 /// expected), the result is still returned but not cached.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn cached_or_compute_lines(
     cache: &mut [Option<RenderedCache>],
     index: usize,
@@ -735,6 +757,7 @@ pub(crate) fn cached_or_compute_lines(
     width: u16,
     viewport_width: u16,
     reasoning_expanded: bool,
+    tool_results_collapsed: &[bool],
     compute: impl FnOnce() -> RenderedTurnLines,
 ) -> RenderedTurnCache {
     if let Some(Some(cached)) = cache.get(index)
@@ -742,12 +765,14 @@ pub(crate) fn cached_or_compute_lines(
         && cached.width == width
         && cached.viewport_width == viewport_width
         && cached.reasoning_expanded == reasoning_expanded
+        && cached.tool_results_collapsed == tool_results_collapsed
     {
         return (
             Arc::clone(&cached.lines),
             cached.height,
             Arc::clone(&cached.visual_offsets),
             cached.reasoning_header_idx,
+            cached.tool_result_header_idxs.clone(),
         );
     }
 
@@ -759,7 +784,9 @@ pub(crate) fn cached_or_compute_lines(
         *slot = Some(RenderedCache {
             turn_id,
             reasoning_expanded,
+            tool_results_collapsed: tool_results_collapsed.to_vec(),
             reasoning_header_idx: rendered.reasoning_header_idx,
+            tool_result_header_idxs: rendered.tool_result_header_idxs.clone(),
             height,
             lines: Arc::clone(&lines),
             width,
@@ -767,7 +794,13 @@ pub(crate) fn cached_or_compute_lines(
             visual_offsets: Arc::clone(&visual_offsets),
         });
     }
-    (lines, height, visual_offsets, rendered.reasoning_header_idx)
+    (
+        lines,
+        height,
+        visual_offsets,
+        rendered.reasoning_header_idx,
+        rendered.tool_result_header_idxs,
+    )
 }
 
 pub(crate) struct SessionDisplayState {
@@ -787,6 +820,12 @@ pub(crate) struct SessionDisplayState {
     /// [`reasoning_expanded_default`] (expanded while streaming, collapsed
     /// once a response exists).
     pub(crate) reasoning_override: HashMap<u32, bool>,
+    /// Per-(turn, tool-call) explicit collapse state ((turn_id, call_id) →
+    /// collapsed) set by clicking a tool result's header.  Absent entries
+    /// fall back to [`tool_result_default_collapsed`] (quiet tools
+    /// collapsed, everything else expanded).  Keyed by call_id because a
+    /// result's position is stable while its content streams in.
+    pub(crate) tool_collapse_override: HashMap<(u32, String), bool>,
     pub(crate) render_cache: Vec<Option<RenderedCache>>,
     pub(crate) active: HashSet<u32>,
     pub(crate) live_input_estimate: u32,
@@ -819,6 +858,7 @@ impl Default for SessionDisplayState {
             history_scroll: HistoryScrollState::new(),
             turn_layouts: Vec::new(),
             reasoning_override: HashMap::new(),
+            tool_collapse_override: HashMap::new(),
             render_cache: Vec::new(),
             active: HashSet::new(),
             live_input_estimate: 0,
@@ -3077,23 +3117,39 @@ impl SessionDisplayState {
             let reasoning_expanded =
                 self.effective_reasoning_expanded(turn_id, reasoning_default_expanded);
 
-            let (_text_lines, text_height, text_offsets, reasoning_header_idx) =
-                cached_or_compute_lines(
-                    &mut self.render_cache,
-                    visible_idx,
-                    turn_id,
-                    content_width,
-                    viewport.width,
-                    reasoning_expanded,
-                    || {
-                        render_turn_lines(
-                            turn,
-                            content_width,
-                            tool_content_width,
-                            reasoning_expanded,
-                        )
-                    },
-                );
+            // Effective per-result collapse state, aligned with
+            // `turn.tool_results`; part of the render-cache key so a stale
+            // entry (rendered with a different visibility) is a miss.
+            let tool_results_collapsed: Vec<bool> = turn
+                .tool_results
+                .iter()
+                .map(|r| self.effective_tool_result_collapsed(turn_id, r))
+                .collect();
+
+            let (
+                _text_lines,
+                text_height,
+                text_offsets,
+                reasoning_header_idx,
+                tool_result_header_idxs,
+            ) = cached_or_compute_lines(
+                &mut self.render_cache,
+                visible_idx,
+                turn_id,
+                content_width,
+                viewport.width,
+                reasoning_expanded,
+                &tool_results_collapsed,
+                || {
+                    render_turn_lines(
+                        turn,
+                        content_width,
+                        tool_content_width,
+                        reasoning_expanded,
+                        &tool_results_collapsed,
+                    )
+                },
+            );
 
             // The reasoning header's visual-row range for click hit-testing.
             // The renderer reports the header's semantic-line index directly
@@ -3106,6 +3162,18 @@ impl SessionDisplayState {
                 (start, end)
             });
 
+            // Same conversion for every tool result header, so clicking a
+            // triangle toggles exactly that result.  One range per result,
+            // aligned with `turn.tool_results`.
+            let tool_result_header_ranges = tool_result_header_idxs
+                .iter()
+                .map(|&idx| {
+                    let start = if idx == 0 { 0 } else { text_offsets[idx - 1] };
+                    let end = text_offsets[idx];
+                    (start, end)
+                })
+                .collect();
+
             let mut image_ranges: Vec<(usize, usize)> = Vec::new();
             let mut total_img_height: usize = 0;
             for _ in 0..turn.displayed_images.len() {
@@ -3117,6 +3185,7 @@ impl SessionDisplayState {
                 reasoning_header_range,
                 reasoning_default_expanded,
                 image_ranges,
+                tool_result_header_ranges,
             });
             let turn_height = text_height + total_img_height;
             self.turn_heights.push(turn_height);
@@ -3179,6 +3248,43 @@ impl SessionDisplayState {
         };
         let current = self.effective_reasoning_expanded(turn_id, reasoning_expanded_default(turn));
         self.reasoning_override.insert(turn_id, !current);
+        if let Some(idx) = self.visible_turn_ids.iter().position(|id| *id == turn_id)
+            && let Some(slot) = self.render_cache.get_mut(idx)
+        {
+            *slot = None;
+        }
+        self.mark_content_changed();
+    }
+
+    /// Effective collapse state for a tool result: an explicit override from
+    /// clicking the header wins; otherwise the derived default (quiet tools
+    /// collapsed, everything else expanded — see
+    /// [`tool_result_default_collapsed`]) is used.
+    pub(crate) fn effective_tool_result_collapsed(
+        &self,
+        turn_id: u32,
+        record: &ToolResultRecord,
+    ) -> bool {
+        self.tool_collapse_override
+            .get(&(turn_id, record.call_id.clone()))
+            .copied()
+            .unwrap_or_else(|| tool_result_default_collapsed(record))
+    }
+
+    /// Toggle a tool result's collapse state (clicking its header row).
+    /// Records the explicit user preference in `tool_collapse_override` and
+    /// invalidates the turn's render cache so the change takes effect on
+    /// the next frame.
+    pub(crate) fn toggle_tool_result(&mut self, turn_id: u32, call_id: &str) {
+        let Some(turn) = self.view.turns.get(&turn_id) else {
+            return;
+        };
+        let Some(record) = turn.tool_results.iter().find(|r| r.call_id == call_id) else {
+            return;
+        };
+        let current = self.effective_tool_result_collapsed(turn_id, record);
+        self.tool_collapse_override
+            .insert((turn_id, call_id.to_string()), !current);
         if let Some(idx) = self.visible_turn_ids.iter().position(|id| *id == turn_id)
             && let Some(slot) = self.render_cache.get_mut(idx)
         {
@@ -3259,13 +3365,28 @@ impl SessionDisplayState {
         let reasoning_expanded =
             self.effective_reasoning_expanded(turn_id, reasoning_default_expanded);
 
+        // Effective per-result collapse state (aligned with tool_results).
+        // This is what makes "stream while toggled visible" work: chunks
+        // re-render the streaming turn with the user's visibility choice,
+        // so an expanded result grows live and a collapsed one stays flat.
+        let tool_results_collapsed: Vec<bool> = turn
+            .tool_results
+            .iter()
+            .map(|r| self.effective_tool_result_collapsed(turn_id, r))
+            .collect();
+
         if let Some(Some(cached)) = self.render_cache.get_mut(turn_idx)
             && cached.turn_id == turn_id
             && cached.width == content_width
             && cached.viewport_width == viewport.width
         {
-            let rendered =
-                render_turn_lines(turn, content_width, tool_content_width, reasoning_expanded);
+            let rendered = render_turn_lines(
+                turn,
+                content_width,
+                tool_content_width,
+                reasoning_expanded,
+                &tool_results_collapsed,
+            );
             let text_lines = rendered.lines;
             let text_height = lines_height(&text_lines, viewport.width).max(1);
             let visual_offsets = compute_visual_offsets(&text_lines, viewport.width);
@@ -3281,12 +3402,27 @@ impl SessionDisplayState {
                     (start, end)
                 });
                 layout.reasoning_default_expanded = reasoning_default_expanded;
+                // Same sync for tool result headers: they sit below the
+                // growing response too, and their own bodies grow when
+                // expanded, so their click ranges shift on every chunk.
+                layout.tool_result_header_ranges = rendered
+                    .tool_result_header_idxs
+                    .iter()
+                    .map(|&idx| {
+                        let start = if idx == 0 { 0 } else { visual_offsets[idx - 1] };
+                        let end = visual_offsets[idx];
+                        (start, end)
+                    })
+                    .collect();
             }
 
-            // The cache entry now reflects the current reasoning state; the
-            // next frame's lookup will treat this as a valid hit.
+            // The cache entry now reflects the current reasoning and tool
+            // collapse state; the next frame's lookup will treat this as a
+            // valid hit.
             cached.reasoning_expanded = reasoning_expanded;
+            cached.tool_results_collapsed = tool_results_collapsed;
             cached.reasoning_header_idx = rendered.reasoning_header_idx;
+            cached.tool_result_header_idxs = rendered.tool_result_header_idxs;
             cached.lines = Arc::from(text_lines);
             cached.height = text_height;
             cached.visual_offsets = visual_offsets;
@@ -3545,6 +3681,11 @@ impl TurnEventHandler for App {
             // so the map can't accumulate stale entries; a redo restores the
             // turn fresh with the derived default.
             display.reasoning_override.remove(tid);
+            // Same for tool-result collapse preferences: a redo restores the
+            // turn fresh, so stale (turn, call_id) overrides must not leak.
+            display
+                .tool_collapse_override
+                .retain(|(turn_id, _), _| turn_id != tid);
             if let Some(turn) = display.view.turns.get_mut(tid) {
                 turn.undone = true;
             }
@@ -5044,7 +5185,7 @@ mod tests {
             let display = app.active_display().unwrap();
             let turn = &display.view.turns[&2];
             lines_height(
-                &render_turn_lines(turn, 71, vp_width, false).lines,
+                &render_turn_lines(turn, 71, vp_width, false, &[]).lines,
                 vp_width,
             )
             .max(1)
@@ -5210,6 +5351,8 @@ mod tests {
             turn_id: 1,
             reasoning_expanded: false, // response present → collapsed default
             reasoning_header_idx: None,
+            tool_results_collapsed: vec![],
+            tool_result_header_idxs: vec![],
             lines: Arc::from(vec![Line::from("stale")]),
             width: 71,
             viewport_width: 80,
@@ -5331,6 +5474,234 @@ mod tests {
         assert!(
             display.view.turns[&1].undone,
             "the turn should be marked undone"
+        );
+    }
+
+    // ── tool result collapse ──
+
+    #[test]
+    fn effective_tool_result_collapsed_prefers_override() {
+        let mut app = test_app();
+        let display = app.active_display().unwrap();
+        let quiet = ToolResultRecord {
+            call_id: "c".into(),
+            name: "read_file".into(),
+            content: "x".into(),
+            is_error: false,
+            invocation_description: String::new(),
+        };
+        let loud = ToolResultRecord {
+            call_id: "c2".into(),
+            name: "sh".into(),
+            content: "y".into(),
+            is_error: false,
+            invocation_description: String::new(),
+        };
+        // No override → the derived default wins (quiet collapsed, others
+        // expanded).
+        assert!(display.effective_tool_result_collapsed(1, &quiet));
+        assert!(!display.effective_tool_result_collapsed(1, &loud));
+        // An explicit override wins over the derived default.
+        display
+            .tool_collapse_override
+            .insert((1, "c".into()), false);
+        assert!(!display.effective_tool_result_collapsed(1, &quiet));
+        display
+            .tool_collapse_override
+            .insert((1, "c2".into()), true);
+        assert!(display.effective_tool_result_collapsed(1, &loud));
+    }
+
+    #[test]
+    fn toggle_tool_result_flips_override_and_invalidates_cache() {
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![ToolResultRecord {
+                call_id: "call-1".into(),
+                name: "read_file".into(),
+                content: "file contents".into(),
+                is_error: false,
+                invocation_description: "Reading file `src/main.rs`.".into(),
+            }],
+            displayed_images: vec![],
+        };
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, turn);
+        display.visible_turn_ids.push(1);
+        display.render_cache = vec![Some(RenderedCache {
+            turn_id: 1,
+            reasoning_expanded: false,
+            reasoning_header_idx: None,
+            tool_results_collapsed: vec![true], // quiet default → collapsed
+            tool_result_header_idxs: vec![0],
+            lines: Arc::from(vec![Line::from("stale")]),
+            width: 71,
+            viewport_width: 80,
+            height: 1,
+            visual_offsets: Arc::from([1]),
+        })];
+
+        // Quiet default is collapsed → the first click expands.
+        display.toggle_tool_result(1, "call-1");
+        assert_eq!(
+            display.tool_collapse_override.get(&(1, "call-1".into())),
+            Some(&false),
+            "first click should expand a collapsed quiet result"
+        );
+        assert!(
+            display.render_cache[0].is_none(),
+            "toggle must invalidate the render cache"
+        );
+
+        // Second click collapses again.
+        display.toggle_tool_result(1, "call-1");
+        assert_eq!(
+            display.tool_collapse_override.get(&(1, "call-1".into())),
+            Some(&true),
+            "second click should collapse the result again"
+        );
+    }
+
+    #[test]
+    fn toggle_tool_result_missing_turn_or_call_is_noop() {
+        let mut app = test_app();
+        let display = app.active_display().unwrap();
+        // No such turn → no-op.
+        display.toggle_tool_result(99, "call-1");
+        assert!(display.tool_collapse_override.is_empty());
+        // Turn exists but no matching call_id → no-op.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![ToolResultRecord {
+                call_id: "other".into(),
+                name: "sh".into(),
+                content: "y".into(),
+                is_error: false,
+                invocation_description: String::new(),
+            }],
+            displayed_images: vec![],
+        };
+        display.view.insert_or_replace(1, turn);
+        display.toggle_tool_result(1, "call-1");
+        assert!(display.tool_collapse_override.is_empty());
+    }
+
+    #[test]
+    fn turns_undone_prunes_tool_collapse_override() {
+        let mut app = test_app();
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![ToolResultRecord {
+                call_id: "call-1".into(),
+                name: "read_file".into(),
+                content: "x".into(),
+                is_error: false,
+                invocation_description: String::new(),
+            }],
+            displayed_images: vec![],
+        };
+        {
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(1, turn);
+            // Simulate the user having expanded the quiet result.
+            display
+                .tool_collapse_override
+                .insert((1, "call-1".into()), false);
+        }
+
+        app.handle_turns_undone(0, &[1]);
+
+        let display = app.active_display_ref().unwrap();
+        assert!(
+            display.tool_collapse_override.is_empty(),
+            "undo should prune the tool collapse override"
+        );
+        assert!(
+            display.view.turns[&1].undone,
+            "the turn should be marked undone"
+        );
+    }
+
+    #[test]
+    fn turn_layout_populates_tool_result_header_ranges() {
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![
+                ToolResultRecord {
+                    call_id: "c1".into(),
+                    name: "read_file".into(),
+                    content: "x".into(),
+                    is_error: false,
+                    invocation_description: "Reading `a`.".into(),
+                },
+                ToolResultRecord {
+                    call_id: "c2".into(),
+                    name: "sh".into(),
+                    content: "y".into(),
+                    is_error: false,
+                    invocation_description: "Running `b`.".into(),
+                },
+            ],
+            displayed_images: vec![],
+        };
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(1, turn);
+        app.rebuild_height_prefix();
+
+        // Capture the ranges and turn height in one borrow scope to avoid
+        // overlapping borrows of the display.
+        let (ranges, turn_h) = {
+            let display = app.active_display().unwrap();
+            let layout = &display.turn_layouts[0];
+            (
+                layout.tool_result_header_ranges.clone(),
+                display.turn_heights[0],
+            )
+        };
+        assert_eq!(ranges.len(), 2, "one header range per tool result");
+        // No other sections on this turn: both headers are the first two
+        // lines (the quiet read_file is collapsed, the sh result expanded).
+        assert_eq!(ranges[0], (0, 1));
+        assert_eq!(ranges[1], (1, 2));
+        assert!(
+            ranges[1].1 <= turn_h,
+            "headers must lie within the turn text"
         );
     }
 
@@ -5865,6 +6236,8 @@ mod tests {
                 turn_id: 0,
                 reasoning_expanded: false,
                 reasoning_header_idx: None,
+                tool_results_collapsed: vec![],
+                tool_result_header_idxs: vec![],
                 lines: Arc::from(Vec::<Line<'static>>::new()),
                 width: 0,
                 viewport_width: 0,
@@ -5906,6 +6279,8 @@ mod tests {
                 turn_id: 0,
                 reasoning_expanded: false,
                 reasoning_header_idx: None,
+                tool_results_collapsed: vec![],
+                tool_result_header_idxs: vec![],
                 lines: Arc::from(Vec::<Line<'static>>::new()),
                 width: 0,
                 viewport_width: 0,
