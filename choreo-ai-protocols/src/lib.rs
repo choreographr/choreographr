@@ -41,8 +41,9 @@ mod types;
 
 pub use anthropic::{AnthropicClient, AnthropicConfig};
 pub use catalog::{
-    ModelEntry, PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, all_display_names, all_slugs,
-    lookup_context_window, lookup_provider, model_reasoning_capability, model_request_format,
+    ModelEntry, PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, ReasoningPassback,
+    all_display_names, all_slugs, lookup_context_window, lookup_provider,
+    model_reasoning_capability, model_reasoning_passback, model_request_format,
 };
 pub use context_window::ContextWindowConfig;
 pub use google::{GoogleClient, GoogleConfig};

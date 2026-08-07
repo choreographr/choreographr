@@ -10,6 +10,8 @@ use std::fmt;
 use std::sync::LazyLock;
 use tracing::debug;
 
+use serde::{Deserialize, Serialize};
+
 use choreo_proto::ReasoningCapability;
 
 use crate::openai::RequestFormat;
@@ -17,9 +19,32 @@ use crate::shared::MaxTokensField;
 
 mod loader;
 
+/// How reasoning is replayed back to the provider on subsequent turns.
+/// Default derived from protocol in `model_reasoning_passback`.
+/// `None` (the serde default) means "no explicit override — derive from
+/// protocol", so TOMLs only set this field where nuance matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningPassback {
+    /// Never send reasoning back (display-only providers / fields).
+    #[default]
+    None,
+    /// Echo reasoning on assistant messages that had tool calls
+    /// (DeepSeek/Kimi chat, and the minimum for Anthropic tool loops).
+    ToolLoop,
+    /// Echo reasoning across all turns of the session (Anthropic keep-all,
+    /// GPT-5.6 all_turns).
+    AllTurns,
+    /// Send back encrypted thought signatures (Gemini).
+    Signature,
+    /// Chain via previous_response_id / opaque reasoning items
+    /// (OpenAI/xAI Responses).
+    ResponseId,
+}
+
 /// Per-model metadata in the provider catalog.
 /// A single source of truth for context window, reasoning support,
-/// and explicit effort levels.
+/// explicit effort levels, and reasoning round-trip format.
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
     pub model: String,
@@ -40,6 +65,12 @@ pub struct ModelEntry {
     /// Whether this model uses OpenAI's Responses API vs Chat Completions.
     /// Only relevant for OpenAi protocol providers.
     pub openai_responses: bool,
+    /// How reasoning is replayed back to the provider on subsequent turns.
+    /// `None` means "no override — `model_reasoning_passback` derives the
+    /// format from the provider protocol" (Responses → `ResponseId`,
+    /// chat completions → `ToolLoop`, Anthropic → `AllTurns`, Google →
+    /// `Signature`).
+    pub reasoning_passback: ReasoningPassback,
 }
 
 /// Protocol variant — selects wire format and carries protocol-specific fields.
@@ -179,6 +210,62 @@ pub fn model_request_format(provider_slug: &str, model: &str) -> Option<RequestF
         }
     }
     None
+}
+
+/// Compute how reasoning is replayed back to the provider for a given
+/// model. Mirrors `model_reasoning_capability`: an explicit per-model
+/// `reasoning_passback` TOML override wins, otherwise the format is derived
+/// from the provider protocol (falling back to protocol defaults for
+/// unknown/new models, and `None` for unknown providers).
+pub fn model_reasoning_passback(provider_slug: &str, model: &str) -> ReasoningPassback {
+    let entry = lookup_provider(provider_slug);
+
+    let passback = match entry {
+        Some(e) => {
+            let model_entry = e.models.iter().find(|m| m.model == model);
+            match model_entry {
+                // Known model: explicit TOML override wins; `None` means
+                // unset, so derive from the protocol (and, for OpenAi
+                // providers, whether the model uses Responses).
+                Some(m) if m.reasoning_passback != ReasoningPassback::None => m.reasoning_passback,
+                // Known model without an override → protocol default.
+                Some(m) => protocol_default_passback(e.protocol, m.openai_responses),
+                // Unknown model → protocol default (best-effort for new
+                // models; OpenAi assumed chat-completions, matching
+                // `ServiceConfig::default_request_format`).
+                None => protocol_default_passback(e.protocol, false),
+            }
+        }
+        // Unknown provider — no protocol to infer a default from.
+        None => ReasoningPassback::None,
+    };
+
+    debug!(
+        provider = %provider_slug,
+        model = %model,
+        ?passback,
+        "model_reasoning_passback"
+    );
+
+    passback
+}
+
+/// Protocol-level default passback format, used when a model has no explicit
+/// override (or is unknown). OpenAI-protocol providers that use the
+/// Responses API chain continuity via `previous_response_id`; chat-completions
+/// providers echo reasoning on tool-call turns (DeepSeek/Kimi minimum).
+/// Anthropic echoes across all turns by default (last-turn-only models carry
+/// an explicit `tool_loop` override); Google sends encrypted signatures.
+fn protocol_default_passback(
+    protocol: ProviderProtocol,
+    openai_responses: bool,
+) -> ReasoningPassback {
+    match protocol {
+        ProviderProtocol::OpenAi { .. } if openai_responses => ReasoningPassback::ResponseId,
+        ProviderProtocol::OpenAi { .. } => ReasoningPassback::ToolLoop,
+        ProviderProtocol::AnthropicMessages => ReasoningPassback::AllTurns,
+        ProviderProtocol::GoogleGenerativeAi => ReasoningPassback::Signature,
+    }
 }
 
 #[cfg(test)]
@@ -417,5 +504,145 @@ mod tests {
     fn model_request_format_unknown_provider() {
         let fmt = model_request_format("nope", "gpt-4.1");
         assert_eq!(fmt, None);
+    }
+
+    #[test]
+    fn model_reasoning_passback_openai_responses_model() {
+        // gpt-5.4 uses the Responses API (responses = true) → chain via
+        // previous_response_id / opaque reasoning items.
+        assert_eq!(
+            model_reasoning_passback("openai", "gpt-5.4"),
+            ReasoningPassback::ResponseId
+        );
+    }
+
+    #[test]
+    fn model_reasoning_passback_openai_chat_completions_model() {
+        // openai.toml has no chat-completions models, so exercise the
+        // protocol default on another OpenAI-protocol provider with a known
+        // chat-completions model: Cerebras' gpt-oss-120b (responses = false)
+        // → echo reasoning on tool-call turns.
+        assert_eq!(
+            model_reasoning_passback("cerebras", "gpt-oss-120b"),
+            ReasoningPassback::ToolLoop
+        );
+    }
+
+    #[test]
+    fn model_reasoning_passback_deepseek_toml_override() {
+        // DeepSeek overrides the protocol default explicitly (tool_loop) on
+        // both models; matches the responses = false default, so the override
+        // is documentation-grade here.
+        assert_eq!(
+            model_reasoning_passback("deepseek", "deepseek-v4-flash"),
+            ReasoningPassback::ToolLoop
+        );
+        assert_eq!(
+            model_reasoning_passback("deepseek", "deepseek-v4-pro"),
+            ReasoningPassback::ToolLoop
+        );
+    }
+
+    #[test]
+    fn model_reasoning_passback_anthropic_keep_all_turns() {
+        // Opus 4.5+ / later Opus, Sonnet 4.6+, and Fable 5 keep ALL prior
+        // turns → echo reasoning on every turn.
+        for model in [
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-fable-5",
+        ] {
+            assert_eq!(
+                model_reasoning_passback("anthropic", model),
+                ReasoningPassback::AllTurns,
+                "expected {model} to keep all prior turns"
+            );
+        }
+    }
+
+    #[test]
+    fn model_reasoning_passback_anthropic_last_turn_only() {
+        // Earlier Opus/Sonnet and all Haiku keep only the last turn → the
+        // tool_loop minimum (echo reasoning on assistant tool-call messages).
+        for model in [
+            "claude-opus-4-1",
+            "claude-opus-4-1-20250805",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert_eq!(
+                model_reasoning_passback("anthropic", model),
+                ReasoningPassback::ToolLoop,
+                "expected {model} to keep only the last turn"
+            );
+        }
+    }
+
+    #[test]
+    fn model_reasoning_passback_google_model() {
+        // Gemini → encrypted thought signatures.
+        assert_eq!(
+            model_reasoning_passback("google", "gemini-2.5-pro"),
+            ReasoningPassback::Signature
+        );
+    }
+
+    #[test]
+    fn model_reasoning_passback_none_provider() {
+        // Unknown provider — no protocol to derive a default from.
+        assert_eq!(
+            model_reasoning_passback("nonexistent", "any-model"),
+            ReasoningPassback::None
+        );
+    }
+
+    #[test]
+    fn model_reasoning_passback_unknown_model_uses_protocol_default() {
+        // Unknown model on a known anthropic provider → AllTurns (default).
+        assert_eq!(
+            model_reasoning_passback("anthropic", "claude-opus-3"),
+            ReasoningPassback::AllTurns
+        );
+        // Unknown model on a known google provider → Signature (default).
+        assert_eq!(
+            model_reasoning_passback("google", "gemini-9.9"),
+            ReasoningPassback::Signature
+        );
+        // Unknown model on a known OpenAI-protocol provider → chat-completions
+        // default (ToolLoop), matching ServiceConfig::default_request_format.
+        assert_eq!(
+            model_reasoning_passback("openai", "gpt-9.9-unknown"),
+            ReasoningPassback::ToolLoop
+        );
+    }
+
+    #[test]
+    fn model_reasoning_passback_explicit_override_beats_protocol_default() {
+        // deepseek-v4-flash carries an explicit tool_loop override; even if
+        // the responses flag flipped to true, the override would still win.
+        let entry = lookup_provider("deepseek").unwrap();
+        let model = entry
+            .models
+            .iter()
+            .find(|m| m.model == "deepseek-v4-flash")
+            .unwrap();
+        assert_eq!(model.reasoning_passback, ReasoningPassback::ToolLoop);
+    }
+
+    #[test]
+    fn bundled_toml_reasoning_passback_parses() {
+        // TOML files WITHOUT the field must still parse (serde default None).
+        // Spot-check one untouched provider resolves via protocol default.
+        assert_eq!(
+            model_reasoning_passback("groq", "groq/compound"),
+            ReasoningPassback::ToolLoop
+        );
     }
 }

@@ -11,9 +11,11 @@ context_window = 1000000
 reasoning_supported = true
 reasoning_levels = ["off", "low", "high", "xhigh", "max"]
 responses = false
+reasoning_passback = "tool_loop"
 [[models]]
 model = "deepseek-v4-pro"
 context_window = 1000000
 reasoning_supported = true
 reasoning_levels = ["off", "low", "high", "xhigh", "max"]
 responses = false
+reasoning_passback = "tool_loop"

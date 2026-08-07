@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::shared::MaxTokensField;
 
-use super::{ModelEntry, ProviderEntry, ProviderProtocol};
+use super::{ModelEntry, ProviderEntry, ProviderProtocol, ReasoningPassback};
 
 /// Every provider data file bundled into the binary.
 pub(crate) const CATALOG_FILES: &[&str] = &[
@@ -129,6 +129,10 @@ struct RawModel {
     reasoning_levels: Vec<String>,
     #[serde(default)]
     responses: bool,
+    /// Explicit reasoning passback format; `None` (default) means "derive
+    /// from protocol" in `model_reasoning_passback`.
+    #[serde(default)]
+    reasoning_passback: ReasoningPassback,
 }
 
 /// Parse every bundled TOML file into typed `ProviderEntry` values.
@@ -181,6 +185,7 @@ fn convert(raw: RawProvider) -> ProviderEntry {
                 reasoning_supported: m.reasoning_supported,
                 openai_reasoning_levels: m.reasoning_levels,
                 openai_responses: m.responses,
+                reasoning_passback: m.reasoning_passback,
             })
             .collect(),
     }
