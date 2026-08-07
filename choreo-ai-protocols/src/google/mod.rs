@@ -13,7 +13,7 @@ use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
 use crate::{ChatTurnRequest, ContextWindowConfig};
-use choreo_proto::TokenUsage;
+use choreo_proto::{ReasoningArtifact, TokenUsage};
 
 /// Default base URL for the Gemini API.
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -366,22 +366,116 @@ struct ContentBlock {
     role: Option<String>,
 }
 
+/// One `part` entry inside a Gemini `content` block, per the real wire format.
+///
+/// The Gemini API has NO `thinking` key. A thinking step is a regular `text`
+/// part flagged with `thought: true`; the optional `thoughtSignature` is an
+/// encrypted representation of the internal thought process and can appear on
+/// ANY part type (text, functionCall, …). `Text` and `FunctionCall` are
+/// disjoint in the untagged union — one carries `text`, the other
+/// `functionCall` — so serde picks the right variant unambiguously.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ResponsePart {
     Text {
         text: String,
+        /// `thought: true` marks a thinking part (its text is reasoning, not
+        /// the assistant answer). Absent/false on ordinary text parts.
+        #[serde(default)]
+        thought: Option<bool>,
+        #[serde(default, rename = "thoughtSignature")]
+        thought_signature: Option<String>,
     },
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: FunctionCallResponse,
+        #[serde(default, rename = "thoughtSignature")]
+        thought_signature: Option<String>,
     },
-    Thinking {
-        thinking: String,
-        #[serde(default)]
-        #[allow(dead_code)]
+}
+
+/// A response part routed to its consumer. Shared by the non-streaming and
+/// streaming consumption paths so a thinking part can never leak into the
+/// assistant answer and signatures are captured in both paths.
+#[derive(Debug)]
+enum ClassifiedPart {
+    /// An ordinary text part (`thought` absent or false): display text.
+    Answer(String),
+    /// A thinking part (`thought: true`): its text is reasoning (display-only),
+    /// and the optional encrypted signature is captured for round-trip.
+    Reasoning {
+        text: String,
         signature: Option<String>,
     },
+    /// A function call, optionally carrying a thought signature.
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+        signature: Option<String>,
+    },
+}
+
+impl ResponsePart {
+    /// Classify this part for consumption. This is the single source of truth
+    /// for the `thought: true` routing decision.
+    fn classify(self) -> ClassifiedPart {
+        match self {
+            ResponsePart::Text {
+                text,
+                thought,
+                thought_signature,
+            } => {
+                if thought == Some(true) {
+                    ClassifiedPart::Reasoning {
+                        text,
+                        signature: thought_signature,
+                    }
+                } else {
+                    ClassifiedPart::Answer(text)
+                }
+            }
+            ResponsePart::FunctionCall {
+                function_call,
+                thought_signature,
+            } => ClassifiedPart::ToolCall {
+                name: function_call.name,
+                args: function_call.args,
+                signature: thought_signature,
+            },
+        }
+    }
+}
+
+/// Record one `thoughtSignature` (if any) for the round-trip artifact.
+///
+/// Signatures are provider-owned opaque blobs; we capture them verbatim in
+/// wire order so a later passback can echo them back (Phase 4a). Log at
+/// capture time for observability.
+fn capture_signature(signatures: &mut Vec<String>, signature: Option<String>) {
+    if let Some(sig) = signature {
+        debug!(sig_len = sig.len(), "captured google thought signature");
+        signatures.push(sig);
+    }
+}
+
+/// Serialize the captured thought signatures into the opaque
+/// [`ReasoningArtifact::GoogleSignatures`] payload, or `None` when nothing was
+/// captured. The payload is the JSON serialization of the signature array as
+/// received (order preserved), matching the encrypted blobs the provider
+/// expects back verbatim.
+fn google_signatures_artifact(
+    signatures: &[String],
+) -> Result<Option<ReasoningArtifact>, GoogleError> {
+    if signatures.is_empty() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(signatures).map_err(|e| GoogleError::Io(io::Error::other(e)))?;
+    debug!(
+        signature_count = signatures.len(),
+        payload_bytes = bytes.len(),
+        "captured google thought signatures artifact",
+    );
+    Ok(Some(ReasoningArtifact::GoogleSignatures(bytes)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -556,27 +650,41 @@ fn response_to_turn_result(
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ChatToolCall> = Vec::new();
     let mut reasoning_parts: Vec<String> = Vec::new();
+    // Encrypted thought signatures in wire order, captured for the opaque
+    // round-trip artifact (see `google_signatures_artifact`).
+    let mut signatures: Vec<String> = Vec::new();
 
     for part in content.parts {
-        match part {
-            ResponsePart::Text { text } => {
+        match part.classify() {
+            ClassifiedPart::Answer(text) => {
+                // Ordinary text part: display text only.
                 text_parts.push(text);
             }
-            ResponsePart::FunctionCall { function_call } => {
-                let id = format!("fc_{}", function_call.name);
-                let args_json = function_call.args.to_string();
+            ClassifiedPart::Reasoning { text, signature } => {
+                // `thought: true` part: the text is reasoning, never the
+                // assistant answer; its signature (if any) is captured.
+                capture_signature(&mut signatures, signature);
+                reasoning_parts.push(text);
+            }
+            ClassifiedPart::ToolCall {
+                name,
+                args,
+                signature,
+            } => {
+                capture_signature(&mut signatures, signature);
+                let id = format!("fc_{}", name);
+                let args_json = args.to_string();
                 tool_calls.push(ChatToolCall {
                     id,
-                    name: function_call.name,
+                    name,
                     arguments_json: args_json,
                     caller: None,
                 });
             }
-            ResponsePart::Thinking { thinking, .. } => {
-                reasoning_parts.push(thinking);
-            }
         }
     }
+
+    let reasoning_artifact = google_signatures_artifact(&signatures)?;
 
     let reasoning = if reasoning_parts.is_empty() {
         None
@@ -596,7 +704,7 @@ fn response_to_turn_result(
             reasoning,
             usage,
             response_id: None,
-            reasoning_artifact: None,
+            reasoning_artifact,
         }));
     }
 
@@ -610,6 +718,6 @@ fn response_to_turn_result(
         reasoning,
         usage,
         response_id: None,
-        reasoning_artifact: None,
+        reasoning_artifact,
     }))
 }

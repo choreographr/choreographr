@@ -10,9 +10,9 @@ use crate::shared::MAX_TOOL_CALLS;
 use crate::types::{ChatTurnResult, StreamEvent};
 
 use super::{
-    GenerateContentRequest, GenerateContentResponse, GoogleConfig, GoogleError, ModelListResponse,
-    build_message_payloads, build_tool_payloads, model_url, response_to_turn_result,
-    thinking_config_payload,
+    ClassifiedPart, GenerateContentRequest, GenerateContentResponse, GoogleConfig, GoogleError,
+    ModelListResponse, build_message_payloads, build_tool_payloads, capture_signature,
+    google_signatures_artifact, model_url, response_to_turn_result, thinking_config_payload,
 };
 
 /// Endpoint action for non-streaming content generation.
@@ -227,6 +227,9 @@ where
     let mut full_reasoning = String::new();
     let mut pending_tool_calls: Vec<super::ChatToolCall> = Vec::new();
     let mut stream_usage: Option<TokenUsage> = None;
+    // Encrypted thought signatures in wire order, captured for the opaque
+    // round-trip artifact (same shape as the non-streaming path).
+    let mut signatures: Vec<String> = Vec::new();
 
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: GenerateContentResponse =
@@ -250,46 +253,24 @@ where
         };
 
         for part in content.parts {
-            match part {
-                super::ResponsePart::Text { text } => {
-                    if !text.is_empty() {
-                        has_any_output = true;
-                        full_text.push_str(&text);
-                        on_event(StreamEvent::Answer(text))?;
-                    }
-                }
-                super::ResponsePart::FunctionCall { function_call } => {
-                    has_any_output = true;
-                    if pending_tool_calls.len() >= MAX_TOOL_CALLS {
-                        return Err(GoogleError::Io(io::Error::other(format!(
-                            "too many tool calls (max {MAX_TOOL_CALLS})"
-                        ))));
-                    }
-                    let id = format!("fc_{}", function_call.name);
-                    let name = function_call.name;
-                    let args_json = function_call.args.to_string();
-                    trace!(
-                        tool_name = %name,
-                        args_len = args_json.len(),
-                        "google: function call",
-                    );
-                    pending_tool_calls.push(super::ChatToolCall {
-                        id,
-                        name,
-                        arguments_json: args_json,
-                        caller: None,
-                    });
-                }
-                super::ResponsePart::Thinking { thinking, .. } => {
-                    if !thinking.is_empty() {
-                        has_any_output = true;
-                        full_reasoning.push_str(&thinking);
-                        on_event(StreamEvent::Reasoning(thinking))?;
-                    }
-                }
+            // Classify each part (thought vs answer vs tool call) and accumulate
+            // it; the returned event (if any) is emitted to the consumer.
+            if let Some(event) = handle_stream_part(
+                part.classify(),
+                &mut has_any_output,
+                &mut full_text,
+                &mut full_reasoning,
+                &mut pending_tool_calls,
+                &mut signatures,
+            )? {
+                on_event(event)?;
             }
         }
     }
+
+    // Assemble the round-trip artifact from the signatures collected during
+    // the stream.
+    let reasoning_artifact = google_signatures_artifact(&signatures)?;
 
     if !has_any_output {
         return Err(GoogleError::EmptyResponse);
@@ -311,7 +292,7 @@ where
                 },
                 usage: stream_usage,
                 response_id: None,
-                reasoning_artifact: None,
+                reasoning_artifact,
             },
         ));
     }
@@ -329,8 +310,73 @@ where
         },
         usage: stream_usage,
         response_id: None,
-        reasoning_artifact: None,
+        reasoning_artifact,
     }))
+}
+
+/// Handle one classified part for the streaming loop: accumulate answer text,
+/// reasoning text, tool calls, and thought signatures, and return the
+/// [`StreamEvent`] the caller should emit (if any).
+///
+/// Extracted from the SSE loop so the routing (thinking text must go to
+/// reasoning, never the answer) and signature capture are unit-testable
+/// without an HTTP round-trip.
+pub(super) fn handle_stream_part(
+    part: ClassifiedPart,
+    has_any_output: &mut bool,
+    full_text: &mut String,
+    full_reasoning: &mut String,
+    pending_tool_calls: &mut Vec<super::ChatToolCall>,
+    signatures: &mut Vec<String>,
+) -> Result<Option<StreamEvent>, GoogleError> {
+    match part {
+        ClassifiedPart::Answer(text) => {
+            if !text.is_empty() {
+                *has_any_output = true;
+                full_text.push_str(&text);
+                Ok(Some(StreamEvent::Answer(text)))
+            } else {
+                Ok(None)
+            }
+        }
+        ClassifiedPart::Reasoning { text, signature } => {
+            capture_signature(signatures, signature);
+            if !text.is_empty() {
+                *has_any_output = true;
+                full_reasoning.push_str(&text);
+                Ok(Some(StreamEvent::Reasoning(text)))
+            } else {
+                Ok(None)
+            }
+        }
+        ClassifiedPart::ToolCall {
+            name,
+            args,
+            signature,
+        } => {
+            capture_signature(signatures, signature);
+            *has_any_output = true;
+            if pending_tool_calls.len() >= MAX_TOOL_CALLS {
+                return Err(GoogleError::Io(io::Error::other(format!(
+                    "too many tool calls (max {MAX_TOOL_CALLS})"
+                ))));
+            }
+            let id = format!("fc_{}", name);
+            let args_json = args.to_string();
+            trace!(
+                tool_name = %name,
+                args_len = args_json.len(),
+                "google: function call",
+            );
+            pending_tool_calls.push(super::ChatToolCall {
+                id,
+                name,
+                arguments_json: args_json,
+                caller: None,
+            });
+            Ok(None)
+        }
+    }
 }
 
 /// Map an HTTP status code and detail string to a GoogleError.
