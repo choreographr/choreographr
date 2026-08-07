@@ -14,7 +14,6 @@ use crate::types::{
 use choreo_proto::TokenUsage;
 use std::collections::HashMap;
 use std::io;
-use std::sync::mpsc;
 
 // ── Responses API wire types ─────────────────────────────────────────────
 
@@ -336,7 +335,7 @@ pub(crate) fn responses_request(
     api_key: &str,
     model: &str,
     prompt: &str,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<String, super::OpenAiError> {
     let (url, body) = build_simple_responses_body(config, model, prompt, false)?;
     let retry = retry::retry_config_from_config(config);
@@ -381,7 +380,7 @@ pub(crate) fn responses_request_streaming<F>(
     api_key: &str,
     model: &str,
     prompt: &str,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
@@ -450,7 +449,7 @@ pub(crate) fn responses_request_with_tools(
     previous_response_id: Option<&str>,
     tool_results: &[ToolResultItem],
     on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     programmatic_tool_calling: bool,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
     let start = std::time::Instant::now();
@@ -677,7 +676,7 @@ pub(crate) fn responses_request_streaming_with_tools<F>(
     previous_response_id: Option<&str>,
     tool_results: &[ToolResultItem],
     on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     programmatic_tool_calling: bool,
     on_event: &mut F,
 ) -> Result<ChatTurnResult, super::OpenAiError>

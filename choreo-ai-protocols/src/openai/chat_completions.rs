@@ -12,7 +12,6 @@ use crate::types::{
 use choreo_proto::TokenUsage;
 use std::collections::HashMap;
 use std::io;
-use std::sync::mpsc;
 
 // ── Chat Completions wire types ──────────────────────────────────────────
 
@@ -122,7 +121,7 @@ pub(crate) fn chat_completions_request(
     api_key: &str,
     model: &str,
     prompt: &str,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<String, super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
@@ -177,7 +176,7 @@ pub(crate) fn chat_completions_request_with_tools(
     tools: &[ChatToolDefinition],
     reasoning_effort: Option<&str>,
     on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
     let start = std::time::Instant::now();
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
@@ -292,7 +291,7 @@ pub(crate) fn chat_completions_request_streaming<F>(
     model: &str,
     prompt: &str,
     reasoning_effort: Option<&str>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
@@ -428,7 +427,7 @@ pub(crate) fn chat_completions_request_streaming_with_tools<F>(
     tools: &[ChatToolDefinition],
     reasoning_effort: Option<&str>,
     on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     on_event: &mut F,
 ) -> Result<ChatTurnResult, super::OpenAiError>
 where

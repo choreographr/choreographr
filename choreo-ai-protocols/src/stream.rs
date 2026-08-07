@@ -1,19 +1,6 @@
 use std::io;
-use std::sync::mpsc;
-use std::time::Duration;
 
-use crate::retry::cancellation_pending;
 use crate::shared::ProviderError;
-
-/// How often the consumer polls for new SSE events (and re-checks
-/// cancellation) while a stream is quiet.
-///
-/// The reader thread may be blocked inside a socket `read()` for a long time
-/// (a stalled or keep-alive-trickling provider), so the consumer cannot block
-/// indefinitely on a plain `recv()` — it must wake up periodically to notice
-/// a cancellation signal.  ~200 ms keeps Escape responsive without adding
-/// meaningful latency to normal event flow.
-pub(crate) const SSE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Capacity of the bounded channel between the SSE reader thread and the
 /// consumer.
@@ -48,15 +35,15 @@ pub(crate) enum SseStreamMsg<T> {
 /// boundary (see [`SseStream::drop`]) and reaps the thread immediately if it
 /// has already exited.
 pub(crate) struct SseStream<T> {
-    rx: mpsc::Receiver<SseStreamMsg<T>>,
+    rx: crossbeam_channel::Receiver<SseStreamMsg<T>>,
     handle: Option<std::thread::JoinHandle<()>>,
     /// One-way abort signal to the reader thread: sending a message asks it
     /// to stop at its next loop boundary instead of parsing the remainder of
-    /// a live stream.  Implemented as an mpsc message rather than a shared
+    /// a live stream.  Implemented as a channel message rather than a shared
     /// atomic so cross-thread communication stays channel-based (per the
     /// repo's thread-communication rules); the unbounded channel never blocks
     /// `Drop`.
-    abort_tx: mpsc::Sender<()>,
+    abort_tx: crossbeam_channel::Sender<()>,
     /// Hard wall-clock deadline for this response's whole attempt, supplied
     /// by the caller (see [`crate::retry::AttemptDeadline`]); `None` disables.
     /// ureq's own `timeout_global` cannot hard-cap a stream that keeps
@@ -89,7 +76,7 @@ impl<T> Drop for SseStream<T> {
 }
 
 /// Spawn a dedicated thread that runs the blocking SSE read loop and
-/// forwards each parsed event through an mpsc channel.
+/// forwards each parsed event through a crossbeam channel.
 ///
 /// `deadline` is the hard wall-clock deadline for this response's whole
 /// attempt (body read included); `None` disables it.  It is computed by the
@@ -102,9 +89,10 @@ impl<T> Drop for SseStream<T> {
 /// If the provider stalls (or trickles keep-alive bytes that never form a
 /// complete event), that read can block indefinitely — and a loop that only
 /// checks `cancel_rx` *between* reads would never see the user's Escape.
-/// Moving the read onto its own thread lets the consumer poll the channel
-/// with `recv_timeout` and check cancellation every iteration, so Escape
-/// lands within ~200 ms instead of never.
+/// Moving the read onto its own thread lets the consumer `select!` on the
+/// event channel, the cancellation channel, and the deadline timer at once,
+/// so Escape (and deadline expiry) are noticed the moment they happen
+/// instead of on a poll tick.
 ///
 /// # Reader-thread lifetime
 ///
@@ -123,8 +111,8 @@ where
     T: Send + 'static,
     F: FnMut() -> io::Result<Option<T>> + Send + 'static,
 {
-    let (tx, rx) = mpsc::sync_channel(SSE_CHANNEL_CAPACITY);
-    let (abort_tx, abort_rx) = mpsc::channel::<()>();
+    let (tx, rx) = crossbeam_channel::bounded(SSE_CHANNEL_CAPACITY);
+    let (abort_tx, abort_rx) = crossbeam_channel::unbounded::<()>();
     // Per-attempt deadline supplied by the caller (see
     // `retry::AttemptDeadline`): it is armed *before* the request is sent and
     // re-armed on each retry, so it covers the whole attempt (DNS → connect →
@@ -174,9 +162,35 @@ where
     }
 }
 
-/// Receive the next SSE event from a spawned reader thread, polling with
-/// [`SSE_POLL_INTERVAL`] so that a cancellation signal on `cancel_rx` is
-/// observed within ~200 ms even when the stream is quiet or stalled.
+/// Translate one message from the reader channel into the consumer's result,
+/// mapping a dropped sender (reader died without a final message) to an Io
+/// error.  Shared by both `select!` branches in [`recv_sse_event`].
+fn handle_sse_msg<T>(
+    msg: Result<SseStreamMsg<T>, crossbeam_channel::RecvError>,
+) -> Result<Option<T>, ProviderError> {
+    match msg {
+        Ok(SseStreamMsg::Event(item)) => Ok(Some(item)),
+        Ok(SseStreamMsg::End) => Ok(None),
+        Ok(SseStreamMsg::Err(e)) => Err(ProviderError::Io(e)),
+        Err(_) => {
+            // The reader thread ended without sending End or Err — its
+            // closure cannot return normally without sending one of
+            // those, so this means the thread died unexpectedly.
+            tracing::warn!("SSE reader thread terminated unexpectedly");
+            Err(ProviderError::Io(io::Error::other(
+                "SSE reader thread terminated unexpectedly",
+            )))
+        }
+    }
+}
+
+/// Receive the next SSE event from a spawned reader thread.
+///
+/// Blocks until one of three things happens: an event (or clean end / error)
+/// arrives on the reader channel, a cancellation signal arrives on
+/// `cancel_rx`, or the hard wall-clock deadline expires.  Because the reader
+/// thread decouples the blocking socket read from this wait, the wait itself
+/// can be purely event-driven via `select!` — no polling interval.
 ///
 /// Returns `Ok(None)` on a clean stream end, `Err(ProviderError::Cancelled)`
 /// when a cancellation is pending, `Err(ProviderError::DeadlineExceeded)` when
@@ -187,52 +201,60 @@ where
 /// remainder of the stream.
 pub(crate) fn recv_sse_event<T>(
     sse: &SseStream<T>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<Option<T>, ProviderError> {
-    loop {
-        // Check cancellation before each poll.  Because the reader thread
-        // decouples the blocking read from this loop, a cancel that arrives
-        // while we are inside `recv_timeout` is noticed on the next iteration
-        // at most ~200 ms later.
-        if cancellation_pending(cancel_rx) {
-            // Cancel wins: signal the reader thread to stop at its next
-            // opportunity, then report cancellation to the caller.
-            let _ = sse.abort_tx.send(());
-            tracing::debug!("SSE stream cancelled by user");
-            return Err(ProviderError::Cancelled);
-        }
+    // A never-ready stand-in channel so the cancellation arm below is always
+    // wired up, even when the caller provided no cancellation channel.
+    let never_rx = crossbeam_channel::never::<()>();
+    let cancel: &crossbeam_channel::Receiver<()> = cancel_rx.unwrap_or(&never_rx);
 
-        // Hard wall-clock deadline: fires even when a provider keeps trickling
-        // keep-alive bytes (ureq's global timeout is floored at ~1 s per
-        // socket read, so sub-second trickles can evade it).  Signal the
-        // reader thread to stop, then surface a dedicated timeout error so
-        // callers can distinguish a deadline expiry from a genuine socket
-        // failure (and treat it as non-retryable by construction).
-        if let Some(deadline) = sse.deadline
-            && std::time::Instant::now() >= deadline
-        {
-            let _ = sse.abort_tx.send(());
-            tracing::warn!("SSE stream exceeded total request deadline");
-            return Err(ProviderError::DeadlineExceeded);
-        }
+    // Hard wall-clock deadline: fires even when a provider keeps trickling
+    // keep-alive bytes (ureq's global timeout is floored at ~1 s per
+    // socket read, so sub-second trickles can evade it).  Signal the
+    // reader thread to stop, then surface a dedicated timeout error so
+    // callers can distinguish a deadline expiry from a genuine socket
+    // failure (and treat it as non-retryable by construction).
+    if let Some(deadline) = sse.deadline
+        && std::time::Instant::now() >= deadline
+    {
+        let _ = sse.abort_tx.send(());
+        tracing::warn!("SSE stream exceeded total request deadline");
+        return Err(ProviderError::DeadlineExceeded);
+    }
 
-        match sse.rx.recv_timeout(SSE_POLL_INTERVAL) {
-            Ok(SseStreamMsg::Event(item)) => return Ok(Some(item)),
-            Ok(SseStreamMsg::End) => return Ok(None),
-            Ok(SseStreamMsg::Err(e)) => return Err(ProviderError::Io(e)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // No event yet; loop back and re-check cancellation.
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // The reader thread ended without sending End or Err — its
-                // closure cannot return normally without sending one of
-                // those, so this means the thread died unexpectedly.
-                tracing::warn!("SSE reader thread terminated unexpectedly");
-                return Err(ProviderError::Io(io::Error::other(
-                    "SSE reader thread terminated unexpectedly",
-                )));
+    // Biased selection with cancellation first: a signal that was sent
+    // before this call must win deterministically, even if the reader has
+    // already queued events.  (The cancel sender outlives the worker, so
+    // the arm cannot spuriously fire on disconnect during a live stream.)
+    match sse.deadline {
+        // With a deadline, also wait on an exact timer for the remaining
+        // budget — the timer, not a poll interval, bounds the wait.
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            crossbeam_channel::select_biased! {
+                recv(cancel) -> _ => {
+                    let _ = sse.abort_tx.send(());
+                    tracing::debug!("SSE stream cancelled by user");
+                    Err(ProviderError::Cancelled)
+                }
+                recv(sse.rx) -> msg => handle_sse_msg(msg),
+                recv(crossbeam_channel::after(remaining)) -> _ => {
+                    let _ = sse.abort_tx.send(());
+                    tracing::warn!("SSE stream exceeded total request deadline");
+                    Err(ProviderError::DeadlineExceeded)
+                }
             }
         }
+        // Without a deadline, only an event or a cancellation can wake
+        // this wait — both handled by `select!`, so no timer is needed.
+        None => crossbeam_channel::select_biased! {
+            recv(cancel) -> _ => {
+                let _ = sse.abort_tx.send(());
+                tracing::debug!("SSE stream cancelled by user");
+                Err(ProviderError::Cancelled)
+            }
+            recv(sse.rx) -> msg => handle_sse_msg(msg),
+        },
     }
 }
 
@@ -293,7 +315,7 @@ mod tests {
         // yields forever here; the abort signal armed by the cancellation
         // (plus the receiver being dropped at test end) stops the thread, so
         // nothing leaks.
-        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
         cancel_tx.send(()).unwrap();
 
         let mut items = std::iter::repeat_with(|| Ok(Some(0)));
@@ -308,7 +330,7 @@ mod tests {
         // reader thread.  Deterministic: the abort signal is consumed at the
         // reader's next loop boundary, and `join()` below blocks until the
         // pure-iterator reader exits (no time-based waits).
-        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
         cancel_tx.send(()).unwrap();
 
         let mut items = std::iter::repeat_with(|| Ok(Some(0)));
@@ -348,9 +370,9 @@ mod tests {
         // thread died without sending End or Err) surfaces as an Io error.
         // Constructed directly rather than via a spawned reader so the test
         // is fully deterministic — no thread, no race with the reader.
-        let (tx, rx) = mpsc::channel::<SseStreamMsg<i32>>();
+        let (tx, rx) = crossbeam_channel::unbounded::<SseStreamMsg<i32>>();
         drop(tx);
-        let (abort_tx, _abort_rx) = mpsc::channel();
+        let (abort_tx, _abort_rx) = crossbeam_channel::unbounded::<()>();
         let sse = SseStream {
             rx,
             handle: None,
@@ -372,13 +394,13 @@ mod tests {
         // socket `Io` error), before the reader produces anything.  Fully
         // deterministic: the past deadline is checked on the first poll, and
         // the channel is never touched.
-        let (tx, rx) = mpsc::sync_channel::<SseStreamMsg<i32>>(SSE_CHANNEL_CAPACITY);
-        let (abort_tx, _abort_rx) = mpsc::channel();
+        let (tx, rx) = crossbeam_channel::bounded::<SseStreamMsg<i32>>(SSE_CHANNEL_CAPACITY);
+        let (abort_tx, _abort_rx) = crossbeam_channel::unbounded::<()>();
         let sse = SseStream {
             rx,
             handle: None,
             abort_tx,
-            deadline: Some(std::time::Instant::now() - Duration::from_secs(1)),
+            deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
         };
         match recv_sse_event(&sse, None) {
             Err(ProviderError::DeadlineExceeded) => {}
@@ -394,7 +416,7 @@ mod tests {
         let mut items = std::iter::once(Ok(Some("hello".to_string())));
         let sse = spawn_sse_reader(
             move || items.next().unwrap_or(Ok(None)),
-            Some(std::time::Instant::now() + Duration::from_secs(3600)),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3600)),
         );
         let item = recv_sse_event(&sse, None).unwrap().expect("event");
         assert_eq!(item, "hello");

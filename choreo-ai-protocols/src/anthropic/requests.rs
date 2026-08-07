@@ -1,5 +1,4 @@
 use std::io::{self, BufReader, Read};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use choreo_proto::TokenUsage;
@@ -92,7 +91,7 @@ pub(super) fn messages_request(
     thinking_effort: &str,
     stream: bool,
     on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<ChatTurnResult, AnthropicError> {
     let url = endpoint_url(&config.base_url, MESSAGES_PATH)?;
     let retry_cfg = retry::RetryConfig {
@@ -160,7 +159,7 @@ pub(super) fn messages_request_streaming<F>(
     tools: &[ChatToolDefinition],
     thinking_effort: &str,
     on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     mut on_event: F,
 ) -> Result<ChatTurnResult, AnthropicError>
 where

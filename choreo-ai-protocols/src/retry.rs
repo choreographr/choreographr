@@ -1,5 +1,4 @@
 use std::io;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -70,7 +69,8 @@ pub struct AttemptContext<'a> {
     /// Invoked before each retry wait with (attempt, max_attempts, delay).
     pub on_retry: &'a mut Option<RetryCallback>,
     /// Cancellation channel; `None` when cancellation is not wired up.
-    pub cancel_rx: Option<&'a mpsc::Receiver<()>>,
+    /// Crossbeam so waits can `select!` on it alongside a retry timer.
+    pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
     /// Per-attempt wall-clock deadline, re-armed at the top of every attempt;
     /// `None` when the deadline is disabled or not provided.
     pub attempt_deadline: Option<&'a mut AttemptDeadline>,
@@ -79,7 +79,7 @@ pub struct AttemptContext<'a> {
 impl<'a> AttemptContext<'a> {
     pub fn new(
         on_retry: &'a mut Option<RetryCallback>,
-        cancel_rx: Option<&'a mpsc::Receiver<()>>,
+        cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
         attempt_deadline: Option<&'a mut AttemptDeadline>,
     ) -> Self {
         Self {
@@ -173,7 +173,7 @@ pub fn parse_retry_after_secs(value: Option<&str>) -> Option<u64> {
 
 /// Returns `true` when a cancellation signal is pending on `cancel_rx`.
 /// With no channel provided, cancellation is never pending.
-pub(crate) fn cancellation_pending(cancel_rx: Option<&mpsc::Receiver<()>>) -> bool {
+pub(crate) fn cancellation_pending(cancel_rx: Option<&crossbeam_channel::Receiver<()>>) -> bool {
     cancel_rx.is_some_and(|rx| rx.try_recv().is_ok())
 }
 
@@ -181,7 +181,9 @@ pub(crate) fn cancellation_pending(cancel_rx: Option<&mpsc::Receiver<()>>) -> bo
 /// Returns `Err(ProviderHttpError::Cancelled)` if the channel contains a
 /// pending message, or `Ok(())` when no cancellation is pending (or when
 /// no channel is provided).
-pub fn check_cancelled(cancel_rx: Option<&mpsc::Receiver<()>>) -> Result<(), ProviderHttpError> {
+pub fn check_cancelled(
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+) -> Result<(), ProviderHttpError> {
     if cancellation_pending(cancel_rx) {
         tracing::debug!("operation cancelled by user");
         return Err(ProviderHttpError::Cancelled);
@@ -193,15 +195,21 @@ pub fn check_cancelled(cancel_rx: Option<&mpsc::Receiver<()>>) -> Result<(), Pro
 /// `cancel_rx`.  When no channel is provided, falls back to `thread::sleep`.
 pub fn sleep_or_cancel(
     delay: Duration,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<(), ProviderHttpError> {
     if let Some(rx) = cancel_rx {
-        match rx.recv_timeout(delay) {
-            Ok(()) => return Err(ProviderHttpError::Cancelled),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::trace!("cancel_rx sender dropped — proceeding without cancellation");
-            }
+        // Wait on the cancel channel and a delay timer simultaneously, so a
+        // cancellation wakes this thread the instant it is sent instead of at
+        // the next poll tick.  `select!` is the event-driven replacement for
+        // the old `recv_timeout(delay)` loop.
+        crossbeam_channel::select! {
+            recv(rx) -> msg => match msg {
+                Ok(()) => return Err(ProviderHttpError::Cancelled),
+                Err(_) => {
+                    tracing::trace!("cancel_rx sender dropped — proceeding without cancellation");
+                }
+            },
+            recv(crossbeam_channel::after(delay)) -> _ => {}
         }
     } else {
         thread::sleep(delay);
@@ -216,7 +224,7 @@ pub fn wait_before_retry(
     max_attempts: u32,
     delay: Duration,
     on_retry: &mut Option<RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<(), ProviderHttpError> {
     if let Some(cb) = on_retry.as_mut() {
         cb(attempt, max_attempts, delay);

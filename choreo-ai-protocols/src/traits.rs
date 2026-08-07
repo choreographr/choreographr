@@ -1,6 +1,5 @@
 use std::fmt::Debug;
 use std::io;
-use std::sync::mpsc;
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition};
 use crate::retry::RetryCallback;
@@ -22,7 +21,10 @@ pub struct ChatTurnRequest<'a> {
     pub tools: &'a [ChatToolDefinition],
     pub thinking_effort: String,
     pub on_retry: &'a mut Option<RetryCallback>,
-    pub cancel_rx: Option<&'a mpsc::Receiver<()>>,
+    /// Cancellation channel.  A crossbeam receiver so the retry backoff and
+    /// SSE waits can `select!` on it alongside their own channels instead of
+    /// polling with `recv_timeout`.
+    pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
     /// Response ID from a previous turn (Responses API).
     pub previous_response_id: Option<&'a str>,
     /// Tool results from previous turn (Responses API).

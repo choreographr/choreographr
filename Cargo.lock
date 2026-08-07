@@ -786,6 +786,7 @@ name = "choreo-ai-protocols"
 version = "0.1.0"
 dependencies = [
  "choreo-proto",
+ "crossbeam-channel",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -824,6 +825,7 @@ dependencies = [
  "chrono",
  "ckb-vm",
  "clap",
+ "crossbeam-channel",
  "dirs",
  "filetime",
  "gix",

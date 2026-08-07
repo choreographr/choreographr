@@ -89,7 +89,7 @@ fn retry_succeeds_with_callback() {
         count.fetch_add(1, Ordering::SeqCst);
     }));
 
-    let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     let messages = [ChatRequestMessage::simple("user", "hello".into())];
 
     let result = client.chat_completion_turn(ChatTurnRequest {
@@ -146,7 +146,7 @@ fn retry_cancelled_during_backoff() {
     };
     let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
 
-    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     let messages = [ChatRequestMessage::simple("user", "hello".into())];
 
     // Send the cancel signal after a brief delay so the HTTP request has
@@ -238,7 +238,7 @@ fn streaming_cancelled_during_sse_events() {
     let (port, event_tx, _server) = spawn_sse_server();
     let client = OpenAiClient::new(sse_test_config(port), "test-key".into()).expect("OpenAiClient");
 
-    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
 
     // Let a few SSE events through first, then cancel after a delay.
     event_tx.send(()).ok();
@@ -278,7 +278,7 @@ fn streaming_cancelled_before_first_event() {
     let (port, _event_tx, _server) = spawn_sse_server();
     let client = OpenAiClient::new(sse_test_config(port), "test-key".into()).expect("OpenAiClient");
 
-    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
 
     // Send cancel before the streaming call — the HTTP request hasn't been
     // made yet, so cancellation happens during the retry/connect phase.

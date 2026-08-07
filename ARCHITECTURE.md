@@ -244,7 +244,7 @@ account configuration, no sessions — so it can be consumed independently of
 | `context_window.rs` | `ContextWindowConfig` — per-model/global context window resolution shared by all configs |
 | `overrides.rs` | `ProviderOverrides` — protocol-agnostic account overrides carrier (the daemon converts its `AccountConfig` into this) |
 | `retry.rs` | Shared HTTP retry logic. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, cancellation support, and a per-attempt wall-clock deadline (`AttemptDeadline`, re-armed at the start of every attempt). `AttemptContext` bundles the per-call retry inputs (`on_retry` callback, `cancel_rx`, `attempt_deadline`) so the retry entry points do not grow a parameter per knob. |
-| `stream.rs` | Cancellable SSE reader plumbing: `spawn_sse_reader()` runs the blocking socket read on a dedicated thread and forwards parsed events through a bounded mpsc channel (backpressure — the reader blocks on `send` instead of buffering unboundedly); an mpsc abort signal stops the thread at its next loop boundary on cancel/drop; `recv_sse_event()` polls the channel with a ~200 ms `recv_timeout`, re-checks cancellation each iteration, and enforces the per-attempt wall-clock deadline supplied by the caller (`retry::AttemptDeadline` — armed *before* the request is sent and re-armed on each retry, so it spans DNS → connect → headers → body; the real backstop — ureq's `timeout_global` is floored at ~1 s per socket read, so sub-second keep-alive trickles could otherwise evade it), so Escape interrupts a stalled/trickling stream instead of blocking forever inside `read()`. Deadline expiry surfaces as a dedicated `ProviderError::DeadlineExceeded` (non-retryable, distinct from a socket `Io` error). |
+| `stream.rs` | Cancellable SSE reader plumbing: `spawn_sse_reader()` runs the blocking socket read on a dedicated thread and forwards parsed events through a bounded crossbeam channel (backpressure — the reader blocks on `send` instead of buffering unboundedly); an abort signal stops the thread at its next loop boundary on cancel/drop; `recv_sse_event()` waits event-driven with `select_biased!` on the event channel, the cancellation channel, and an exact timer for the remaining budget — no polling, so Escape and deadline expiry interrupt a stalled/trickling stream the moment they happen instead of blocking forever inside `read()`. The per-attempt wall-clock deadline is supplied by the caller (`retry::AttemptDeadline` — armed *before* the request is sent and re-armed on each retry, so it spans DNS → connect → headers → body; the real backstop — ureq's `timeout_global` is floored at ~1 s per socket read, so sub-second keep-alive trickles could otherwise evade it). Deadline expiry surfaces as a dedicated `ProviderError::DeadlineExceeded` (non-retryable, distinct from a socket `Io` error). |
 | `catalog/` | `ProviderProtocol` enum + `ProviderEntry`/`ModelEntry`, `PROVIDER_CATALOG` (bundled TOML, one `catalog/<slug>.toml` per provider), and lookups (`lookup_provider`, `lookup_context_window`, `model_reasoning_capability`, `model_request_format`, `all_slugs`, `all_display_names`) |
 
 **Root re-exports** give consumers a stable front door: the client types
@@ -350,7 +350,7 @@ pub struct ChatTurnRequest<'a> {
     pub tools: &'a [ChatToolDefinition],
     pub thinking_effort: String,
     pub on_retry: &'a mut Option<RetryCallback>,
-    pub cancel_rx: Option<&'a mpsc::Receiver<()>>,
+    pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
     pub previous_response_id: Option<&'a str>,
     pub tool_results: &'a [ToolResultItem],
     pub programmatic_tool_calling: bool,
@@ -1277,6 +1277,16 @@ The `invocation_description` is generated before spawning (via
 `ToolRegistry::describe_invocation`) and passed through `SpawnToolArgs`, so even timeout
 and panic error paths carry a meaningful description in the `ToolOutput`.
 
+Cancellation during tool execution is fully event-driven: the concurrent collector and
+`execute_tool_with_timeout` (serial phase) block on `crossbeam_channel::select!` between
+their result channels, the request's cancel channel, and (where a timeout applies) an exact
+`after(remaining)` timer — there are no `recv_timeout` poll loops, and timeouts fire
+precisely. The per-request cancel channel is a crossbeam channel created in `sessions.rs`
+(`ActiveRequest.cancel_tx`) and threaded through `run_agent_loop` → `ChatTurnRequest` →
+retry/stream, so every wait (provider SSE, retry backoff, serial tool, concurrent
+collector) can `select!` on it directly. A cancel observed mid-batch stops the request
+(sticky `cancelled` flag) after Phase 3 has mirrored the already-executed config changes.
+
 ### spawn_subsession
 
 `spawn_subsession` is a core-group `Tool` trait implementation registered in `ToolRegistry`.
@@ -1729,16 +1739,17 @@ counts survive the attach instead of regressing.
    module has its own `AnthropicSseReader` that handles both `event:` and `data:` lines
    (required by the Anthropic Messages streaming format) and yields `(event_type, data)` pairs.
    The blocking socket read is decoupled onto a dedicated reader thread (`stream.rs`) that
-   forwards parsed events through a bounded mpsc channel, so the caller can poll with a short
-   `recv_timeout` and observe cancellation within ~200 ms even on a quiet stream; an mpsc
+   forwards parsed events through a bounded crossbeam channel, so the caller can `select!`
+   on the event channel, the cancellation channel, and the deadline timer simultaneously —
+   cancellation and deadline expiry are observed the moment they happen, with no polling; an
    abort signal stops the reader thread at its next loop boundary once the consumer cancels
    or drops the stream. A wall-clock deadline (`total_timeout_secs`) backstops each request
    attempt: the deadline is armed by `retry::AttemptDeadline` *before* the request is sent
    and re-armed at the start of every retry, so a single attempt's budget spans DNS →
    connect → headers → body (ureq's `timeout_global` bounds the attempt from DNS through
-   the first body byte, and the SSE consumer enforces the same deadline on every poll — the
-   real hard cap, since ureq floors its per-read timeout at ~1 s so sub-second keep-alive
-   trickles could otherwise outlive the deadline). Expiry surfaces as a dedicated
+   the first body byte, and the SSE consumer enforces the same deadline with an exact
+   timer — the real hard cap, since ureq floors its per-read timeout at ~1 s so sub-second
+   keep-alive trickles could otherwise outlive the deadline). Expiry surfaces as a dedicated
    `ProviderError::DeadlineExceeded` — non-retryable and distinct from a socket `Io` error.
    Each retry restarts the deadline, so retries plus their backoff can exceed the configured
    value in aggregate.

@@ -447,7 +447,7 @@ pub struct SessionSnapshot {
 }
 
 pub(crate) struct ActiveRequest {
-    pub(crate) cancel_tx: mpsc::Sender<()>,
+    pub(crate) cancel_tx: crossbeam_channel::Sender<()>,
     /// The turn_id associated with this request, so that late-joining
     /// subscribers can route streaming chunks to the correct turn.
     pub(crate) turn_id: u32,
@@ -1076,7 +1076,7 @@ fn handle_run_input(
             estimated_prompt_tokens: 0,
         },
     );
-    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     state.active_requests.insert(
         request_id,
         ActiveRequest {
@@ -1144,7 +1144,7 @@ fn handle_run_child_input(
             estimated_prompt_tokens: 0,
         },
     );
-    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     state.active_requests.insert(
         request_id,
         ActiveRequest {
@@ -1953,7 +1953,7 @@ fn run_request_worker(
     client: InferenceProvider,
     session: &mut SessionState,
     model: String,
-    cancel_rx: mpsc::Receiver<()>,
+    cancel_rx: crossbeam_channel::Receiver<()>,
     ctx: RequestContext,
     child_reply: Option<mpsc::Sender<io::Result<ChildResult>>>,
     user_text: Option<String>,
@@ -2500,7 +2500,7 @@ mod tests {
 
     #[test]
     fn cancel_sends_through_channel() {
-        let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
         let (mut state, ctx) = broadcast_setup();
         state.active_requests.insert(
             1,
@@ -2524,8 +2524,8 @@ mod tests {
 
     #[test]
     fn shutdown_cancels_all_active_requests() {
-        let (cancel_tx1, cancel_rx1) = mpsc::channel::<()>();
-        let (cancel_tx2, cancel_rx2) = mpsc::channel::<()>();
+        let (cancel_tx1, cancel_rx1) = crossbeam_channel::unbounded::<()>();
+        let (cancel_tx2, cancel_rx2) = crossbeam_channel::unbounded::<()>();
         let (mut state, ctx) = broadcast_setup();
         state.active_requests.insert(
             1,
@@ -2872,8 +2872,8 @@ mod tests {
         let (mut state, ctx) = broadcast_setup();
 
         // Populate active requests as if a request is in flight.
-        let (cancel_tx1, _cancel_rx1) = mpsc::channel::<()>();
-        let (cancel_tx2, _cancel_rx2) = mpsc::channel::<()>();
+        let (cancel_tx1, _cancel_rx1) = crossbeam_channel::unbounded::<()>();
+        let (cancel_tx2, _cancel_rx2) = crossbeam_channel::unbounded::<()>();
         state.active_requests.insert(
             10,
             ActiveRequest {

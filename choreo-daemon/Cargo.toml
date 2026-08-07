@@ -17,6 +17,7 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 base64.workspace = true
+crossbeam-channel.workspace = true
 dirs.workspace = true
 zlob = "1.6"
 grep-regex = "0.1"

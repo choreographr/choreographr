@@ -18,7 +18,7 @@ use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
     OutputStream, SessionStatus, TokenUsage,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -117,8 +117,10 @@ fn spawn_forwarding_thread(
 /// Check whether a cancellation signal has been received.
 ///
 /// This is a one-shot check — call this when you only need to check once
-/// and don't need to cache the result across loop iterations.
-pub(crate) fn is_cancelled_once(rx: &mpsc::Receiver<()>) -> bool {
+/// and don't need to cache the result across loop iterations.  The channel
+/// is crossbeam so callers that need to *wait* on cancellation (rather than
+/// poll) can `select!` on it directly.
+pub(crate) fn is_cancelled_once(rx: &crossbeam_channel::Receiver<()>) -> bool {
     rx.try_recv().is_ok()
 }
 
@@ -206,7 +208,34 @@ struct SpawnToolArgs {
     /// Shared batch channel: the wait-loop thread delivers its final
     /// `ToolHandle` here the moment the tool completes, so the caller can
     /// collect results in completion order without joining.
-    result_tx: mpsc::Sender<ToolHandle>,
+    result_tx: crossbeam_channel::Sender<ToolHandle>,
+}
+
+/// Dispatch-order metadata for a single concurrent tool call, retained so a
+/// wait-loop thread that dies before delivering its result can be
+/// synthesized with the tool's real name, arguments, description, and start
+/// time — matching what the old join-based path reconstructed.
+struct CallInfo {
+    call_id: String,
+    tool_name: String,
+    arguments_json: String,
+    invocation_description: String,
+    started_at: Instant,
+}
+
+/// The subset of dispatched calls whose results were never delivered.
+///
+/// Handles arrive in *completion* order, not dispatch order, so the missing
+/// set must be computed by `call_id` — skipping the first N entries by index
+/// would misattribute the fallback to the wrong tools whenever a fast tool
+/// finished before a slower one that died.
+fn missing_calls<'a>(
+    call_infos: &'a [CallInfo],
+    delivered: &HashSet<String>,
+) -> impl Iterator<Item = &'a CallInfo> {
+    call_infos
+        .iter()
+        .filter(move |info| !delivered.contains(&info.call_id))
 }
 
 /// Spawn a single tool call on a dedicated thread with its own forwarding
@@ -233,7 +262,7 @@ fn spawn_single_tool(args: SpawnToolArgs) {
         result_tx,
     } = args;
     // Channel for the execution thread to deliver its final result.
-    let (exec_tx, exec_rx) = mpsc::channel::<Result<ToolOutput, ToolError>>();
+    let (exec_tx, exec_rx) = crossbeam_channel::unbounded::<Result<ToolOutput, ToolError>>();
 
     // Channel for streaming output forwarded to subscribers in real time.
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
@@ -280,64 +309,47 @@ fn spawn_single_tool(args: SpawnToolArgs) {
     // ── Wait loop ──────────────────────────────────────────────────
     //
     // Two modes:
-    //   Some(dur) — bounded wait with deadline; returns error on timeout.
+    //   Some(dur) — bounded wait with an exact deadline timer.
     //   None      — unbounded wait; blocks until the tool completes.
     let deadline = timeout.map(|d| Instant::now() + d);
-    let check_interval = Duration::from_millis(200);
     thread::spawn(move || {
         // Dispatch-time instant, carried on the handle so the collector can
         // log per-tool elapsed independent of batch arrival order.
         let started_at = Instant::now();
+        // Wrap a failed execution into the error `ToolOutput` the turn records.
+        let exec_error = |content: String| ToolOutput {
+            content,
+            is_error: true,
+            invocation_description: invocation_description.clone(),
+            ..Default::default()
+        };
         let output = loop {
-            if let Some(deadline) = deadline {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break ToolOutput {
-                        content: format!("tool '{}' timed out", tool_call.name,),
-                        is_error: true,
-                        invocation_description: invocation_description.clone(),
-                        ..Default::default()
+            match deadline {
+                None => match exec_rx.recv() {
+                    Ok(Ok(output)) => break output,
+                    Ok(Err(e)) => break exec_error(e.to_string()),
+                    Err(_) => break exec_error("tool execution thread panicked".to_string()),
+                },
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break exec_error(format!("tool '{}' timed out", tool_call.name));
+                    }
+                    // Wait for the tool's result OR an exact timer for the
+                    // remaining budget.  `select!` removes the old 200 ms
+                    // `recv_timeout` poll and makes the timeout precise.
+                    let received = crossbeam_channel::select! {
+                        recv(exec_rx) -> msg => Some(msg),
+                        recv(crossbeam_channel::after(remaining)) -> _ => None,
                     };
-                }
-                match exec_rx.recv_timeout(remaining.min(check_interval)) {
-                    Ok(Ok(output)) => break output,
-                    Ok(Err(e)) => {
-                        break ToolOutput {
-                            content: e.to_string(),
-                            is_error: true,
-                            invocation_description: invocation_description.clone(),
-                            ..Default::default()
-                        };
-                    }
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        break ToolOutput {
-                            content: "tool execution thread panicked".to_string(),
-                            is_error: true,
-                            invocation_description: invocation_description.clone(),
-                            ..Default::default()
-                        };
-                    }
-                }
-            } else {
-                // No timeout — block indefinitely until the tool finishes.
-                match exec_rx.recv() {
-                    Ok(Ok(output)) => break output,
-                    Ok(Err(e)) => {
-                        break ToolOutput {
-                            content: e.to_string(),
-                            is_error: true,
-                            invocation_description: invocation_description.clone(),
-                            ..Default::default()
-                        };
-                    }
-                    Err(_) => {
-                        break ToolOutput {
-                            content: "tool execution thread panicked".to_string(),
-                            is_error: true,
-                            invocation_description: invocation_description.clone(),
-                            ..Default::default()
-                        };
+                    match received {
+                        Some(Ok(Ok(output))) => break output,
+                        Some(Ok(Err(e))) => break exec_error(e.to_string()),
+                        Some(Err(_)) => {
+                            break exec_error("tool execution thread panicked".to_string());
+                        }
+                        // Deadline tick: loop back and re-check the budget.
+                        None => {}
                     }
                 }
             }
@@ -799,7 +811,7 @@ pub(crate) fn run_agent_loop(
     session: &mut SessionState,
     model: &str,
     request_id: u32,
-    cancel_rx: &mpsc::Receiver<()>,
+    cancel_rx: &crossbeam_channel::Receiver<()>,
     ctx: &RequestContext,
     user_text: Option<String>,
 ) -> io::Result<bool> {
@@ -1053,10 +1065,17 @@ pub(crate) fn run_agent_loop(
                 // the response has executed (see Phase 3 below).
                 let mut pending_config_changes: Vec<PendingConfigChange> = Vec::new();
 
+                // Sticky cancellation: a cancel observed during Phase 1 or
+                // Phase 2 stops the request, but only AFTER Phase 3 has
+                // mirrored the config changes from the tools that already
+                // ran — the same ordering the no-cancel path uses.
+                let mut cancelled = false;
+
                 // ── Phase 1: Session-config tools (serial) ────────
                 for tool_call in mutators.into_iter() {
                     if is_cancelled_once(cancel_rx) {
-                        return Ok(true);
+                        cancelled = true;
+                        break;
                     }
 
                     if let Err(e) =
@@ -1096,7 +1115,7 @@ pub(crate) fn run_agent_loop(
 
                     let (image_tx, image_rx) = mpsc::channel::<PreparedImage>();
                     let turn_working_dir = session.config.working_dir.clone();
-                    let mut output = execute_tool_with_timeout(
+                    let (mut output, tool_cancelled) = execute_tool_with_timeout(
                         &tool_call,
                         None,
                         turn_working_dir.as_deref(),
@@ -1108,6 +1127,12 @@ pub(crate) fn run_agent_loop(
                         ctx,
                         Some(image_tx),
                     );
+                    if tool_cancelled {
+                        // The wait observed a cancellation signal (consumed by
+                        // its `select!`), so the request must stop after this
+                        // tool's result is recorded below.
+                        cancelled = true;
+                    }
 
                     if let Ok(image) = image_rx.try_recv() {
                         emit_image(
@@ -1150,10 +1175,16 @@ pub(crate) fn run_agent_loop(
                     {
                         pending_config_changes.push(change);
                     }
+
+                    if cancelled {
+                        // Stop executing further serial tools; the concurrent
+                        // batch is skipped and Phase 3 still runs below.
+                        break;
+                    }
                 }
 
                 // ── Phase 2: All remaining tools (concurrent) ───────
-                if !concurrent.is_empty() {
+                if !cancelled && !concurrent.is_empty() {
                     for tc in concurrent.iter() {
                         if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::ToolCallStarted {
@@ -1209,24 +1240,22 @@ pub(crate) fn run_agent_loop(
                     // arrive in *completion* order, so a fast tool broadcasts
                     // immediately instead of waiting for the slowest tool the
                     // model listed before it.
-                    let (batch_tx, batch_rx) = mpsc::channel::<ToolHandle>();
+                    let (batch_tx, batch_rx) = crossbeam_channel::unbounded::<ToolHandle>();
 
-                    // Retained for the (rare) fallback synthesis below:
-                    // rebuilding a panicked tool's call from its recorded info,
-                    // matching the old join-based path. Index i holds the
-                    // dispatch-order metadata for the i-th tool call.
-                    let mut call_infos: Vec<(String, String, String, String, Instant)> =
-                        Vec::with_capacity(concurrent.len());
+                    // Dispatch-order metadata for every call, retained for the
+                    // (rare) fallback synthesis below: rebuilding the results
+                    // of wait-loop threads that died before delivering.
+                    let mut call_infos: Vec<CallInfo> = Vec::with_capacity(concurrent.len());
                     for tool_call in concurrent.into_iter() {
                         let timeout = determine_tool_timeout(&tool_call.name);
                         let invocation_description = reg.describe_invocation(&tool_call);
-                        call_infos.push((
-                            tool_call.id.clone(),
-                            tool_call.name.clone(),
-                            tool_call.arguments_json.clone(),
-                            invocation_description.clone(),
-                            Instant::now(),
-                        ));
+                        call_infos.push(CallInfo {
+                            call_id: tool_call.id.clone(),
+                            tool_name: tool_call.name.clone(),
+                            arguments_json: tool_call.arguments_json.clone(),
+                            invocation_description: invocation_description.clone(),
+                            started_at: Instant::now(),
+                        });
                         spawn_single_tool(SpawnToolArgs {
                             tool_call,
                             timeout,
@@ -1300,64 +1329,72 @@ pub(crate) fn run_agent_loop(
                             });
                         };
 
-                    if is_cancelled_once(cancel_rx) {
-                        cancel_flag.store(true, Ordering::Relaxed);
-                    }
+                    // Which call_ids actually delivered, so the disconnected-
+                    // channel fallback below synthesizes only the genuinely
+                    // missing tools (handles arrive in completion order, NOT
+                    // dispatch order).
+                    let mut delivered: HashSet<String> = HashSet::with_capacity(batch_size);
                     let mut received = 0usize;
                     while received < batch_size {
-                        // Poll cancellation on the same tick as the forwarding
-                        // threads, so a cancel is noticed promptly even while
-                        // slow tools are still running.
-                        if is_cancelled_once(cancel_rx) {
+                        // Block until a tool completes OR the request is
+                        // cancelled.  `select!` makes both waits event-driven:
+                        // a cancel wakes this loop the instant it is sent, and
+                        // a quiet batch costs nothing (no 200 ms ticks).  The
+                        // cancel sender cannot disconnect while the worker
+                        // runs (it is dropped only on RequestFinished), so a
+                        // firing cancel arm always means "cancel".
+                        let (cancelled_now, handle_msg) = crossbeam_channel::select! {
+                            recv(batch_rx) -> msg => (false, Some(msg)),
+                            recv(cancel_rx) -> _ => (true, None),
+                        };
+                        if cancelled_now {
                             cancel_flag.store(true, Ordering::Relaxed);
+                            cancelled = true;
                         }
-                        match batch_rx.recv_timeout(Duration::from_millis(200)) {
-                            Ok(handle) => {
-                                received += 1;
-                                process_tool_handle(handle);
-                            }
-                            Err(RecvTimeoutError::Timeout) => continue,
-                            Err(RecvTimeoutError::Disconnected) => {
-                                // Every wait-loop thread has exited but fewer
-                                // handles arrived than expected: some thread
-                                // panicked before sending. Synthesize the same
-                                // "tool thread panicked" output the old
-                                // join-based path produced, in dispatch order
-                                // for the remaining slots, so the turn still
-                                // records a result for every call.
-                                warn!(
-                                    session_id = ctx.session_id,
-                                    request_id,
-                                    delivered = received,
-                                    expected = batch_size,
-                                    "concurrent tool batch ended early; synthesizing missing tool results",
-                                );
-                                for (
-                                    call_id,
-                                    tool_name,
-                                    arguments_json,
-                                    invocation_description,
-                                    started_at,
-                                ) in call_infos.into_iter().skip(received)
-                                {
-                                    process_tool_handle(ToolHandle {
-                                        tool_call: ChatToolCall {
-                                            id: call_id,
-                                            name: tool_name,
-                                            arguments_json,
-                                            caller: None,
-                                        },
-                                        output: ToolOutput {
-                                            content: "tool thread panicked".to_string(),
-                                            is_error: true,
-                                            invocation_description,
-                                            ..Default::default()
-                                        },
-                                        image: None,
-                                        started_at,
-                                    });
+                        if let Some(msg) = handle_msg {
+                            match msg {
+                                Ok(handle) => {
+                                    received += 1;
+                                    delivered.insert(handle.tool_call.id.clone());
+                                    process_tool_handle(handle);
                                 }
-                                break;
+                                Err(_) => {
+                                    // Every wait-loop thread has exited but fewer
+                                    // handles arrived than expected: some thread
+                                    // panicked before sending. Synthesize the same
+                                    // "tool thread panicked" output the old
+                                    // join-based path produced, for the missing
+                                    // slots only (by call_id), so the turn still
+                                    // records a result for every call.
+                                    warn!(
+                                        session_id = ctx.session_id,
+                                        request_id,
+                                        delivered = received,
+                                        expected = batch_size,
+                                        "concurrent tool batch ended early; synthesizing missing tool results",
+                                    );
+                                    for info in missing_calls(&call_infos, &delivered) {
+                                        process_tool_handle(ToolHandle {
+                                            tool_call: ChatToolCall {
+                                                id: info.call_id.clone(),
+                                                name: info.tool_name.clone(),
+                                                arguments_json: info.arguments_json.clone(),
+                                                caller: None,
+                                            },
+                                            output: ToolOutput {
+                                                content: "tool thread panicked".to_string(),
+                                                is_error: true,
+                                                invocation_description: info
+                                                    .invocation_description
+                                                    .clone(),
+                                                ..Default::default()
+                                            },
+                                            image: None,
+                                            started_at: info.started_at,
+                                        });
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1399,6 +1436,13 @@ pub(crate) fn run_agent_loop(
                 // cannot drift across requests.
                 for change in &pending_config_changes {
                     apply_pending_config_change(session, change);
+                }
+
+                // A cancel observed during tool execution stops the request
+                // here — after Phase 3 has mirrored the config changes from
+                // the tools that already ran, matching the no-cancel ordering.
+                if cancelled {
+                    return Ok(true);
                 }
             }
             Ok(_) => {
@@ -1512,10 +1556,10 @@ fn execute_tool_with_timeout(
     request_id: u32,
     session_id: u64,
     session: &mut SessionState,
-    cancel_rx: &mpsc::Receiver<()>,
+    cancel_rx: &crossbeam_channel::Receiver<()>,
     ctx: &RequestContext,
     image_tx: Option<mpsc::Sender<PreparedImage>>,
-) -> ToolOutput {
+) -> (ToolOutput, bool) {
     let format = match &tool_call.caller {
         Some(caller) if caller.kind == "program" => ToolOutputFormat::Json,
         _ => ToolOutputFormat::Text,
@@ -1523,7 +1567,7 @@ fn execute_tool_with_timeout(
     // Capture start time for tool execution metrics.
     let exec_start = std::time::Instant::now();
 
-    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = crossbeam_channel::unbounded();
     let (output_tx, output_rx) = std::sync::mpsc::channel();
     let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
 
@@ -1578,29 +1622,13 @@ fn execute_tool_with_timeout(
         let _ = result_tx.send(result);
     });
 
-    // Event-driven wait loop: blocked on recv_timeout for most of the
-    // interval, waking briefly at each check point to see whether the
-    // caller has cancelled the request or the tool has finished.
+    // Event-driven wait loop: `select_biased!` waits on the tool's result
+    // channel, the cancellation channel, and an exact timer for the remaining
+    // budget simultaneously — no polling interval, timeouts fire precisely,
+    // and a cancel sent before tool start wins deterministically (cancellation
+    // is the first arm).
     let deadline = std::time::Instant::now() + timeout_dur;
-    let check_interval = Duration::from_millis(200);
     loop {
-        // Check cancellation before each blocking wait so that a cancel
-        // sent between tool start and our first recv_timeout is honoured
-        // immediately rather than waiting up to check_interval.
-        if is_cancelled_once(cancel_rx) {
-            crate::metrics::record_tool_execution(
-                &tool_call.name,
-                exec_start.elapsed().as_secs_f64(),
-                true,
-            );
-            return ToolOutput {
-                content: format!("tool '{}' cancelled", tool_call.name),
-                is_error: true,
-                invocation_description: String::new(),
-                ..Default::default()
-            };
-        }
-
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             crate::metrics::record_tool_execution(
@@ -1608,54 +1636,84 @@ fn execute_tool_with_timeout(
                 exec_start.elapsed().as_secs_f64(),
                 true,
             );
-            return ToolOutput {
-                content: format!(
-                    "tool '{}' timed out after {}s",
-                    tool_call.name,
-                    timeout_dur.as_secs()
-                ),
-                is_error: true,
-                invocation_description: String::new(),
-                ..Default::default()
-            };
+            return (
+                ToolOutput {
+                    content: format!(
+                        "tool '{}' timed out after {}s",
+                        tool_call.name,
+                        timeout_dur.as_secs()
+                    ),
+                    is_error: true,
+                    invocation_description: String::new(),
+                    ..Default::default()
+                },
+                false,
+            );
         }
-
-        match result_rx.recv_timeout(remaining.min(check_interval)) {
-            Ok(Ok(output)) => {
-                crate::metrics::record_tool_execution(
-                    &tool_call.name,
-                    exec_start.elapsed().as_secs_f64(),
-                    output.is_error,
-                );
-                return output;
-            }
-            Ok(Err(e)) => {
+        crossbeam_channel::select_biased! {
+            recv(cancel_rx) -> _ => {
                 crate::metrics::record_tool_execution(
                     &tool_call.name,
                     exec_start.elapsed().as_secs_f64(),
                     true,
                 );
-                return ToolOutput {
-                    content: e.to_string(),
-                    is_error: true,
-                    invocation_description: String::new(),
-                    ..Default::default()
-                };
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                crate::metrics::record_tool_execution(
-                    &tool_call.name,
-                    exec_start.elapsed().as_secs_f64(),
+                return (
+                    ToolOutput {
+                        content: format!("tool '{}' cancelled", tool_call.name),
+                        is_error: true,
+                        invocation_description: String::new(),
+                        ..Default::default()
+                    },
                     true,
                 );
-                return ToolOutput {
-                    content: "tool execution thread panicked".to_string(),
-                    is_error: true,
-                    invocation_description: String::new(),
-                    ..Default::default()
-                };
             }
+            recv(result_rx) -> msg => {
+                match msg {
+                    Ok(Ok(output)) => {
+                        crate::metrics::record_tool_execution(
+                            &tool_call.name,
+                            exec_start.elapsed().as_secs_f64(),
+                            output.is_error,
+                        );
+                        return (output, false);
+                    }
+                    Ok(Err(e)) => {
+                        crate::metrics::record_tool_execution(
+                            &tool_call.name,
+                            exec_start.elapsed().as_secs_f64(),
+                            true,
+                        );
+                        return (
+                            ToolOutput {
+                                content: e.to_string(),
+                                is_error: true,
+                                invocation_description: String::new(),
+                                ..Default::default()
+                            },
+                            false,
+                        );
+                    }
+                    Err(_) => {
+                        crate::metrics::record_tool_execution(
+                            &tool_call.name,
+                            exec_start.elapsed().as_secs_f64(),
+                            true,
+                        );
+                        return (
+                            ToolOutput {
+                                content: "tool execution thread panicked".to_string(),
+                                is_error: true,
+                                invocation_description: String::new(),
+                                ..Default::default()
+                            },
+                            false,
+                        );
+                    }
+                }
+            }
+            // Deadline tick: loop back, re-check the remaining budget, and
+            // create a fresh timer for it.
+            recv(crossbeam_channel::after(remaining)) -> _ => {}
         }
     }
 }
@@ -1858,13 +1916,13 @@ mod tests {
 
     #[test]
     fn is_cancelled_once_no_signal() {
-        let (_tx, rx) = mpsc::channel::<()>();
+        let (_tx, rx) = crossbeam_channel::unbounded::<()>();
         assert!(!is_cancelled_once(&rx));
     }
 
     #[test]
     fn is_cancelled_once_with_signal() {
-        let (tx, rx) = mpsc::channel::<()>();
+        let (tx, rx) = crossbeam_channel::unbounded::<()>();
         tx.send(()).unwrap();
         assert!(is_cancelled_once(&rx));
     }
@@ -2293,8 +2351,8 @@ mod tests {
         tool_name: &str,
         tool_args: &str,
         timeout_dur: Duration,
-        cancel_rx: mpsc::Receiver<()>,
-    ) -> (ToolOutput, mpsc::Receiver<SessionCommand>) {
+        cancel_rx: crossbeam_channel::Receiver<()>,
+    ) -> (ToolOutput, bool, mpsc::Receiver<SessionCommand>) {
         let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
 
@@ -2322,7 +2380,7 @@ mod tests {
             daemon_tx,
             max_turns: 0,
         };
-        let result = execute_tool_with_timeout(
+        let (result, cancelled) = execute_tool_with_timeout(
             &tool_call,
             None,
             None,
@@ -2334,13 +2392,13 @@ mod tests {
             &ctx,
             None,
         );
-        (result, cmd_rx)
+        (result, cancelled, cmd_rx)
     }
 
     #[test]
     fn execute_tool_normal_completion() {
-        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let (result, _cmd_rx) = run_exec_tool(
+        let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+        let (result, cancelled, _cmd_rx) = run_exec_tool(
             FastTestTool,
             "_test_fast",
             "{}",
@@ -2349,15 +2407,16 @@ mod tests {
         );
         assert!(!result.is_error, "expected success: {}", result.content);
         assert!(result.content.contains("fast result"), "{}", result.content);
+        assert!(!cancelled, "completion must not report a cancel");
     }
 
     #[test]
     fn execute_tool_cancelled_before_execution() {
-        let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
         cancel_tx.send(()).expect("send cancel");
         drop(cancel_tx);
 
-        let (result, _cmd_rx) = run_exec_tool(
+        let (result, cancelled, _cmd_rx) = run_exec_tool(
             FastTestTool,
             "_test_fast",
             "{}",
@@ -2366,14 +2425,17 @@ mod tests {
         );
         assert!(result.is_error, "expected error: {}", result.content);
         assert!(result.content.contains("cancelled"), "{}", result.content);
+        // The wait observed the cancellation signal; the caller must stop the
+        // request (the sticky-cancel contract).
+        assert!(cancelled, "cancel must be reported to the caller");
     }
 
     #[test]
     fn execute_tool_timeout() {
-        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
         let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
 
-        let (result, _cmd_rx) = run_exec_tool(
+        let (result, cancelled, _cmd_rx) = run_exec_tool(
             BlockingTestTool {
                 proceed: std::sync::Mutex::new(Some(proceed_rx)),
             },
@@ -2385,6 +2447,7 @@ mod tests {
 
         assert!(result.is_error, "expected error: {}", result.content);
         assert!(result.content.contains("timed out"), "{}", result.content);
+        assert!(!cancelled, "a timeout is not a cancellation");
 
         drop(proceed_tx);
     }
@@ -2442,8 +2505,8 @@ mod tests {
 
     #[test]
     fn execute_tool_forwards_streaming_output() {
-        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let (result, cmd_rx) = run_exec_tool(
+        let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+        let (result, cancelled, cmd_rx) = run_exec_tool(
             StreamingTestTool,
             "_test_streaming",
             "{}",
@@ -2457,6 +2520,7 @@ mod tests {
             "{}",
             result.content
         );
+        assert!(!cancelled, "completion must not report a cancel");
 
         // First chunk is the description string (from execute_streaming_json)
         match cmd_rx.recv() {
@@ -2558,7 +2622,7 @@ mod tests {
             .describe_invocation_for(&tool_call.name, &tool_call.arguments_json)
             .unwrap_or_default();
 
-        let (result_tx, result_rx) = mpsc::channel::<ToolHandle>();
+        let (result_tx, result_rx) = crossbeam_channel::unbounded::<ToolHandle>();
         spawn_single_tool(SpawnToolArgs {
             tool_call,
             timeout,
@@ -2641,7 +2705,7 @@ mod tests {
             caller: None,
         };
 
-        let (batch_tx, batch_rx) = mpsc::channel::<ToolHandle>();
+        let (batch_tx, batch_rx) = crossbeam_channel::unbounded::<ToolHandle>();
 
         // Dispatch the slow tool first, then the fast one.
         spawn_single_tool(SpawnToolArgs {
@@ -2693,6 +2757,59 @@ mod tests {
             "{}",
             second.output.content
         );
+    }
+
+    // -- missing_calls tests ------------------------------------------------
+
+    #[test]
+    fn missing_calls_skips_delivered_by_id_not_index() {
+        // A (slow, dies before delivering), B (fast, delivered), C (slow,
+        // dies): handles arrive in completion order, so B is delivered first
+        // and received == 1.  Skipping the first 1 entry by *index* would
+        // mark A delivered and synthesize C in its place — misattributing the
+        // panic to the wrong tool.  Filtering by call_id must synthesize A
+        // and C (in dispatch order), never B.
+        let call_infos = vec![
+            CallInfo {
+                call_id: "a".into(),
+                tool_name: "slow_1".into(),
+                arguments_json: "{}".into(),
+                invocation_description: "a".into(),
+                started_at: Instant::now(),
+            },
+            CallInfo {
+                call_id: "b".into(),
+                tool_name: "fast".into(),
+                arguments_json: "{}".into(),
+                invocation_description: "b".into(),
+                started_at: Instant::now(),
+            },
+            CallInfo {
+                call_id: "c".into(),
+                tool_name: "slow_2".into(),
+                arguments_json: "{}".into(),
+                invocation_description: "c".into(),
+                started_at: Instant::now(),
+            },
+        ];
+        let delivered = HashSet::from(["b".to_string()]);
+        let missing: Vec<&str> = missing_calls(&call_infos, &delivered)
+            .map(|info| info.call_id.as_str())
+            .collect();
+        assert_eq!(missing, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn missing_calls_empty_when_all_delivered() {
+        let call_infos = vec![CallInfo {
+            call_id: "a".into(),
+            tool_name: "read_file".into(),
+            arguments_json: "{}".into(),
+            invocation_description: "a".into(),
+            started_at: Instant::now(),
+        }];
+        let delivered = HashSet::from(["a".to_string()]);
+        assert_eq!(missing_calls(&call_infos, &delivered).count(), 0);
     }
 
     // -- sort_by_call_order tests -----------------------------------------

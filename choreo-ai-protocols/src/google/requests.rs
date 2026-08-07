@@ -1,5 +1,4 @@
 use std::io::{self, BufReader, Read};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use choreo_proto::TokenUsage;
@@ -89,7 +88,7 @@ pub(super) fn generate_content_request(
     tools: &[ChatToolDefinition],
     thinking_effort: &str,
     on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<ChatTurnResult, GoogleError> {
     let url = model_url(&config.base_url, model, GENERATE_CONTENT)?;
     let retry_cfg = retry::RetryConfig {
@@ -160,7 +159,7 @@ pub(super) fn generate_content_request_streaming<F>(
     tools: &[ChatToolDefinition],
     thinking_effort: &str,
     on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     mut on_event: F,
 ) -> Result<ChatTurnResult, GoogleError>
 where

@@ -10,6 +10,7 @@ name = "choreo_ai_protocols"
 
 [dependencies]
 choreo-proto.workspace = true
+crossbeam-channel.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

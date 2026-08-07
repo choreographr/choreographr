@@ -1,5 +1,4 @@
 use super::*;
-use std::sync::mpsc;
 use std::time::Duration;
 
 #[test]
@@ -306,7 +305,7 @@ fn parse_responses_stream_event_program_output_done_missing_call_id() {
 
 #[test]
 fn sleep_or_cancel_signal_returns_cancelled() {
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = crossbeam_channel::unbounded::<()>();
     tx.send(()).unwrap();
     let result = crate::retry::sleep_or_cancel(Duration::from_secs(10), Some(&rx));
     assert!(result.is_err());
@@ -314,7 +313,7 @@ fn sleep_or_cancel_signal_returns_cancelled() {
 
 #[test]
 fn sleep_or_cancel_disconnected_returns_ok() {
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = crossbeam_channel::unbounded::<()>();
     drop(tx);
     let result = crate::retry::sleep_or_cancel(Duration::from_millis(1), Some(&rx));
     assert!(result.is_ok());
