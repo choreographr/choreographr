@@ -1251,7 +1251,13 @@ fn handle_chat_event(
         Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
             if let Some((term_w, term_h)) = app.last_terminal_size {
                 let box_rect = app.input_box_rect(term_w, term_h);
-                let inner_width = input_inner_width(term_w);
+                // Use the box's own width (not the terminal width) so the
+                // wrap width matches the renderer's `input_inner_width`, and
+                // mirror the renderer's drawn content height (box height minus
+                // its two borders) so the click's visual window is clamped
+                // exactly like the drawn one.
+                let inner_width = input_inner_width(box_rect.width);
+                let visible_height = (box_rect.height.saturating_sub(2)) as usize;
                 // Row must fall in the content area, strictly between the two
                 // borders; the column may be anywhere in the box width.
                 if mouse.row >= box_rect.y.saturating_add(1)
@@ -1266,9 +1272,12 @@ fn handle_chat_event(
                         .column
                         .saturating_sub(box_rect.x.saturating_add(INPUT_PAD))
                         .min(inner_width as u16) as usize;
-                    app.input.cursor =
-                        app.input
-                            .byte_offset_at_click(inner_width, content_row, content_col);
+                    app.input.cursor = app.input.byte_offset_at_click(
+                        inner_width,
+                        visible_height,
+                        content_row,
+                        content_col,
+                    );
                     app.ensure_input_cursor_visible();
                     tracing::debug!(
                         cursor = app.input.cursor,

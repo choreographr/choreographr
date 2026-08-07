@@ -855,20 +855,20 @@ fn is_on_last_visual_line_returns_false_on_first_line() {
 fn byte_offset_at_click_single_line() {
     let mut buf = InputBuffer::new();
     buf.text = "hello".to_string();
-    assert_eq!(buf.byte_offset_at_click(80, 0, 0), 0);
-    assert_eq!(buf.byte_offset_at_click(80, 0, 2), 2);
-    assert_eq!(buf.byte_offset_at_click(80, 0, 5), 5);
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 0), 0);
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 2), 2);
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 5), 5);
     // Past the right edge of the line clamps to the line end.
-    assert_eq!(buf.byte_offset_at_click(80, 0, 100), 5);
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 100), 5);
 }
 
 #[test]
 fn byte_offset_at_click_multiline_text() {
     let mut buf = InputBuffer::new();
     buf.text = "abc\ndef".to_string();
-    assert_eq!(buf.byte_offset_at_click(80, 0, 2), 2);
-    assert_eq!(buf.byte_offset_at_click(80, 1, 1), 5); // 'e' in "def" → byte 4+1
-    assert_eq!(buf.byte_offset_at_click(80, 1, 3), 7); // end of "def"
+    assert_eq!(buf.byte_offset_at_click(80, 2, 0, 2), 2);
+    assert_eq!(buf.byte_offset_at_click(80, 2, 1, 1), 5); // 'e' in "def" → byte 4+1
+    assert_eq!(buf.byte_offset_at_click(80, 2, 1, 3), 7); // end of "def"
 }
 
 #[test]
@@ -876,9 +876,9 @@ fn byte_offset_at_click_wrapped_lines() {
     let mut buf = InputBuffer::new();
     buf.text = "aaa bbb ccc ddd".to_string();
     // max_width 7 wraps as: line 0 = "aaa bbb" (bytes 0..7), line 1 = "ccc ddd" (bytes 8..15)
-    assert_eq!(buf.byte_offset_at_click(7, 0, 4), 4); // after "aaa " → the space
-    assert_eq!(buf.byte_offset_at_click(7, 1, 3), 11); // after "ccc" → the space
-    assert_eq!(buf.byte_offset_at_click(7, 1, 7), 15); // end of line 1
+    assert_eq!(buf.byte_offset_at_click(7, 2, 0, 4), 4); // after "aaa " → the space
+    assert_eq!(buf.byte_offset_at_click(7, 2, 1, 3), 11); // after "ccc" → the space
+    assert_eq!(buf.byte_offset_at_click(7, 2, 1, 7), 15); // end of line 1
 }
 
 #[test]
@@ -886,7 +886,7 @@ fn byte_offset_at_click_below_last_line_goes_to_end() {
     let mut buf = InputBuffer::new();
     buf.text = "abc".to_string();
     // Row 5 is past the single visual line → cursor at end of buffer.
-    assert_eq!(buf.byte_offset_at_click(80, 5, 0), 3);
+    assert_eq!(buf.byte_offset_at_click(80, 1, 5, 0), 3);
 }
 
 #[test]
@@ -895,7 +895,25 @@ fn byte_offset_at_click_uses_scroll_offset() {
     buf.text = "aaa bbb ccc ddd".to_string();
     buf.scroll_offset = 1;
     // Content row 0 now displays visual line 1 ("ccc ddd", bytes 8..15).
-    assert_eq!(buf.byte_offset_at_click(7, 0, 0), 8);
+    assert_eq!(buf.byte_offset_at_click(7, 1, 0, 0), 8);
+}
+
+#[test]
+fn byte_offset_at_click_clamps_stale_scroll_offset() {
+    let mut buf = InputBuffer::new();
+    buf.text = "aaa bbb ccc ddd".to_string();
+    // A scroll_offset left over from a wider box (e.g. after a shrink-resize
+    // before the next re-clamp) must be clamped to the renderer's visible
+    // window instead of sending every click to the end of the buffer.
+    buf.scroll_offset = 10;
+    // With visible_height 1 the window shows one line at a time: it starts at
+    // the last line (line 1, bytes 8..15).
+    assert_eq!(buf.byte_offset_at_click(7, 1, 0, 0), 8);
+    assert_eq!(buf.byte_offset_at_click(7, 1, 0, 3), 11);
+    // With visible_height 2 the whole text fits, so the window starts at 0.
+    assert_eq!(buf.byte_offset_at_click(7, 2, 0, 0), 0);
+    // A click below the last visible line still resolves to the end.
+    assert_eq!(buf.byte_offset_at_click(7, 1, 3, 0), 15);
 }
 
 #[test]
@@ -904,8 +922,8 @@ fn byte_offset_at_click_is_grapheme_aware() {
     buf.text = "a😀b".to_string();
     // 😀 is 4 bytes wide; clicking at display column 1 places the cursor
     // between 'a' and the emoji (byte 1), not inside the emoji's bytes.
-    assert_eq!(buf.byte_offset_at_click(80, 0, 1), 1);
-    assert_eq!(buf.byte_offset_at_click(80, 0, 3), 5); // after the emoji, before 'b'
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 1), 1);
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 3), 5); // after the emoji, before 'b'
 }
 
 #[test]
@@ -915,9 +933,9 @@ fn byte_offset_at_click_right_half_of_wide_char_places_after() {
     // 😀 occupies display columns 1..3.  A click on its left cell (col 1)
     // places the cursor before it; a click on its right cell (col 2) or one
     // column past it (col 3) places the cursor after it.
-    assert_eq!(buf.byte_offset_at_click(80, 0, 1), 1); // left cell → before
-    assert_eq!(buf.byte_offset_at_click(80, 0, 2), 5); // right cell → after
-    assert_eq!(buf.byte_offset_at_click(80, 0, 3), 5); // one past → after
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 1), 1); // left cell → before
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 2), 5); // right cell → after
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 3), 5); // one past → after
 }
 
 #[test]
@@ -928,10 +946,10 @@ fn byte_offset_at_click_never_splits_zwj_grapheme_cluster() {
     buf.text = "👨‍👩‍👧‍👦x".to_string();
     // Any click inside the cluster's cells must land on a grapheme boundary —
     // before the cluster (byte 0) or after it (byte 25), never mid-cluster.
-    assert_eq!(buf.byte_offset_at_click(80, 0, 0), 0); // left cell → before
-    assert_eq!(buf.byte_offset_at_click(80, 0, 1), 25); // right cell → after
-    assert_eq!(buf.byte_offset_at_click(80, 0, 2), 25); // 'x' (byte 25)
-    assert_eq!(buf.byte_offset_at_click(80, 0, 3), 26); // end of buffer
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 0), 0); // left cell → before
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 1), 25); // right cell → after
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 2), 25); // 'x' (byte 25)
+    assert_eq!(buf.byte_offset_at_click(80, 1, 0, 3), 26); // end of buffer
 }
 
 #[test]
@@ -2726,7 +2744,7 @@ fn mouse_click_in_input_box_second_line_of_multiline_text() {
     app.input.cursor = 0;
     app.update_viewport_from_terminal_size();
 
-    // Two content lines → box occupies rows 19..23 (content rows 20, 21).
+    // Two content lines → box occupies rows 19..22 (content rows 20, 21).
     click_input(&mut app, &tx, 3, 20); // content row 0, col 1 → 'b' in "abc"
     assert_eq!(app.input.cursor, 1);
     click_input(&mut app, &tx, 3, 21); // content row 1, col 1 → 'e' in "def"
@@ -2744,7 +2762,7 @@ fn mouse_click_in_input_box_wrapped_line() {
     app.input.cursor = 0;
     app.update_viewport_from_terminal_size();
 
-    // Two content lines → box occupies rows 19..23 (content rows 20, 21).
+    // Two content lines → box occupies rows 19..22 (content rows 20, 21).
     click_input(&mut app, &tx, 30, 20); // visual line 0, content col 28
     assert_eq!(app.input.cursor, 28);
     click_input(&mut app, &tx, 10, 21); // visual line 1, content col 8
@@ -3859,6 +3877,42 @@ fn input_box_rect_matches_renderer_layout() {
         });
 
     assert_eq!(app.input_box_rect(80, 30), chunks[3]);
+}
+
+#[test]
+fn input_box_rect_matches_renderer_layout_in_overflow() {
+    // A terminal too small for the fixed chrome (help + input + status bar)
+    // to fit: the layout solver shrinks the input box instead of placing it
+    // at a fixed distance above the status bar.  Replicate render_chat's
+    // layout verbatim and assert the hit-test rect agrees with the chunk the
+    // renderer draws — the old bottom-anchored formula would report y=0 h=12.
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 10));
+    // 12 logical lines → input_bar_height clamps to 12 (MAX_INPUT_CONTENT_LINES
+    // + 2 borders), pushing the fixed chrome past the 10-row terminal.
+    app.input.text = "line\n".repeat(12);
+    app.input.generation += 1;
+    app.update_viewport_from_terminal_size();
+
+    let status_error_height = app.status_error_height(80);
+    let help_height = if app.show_ctrl_help { 2u16 } else { 0u16 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(status_error_height),
+            Constraint::Length(help_height),
+            Constraint::Length(app.input_bar_height(80)),
+            Constraint::Length(STATUS_BAR_HEIGHT),
+        ])
+        .split(Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        });
+
+    assert_eq!(app.input_box_rect(80, 10), chunks[3]);
 }
 
 #[test]

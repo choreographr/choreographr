@@ -3,8 +3,8 @@ use crate::markdown_render::{display_width, reasoning_expanded_default, render_t
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, CTRL_HELP_LINE1, CTRL_HELP_LINE2, INPUT_PAD,
-    PROVIDER_OPTIONS, Page, STATUS_BAR_HEIGHT, SessionManagerView, cached_or_compute_lines,
-    cached_visual_lines, input_inner_width,
+    PROVIDER_OPTIONS, Page, SessionManagerView, cached_or_compute_lines, cached_visual_lines,
+    input_inner_width,
 };
 use choreo_proto::SessionStatus;
 use choreo_tui::RenderedImage;
@@ -169,29 +169,24 @@ fn render_fullscreen_image(
 }
 
 fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
-    let status_error_height = app.status_error_height(frame.area().width);
-    let help_height = if app.show_ctrl_help { 2u16 } else { 0u16 };
-    // Compute the input box's rect via the shared layout helper so that
-    // rendering and mouse hit-testing (connection.rs click-to-position)
-    // can never drift apart.  The box always sits directly above the status
-    // bar; its height is derived from the wrapped input content.
-    let input_area = app.input_box_rect(frame.area().width, frame.area().height);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(status_error_height),
-            Constraint::Length(help_height),
-            Constraint::Length(input_area.height),
-            Constraint::Length(STATUS_BAR_HEIGHT),
-        ])
-        .split(frame.area());
+    // Compute the Chat page's vertical layout via the shared helper so that
+    // rendering, mouse hit-testing (connection.rs click-to-position), and the
+    // history viewport (update_viewport_from_terminal_size) all use identical
+    // math — they can never drift apart, even on tiny terminals where the
+    // layout solver shrinks the fixed-height chunks.
+    let [
+        history_area,
+        status_error_area,
+        help_area,
+        input_area,
+        status_bar_area,
+    ] = app.chat_page_layout(frame.area().width, frame.area().height);
 
     // Reserve 1 column on the right for the scrollbar
     let history_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(chunks[0]);
+        .split(history_area);
 
     // Build height_prefix and visible_turn_ids BEFORE rendering history,
     // so render_history iterates the correct set of visible turns rather
@@ -221,9 +216,9 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
     // ── Status/error bar (above command box) ──────────────────
     let notify_area = Rect {
-        x: chunks[1].x + 1,
-        width: chunks[1].width.saturating_sub(2),
-        ..chunks[1]
+        x: status_error_area.x + 1,
+        width: status_error_area.width.saturating_sub(2),
+        ..status_error_area
     };
     if let Some(ref err) = app.error {
         let err_para = Paragraph::new(Text::from(err.clone()))
@@ -239,10 +234,10 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
     // ── Help overlay (2 lines, conditional) ───────────────────
     if app.show_ctrl_help {
-        let help_area = Rect {
-            x: chunks[2].x + 1,
-            width: chunks[2].width.saturating_sub(2),
-            ..chunks[2]
+        let help_inner = Rect {
+            x: help_area.x + 1,
+            width: help_area.width.saturating_sub(2),
+            ..help_area
         };
         let help = Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
@@ -254,7 +249,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
                 Style::default().fg(Color::Cyan),
             )),
         ]));
-        frame.render_widget(help, help_area);
+        frame.render_widget(help, help_inner);
     }
 
     // ── Command input box ──────────────────────────────────────
@@ -313,8 +308,6 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     frame.set_cursor_position((cursor_x, cursor_y));
 
     // ── Status bar (single line) ───────────────────────────────
-    let status_area = chunks[4];
-
     let has_session = app.attached_session_id.is_some();
 
     let status_line = if has_session {
@@ -413,7 +406,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         Line::from("")
     };
     let status_bar = Paragraph::new(status_line).style(Style::default().bg(Color::Reset));
-    frame.render_widget(status_bar, status_area);
+    frame.render_widget(status_bar, status_bar_area);
 }
 
 fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {

@@ -7,7 +7,7 @@ use choreo_proto::{
 use choreo_tui::RenderedImage;
 use choreo_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Rect, Size};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1776,14 +1776,20 @@ impl InputBuffer {
     ///
     /// Coordinates are relative to the input box's text area (0-indexed),
     /// *excluding* the box borders and side padding: `row` is the visual line
-    /// within the currently visible window (so `scroll_offset` is added to it)
-    /// and `col` is the display-width column.  Clicks below the last text line
-    /// resolve to the end of the buffer; clicks past the right edge of a line
-    /// resolve to that line's end.  Within a line the offset is grapheme-aware
-    /// (see [`grapheme_offset_at_column`]).
+    /// within the currently visible window and `col` is the display-width
+    /// column.  `visible_height` is the number of content rows actually drawn
+    /// (box height minus its two borders) — it is used to clamp `scroll_offset`
+    /// exactly as the renderer does, so clicks land on the same lines that are
+    /// drawn even when `scroll_offset` is stale (e.g. right after a resize
+    /// shrank the box but before the next `ensure_cursor_visible` re-clamped
+    /// it).  Clicks below the last text line resolve to the end of the buffer;
+    /// clicks past the right edge of a line resolve to that line's end.
+    /// Within a line the offset is grapheme-aware (see
+    /// [`grapheme_offset_at_column`]).
     pub(crate) fn byte_offset_at_click(
         &mut self,
         max_width: usize,
+        visible_height: usize,
         row: usize,
         col: usize,
     ) -> usize {
@@ -1796,7 +1802,16 @@ impl InputBuffer {
             self.generation,
             &mut self.lines_cache,
         );
-        let visual_idx = self.scroll_offset.saturating_add(row);
+        // Mirror the renderer's visible-window arithmetic: the window starts
+        // at `scroll_offset` clamped so it never runs past the last visual
+        // line.  Without this, a stale `scroll_offset` (left over from a wider
+        // box) would map clicks to the end of the buffer instead of the line
+        // under the pointer.
+        let visible_count = visible_height.max(1).min(lines.len());
+        let offset = self
+            .scroll_offset
+            .min(lines.len().saturating_sub(visible_count));
+        let visual_idx = offset.saturating_add(row);
         match lines.get(visual_idx) {
             Some(vl) => {
                 let line_text = &self.text[vl.start_byte..vl.end_byte];
@@ -2149,22 +2164,47 @@ impl App {
         self.input_bar_content_lines(term_width) + 2
     }
 
+    /// The five vertical chunks of the Chat page: history, status/error, help,
+    /// command input box, status bar.
+    ///
+    /// Single source of truth for the Chat page's vertical layout —
+    /// `render_chat` draws into these chunks, `input_box_rect` hit-tests clicks
+    /// against chunk 3, and `update_viewport_from_terminal_size` sizes the
+    /// history viewport from chunk 0.  Every consumer runs the *identical*
+    /// `Layout::split`, so they can never drift apart — including on terminals
+    /// too small for the fixed chrome to fit, where the solver shrinks and
+    /// relocates chunks rather than honouring every `Length`.
+    pub(crate) fn chat_page_layout(&mut self, term_width: u16, term_height: u16) -> [Rect; 5] {
+        let status_error_height = self.status_error_height(term_width);
+        let help_height = if self.show_ctrl_help { 2u16 } else { 0u16 };
+        let input_height = self.input_bar_height(term_width);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(status_error_height),
+                Constraint::Length(help_height),
+                Constraint::Length(input_height),
+                Constraint::Length(STATUS_BAR_HEIGHT),
+            ])
+            .split(Rect {
+                x: 0,
+                y: 0,
+                width: term_width,
+                height: term_height,
+            });
+        [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
+    }
+
     /// Rectangle (terminal coordinates) occupied by the command input box on
     /// the Chat page, including its top/bottom borders.
     ///
-    /// Must stay in sync with `render_chat`'s layout so mouse hit-testing
-    /// (clicking to position the cursor) agrees with what is drawn.  The input
-    /// box always sits directly above the status bar, so its top edge is
-    /// `term_height - input_bar_height - STATUS_BAR_HEIGHT` regardless of how
-    /// tall the status/error and help rows above it are.
+    /// Delegates to [`Self::chat_page_layout`] so mouse hit-testing (clicking
+    /// to position the cursor) always agrees with what `render_chat` draws —
+    /// even on tiny terminals where the layout solver shrinks the box rather
+    /// than placing it at a fixed distance above the status bar.
     pub(crate) fn input_box_rect(&mut self, term_width: u16, term_height: u16) -> Rect {
-        let input_height = self.input_bar_height(term_width);
-        Rect {
-            x: 0,
-            y: term_height.saturating_sub(input_height.saturating_add(STATUS_BAR_HEIGHT)),
-            width: term_width,
-            height: input_height,
-        }
+        self.chat_page_layout(term_width, term_height)[3]
     }
 
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
@@ -2183,36 +2223,37 @@ impl App {
             }
         };
         let (width, height) = size;
-        let help_height: u16 = if self.show_ctrl_help { 2 } else { 0 };
-        let bottom_height = self.input_bar_height(width)
-            + STATUS_BAR_HEIGHT
-            + self.status_error_height(width)
-            + help_height;
-        if width > 1 && height > bottom_height {
-            let old_width = self.history_viewport.width;
-            let old_height = self.history_viewport.height;
-            let new_height = height - bottom_height;
-            self.history_viewport.update(Rect {
-                x: 0,
-                y: 0,
-                width: width - 1,
-                height: new_height,
-            });
-            if old_width != width.saturating_sub(1) || old_height != self.history_viewport.height {
-                for display in self.session_displays.values_mut() {
-                    for cached in &mut display.render_cache {
-                        *cached = None;
-                    }
-                    display.markers_dirty = true;
-                    if old_width != width.saturating_sub(1) {
-                        let new_vp_width = width.saturating_sub(1);
-                        tracing::debug!(
-                            "width changed ({} → {}), clearing content_dirty",
-                            old_width,
-                            new_vp_width,
-                        );
-                        display.content_dirty = false;
-                    }
+        // The history viewport must match what render_chat actually draws:
+        // chunk 0 of the shared Chat-page layout, minus the reserved scrollbar
+        // column.  Deriving it from the solver output (rather than
+        // `height - bottom_height`) keeps the viewport faithful even on
+        // terminals too small for the fixed chrome to fit, where the solver
+        // shrinks chunks — so the history-box mouse arm can never swallow
+        // clicks that the renderer drew as part of the input box.
+        let [history_area, _, _, _, _] = self.chat_page_layout(width, height);
+        let old_width = self.history_viewport.width;
+        let old_height = self.history_viewport.height;
+        let new_width = history_area.width.saturating_sub(1);
+        let new_height = history_area.height;
+        self.history_viewport.update(Rect {
+            x: 0,
+            y: 0,
+            width: new_width,
+            height: new_height,
+        });
+        if old_width != new_width || old_height != self.history_viewport.height {
+            for display in self.session_displays.values_mut() {
+                for cached in &mut display.render_cache {
+                    *cached = None;
+                }
+                display.markers_dirty = true;
+                if old_width != new_width {
+                    tracing::debug!(
+                        "width changed ({} → {}), clearing content_dirty",
+                        old_width,
+                        new_width,
+                    );
+                    display.content_dirty = false;
                 }
             }
         }
