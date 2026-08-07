@@ -47,6 +47,7 @@ serde_json = "1"
 schemars = { version = "1.2.1", features = ["derive"] }
 yaml_serde = "0.10"
 signal-hook = "0.4"
+# Held at 3.x (3.5.0): serial_test 4.0.1 requires Rust 1.93.1, above the workspace MSRV floor (1.91).
 serial_test = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

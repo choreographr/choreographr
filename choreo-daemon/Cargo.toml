@@ -80,7 +80,9 @@ postcard.workspace = true
 # (omeileo, single commit f86decf) bumps it, verified source-compatible with
 # 860 green tests and a clean error instead of SIGABRT on the PoC.
 #
-# Once upstream merges #198/#222 and publishes, switch back to:
+# Re-checked 2026-08-07: crates.io pdf-inspector 0.1.7 (latest) still depends
+# on lopdf ^0.41.0 (vulnerable to RUSTSEC-2026-0187), so the fork pin remains.
+# Once upstream merges #198/#222 and publishes with lopdf >= 0.42, switch back to:
 #   pdf-inspector = "0.1"  # (or the fixed release)
 # and drop this comment.
 pdf-inspector = { git = "https://github.com/omeileo/pdf-inspector", rev = "f86decf82d72e4bc318aaf54c04f854763cbed1c" }
