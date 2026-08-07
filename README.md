@@ -574,6 +574,39 @@ Note that the `test-*` aliases bake in `--workspace`, so passing `-p <crate>`
 to them is rejected by cargo (conflicting flags) — run
 `cargo nextest run -p <crate>` directly to scope a run to a single crate.
 
+### justfile
+
+A [`justfile`](./justfile) wraps the common workflows above (and the daemon run
+commands) in one place — `just` lists every recipe, and `just help` explains the
+prerequisites. Install `just` with `cargo install just` (or `brew install just`
+on macOS); the recipes require the same toolchain as the README quick start
+(cargo ≥ 1.91 + zig), and nextest only where noted:
+
+```bash
+just preflight            # verify cargo + zig (+ optional nextest) are present
+just build                # cargo build --workspace (release by default)
+just check                # cargo check --workspace --all-targets (fastest CI signal)
+
+just test                 # full suite via nextest (alias of just test-all)
+just test-fast            # unit tests via nextest
+just test-integration     # integration tests (the #[ignore] suite) via nextest
+just test-libtest         # unit tests via libtest (no nextest required)
+just test-crate choreo-proto   # a single crate via nextest
+
+just fmt                  # cargo fmt --all
+just clippy               # cargo clippy --workspace --all-targets
+just pre-commit           # AGENTS.md gate: fmt-check + clippy + test-all
+just ci                   # CI gate: fmt-check + clippy-strict + test-all
+
+just daemon -v            # run the daemon with debug logging
+just tui / gui / im / acp # run the other clients (im takes e.g. `just im telegram`)
+```
+
+`just --set profile debug build` switches the build profile (default `release`);
+`CARGO_FLAGS` (env) appends flags to every cargo invocation. The nextest-backed
+recipes (`test`, `test-fast`, `test-integration`, `test-all`, `test-crate`,
+`shard`, `retry`) fail with an install hint until `cargo-nextest` is on `PATH`.
+
 ## Troubleshooting
 
 - `choreo-tui` writes its diagnostics to `/tmp/choreo-tui.log` — check there
