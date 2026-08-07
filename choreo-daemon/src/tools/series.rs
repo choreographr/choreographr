@@ -1,12 +1,13 @@
 use super::{Tool, ToolExecError, ToolOutputFormat, ToolRegistry, context::ToolContext};
 use choreo_ai_protocols::ChatToolCall;
 use choreo_keystore::ServiceCredential;
+use crossbeam_channel;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Weak, mpsc};
+use std::sync::Weak;
 use std::thread;
 
 pub(crate) struct RunSeries {
@@ -105,7 +106,7 @@ impl Tool for RunSeries {
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
+        output_tx: crossbeam_channel::Sender<Vec<u8>>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
         execute_series(
@@ -183,7 +184,7 @@ fn execute_series(
     x_credentials: Option<&ServiceCredential>,
     working_dir: Option<&Path>,
     ctx: Option<&ToolContext>,
-    output_tx: Option<mpsc::Sender<Vec<u8>>>,
+    output_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
 ) -> Result<String, ToolExecError> {
     let registry = registry
         .upgrade()
@@ -217,7 +218,7 @@ fn execute_series(
         // Pipe sub-tool streaming output through the relay thread to the
         // parent output channel so subscribers see output in real-time.
         let output = if let Some(parent_tx) = output_tx.as_ref() {
-            let (sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>();
+            let (sub_tx, sub_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
             let relay_handle = thread::spawn({
                 let parent_tx = parent_tx.clone();
                 move || {
@@ -584,7 +585,7 @@ mod tests {
             }],
         };
 
-        let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+        let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         // Spawn a thread to drain the output channel (avoiding buffer deadlock).
         let _drainer = thread::spawn(move || {
             for _chunk in output_rx {

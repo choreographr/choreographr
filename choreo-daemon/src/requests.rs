@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -79,39 +78,50 @@ fn emit_image(
 /// Spawn a forwarding thread that relays streaming output chunks to session
 /// subscribers in real time.  Exits when the output channel is disconnected
 /// (tool finished) or a kill signal is received (caller stopped waiting).
+///
+/// Fully event-driven: `select_biased!` blocks until either an output chunk
+/// or a kill signal arrives, so a kill is observed the instant it is sent
+/// instead of at the next poll boundary.  The output arm is listed first so
+/// chunks already queued when the kill lands are still drained before the
+/// thread stops (output priority, matching the old recv_timeout semantics).
+///
+/// Returns the spawned `JoinHandle` so tests can deterministically observe
+/// thread exit (no polling); production callers discard it.
 fn spawn_forwarding_thread(
     cmd_tx: mpsc::Sender<SessionCommand>,
     session_id: u64,
     request_id: u32,
     call_id: String,
-    output_rx: mpsc::Receiver<Vec<u8>>,
-    kill_rx: mpsc::Receiver<()>,
-) {
-    let check_interval = Duration::from_millis(200);
+    output_rx: crossbeam_channel::Receiver<Vec<u8>>,
+    kill_rx: crossbeam_channel::Receiver<()>,
+) -> std::thread::JoinHandle<()> {
     thread::spawn(move || {
         loop {
-            match output_rx.recv_timeout(check_interval) {
-                Ok(data) => {
-                    if cmd_tx
-                        .send(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk {
-                            session_id,
-                            request_id,
-                            call_id: call_id.clone(),
-                            data,
-                        }))
-                        .is_err()
-                    {
-                        break;
+            crossbeam_channel::select_biased! {
+                recv(output_rx) -> msg => match msg {
+                    Ok(data) => {
+                        if cmd_tx
+                            .send(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk {
+                                session_id,
+                                request_id,
+                                call_id: call_id.clone(),
+                                data,
+                            }))
+                            .is_err()
+                        {
+                            // Subscribers are gone — nothing left to stream to.
+                            break;
+                        }
                     }
-                }
-                Err(RecvTimeoutError::Timeout) => match kill_rx.try_recv() {
-                    Ok(()) | Err(TryRecvError::Disconnected) => break,
-                    Err(TryRecvError::Empty) => {}
+                    // Output sender dropped → the tool finished; stop forwarding.
+                    Err(_) => break,
                 },
-                Err(RecvTimeoutError::Disconnected) => break,
+                // A kill message OR the kill sender being dropped both mean
+                // "stop" — identical to the old Ok(()) | Disconnected => break.
+                recv(kill_rx) -> _ => break,
             }
         }
-    });
+    })
 }
 
 /// Check whether a cancellation signal has been received.
@@ -265,10 +275,10 @@ fn spawn_single_tool(args: SpawnToolArgs) {
     let (exec_tx, exec_rx) = crossbeam_channel::unbounded::<Result<ToolOutput, ToolError>>();
 
     // Channel for streaming output forwarded to subscribers in real time.
-    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+    let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
     // Kill signal for the forwarding thread — sent when we're done waiting.
-    let (kill_tx, kill_rx) = mpsc::channel::<()>();
+    let (kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
 
     // Image channel — the tool may emit one image during execution.
     let (image_tx, image_rx) = mpsc::channel::<PreparedImage>();
@@ -278,7 +288,7 @@ fn spawn_single_tool(args: SpawnToolArgs) {
     // Forwards streaming output chunks to subscribers as they arrive.
     // Exits when the output channel is disconnected (tool finished) or
     // a kill signal is received (we stopped waiting).
-    spawn_forwarding_thread(
+    let _forwarder = spawn_forwarding_thread(
         cmd_tx,
         session_id,
         request_id,
@@ -1568,13 +1578,13 @@ fn execute_tool_with_timeout(
     let exec_start = std::time::Instant::now();
 
     let (result_tx, result_rx) = crossbeam_channel::unbounded();
-    let (output_tx, output_rx) = std::sync::mpsc::channel();
-    let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
+    let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+    let (kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
 
     // Forward streaming output to subscribers as it arrives, exiting when
     // the output channel is disconnected (tool finished) or a kill signal
     // arrives (main loop exited).
-    spawn_forwarding_thread(
+    let _forwarder = spawn_forwarding_thread(
         ctx.cmd_tx.clone(),
         session_id,
         request_id,
@@ -1585,7 +1595,7 @@ fn execute_tool_with_timeout(
 
     // Drop guard: when the main loop exits (for any reason), signal the
     // forwarder to stop so it doesn't orphan waiting on output_rx.
-    struct KillGuard(mpsc::Sender<()>);
+    struct KillGuard(crossbeam_channel::Sender<()>);
     impl Drop for KillGuard {
         fn drop(&mut self) {
             let _ = self.0.send(());
@@ -2336,7 +2346,7 @@ mod tests {
             _args: Self::Args,
             _xc: Option<&ServiceCredential>,
             _working_dir: Option<&Path>,
-            _output_tx: mpsc::Sender<Vec<u8>>,
+            _output_tx: crossbeam_channel::Sender<Vec<u8>>,
             _ctx: Option<&ToolContext>,
         ) -> Result<Self::Return, Self::Error> {
             if let Some(rx) = self.proceed.lock().unwrap().take() {
@@ -2495,7 +2505,7 @@ mod tests {
             _args: Self::Args,
             _xc: Option<&ServiceCredential>,
             _working_dir: Option<&Path>,
-            output_tx: mpsc::Sender<Vec<u8>>,
+            output_tx: crossbeam_channel::Sender<Vec<u8>>,
             _ctx: Option<&ToolContext>,
         ) -> Result<Self::Return, Self::Error> {
             let _ = output_tx.send(b"streamed payload".to_vec());
@@ -2538,6 +2548,84 @@ mod tests {
             Ok(_other) => panic!("expected ToolResultChunk, got unexpected SessionCommand"),
             Err(e) => panic!("channel disconnected while waiting for streaming output: {e}"),
         }
+    }
+
+    // -- forwarding-thread tests -----------------------------------------
+    //
+    // These exercise `spawn_forwarding_thread` directly and deterministically:
+    // the returned `JoinHandle` lets the test observe thread exit without any
+    // time-based waits (AGENTS.md forbids sleeps in unit tests).
+
+    #[test]
+    fn forwarding_thread_drains_queued_output_before_kill() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+        let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
+
+        let handle = spawn_forwarding_thread(cmd_tx, 1, 1, "call_1".into(), output_rx, kill_rx);
+
+        // Queue a chunk and then a kill back-to-back. The test sends the chunk
+        // BEFORE the kill, so the forwarder can never observe the kill arm as
+        // ready while the output arm is still pending — the biased select
+        // (output first) must therefore forward the chunk before honoring the
+        // kill, in any interleaving.
+        output_tx
+            .send(b"queued chunk".to_vec())
+            .expect("send chunk");
+        kill_tx.send(()).expect("send kill");
+
+        match cmd_rx.recv() {
+            Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
+                assert_eq!(data, b"queued chunk");
+            }
+            Ok(_other) => panic!("expected ToolResultChunk, got unexpected SessionCommand"),
+            Err(e) => panic!("channel disconnected while waiting for chunk: {e}"),
+        }
+        // Only the kill can terminate the forwarder now (output_tx still alive),
+        // so a successful join proves the kill was honored after the drain.
+        handle.join().expect("forwarder should exit after kill");
+    }
+
+    #[test]
+    fn forwarding_thread_exits_when_output_disconnects() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+        let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (_kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
+
+        let handle = spawn_forwarding_thread(cmd_tx, 1, 1, "call_2".into(), output_rx, kill_rx);
+
+        output_tx.send(b"last chunk".to_vec()).expect("send chunk");
+        // Tool finished: dropping the output sender makes the forwarder's next
+        // `recv(output_rx)` return Err (disconnect) → drain → exit.
+        drop(output_tx);
+
+        match cmd_rx.recv() {
+            Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
+                assert_eq!(data, b"last chunk");
+            }
+            Ok(_other) => panic!("expected ToolResultChunk, got unexpected SessionCommand"),
+            Err(e) => panic!("channel disconnected while waiting for chunk: {e}"),
+        }
+        handle
+            .join()
+            .expect("forwarder should exit on output disconnect");
+    }
+
+    #[test]
+    fn forwarding_thread_exits_when_kill_sender_dropped() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+        let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
+
+        let handle = spawn_forwarding_thread(cmd_tx, 1, 1, "call_3".into(), output_rx, kill_rx);
+
+        // Dropping the kill sender disconnects kill_rx; with no output traffic
+        // the select returns on the kill arm immediately and the thread exits.
+        drop(kill_tx);
+        handle
+            .join()
+            .expect("forwarder should exit when kill sender dropped");
+        drop(output_tx);
     }
 
     // -- determine_tool_timeout tests ----------------------------------

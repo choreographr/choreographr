@@ -10,6 +10,7 @@ use ckb_vm::{
     FlatMemory, ISA_B, ISA_IMC, ISA_MOP, SupportMachine, Syscalls, TraceMachine, memory::Memory,
     registers,
 };
+use crossbeam_channel;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -710,7 +711,7 @@ struct ChoreographrSyscall {
     x_credentials: Option<ServiceCredential>,
     working_dir: Option<PathBuf>,
     output_tx: mpsc::Sender<Vec<u8>>,
-    write_tx: Option<mpsc::Sender<Vec<u8>>>,
+    write_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
     ctx: Option<crate::tools::context::ToolContext>,
 }
 
@@ -1026,7 +1027,7 @@ fn run_riscv_impl(
     input: &RunRiscVInput,
     x_credentials: Option<&ServiceCredential>,
     working_dir: Option<&Path>,
-    write_tx: Option<mpsc::Sender<Vec<u8>>>,
+    write_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
     registry: Arc<ToolRegistry>,
     ctx: Option<crate::tools::context::ToolContext>,
 ) -> ToolOutput {
@@ -1337,7 +1338,7 @@ impl Tool for RunRiscV {
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
+        output_tx: crossbeam_channel::Sender<Vec<u8>>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
         let registry = self

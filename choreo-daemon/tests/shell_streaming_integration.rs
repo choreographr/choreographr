@@ -1,7 +1,6 @@
 use choreographr::tools::shell_util::{run_shell_streaming, spawn_with_streaming};
 use choreographr::{ShArgs, execute_sh_tool};
 use std::path::Path;
-use std::sync::mpsc;
 
 /// Helper: set up piped stdout/stderr on a Command for use with
 /// spawn_with_streaming / run_shell_streaming.
@@ -19,7 +18,7 @@ fn cmd(program: &str, arg: &str, dir: &Path) -> std::process::Command {
 fn spawn_with_streaming_produces_stdout() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "echo hello world", dir);
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
     let (output, was_killed) = spawn_with_streaming(&mut c, 5000, tx).unwrap();
     drop(rx);
@@ -35,7 +34,7 @@ fn spawn_with_streaming_produces_stdout() {
 fn spawn_with_streaming_stderr_is_accumulated() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "echo errmsg >&2", dir);
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
     let (output, was_killed) = spawn_with_streaming(&mut c, 5000, tx).unwrap();
     drop(rx);
@@ -50,7 +49,7 @@ fn spawn_with_streaming_stderr_is_accumulated() {
 fn spawn_with_streaming_timeout_kills() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "sleep 10", dir);
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
     let (output, was_killed) = spawn_with_streaming(&mut c, 500, tx).unwrap();
     drop(rx);
@@ -63,7 +62,7 @@ fn spawn_with_streaming_timeout_kills() {
 fn run_shell_streaming_combines_output() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "echo hello", dir);
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
     let result = run_shell_streaming(&mut c, "echo hello", 5000, tx).unwrap();
     drop(rx);
@@ -77,7 +76,7 @@ fn run_shell_streaming_combines_output() {
 fn run_shell_streaming_streams_lines_in_realtime() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "echo line1 && echo line2", dir);
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
     let handle = std::thread::spawn(move || {
         // Collect streamed chunks until the sender is dropped

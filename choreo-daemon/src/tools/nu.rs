@@ -4,10 +4,10 @@ use super::{
     shell_util::{format_shell_output, resolve_workdir, run_shell_streaming, spawn_with_watchdog},
 };
 use choreo_keystore::ServiceCredential;
+use crossbeam_channel;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
-use std::sync::mpsc;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct NuArgs {
@@ -68,7 +68,7 @@ impl Tool for NuShell {
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
+        output_tx: crossbeam_channel::Sender<Vec<u8>>,
         _ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
         let command = &args.command;

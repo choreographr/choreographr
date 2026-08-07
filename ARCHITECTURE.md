@@ -1250,7 +1250,10 @@ Implementation details:
 For concurrent tools, each call gets:
 1. A dedicated **execution thread** that runs the tool via `ToolDyn::execute_streaming_json()`.
 2. A **forwarding thread** that relays streaming output chunks to session subscribers in
-   real time through the session command channel.
+   real time through the session command channel. It is fully event-driven — a
+   `crossbeam_channel::select_biased!` on the streaming-output receiver (first arm) and
+   the per-call kill receiver — so a kill signal is honored the instant it is sent and
+   chunks already queued are still drained before the thread exits.
 3. A **wait-loop thread** that enforces the per-tool timeout (300s for shell tools, 60s for
    others, no limit for sub-sessions).
 4. A dedicated **image channel** — the tool emits any produced image through this channel,
@@ -1281,7 +1284,12 @@ Cancellation during tool execution is fully event-driven: the concurrent collect
 `execute_tool_with_timeout` (serial phase) block on `crossbeam_channel::select!` between
 their result channels, the request's cancel channel, and (where a timeout applies) an exact
 `after(remaining)` timer — there are no `recv_timeout` poll loops, and timeouts fire
-precisely. The per-request cancel channel is a crossbeam channel created in `sessions.rs`
+precisely. The per-tool forwarding threads are event-driven too: they `select_biased!` on
+the streaming-output channel and a dedicated kill channel (output arm first, so queued
+chunks drain before a kill is honored), which removed the last poll loop from the tool
+execution path — the streaming channel itself is a crossbeam channel, so the forwarder
+blocks until a chunk or kill actually arrives rather than waking on a 200 ms interval. The
+per-request cancel channel is a crossbeam channel created in `sessions.rs`
 (`ActiveRequest.cancel_tx`) and threaded through `run_agent_loop` → `ChatTurnRequest` →
 retry/stream, so every wait (provider SSE, retry backoff, serial tool, concurrent
 collector) can `select!` on it directly. A cancel observed mid-batch stops the request

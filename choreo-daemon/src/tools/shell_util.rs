@@ -1,4 +1,5 @@
 use super::{ToolExecError, truncate_tool_output};
+use crossbeam_channel;
 use std::{
     io::Read,
     os::fd::{AsFd, AsRawFd, OwnedFd},
@@ -467,7 +468,7 @@ pub(crate) fn spawn_with_watchdog(
 pub fn spawn_with_streaming(
     cmd: &mut Command,
     timeout_ms: u64,
-    output_tx: mpsc::Sender<Vec<u8>>,
+    output_tx: crossbeam_channel::Sender<Vec<u8>>,
 ) -> Result<(Output, bool), ToolExecError> {
     setup_child(cmd);
     let mut child = cmd.spawn()?;
@@ -561,7 +562,7 @@ pub fn run_shell_streaming(
     cmd: &mut Command,
     display_cmd: &str,
     timeout_ms: u64,
-    output_tx: mpsc::Sender<Vec<u8>>,
+    output_tx: crossbeam_channel::Sender<Vec<u8>>,
 ) -> Result<String, ToolExecError> {
     let (output, was_killed) = spawn_with_streaming(cmd, timeout_ms, output_tx)?;
     Ok(format_shell_output(

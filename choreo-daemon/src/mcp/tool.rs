@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use choreo_ai_protocols::openai::AllowedCaller;
 use choreo_keystore::ServiceCredential;
 use choreo_mcp::{CallToolResult, McpClient, McpContent};
+use crossbeam_channel;
 use serde_json::Value;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -170,7 +171,7 @@ impl ToolDyn for McpToolWrapper {
         format: ToolOutputFormat,
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
+        output_tx: crossbeam_channel::Sender<Vec<u8>>,
         _ctx: Option<&ToolContext>,
         _image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {

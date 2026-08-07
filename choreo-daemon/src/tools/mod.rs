@@ -2,6 +2,7 @@ use choreo_ai_protocols::ChatToolCall;
 pub(crate) use choreo_ai_protocols::openai::AllowedCaller;
 use choreo_ai_protocols::openai::ChatToolDefinition;
 use choreo_keystore::ServiceCredential;
+use crossbeam_channel;
 use humfmt::{BytesOptions, bytes_with};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -319,7 +320,7 @@ pub trait Tool: Send + Sync {
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
-        _output_tx: mpsc::Sender<Vec<u8>>,
+        _output_tx: crossbeam_channel::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
         // Non-streaming tools deliver their result via TurnAppended —
@@ -391,7 +392,7 @@ pub trait ToolDyn: Send + Sync {
         format: ToolOutputFormat,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
+        output_tx: crossbeam_channel::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError>;
@@ -507,7 +508,7 @@ impl<T: Tool + 'static> ToolDyn for T {
         format: ToolOutputFormat,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
+        output_tx: crossbeam_channel::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
@@ -710,7 +711,7 @@ impl ToolRegistry {
         &self,
         tool_call: &ChatToolCall,
         format: ToolOutputFormat,
-        output_tx: mpsc::Sender<Vec<u8>>,
+        output_tx: crossbeam_channel::Sender<Vec<u8>>,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
@@ -2179,7 +2180,7 @@ mod tests {
     fn describe_invocation_in_tool_output_is_populated_on_success() {
         let tool = DefaultTool;
         let wrapper: Box<dyn ToolDyn> = Box::new(tool);
-        let (output_tx, _output_rx) = mpsc::channel();
+        let (output_tx, _output_rx) = crossbeam_channel::unbounded();
         let result = wrapper
             .execute_streaming_json(
                 "null",
@@ -2216,7 +2217,7 @@ mod tests {
     fn non_streaming_tool_sends_no_chunk() {
         let tool = DefaultTool;
         let wrapper: Box<dyn ToolDyn> = Box::new(tool);
-        let (output_tx, output_rx) = mpsc::channel();
+        let (output_tx, output_rx) = crossbeam_channel::unbounded();
         let result = wrapper
             .execute_streaming_json(
                 "null",
@@ -2235,7 +2236,8 @@ mod tests {
         );
         assert!(!result.is_error, "tool should succeed: {}", result.content);
         match output_rx.try_recv() {
-            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
+            Err(crossbeam_channel::TryRecvError::Empty)
+            | Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 // expected — no chunk sent (channel may already be closed)
             }
             Ok(chunk) => {

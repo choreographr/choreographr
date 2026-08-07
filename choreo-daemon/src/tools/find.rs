@@ -3,11 +3,11 @@ use super::{
     symlink_target_label, truncation_marker,
 };
 use choreo_keystore::ServiceCredential;
+use crossbeam_channel;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::path::Path;
-use std::sync::mpsc;
 use tracing::debug;
 use zlob::walk::{WalkBuilder, WalkEntryKind, WalkFlags, WalkMetadata, WalkState};
 use zlob::{ZlobFlags, ZlobPattern};
@@ -93,7 +93,7 @@ fn run_find_walk(
     pattern: &str,
     glob: bool,
     max_results: u32,
-    output_tx: Option<&mpsc::Sender<Vec<u8>>>,
+    output_tx: Option<&crossbeam_channel::Sender<Vec<u8>>>,
 ) -> Result<String, ToolExecError> {
     let use_glob = use_glob_pattern(pattern, glob);
     // Normalize before deciding the matching mode: `./src/*.rs` must become
@@ -319,7 +319,7 @@ impl Tool for Find {
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
+        output_tx: crossbeam_channel::Sender<Vec<u8>>,
         _ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
         let path = args.path.as_deref().unwrap_or(".");
