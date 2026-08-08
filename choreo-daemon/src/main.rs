@@ -103,6 +103,11 @@ fn main() -> anyhow::Result<()> {
 
     let db = Arc::new(choreographr::db::open_db().context("failed to open database")?);
 
+    // Bring the database up to the current schema version before any table
+    // access: stamps a fresh database (0 → 1), and refuses a newer-version
+    // database before any code can read or write it.
+    choreographr::db::run_migrations(&db).context("failed to migrate database")?;
+
     // Purge any sessions that were deleted while their still-shutting-down
     // thread was alive and re-created the record before the daemon crashed:
     // without this, a deleted session could reappear after a restart.  Runs

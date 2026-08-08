@@ -13,7 +13,9 @@ use tracing::{debug, error, info, warn};
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
 const SESSION_TURNS: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("session_turns");
 const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credentials");
-#[cfg(test)]
+/// Production `meta` table: string keys, u64 values. Holds the persisted
+/// schema version under [`SCHEMA_VERSION_KEY`]; the test-only
+/// `next_session_id` counter shares the same table (test key, shared table).
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const SESSION_KV: TableDefinition<(u64, String), Vec<u8>> = TableDefinition::new("session_kv");
 /// Tombstones for deleted sessions whose still-shutting-down thread may
@@ -89,27 +91,194 @@ pub fn db_path() -> io::Result<PathBuf> {
     Ok(data_dir.join("choreographr").join("state.redb"))
 }
 
+// ── Schema versioning & migrations ─────────────────────────────────────────────
+
+/// Persisted schema version. Bump on any *breaking* change to persisted
+/// records: codec swap, key-type change, table split/merge, semantic change.
+/// Additive fields (with `#[serde(default)]`) do NOT bump it — named
+/// MessagePack tolerates those without a migration.
+pub const SCHEMA_VERSION: u64 = 1;
+
+/// Key under which the current schema version is stored in [`META`].
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+/// A single schema migration: upgrades version N → N+1.
+///
+/// Each migration must run in exactly one redb write transaction (so a crash
+/// mid-migration leaves the pre-migration state intact), must decode
+/// historical record shapes with frozen local copies of the old structs
+/// (current shapes drift over time), and must leave the database in the state
+/// the new [`SCHEMA_VERSION`] describes.
+type Migration = fn(&redb::Database) -> io::Result<()>;
+
+/// `MIGRATIONS[i]` upgrades schema version i → i+1.
+///
+/// Empty at release: version 1 is the *initial* stamped version, reached by
+/// initialization, not by a migration. There is no v0 data worth migrating
+/// pre-release — leftover postcard-era blobs are skipped with a warning by
+/// `read_all_sessions`/`read_turns` on first read. The first real entry
+/// lands with the first future breaking schema change.
+const MIGRATIONS: &[Migration] = &[];
+
+/// Read the persisted schema version, or `0` for an unversioned database
+/// (no `meta` table yet, or the `schema_version` key absent).
+fn current_schema_version(db: &redb::Database) -> io::Result<u64> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+    let table = match read_txn.open_table(META) {
+        Ok(table) => table,
+        // No meta table ⇒ either a freshly created DB (never stamped) or a
+        // pre-release leftover. Both report 0 (unversioned).
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(db_err(format!("redb open meta: {e}"))),
+    };
+    Ok(table
+        .get(SCHEMA_VERSION_KEY)
+        .map_err(|e| db_err(format!("redb get meta: {e}")))?
+        .map(|guard| guard.value())
+        .unwrap_or(0))
+}
+
+/// Persist `version` under `SCHEMA_VERSION_KEY` in [`META`]. Opening the
+/// table inside a write transaction creates it on first use, so this also
+/// initializes the `meta` table on a fresh database.
+fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Result<()> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+    {
+        let mut table = write_txn
+            .open_table(META)
+            .map_err(|e| db_err(format!("redb open meta: {e}")))?;
+        table
+            .insert(SCHEMA_VERSION_KEY, version)
+            .map_err(|e| db_err(format!("redb set schema_version: {e}")))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| db_err(format!("redb commit schema_version: {e}")))?;
+    info!(version, "stamped database schema version");
+    Ok(())
+}
+
+/// Snapshot the database file before a migration rewrites it:
+/// `state.redb` → `state.redb.bak-v{SCHEMA_VERSION}`.
+///
+/// Dormant while [`MIGRATIONS`] is empty — the 0 → 1 transition is pure
+/// stamping and rewrites nothing, so no snapshot is taken (see
+/// [`run_migrations`]). Must be correct when the first real migration lands:
+/// one backup per schema version, taken before any write, so a failed
+/// migration can always be rolled back from disk.
+fn backup_db_file() -> io::Result<()> {
+    let path = db_path()?;
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "state.redb".to_string());
+    let backup_path = path.with_file_name(format!("{file_name}.bak-v{SCHEMA_VERSION}"));
+    fs::copy(&path, &backup_path)?;
+    info!(
+        from = %path.display(),
+        to = %backup_path.display(),
+        "backed up database before applying migrations"
+    );
+    Ok(())
+}
+
+/// Bring the database up to [`SCHEMA_VERSION`]. Idempotent; safe to call on
+/// every startup, right after [`open_db`].
+///
+/// - A database at a *newer* version than this binary knows is rejected
+///   outright (downgrade protection — a future binary's writes would be
+///   misread by this one).
+/// - An unversioned database (version 0) is accepted only while
+///   [`SCHEMA_VERSION`] == 1, i.e. as the initial state. Once the chain
+///   grows past 1, a no-meta database means pre-release leftovers and is
+///   refused with recreate/restore guidance.
+/// - The 0 → 1 transition is pure initialization: stamp, no backup, no
+///   migration (see [`MIGRATIONS`]).
+pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
+    let current = current_schema_version(db)?;
+    if current > SCHEMA_VERSION {
+        error!(
+            current,
+            supported = SCHEMA_VERSION,
+            "refusing to open database: schema version newer than this binary supports"
+        );
+        return Err(db_err(format!(
+            "database schema version {current} is newer than this binary supports ({SCHEMA_VERSION}); \
+             upgrade choreographr before continuing"
+        )));
+    }
+    // An unversioned DB is only ever acceptable as the *initial* state (v1).
+    // Once the chain grows, a no-meta DB means pre-release leftovers.
+    if current == 0 && SCHEMA_VERSION > 1 {
+        let msg =
+            "database has no schema version (pre-release data); recreate it or restore a backup";
+        error!("{msg}");
+        return Err(db_err(msg.to_string()));
+    }
+    if current == SCHEMA_VERSION {
+        return Ok(()); // idempotent fast path
+    }
+    // current == 0 here: a fresh DB or a pre-release dev DB. Both are stamped
+    // the same way — the leftover postcard-era blobs are deliberately not
+    // migrated (no v0 → v1 migration by design) and will be skipped with a
+    // warning by read_all_sessions/read_turns on first read.
+    warn!(
+        "database was unversioned; stamping schema version {SCHEMA_VERSION} \
+         (pre-release blobs, if any, are not migrated)"
+    );
+    // Snapshot only before an actual migration writes. With an empty chain
+    // (current release) this never fires — the 0 → 1 transition is pure
+    // initialization (stamping), and nothing was rewritten.
+    if !MIGRATIONS.is_empty() {
+        backup_db_file()?; // state.redb → state.redb.bak-v{SCHEMA_VERSION}
+    }
+    for (idx, migration) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+        info!(from = idx, to = idx + 1, "applying database migration");
+        migration(db)?;
+    }
+    // Final stamping: initializes a fresh/legacy DB (0 → 1) and is a no-op
+    // when the last migration already stamped its target.
+    stamp_schema_version(db, SCHEMA_VERSION)
+}
+
 pub fn open_db() -> io::Result<redb::Database> {
     let path = db_path()?;
     info!(path = %path.display(), "opening database");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Try open first (fails if file doesn't exist), then fall back to create
-    let result = redb::Database::open(&path);
-    match result {
-        Ok(db) => return Ok(db),
+    match redb::Database::open(&path) {
+        Ok(db) => Ok(db),
+        // File does not exist: fresh install. Create the DB, then stamp the
+        // schema version via run_migrations so the database is versioned from
+        // the moment it exists.
         Err(redb::DatabaseError::Storage(redb::StorageError::Io(io_err)))
-            if io_err.kind() == std::io::ErrorKind::NotFound =>
+            if io_err.kind() == io::ErrorKind::NotFound =>
         {
             info!("database file not found, creating new database");
+            let db = redb::Database::create(&path)
+                .map_err(|e| io::Error::other(format!("failed to create database: {e}")))?;
+            run_migrations(&db)?;
+            Ok(db)
         }
-        Err(e) => {
-            warn!("failed to open existing database, trying to recreate: {e}");
-        }
+        // redb file-format bump: the file is a valid redb database but in a
+        // newer file format than this binary can read. Hard error with
+        // recovery guidance — recreating would destroy the data.
+        Err(redb::DatabaseError::UpgradeRequired(actual)) => Err(io::Error::other(format!(
+            "database file format version {actual} is not supported by this binary; \
+             restore a backup (state.redb.bak-v*) or use the documented dump/restore path"
+        ))),
+        // Any other open failure (corruption, permissions, lock contention…)
+        // is also a hard error: the old "trying to recreate" catch-all could
+        // silently clobber a potentially-recoverable file.
+        Err(e) => Err(io::Error::other(format!(
+            "failed to open database (refusing to recreate a potentially corrupt file): {e}"
+        ))),
     }
-    redb::Database::create(path)
-        .map_err(|e| io::Error::other(format!("failed to open database: {e}")))
 }
 
 pub fn write_session(
@@ -1072,5 +1241,122 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
         assert_eq!(purge_tombstoned_sessions(&db).unwrap(), 0);
+    }
+
+    #[test]
+    fn run_migrations_stamps_fresh_database_v1() {
+        // A freshly created DB has no meta table → unversioned (0). The
+        // runner's 0 → 1 transition is pure initialization: stamp v1.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        assert_eq!(
+            current_schema_version(&db).unwrap(),
+            0,
+            "a freshly created database must be unversioned"
+        );
+        run_migrations(&db).unwrap();
+        assert_eq!(
+            current_schema_version(&db).unwrap(),
+            SCHEMA_VERSION,
+            "0 → 1 initialization must stamp the current schema version"
+        );
+    }
+
+    #[test]
+    fn run_migrations_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        run_migrations(&db).unwrap();
+        // Second run hits the fast path and must not error or rewrite.
+        run_migrations(&db).unwrap();
+        assert_eq!(current_schema_version(&db).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn run_migrations_rejects_newer_schema_version() {
+        // Simulate a database written by a future binary by stamping a
+        // version above SCHEMA_VERSION directly into meta.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(META).unwrap();
+                table.insert(SCHEMA_VERSION_KEY, 5u64).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        let err = run_migrations(&db).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer") && msg.contains('5'),
+            "error must name the newer version: {msg}"
+        );
+    }
+
+    #[test]
+    fn legacy_unversioned_db_with_postcard_blobs_stamps_v1_and_skips() {
+        // Simulate a v0-era database: a session record written with the old
+        // postcard codec before schema versioning existed. postcard is still
+        // a daemon dependency (VM + credential channels), so encode an
+        // authentic legacy blob with it. Intentionally NOT write_session —
+        // that writes MessagePack and would defeat the point.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let legacy_record = SessionRecord {
+            title: Some("legacy".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            turn_count: 0,
+            created_at: 1000,
+            last_modified: 1000,
+            active_tool_groups: vec![],
+            context_config: ContextConfig::default(),
+            account_name: None,
+            last_response_id: None,
+            last_response_id_producer: None,
+        };
+        let legacy_blob = postcard::to_allocvec(&legacy_record).unwrap();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(SESSIONS).unwrap();
+                table.insert(42u64, legacy_blob.as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        // No meta table → unversioned, exactly like a pre-release dev DB.
+        assert_eq!(current_schema_version(&db).unwrap(), 0);
+
+        // The runner stamps v1; there is no v0 → v1 migration by design, so
+        // the postcard blob stays in place.
+        run_migrations(&db).unwrap();
+        assert_eq!(current_schema_version(&db).unwrap(), SCHEMA_VERSION);
+
+        // The legacy blob is undecodable as MessagePack: read_all_sessions
+        // must skip it (with a warning) rather than fail the daemon.
+        let all = read_all_sessions(&db).unwrap();
+        assert!(
+            all.is_empty(),
+            "legacy postcard blob must be skipped, not decoded or fatal"
+        );
+    }
+
+    #[test]
+    fn run_migrations_writes_no_backup_while_chain_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+        let db = redb::Database::create(&db_path).unwrap();
+        run_migrations(&db).unwrap();
+        // With MIGRATIONS empty, the 0 → 1 transition is pure stamping and
+        // must not snapshot the file — the backup path stays dormant until
+        // the first real migration lands.
+        assert!(
+            !db_path.with_file_name("test.redb.bak-v1").exists(),
+            "no backup artifact may be produced while the migration chain is empty"
+        );
     }
 }
