@@ -1493,10 +1493,17 @@ and calling it repeatedly is safe.
   structs, and each migration ships with a fixture-based unit test (build a DB
   as the old version would have written it, run the runner, assert contents +
   version stamp + idempotency + backup artifact).
-- **Migration chain.** `MIGRATIONS` is empty at release: `MIGRATIONS[i]` would
-  upgrade schema version i → i+1, and version 1 is the *initial* stamped
-  version, reached by initialization rather than by a migration. The first real
-  entry lands with the first future breaking schema change.
+- **Migration chain.** `MIGRATIONS` is empty at release: version 1 is the
+  *initial* stamped version, reached by initialization rather than by a
+  migration. Each entry carries its source version explicitly (`from`, upgrading
+  `from → from + 1`), so an entry's position in the array is irrelevant — the
+  first real migration is `from == 1` (the 0 → 1 transition is initialization,
+  never a migration). Before applying anything, the runner validates that the
+  entries' `from` values form the exact contiguous sequence `1..SCHEMA_VERSION`;
+  a gap or misplaced entry is a hard error, never a silent stamp over data that
+  was not migrated. Every migration must be idempotent under re-run (crash
+  recovery re-applies from the last persisted version), transactional (one redb
+  write transaction), and shipped with a fixture-based unit test.
 - **Pre-release legacy data.** A database with no `meta` table reports version
   0. At release that is either a freshly created DB (stamped to 1; nothing else
   happens) or a pre-release dev DB whose postcard-era blobs are *not* migrated —

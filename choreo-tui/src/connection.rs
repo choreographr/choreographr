@@ -1484,13 +1484,19 @@ fn handle_session_list_key(
                 && let Some(session) = app.session_mgr.sessions.get(sel)
             {
                 let session_id = session.session_id;
-                app.set_page(Page::Chat);
-                let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
-                app.reset_for_session_switch(session_id);
-                app.attached_session_id = Some(session_id);
+                // Send before flipping pages (same ordering as the accounts
+                // page's Enter): if a send fails (broken pipe), the error
+                // propagates and the user stays on the session list instead
+                // of being stranded on Chat with an un-attached session.
+                client_tx
+                    .send(ClientMessage::UnsubscribeSessionsSummary)
+                    .map_err(broken_pipe)?;
                 client_tx
                     .send(ClientMessage::AttachSession { session_id })
                     .map_err(broken_pipe)?;
+                app.set_page(Page::Chat);
+                app.reset_for_session_switch(session_id);
+                app.attached_session_id = Some(session_id);
             }
         }
         KeyCode::Char('i') => app.session_mgr.enter_detail(),
@@ -1545,13 +1551,19 @@ fn handle_session_detail_key(
         KeyCode::Enter => {
             if let Some(ref detail) = app.session_mgr.detail_data {
                 let session_id = detail.session_id;
-                app.set_page(Page::Chat);
-                let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
-                app.reset_for_session_switch(session_id);
-                app.attached_session_id = Some(session_id);
+                // Send before flipping pages, mirroring the session-list and
+                // accounts-page Enter handlers: a failed send leaves the user
+                // on the detail view, not stranded on Chat with an un-attached
+                // session.
+                client_tx
+                    .send(ClientMessage::UnsubscribeSessionsSummary)
+                    .map_err(broken_pipe)?;
                 client_tx
                     .send(ClientMessage::AttachSession { session_id })
                     .map_err(broken_pipe)?;
+                app.set_page(Page::Chat);
+                app.reset_for_session_switch(session_id);
+                app.attached_session_id = Some(session_id);
             }
         }
         _ => {}

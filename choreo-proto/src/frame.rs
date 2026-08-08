@@ -11,7 +11,11 @@ use std::io::Cursor;
 ///
 /// 1 = postcard era; 2 = MessagePack (named mode, rmp-serde >= 1.3).
 pub const PROTOCOL_VERSION: u8 = 2;
-/// Max serialised frame size (4 bytes length prefix + payload).
+/// Max serialised *payload* size, enforced identically on encode (before the
+/// 4-byte length prefix is added — [`encode_inner`]) and on decode
+/// (`read_payload`, which checks the length prefix before reading the body).
+/// A payload at the limit therefore produces a frame of
+/// `MAX_FRAME_SIZE + 4` bytes.
 ///
 /// Bumped from 1 MiB to 32 MiB to accommodate `SessionState` responses that
 /// carry full image binary data inside `DisplayedImage` records.  The old
@@ -45,7 +49,11 @@ pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
     let payload = encode_inner(message)?;
 
     let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    // `encode_inner` already bounds `payload.len()` to MAX_FRAME_SIZE (32 MiB),
+    // far below u32::MAX, but go through `try_from` so the length prefix can
+    // never silently truncate if the limit is ever raised past 4 GiB.
+    let len = u32::try_from(payload.len()).map_err(|_| ProtoError::FrameTooLarge)?;
+    frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(&payload);
     Ok(frame)
 }

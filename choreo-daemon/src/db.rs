@@ -102,22 +102,37 @@ pub const SCHEMA_VERSION: u64 = 1;
 /// Key under which the current schema version is stored in [`META`].
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
-/// A single schema migration: upgrades version N → N+1.
+/// A single schema migration: upgrades schema version `from` → `from + 1`.
 ///
-/// Each migration must run in exactly one redb write transaction (so a crash
-/// mid-migration leaves the pre-migration state intact), must decode
-/// historical record shapes with frozen local copies of the old structs
-/// (current shapes drift over time), and must leave the database in the state
-/// the new [`SCHEMA_VERSION`] describes.
-type Migration = fn(&redb::Database) -> io::Result<()>;
+/// The source version is carried *explicitly* — an entry's position in
+/// [`MIGRATIONS`] is irrelevant, so a future contributor cannot silently
+/// break the chain by placing the first migration at the wrong index (the
+/// 0 → 1 transition is initialization, not a migration, so no entry has
+/// `from == 0`; the first real migration is `from == 1`).
+///
+/// Each migration must:
+/// - run in exactly one redb write transaction (a crash mid-migration leaves
+///   the pre-migration state intact);
+/// - decode historical record shapes with frozen local copies of the old
+///   structs (current shapes drift over time);
+/// - leave the database in the state `from + 1` describes; and
+/// - be **idempotent under re-run**: the runner's crash recovery re-runs
+///   migrations from the last persisted version (a migration that succeeded
+///   but whose stamp was never committed would otherwise be re-applied), so
+///   applying the same migration twice must produce the identical final state.
+struct Migration {
+    from: u64,
+    run: fn(&redb::Database) -> io::Result<()>,
+}
 
-/// `MIGRATIONS[i]` upgrades schema version i → i+1.
-///
-/// Empty at release: version 1 is the *initial* stamped version, reached by
-/// initialization, not by a migration. There is no v0 data worth migrating
-/// pre-release — leftover postcard-era blobs are skipped with a warning by
-/// `read_all_sessions`/`read_turns` on first read. The first real entry
-/// lands with the first future breaking schema change.
+/// Ordered migration chain, empty at release: version 1 is the *initial*
+/// stamped version, reached by initialization, not by a migration. There is
+/// no v0 data worth migrating pre-release — leftover postcard-era blobs are
+/// skipped with a warning by `read_all_sessions`/`read_turns` on first read.
+/// The first real entry (`from == 1`, upgrading 1 → 2) lands with the first
+/// future breaking schema change; [`run_migrations_to`] validates that the
+/// chain is contiguous and covers every version from the first migration up
+/// to the target before applying anything.
 const MIGRATIONS: &[Migration] = &[];
 
 /// Read the persisted schema version, or `0` for an unversioned database
@@ -163,26 +178,26 @@ fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Result<()> {
 }
 
 /// Snapshot the database file before a migration rewrites it:
-/// `state.redb` → `state.redb.bak-v{from}`, where `from` is the schema
-/// version of the file being snapshotted (the version being migrated away
-/// from). Naming the backup after its *source* version — not the migration
-/// target — keeps restore semantics unambiguous: a `bak-v2` file IS a v2
-/// database, so restoring it rolls back to exactly the state the migration
-/// started from.
+/// `path` → `path.bak-v{from}`, where `from` is the schema version of the
+/// file being snapshotted (the version being migrated away from). Naming the
+/// backup after its *source* version — not the migration target — keeps
+/// restore semantics unambiguous: a `bak-v2` file IS a v2 database, so
+/// restoring it rolls back to exactly the state the migration started from.
 ///
+/// The path is injected (the caller resolves [`db_path`]) so the naming
+/// behavior is unit-testable without touching the real data directory.
 /// Dormant while [`MIGRATIONS`] is empty — the 0 → 1 transition is pure
 /// stamping and rewrites nothing, so no snapshot is taken (see
 /// [`run_migrations`]). Must be correct when the first real migration lands:
 /// one backup per source schema version, taken before any write, so a failed
 /// migration can always be rolled back from disk.
-fn backup_db_file(from: u64) -> io::Result<()> {
-    let path = db_path()?;
+fn backup_db_file(path: &std::path::Path, from: u64) -> io::Result<()> {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "state.redb".to_string());
     let backup_path = path.with_file_name(format!("{file_name}.bak-v{from}"));
-    fs::copy(&path, &backup_path)?;
+    fs::copy(path, &backup_path)?;
     info!(
         from = %path.display(),
         to = %backup_path.display(),
@@ -192,64 +207,102 @@ fn backup_db_file(from: u64) -> io::Result<()> {
 }
 
 /// Bring the database up to [`SCHEMA_VERSION`]. Idempotent; safe to call on
-/// every startup, right after [`open_db`].
+/// every startup, right after [`open_db`]. Delegates to [`run_migrations_to`]
+/// with the production version and chain.
+pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
+    run_migrations_to(db, SCHEMA_VERSION, MIGRATIONS)
+}
+
+/// The full migration runner, parameterized by the target version and the
+/// migration chain so the future (non-empty-chain) behavior is unit-testable
+/// today. Production entry point: [`run_migrations`].
 ///
-/// - A database at a *newer* version than this binary knows is rejected
-///   outright (downgrade protection — a future binary's writes would be
-///   misread by this one).
-/// - An unversioned database (version 0) is accepted only while
-///   [`SCHEMA_VERSION`] == 1, i.e. as the initial state. Once the chain
-///   grows past 1, a no-meta database means pre-release leftovers and is
-///   refused with recreate/restore guidance.
+/// - A database at a *newer* version than the target is rejected outright
+///   (downgrade protection — a future binary's writes would be misread by
+///   this one).
+/// - An unversioned database (version 0) is accepted only while the target
+///   is 1, i.e. as the initial state. Once the chain grows past 1, a
+///   no-meta database means pre-release leftovers and is refused with
+///   recreate/restore guidance.
+/// - The chain must be contiguous: the entries' `from` values must cover
+///   exactly `1..target` (the 0 → 1 transition is initialization, so no
+///   entry has `from == 0`). A gap — or a misplaced entry — is a hard error
+///   BEFORE anything is written: silently stamping a version whose data was
+///   never migrated would corrupt reads far worse than failing startup.
 /// - The 0 → 1 transition is pure initialization: stamp, no backup, no
 ///   migration (see [`MIGRATIONS`]).
-pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
+fn run_migrations_to(db: &redb::Database, target: u64, migrations: &[Migration]) -> io::Result<()> {
     let current = current_schema_version(db)?;
-    if current > SCHEMA_VERSION {
+    if current > target {
         error!(
             current,
-            supported = SCHEMA_VERSION,
+            supported = target,
             "refusing to open database: schema version newer than this binary supports"
         );
         return Err(db_err(format!(
-            "database schema version {current} is newer than this binary supports ({SCHEMA_VERSION}); \
+            "database schema version {current} is newer than this binary supports ({target}); \
              upgrade choreographr before continuing"
         )));
     }
     // An unversioned DB is only ever acceptable as the *initial* state (v1).
     // Once the chain grows, a no-meta DB means pre-release leftovers.
-    if current == 0 && SCHEMA_VERSION > 1 {
+    if current == 0 && target > 1 {
         let msg =
             "database has no schema version (pre-release data); recreate it or restore a backup";
         error!("{msg}");
         return Err(db_err(msg.to_string()));
     }
-    if current == SCHEMA_VERSION {
+    if current == target {
         return Ok(()); // idempotent fast path
     }
-    // current == 0 here: a fresh DB or a pre-release dev DB. Both are stamped
-    // the same way — the leftover postcard-era blobs are deliberately not
-    // migrated (no v0 → v1 migration by design) and will be skipped with a
-    // warning by read_all_sessions/read_turns on first read.
-    warn!(
-        "database was unversioned; stamping schema version {SCHEMA_VERSION} \
-         (pre-release blobs, if any, are not migrated)"
-    );
+    // Validate the chain BEFORE any write: the entries' `from` values must
+    // form the exact contiguous sequence 1..target. This catches a misplaced
+    // entry — e.g. the first real migration written with `from == 0` when the
+    // database is at v1 — before it can silently stamp a version whose data
+    // was never migrated. Entries below `current` have already run on disk
+    // and are skipped by the filter in the apply loop below.
+    let expected: Vec<u64> = (1..target).collect();
+    let provided: Vec<u64> = migrations.iter().map(|m| m.from).collect();
+    if provided != expected {
+        let msg =
+            format!("migration chain is not contiguous: has {provided:?}, needs {expected:?}");
+        error!("{msg}");
+        return Err(db_err(msg));
+    }
+    if current == 0 {
+        // A fresh DB or a pre-release dev DB. Both are stamped the same way —
+        // the leftover postcard-era blobs are deliberately not migrated (no
+        // v0 → v1 migration by design) and will be skipped with a warning by
+        // read_all_sessions/read_turns on first read.
+        warn!(
+            "database was unversioned; stamping schema version {target} \
+             (pre-release blobs, if any, are not migrated)"
+        );
+    }
     // Snapshot only before an actual migration writes. With an empty chain
     // (current release) this never fires — the 0 → 1 transition is pure
     // initialization (stamping), and nothing was rewritten. The backup is
     // named after the version being migrated FROM: `current` is the schema
     // version of the file on disk right now.
-    if !MIGRATIONS.is_empty() {
-        backup_db_file(current)?; // state.redb → state.redb.bak-v{current}
+    if !migrations.is_empty() {
+        let path = db_path()?;
+        backup_db_file(&path, current)?; // state.redb → state.redb.bak-v{current}
     }
-    for (idx, migration) in MIGRATIONS.iter().enumerate().skip(current as usize) {
-        info!(from = idx, to = idx + 1, "applying database migration");
-        migration(db)?;
+    for migration in migrations.iter().filter(|m| m.from >= current) {
+        info!(
+            from = migration.from,
+            to = migration.from + 1,
+            "applying database migration"
+        );
+        // Parenthesized call: `run` is a field holding a function pointer, but
+        // trait methods named `run` are in scope (e.g. flate2's `Ops`), so an
+        // unparenthesized `migration.run(db)` is parsed as a method call and
+        // fails to resolve. The explicit `(…)` disambiguates field access.
+        (migration.run)(db)?;
     }
     // Final stamping: initializes a fresh/legacy DB (0 → 1) and is a no-op
     // when the last migration already stamped its target.
-    stamp_schema_version(db, SCHEMA_VERSION)
+    stamp_schema_version(db, target)
 }
 
 /// Open (or create) the database file. The file is created when missing or
@@ -1418,5 +1471,115 @@ mod tests {
             !db_path.with_file_name("test.redb.bak-v1").exists(),
             "no backup artifact may be produced while the migration chain is empty"
         );
+    }
+
+    /// A stand-in for a real future migration: records a marker in `meta` so a
+    /// test can assert the migration actually ran.
+    fn dummy_migrate_1_to_2(db: &redb::Database) -> io::Result<()> {
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        {
+            let mut table = write_txn
+                .open_table(META)
+                .map_err(|e| db_err(format!("redb open meta: {e}")))?;
+            table
+                .insert("migrated", 1u64)
+                .map_err(|e| db_err(format!("redb set migrated marker: {e}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| db_err(format!("redb commit migrated marker: {e}")))?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_migrations_applies_contiguous_chain_from_current_version() {
+        // Simulates the first real migration landing (1 → 2): a database
+        // stamped at v1 plus a dummy migration entry. Pins the runner's
+        // indexing — the entry's explicit `from` field (not its position)
+        // determines what runs.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        stamp_schema_version(&db, 1).unwrap();
+
+        run_migrations_to(
+            &db,
+            2,
+            &[Migration {
+                from: 1,
+                run: dummy_migrate_1_to_2,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(current_schema_version(&db).unwrap(), 2);
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(META).unwrap();
+            assert_eq!(
+                table.get("migrated").unwrap().unwrap().value(),
+                1,
+                "the dummy migration must have run"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_db_file_names_backup_after_source_version() {
+        // The pre-migration snapshot must be named after the version being
+        // migrated FROM (`bak-v1` for a v1 database), so restoring it rolls
+        // back to exactly the pre-migration state — never after the target
+        // (a target-named `bak-v2` for a 1 → 2 migration would be ambiguous:
+        // is it the pre-migration v1 file or a post-migration v2 file?).
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        fs::write(&db_path, b"database contents").unwrap();
+
+        backup_db_file(&db_path, 1).unwrap();
+        assert!(db_path.with_file_name("state.redb.bak-v1").exists());
+
+        // A different source version produces a differently named backup —
+        // both can coexist without colliding.
+        backup_db_file(&db_path, 2).unwrap();
+        assert!(db_path.with_file_name("state.redb.bak-v2").exists());
+    }
+
+    #[test]
+    fn run_migrations_rejects_non_contiguous_chain_before_writing() {
+        // The natural mistake a contributor would make: writing the first
+        // migration with `from == 0` (thinking of the array index) when the
+        // database is at v1. The runner must refuse loudly BEFORE writing
+        // anything — stamping v2 over data that was never migrated would
+        // corrupt every subsequent read.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        stamp_schema_version(&db, 1).unwrap();
+
+        let err = run_migrations_to(
+            &db,
+            2,
+            &[Migration {
+                from: 0,
+                run: dummy_migrate_1_to_2,
+            }],
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not contiguous") && msg.contains('0') && msg.contains('1'),
+            "error must describe the chain mismatch: {msg}"
+        );
+        // Nothing was applied or stamped: still at v1, marker absent.
+        assert_eq!(current_schema_version(&db).unwrap(), 1);
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(META).unwrap();
+            assert!(
+                table.get("migrated").unwrap().is_none(),
+                "no migration may run when the chain is rejected"
+            );
+        }
     }
 }

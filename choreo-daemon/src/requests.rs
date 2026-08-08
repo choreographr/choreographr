@@ -752,6 +752,11 @@ fn estimate_prompt_tokens(
             content_tokens + tool_call_tokens + tool_def_tokens + artifact_tokens
         }
         None => {
+            // Effectively unreachable — `get_encoding("cl100k_base")` above
+            // always succeeds — but kept as defense-in-depth: if the fallback
+            // encoding ever fails to load, report 0 rather than panic or reuse
+            // a stale estimate. The estimate is informational only (billing
+            // uses the provider-reported usage).
             tracing::warn!("no tiktoken encoding available for {model}");
             0
         }
