@@ -65,6 +65,12 @@ pub(crate) struct ResponsesRequest<'a> {
 /// Fields like `id` come from the wire but aren't always read in the
 /// current code path — they're kept for deserialization completeness
 /// and future use (streaming contexts, resumption, etc.).
+///
+/// `output` holds each item as the raw `serde_json::Value` exactly as
+/// received — mirroring the streaming path, which keeps reasoning items as
+/// raw values. Display/tool-call extraction parses them lazily into
+/// `ResponseOutputItem`, while the reasoning round-trip artifact preserves
+/// every field (including unknown ones) byte-for-byte.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct ResponsesResponse {
@@ -73,13 +79,22 @@ pub(crate) struct ResponsesResponse {
     #[serde(default)]
     pub(crate) status: Option<String>,
     #[serde(default)]
-    pub(crate) output: Vec<ResponseOutputItem>,
+    pub(crate) output: Vec<serde_json::Value>,
     #[serde(default)]
     pub(crate) usage: Option<super::Usage>,
 }
 
 /// Items in a Responses API response output array.
-#[derive(Debug, Deserialize, Serialize)]
+///
+/// Deserialize-only: the raw `serde_json::Value` of each output item is kept
+/// for the round-trip artifact, so this typed form is used solely for
+/// display/tool-call extraction and is never re-serialized (re-serializing
+/// through the struct would drop unknown fields like a newer `content` shape).
+/// Fields like `id`/`role` are kept for wire-format completeness (matching
+/// `ResponsesResponse`) even though the current code reads only the fields it
+/// needs.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ResponseOutputItem {
     Message {
@@ -89,14 +104,14 @@ pub(crate) enum ResponseOutputItem {
         role: Option<String>,
     },
     Reasoning {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         id: Option<String>,
         #[serde(default)]
         summary: Vec<serde_json::Value>,
         /// Opaque encrypted reasoning content — present only when the request
         /// was sent with `store: false` (stateless mode). Kept verbatim for
         /// the round-trip artifact; never interpreted by the daemon.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         encrypted_content: Option<String>,
     },
     #[serde(rename = "function_call")]
@@ -128,7 +143,7 @@ pub(crate) enum ResponseOutputItem {
     },
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub(crate) struct ResponseContentPart {
     #[serde(rename = "type")]
     pub(crate) kind: String,
@@ -355,21 +370,24 @@ pub(crate) fn responses_request(
         .read_json()
         .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
-    let content = payload
-        .output
-        .into_iter()
-        .filter_map(|item| {
-            if let ResponseOutputItem::Message { content, .. } = item {
-                Some(content)
-            } else {
-                None
-            }
-        })
-        .flatten()
-        .filter_map(|part| part.text)
-        .map(|text| text.trim().to_string())
-        .find(|text| !text.is_empty())
-        .unwrap_or_default();
+    let mut content = String::new();
+    for raw in payload.output {
+        // Parse each raw item for message-text extraction; a malformed item
+        // surfaces as an error (matching the previous typed-deserialization
+        // behavior) rather than being silently skipped.
+        let item: ResponseOutputItem =
+            serde_json::from_value(raw).map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+        if let ResponseOutputItem::Message { content: parts, .. } = item
+            && let Some(text) = parts
+                .into_iter()
+                .filter_map(|part| part.text)
+                .map(|text| text.trim().to_string())
+                .find(|text| !text.is_empty())
+        {
+            content = text;
+            break;
+        }
+    }
 
     if content.is_empty() {
         return Err(super::OpenAiError::EmptyResponse);
@@ -569,7 +587,15 @@ fn responses_response_to_turn(
     let mut tool_calls: Vec<ChatToolCall> = Vec::new();
     let mut reasoning_items: Vec<serde_json::Value> = Vec::new();
 
-    for item in payload.output {
+    for raw in payload.output {
+        // Parse the raw item into the typed form for display/tool-call
+        // extraction. The raw value itself is kept (never re-serialized) for
+        // the reasoning artifact below, so unknown fields — e.g. a newer
+        // `content` shape alongside `summary` — and explicit `null`s survive
+        // byte-for-byte, matching the streaming path which stores reasoning
+        // items as raw `serde_json::Value` directly.
+        let item: ResponseOutputItem = serde_json::from_value(raw.clone())
+            .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
         match item {
             ResponseOutputItem::Message { content, .. } => {
                 for part in content {
@@ -580,25 +606,16 @@ fn responses_response_to_turn(
                     }
                 }
             }
-            ResponseOutputItem::Reasoning {
-                id,
-                summary,
-                encrypted_content,
-            } => {
+            ResponseOutputItem::Reasoning { summary, .. } => {
                 if let Some(text) = extract_reasoning_text(&summary) {
                     full_reasoning.push_str(&text);
                 }
-                // Re-serialize the item (type tag + fields) so the artifact
-                // is byte-faithful to what the API returned and the daemon
-                // can forward it uninterpreted.
-                reasoning_items.push(
-                    serde_json::to_value(&ResponseOutputItem::Reasoning {
-                        id,
-                        summary,
-                        encrypted_content,
-                    })
-                    .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?,
-                );
+                // Capture the RAW item exactly as the API returned it — every
+                // field, value, and ordering survives (unknown fields such as
+                // `content` are never dropped). This keeps the non-streaming
+                // artifact byte-identical to the streaming path's raw-value
+                // capture for the same logical item.
+                reasoning_items.push(raw);
             }
             ResponseOutputItem::FunctionCall {
                 call_id,
@@ -1325,6 +1342,54 @@ mod tests {
                 );
             }
             other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_captures_unknown_reasoning_fields_verbatim() {
+        // A newer reasoning item shape may carry reasoning text in a `content`
+        // array alongside `summary`. The raw-value capture must preserve the
+        // unknown field verbatim in the artifact — the previous typed
+        // re-serialization would have dropped it (and the display text in
+        // `summary` is still picked up for `reasoning`).
+        let json_str = r#"{
+            "id": "resp_new",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "re_new",
+                    "summary": [{"type": "summary_text", "text": "visible summary"}],
+                    "content": [{"type": "output_text", "text": "thinking"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Answer here"}]
+                }
+            ]
+        }"#;
+        let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+        let result = responses_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.content, "Answer here");
+                // Display text still comes from `summary`.
+                assert_eq!(f.reasoning.as_deref(), Some("visible summary"));
+                let ReasoningArtifact::ResponsesItems(bytes) =
+                    f.reasoning_artifact.expect("artifact captured")
+                else {
+                    panic!("expected ResponsesItems artifact");
+                };
+                let items: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                // The unknown `content` field survives verbatim alongside the
+                // known ones — nothing is dropped or re-ordered.
+                assert_eq!(items[0]["type"], "reasoning");
+                assert_eq!(items[0]["id"], "re_new");
+                assert_eq!(items[0]["summary"][0]["text"], "visible summary");
+                assert_eq!(items[0]["content"][0]["type"], "output_text");
+                assert_eq!(items[0]["content"][0]["text"], "thinking");
+            }
+            other => panic!("expected FinalText, got {other:?}"),
         }
     }
 
