@@ -9,7 +9,7 @@ pub use crate::shared::MaxTokensField;
 use crate::types::{ChatTurnResult, StreamEvent};
 use tracing::{debug, warn};
 
-use choreo_proto::ReasoningArtifact;
+use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 
 pub(crate) use config::endpoint_url;
 pub use config::{ServiceConfig, completion, validate_and_list_models};
@@ -109,9 +109,11 @@ pub struct ChatRequestMessage {
     /// Opaque reasoning round-trip artifact captured by the producing adapter
     /// at parse time (see `ReasoningArtifact`). Never serialized as a field of
     /// its own — each adapter re-emits it in ITS OWN wire format: OpenAI chat
-    /// writes it as `reasoning_content` on assistant messages (see the manual
-    /// `Serialize` impl below), Responses pushes the items into `input`,
-    /// and the Anthropic/Google builders interpret their own variants.
+    /// writes it back as the field recorded in the artifact
+    /// (`reasoning_content` / `reasoning` / `reasoning_text`) on assistant
+    /// messages (see the manual `Serialize` impl below), Responses pushes the
+    /// items into `input`, and the Anthropic/Google builders interpret their
+    /// own variants.
     pub reasoning_artifact: Option<ReasoningArtifact>,
 }
 
@@ -120,31 +122,49 @@ impl Serialize for ChatRequestMessage {
     /// (role, content, tool_call_id, tool_calls, reasoning_content,
     /// reasoning, reasoning_text — `None` fields omitted) EXCEPT that an
     /// assistant message carrying a `ChatReasoning` artifact re-emits it as
-    /// `reasoning_content`, decoded from the captured bytes. The artifact
-    /// field itself never appears on the wire. DeepSeek/Kimi reject a
-    /// tool-loop turn whose assistant message drops `reasoning_content`, so
-    /// the round-trip payload must survive to the next request.
+    /// the wire field recorded at capture time (`reasoning_content` /
+    /// `reasoning` / `reasoning_text`), decoded from the captured bytes — a
+    /// provider that streamed `reasoning_text` must get `reasoning_text`
+    /// back, not `reasoning_content` (the mis-routing this field tag
+    /// prevents). The artifact field itself never appears on the wire.
+    /// DeepSeek/Kimi reject a tool-loop turn whose assistant message drops
+    /// `reasoning_content`, so the round-trip payload must survive to the
+    /// next request.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::{Error as _, SerializeStruct};
 
-        // An explicit `reasoning_content` wins when the daemon populated it
+        // Explicit reasoning fields win when the daemon populated them
         // directly; the artifact is the fallback so a message built with only
         // the opaque payload still round-trips. Only assistant-role messages
         // may carry provider reasoning — user/tool/system messages never had
         // any, so the artifact is dropped for them.
         let mut reasoning_content = self.reasoning_content.clone();
-        if reasoning_content.is_none()
-            && self.role == "assistant"
-            && let Some(ReasoningArtifact::ChatReasoning(bytes)) = &self.reasoning_artifact
+        let mut reasoning = self.reasoning.clone();
+        let mut reasoning_text = self.reasoning_text.clone();
+        if self.role == "assistant"
+            && let Some(ReasoningArtifact::ChatReasoning { field, bytes }) =
+                &self.reasoning_artifact
         {
             let text = std::str::from_utf8(bytes).map_err(|e| {
                 S::Error::custom(format!("chat reasoning artifact is not valid UTF-8: {e}"))
             })?;
             debug!(
+                ?field,
                 payload_bytes = bytes.len(),
-                "re-emitting chat reasoning_content from artifact"
+                "re-emitting chat reasoning artifact"
             );
-            reasoning_content = Some(text.to_string());
+            // Write the decoded text to the field named by the artifact's tag
+            // (only when that field is currently None — explicit values still
+            // win), so re-emission targets the same wire field the provider
+            // used at capture.
+            let target = match field {
+                ChatReasoningField::ReasoningContent => &mut reasoning_content,
+                ChatReasoningField::Reasoning => &mut reasoning,
+                ChatReasoningField::ReasoningText => &mut reasoning_text,
+            };
+            if target.is_none() {
+                *target = Some(text.to_string());
+            }
         }
 
         let mut msg = serializer.serialize_struct("ChatRequestMessage", 7)?;
@@ -161,10 +181,10 @@ impl Serialize for ChatRequestMessage {
         if let Some(rc) = &reasoning_content {
             msg.serialize_field("reasoning_content", rc)?;
         }
-        if let Some(reasoning) = &self.reasoning {
+        if let Some(reasoning) = &reasoning {
             msg.serialize_field("reasoning", reasoning)?;
         }
-        if let Some(reasoning_text) = &self.reasoning_text {
+        if let Some(reasoning_text) = &reasoning_text {
             msg.serialize_field("reasoning_text", reasoning_text)?;
         }
         msg.end()

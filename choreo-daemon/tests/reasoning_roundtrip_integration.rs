@@ -17,7 +17,9 @@ use choreo_ai_protocols::openai::{
     ChatRequestMessage, MaxTokensField, OpenAiClient, ServiceConfig,
 };
 use choreo_ai_protocols::test_utils::MockProvider;
-use choreo_proto::{AssistantToolCallRecord, ReasoningArtifact, ReasoningProducer};
+use choreo_proto::{
+    AssistantToolCallRecord, ChatReasoningField, ReasoningArtifact, ReasoningProducer,
+};
 use choreographr::{SessionState, build_chat_request_messages};
 
 // ── Fixtures ─────────────────────────────────────────────────────────────
@@ -43,9 +45,10 @@ fn add_tool_turn(
             arguments_json: r#"{"city":"London"}"#.into(),
         }],
         None,
-        Some(ReasoningArtifact::ChatReasoning(
-            reasoning.as_bytes().to_vec(),
-        )),
+        Some(ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningContent,
+            bytes: reasoning.as_bytes().to_vec(),
+        }),
         Some(ReasoningProducer {
             provider_slug: provider_slug.to_string(),
             model: model.to_string(),

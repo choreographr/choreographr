@@ -9,10 +9,10 @@ pub use io::{
     DEFAULT_SOCKET_PATH, SOCKET_PATH_ENV, read_message, read_payload, socket_path, write_message,
 };
 pub use types::{
-    AccountInfo, AssistantToolCallRecord, ClientMessage, ContextConfig, DaemonMessage,
-    DiscardedToolCall, DisplayedImageRecord, ImageMetadata, InferenceError, OutputStream,
-    ReasoningArtifact, ReasoningCapability, ReasoningProducer, SessionStatus, SessionSummary,
-    TimestampMs, TokenUsage, ToolResultRecord, Turn,
+    AccountInfo, AssistantToolCallRecord, ChatReasoningField, ClientMessage, ContextConfig,
+    DaemonMessage, DiscardedToolCall, DisplayedImageRecord, ImageMetadata, InferenceError,
+    OutputStream, ReasoningArtifact, ReasoningCapability, ReasoningProducer, SessionStatus,
+    SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn,
 };
 
 #[cfg(test)]

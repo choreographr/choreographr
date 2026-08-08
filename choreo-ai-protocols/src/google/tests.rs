@@ -921,9 +921,10 @@ fn build_message_payloads_foreign_artifact_variant_is_dropped() {
         reasoning_content: None,
         reasoning: None,
         reasoning_text: None,
-        reasoning_artifact: Some(ReasoningArtifact::ChatReasoning(
-            b"not a signature".to_vec(),
-        )),
+        reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+            field: choreo_proto::ChatReasoningField::ReasoningContent,
+            bytes: b"not a signature".to_vec(),
+        }),
     }];
     let (payloads, _) = build_message_payloads(&msgs).unwrap();
     let json_val = serde_json::to_value(&payloads[0]).unwrap();

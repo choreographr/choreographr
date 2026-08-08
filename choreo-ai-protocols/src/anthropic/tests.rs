@@ -619,7 +619,10 @@ fn build_message_payloads_foreign_artifact_variant_is_dropped() {
         reasoning_content: None,
         reasoning: None,
         reasoning_text: None,
-        reasoning_artifact: Some(ReasoningArtifact::ChatReasoning(b"not anthropic".to_vec())),
+        reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+            field: choreo_proto::ChatReasoningField::ReasoningContent,
+            bytes: b"not anthropic".to_vec(),
+        }),
     }];
     let (payloads, _) = build_message_payloads(&msgs, &[], true).unwrap();
     let blocks = serde_json::to_value(&payloads[0].content).unwrap();

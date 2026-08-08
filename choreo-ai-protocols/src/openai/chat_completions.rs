@@ -9,7 +9,7 @@ use crate::shared::MAX_TOOL_CALLS;
 use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
-use choreo_proto::{ReasoningArtifact, TokenUsage};
+use choreo_proto::{ChatReasoningField, ReasoningArtifact, TokenUsage};
 use std::collections::HashMap;
 use std::io;
 
@@ -65,39 +65,57 @@ pub(crate) struct AssistantMessage {
 
 impl AssistantMessage {
     /// Extract reasoning content from whichever field the model populated
-    /// (reasoning_content, reasoning, or reasoning_text).
+    /// (reasoning_content, reasoning, or reasoning_text), consuming the field
+    /// with the non-streaming precedence reasoning_content > reasoning >
+    /// reasoning_text.
     ///
     /// Returns the display text alongside an opaque [`ReasoningArtifact`]
-    /// capturing the same raw value as UTF-8 bytes. The artifact is built
-    /// from the value BEFORE `.take()` consumes it, so the round-trip
-    /// payload survives the parse boundary untouched.
+    /// capturing the same raw value as UTF-8 bytes. The artifact records
+    /// WHICH field was consumed, so re-emission targets the same wire field
+    /// the provider used — a provider that sends `reasoning_text` must not
+    /// have its payload echoed back as `reasoning_content` on the next
+    /// tool-loop turn.
     pub(crate) fn take_reasoning(&mut self) -> (Option<String>, Option<ReasoningArtifact>) {
-        let reasoning = self
-            .reasoning_content
-            .take()
-            .or_else(|| self.reasoning.take())
-            .or_else(|| self.reasoning_text.take());
-        let artifact = reasoning.as_deref().and_then(chat_reasoning_artifact);
-        (reasoning, artifact)
+        // Consume the fields in precedence order and record the winner; the
+        // artifact is built from the value BEFORE it leaves `self`, so the
+        // round-trip payload survives the parse boundary untouched.
+        if let Some(text) = self.reasoning_content.take() {
+            let artifact = chat_reasoning_artifact(ChatReasoningField::ReasoningContent, &text);
+            return (Some(text), artifact);
+        }
+        if let Some(text) = self.reasoning.take() {
+            let artifact = chat_reasoning_artifact(ChatReasoningField::Reasoning, &text);
+            return (Some(text), artifact);
+        }
+        if let Some(text) = self.reasoning_text.take() {
+            let artifact = chat_reasoning_artifact(ChatReasoningField::ReasoningText, &text);
+            return (Some(text), artifact);
+        }
+        (None, None)
     }
 }
 
 /// Build the opaque `ChatReasoning` artifact from captured reasoning text,
-/// or `None` when nothing reusable was produced. Empty strings are skipped:
-/// an empty payload captures nothing, and a later passback policy shouldn't
-/// be tempted to echo an empty `reasoning_content` (some providers reject
-/// `""` outright).
-fn chat_reasoning_artifact(reasoning: &str) -> Option<ReasoningArtifact> {
+/// tagging it with the wire field it came from (`field`), or `None` when
+/// nothing reusable was produced. Empty strings are skipped: an empty payload
+/// captures nothing, and a later passback policy shouldn't be tempted to echo
+/// an empty reasoning field (some providers reject `""` outright).
+fn chat_reasoning_artifact(
+    field: ChatReasoningField,
+    reasoning: &str,
+) -> Option<ReasoningArtifact> {
     if reasoning.is_empty() {
         return None;
     }
     debug!(
+        ?field,
         payload_bytes = reasoning.len(),
         "captured chat reasoning artifact"
     );
-    Some(ReasoningArtifact::ChatReasoning(
-        reasoning.as_bytes().to_vec(),
-    ))
+    Some(ReasoningArtifact::ChatReasoning {
+        field,
+        bytes: reasoning.as_bytes().to_vec(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -450,19 +468,6 @@ pub(crate) fn accumulate_tool_calls_from_deltas(
 
 // ── Streaming chat completions with tools ───────────────────────────────
 
-/// Which chat-completions reasoning field a stream is using, locked in on the
-/// first non-empty reasoning delta. Mirrors the non-streaming precedence
-/// (`reasoning_content` > `reasoning` > `reasoning_text` in `take_reasoning`)
-/// so the round-trip artifact is re-emitted to the SAME field the provider
-/// used — a stream that sends `reasoning_text` must not have it replayed as
-/// `reasoning_content` on the next tool-loop turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReasoningField {
-    ReasoningContent,
-    Reasoning,
-    ReasoningText,
-}
-
 /// Mutable state accumulated across streamed chat-completions chunks.
 ///
 /// Extracted from the streaming request loop so the parse→accumulate→turn
@@ -474,8 +479,13 @@ struct ChatCompletionsStreamAccumulator {
     full_content: String,
     full_reasoning: String,
     /// The reasoning field the stream is using, locked in on the first
-    /// non-empty delta (`None` until then) — see [`ReasoningField`].
-    reasoning_field: Option<ReasoningField>,
+    /// non-empty delta (`None` until then) — see [`ChatReasoningField`].
+    /// Mirrors the non-streaming precedence (`reasoning_content` >
+    /// `reasoning` > `reasoning_text` in `take_reasoning`) so the round-trip
+    /// artifact is re-emitted to the SAME field the provider used — a stream
+    /// that sends `reasoning_text` must not have it replayed as
+    /// `reasoning_content` on the next tool-loop turn.
+    reasoning_field: Option<ChatReasoningField>,
     /// Raw tool call deltas across all chunks, merged by index by
     /// `accumulate_tool_calls_from_deltas` once the stream is fully consumed.
     raw_tool_call_deltas: Vec<StreamToolCallDelta>,
@@ -550,9 +560,12 @@ impl ChatCompletionsStreamAccumulator {
             // provider used; a stray delta from a different field is ignored
             // rather than mixed into the blob.
             for (field, text) in [
-                (ReasoningField::ReasoningContent, &delta.reasoning_content),
-                (ReasoningField::Reasoning, &delta.reasoning),
-                (ReasoningField::ReasoningText, &delta.reasoning_text),
+                (
+                    ChatReasoningField::ReasoningContent,
+                    &delta.reasoning_content,
+                ),
+                (ChatReasoningField::Reasoning, &delta.reasoning),
+                (ChatReasoningField::ReasoningText, &delta.reasoning_text),
             ] {
                 let Some(text) = text.as_deref().filter(|t| !t.is_empty()) else {
                     continue;
@@ -601,13 +614,18 @@ impl ChatCompletionsStreamAccumulator {
     /// Finalize the accumulated stream into a turn result, attaching the
     /// `ChatReasoning` artifact captured from the accumulated reasoning
     /// deltas (the concatenated deltas of the locked-in field are the
-    /// provider's raw reasoning value, echoed verbatim on tool-loop turns).
+    /// provider's raw reasoning value, echoed verbatim — to the same field —
+    /// on tool-loop turns).
     fn into_turn_result(self) -> Result<ChatTurnResult, super::OpenAiError> {
         if !self.has_any_output {
             return Err(super::OpenAiError::EmptyResponse);
         }
 
-        let reasoning_artifact = chat_reasoning_artifact(&self.full_reasoning);
+        // The field was locked in on the first non-empty delta; the artifact
+        // carries that field so re-emission targets the same wire field.
+        let reasoning_artifact = self
+            .reasoning_field
+            .and_then(|field| chat_reasoning_artifact(field, &self.full_reasoning));
 
         if !self.raw_tool_call_deltas.is_empty() {
             let mut tool_calls = accumulate_tool_calls_from_deltas(self.raw_tool_call_deltas);
@@ -1152,9 +1170,10 @@ mod tests {
                 assert_eq!(f.reasoning.as_deref(), Some("Let me think step-by-step"));
                 assert_eq!(
                     f.reasoning_artifact,
-                    Some(ReasoningArtifact::ChatReasoning(
-                        b"Let me think step-by-step".to_vec()
-                    ))
+                    Some(ReasoningArtifact::ChatReasoning {
+                        field: ChatReasoningField::ReasoningContent,
+                        bytes: b"Let me think step-by-step".to_vec(),
+                    })
                 );
             }
             other => panic!("expected FinalText, got {other:?}"),
@@ -1172,9 +1191,10 @@ mod tests {
                 assert_eq!(f.reasoning.as_deref(), Some("bare reasoning field"));
                 assert_eq!(
                     f.reasoning_artifact,
-                    Some(ReasoningArtifact::ChatReasoning(
-                        b"bare reasoning field".to_vec()
-                    ))
+                    Some(ReasoningArtifact::ChatReasoning {
+                        field: ChatReasoningField::Reasoning,
+                        bytes: b"bare reasoning field".to_vec(),
+                    })
                 );
             }
             other => panic!("expected FinalText, got {other:?}"),
@@ -1193,7 +1213,10 @@ mod tests {
                 assert_eq!(f.reasoning.as_deref(), Some("text reasoning"));
                 assert_eq!(
                     f.reasoning_artifact,
-                    Some(ReasoningArtifact::ChatReasoning(b"text reasoning".to_vec()))
+                    Some(ReasoningArtifact::ChatReasoning {
+                        field: ChatReasoningField::ReasoningText,
+                        bytes: b"text reasoning".to_vec(),
+                    })
                 );
             }
             other => panic!("expected FinalText, got {other:?}"),
@@ -1218,9 +1241,10 @@ mod tests {
                 assert_eq!(t.reasoning.as_deref(), Some("reasoning for tool call"));
                 assert_eq!(
                     t.reasoning_artifact,
-                    Some(ReasoningArtifact::ChatReasoning(
-                        b"reasoning for tool call".to_vec()
-                    ))
+                    Some(ReasoningArtifact::ChatReasoning {
+                        field: ChatReasoningField::ReasoningContent,
+                        bytes: b"reasoning for tool call".to_vec(),
+                    })
                 );
             }
             other => panic!("expected ToolUse, got {other:?}"),
@@ -1289,9 +1313,10 @@ mod tests {
                 assert_eq!(f.reasoning.as_deref(), Some("Let me think step-by-step"));
                 assert_eq!(
                     f.reasoning_artifact,
-                    Some(ReasoningArtifact::ChatReasoning(
-                        b"Let me think step-by-step".to_vec()
-                    ))
+                    Some(ReasoningArtifact::ChatReasoning {
+                        field: ChatReasoningField::ReasoningContent,
+                        bytes: b"Let me think step-by-step".to_vec(),
+                    })
                 );
             }
             other => panic!("expected FinalText, got {other:?}"),
@@ -1330,9 +1355,10 @@ mod tests {
                 assert_eq!(t.reasoning.as_deref(), Some("deciding on tool"));
                 assert_eq!(
                     t.reasoning_artifact,
-                    Some(ReasoningArtifact::ChatReasoning(
-                        b"deciding on tool".to_vec()
-                    ))
+                    Some(ReasoningArtifact::ChatReasoning {
+                        field: ChatReasoningField::ReasoningContent,
+                        bytes: b"deciding on tool".to_vec(),
+                    })
                 );
             }
             other => panic!("expected ToolUse, got {other:?}"),
@@ -1395,11 +1421,17 @@ mod tests {
                 assert_eq!(f.reasoning.as_deref(), Some("think step by step"));
                 assert_eq!(
                     f.reasoning_artifact,
-                    Some(ReasoningArtifact::ChatReasoning(
-                        b"think step by step".to_vec()
-                    )),
+                    Some(ReasoningArtifact::ChatReasoning {
+                        field: ChatReasoningField::ReasoningText,
+                        bytes: b"think step by step".to_vec(),
+                    }),
                     "artifact must capture only the locked-in reasoning_text field",
                 );
+                // The field tag must record WHICH wire field was captured, so
+                // re-emission targets reasoning_text (not reasoning_content).
+                if let Some(ReasoningArtifact::ChatReasoning { field, .. }) = f.reasoning_artifact {
+                    assert_eq!(field, ChatReasoningField::ReasoningText);
+                }
             }
             other => panic!("expected FinalText, got {other:?}"),
         }
@@ -1431,7 +1463,10 @@ mod tests {
                 assert_eq!(f.reasoning.as_deref(), Some("primary"));
                 assert_eq!(
                     f.reasoning_artifact,
-                    Some(ReasoningArtifact::ChatReasoning(b"primary".to_vec())),
+                    Some(ReasoningArtifact::ChatReasoning {
+                        field: ChatReasoningField::ReasoningContent,
+                        bytes: b"primary".to_vec(),
+                    }),
                 );
             }
             other => panic!("expected FinalText, got {other:?}"),
@@ -1453,14 +1488,52 @@ mod tests {
             reasoning_content: None,
             reasoning: None,
             reasoning_text: None,
-            reasoning_artifact: Some(ReasoningArtifact::ChatReasoning(
-                b"Let me think step-by-step".to_vec(),
-            )),
+            reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+                field: ChatReasoningField::ReasoningContent,
+                bytes: b"Let me think step-by-step".to_vec(),
+            }),
         };
         let body = serde_json::to_value(&msg).unwrap();
         assert_eq!(body["reasoning_content"], "Let me think step-by-step");
         // The artifact field itself never appears on the wire.
         assert!(body.get("reasoning_artifact").is_none());
+    }
+
+    #[test]
+    fn chat_request_message_reemits_to_captured_field() {
+        // The artifact records WHICH chat field the provider used; re-emission
+        // must target that same field — a `reasoning_text` artifact goes back
+        // as `reasoning_text`, a `reasoning` artifact as `reasoning`, and
+        // neither leaks into `reasoning_content` (the historical default).
+        for (field, wire_key) in [
+            (ChatReasoningField::ReasoningText, "reasoning_text"),
+            (ChatReasoningField::Reasoning, "reasoning"),
+        ] {
+            let msg = ChatRequestMessage {
+                role: "assistant",
+                content: Some("answer".into()),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_text: None,
+                reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+                    field,
+                    bytes: b"provider reasoning".to_vec(),
+                }),
+            };
+            let body = serde_json::to_value(&msg).unwrap();
+            assert_eq!(body[wire_key], "provider reasoning");
+            for other in ["reasoning_content", "reasoning", "reasoning_text"] {
+                if other != wire_key {
+                    assert!(
+                        body.get(other).is_none(),
+                        "{other} must be absent when re-emitting {wire_key}"
+                    );
+                }
+            }
+            assert!(body.get("reasoning_artifact").is_none());
+        }
     }
 
     #[test]
@@ -1483,9 +1556,10 @@ mod tests {
             reasoning_content: None,
             reasoning: None,
             reasoning_text: None,
-            reasoning_artifact: Some(ReasoningArtifact::ChatReasoning(
-                b"should not leak".to_vec(),
-            )),
+            reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+                field: ChatReasoningField::ReasoningContent,
+                bytes: b"should not leak".to_vec(),
+            }),
         };
         let body = serde_json::to_value(&msg).unwrap();
         assert!(body.get("reasoning_content").is_none());

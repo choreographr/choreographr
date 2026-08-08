@@ -210,6 +210,22 @@ pub struct ToolResultRecord {
     pub invocation_description: String,
 }
 
+/// Which OpenAI-compatible chat field carried the reasoning text, locked in
+/// when the adapter captured the payload. The artifact must be re-emitted to
+/// the SAME field the provider used — a provider that streams `reasoning_text`
+/// must not have its payload echoed back as `reasoning_content` on the next
+/// tool-loop turn (the mis-routing this tag prevents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatReasoningField {
+    /// The `reasoning_content` field (DeepSeek/Kimi style).
+    ReasoningContent,
+    /// The bare `reasoning` field.
+    Reasoning,
+    /// The `reasoning_text` field.
+    ReasoningText,
+}
+
 /// Opaque reasoning round-trip payload, captured verbatim by a provider
 /// adapter and re-emitted verbatim on the next request. Only the producing
 /// adapter may interpret the payload. Display text lives separately in
@@ -223,7 +239,8 @@ pub struct ToolResultRecord {
 ///
 /// Serialized as an externally-tagged enum (`rename_all = "snake_case"`), so
 /// the adapter-ownership tag is the JSON object key (e.g.
-/// `{"chat_reasoning": [104,105]}`) and the postcard variant index — NOT
+/// `{"chat_reasoning": {"field": "reasoning_content", "bytes": [104,105]}}`)
+/// and the postcard variant index — NOT
 /// `#[serde(tag = "kind", content = "payload")]`, because postcard (the
 /// workspace wire format, see `frame.rs`) cannot deserialize
 /// internally/adjacently tagged enums (`WontImplement`: they require
@@ -231,8 +248,13 @@ pub struct ToolResultRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningArtifact {
-    /// OpenAI-compatible chat: the `reasoning_content` string (verbatim).
-    ChatReasoning(Vec<u8>),
+    /// OpenAI-compatible chat: the reasoning text (verbatim) plus the wire
+    /// field it was captured from (see [`ChatReasoningField`]), so re-emission
+    /// targets the same field the provider used.
+    ChatReasoning {
+        field: ChatReasoningField,
+        bytes: Vec<u8>,
+    },
     /// Anthropic: ordered thinking / redacted_thinking blocks, JSON as
     /// received (signatures + redacted data intact, order preserved).
     AnthropicThinking(Vec<u8>),
@@ -740,7 +762,10 @@ mod tests {
     /// All four artifact variants, with realistic payload bytes.
     fn all_artifacts() -> Vec<ReasoningArtifact> {
         vec![
-            ReasoningArtifact::ChatReasoning(b"deep think step-by-step".to_vec()),
+            ReasoningArtifact::ChatReasoning {
+                field: ChatReasoningField::ReasoningContent,
+                bytes: b"deep think step-by-step".to_vec(),
+            },
             ReasoningArtifact::AnthropicThinking(
                 br#"[{"type":"thinking","thinking":"...","signature":"sig_abc"},{"type":"redacted_thinking","data":"eJxT"}]"#
                     .to_vec(),
@@ -780,12 +805,55 @@ mod tests {
         // adapter's identity must be visible on the wire (as the JSON object
         // key) without interpreting the payload bytes. Pin the exact shape so
         // a serde refactor cannot silently change it.
-        let artifact = ReasoningArtifact::ChatReasoning(b"hi".to_vec());
+        let artifact = ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningContent,
+            bytes: b"hi".to_vec(),
+        };
         let json = serde_json::to_value(&artifact).expect("serialize");
-        assert_eq!(json["chat_reasoning"], serde_json::json!([104, 105]));
+        assert_eq!(
+            json["chat_reasoning"]["field"],
+            serde_json::json!("reasoning_content")
+        );
+        assert_eq!(
+            json["chat_reasoning"]["bytes"],
+            serde_json::json!([104, 105])
+        );
         // Exactly one key — the ownership tag — and nothing else.
         let keys: Vec<_> = json.as_object().expect("object").keys().collect();
         assert_eq!(keys, vec!["chat_reasoning"]);
+    }
+
+    #[test]
+    fn chat_reasoning_struct_variant_round_trips_postcard_and_json() {
+        // The struct-variant ChatReasoning (field + bytes) is the one variant
+        // whose payload is not a bare byte array — pin both wire formats so a
+        // serde/postcard refactor cannot silently drop the field identity
+        // (re-emission would then mis-route to the default reasoning_content).
+        for artifact in [
+            ReasoningArtifact::ChatReasoning {
+                field: ChatReasoningField::ReasoningContent,
+                bytes: b"deep think step-by-step".to_vec(),
+            },
+            ReasoningArtifact::ChatReasoning {
+                field: ChatReasoningField::Reasoning,
+                bytes: b"bare reasoning".to_vec(),
+            },
+            ReasoningArtifact::ChatReasoning {
+                field: ChatReasoningField::ReasoningText,
+                bytes: b"text reasoning".to_vec(),
+            },
+        ] {
+            let bytes = postcard::to_allocvec(&artifact).expect("encode");
+            let decoded: ReasoningArtifact = postcard::from_bytes(&bytes).expect("decode");
+            assert_eq!(
+                decoded, artifact,
+                "postcard round-trip must keep field + bytes"
+            );
+
+            let json = serde_json::to_string(&artifact).expect("serialize");
+            let decoded: ReasoningArtifact = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, artifact, "JSON round-trip must keep field + bytes");
+        }
     }
 
     #[test]

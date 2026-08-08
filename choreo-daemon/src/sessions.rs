@@ -2224,7 +2224,10 @@ mod tests {
         // on the next request (same-model + passback policy gates).
         let mut state = SessionState::empty();
         let (tid, _) = state.start_turn(Some("hello".into()));
-        let artifact = ReasoningArtifact::ChatReasoning(b"thinking".to_vec());
+        let artifact = ReasoningArtifact::ChatReasoning {
+            field: choreo_proto::ChatReasoningField::ReasoningContent,
+            bytes: b"thinking".to_vec(),
+        };
         let producer = ReasoningProducer {
             provider_slug: "deepseek".into(),
             model: "deepseek-v4-pro".into(),

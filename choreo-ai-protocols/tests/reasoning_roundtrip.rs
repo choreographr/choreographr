@@ -26,7 +26,7 @@ use choreo_ai_protocols::openai::{
 };
 use choreo_ai_protocols::test_utils::{CapturedRequest, MockProvider};
 use choreo_ai_protocols::{ChatAssistantToolUse, ChatTurnRequest, ChatTurnResult};
-use choreo_proto::ReasoningArtifact;
+use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 
 // ── Shared builders ─────────────────────────────────────────────────────
 
@@ -182,9 +182,10 @@ fn deepseek_tool_loop_echoes_reasoning_content_verbatim() {
     // boundary — before the display field is consumed.
     assert_eq!(
         tool_use.reasoning_artifact,
-        Some(ReasoningArtifact::ChatReasoning(
-            REASONING.as_bytes().to_vec()
-        )),
+        Some(ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningContent,
+            bytes: REASONING.as_bytes().to_vec(),
+        }),
         "reasoning_content must be captured into the round-trip artifact",
     );
 

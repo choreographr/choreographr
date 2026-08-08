@@ -687,7 +687,10 @@ fn resolve_reasoning_effort(
 /// models, so under-counting here would mislead the context-window display.
 fn reasoning_artifact_tokens(enc: &tiktoken::CoreBpe, artifact: &ReasoningArtifact) -> u32 {
     let bytes = match artifact {
-        ReasoningArtifact::ChatReasoning(b)
+        // ChatReasoning is a struct variant (field tag + bytes); the field
+        // tag only matters for re-emission targeting, not token estimation,
+        // so bind just the payload.
+        ReasoningArtifact::ChatReasoning { bytes: b, .. }
         | ReasoningArtifact::AnthropicThinking(b)
         | ReasoningArtifact::GoogleSignatures(b)
         | ReasoningArtifact::ResponsesItems(b) => b,
@@ -2481,6 +2484,7 @@ mod tests {
     use crate::tools::context::ToolContext;
     use crate::tools::{Tool, ToolExecError, ToolRegistry};
     use choreo_ai_protocols::openai::AssistantToolCall;
+    use choreo_proto::ChatReasoningField;
     use std::sync::mpsc;
 
     fn make_session_with_turns() -> SessionState {
@@ -2598,7 +2602,10 @@ mod tests {
     }
 
     fn artifact(bytes: &[u8]) -> ReasoningArtifact {
-        ReasoningArtifact::ChatReasoning(bytes.to_vec())
+        ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningContent,
+            bytes: bytes.to_vec(),
+        }
     }
 
     /// Add a turn with an optional artifact/producer and optional assistant
@@ -3363,8 +3370,10 @@ mod tests {
             ChatRequestMessage::simple("assistant", "visible".into()),
         ];
         let mut with_artifact = base_messages.clone();
-        with_artifact[1].reasoning_artifact =
-            Some(ReasoningArtifact::ChatReasoning("thinking deep...".into()));
+        with_artifact[1].reasoning_artifact = Some(ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningContent,
+            bytes: "thinking deep...".into(),
+        });
 
         let (_, base_est) = estimate_prompt_tokens("gpt-4", &base_messages, &[]);
         let (_, artifact_est) = estimate_prompt_tokens("gpt-4", &with_artifact, &[]);
