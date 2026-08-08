@@ -449,7 +449,7 @@ Reasoning text is not only *displayed* — for several providers it must also be
 
 **Capture** happens inside each adapter before the display field is consumed: OpenAI chat wraps the raw reasoning string — from whichever chat field the provider populated (`reasoning_content`, `reasoning`, or `reasoning_text`, with that precedence) — into `ChatReasoning { field, bytes }`, tagging the artifact with the field it came from; Anthropic serializes the ordered thinking / redacted_thinking blocks (signatures + redacted data intact, order preserved) into `AnthropicThinking`; Google collects the `thoughtSignature` values (the `thought: true` marker may carry a signature on **any** part type — the wire-format fix; there is no separate `thinking` key) into `GoogleSignatures`; Responses collects the raw reasoning output items verbatim — type tag, id, summary, `encrypted_content` in stateless mode, and any unknown fields (e.g. a newer `content` shape), preserved exactly as returned — into `ResponsesItems`. The artifact rides out of the provider crate on `ChatAssistantToolUse`/`FinalTextResult.reasoning_artifact` and is stored on the `Turn` by the agent loop via `SessionState::set_assistant_response` — which now takes an `AssistantResponse` struct bundling text, reasoning, tool calls, usage, and the artifact + producer pair — alongside `Turn.reasoning_producer` (provider slug + model).
 
-**Carry** is a pure store-and-forward: the daemon never reads the payload bytes. The builder's only job is the *whether*: an artifact is attached to an assistant message only when (1) **same-model provenance** holds — `turn.reasoning_producer == {current provider_slug, current model}` — so a turn produced by a different model (mid-session `/model` switch) never replays its possibly-encrypted payload, and (2) the resolved `ReasoningPassback` policy says to:
+**Carry** is a pure store-and-forward: the daemon never reads the payload bytes. It also strips the artifact (and its producer) from every client-bound `DaemonMessage` payload — `TurnAppended`, `TurnFinalized`, `SessionState`, and `TurnsRedone` carry client copies with `reasoning_artifact`/`reasoning_producer` set to `None` (see `turn_for_client` in `choreo-daemon/src/sessions.rs`), so the bytes never leave the daemon process; only the request builder consumes them, from the authoritative `Turn` in `SessionState` and the DB. The builder's only job is the *whether*: an artifact is attached to an assistant message only when (1) **same-model provenance** holds — `turn.reasoning_producer == {current provider_slug, current model}` — so a turn produced by a different model (mid-session `/model` switch) never replays its possibly-encrypted payload, and (2) the resolved `ReasoningPassback` policy says to:
 
 | `reasoning_passback` | Meaning | Wire behavior |
 |---|---|---|
@@ -1528,9 +1528,11 @@ Sessions support undo/redo via an `undone` boolean flag on each `Turn`:
 - `assistant_text`, `assistant_reasoning`, `tool_calls`, `tool_results`, `displayed_images` — the assistant response.
 - `reasoning_artifact: Option<ReasoningArtifact>` — the opaque reasoning round-trip payload captured by
   the provider adapter at parse time (see Provider Architecture); forwarded to the next request verbatim
-  when the same model is still active and the passback policy asks for it.
+  when the same model is still active and the passback policy asks for it. The daemon strips it from
+  client-bound `DaemonMessage` payloads (clients receive `None`); only the daemon's request builder reads it.
 - `reasoning_producer: Option<ReasoningProducer>` — the `{ provider_slug, model }` that produced the turn's
   artifact; the builder's same-model provenance check drops the artifact after a mid-session model switch.
+  Also stripped from client-bound copies alongside the artifact.
 
 **Undo flow (`/undo` → `ClientMessage::Undo` → `SessionCommand::Undo` → `handle_undo`):**
 1. `SessionState::undo_turns()` finds the most recent non-undone turn with `user_text: Some(...)` via reverse scan.
@@ -1901,7 +1903,8 @@ counts survive the attach instead of regressing.
     (thought signatures), and OpenAI/xAI Responses (opaque reasoning items + `previous_response_id`)
     it must be sent back on the next request or the tool-call loop fails with a 400. The adapter
     captures the payload verbatim at the parse boundary into an opaque `ReasoningArtifact`; the
-    daemon stores it on the `Turn` and forwards it untouched; the adapter re-emits it verbatim in
+    daemon stores it on the `Turn` (and persists it), but strips it from client-bound `DaemonMessage`
+    payloads — only the daemon consumes it; the adapter re-emits it verbatim in
     its own wire format. *Whether* to send is derived, never configured: same-model provenance
     (`Turn.reasoning_producer` vs current provider+model, so a mid-session model switch drops every
     old artifact) plus the catalog's `reasoning_passback` policy (`None` / `ToolLoop` / `AllTurns` /

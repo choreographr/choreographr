@@ -605,7 +605,11 @@ impl SessionState {
                 .working_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
-            turns: self.turns.clone(),
+            turns: self
+                .turns
+                .iter()
+                .map(|(&turn_id, turn)| (turn_id, turn_for_client(turn)))
+                .collect(),
             active_tool_groups: self.config.active_tool_groups.iter().cloned().collect(),
             token_usage: Some(self.config.accumulated_usage),
             context_window: self.config.context_window,
@@ -805,6 +809,21 @@ impl SessionState {
             discovered_skills: None,
         }
     }
+}
+
+/// Client-bound copy of a turn with the opaque reasoning round-trip payload
+/// stripped: only the daemon consumes `reasoning_artifact`/`reasoning_producer`
+/// (it rebuilds the next provider request from them); clients render
+/// `assistant_reasoning` and never need the artifact bytes.  Stripping here
+/// keeps the artifact off every `DaemonMessage` payload (bandwidth + privacy:
+/// thinking-block JSON and encrypted provider blobs never leave the daemon
+/// process), while the authoritative `Turn` in `SessionState` and the DB keeps
+/// the full payload for the next request's builder.
+pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
+    let mut clone = turn.clone();
+    clone.reasoning_artifact = None;
+    clone.reasoning_producer = None;
+    clone
 }
 
 fn broadcast(
@@ -2007,7 +2026,10 @@ fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
         &ctx.daemon_tx,
         DaemonMessage::TurnsRedone {
             session_id: ctx.session_id,
-            turns,
+            turns: turns
+                .iter()
+                .map(|(&turn_id, turn)| (turn_id, turn_for_client(turn)))
+                .collect(),
         },
     );
     false
@@ -2272,6 +2294,96 @@ mod tests {
         let turn = state.turns.get(&tid).expect("turn exists");
         assert_eq!(turn.reasoning_artifact, None);
         assert_eq!(turn.reasoning_producer, None);
+    }
+
+    #[test]
+    fn turn_for_client_strips_artifact_and_producer() {
+        // The helper is the single choke point for client-bound turns: an
+        // authoritative turn carrying both round-trip fields must lose them
+        // in the client copy while every client-rendered field survives.
+        let artifact = ReasoningArtifact::ChatReasoning {
+            field: choreo_proto::ChatReasoningField::ReasoningContent,
+            bytes: b"thinking".to_vec(),
+        };
+        let producer = ReasoningProducer {
+            provider_slug: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+        };
+        let mut state = SessionState::empty();
+        let (tid, _) = state.start_turn(Some("hello".into()));
+        state.set_assistant_response(
+            tid,
+            AssistantResponse {
+                text: Some("hi".into()),
+                reasoning: Some("thinking out loud".into()),
+                reasoning_artifact: Some(artifact),
+                reasoning_producer: Some(producer),
+                ..Default::default()
+            },
+        );
+        let authoritative = state.turns.get(&tid).expect("turn exists");
+
+        let client = turn_for_client(authoritative);
+
+        // Round-trip payload is stripped from the client copy…
+        assert_eq!(client.reasoning_artifact, None);
+        assert_eq!(client.reasoning_producer, None);
+        // …while everything clients render survives untouched.
+        assert_eq!(client.assistant_text.as_deref(), Some("hi"));
+        assert_eq!(
+            client.assistant_reasoning.as_deref(),
+            Some("thinking out loud")
+        );
+        assert_eq!(client.user_text.as_deref(), Some("hello"));
+
+        // The authoritative turn keeps the full payload for the next request's builder.
+        assert!(authoritative.reasoning_artifact.is_some());
+        assert!(authoritative.reasoning_producer.is_some());
+    }
+
+    #[test]
+    fn session_state_message_strips_artifacts_from_turns() {
+        // `SessionState` snapshots ride on attach — every turn in the map must
+        // be the client-bound copy, even though the session's authoritative
+        // turns still carry their artifacts for the daemon's own use.
+        let artifact = ReasoningArtifact::ChatReasoning {
+            field: choreo_proto::ChatReasoningField::ReasoningContent,
+            bytes: b"thinking".to_vec(),
+        };
+        let producer = ReasoningProducer {
+            provider_slug: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+        };
+        let mut state = SessionState::empty();
+        let (tid, _) = state.start_turn(Some("hello".into()));
+        state.set_assistant_response(
+            tid,
+            AssistantResponse {
+                text: Some("hi".into()),
+                reasoning: Some("thinking out loud".into()),
+                reasoning_artifact: Some(artifact),
+                reasoning_producer: Some(producer),
+                ..Default::default()
+            },
+        );
+
+        let DaemonMessage::SessionState { turns, .. } = state.session_state_message(7) else {
+            panic!("expected SessionState message");
+        };
+        let client_turn = turns.get(&tid).expect("turn present in message");
+        assert_eq!(client_turn.reasoning_artifact, None);
+        assert_eq!(client_turn.reasoning_producer, None);
+        assert_eq!(client_turn.assistant_text.as_deref(), Some("hi"));
+        assert_eq!(
+            client_turn.assistant_reasoning.as_deref(),
+            Some("thinking out loud")
+        );
+
+        // The authoritative state must be untouched — the next request's
+        // builder still reads the artifact from the session's turn map.
+        let authoritative = state.turns.get(&tid).expect("turn exists");
+        assert!(authoritative.reasoning_artifact.is_some());
+        assert!(authoritative.reasoning_producer.is_some());
     }
 
     #[test]

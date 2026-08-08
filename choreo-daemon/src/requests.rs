@@ -1,6 +1,8 @@
 use crate::context::{self, LoadedSkill, SkillMeta};
 use crate::providers::InferenceProvider;
-use crate::sessions::{AssistantResponse, RequestContext, SessionCommand, SessionState};
+use crate::sessions::{
+    AssistantResponse, RequestContext, SessionCommand, SessionState, turn_for_client,
+};
 use crate::tools::context::ToolContext;
 use crate::tools::load_tools::{LoadToolsArgs, apply_load_tools};
 use crate::tools::set_working_dir::{SetWorkingDirArgs, resolve_working_dir_path};
@@ -44,7 +46,7 @@ fn broadcast_turn_appended(
         && let Err(e) = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
             session_id,
             turn_id,
-            turn: turn.clone(),
+            turn: turn_for_client(turn),
         }))
     {
         warn!(%turn_id, error = %e, "failed to broadcast TurnAppended");
@@ -1992,7 +1994,7 @@ fn finalize_and_broadcast_turn(
             .send(SessionCommand::Broadcast(DaemonMessage::TurnFinalized {
                 session_id: ctx.session_id,
                 turn_id: current_turn_id,
-                turn: turn.clone(),
+                turn: turn_for_client(turn),
             }));
     }
     Ok(())
@@ -3302,6 +3304,111 @@ mod tests {
 
         // Disconnected receiver should not panic — warn! is logged instead.
         broadcast_turn_appended(&tx, &session, 0, turn_id);
+    }
+
+    #[test]
+    fn broadcast_turn_appended_strips_reasoning_artifact() {
+        // The client-bound TurnAppended must never carry the opaque reasoning
+        // round-trip payload, even when the session's authoritative turn does.
+        let (tx, rx) = mpsc::channel::<SessionCommand>();
+        let mut session = SessionState::empty();
+        let (turn_id, _) = session.start_turn(Some("hello".into()));
+        session.set_assistant_response(
+            turn_id,
+            AssistantResponse {
+                text: Some("hi".into()),
+                reasoning: Some("thinking out loud".into()),
+                reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+                    field: ChatReasoningField::ReasoningContent,
+                    bytes: b"thinking".to_vec(),
+                }),
+                reasoning_producer: Some(ReasoningProducer {
+                    provider_slug: "deepseek".into(),
+                    model: "deepseek-v4-pro".into(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        broadcast_turn_appended(&tx, &session, 0, turn_id);
+
+        match rx.try_recv() {
+            Ok(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
+                turn_id: id,
+                turn,
+                ..
+            })) => {
+                assert_eq!(id, turn_id);
+                assert_eq!(turn.reasoning_artifact, None);
+                assert_eq!(turn.reasoning_producer, None);
+                assert_eq!(turn.assistant_text.as_deref(), Some("hi"));
+                assert_eq!(
+                    turn.assistant_reasoning.as_deref(),
+                    Some("thinking out loud")
+                );
+            }
+            Ok(_) => panic!("expected TurnAppended broadcast, got different command"),
+            Err(e) => panic!("expected TurnAppended broadcast, got error: {e}"),
+        }
+        // The authoritative turn keeps the artifact for the next request's builder.
+        assert!(session.turns[&turn_id].reasoning_artifact.is_some());
+        assert!(session.turns[&turn_id].reasoning_producer.is_some());
+    }
+
+    #[test]
+    fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
+        // TurnFinalized is the final turn snapshot sent to clients — the
+        // reasoning artifact must be stripped here too, while the DB write
+        // (inside finalize_and_broadcast_turn) persists the full turn.
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db,
+            tool_registry: ToolRegistry::new().build(),
+            daemon_tx,
+            max_turns: 0,
+        };
+        let mut session = SessionState::empty();
+        let (turn_id, _) = session.start_turn(Some("hello".into()));
+        session.set_assistant_response(
+            turn_id,
+            AssistantResponse {
+                text: Some("hi".into()),
+                reasoning: Some("thinking out loud".into()),
+                reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+                    field: ChatReasoningField::ReasoningContent,
+                    bytes: b"thinking".to_vec(),
+                }),
+                reasoning_producer: Some(ReasoningProducer {
+                    provider_slug: "deepseek".into(),
+                    model: "deepseek-v4-pro".into(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        finalize_and_broadcast_turn(&mut session, &ctx, turn_id).unwrap();
+
+        match cmd_rx.try_recv() {
+            Ok(SessionCommand::Broadcast(DaemonMessage::TurnFinalized { turn, .. })) => {
+                assert_eq!(turn.reasoning_artifact, None);
+                assert_eq!(turn.reasoning_producer, None);
+                assert_eq!(turn.assistant_text.as_deref(), Some("hi"));
+                assert_eq!(
+                    turn.assistant_reasoning.as_deref(),
+                    Some("thinking out loud")
+                );
+            }
+            Ok(_) => panic!("expected TurnFinalized broadcast, got different command"),
+            Err(e) => panic!("expected TurnFinalized broadcast, got error: {e}"),
+        }
+        // The authoritative turn keeps the artifact after finalize + broadcast.
+        assert!(session.turns[&turn_id].reasoning_artifact.is_some());
+        assert!(session.turns[&turn_id].reasoning_producer.is_some());
     }
 
     // -- resolve_reasoning_effort tests ------------------------------------
