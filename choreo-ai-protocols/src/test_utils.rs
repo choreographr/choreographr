@@ -172,12 +172,18 @@ impl MockProvider {
                     .filter_map(|line| line.split_once(':'))
                     .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
                     .collect();
-                captured_thread.lock().unwrap().push(CapturedRequest {
-                    method,
-                    path,
-                    headers,
-                    body,
-                });
+                // Recover from a poisoned lock (e.g. a test thread that
+                // panicked while holding it) instead of aborting this serve
+                // thread, which would stall `Drop`'s join and leak the thread.
+                captured_thread
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(CapturedRequest {
+                        method,
+                        path,
+                        headers,
+                        body,
+                    });
 
                 // Serve the next scripted response (peek when it is the last
                 // one so excess requests still get an answer). The lock is
@@ -185,7 +191,7 @@ impl MockProvider {
                 // blocking reads above would let an in-flight request stall
                 // `requests()` from the test thread.
                 let (status, content_type, response_body) = {
-                    let mut responses = responses.lock().unwrap();
+                    let mut responses = responses.lock().unwrap_or_else(|e| e.into_inner());
                     if responses.len() > 1 {
                         responses.pop_front().expect("scripted response")
                     } else {
@@ -246,7 +252,10 @@ impl MockProvider {
 
     /// Every request captured so far, in arrival order.
     pub fn requests(&self) -> Vec<CapturedRequest> {
-        self.captured.lock().unwrap().clone()
+        self.captured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 

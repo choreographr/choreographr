@@ -242,22 +242,38 @@ fn build_responses_input(
 }
 
 /// The minimal input for a fresh user turn chained onto a previous response:
-/// the system messages (the daemon rebuilds the system prompt every request,
-/// so the newest one must reach the model even though the chain already
-/// carries the old one) plus every message AFTER the last assistant-role
-/// message — in the daemon's loop that is exactly the new user message.
-/// Everything up to and including the last assistant message is already in
-/// the chained response's context and must not be resent.
+/// the newest system message (the daemon rebuilds the system prompt every
+/// request, so the latest one must reach the model even though the chain
+/// already carries the old one) plus every message AFTER the last
+/// assistant-role message — in the daemon's loop that is exactly the new user
+/// message. Everything up to and including the last assistant message is
+/// already in the chained response's context and must not be resent.
+///
+/// Only the *newest* system message is kept: any older system prompt is
+/// already in the chained context, and resending it would duplicate it. The
+/// system message is emitted first so it leads the request.
 fn chain_input_messages(messages: &[ChatRequestMessage]) -> Vec<ChatRequestMessage> {
     match messages.iter().rposition(|m| m.role == "assistant") {
-        // No assistant message yet — nothing has been chained, keep all.
+        // No assistant message yet — nothing has been chained, keep all. A
+        // chain id implies a prior model call that produced an assistant
+        // response, so this arm is defensive only.
         None => messages.to_vec(),
-        Some(last_assistant) => messages
-            .iter()
-            .enumerate()
-            .filter(|(i, m)| *i > last_assistant || m.role == "system")
-            .map(|(_, m)| m.clone())
-            .collect(),
+        Some(last_assistant) => {
+            let mut out = Vec::new();
+            if let Some(system) = messages.iter().rev().find(|m| m.role == "system") {
+                out.push(system.clone());
+            }
+            // Messages strictly after the last assistant message; the newest
+            // system message (if any) was already emitted above, so skip any
+            // system role in the tail to avoid duplicates.
+            out.extend(
+                messages[last_assistant + 1..]
+                    .iter()
+                    .filter(|m| m.role != "system")
+                    .cloned(),
+            );
+            out
+        }
     }
 }
 
@@ -1689,6 +1705,29 @@ mod tests {
         let value = result.expect("expected Some value");
         let arr = value.as_array().unwrap();
         assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn build_responses_input_chained_keeps_only_newest_system_message() {
+        // If the caller ever accumulates more than one system message, only the
+        // newest may be sent: the older one is already in the chained response's
+        // context and resending it would duplicate it (billing + context
+        // inflation). The newest system message leads the input.
+        let messages = vec![
+            ChatRequestMessage::simple("system", "old system".into()),
+            ChatRequestMessage::simple("user", "turn one".into()),
+            ChatRequestMessage::simple("assistant", "answer".into()),
+            ChatRequestMessage::simple("system", "new system".into()),
+            ChatRequestMessage::simple("user", "turn two".into()),
+        ];
+        let result = build_responses_input(&[], &messages, Some("resp_1")).unwrap();
+        let value = result.expect("expected Some value");
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[0]["content"], "new system");
+        assert_eq!(arr[1]["role"], "user");
+        assert_eq!(arr[1]["content"], "turn two");
     }
 
     // ── Reasoning extraction tests ────────────────────────────────────

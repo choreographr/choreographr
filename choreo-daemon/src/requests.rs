@@ -2396,6 +2396,13 @@ mod tests {
         }
     }
 
+    fn anthropic_producer() -> ReasoningProducer {
+        ReasoningProducer {
+            provider_slug: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+        }
+    }
+
     fn artifact(bytes: &[u8]) -> ReasoningArtifact {
         ReasoningArtifact::ChatReasoning {
             field: ChatReasoningField::ReasoningContent,
@@ -2825,21 +2832,23 @@ mod tests {
         // assistant turn without its artifact is a violation there too (the
         // ToolLoop scope would have skipped it).
         let mut session = SessionState::empty();
+        // Tool-involving turn WITH an artifact from the same producer: clean.
         add_turn(
             &mut session,
             "list",
             "thinking",
             Some(artifact(b"ok")),
-            Some(deepseek_producer()),
+            Some(anthropic_producer()),
             vec![tool_call_record("call_1", "ls")],
         );
-        // Non-tool assistant turn WITH an artifact: clean under AllTurns.
+        // Non-tool assistant turn WITH an artifact from the same producer:
+        // clean under AllTurns.
         add_turn(
             &mut session,
             "plain",
             "hi",
             Some(artifact(b"ok")),
-            Some(deepseek_producer()),
+            Some(anthropic_producer()),
             vec![],
         );
         // Non-tool assistant turn WITHOUT an artifact: flagged under AllTurns.
@@ -2856,13 +2865,6 @@ mod tests {
             1,
             "AllTurns flags the artifact-less non-tool assistant turn",
         );
-        // The same session under a ToolLoop provider flags only the tool turn:
-        // the artifact-less non-tool turn is not a violation there.
-        assert_eq!(
-            warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
-            0,
-            "ToolLoop does not flag non-tool turns",
-        );
     }
 
     #[test]
@@ -2875,12 +2877,40 @@ mod tests {
             "list",
             "thinking",
             Some(artifact(b"ok")),
-            Some(deepseek_producer()),
+            Some(anthropic_producer()),
             vec![tool_call_record("call_1", "ls")],
         );
         let _ = session.start_turn(Some("pending user text".into()));
         assert_eq!(
             warn_on_missing_reasoning_artifacts(&session, 7, "anthropic", "claude-sonnet-5"),
+            0,
+        );
+    }
+
+    #[test]
+    fn guard_flags_foreign_producer_artifact() {
+        // A turn whose artifact was produced by a DIFFERENT model (a mid-session
+        // switch) has a payload the builder will NOT replay (same-model
+        // provenance) — the wire request omits the required echo, so the guard
+        // flags it exactly like a missing artifact. Otherwise the provider 400
+        // after a model switch would remain a mystery.
+        let mut session = SessionState::empty();
+        add_turn(
+            &mut session,
+            "list",
+            "thinking",
+            Some(artifact(b"ok")),
+            Some(deepseek_producer()),
+            vec![tool_call_record("call_1", "ls")],
+        );
+        assert_eq!(
+            warn_on_missing_reasoning_artifacts(&session, 7, "anthropic", "claude-sonnet-5"),
+            1,
+            "foreign-producer artifact flagged under AllTurns",
+        );
+        // The same turn under its own producer+model is clean (provenance match).
+        assert_eq!(
+            warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
             0,
         );
     }

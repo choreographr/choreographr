@@ -189,8 +189,9 @@ pub(crate) fn initial_prev_resp_id(
 /// was captured (e.g. a pre-migration session state) would otherwise be sent
 /// without the reasoning payload the provider demands on tool-loop turns,
 /// surfacing as a mysterious 400 — this turns that into a diagnosable log
-/// line. Returns the number of missing artifacts (0 when clean) so tests can
-/// exercise the path deterministically.
+/// line. Returns the number of turns that will omit a required reasoning
+/// echo (missing artifact, or an artifact produced by a different model), 0
+/// when clean, so tests can exercise the path deterministically.
 ///
 /// The guard deliberately does NOT disable thinking for the request: for
 /// ToolLoop providers (DeepSeek/Kimi) the 400 comes from *history*, not the
@@ -202,7 +203,14 @@ pub(crate) fn initial_prev_resp_id(
 /// Scope: `ToolLoop` cares only about tool-involving turns (that is where the
 /// provider demands the echo); `AllTurns`/`Signature` echo on every assistant
 /// message, so any assistant turn missing its artifact is a violation there.
-pub fn warn_on_missing_reasoning_artifacts(
+///
+/// Provenance is checked exactly like the builder: an artifact is only
+/// replayed when its producer matches the current (provider_slug, model), so
+/// after a deliberate mid-session model switch every pre-switch turn is
+/// flagged on each request. That is the intended diagnostic signal — the
+/// built request genuinely omits those echoes; if the provider accepts the
+/// switch, the warnings are informational rather than a blocker.
+pub(crate) fn warn_on_missing_reasoning_artifacts(
     session: &SessionState,
     session_id: u64,
     provider_slug: &str,
@@ -221,7 +229,7 @@ pub fn warn_on_missing_reasoning_artifacts(
         passback,
         ReasoningPassback::AllTurns | ReasoningPassback::Signature
     );
-    let mut missing = 0;
+    let mut problems = 0;
     for (turn_id, turn) in session.turns.iter() {
         if turn.undone {
             continue;
@@ -235,8 +243,19 @@ pub fn warn_on_missing_reasoning_artifacts(
         if !check_all_turns && !turn_has_tool_involvement(turn) {
             continue;
         }
+        // Mirror the builder's provenance gate exactly: an artifact is
+        // replayed only when its producer matches the current (provider_slug,
+        // model), so a turn recorded under a different model (mid-session
+        // switch) omits its echo on the wire even though the artifact bytes
+        // exist — flag it like a missing artifact, or the provider 400 after
+        // the switch stays a mystery.
+        let same_producer = turn
+            .reasoning_producer
+            .as_ref()
+            .map(|p| (p.provider_slug.as_str(), p.model.as_str()))
+            == Some((provider_slug, model));
         if turn.reasoning_artifact.is_none() {
-            missing += 1;
+            problems += 1;
             warn!(
                 session_id,
                 turn_id,
@@ -245,9 +264,19 @@ pub fn warn_on_missing_reasoning_artifacts(
                 passback = ?passback,
                 "reasoning artifact missing for turn; provider may reject this request",
             );
+        } else if !same_producer {
+            problems += 1;
+            warn!(
+                session_id,
+                turn_id,
+                provider_slug,
+                model,
+                passback = ?passback,
+                "reasoning artifact produced by a different model; it will not be replayed and the provider may reject this request",
+            );
         }
     }
-    missing
+    problems
 }
 
 /// Estimate the input tokens contributed by a reasoning artifact's payload.
