@@ -280,6 +280,7 @@ impl From<SessionRecord> for SessionMetadata {
             context_window: None,
             last_prompt_tokens: None,
             last_response_id: record.last_response_id,
+            last_response_id_producer: record.last_response_id_producer,
         };
         let mut meta = SessionMetadata::from(&config);
         meta.turn_count = record.turn_count;
@@ -305,6 +306,7 @@ impl From<SessionMetadata> for SessionRecord {
             // `SessionMetadata` deliberately does not carry response ids; the
             // state→record conversion below overrides this from the config.
             last_response_id: None,
+            last_response_id_producer: None,
         }
     }
 }
@@ -369,6 +371,12 @@ pub struct SessionConfig {
     /// turns (phase 4c). Meaningless for other policies; set after every model
     /// call in the agent loop and restored only under the ResponseId policy.
     pub last_response_id: Option<String>,
+    /// Which provider+model produced `last_response_id`. The builder restores
+    /// the id only when the current provider+model matches (same provenance
+    /// rule as reasoning artifacts) — a stale id persisted under a different
+    /// provider must never be replayed into a service that does not recognize
+    /// it.
+    pub last_response_id_producer: Option<ReasoningProducer>,
 }
 
 impl Default for SessionConfig {
@@ -389,6 +397,7 @@ impl Default for SessionConfig {
             context_window: None,
             last_prompt_tokens: None,
             last_response_id: None,
+            last_response_id_producer: None,
         }
     }
 }
@@ -408,10 +417,11 @@ impl SessionConfig {
         self.accumulated_usage = snapshot.accumulated_usage;
         self.context_window = snapshot.context_window;
         self.last_prompt_tokens = snapshot.last_prompt_tokens;
-        // The worker writes last_response_id after each model call; it must
-        // survive the request boundary so ResponseId-policy chaining works
-        // across user turns (phase 4c).
+        // The worker writes last_response_id (+ its producer) after each model
+        // call; they must survive the request boundary so ResponseId-policy
+        // chaining works across user turns (phase 4c).
         self.last_response_id = snapshot.last_response_id.clone();
+        self.last_response_id_producer = snapshot.last_response_id_producer.clone();
     }
 }
 
@@ -448,10 +458,11 @@ impl From<&SessionState> for SessionRecord {
         let meta: SessionMetadata = state.into();
         let mut record: SessionRecord = meta.into();
         record.context_config = state.config.context_config.clone();
-        // last_response_id is worker-owned runtime state that must survive the
-        // record round-trip: it chains ResponseId-policy models across user
-        // turns AND daemon restarts (phase 4c).
+        // last_response_id (+ producer) is worker-owned runtime state that must
+        // survive the record round-trip: it chains ResponseId-policy models
+        // across user turns AND daemon restarts (phase 4c).
         record.last_response_id = state.config.last_response_id.clone();
+        record.last_response_id_producer = state.config.last_response_id_producer.clone();
         record
     }
 }
@@ -913,6 +924,9 @@ pub fn session_main(
         last_response_id: init_record
             .as_ref()
             .and_then(|r| r.last_response_id.clone()),
+        last_response_id_producer: init_record
+            .as_ref()
+            .and_then(|r| r.last_response_id_producer.clone()),
     };
     let mut state = SessionState {
         config,
@@ -2189,6 +2203,7 @@ mod tests {
                 context_window: None,
                 last_prompt_tokens: None,
                 last_response_id: None,
+                last_response_id_producer: None,
             },
             next_turn_id: 1,
             last_undo_turn_ids: None,
@@ -2242,21 +2257,35 @@ mod tests {
 
     #[test]
     fn session_record_carries_last_response_id_from_config() {
-        // Phase 4c: `last_response_id` is worker-owned runtime state that must
-        // survive the state → record conversion (and the reverse on session
-        // load) so ResponseId-policy models chain across user turns and
-        // daemon restarts.
+        // Phase 4c: `last_response_id` (+ its producer) is worker-owned runtime
+        // state that must survive the state → record conversion (and the
+        // reverse on session load) so ResponseId-policy models chain across
+        // user turns and daemon restarts.
         let mut state = SessionState::empty();
         state.config.last_response_id = Some("resp_9".into());
+        state.config.last_response_id_producer = Some(ReasoningProducer {
+            provider_slug: "openai".into(),
+            model: "gpt-5.4".into(),
+        });
         let record = SessionRecord::from(&state);
         assert_eq!(record.last_response_id.as_deref(), Some("resp_9"));
+        assert_eq!(
+            record
+                .last_response_id_producer
+                .as_ref()
+                .map(|p| p.model.as_str()),
+            Some("gpt-5.4"),
+            "producer must survive the state → record conversion",
+        );
 
         // Round-trip back into a config (mirrors `session_main` restore).
         let restored = SessionConfig {
             last_response_id: record.last_response_id.clone(),
+            last_response_id_producer: record.last_response_id_producer.clone(),
             ..SessionConfig::default()
         };
         assert_eq!(restored.last_response_id.as_deref(), Some("resp_9"));
+        assert_eq!(restored.last_response_id_producer.unwrap().model, "gpt-5.4",);
     }
 
     fn broadcast_setup() -> (SessionState, RequestContext) {

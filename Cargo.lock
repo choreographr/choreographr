@@ -785,6 +785,7 @@ dependencies = [
 name = "choreo-ai-protocols"
 version = "0.1.0"
 dependencies = [
+ "choreo-ai-protocols",
  "choreo-proto",
  "crossbeam-channel",
  "rand 0.10.2",

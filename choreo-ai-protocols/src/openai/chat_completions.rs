@@ -450,6 +450,19 @@ pub(crate) fn accumulate_tool_calls_from_deltas(
 
 // ── Streaming chat completions with tools ───────────────────────────────
 
+/// Which chat-completions reasoning field a stream is using, locked in on the
+/// first non-empty reasoning delta. Mirrors the non-streaming precedence
+/// (`reasoning_content` > `reasoning` > `reasoning_text` in `take_reasoning`)
+/// so the round-trip artifact is re-emitted to the SAME field the provider
+/// used — a stream that sends `reasoning_text` must not have it replayed as
+/// `reasoning_content` on the next tool-loop turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningField {
+    ReasoningContent,
+    Reasoning,
+    ReasoningText,
+}
+
 /// Mutable state accumulated across streamed chat-completions chunks.
 ///
 /// Extracted from the streaming request loop so the parse→accumulate→turn
@@ -460,6 +473,9 @@ struct ChatCompletionsStreamAccumulator {
     has_any_output: bool,
     full_content: String,
     full_reasoning: String,
+    /// The reasoning field the stream is using, locked in on the first
+    /// non-empty delta (`None` until then) — see [`ReasoningField`].
+    reasoning_field: Option<ReasoningField>,
     /// Raw tool call deltas across all chunks, merged by index by
     /// `accumulate_tool_calls_from_deltas` once the stream is fully consumed.
     raw_tool_call_deltas: Vec<StreamToolCallDelta>,
@@ -472,12 +488,14 @@ struct ChatCompletionsStreamAccumulator {
 
 impl Default for ChatCompletionsStreamAccumulator {
     fn default() -> Self {
-        // Manual impl: `[bool; MAX_TOOL_CALLS]` (128) is past the size for
-        // which std provides a derive-usable `Default`.
+        // Manual impl: std implements `Default` only for arrays up to `[T; 32]`
+        // (const-generic array Default was never stabilized), so `[bool;
+        // MAX_TOOL_CALLS]` (128) cannot be derived.
         Self {
             has_any_output: false,
             full_content: String::new(),
             full_reasoning: String::new(),
+            reasoning_field: None,
             raw_tool_call_deltas: Vec::new(),
             seen_tool_call_indices: [false; MAX_TOOL_CALLS],
             distinct_tool_call_count: 0,
@@ -525,19 +543,30 @@ impl ChatCompletionsStreamAccumulator {
 
             // Reasoning chunks — accumulate into `full_reasoning` (used for
             // both display and the round-trip artifact) and forward each
-            // delta as a display event.
-            for reasoning in [
-                &delta.reasoning_content,
-                &delta.reasoning,
-                &delta.reasoning_text,
-            ]
-            .into_iter()
-            .flatten()
-            .filter(|r| !r.is_empty())
-            {
+            // delta as a display event. The field is locked in on the first
+            // non-empty delta (precedence reasoning_content > reasoning >
+            // reasoning_text, matching the non-streaming `take_reasoning`
+            // choice), so the artifact is re-emitted to the SAME field the
+            // provider used; a stray delta from a different field is ignored
+            // rather than mixed into the blob.
+            for (field, text) in [
+                (ReasoningField::ReasoningContent, &delta.reasoning_content),
+                (ReasoningField::Reasoning, &delta.reasoning),
+                (ReasoningField::ReasoningText, &delta.reasoning_text),
+            ] {
+                let Some(text) = text.as_deref().filter(|t| !t.is_empty()) else {
+                    continue;
+                };
                 self.has_any_output = true;
-                self.full_reasoning.push_str(reasoning);
-                on_event(StreamEvent::Reasoning(reasoning.clone()))?;
+                let chosen = self.reasoning_field.get_or_insert(field);
+                if *chosen != field {
+                    // Stray delta from a non-primary field — don't display or
+                    // capture it (the artifact must stay field-pure so it
+                    // replays to the correct wire field).
+                    continue;
+                }
+                self.full_reasoning.push_str(text);
+                on_event(StreamEvent::Reasoning(text.to_string()))?;
             }
 
             // Collect raw tool call deltas — the shared accumulator
@@ -571,8 +600,8 @@ impl ChatCompletionsStreamAccumulator {
 
     /// Finalize the accumulated stream into a turn result, attaching the
     /// `ChatReasoning` artifact captured from the accumulated reasoning
-    /// deltas (the concatenated deltas are the provider's raw
-    /// `reasoning_content` value, echoed verbatim on tool-loop turns).
+    /// deltas (the concatenated deltas of the locked-in field are the
+    /// provider's raw reasoning value, echoed verbatim on tool-loop turns).
     fn into_turn_result(self) -> Result<ChatTurnResult, super::OpenAiError> {
         if !self.has_any_output {
             return Err(super::OpenAiError::EmptyResponse);
@@ -1327,6 +1356,83 @@ mod tests {
             ChatTurnResult::FinalText(f) => {
                 assert!(f.reasoning.is_none());
                 assert!(f.reasoning_artifact.is_none());
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_locks_reasoning_field_on_first_delta() {
+        // A stream that sends `reasoning_text` (not `reasoning_content`) must
+        // capture ONLY that field: the round-trip artifact is re-emitted to
+        // the same field the provider used, so a later stray
+        // `reasoning_content` delta must not be mixed into the payload (it
+        // would corrupt the replayed reasoning on the next tool-loop turn).
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk1: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_text":"think step by step"}}]}"#,
+        )
+        .unwrap();
+        let chunk2: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_content":"stray other field","content":"answer"}}]}"#,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        acc.apply(&chunk1, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        acc.apply(&chunk2, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        let result = acc.into_turn_result().unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.content, "answer");
+                assert_eq!(f.reasoning.as_deref(), Some("think step by step"));
+                assert_eq!(
+                    f.reasoning_artifact,
+                    Some(ReasoningArtifact::ChatReasoning(
+                        b"think step by step".to_vec()
+                    )),
+                    "artifact must capture only the locked-in reasoning_text field",
+                );
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+        // Only the locked-in field's delta is forwarded as a display event;
+        // the stray reasoning_content delta is neither displayed nor captured.
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Reasoning("think step by step".into()),
+                StreamEvent::Answer("answer".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_single_chunk_prefers_reasoning_content() {
+        // A single chunk carrying BOTH reasoning_content and reasoning must
+        // pick reasoning_content — the non-streaming precedence
+        // (take_reasoning consumes reasoning_content first).
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_content":"primary","reasoning":"secondary"}}]}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk, &mut |_| Ok(())).unwrap();
+        let result = acc.into_turn_result().unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.reasoning.as_deref(), Some("primary"));
+                assert_eq!(
+                    f.reasoning_artifact,
+                    Some(ReasoningArtifact::ChatReasoning(b"primary".to_vec())),
+                );
             }
             other => panic!("expected FinalText, got {other:?}"),
         }

@@ -12,139 +12,13 @@
 //! AGENTS.md they live in `tests/` and are marked `#[ignore]` (run via
 //! `cargo test-integration`).
 
-use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
-
 use choreo_ai_protocols::ChatTurnRequest;
 use choreo_ai_protocols::openai::{
     ChatRequestMessage, MaxTokensField, OpenAiClient, ServiceConfig,
 };
+use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_proto::{AssistantToolCallRecord, ReasoningArtifact, ReasoningProducer};
 use choreographr::{SessionState, build_chat_request_messages};
-
-// ── Scripted mock provider (see choreo-ai-protocols tests for the same
-//    helper — duplicated here because integration test crates cannot share
-//    code across workspace members) ──────────────────────────────────────
-
-/// One HTTP request captured by the mock provider.
-#[derive(Debug, Clone)]
-struct CapturedRequest {
-    path: String,
-    body: Vec<u8>,
-}
-
-impl CapturedRequest {
-    fn body_json(&self) -> serde_json::Value {
-        serde_json::from_slice(&self.body).expect("captured request body is JSON")
-    }
-}
-
-/// Serves one canned response per request (last entry repeats) and records
-/// every request body. Speaks just enough HTTP/1.1 for the ureq agent.
-struct MockProvider {
-    addr: std::net::SocketAddr,
-    captured: Arc<Mutex<Vec<CapturedRequest>>>,
-    _handle: std::thread::JoinHandle<()>,
-}
-
-impl MockProvider {
-    fn start(responses: Vec<(u16, String)>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
-        let addr = listener.local_addr().expect("mock provider local addr");
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let captured_thread = Arc::clone(&captured);
-        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
-
-        let handle = std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else {
-                    break;
-                };
-                let mut responses = responses.lock().unwrap();
-
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 4096];
-                let head_end = loop {
-                    let n = stream.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        break 0;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        break pos;
-                    }
-                    if buf.len() > 1 << 20 {
-                        panic!("mock provider: request head too large");
-                    }
-                };
-                if head_end == 0 {
-                    continue;
-                }
-                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-                let body_start = head_end + 4;
-                let content_length = head
-                    .lines()
-                    .find_map(|line| {
-                        let (key, value) = line.split_once(':')?;
-                        if !key.trim().eq_ignore_ascii_case("content-length") {
-                            return None;
-                        }
-                        value.trim().parse::<usize>().ok()
-                    })
-                    .unwrap_or(0);
-                while buf.len().saturating_sub(body_start) < content_length {
-                    let n = stream.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                }
-                let body = buf[body_start..body_start + content_length].to_vec();
-                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
-                captured_thread
-                    .lock()
-                    .unwrap()
-                    .push(CapturedRequest { path, body });
-
-                let (status, response_body) = if responses.len() > 1 {
-                    responses.pop_front().expect("scripted response")
-                } else {
-                    responses.front().cloned().expect("scripted response")
-                };
-                let reason = if status == 200 { "OK" } else { "Error" };
-                let head = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    response_body.len()
-                );
-                stream.write_all(head.as_bytes()).unwrap_or_default();
-                stream
-                    .write_all(response_body.as_bytes())
-                    .unwrap_or_default();
-                stream.flush().unwrap_or_default();
-            }
-        });
-
-        Self {
-            addr,
-            captured,
-            _handle: handle,
-        }
-    }
-
-    fn base_url(&self, prefix: &str) -> String {
-        format!(
-            "http://127.0.0.1:{}/{}",
-            self.addr.port(),
-            prefix.trim_matches('/')
-        )
-    }
-
-    fn requests(&self) -> Vec<CapturedRequest> {
-        self.captured.lock().unwrap().clone()
-    }
-}
 
 // ── Fixtures ─────────────────────────────────────────────────────────────
 
@@ -279,8 +153,8 @@ fn model_switch_sends_no_reasoning_on_the_wire() {
     );
 
     let mock = MockProvider::start(vec![
-        (200, final_text_response()),
-        (200, final_text_response()),
+        (200, "application/json", final_text_response()),
+        (200, "application/json", final_text_response()),
     ]);
 
     let client = OpenAiClient::new(

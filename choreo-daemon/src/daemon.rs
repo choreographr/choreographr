@@ -550,6 +550,7 @@ impl DaemonState {
             context_config: context_config.clone().unwrap_or_default(),
             account_name: account_name.clone(),
             last_response_id: None,
+            last_response_id_producer: None,
         };
 
         if let Err(e) = db::write_session(&self.db, sid, &record) {
@@ -2122,6 +2123,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: None,
+            last_response_id_producer: None,
         };
         db::write_session(&state.db, 1, &record).unwrap();
         // The deleted marker is set (the session thread has not yet exited,
@@ -2167,6 +2169,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: None,
+            last_response_id_producer: None,
         };
         db::write_session(&state.db, 7, &record).unwrap();
         db::mark_session_deleted(&state.db, 7).unwrap();
@@ -2219,6 +2222,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: None,
+            last_response_id_producer: None,
         };
         db::write_session(&state.db, 12, &record).unwrap();
         // A stale tombstone from an earlier interrupted delete of the same id.
@@ -2308,6 +2312,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: None,
+            last_response_id_producer: None,
         };
         db::write_session(&state.db, 3, &record).unwrap();
         db::mark_session_deleted(&state.db, 3).unwrap();
@@ -2351,6 +2356,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: None,
+            last_response_id_producer: None,
         };
         db::write_session(&state.db, 4, &record).unwrap();
         // A blocking stand-in session thread: not finished, so the delete
@@ -2400,6 +2406,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: None,
+            last_response_id_producer: None,
         };
         db::write_session(&state.db, 5, &record).unwrap();
         // First delete defers: live thread → marker set, tombstone written,
@@ -2468,6 +2475,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: None,
+            last_response_id_producer: None,
         };
         db::write_session(&state.db, 8, &record).unwrap();
 

@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use choreo_proto::{ContextConfig, Turn};
+use choreo_proto::{ContextConfig, ReasoningProducer, Turn};
 use redb::ReadableDatabase;
 use redb::ReadableTable;
 use redb::TableDefinition;
@@ -67,6 +67,13 @@ pub struct SessionRecord {
     /// warning by `read_all_sessions`).
     #[serde(default)]
     pub last_response_id: Option<String>,
+    /// Which provider+model produced `last_response_id`. The request builder
+    /// restores the persisted id only when the current provider+model matches
+    /// (same provenance rule as reasoning artifacts) — a stale id persisted
+    /// under a different provider (e.g. a mid-session openai → xAI switch)
+    /// must never be replayed into a service that does not recognize it.
+    #[serde(default)]
+    pub last_response_id_producer: Option<ReasoningProducer>,
 }
 
 pub fn db_path() -> io::Result<PathBuf> {
@@ -888,6 +895,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: None,
+            last_response_id_producer: None,
         };
         write_session(&db, id, &record).unwrap();
 
@@ -937,11 +945,22 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: Some("resp_1".into()),
+            last_response_id_producer: Some(ReasoningProducer {
+                provider_slug: "openai".into(),
+                model: "gpt-5.4".into(),
+            }),
         };
         write_session(&db, id, &record).unwrap();
 
         let read = read_session(&db, id).unwrap().unwrap();
         assert_eq!(read.last_response_id.as_deref(), Some("resp_1"));
+        assert_eq!(
+            read.last_response_id_producer
+                .as_ref()
+                .map(|p| p.model.as_str()),
+            Some("gpt-5.4"),
+            "response id provenance must survive the write/read cycle",
+        );
         assert_eq!(read.title.as_deref(), Some("t"));
     }
 
@@ -999,6 +1018,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: None,
+            last_response_id_producer: None,
         };
 
         write_session(&db, 5, &record).unwrap();
@@ -1036,6 +1056,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             last_response_id: None,
+            last_response_id_producer: None,
         };
         write_session(&db, 6, &record).unwrap();
         mark_session_deleted(&db, 6).unwrap();

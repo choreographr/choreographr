@@ -1110,12 +1110,28 @@ fn apply_pending_config_change(session: &mut SessionState, change: &PendingConfi
 /// config after the last model call is restored here. Every other policy
 /// resets to None: the id is meaningless outside Responses-style APIs and
 /// must not leak into a request that does not understand it.
+///
+/// Restoration is additionally gated on provenance: the persisted id is
+/// restored only when the current provider+model is the one that produced it
+/// (same-model provenance as reasoning artifacts), so a stale id from a
+/// different provider or model is never replayed.
 fn initial_prev_resp_id(
     session: &SessionState,
     provider_slug: &str,
     model: &str,
 ) -> Option<String> {
-    if model_reasoning_passback(provider_slug, model) == ReasoningPassback::ResponseId {
+    // A response id is service-bound: a stale id persisted under a different
+    // provider (mid-session openai → xAI switch) would be rejected with a 400
+    // if replayed, and it is model-bound for continuity purposes too — so
+    // require an exact producer match, mirroring the artifact provenance check.
+    let same_producer = session.config.last_response_id_producer.as_ref()
+        == Some(&ReasoningProducer {
+            provider_slug: provider_slug.to_string(),
+            model: model.to_string(),
+        });
+    if same_producer
+        && model_reasoning_passback(provider_slug, model) == ReasoningPassback::ResponseId
+    {
         session.config.last_response_id.clone()
     } else {
         None
@@ -1379,6 +1395,12 @@ pub(crate) fn run_agent_loop(
                 // turn (phase 4c): the builder re-emits it on the next request
                 // when the same model is still active and the passback policy
                 // asks for it.
+                // Record the producing provider+model once: it feeds both the
+                // turn's provenance and the persisted response-id provenance.
+                let producer = ReasoningProducer {
+                    provider_slug: provider_slug.to_string(),
+                    model: model.to_string(),
+                };
                 session.set_assistant_response(
                     current_turn_id,
                     Some(final_text.content),
@@ -1386,15 +1408,16 @@ pub(crate) fn run_agent_loop(
                     Vec::new(),
                     token_usage,
                     final_text.reasoning_artifact.clone(),
-                    Some(ReasoningProducer {
-                        provider_slug: provider_slug.to_string(),
-                        model: model.to_string(),
-                    }),
+                    Some(producer.clone()),
                 );
-                // Persist the response id so a ResponseId-policy provider can
-                // chain the next user turn via previous_response_id (restored
-                // at the top of the next loop invocation).
+                // Persist the response id + its producing model so a
+                // ResponseId-policy provider can chain the next user turn via
+                // previous_response_id (restored at the top of the next loop
+                // invocation only when the same provider+model is still
+                // active — the id is service-bound and must not be replayed
+                // into a different provider).
                 session.config.last_response_id = final_text.response_id.clone();
+                session.config.last_response_id_producer = Some(producer);
                 finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
                 tool_results.clear();
                 return Ok(false);
@@ -1416,6 +1439,12 @@ pub(crate) fn run_agent_loop(
                         arguments_json: tc.arguments_json.clone(),
                     })
                     .collect();
+                // Record the producing provider+model once: it feeds both the
+                // turn's provenance and the persisted response-id provenance.
+                let producer = ReasoningProducer {
+                    provider_slug: provider_slug.to_string(),
+                    model: model.to_string(),
+                };
                 session.set_assistant_response(
                     current_turn_id,
                     tool_use.content.clone(),
@@ -1423,10 +1452,7 @@ pub(crate) fn run_agent_loop(
                     tool_call_records.clone(),
                     token_usage,
                     tool_use.reasoning_artifact.clone(),
-                    Some(ReasoningProducer {
-                        provider_slug: provider_slug.to_string(),
-                        model: model.to_string(),
-                    }),
+                    Some(producer.clone()),
                 );
                 // Seed one placeholder tool result per call, in the model's
                 // call order, so the transcript renders every tool result in
@@ -1435,11 +1461,13 @@ pub(crate) fn run_agent_loop(
                 session.seed_tool_results(current_turn_id, &tool_call_records);
                 broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, current_turn_id);
                 // Store response_id for chaining tool results back to this
-                // turn, and persist it on the session config so ResponseId-
-                // policy providers can chain across user turns (restored at
-                // the top of the next loop invocation).
+                // turn, and persist it (+ its producing model) on the session
+                // config so ResponseId-policy providers can chain across user
+                // turns (restored at the top of the next loop invocation only
+                // when the same provider+model is still active).
                 prev_resp_id = tool_use.response_id.clone();
                 session.config.last_response_id = prev_resp_id.clone();
+                session.config.last_response_id_producer = Some(producer);
                 tool_results.clear();
 
                 // Partition tool calls into serial and concurrent.
@@ -2862,9 +2890,13 @@ mod tests {
     fn initial_prev_resp_id_response_policy_restores_persisted_id() {
         let mut session = SessionState::empty();
         session.config.last_response_id = Some("resp_123".into());
-        // gpt-4 is an OpenAI Responses model → ResponseId policy: the id
-        // persisted after the last model call must be restored to chain
-        // reasoning continuity across user turns.
+        session.config.last_response_id_producer = Some(ReasoningProducer {
+            provider_slug: "openai".into(),
+            model: "gpt-4".into(),
+        });
+        // gpt-4 is an OpenAI Responses model → ResponseId policy AND the
+        // persisted id was produced by the same provider+model: the id must
+        // be restored to chain reasoning continuity across user turns.
         assert_eq!(
             initial_prev_resp_id(&session, "openai", "gpt-4").as_deref(),
             Some("resp_123"),
@@ -2875,8 +2907,13 @@ mod tests {
     fn initial_prev_resp_id_other_policies_reset_to_none() {
         let mut session = SessionState::empty();
         session.config.last_response_id = Some("resp_123".into());
+        session.config.last_response_id_producer = Some(ReasoningProducer {
+            provider_slug: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+        });
         // DeepSeek chat → ToolLoop policy: a stale id must NOT leak into a
-        // request that does not understand previous_response_id.
+        // request that does not understand previous_response_id — even when
+        // the provenance matches.
         assert_eq!(
             initial_prev_resp_id(&session, "deepseek", "deepseek-v4-pro"),
             None,
@@ -2886,6 +2923,35 @@ mod tests {
             initial_prev_resp_id(&session, "unknown-provider", "m"),
             None
         );
+    }
+
+    #[test]
+    fn initial_prev_resp_id_drops_stale_id_from_other_producer() {
+        // The persisted id was produced by a DIFFERENT provider+model (e.g. a
+        // mid-session openai → xAI switch): restoring it would replay a stale
+        // previous_response_id into a service that does not recognize it →
+        // provider 400. Provenance must gate the restore, exactly like
+        // reasoning artifacts.
+        let mut session = SessionState::empty();
+        session.config.last_response_id = Some("resp_openai".into());
+        session.config.last_response_id_producer = Some(ReasoningProducer {
+            provider_slug: "openai".into(),
+            model: "gpt-5.4".into(),
+        });
+        // Same provider, different model → dropped (model-bound provenance).
+        assert_eq!(
+            initial_prev_resp_id(&session, "openai", "gpt-4"),
+            None,
+            "id from gpt-5.4 must not be restored for gpt-4",
+        );
+        // Matching provider+model → restored.
+        assert_eq!(
+            initial_prev_resp_id(&session, "openai", "gpt-5.4").as_deref(),
+            Some("resp_openai"),
+        );
+        // No producer recorded (fresh session) → no id is ever restored.
+        let fresh = SessionState::empty();
+        assert_eq!(initial_prev_resp_id(&fresh, "openai", "gpt-5.4"), None);
     }
 
     // -- Precondition guard (phase 4c) --------------------------------------

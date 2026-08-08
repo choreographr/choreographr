@@ -32,6 +32,11 @@ pub mod google;
 pub mod openai;
 pub mod retry;
 
+// Test-only helpers (scripted HTTP mock provider for the integration tests);
+// compiled only when the `test-utils` feature is enabled (see Cargo.toml).
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
+
 mod context_window;
 mod overrides;
 mod shared;

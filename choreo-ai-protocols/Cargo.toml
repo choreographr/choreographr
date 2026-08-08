@@ -19,3 +19,15 @@ toml.workspace = true
 tracing.workspace = true
 ureq.workspace = true
 zeroize.workspace = true
+
+[features]
+# Test-only: exposes the shared scripted HTTP mock provider (`test_utils::
+# MockProvider`) used by the reasoning round-trip wire tests in this crate's
+# tests/ and choreo-daemon's tests/. Enabled for test builds via the self
+# dev-dependency below, so it never leaks into the published public API.
+test-utils = []
+
+[dev-dependencies]
+# Enable the `test-utils` feature when building tests/examples/benchmarks for
+# this package (a package may depend on itself in dev-dependencies).
+choreo-ai-protocols = { path = ".", features = ["test-utils"] }

@@ -108,3 +108,6 @@ serial_test.workspace = true
 # Enable the `test-utils` feature when building tests/examples/benchmarks for
 # this package (a package may depend on itself in dev-dependencies).
 choreo-daemon = { path = ".", features = ["test-utils"] }
+# The shared scripted HTTP mock provider for the reasoning round-trip wire
+# tests lives in choreo-ai-protocols behind its `test-utils` feature.
+choreo-ai-protocols = { workspace = true, features = ["test-utils"] }
