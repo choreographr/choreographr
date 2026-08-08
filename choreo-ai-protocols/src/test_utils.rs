@@ -13,8 +13,9 @@
 //! actual wire.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// One HTTP request captured by the mock provider.
@@ -49,10 +50,20 @@ impl CapturedRequest {
 /// Only speaks the subset of HTTP/1.1 the ureq agents need: reads the request
 /// head + `Content-Length` body, replies with `Connection: close` (so the
 /// client opens a fresh connection per request), and drops the stream.
+///
+/// The serve thread runs a non-blocking accept + poll loop so that dropping
+/// the provider (which sets the `shutdown` flag and joins the thread) can
+/// terminate it promptly instead of leaking a permanently blocked `accept`
+/// thread per test.
 pub struct MockProvider {
     addr: std::net::SocketAddr,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
-    _handle: std::thread::JoinHandle<()>,
+    /// Set by `Drop` to ask the serve thread to exit its poll loop. This is a
+    /// test-only cooperative cancellation flag (single-bit, no data), the one
+    /// shared-state pattern AGENTS.md sanctions; a channel message could not
+    /// interrupt a thread blocked in `accept`.
+    shutdown: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MockProvider {
@@ -60,16 +71,22 @@ impl MockProvider {
     /// entry repeats for any excess requests.
     pub fn start(responses: Vec<(u16, &'static str, String)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+        // Non-blocking so the serve loop can poll `accept` and observe the
+        // shutdown flag instead of blocking forever on a connection that never
+        // arrives.
+        listener.set_nonblocking(true).expect("nonblocking");
         let addr = listener.local_addr().expect("mock provider local addr");
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_thread = Arc::clone(&captured);
         let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_thread = Arc::clone(&shutdown);
 
         let handle = std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else {
-                    break;
-                };
+            // Handle one accepted connection: read the request head + body,
+            // record it, and serve the next scripted response. Kept as a
+            // closure so the poll loop below stays readable.
+            let serve_request = |mut stream: std::net::TcpStream| {
                 let mut responses = responses.lock().unwrap();
 
                 // Read the request head (through the blank line) and then the
@@ -91,7 +108,7 @@ impl MockProvider {
                     }
                 };
                 if head_end == 0 {
-                    continue;
+                    return;
                 }
                 let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
                 let body_start = head_end + 4;
@@ -149,13 +166,36 @@ impl MockProvider {
                     .write_all(response_body.as_bytes())
                     .unwrap_or_default();
                 stream.flush().unwrap_or_default();
+            };
+
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // The accepted socket inherits the listener's
+                        // non-blocking mode on some platforms; restore blocking
+                        // so the request reader works.
+                        stream.set_nonblocking(false).expect("stream blocking");
+                        serve_request(stream);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // No pending connection: poll the shutdown flag and
+                        // sleep briefly before trying again, so Drop can
+                        // terminate this thread promptly.
+                        if shutdown_thread.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break, // listener closed
+                }
             }
         });
 
         Self {
             addr,
             captured,
-            _handle: handle,
+            shutdown,
+            handle: Some(handle),
         }
     }
 
@@ -171,5 +211,16 @@ impl MockProvider {
     /// Every request captured so far, in arrival order.
     pub fn requests(&self) -> Vec<CapturedRequest> {
         self.captured.lock().unwrap().clone()
+    }
+}
+
+impl Drop for MockProvider {
+    fn drop(&mut self) {
+        // Signal the serve thread to stop polling and join it, so tests do
+        // not leak a blocked accept thread per MockProvider.
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
