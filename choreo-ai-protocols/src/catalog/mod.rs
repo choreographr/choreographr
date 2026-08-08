@@ -20,14 +20,14 @@ use crate::shared::MaxTokensField;
 mod loader;
 
 /// How reasoning is replayed back to the provider on subsequent turns.
-/// Default derived from protocol in `model_reasoning_passback`.
-/// `None` (the serde default) means "no explicit override — derive from
-/// protocol", so TOMLs only set this field where nuance matters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// The "unset" meaning lives in the outer `Option` on [`ModelEntry`]
+/// (`None` → derive from protocol); `None` *here* is an explicit
+/// "never replay" override. [`model_reasoning_passback`] resolves the
+/// effective format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningPassback {
     /// Never send reasoning back (display-only providers / fields).
-    #[default]
     None,
     /// Echo reasoning on assistant messages that had tool calls
     /// (DeepSeek/Kimi chat, and the minimum for Anthropic tool loops).
@@ -69,8 +69,10 @@ pub struct ModelEntry {
     /// `None` means "no override — `model_reasoning_passback` derives the
     /// format from the provider protocol" (Responses → `ResponseId`,
     /// chat completions → `ToolLoop`, Anthropic → `AllTurns`, Google →
-    /// `Signature`).
-    pub reasoning_passback: ReasoningPassback,
+    /// `Signature`); `Some(...)` is an explicit per-model override,
+    /// including `Some(ReasoningPassback::None)` for "never replay this
+    /// model's reasoning".
+    pub reasoning_passback: Option<ReasoningPassback>,
 }
 
 /// Protocol variant — selects wire format and carries protocol-specific fields.
@@ -214,28 +216,26 @@ pub fn model_request_format(provider_slug: &str, model: &str) -> Option<RequestF
 
 /// Compute how reasoning is replayed back to the provider for a given
 /// model. Mirrors `model_reasoning_capability`: an explicit per-model
-/// `reasoning_passback` TOML override wins, otherwise the format is derived
-/// from the provider protocol (falling back to protocol defaults for
-/// unknown/new models, and `None` for unknown providers).
+/// `reasoning_passback` TOML override wins — including an explicit `none`,
+/// which suppresses replay even where the protocol default would echo —
+/// otherwise the format is derived from the provider protocol (falling back
+/// to protocol defaults for unknown/new models, and `None` for unknown
+/// providers).
 pub fn model_reasoning_passback(provider_slug: &str, model: &str) -> ReasoningPassback {
     let entry = lookup_provider(provider_slug);
 
     let passback = match entry {
-        Some(e) => {
-            let model_entry = e.models.iter().find(|m| m.model == model);
-            match model_entry {
-                // Known model: explicit TOML override wins; `None` means
-                // unset, so derive from the protocol (and, for OpenAi
-                // providers, whether the model uses Responses).
-                Some(m) if m.reasoning_passback != ReasoningPassback::None => m.reasoning_passback,
-                // Known model without an override → protocol default.
-                Some(m) => protocol_default_passback(e.protocol, m.openai_responses),
-                // Unknown model → protocol default (best-effort for new
-                // models; OpenAi assumed chat-completions, matching
-                // `ServiceConfig::default_request_format`).
-                None => protocol_default_passback(e.protocol, false),
-            }
-        }
+        Some(e) => match e.models.iter().find(|m| m.model == model) {
+            // Known model: an explicit TOML override wins (`Some(..)`, incl.
+            // `Some(ReasoningPassback::None)` for "never replay"); an unset
+            // field (`None`) derives from the protocol (and, for OpenAi
+            // providers, whether the model uses Responses).
+            Some(m) => resolve_passback(m.reasoning_passback, e.protocol, m.openai_responses),
+            // Unknown model → protocol default (best-effort for new models;
+            // OpenAi assumed chat-completions, matching
+            // `ServiceConfig::default_request_format`).
+            None => protocol_default_passback(e.protocol, false),
+        },
         // Unknown provider — no protocol to infer a default from.
         None => ReasoningPassback::None,
     };
@@ -248,6 +248,16 @@ pub fn model_reasoning_passback(provider_slug: &str, model: &str) -> ReasoningPa
     );
 
     passback
+}
+
+/// Resolve the effective passback format: an explicit per-model override
+/// wins; `None` (unset) derives from the provider protocol.
+fn resolve_passback(
+    explicit: Option<ReasoningPassback>,
+    protocol: ProviderProtocol,
+    openai_responses: bool,
+) -> ReasoningPassback {
+    explicit.unwrap_or_else(|| protocol_default_passback(protocol, openai_responses))
 }
 
 /// Protocol-level default passback format, used when a model has no explicit
@@ -633,7 +643,58 @@ mod tests {
             .iter()
             .find(|m| m.model == "deepseek-v4-flash")
             .unwrap();
-        assert_eq!(model.reasoning_passback, ReasoningPassback::ToolLoop);
+        assert_eq!(model.reasoning_passback, Some(ReasoningPassback::ToolLoop));
+    }
+
+    #[test]
+    fn resolve_passback_unset_uses_protocol_default() {
+        // `None` (unset) on Anthropic → the keep-all-turns protocol default.
+        assert_eq!(
+            resolve_passback(None, ProviderProtocol::AnthropicMessages, false),
+            ReasoningPassback::AllTurns
+        );
+    }
+
+    #[test]
+    fn resolve_passback_explicit_none_beats_protocol_default() {
+        // The new capability: an explicit `none` override suppresses replay
+        // even on a protocol whose default would echo (OpenAi chat-completions
+        // → ToolLoop) — a Cerebras-style model that rejects replayed
+        // `reasoning_content` can be pinned to never replay without inventing
+        // a provider.
+        let protocol = ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        };
+        assert_eq!(
+            resolve_passback(Some(ReasoningPassback::None), protocol, false),
+            ReasoningPassback::None
+        );
+    }
+
+    #[test]
+    fn resolve_passback_explicit_override_beats_responses_default() {
+        // An explicit ToolLoop override wins even when the model uses the
+        // Responses API, whose protocol default would be ResponseId.
+        let protocol = ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        };
+        assert_eq!(
+            resolve_passback(Some(ReasoningPassback::ToolLoop), protocol, true),
+            ReasoningPassback::ToolLoop
+        );
+    }
+
+    #[test]
+    fn resolve_passback_unset_openai_responses_uses_response_id() {
+        // `None` (unset) on an OpenAI-protocol Responses model → chain
+        // continuity via previous_response_id / opaque reasoning items.
+        let protocol = ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        };
+        assert_eq!(
+            resolve_passback(None, protocol, true),
+            ReasoningPassback::ResponseId
+        );
     }
 
     #[test]

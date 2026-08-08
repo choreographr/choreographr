@@ -129,10 +129,12 @@ struct RawModel {
     reasoning_levels: Vec<String>,
     #[serde(default)]
     responses: bool,
-    /// Explicit reasoning passback format; `None` (default) means "derive
-    /// from protocol" in `model_reasoning_passback`.
+    /// Explicit reasoning passback format; `None` (the serde default) means
+    /// "no override — derive from protocol" in `model_reasoning_passback`;
+    /// `Some(ReasoningPassback::None)` explicitly disables replay (a model
+    /// that rejects replayed reasoning, e.g. Cerebras-style chat providers).
     #[serde(default)]
-    reasoning_passback: ReasoningPassback,
+    reasoning_passback: Option<ReasoningPassback>,
 }
 
 /// Parse every bundled TOML file into typed `ProviderEntry` values.
