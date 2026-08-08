@@ -129,15 +129,30 @@ Defines all shared message types and framing. No dependencies on other workspace
 
 ```
 ┌──────────────────┬────────────────────────────────────────┐
-│ 4 bytes (BE u32) │ postcard((protocol_version: u8, msg)) │
+│ 4 bytes (BE u32) │ msgpack((protocol_version: u8, msg))   │
 │   payload len    │                                        │
 └──────────────────┴────────────────────────────────────────┘
 ```
 
-- Protocol version: `1`
+- Protocol version: `2`
 - Max frame size: 32 MiB
 - Framing functions: `encode_frame`, `decode_frame`, `read_message`, `write_message`
-- **Error type**: `ProtoError` (thiserror enum) — `Postcard`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io`
+- **Error type**: `ProtoError` (thiserror enum) — `Codec`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io`
+
+Payloads are MessagePack in **named mode** (`rmp_serde::to_vec_named`): structs
+serialize as maps with field names and enum variants by variant name, so the
+format is self-describing, compact, and broadly supported across languages
+(future mobile/web/third-party clients). The `(protocol_version, message)` tuple
+still encodes as a MessagePack array of 2 even in named mode. Decoding runs
+through an explicit `Deserializer` over a `Cursor` so the trailing-bytes check
+can use the cursor position as a remainder probe (rmp-serde 1.3.1 has no
+`from_slice_ref`).
+
+**Codec rule.** MessagePack (named) carries anything that crosses a language
+boundary: the client↔daemon wire and the values in `sessions`/`session_turns`.
+Postcard is retained only on Rust-only, language-isolated internal channels —
+the RISC-V VM↔host protocol and the encrypted credential pipeline — where no
+foreign reader will ever touch the bytes.
 
 
 ### `choreo-keystore` — Identity keypair & credential crypto
@@ -275,7 +290,7 @@ main()
 ├── daemon-reader thread: reads DaemonMessages from the daemon socket,
 │   forwards them into the shared event channel
 ├── daemon-writer thread: receives ClientMessages via mpsc and writes
-│   length-prefixed postcard frames to the daemon socket
+│   length-prefixed MessagePack frames to the daemon socket
 └── main thread: event loop — receives from the shared event channel
     and dispatches to the appropriate handler
 ```
@@ -1449,15 +1464,56 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 
 | Table | Key | Value |
 |---|---|---|
-| `sessions` | `u64` session ID | postcard(`SessionRecord`) |
-| `session_turns` | `(u64, u32)` (session ID, turn ID) | postcard(`Turn`) |
+| `sessions` | `u64` session ID | MessagePack named(`SessionRecord`) |
+| `session_turns` | `(u64, u32)` (session ID, turn ID) | MessagePack named(`Turn`) |
 | `credentials` | `&str` service name | encrypted blob |
 | `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
 | `deleted_sessions` | `u64` session ID | `()` tombstone — marks a deleted session whose still-shutting-down thread may re-create the record; written only when the delete is deferred (a live thread exists), cleared once the exit finalize re-deletes the record, purged at startup |
-| `meta` | `&str` | `u64` counter |
+| `meta` | `&str` key (e.g. `schema_version`) | `u64` — persisted schema version (currently `1`) |
 
 `SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `working_dir`,
 `turn_count`, `created_at`, `context_config`, `account_name`.
+
+### Schema versioning & migrations
+
+The `meta` table persists the schema version under the `schema_version` key
+(`SCHEMA_VERSION`, currently `1`). On every startup the daemon runs
+`db::run_migrations` right after `open_db` and before any session data is read;
+it is idempotent — a database already at the current version exits immediately,
+and calling it repeatedly is safe.
+
+- **Versioning policy (additive vs breaking).** An additive change — a new
+  struct field with `#[serde(default)]`, or a new enum variant appended — needs
+  no migration and no version bump: named MessagePack tolerates it on decode.
+  A breaking change — reordering/removing/mid-inserting a struct field,
+  reordering or removing an enum variant, changing a type, key, or table
+  (split/merge), or swapping the codec — requires a numbered
+  `migrate_vX_to_vX+1` migration and a `SCHEMA_VERSION` bump. Future migrations
+  that rewrite historical shapes must define frozen local copies of the old
+  structs, and each migration ships with a fixture-based unit test (build a DB
+  as the old version would have written it, run the runner, assert contents +
+  version stamp + idempotency + backup artifact).
+- **Migration chain.** `MIGRATIONS` is empty at release: `MIGRATIONS[i]` would
+  upgrade schema version i → i+1, and version 1 is the *initial* stamped
+  version, reached by initialization rather than by a migration. The first real
+  entry lands with the first future breaking schema change.
+- **Pre-release legacy data.** A database with no `meta` table reports version
+  0. At release that is either a freshly created DB (stamped to 1; nothing else
+  happens) or a pre-release dev DB whose postcard-era blobs are *not* migrated —
+  `read_all_sessions` / `read_turns` skip undecodable entries with a warning, so
+  legacy sessions drop out loudly-but-non-fatally on first read. Once the chain
+  grows past 1, a no-meta database is treated as pre-release leftovers and
+  `run_migrations` refuses to start.
+- **Backups.** A pre-migration snapshot (`state.redb` → `state.redb.bak-v{n}`)
+  is taken only *before a real migration writes* — never for the pure 0 → 1
+  initialization stamp, so no backup artifact exists while the chain is empty.
+- **redb `UpgradeRequired` is a separate axis.** The redb file-format version
+  (the library's on-disk format) is independent of the app's `schema_version`.
+  If a newer redb wrote the file, `open_db` hard-errors with guidance to restore
+  a backup (`state.redb.bak-v*`) or use the documented dump/restore path —
+  it no longer silently recreates (and thereby destroys) a database it cannot
+  open. A database whose `schema_version` is *newer* than the binary supports
+  likewise errors at startup with "upgrade choreographr before continuing".
 
 ### Session state (in-memory)
 
@@ -1813,8 +1869,9 @@ counts survive the attach instead of regressing.
 1. **Unix sockets, not HTTP for client↔daemon** — keeps everything local, avoids port conflicts,
    leverages OS-level access control.
 
-2. **Binary protocol (postcard), not JSON** — compact, typed, versioned. Length-prefixed framing
-   avoids parsing ambiguities. Version field allows protocol evolution.
+2. **Binary protocol (MessagePack, named mode), not JSON** — self-describing, compact, typed,
+   versioned. Length-prefixed framing avoids parsing ambiguities. Version field allows protocol
+   evolution.
 
 3. **Lock/Unlock security** — the daemon starts without credentials in memory. The private key is
    sent over the Unix socket and zeroized after use. Credentials are encrypted per-credential so
@@ -2274,7 +2331,7 @@ cargo run -p choreo-im -- telegram
 | Crate | Used by | Purpose |
 |---|---|---|
 | `tokio` | tui, dioxus, im | Async runtime |
-| `serde` + `postcard` | proto, clients, daemon | Wire protocol framing and internal storage |
+| `serde` + `rmp-serde` | proto, daemon | Wire protocol framing and DB value encoding (MessagePack, named mode) |
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
 | `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
@@ -2285,7 +2342,7 @@ cargo run -p choreo-im -- telegram
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `x25519-dalek` + `hkdf` + `sha2` | keystore | X25519 ECDH key agreement, HKDF key derivation |
 | `ckb-vm` | daemon | RISC-V VM interpreter for sandboxed code execution |
-| `postcard` | daemon | Compact binary serialization (internal storage, VM↔host tool communication) |
+| `postcard` | daemon, client-core | Compact binary serialization for Rust-only internal channels (VM↔host tool communication, encrypted credential pipeline) |
 | `thiserror` | proto, keystore, client-core, daemon | Structured library error types |
 | `anyhow` | daemon, tui, dioxus, im, keystore | Application error context & propagation |
 
@@ -2300,7 +2357,7 @@ Each library crate defines a structured error enum:
 
 | Crate | Error type | Key variants |
 |---|---|---|
-| `choreo-proto` | `ProtoError` | `Postcard`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io` |
+| `choreo-proto` | `ProtoError` | `Codec`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io` |
 | `choreo-keystore` | `KeystoreError` | `Io`, `TooShort`, `DecryptionFailed`, `InvalidKeyLength`, `EncryptionFailed`, `ConfigDirNotFound` |
 | `choreo-client-core` | `ClientError` | `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch` |
 

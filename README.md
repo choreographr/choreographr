@@ -30,7 +30,7 @@ Choreographr was designed from the beginning to have a separation of concerns be
 
 The client can either run on the same computer as the server agent (via local socket), or the server can be anywhere else on your local network or the Internet. When not connecting locally the client connects to the server via [Noise-IK](https://en.wikipedia.org/wiki/Noise_Protocol_Framework) encrypted TCP connection. Because the server can live anywhere and is reachable over encrypted TCP, it can also be accessed from mobile devices — for example, chatting with your agent on the go via the `choreo-im` Telegram bridge.
 
-Client/server communication is currently encoded via [Postcard](https://postcard.jamesmunns.com/), but this will probably be changed in future to a self-describing binary format with broader language support.
+Client/server communication is encoded in [MessagePack](https://msgpack.org/) in *named* mode — a self-describing, compact binary format with broad language support (struct field names and enum variant names travel on the wire, so the format is evolution-safe for future mobile/web/third-party clients). [Postcard](https://postcard.jamesmunns.com/) remains only on internal Rust-only channels: the RISC-V VM↔host protocol and encrypted credential storage.
 
 Currently the primary client is **`choreo-tui`** - a fullscreen terminal UI.
 
@@ -308,7 +308,7 @@ data model.
 |---|---|
 | `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
 | `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (79+ providers) |
-| `choreo-proto` | Framed binary protocol (postcard + length prefix) shared between clients and daemon |
+| `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
 | `choreo-keystore` | X25519 keypair + ECDH/AES-256-GCM crypto library for encrypted credentials |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
 | `choreo-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio |
