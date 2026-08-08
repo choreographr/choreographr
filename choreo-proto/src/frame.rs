@@ -19,11 +19,11 @@ pub const PROTOCOL_VERSION: u8 = 2;
 /// overflow the frame when the client re-attaches to a session.
 pub const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
 
-/// Encode a message without the 4-byte length prefix.
-///
-/// This is used when the transport layer already provides its own
-/// framing (e.g. NoiseStream), so only the raw MessagePack payload is needed.
-pub fn encode_payload<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
+/// Encode `(PROTOCOL_VERSION, message)` as named MessagePack, enforcing
+/// [`MAX_FRAME_SIZE`]. Shared by [`encode_payload`] (transport-provided
+/// framing) and [`encode_frame`] (4-byte length prefix added by the caller),
+/// so the codec and the size policy live in exactly one place.
+fn encode_inner<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
     let payload = rmp_serde::to_vec_named(&(PROTOCOL_VERSION, message))
         .map_err(|e| ProtoError::Codec(e.to_string()))?;
 
@@ -33,13 +33,16 @@ pub fn encode_payload<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> 
     Ok(payload)
 }
 
-pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
-    let payload = rmp_serde::to_vec_named(&(PROTOCOL_VERSION, message))
-        .map_err(|e| ProtoError::Codec(e.to_string()))?;
+/// Encode a message without the 4-byte length prefix.
+///
+/// This is used when the transport layer already provides its own
+/// framing (e.g. NoiseStream), so only the raw MessagePack payload is needed.
+pub fn encode_payload<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
+    encode_inner(message)
+}
 
-    if payload.len() > MAX_FRAME_SIZE {
-        return Err(ProtoError::FrameTooLarge);
-    }
+pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
+    let payload = encode_inner(message)?;
 
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());

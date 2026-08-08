@@ -80,7 +80,7 @@ pub fn spawn_daemon_io(
     // ------------------------------------------------------------------
     // Writer thread
     //
-    // Blocks on writer_rx.recv() and writes each message as a postcard-
+    // Blocks on writer_rx.recv() and writes each message as a MessagePack-
     // encoded frame with a 4-byte big-endian length prefix.
     // ------------------------------------------------------------------
     let writer_handle = thread::Builder::new()

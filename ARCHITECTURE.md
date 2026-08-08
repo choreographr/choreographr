@@ -1500,12 +1500,15 @@ and calling it repeatedly is safe.
 - **Pre-release legacy data.** A database with no `meta` table reports version
   0. At release that is either a freshly created DB (stamped to 1; nothing else
   happens) or a pre-release dev DB whose postcard-era blobs are *not* migrated —
-  `read_all_sessions` / `read_turns` skip undecodable entries with a warning, so
-  legacy sessions drop out loudly-but-non-fatally on first read. Once the chain
+  `read_all_sessions` / `read_turns` skip undecodable entries with a warning, and
+  single-record `read_session` treats an undecodable record as absent, so legacy
+  sessions drop out loudly-but-non-fatally on first read. Once the chain
   grows past 1, a no-meta database is treated as pre-release leftovers and
   `run_migrations` refuses to start.
-- **Backups.** A pre-migration snapshot (`state.redb` → `state.redb.bak-v{n}`)
-  is taken only *before a real migration writes* — never for the pure 0 → 1
+- **Backups.** A pre-migration snapshot (`state.redb` → `state.redb.bak-v{from}`,
+  named after the version being migrated *from*, so a `bak-v2` file IS a v2
+  database and restoring it rolls back to exactly the pre-migration state) is
+  taken only *before a real migration writes* — never for the pure 0 → 1
   initialization stamp, so no backup artifact exists while the chain is empty.
 - **redb `UpgradeRequired` is a separate axis.** The redb file-format version
   (the library's on-disk format) is independent of the app's `schema_version`.
@@ -1513,7 +1516,10 @@ and calling it repeatedly is safe.
   a backup (`state.redb.bak-v*`) or use the documented dump/restore path —
   it no longer silently recreates (and thereby destroys) a database it cannot
   open. A database whose `schema_version` is *newer* than the binary supports
-  likewise errors at startup with "upgrade choreographr before continuing".
+  likewise errors at startup with "upgrade choreographr before continuing". A
+  0-byte `state.redb` (the corpse of an interrupted create) is the one exception
+  to the refuse-to-recreate rule — it holds no recoverable data, so `open_db`
+  recreates it and the startup `run_migrations` stamps it like a fresh database.
 
 ### Session state (in-memory)
 

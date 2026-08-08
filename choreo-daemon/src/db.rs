@@ -163,20 +163,25 @@ fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Result<()> {
 }
 
 /// Snapshot the database file before a migration rewrites it:
-/// `state.redb` → `state.redb.bak-v{SCHEMA_VERSION}`.
+/// `state.redb` → `state.redb.bak-v{from}`, where `from` is the schema
+/// version of the file being snapshotted (the version being migrated away
+/// from). Naming the backup after its *source* version — not the migration
+/// target — keeps restore semantics unambiguous: a `bak-v2` file IS a v2
+/// database, so restoring it rolls back to exactly the state the migration
+/// started from.
 ///
 /// Dormant while [`MIGRATIONS`] is empty — the 0 → 1 transition is pure
 /// stamping and rewrites nothing, so no snapshot is taken (see
 /// [`run_migrations`]). Must be correct when the first real migration lands:
-/// one backup per schema version, taken before any write, so a failed
+/// one backup per source schema version, taken before any write, so a failed
 /// migration can always be rolled back from disk.
-fn backup_db_file() -> io::Result<()> {
+fn backup_db_file(from: u64) -> io::Result<()> {
     let path = db_path()?;
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "state.redb".to_string());
-    let backup_path = path.with_file_name(format!("{file_name}.bak-v{SCHEMA_VERSION}"));
+    let backup_path = path.with_file_name(format!("{file_name}.bak-v{from}"));
     fs::copy(&path, &backup_path)?;
     info!(
         from = %path.display(),
@@ -232,9 +237,11 @@ pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
     );
     // Snapshot only before an actual migration writes. With an empty chain
     // (current release) this never fires — the 0 → 1 transition is pure
-    // initialization (stamping), and nothing was rewritten.
+    // initialization (stamping), and nothing was rewritten. The backup is
+    // named after the version being migrated FROM: `current` is the schema
+    // version of the file on disk right now.
     if !MIGRATIONS.is_empty() {
-        backup_db_file()?; // state.redb → state.redb.bak-v{SCHEMA_VERSION}
+        backup_db_file(current)?; // state.redb → state.redb.bak-v{current}
     }
     for (idx, migration) in MIGRATIONS.iter().enumerate().skip(current as usize) {
         info!(from = idx, to = idx + 1, "applying database migration");
@@ -245,25 +252,41 @@ pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
     stamp_schema_version(db, SCHEMA_VERSION)
 }
 
+/// Open (or create) the database file. The file is created when missing or
+/// empty (the corpse of an interrupted create), but schema versioning is
+/// deliberately NOT applied here — callers run [`run_migrations`] right
+/// after, before any table access (see `main.rs`). Hard-errors on a
+/// database it cannot open rather than recreating a potentially recoverable
+/// file (the old "trying to recreate" catch-all could silently clobber it).
 pub fn open_db() -> io::Result<redb::Database> {
     let path = db_path()?;
     info!(path = %path.display(), "opening database");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // A 0-byte file is the corpse of an interrupted `Database::create`
+    // (crash between file creation and the first write): it holds no
+    // recoverable data, so recreate it rather than hard-erroring like a
+    // potentially-valuable corrupt file. Version stamping stays with the
+    // caller (`run_migrations` right after `open_db`), exactly as for an
+    // existing database.
+    if let Ok(metadata) = fs::metadata(&path)
+        && metadata.len() == 0
+    {
+        warn!("database file exists but is empty (interrupted create?); recreating");
+        return redb::Database::create(&path)
+            .map_err(|e| io::Error::other(format!("failed to create database: {e}")));
+    }
     match redb::Database::open(&path) {
         Ok(db) => Ok(db),
-        // File does not exist: fresh install. Create the DB, then stamp the
-        // schema version via run_migrations so the database is versioned from
-        // the moment it exists.
+        // File does not exist: fresh install. Create the database file; the
+        // caller brings it up to the current schema version via run_migrations.
         Err(redb::DatabaseError::Storage(redb::StorageError::Io(io_err)))
             if io_err.kind() == io::ErrorKind::NotFound =>
         {
             info!("database file not found, creating new database");
-            let db = redb::Database::create(&path)
-                .map_err(|e| io::Error::other(format!("failed to create database: {e}")))?;
-            run_migrations(&db)?;
-            Ok(db)
+            redb::Database::create(&path)
+                .map_err(|e| io::Error::other(format!("failed to create database: {e}")))
         }
         // redb file-format bump: the file is a valid redb database but in a
         // newer file format than this binary can read. Hard error with
@@ -306,6 +329,12 @@ pub fn write_session(
     Ok(())
 }
 
+/// Read a single session record. Returns `Ok(None)` both when the session
+/// does not exist and when the stored record cannot be decoded — an
+/// undecodable record is skipped with a warning and treated as absent, the
+/// same policy as `read_all_sessions`/`read_turns`. A corrupt record is
+/// unrecoverable, so it must never fail the caller (or the daemon); the
+/// warning keeps the loss loud-but-non-fatal.
 pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<SessionRecord>> {
     debug!("read_session: id={}", session_id);
     let read_txn = db
@@ -318,11 +347,17 @@ pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<S
         .get(session_id)
         .map_err(|e| db_err(format!("redb get session: {e}")))?
     {
-        Some(guard) => {
-            let record: SessionRecord = rmp_serde::from_slice::<SessionRecord>(guard.value())
-                .map_err(|e| db_err(format!("codec decode session: {e}")))?;
-            Ok(Some(record))
-        }
+        Some(guard) => match rmp_serde::from_slice::<SessionRecord>(guard.value()) {
+            Ok(record) => Ok(Some(record)),
+            Err(e) => {
+                warn!(
+                    session_id,
+                    error = %e,
+                    "undecodable session record, treating as absent"
+                );
+                Ok(None)
+            }
+        },
         None => Ok(None),
     }
 }
@@ -1164,6 +1199,31 @@ mod tests {
         assert_eq!(turns.len(), 2, "corrupt turn should be skipped");
         assert_eq!(turns[0].1, valid_turn);
         assert_eq!(turns[1].1, valid_turn2);
+    }
+
+    #[test]
+    fn read_session_skips_corrupt_record_with_warning() {
+        // A corrupt/legacy session record must not fail the read (or the
+        // daemon): read_session treats undecodable data as absent — warn and
+        // return None — the same policy as the batch reads.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(SESSIONS).unwrap();
+                table
+                    .insert(42u64, b"not a session record".as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        assert!(
+            read_session(&db, 42).unwrap().is_none(),
+            "undecodable record must read as absent, not error"
+        );
+        // A genuinely missing session is indistinguishable (also None).
+        assert!(read_session(&db, 99).unwrap().is_none());
     }
 
     #[test]

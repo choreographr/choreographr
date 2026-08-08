@@ -387,7 +387,7 @@ fn dispatch_close_session(
     // Remove the session mapping from the bridge's local state only.
     // The daemon keeps sessions alive until explicitly deleted via
     // session/delete — there is no DetachSession message in the
-    // postcard protocol, and the daemon internally auto-detaches
+    // MessagePack protocol, and the daemon internally auto-detaches
     // stale attachments when the connection closes or re-attaches.
     sessions.remove(&session_id);
     respond(req.id, serde_json::json!({}), out)

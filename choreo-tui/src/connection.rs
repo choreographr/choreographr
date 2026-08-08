@@ -1626,10 +1626,14 @@ fn handle_ai_providers_list_key(
                 && let Some(account) = app.ai_providers.accounts.get(sel)
             {
                 let name = account.name.clone();
-                app.set_page(Page::Chat);
+                // Send before flipping pages: if the send fails (broken
+                // pipe), the error propagates and the user stays on the
+                // accounts page instead of being stranded on Chat with an
+                // un-sent selection.
                 client_tx
                     .send(ClientMessage::SetSessionAccount { name })
                     .map_err(broken_pipe)?;
+                app.set_page(Page::Chat);
             }
         }
 

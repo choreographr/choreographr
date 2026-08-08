@@ -28,17 +28,21 @@ fn open_db_creates_migrates_and_round_trips() {
         std::env::set_var("CHOREOGRAPHR_DB_PATH", &db_file);
     }
 
-    // Create path: Database::create + run_migrations stamps schema v1.
+    // Create path: open_db creates the database file; run_migrations stamps
+    // schema v1. This mirrors main.rs's startup sequence — open_db itself
+    // does not version the database, the stamp lives with the migration
+    // runner the daemon calls right after open_db.
     let db = db::open_db().unwrap();
+    db::run_migrations(&db).unwrap();
 
-    // The schema version must have been stamped during creation.
+    // The schema version must have been stamped by the startup sequence.
     {
         let read_txn = db.begin_read().unwrap();
         let table = read_txn.open_table(META).unwrap();
         let version = table
             .get("schema_version")
             .unwrap()
-            .expect("schema_version must be stamped by open_db")
+            .expect("schema_version must be stamped by open_db → run_migrations")
             .value();
         assert_eq!(
             version, 1,
