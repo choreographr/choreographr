@@ -48,10 +48,38 @@ fn decode_rejects_trailing_bytes() {
 
 #[test]
 fn decode_rejects_wrong_version() {
+    // Encode with the *current* named-MessagePack semantics but one version
+    // ahead — what a newer peer would send. Must be rejected up front.
     let payload =
-        postcard::to_allocvec(&(PROTOCOL_VERSION + 1, ClientMessage::Ping)).expect("encode");
+        rmp_serde::to_vec_named(&(PROTOCOL_VERSION + 1, ClientMessage::Ping)).expect("encode");
     let err = decode_frame::<ClientMessage>(&payload).expect_err("should fail");
     assert!(matches!(err, ProtoError::UnsupportedVersion { .. }));
+}
+
+#[test]
+fn decode_tolerates_array_encoded_struct() {
+    // Named mode writes structs as maps with field-name keys, but decode also
+    // accepts the array (field-order) form — that is the compatibility
+    // contract that keeps a future switch to compact mode backwards-readable.
+    // Hand-build `[2, [10, 20, 30]]`: version 2, then a `TokenUsage` struct
+    // serialized WITHOUT field names as a 3-element array.
+    let blob = [
+        0x92, // array of 2: (version, message)
+        0x02, // PROTOCOL_VERSION = 2
+        0x93, // array of 3: TokenUsage { input_tokens, output_tokens, total_tokens }
+        0x0a, // input_tokens = 10
+        0x14, // output_tokens = 20
+        0x1e, // total_tokens = 30
+    ];
+    let decoded: TokenUsage = decode_frame(&blob).expect("decode");
+    assert_eq!(
+        decoded,
+        TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            total_tokens: 30,
+        }
+    );
 }
 
 #[test]

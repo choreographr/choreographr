@@ -240,11 +240,12 @@ pub enum ChatReasoningField {
 /// Serialized as an externally-tagged enum (`rename_all = "snake_case"`), so
 /// the adapter-ownership tag is the JSON object key (e.g.
 /// `{"chat_reasoning": {"field": "reasoning_content", "bytes": [104,105]}}`)
-/// and the postcard variant index — NOT
-/// `#[serde(tag = "kind", content = "payload")]`, because postcard (the
-/// workspace wire format, see `frame.rs`) cannot deserialize
-/// internally/adjacently tagged enums (`WontImplement`: they require
-/// `deserialize_any`, which postcard's deserializer does not implement).
+/// and the MessagePack variant name — NOT
+/// `#[serde(tag = "kind", content = "payload")]`: an internally/adjacently
+/// tagged layout would add nothing here, because named MessagePack (the
+/// workspace wire format, see `frame.rs`) already encodes variants as
+/// `{"variant_name": payload}`, keeping the ownership tag as the object key
+/// just like the JSON shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningArtifact {
@@ -778,13 +779,13 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_artifact_variants_round_trip_postcard() {
-        // postcard is the workspace wire format (see frame.rs) — persistence
-        // and the client socket both round-trip through it, so every variant
-        // must survive byte-for-byte.
+    fn reasoning_artifact_variants_round_trip_msgpack() {
+        // Named MessagePack is the workspace wire format (see frame.rs) —
+        // persistence and the client socket both round-trip through it, so
+        // every variant must survive byte-for-byte.
         for artifact in all_artifacts() {
-            let bytes = postcard::to_allocvec(&artifact).expect("encode");
-            let decoded: ReasoningArtifact = postcard::from_bytes(&bytes).expect("decode");
+            let bytes = rmp_serde::to_vec_named(&artifact).expect("encode");
+            let decoded: ReasoningArtifact = rmp_serde::from_slice(&bytes).expect("decode");
             assert_eq!(decoded, artifact);
         }
     }
@@ -826,10 +827,10 @@ mod tests {
     }
 
     #[test]
-    fn chat_reasoning_struct_variant_round_trips_postcard_and_json() {
+    fn chat_reasoning_struct_variant_round_trips_msgpack_and_json() {
         // The struct-variant ChatReasoning (field + bytes) is the one variant
         // whose payload is not a bare byte array — pin both wire formats so a
-        // serde/postcard refactor cannot silently drop the field identity
+        // serde/codec refactor cannot silently drop the field identity
         // (re-emission would then mis-route to the default reasoning_content).
         for artifact in [
             ReasoningArtifact::ChatReasoning {
@@ -845,11 +846,11 @@ mod tests {
                 bytes: b"text reasoning".to_vec(),
             },
         ] {
-            let bytes = postcard::to_allocvec(&artifact).expect("encode");
-            let decoded: ReasoningArtifact = postcard::from_bytes(&bytes).expect("decode");
+            let bytes = rmp_serde::to_vec_named(&artifact).expect("encode");
+            let decoded: ReasoningArtifact = rmp_serde::from_slice(&bytes).expect("decode");
             assert_eq!(
                 decoded, artifact,
-                "postcard round-trip must keep field + bytes"
+                "MessagePack round-trip must keep field + bytes"
             );
 
             let json = serde_json::to_string(&artifact).expect("serialize");
@@ -859,13 +860,13 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_producer_round_trip_postcard() {
+    fn reasoning_producer_round_trip_msgpack() {
         let producer = ReasoningProducer {
             provider_slug: "openai".to_string(),
             model: "gpt-5.6".to_string(),
         };
-        let bytes = postcard::to_allocvec(&producer).expect("encode");
-        let decoded: ReasoningProducer = postcard::from_bytes(&bytes).expect("decode");
+        let bytes = rmp_serde::to_vec_named(&producer).expect("encode");
+        let decoded: ReasoningProducer = rmp_serde::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, producer);
     }
 
@@ -915,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_with_artifact_and_producer_round_trips_postcard() {
+    fn turn_with_artifact_and_producer_round_trips_msgpack() {
         let turn = sample_turn(
             Some(ReasoningArtifact::AnthropicThinking(
                 b"{\"sig\":\"x\"}".to_vec(),
@@ -925,18 +926,18 @@ mod tests {
                 model: "claude-4.6".to_string(),
             }),
         );
-        let bytes = postcard::to_allocvec(&turn).expect("encode");
-        let decoded: Turn = postcard::from_bytes(&bytes).expect("decode");
+        let bytes = rmp_serde::to_vec_named(&turn).expect("encode");
+        let decoded: Turn = rmp_serde::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, turn);
     }
 
     #[test]
-    fn turn_without_artifact_round_trips_postcard() {
+    fn turn_without_artifact_round_trips_msgpack() {
         // Legacy/placeholder turns (and providers that expose no reusable
         // artifact) must round-trip with both new fields as None.
         let turn = sample_turn(None, None);
-        let bytes = postcard::to_allocvec(&turn).expect("encode");
-        let decoded: Turn = postcard::from_bytes(&bytes).expect("decode");
+        let bytes = rmp_serde::to_vec_named(&turn).expect("encode");
+        let decoded: Turn = rmp_serde::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, turn);
         assert!(decoded.reasoning_artifact.is_none());
         assert!(decoded.reasoning_producer.is_none());
