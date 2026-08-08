@@ -1617,6 +1617,22 @@ fn handle_ai_providers_list_key(
             app.ai_providers.scroll_down_page();
         }
 
+        // Enter selects the highlighted account as the account for the
+        // active (attached) session, then returns to the chat page.  The
+        // daemon confirms with SessionAccountSet, which refreshes the
+        // status-bar provider slug via handle_session_account_set.
+        KeyCode::Enter => {
+            if let Some(sel) = app.ai_providers.selection
+                && let Some(account) = app.ai_providers.accounts.get(sel)
+            {
+                let name = account.name.clone();
+                app.set_page(Page::Chat);
+                client_tx
+                    .send(ClientMessage::SetSessionAccount { name })
+                    .map_err(broken_pipe)?;
+            }
+        }
+
         // Remove account (with confirmation)
         KeyCode::Char('r') => {
             if let Some(sel) = app.ai_providers.selection

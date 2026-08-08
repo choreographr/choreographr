@@ -512,7 +512,7 @@ In `choreo-tui`:
 - `/account list` — list configured AI provider accounts
 - `/account remove <name>` — remove an AI provider account
 - `/account <name>` — set the session's AI provider account
-- `Ctrl+A` — open the AI provider accounts page (list accounts, remove with `r`, set an API key with `c`, or start the new-account wizard with `n`)
+- `Ctrl+A` — open the AI provider accounts page (list accounts; `Enter` sets the highlighted account on the active session and returns to chat, `r` removes, `c` sets an API key, `n` starts the new-account wizard)
 - New-account wizard (`n` on the accounts page) — a two-phase flow: pick a provider (`j`/`k` navigate, `PgUp`/`PgDn` page), then enter a slug (the account's unique name, e.g. `/account <slug>`); Enter creates the account and jumps straight to the API-key page
 - `/reasoning` — show current reasoning effort slug
 - `/reasoning <slug>` — set reasoning effort (e.g. `off`, `low`, `medium`, `high`, `on`, `xhigh`, `max`; available values depend on the model)

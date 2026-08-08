@@ -334,6 +334,73 @@ fn chat_ctrl_a_enters_ai_providers() {
 }
 
 #[test]
+fn ai_providers_enter_selects_account_and_returns_to_chat() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.page = Page::AIProviders;
+    app.ai_providers.set_accounts(vec![
+        AccountInfo {
+            name: "work-account".to_string(),
+            provider: "anthropic".to_string(),
+            has_credential: true,
+        },
+        AccountInfo {
+            name: "personal-account".to_string(),
+            provider: "openai".to_string(),
+            has_credential: true,
+        },
+    ]);
+    // Highlight the second account.
+    app.ai_providers.selection = Some(1);
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    // The view returns to the chat page and the highlighted account is sent
+    // as the account for the active (attached) session.
+    assert_eq!(app.page, Page::Chat);
+    let msg = rx.recv().expect("sent message");
+    assert_eq!(
+        msg,
+        ClientMessage::SetSessionAccount {
+            name: "personal-account".to_string(),
+        }
+    );
+}
+
+#[test]
+fn ai_providers_enter_without_selection_stays_on_page() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.page = Page::AIProviders;
+    app.ai_providers.set_accounts(vec![AccountInfo {
+        name: "only-account".to_string(),
+        provider: "anthropic".to_string(),
+        has_credential: true,
+    }]);
+    // No selection (the list was emptied or never highlighted): Enter must
+    // not send a message or leave the page.
+    app.ai_providers.selection = None;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(app.page, Page::AIProviders);
+    assert!(
+        rx.try_recv().is_err(),
+        "no message sent without a selection"
+    );
+}
+
+#[test]
 fn chat_ctrl_up_sends_undo() {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut app = test_app();
