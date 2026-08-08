@@ -18,19 +18,28 @@ pub(crate) fn retry_send(
     url: &str,
     api_key: &str,
     body: &serde_json::Value,
+    config: &ServiceConfig,
     retry_cfg: &RetryConfig,
     ctx: &mut crate::retry::AttemptContext,
 ) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
     let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", api_key.trim()));
-    // The closure captures `auth_header` by reference (it stays `Fn`); the
-    // Zeroizing wrapper ensures the temporary `Bearer …` string is wiped when
-    // it goes out of scope.
+    // Provider-specific extra headers (e.g. the opencode routing header) are
+    // derived from the config once, here, so every call site stays a plain
+    // "send with retry" and cannot forget or duplicate them. They are static
+    // consts, so the slice can outlive this call without a borrow.
+    let headers = config.opencode_request_headers();
+    // The closure captures `auth_header` and `headers` by reference (it stays
+    // `Fn`); the Zeroizing wrapper ensures the temporary `Bearer …` string is
+    // wiped when it goes out of scope.
     retry::retry_loop(
         || {
-            agent
+            let mut request = agent
                 .post(url)
-                .header("Authorization", auth_header.as_str())
-                .send_json(body.clone())
+                .header("Authorization", auth_header.as_str());
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            request.send_json(body.clone())
         },
         retry_cfg,
         ctx,
@@ -42,19 +51,26 @@ pub(crate) fn retry_send_get(
     agent: &ureq::Agent,
     url: &str,
     api_key: &str,
+    config: &ServiceConfig,
     retry_cfg: &RetryConfig,
     ctx: &mut crate::retry::AttemptContext,
 ) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
     let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", api_key.trim()));
-    // The closure captures `auth_header` by reference (it stays `Fn`); the
-    // Zeroizing wrapper ensures the temporary `Bearer …` string is wiped when
-    // it goes out of scope.
+    // Provider-specific extra headers (e.g. the opencode routing header) are
+    // derived from the config once, here, so every call site stays a plain
+    // "send with retry" and cannot forget or duplicate them. They are static
+    // consts, so the slice can outlive this call without a borrow.
+    let headers = config.opencode_request_headers();
+    // The closure captures `auth_header` and `headers` by reference (it stays
+    // `Fn`); the Zeroizing wrapper ensures the temporary `Bearer …` string is
+    // wiped when it goes out of scope.
     retry::retry_loop(
         || {
-            agent
-                .get(url)
-                .header("Authorization", auth_header.as_str())
-                .call()
+            let mut request = agent.get(url).header("Authorization", auth_header.as_str());
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            request.call()
         },
         retry_cfg,
         ctx,

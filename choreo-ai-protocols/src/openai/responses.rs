@@ -349,7 +349,7 @@ pub(crate) fn responses_request(
     // temporary would be dropped before the retry call below (E0716).
     let mut no_retry = None;
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, None);
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
     let payload: ResponsesResponse = response
         .into_body()
         .read_json()
@@ -400,7 +400,7 @@ where
     // temporary would be dropped before the retry call below (E0716).
     let mut no_retry = None;
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, Some(&mut deadline));
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // Reader thread decouples the blocking socket read from cancellation
     // polling (see `crate::stream`); the abort flag on `sse` stops the thread
@@ -483,7 +483,7 @@ pub(crate) fn responses_request_with_tools(
 
     let retry = retry::retry_config_from_config(config);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
     let payload: ResponsesResponse = response
         .into_body()
         .read_json()
@@ -791,7 +791,7 @@ where
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
 
     let mut has_any_output = false;
     let mut full_content = String::new();

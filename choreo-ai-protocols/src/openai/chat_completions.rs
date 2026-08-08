@@ -168,7 +168,7 @@ pub(crate) fn chat_completions_request(
     // temporary would be dropped before the retry call below (E0716).
     let mut no_retry = None;
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, None);
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
     let payload: ChatCompletionsResponse = response
         .into_body()
         .read_json()
@@ -220,7 +220,7 @@ pub(crate) fn chat_completions_request_with_tools(
     })
     .map_err(io::Error::other)?;
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
     let payload: ChatCompletionsResponse = response
         .into_body()
         .read_json()
@@ -358,7 +358,7 @@ where
     // temporary would be dropped before the retry call below (E0716).
     let mut no_retry = None;
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, Some(&mut deadline));
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // The blocking socket read lives on a dedicated thread (see
     // `crate::stream`): `recv_sse_event` below is fully event-driven — it
@@ -680,7 +680,7 @@ where
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     let mut acc = ChatCompletionsStreamAccumulator::default();
     // Reader thread decouples the blocking socket read from cancellation

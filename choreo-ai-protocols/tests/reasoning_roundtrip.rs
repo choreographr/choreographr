@@ -39,7 +39,19 @@ use choreo_proto::ReasoningArtifact;
 struct CapturedRequest {
     method: String,
     path: String,
+    /// Header lines captured verbatim (lowercased name → value).
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+impl CapturedRequest {
+    /// Look up a request header by name (case-insensitive).
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == &name.to_ascii_lowercase())
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 impl CapturedRequest {
@@ -123,10 +135,20 @@ impl MockProvider {
                 let mut parts = head.split_whitespace();
                 let method = parts.next().unwrap_or("").to_string();
                 let path = parts.next().unwrap_or("").to_string();
-                captured_thread
-                    .lock()
-                    .unwrap()
-                    .push(CapturedRequest { method, path, body });
+                // Capture headers (everything after the request line, before the
+                // blank line) so tests can assert on outbound header values.
+                let headers = head
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                    .collect();
+                captured_thread.lock().unwrap().push(CapturedRequest {
+                    method,
+                    path,
+                    headers,
+                    body,
+                });
 
                 // Serve the next scripted response (peek when it is the last
                 // one so excess requests still get an answer).
@@ -828,4 +850,69 @@ fn responses_reasoning_items_reemitted_into_input() {
         input[reasoning_idx]["summary"][0]["text"], "deciding on tool",
         "opaque reasoning items re-emitted verbatim",
     );
+}
+
+// ── opencode x-opencode-session header tests ─────────────────────────────
+
+/// Drive one non-streaming chat completion turn against the mock provider and
+/// return the captured request.
+fn chat_turn_request(config: ServiceConfig) -> CapturedRequest {
+    let response = r#"{
+        "choices":[{"message":{"content":"hello","tool_calls":[],"reasoning_content":null,"reasoning":null,"reasoning_text":null}}],
+        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+    }"#;
+    let mock = MockProvider::start(vec![(200, "application/json", response.to_string())]);
+
+    let client = OpenAiClient::new(
+        ServiceConfig {
+            base_url: mock.base_url("v1"),
+            retry_max_attempts: 1,
+            ..config
+        },
+        "test-key".to_string(),
+    )
+    .expect("openai client");
+
+    client
+        .completion("deepseek-v4-flash", "hi")
+        .expect("completion");
+    mock.requests().into_iter().next().expect("one request")
+}
+
+#[test]
+#[ignore]
+fn opencode_provider_sends_x_opencode_session_header() {
+    // opencode-go (the go tier) and opencode (zen) both send the fixed session
+    // header so the gateway routes to a stable, working upstream provider.
+    for slug in ["opencode-go", "opencode"] {
+        let req = chat_turn_request(ServiceConfig {
+            provider_slug: slug,
+            streaming: false,
+            ..Default::default()
+        });
+        assert_eq!(
+            req.header("x-opencode-session"),
+            Some("choreographr"),
+            "slug {slug} must send x-opencode-session: choreographr"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn non_opencode_provider_omits_x_opencode_session_header() {
+    // Providers that aren't opencode gateways must not get the header — the
+    // header is only meaningful to opencode.ai's routing.
+    for slug in ["openai", "deepseek"] {
+        let req = chat_turn_request(ServiceConfig {
+            provider_slug: slug,
+            streaming: false,
+            ..Default::default()
+        });
+        assert_eq!(
+            req.header("x-opencode-session"),
+            None,
+            "slug {slug} must not send x-opencode-session"
+        );
+    }
 }

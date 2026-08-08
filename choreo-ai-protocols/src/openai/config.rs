@@ -7,6 +7,18 @@ const DEFAULT_MODEL_LIST_PATH: &str = "/models";
 const DEFAULT_RESPONSES_PATH: &str = "/responses";
 const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
+/// Fixed `x-opencode-session` value sent to opencode providers.
+///
+/// The opencode.ai zen/go gateway routes each request to one of several
+/// weighted upstream providers by hashing a "sticky id": the
+/// `x-opencode-session` header when present, otherwise the API key's
+/// workspace id. Without the header, choreographr requests always landed on a
+/// provider that reported "Model is unavailable". A fixed value keeps routing
+/// on a stable, verified-good provider. The value only matters for its
+/// last-4-chars hash (which provider gets selected), so it is deliberately a
+/// constant rather than the session id.
+pub(crate) const OPENCODE_SESSION_ID: &str = "choreographr";
+
 /// Per-client configuration for an OpenAI-compatible service.
 ///
 /// Provider-level settings (endpoints, timeouts, retry, token limits,
@@ -144,6 +156,24 @@ impl ServiceConfig {
         field
     }
 
+    /// Extra headers to attach to every request for opencode providers.
+    ///
+    /// The opencode.ai zen/go gateway picks a weighted upstream provider by
+    /// hashing the `x-opencode-session` header (falling back to the API key's
+    /// workspace id when absent). Sending a fixed, verified-good session id
+    /// pins routing to a working provider instead of deterministically landing
+    /// on a broken one. Only the two known opencode gateway slugs
+    /// (`opencode`, `opencode-go`) get the header — matched exactly, not by
+    /// prefix, so an unrelated `opencode-*` slug is never given routing
+    /// behavior it wasn't configured for. Every other provider slug gets an
+    /// empty list.
+    pub(crate) fn opencode_request_headers(&self) -> &'static [(&'static str, &'static str)] {
+        match self.provider_slug {
+            "opencode" | "opencode-go" => &[("x-opencode-session", OPENCODE_SESSION_ID)],
+            _ => &[],
+        }
+    }
+
     /// Resolve the `(max_tokens, max_completion_tokens)` pair for a model.
     ///
     /// Which field to use depends on the model family (o-series uses
@@ -178,6 +208,58 @@ pub fn completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_request_headers_present_for_opencode_slug() {
+        for slug in ["opencode", "opencode-go"] {
+            let config = ServiceConfig {
+                provider_slug: slug,
+                ..Default::default()
+            };
+            let headers = config.opencode_request_headers();
+            assert_eq!(
+                headers,
+                &[("x-opencode-session", OPENCODE_SESSION_ID)],
+                "slug {slug} must send the session header"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_request_headers_empty_for_other_providers() {
+        for slug in ["openai", "deepseek", "anthropic", "custom"] {
+            let config = ServiceConfig {
+                provider_slug: slug,
+                ..Default::default()
+            };
+            assert!(
+                config.opencode_request_headers().is_empty(),
+                "slug {slug} must not send opencode headers"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_request_headers_exact_slug_allowlist() {
+        // Only the two known gateway slugs get the header. Prefix matches (e.g.
+        // a hypothetical `opencode-mirror`) and slugs merely *containing*
+        // "opencode" must not — an unknown opencode-* slug is not known to be a
+        // gateway and must not get routing behavior it wasn't configured for.
+        for slug in [
+            "opencode-future-tier",
+            "not-opencode-gateway",
+            "my-opencode-proxy",
+        ] {
+            let config = ServiceConfig {
+                provider_slug: slug,
+                ..Default::default()
+            };
+            assert!(
+                config.opencode_request_headers().is_empty(),
+                "slug {slug} must not send opencode headers"
+            );
+        }
+    }
 
     #[test]
     fn programmatic_tool_calling_default_is_false() {

@@ -284,7 +284,14 @@ impl OpenAiClient {
         // temporary would be dropped before the retry call below (E0716).
         let mut no_retry = None;
         let mut ctx = retry::AttemptContext::new(&mut no_retry, None, None);
-        let response = retry::retry_send_get(&self.http, &url, &self.api_key, &retry, &mut ctx)?;
+        let response = retry::retry_send_get(
+            &self.http,
+            &url,
+            &self.api_key,
+            &self.config,
+            &retry,
+            &mut ctx,
+        )?;
         let payload: ModelListResponse = response
             .into_body()
             .read_json()

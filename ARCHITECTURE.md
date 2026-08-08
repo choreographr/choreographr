@@ -237,7 +237,7 @@ account configuration, no sessions — so it can be consumed independently of
 
 | Module | Purpose |
 |---|---|
-| `openai/` | OpenAI-compatible client (`OpenAiClient`) covering both Chat Completions and Responses APIs (incl. programmatic tool calling), plus the canonical `ChatRequestMessage` / `ChatToolDefinition` types that the other clients translate into their own wire formats, `ServiceConfig`, SSE reader, and per-protocol retry helpers. |
+| `openai/` | OpenAI-compatible client (`OpenAiClient`) covering both Chat Completions and Responses APIs (incl. programmatic tool calling), plus the canonical `ChatRequestMessage` / `ChatToolDefinition` types that the other clients translate into their own wire formats, `ServiceConfig`, SSE reader, and per-protocol retry helpers. For the opencode gateway providers (`provider_slug` exactly `"opencode"` or `"opencode-go"`), `ServiceConfig::opencode_request_headers()` attaches a fixed `x-opencode-session: choreographr` header to every request: the opencode.ai zen/go gateway selects a weighted upstream provider by hashing that header (or the API key's workspace id when absent), so a constant value pins routing to a working provider instead of deterministically hitting a broken one. |
 | `anthropic/` | Anthropic Messages API client (`AnthropicClient`, `AnthropicConfig`). Implements `ProviderClient`. |
 | `google/` | Google Gemini API client (`GoogleClient`, `GoogleConfig`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
 | `traits.rs` | `ProviderClient` trait, `ChatTurnRequest`, `ToolResultItem` |
