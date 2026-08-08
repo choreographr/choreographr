@@ -20,7 +20,7 @@ use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_proto::{
     AssistantToolCallRecord, ChatReasoningField, ReasoningArtifact, ReasoningProducer,
 };
-use choreographr::{SessionState, build_chat_request_messages};
+use choreographr::{AssistantResponse, SessionState, build_chat_request_messages};
 
 // ── Fixtures ─────────────────────────────────────────────────────────────
 
@@ -37,22 +37,23 @@ fn add_tool_turn(
     let (tid, _) = session.start_turn(Some(user_text.to_string()));
     session.set_assistant_response(
         tid,
-        None,
-        Some(reasoning.to_string()),
-        vec![AssistantToolCallRecord {
-            call_id: "call_1".into(),
-            name: "get_weather".into(),
-            arguments_json: r#"{"city":"London"}"#.into(),
-        }],
-        None,
-        Some(ReasoningArtifact::ChatReasoning {
-            field: ChatReasoningField::ReasoningContent,
-            bytes: reasoning.as_bytes().to_vec(),
-        }),
-        Some(ReasoningProducer {
-            provider_slug: provider_slug.to_string(),
-            model: model.to_string(),
-        }),
+        AssistantResponse {
+            reasoning: Some(reasoning.to_string()),
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments_json: r#"{"city":"London"}"#.into(),
+            }],
+            reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+                field: ChatReasoningField::ReasoningContent,
+                bytes: reasoning.as_bytes().to_vec(),
+            }),
+            reasoning_producer: Some(ReasoningProducer {
+                provider_slug: provider_slug.to_string(),
+                model: model.to_string(),
+            }),
+            ..Default::default()
+        },
     );
 }
 

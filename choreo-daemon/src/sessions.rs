@@ -509,6 +509,23 @@ pub struct SessionState {
     pub discovered_skills: Option<Vec<SkillMeta>>,
 }
 
+/// The assistant response recorded onto a turn by the agent loop: display
+/// text + reasoning, tool calls, token usage, and the opaque reasoning
+/// round-trip artifact with its producing model (see `ReasoningArtifact`).
+///
+/// Bundled into one value so the artifact + producer travel as a unit and
+/// call sites stay readable instead of threading eight positional arguments
+/// through [`SessionState::set_assistant_response`].
+#[derive(Debug, Clone, Default)]
+pub struct AssistantResponse {
+    pub text: Option<String>,
+    pub reasoning: Option<String>,
+    pub tool_calls: Vec<AssistantToolCallRecord>,
+    pub token_usage: Option<TokenUsage>,
+    pub reasoning_artifact: Option<ReasoningArtifact>,
+    pub reasoning_producer: Option<ReasoningProducer>,
+}
+
 impl SessionState {
     /// Re-resolve context window from the catalog when the stored value
     /// is `None` (e.g. sessions created before a model was added to the
@@ -628,29 +645,20 @@ impl SessionState {
 
     /// Set the assistant response on a turn (text or tool-use).
     ///
-    /// `reasoning_artifact`/`reasoning_producer` record the opaque reasoning
-    /// round-trip payload and the model that produced it (phase 4b/4c). The
-    /// producer is set whenever the model completes a response — even when
-    /// the artifact is None (no reusable payload) — so the builder's
-    /// same-model provenance check is well-defined for every turn.
-    #[expect(clippy::too_many_arguments)]
-    pub fn set_assistant_response(
-        &mut self,
-        turn_id: u32,
-        text: Option<String>,
-        reasoning: Option<String>,
-        tool_calls: Vec<AssistantToolCallRecord>,
-        token_usage: Option<TokenUsage>,
-        reasoning_artifact: Option<ReasoningArtifact>,
-        reasoning_producer: Option<ReasoningProducer>,
-    ) {
+    /// The response's `reasoning_artifact`/`reasoning_producer` record the
+    /// opaque reasoning round-trip payload and the model that produced it
+    /// (phase 4b/4c). The producer is set whenever the model completes a
+    /// response — even when the artifact is None (no reusable payload) — so
+    /// the builder's same-model provenance check is well-defined for every
+    /// turn. See [`AssistantResponse`].
+    pub fn set_assistant_response(&mut self, turn_id: u32, response: AssistantResponse) {
         if let Some(turn) = self.turns.get_mut(&turn_id) {
-            turn.assistant_text = text;
-            turn.assistant_reasoning = reasoning;
-            turn.tool_calls = tool_calls;
-            turn.token_usage = token_usage;
-            turn.reasoning_artifact = reasoning_artifact;
-            turn.reasoning_producer = reasoning_producer;
+            turn.assistant_text = response.text;
+            turn.assistant_reasoning = response.reasoning;
+            turn.tool_calls = response.tool_calls;
+            turn.token_usage = response.token_usage;
+            turn.reasoning_artifact = response.reasoning_artifact;
+            turn.reasoning_producer = response.reasoning_producer;
         }
     }
 
@@ -2232,14 +2240,16 @@ mod tests {
             provider_slug: "deepseek".into(),
             model: "deepseek-v4-pro".into(),
         };
+        // The struct carries the artifact + producer as a unit; both must land
+        // on the turn so the builder's same-model provenance check can re-emit.
         state.set_assistant_response(
             tid,
-            Some("hi".into()),
-            None,
-            vec![],
-            None,
-            Some(artifact.clone()),
-            Some(producer.clone()),
+            AssistantResponse {
+                text: Some("hi".into()),
+                reasoning_artifact: Some(artifact.clone()),
+                reasoning_producer: Some(producer.clone()),
+                ..Default::default()
+            },
         );
         let turn = state.turns.get(&tid).expect("turn exists");
         assert_eq!(turn.reasoning_artifact, Some(artifact));
@@ -2252,7 +2262,13 @@ mod tests {
         // must leave both round-trip fields None.
         let mut state = SessionState::empty();
         let (tid, _) = state.start_turn(Some("hello".into()));
-        state.set_assistant_response(tid, Some("hi".into()), None, vec![], None, None, None);
+        state.set_assistant_response(
+            tid,
+            AssistantResponse {
+                text: Some("hi".into()),
+                ..Default::default()
+            },
+        );
         let turn = state.turns.get(&tid).expect("turn exists");
         assert_eq!(turn.reasoning_artifact, None);
         assert_eq!(turn.reasoning_producer, None);

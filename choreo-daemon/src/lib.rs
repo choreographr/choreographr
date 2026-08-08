@@ -22,8 +22,8 @@ pub use crate::server::run_server;
 #[cfg(feature = "test-utils")]
 pub use crate::sessions::join_session_shutdown_with_grace_for_test;
 pub use crate::sessions::{
-    ActiveSessionEntry, ChildResult, RequestContext, SessionCommand, SessionMetadata, SessionState,
-    session_main,
+    ActiveSessionEntry, AssistantResponse, ChildResult, RequestContext, SessionCommand,
+    SessionMetadata, SessionState, session_main,
 };
 pub use crate::tools::exec::{ExecArgs, execute_exec_tool};
 pub use crate::tools::find::{FindArgs, execute_find_tool};

@@ -1,6 +1,6 @@
 use crate::context::{self, LoadedSkill, SkillMeta};
 use crate::providers::InferenceProvider;
-use crate::sessions::{RequestContext, SessionCommand, SessionState};
+use crate::sessions::{AssistantResponse, RequestContext, SessionCommand, SessionState};
 use crate::tools::context::ToolContext;
 use crate::tools::load_tools::{LoadToolsArgs, apply_load_tools};
 use crate::tools::set_working_dir::{SetWorkingDirArgs, resolve_working_dir_path};
@@ -1406,12 +1406,14 @@ pub(crate) fn run_agent_loop(
                 };
                 session.set_assistant_response(
                     current_turn_id,
-                    Some(final_text.content),
-                    final_text.reasoning,
-                    Vec::new(),
-                    token_usage,
-                    final_text.reasoning_artifact.clone(),
-                    Some(producer.clone()),
+                    AssistantResponse {
+                        text: Some(final_text.content),
+                        reasoning: final_text.reasoning,
+                        token_usage,
+                        reasoning_artifact: final_text.reasoning_artifact.clone(),
+                        reasoning_producer: Some(producer.clone()),
+                        ..Default::default()
+                    },
                 );
                 // Persist the response id + its producing model so a
                 // ResponseId-policy provider can chain the next user turn via
@@ -1450,12 +1452,14 @@ pub(crate) fn run_agent_loop(
                 };
                 session.set_assistant_response(
                     current_turn_id,
-                    tool_use.content.clone(),
-                    tool_use.reasoning.clone(),
-                    tool_call_records.clone(),
-                    token_usage,
-                    tool_use.reasoning_artifact.clone(),
-                    Some(producer.clone()),
+                    AssistantResponse {
+                        text: tool_use.content.clone(),
+                        reasoning: tool_use.reasoning.clone(),
+                        tool_calls: tool_call_records.clone(),
+                        token_usage,
+                        reasoning_artifact: tool_use.reasoning_artifact.clone(),
+                        reasoning_producer: Some(producer.clone()),
+                    },
                 );
                 // Seed one placeholder tool result per call, in the model's
                 // call order, so the transcript renders every tool result in
@@ -1953,14 +1957,13 @@ pub(crate) fn run_agent_loop(
                     tracing::warn!(?e, "truncated tool call, finalizing turn gracefully");
                     session.set_assistant_response(
                         current_turn_id,
-                        Some(format!("[tool call truncated: {e}]")),
-                        None,
-                        Vec::new(),
-                        None,
-                        // No artifact or producer: the model never completed a
-                        // response, so there is nothing to replay.
-                        None,
-                        None,
+                        AssistantResponse {
+                            text: Some(format!("[tool call truncated: {e}]")),
+                            // No artifact or producer: the model never completed a
+                            // response, so there is nothing to replay. Everything
+                            // else (tool_calls, usage) stays at its default.
+                            ..Default::default()
+                        },
                     );
                     finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
                     tool_results.clear();
@@ -2490,7 +2493,13 @@ mod tests {
     fn make_session_with_turns() -> SessionState {
         let mut session = SessionState::empty();
         let (tid0, _) = session.start_turn(Some("hello".into()));
-        session.set_assistant_response(tid0, Some("hi".into()), None, vec![], None, None, None);
+        session.set_assistant_response(
+            tid0,
+            AssistantResponse {
+                text: Some("hi".into()),
+                ..Default::default()
+            },
+        );
         session
     }
 
@@ -2539,12 +2548,11 @@ mod tests {
         }];
         session.set_assistant_response(
             tid,
-            Some("thinking".into()),
-            None,
-            records.clone(),
-            None,
-            None,
-            None,
+            AssistantResponse {
+                text: Some("thinking".into()),
+                tool_calls: records.clone(),
+                ..Default::default()
+            },
         );
         // Placeholder results are seeded in call order; the finished tool
         // updates its slot in place.
@@ -2571,9 +2579,21 @@ mod tests {
     fn build_chat_request_messages_skips_undone_turns() {
         let mut session = SessionState::empty();
         let (tid0, _) = session.start_turn(Some("visible".into()));
-        session.set_assistant_response(tid0, Some("ok".into()), None, vec![], None, None, None);
+        session.set_assistant_response(
+            tid0,
+            AssistantResponse {
+                text: Some("ok".into()),
+                ..Default::default()
+            },
+        );
         let (tid1, _) = session.start_turn(Some("hidden".into()));
-        session.set_assistant_response(tid1, Some("nope".into()), None, vec![], None, None, None);
+        session.set_assistant_response(
+            tid1,
+            AssistantResponse {
+                text: Some("nope".into()),
+                ..Default::default()
+            },
+        );
         if let Some(turn) = session.turns.get_mut(&tid1) {
             turn.undone = true;
         }
@@ -2621,12 +2641,13 @@ mod tests {
         let (tid, _) = session.start_turn(Some(user_text.to_string()));
         session.set_assistant_response(
             tid,
-            Some(assistant_text.to_string()),
-            None,
-            tool_calls,
-            None,
-            artifact,
-            producer,
+            AssistantResponse {
+                text: Some(assistant_text.to_string()),
+                tool_calls,
+                reasoning_artifact: artifact,
+                reasoning_producer: producer,
+                ..Default::default()
+            },
         );
         tid
     }
@@ -2971,12 +2992,11 @@ mod tests {
         let records = vec![tool_call_record("call_1", "ls")];
         session.set_assistant_response(
             tid,
-            Some("thinking".into()),
-            None,
-            records.clone(),
-            None,
-            None,
-            None,
+            AssistantResponse {
+                text: Some("thinking".into()),
+                tool_calls: records.clone(),
+                ..Default::default()
+            },
         );
         session.seed_tool_results(tid, &records);
         // Tool-involving turn WITH an artifact: clean.
@@ -3030,12 +3050,11 @@ mod tests {
         let records = vec![tool_call_record("call_1", "ls")];
         session.set_assistant_response(
             tid,
-            Some("thinking".into()),
-            None,
-            records.clone(),
-            None,
-            None,
-            None,
+            AssistantResponse {
+                text: Some("thinking".into()),
+                tool_calls: records.clone(),
+                ..Default::default()
+            },
         );
         session.seed_tool_results(tid, &records);
         // ResponseId policy: artifacts flow via previous_response_id, so the
