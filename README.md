@@ -369,9 +369,10 @@ and re-emits it per provider rules on the next request:
   back on every assistant tool-call message when the request carries `tools`.
 - **Gemini** — the encrypted thought-step `thoughtSignature` values are sent
   back (the summary text stays display-only).
-- **OpenAI / xAI Responses** — opaque reasoning items are re-emitted into
-  `input`, and reasoning continuity is chained across user turns via
-  `previous_response_id`.
+- **OpenAI / xAI Responses** — reasoning continuity is chained across user
+  turns via `previous_response_id` (the server retains the reasoning items in
+  the chain; a fresh chained turn sends only the new user message, and opaque
+  reasoning items are re-emitted into `input` on non-chained conversions).
 
 Display-only reasoning (providers/fields that expose no reusable payload) is
 never replayed. Artifacts are model-bound: after a mid-session model switch

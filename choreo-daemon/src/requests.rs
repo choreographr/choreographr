@@ -1,5 +1,9 @@
 use crate::context::{self, LoadedSkill, SkillMeta};
 use crate::providers::InferenceProvider;
+use crate::reasoning::{
+    build_chat_request_messages, initial_prev_resp_id, reasoning_artifact_tokens,
+    warn_on_missing_reasoning_artifacts,
+};
 use crate::sessions::{
     AssistantResponse, RequestContext, SessionCommand, SessionState, turn_for_client,
 };
@@ -11,17 +15,15 @@ use crate::tools::{
     PreparedImage, STREAMING_CHANNEL_CAPACITY, ToolError, ToolOutput, ToolOutputFormat,
     ToolRegistry,
 };
-use choreo_ai_protocols::openai::{
-    AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
-};
+use choreo_ai_protocols::openai::{ChatRequestMessage, ChatToolDefinition};
 use choreo_ai_protocols::{
-    ChatToolCall, ChatTurnRequest, ChatTurnResult, ReasoningPassback, StreamEvent, ToolResultItem,
-    model_reasoning_capability, model_reasoning_passback,
+    ChatToolCall, ChatTurnRequest, ChatTurnResult, StreamEvent, ToolResultItem,
+    model_reasoning_capability,
 };
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
-    OutputStream, ReasoningArtifact, ReasoningProducer, SessionStatus, TokenUsage, Turn,
+    OutputStream, ReasoningProducer, SessionStatus, TokenUsage,
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -679,30 +681,6 @@ fn resolve_reasoning_effort(
     }
 }
 
-/// Estimate the input tokens contributed by a reasoning artifact's payload.
-///
-/// The artifact is opaque bytes owned by the producing adapter; the daemon
-/// never interprets it. Most current payloads (chat `reasoning_content`
-/// strings, Anthropic thinking-block JSON, Gemini signatures) are UTF-8 text,
-/// so count them with the encoding when decodable; otherwise fall back to a
-/// bytes/4 heuristic. Replayed reasoning is billed as input on keep-all
-/// models, so under-counting here would mislead the context-window display.
-fn reasoning_artifact_tokens(enc: &tiktoken::CoreBpe, artifact: &ReasoningArtifact) -> u32 {
-    let bytes = match artifact {
-        // ChatReasoning is a struct variant (field tag + bytes); the field
-        // tag only matters for re-emission targeting, not token estimation,
-        // so bind just the payload.
-        ReasoningArtifact::ChatReasoning { bytes: b, .. }
-        | ReasoningArtifact::AnthropicThinking(b)
-        | ReasoningArtifact::GoogleSignatures(b)
-        | ReasoningArtifact::ResponsesItems(b) => b,
-    };
-    match std::str::from_utf8(bytes) {
-        Ok(text) => enc.count(text) as u32,
-        Err(_) => (bytes.len() / 4) as u32,
-    }
-}
-
 /// Estimate the number of prompt tokens for the current request using
 /// tiktoken.  Returns a (encoding, estimated_tokens) pair so the caller
 /// can reuse the encoding for output-token counting during streaming.
@@ -1107,90 +1085,6 @@ fn apply_pending_config_change(session: &mut SessionState, change: &PendingConfi
             debug!(path = ?path, "mirrored set_working_dir onto worker session config");
         }
     }
-}
-
-/// Resolve the starting `previous_response_id` for a new agent-loop
-/// invocation. ResponseId-policy providers (OpenAI/xAI Responses) chain
-/// reasoning continuity across user turns, so the id persisted on the session
-/// config after the last model call is restored here. Every other policy
-/// resets to None: the id is meaningless outside Responses-style APIs and
-/// must not leak into a request that does not understand it.
-///
-/// Restoration is additionally gated on provenance: the persisted id is
-/// restored only when the current provider+model is the one that produced it
-/// (same-model provenance as reasoning artifacts), so a stale id from a
-/// different provider or model is never replayed.
-fn initial_prev_resp_id(
-    session: &SessionState,
-    provider_slug: &str,
-    model: &str,
-) -> Option<String> {
-    // A response id is service-bound: a stale id persisted under a different
-    // provider (mid-session openai → xAI switch) would be rejected with a 400
-    // if replayed, and it is model-bound for continuity purposes too — so
-    // require an exact producer match, mirroring the artifact provenance check.
-    let same_producer = session.config.last_response_id_producer.as_ref()
-        == Some(&ReasoningProducer {
-            provider_slug: provider_slug.to_string(),
-            model: model.to_string(),
-        });
-    if same_producer
-        && model_reasoning_passback(provider_slug, model) == ReasoningPassback::ResponseId
-    {
-        session.config.last_response_id.clone()
-    } else {
-        None
-    }
-}
-
-/// Precondition guard for reasoning-echo policies (phase 4c).
-///
-/// Before sending a request whose passback policy requires echoing reasoning
-/// (ToolLoop/AllTurns/Signature), check that every tool-involving turn in
-/// history carries its artifact. A turn recorded before the artifact was
-/// captured (e.g. a pre-migration session state) would otherwise be sent
-/// without the reasoning payload the provider demands on tool-loop turns,
-/// surfacing as a mysterious 400 — this turns that into a diagnosable log
-/// line. Returns the number of missing artifacts (0 when clean) so tests can
-/// exercise the path deterministically.
-///
-/// The guard deliberately does NOT disable thinking for the request: for
-/// ToolLoop providers (DeepSeek/Kimi) the 400 comes from *history*, not the
-/// current request's thinking setting, so flipping the effort to "off" would
-/// not fix the failure and would silently change model behavior — the warn is
-/// the honest signal. ResponseId/None policies skip the check entirely (no
-/// artifact is expected on the wire).
-fn warn_on_missing_reasoning_artifacts(
-    session: &SessionState,
-    session_id: u64,
-    provider_slug: &str,
-    model: &str,
-) -> usize {
-    let passback = model_reasoning_passback(provider_slug, model);
-    if matches!(
-        passback,
-        ReasoningPassback::None | ReasoningPassback::ResponseId
-    ) {
-        return 0;
-    }
-    let mut missing = 0;
-    for (turn_id, turn) in session.turns.iter() {
-        if turn.undone || !turn_has_tool_involvement(turn) {
-            continue;
-        }
-        if turn.reasoning_artifact.is_none() {
-            missing += 1;
-            warn!(
-                session_id,
-                turn_id,
-                provider_slug,
-                model,
-                passback = ?passback,
-                "reasoning artifact missing for tool-involving turn; provider may reject this request",
-            );
-        }
-    }
-    missing
 }
 
 pub(crate) fn run_agent_loop(
@@ -2351,130 +2245,6 @@ fn execute_tool_with_timeout(
     (output, cancelled, image)
 }
 
-/// Whether a turn is part of a tool loop: the assistant issued tool calls
-/// (its message must echo reasoning on the next request for several
-/// providers) or tool results are attached (it is mid-loop).
-fn turn_has_tool_involvement(turn: &Turn) -> bool {
-    !turn.tool_calls.is_empty() || !turn.tool_results.is_empty()
-}
-
-/// Build the provider request messages for a session, applying the reasoning
-/// passback policy (phase 4b): the opaque artifact captured on a previous
-/// turn is replayed only when BOTH gates pass — same-model provenance (the
-/// artifact is model-bound; a turn produced by a different model must not
-/// have its payload replayed) and the provider's `reasoning_passback` policy
-/// for this request (`ToolLoop` → tool-involving turns only, `AllTurns` →
-/// every turn, `Signature` → every turn, `ResponseId`/`None` → never via the
-/// message).
-///
-/// Public for the daemon integration tests (the `test-utils` feature); the
-/// production caller is `run_agent_loop`.
-pub fn build_chat_request_messages(
-    session: &SessionState,
-    system_prompt: Option<&str>,
-    provider_slug: &str,
-    model: &str,
-) -> Vec<ChatRequestMessage> {
-    let mut messages = Vec::new();
-
-    // Prepend system prompt and context if provided.
-    if let Some(prompt) = system_prompt {
-        messages.push(ChatRequestMessage::simple("system", prompt.to_string()));
-    }
-
-    // The passback policy decides *whether* the artifact is replayed; it is
-    // constant for the whole request (the model does not change mid-loop).
-    let passback = model_reasoning_passback(provider_slug, model);
-
-    for turn in session.turns.values() {
-        if turn.undone {
-            continue;
-        }
-        // User message
-        if let Some(text) = &turn.user_text {
-            messages.push(ChatRequestMessage::simple("user", text.clone()));
-        }
-        // Assistant message (text or tool calls).
-        //
-        // Reasoning round-trip (phase 4b): the artifact is replayed only when
-        // BOTH gates pass — (1) same-model provenance (artifacts are
-        // model-bound; a turn produced by a different model must not have its
-        // encrypted payload replayed into this request, matching pi's
-        // isSameModel and Anthropic's strip-on-model-change rule) and (2) the
-        // provider's passback policy for this request:
-        //   ToolLoop  → only tool-involving turns (assistant tool_calls or
-        //               tool results attached) — DeepSeek/Kimi reject a tool
-        //               loop whose assistant message drops reasoning_content
-        //   AllTurns  → every turn (Anthropic keep-all)
-        //   Signature → every turn (Gemini encrypted thought signatures)
-        //   ResponseId→ never via the message; continuity flows through
-        //               previous_response_id (handled in the agent loop)
-        //   None      → display-only providers, never replay
-        // The three legacy string fields (reasoning_content/reasoning/
-        // reasoning_text) stay None: the adapter re-emits the artifact in its
-        // own wire format (phase 4a), so the daemon never interprets it.
-        let same_model = turn.reasoning_producer.as_ref()
-            == Some(&ReasoningProducer {
-                provider_slug: provider_slug.to_string(),
-                model: model.to_string(),
-            });
-        let include_artifact = same_model
-            && match passback {
-                ReasoningPassback::None => false,
-                ReasoningPassback::ToolLoop => turn_has_tool_involvement(turn),
-                ReasoningPassback::AllTurns => true,
-                ReasoningPassback::Signature => true,
-                ReasoningPassback::ResponseId => false,
-            };
-        let has_tool_calls = !turn.tool_calls.is_empty();
-        if turn.assistant_text.is_some() || has_tool_calls {
-            let tool_calls = if has_tool_calls {
-                Some(
-                    turn.tool_calls
-                        .iter()
-                        .map(|tc| AssistantToolCall {
-                            id: tc.call_id.clone(),
-                            kind: "function".to_string(),
-                            function: AssistantToolFunction {
-                                name: tc.name.clone(),
-                                arguments: tc.arguments_json.clone(),
-                            },
-                        })
-                        .collect(),
-                )
-            } else {
-                None
-            };
-            messages.push(ChatRequestMessage {
-                role: "assistant",
-                content: turn.assistant_text.clone(),
-                tool_call_id: None,
-                tool_calls,
-                reasoning_content: None,
-                reasoning: None,
-                reasoning_text: None,
-                reasoning_artifact: include_artifact
-                    .then(|| turn.reasoning_artifact.clone())
-                    .flatten(),
-            });
-        }
-        // Tool result messages
-        for tr in &turn.tool_results {
-            messages.push(ChatRequestMessage {
-                role: "tool",
-                content: Some(tr.content.clone()),
-                tool_call_id: Some(tr.call_id.clone()),
-                tool_calls: None,
-                reasoning_content: None,
-                reasoning: None,
-                reasoning_text: None,
-                reasoning_artifact: None,
-            });
-        }
-    }
-    messages
-}
-
 pub const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
 pub const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
 pub const REQUEST_IMAGE_WIDTH: u32 = 640;
@@ -2486,10 +2256,13 @@ mod tests {
     use crate::daemon::DaemonCommand;
     use crate::providers::InferenceProvider;
     use crate::providers::test_util::make_test_provider;
+    use crate::reasoning::{
+        build_chat_request_messages, initial_prev_resp_id, warn_on_missing_reasoning_artifacts,
+    };
     use crate::tools::context::ToolContext;
     use crate::tools::{Tool, ToolExecError, ToolRegistry};
-    use choreo_ai_protocols::openai::AssistantToolCall;
-    use choreo_proto::ChatReasoningField;
+    use choreo_ai_protocols::openai::{AssistantToolCall, AssistantToolFunction};
+    use choreo_proto::{ChatReasoningField, ReasoningArtifact};
     use std::sync::mpsc;
 
     fn make_session_with_turns() -> SessionState {
@@ -3041,6 +2814,73 @@ mod tests {
         );
         assert_eq!(
             warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
+            0,
+        );
+    }
+
+    #[test]
+    fn guard_all_turns_policy_flags_non_tool_turn_missing_artifact() {
+        // AllTurns providers (Anthropic keep-all) echo reasoning on EVERY
+        // assistant message, not just tool-involving ones — so a plain
+        // assistant turn without its artifact is a violation there too (the
+        // ToolLoop scope would have skipped it).
+        let mut session = SessionState::empty();
+        add_turn(
+            &mut session,
+            "list",
+            "thinking",
+            Some(artifact(b"ok")),
+            Some(deepseek_producer()),
+            vec![tool_call_record("call_1", "ls")],
+        );
+        // Non-tool assistant turn WITH an artifact: clean under AllTurns.
+        add_turn(
+            &mut session,
+            "plain",
+            "hi",
+            Some(artifact(b"ok")),
+            Some(deepseek_producer()),
+            vec![],
+        );
+        // Non-tool assistant turn WITHOUT an artifact: flagged under AllTurns.
+        let (tid, _) = session.start_turn(Some("later".into()));
+        session.set_assistant_response(
+            tid,
+            AssistantResponse {
+                text: Some("hello".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            warn_on_missing_reasoning_artifacts(&session, 7, "anthropic", "claude-sonnet-5"),
+            1,
+            "AllTurns flags the artifact-less non-tool assistant turn",
+        );
+        // The same session under a ToolLoop provider flags only the tool turn:
+        // the artifact-less non-tool turn is not a violation there.
+        assert_eq!(
+            warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
+            0,
+            "ToolLoop does not flag non-tool turns",
+        );
+    }
+
+    #[test]
+    fn guard_user_only_turn_is_not_flagged() {
+        // A turn that never produced an assistant message (in-progress or
+        // failed) has no artifact by construction and must not be flagged.
+        let mut session = SessionState::empty();
+        add_turn(
+            &mut session,
+            "list",
+            "thinking",
+            Some(artifact(b"ok")),
+            Some(deepseek_producer()),
+            vec![tool_call_record("call_1", "ls")],
+        );
+        let _ = session.start_turn(Some("pending user text".into()));
+        assert_eq!(
+            warn_on_missing_reasoning_artifacts(&session, 7, "anthropic", "claude-sonnet-5"),
             0,
         );
     }

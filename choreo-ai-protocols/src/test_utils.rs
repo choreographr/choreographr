@@ -87,24 +87,43 @@ impl MockProvider {
             // record it, and serve the next scripted response. Kept as a
             // closure so the poll loop below stays readable.
             let serve_request = |mut stream: std::net::TcpStream| {
-                let mut responses = responses.lock().unwrap();
-
-                // Read the request head (through the blank line) and then the
-                // Content-Length body, recording both for later assertions.
+                // A short read timeout keeps the blocking request reads
+                // interruptible: if Drop sets the shutdown flag while a client
+                // is half-open (e.g. a test panicked mid-request), the read
+                // returns a timeout instead of blocking the join forever.
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
+
+                // Abort the read loops when the provider is being dropped, so
+                // a half-open connection cannot stall `MockProvider::drop`'s
+                // thread join.
+                let shutdown_requested = || shutdown_thread.load(Ordering::SeqCst);
+
                 let head_end = loop {
-                    let n = stream.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        // Client hung up mid-request; move on.
-                        break 0;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        break pos;
-                    }
-                    if buf.len() > 1 << 20 {
-                        panic!("mock provider: request head too large");
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break 0, // client hung up mid-request; move on
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos;
+                            }
+                            if buf.len() > 1 << 20 {
+                                panic!("mock provider: request head too large");
+                            }
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            if shutdown_requested() {
+                                return;
+                            }
+                            continue;
+                        }
+                        Err(_) => return, // connection error; move on
                     }
                 };
                 if head_end == 0 {
@@ -123,11 +142,22 @@ impl MockProvider {
                     })
                     .unwrap_or(0);
                 while buf.len().saturating_sub(body_start) < content_length {
-                    let n = stream.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        break;
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            if shutdown_requested() {
+                                return;
+                            }
+                            continue;
+                        }
+                        Err(_) => return,
                     }
-                    buf.extend_from_slice(&tmp[..n]);
                 }
                 let body = buf[body_start..body_start + content_length].to_vec();
 
@@ -150,11 +180,17 @@ impl MockProvider {
                 });
 
                 // Serve the next scripted response (peek when it is the last
-                // one so excess requests still get an answer).
-                let (status, content_type, response_body) = if responses.len() > 1 {
-                    responses.pop_front().expect("scripted response")
-                } else {
-                    responses.front().cloned().expect("scripted response")
+                // one so excess requests still get an answer). The lock is
+                // taken only for this pop/peek — holding it across the
+                // blocking reads above would let an in-flight request stall
+                // `requests()` from the test thread.
+                let (status, content_type, response_body) = {
+                    let mut responses = responses.lock().unwrap();
+                    if responses.len() > 1 {
+                        responses.pop_front().expect("scripted response")
+                    } else {
+                        responses.front().cloned().expect("scripted response")
+                    }
                 };
                 let reason = if status == 200 { "OK" } else { "Error" };
                 let head = format!(

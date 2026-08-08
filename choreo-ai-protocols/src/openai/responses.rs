@@ -197,11 +197,24 @@ impl From<&ChatToolDefinition> for ResponsesTool {
 fn build_responses_input(
     tool_results: &[ToolResultItem],
     messages: &[ChatRequestMessage],
+    previous_response_id: Option<&str>,
 ) -> Result<Option<serde_json::Value>, super::OpenAiError> {
     if tool_results.is_empty() {
-        // First call in a turn: convert messages to Responses input items.
+        // First call in a turn. When chaining onto a previous response
+        // (`previous_response_id` set), the server retains the full
+        // conversation up to that response — resending the whole history
+        // would duplicate every prior turn on top of the chained context
+        // (billing + context-window inflation), so send only the messages
+        // that postdate the last assistant response (in practice the new
+        // user message) plus the freshly built system prompt.
+        let items = if previous_response_id.is_some() {
+            messages_to_responses_input(&chain_input_messages(messages))?
+        } else {
+            // No chain: the full history is the request. Pass `messages` by
+            // reference so a long session is not cloned on every first call.
+            messages_to_responses_input(messages)?
+        };
         // System messages go into `input` as `{role: "system"}` items.
-        let items = messages_to_responses_input(messages)?;
         let input_value = if items.is_empty() {
             serde_json::Value::String(String::new())
         } else {
@@ -225,6 +238,26 @@ fn build_responses_input(
         let input_value = serde_json::to_value(&items)
             .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
         Ok(Some(input_value))
+    }
+}
+
+/// The minimal input for a fresh user turn chained onto a previous response:
+/// the system messages (the daemon rebuilds the system prompt every request,
+/// so the newest one must reach the model even though the chain already
+/// carries the old one) plus every message AFTER the last assistant-role
+/// message — in the daemon's loop that is exactly the new user message.
+/// Everything up to and including the last assistant message is already in
+/// the chained response's context and must not be resent.
+fn chain_input_messages(messages: &[ChatRequestMessage]) -> Vec<ChatRequestMessage> {
+    match messages.iter().rposition(|m| m.role == "assistant") {
+        // No assistant message yet — nothing has been chained, keep all.
+        None => messages.to_vec(),
+        Some(last_assistant) => messages
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| *i > last_assistant || m.role == "system")
+            .map(|(_, m)| m.clone())
+            .collect(),
     }
 }
 
@@ -264,7 +297,7 @@ fn build_responses_request_body(
 ) -> Result<(String, serde_json::Value), super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
     let max_output_tokens = config.max_output_tokens_for_model(model);
-    let input_value = build_responses_input(tool_results, messages)?;
+    let input_value = build_responses_input(tool_results, messages, previous_response_id)?;
 
     let mut responses_tools: Vec<ResponsesTool> = tools.iter().map(ResponsesTool::from).collect();
     if programmatic_tool_calling {
@@ -1562,7 +1595,7 @@ mod tests {
 
     #[test]
     fn build_responses_input_empty_returns_empty_array() {
-        let result = build_responses_input(&[], &[]).unwrap();
+        let result = build_responses_input(&[], &[], None).unwrap();
         let value = result.expect("expected Some value");
         // Empty messages produce an empty-string input
         assert_eq!(value, json!(""));
@@ -1575,7 +1608,9 @@ mod tests {
             output: "weather_data".to_string(),
             caller: None,
         }];
-        let result = build_responses_input(&tool_results, &[]).unwrap();
+        // The tool-results branch ignores messages and the chain id entirely:
+        // the server reconstructs history from `previous_response_id`.
+        let result = build_responses_input(&tool_results, &[], Some("resp_1")).unwrap();
         let value = result.expect("expected Some value");
         let arr = value.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -1590,7 +1625,7 @@ mod tests {
             ChatRequestMessage::simple("user", "hello".into()),
             ChatRequestMessage::simple("assistant", "hi there".into()),
         ];
-        let result = build_responses_input(&[], &messages).unwrap();
+        let result = build_responses_input(&[], &messages, None).unwrap();
         let value = result.expect("expected Some value");
         let arr = value.as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -1598,6 +1633,62 @@ mod tests {
         assert_eq!(arr[0]["content"], "hello");
         assert_eq!(arr[1]["role"], "assistant");
         assert_eq!(arr[1]["content"], "hi there");
+    }
+
+    #[test]
+    fn build_responses_input_chained_turn_sends_only_trailing_messages() {
+        // Chaining a fresh user turn via `previous_response_id`: the server
+        // already holds everything up to the last assistant response, so
+        // resending the full history would duplicate it. Only the trailing
+        // user message (+ any system prompt) may be sent.
+        let messages = vec![
+            ChatRequestMessage::simple("system", "You are a helpful assistant.".into()),
+            ChatRequestMessage::simple("user", "turn one".into()),
+            ChatRequestMessage::simple("assistant", "old answer".into()),
+            ChatRequestMessage::simple("user", "turn two".into()),
+        ];
+        let result = build_responses_input(&[], &messages, Some("resp_1")).unwrap();
+        let value = result.expect("expected Some value");
+        let arr = value.as_array().unwrap();
+        // system + the new user message only — the old turns are chained
+        // server-side and must not be replayed.
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[1]["role"], "user");
+        assert_eq!(arr[1]["content"], "turn two");
+    }
+
+    #[test]
+    fn build_responses_input_chained_turn_keeps_system_prompt() {
+        // The system prompt is rebuilt by the daemon on every request (skills,
+        // working dir), so the newest one must still reach the model even
+        // though the chain carries the old one — system messages survive the
+        // trailing filter.
+        let messages = vec![
+            ChatRequestMessage::simple("system", "old system".into()),
+            ChatRequestMessage::simple("user", "turn one".into()),
+            ChatRequestMessage::simple("assistant", "answer".into()),
+        ];
+        let result = build_responses_input(&[], &messages, Some("resp_1")).unwrap();
+        let value = result.expect("expected Some value");
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[0]["content"], "old system");
+    }
+
+    #[test]
+    fn build_responses_input_chained_without_assistant_keeps_all() {
+        // Defensive: a chain id with no assistant message yet — nothing has
+        // been chained server-side, so every message must be kept.
+        let messages = vec![
+            ChatRequestMessage::simple("user", "hello".into()),
+            ChatRequestMessage::simple("user", "again".into()),
+        ];
+        let result = build_responses_input(&[], &messages, Some("resp_1")).unwrap();
+        let value = result.expect("expected Some value");
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
     }
 
     // ── Reasoning extraction tests ────────────────────────────────────

@@ -131,7 +131,7 @@ impl Serialize for ChatRequestMessage {
     /// `reasoning_content`, so the round-trip payload must survive to the
     /// next request.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::{Error as _, SerializeStruct};
+        use serde::ser::SerializeStruct;
 
         // Explicit reasoning fields win when the daemon populated them
         // directly; the artifact is the fallback so a message built with only
@@ -145,25 +145,37 @@ impl Serialize for ChatRequestMessage {
             && let Some(ReasoningArtifact::ChatReasoning { field, bytes }) =
                 &self.reasoning_artifact
         {
-            let text = std::str::from_utf8(bytes).map_err(|e| {
-                S::Error::custom(format!("chat reasoning artifact is not valid UTF-8: {e}"))
-            })?;
-            debug!(
-                ?field,
-                payload_bytes = bytes.len(),
-                "re-emitting chat reasoning artifact"
-            );
-            // Write the decoded text to the field named by the artifact's tag
-            // (only when that field is currently None — explicit values still
-            // win), so re-emission targets the same wire field the provider
-            // used at capture.
-            let target = match field {
-                ChatReasoningField::ReasoningContent => &mut reasoning_content,
-                ChatReasoningField::Reasoning => &mut reasoning,
-                ChatReasoningField::ReasoningText => &mut reasoning_text,
-            };
-            if target.is_none() {
-                *target = Some(text.to_string());
+            // The artifact is opaque bytes; only the producing adapter may
+            // interpret it. Chat artifacts are always captured from a Rust
+            // String (so valid UTF-8), but a corrupted persisted blob must
+            // not fail the whole request — log and drop the payload so the
+            // request proceeds without the reasoning echo (the provider may
+            // reject it, but that is a diagnosable 400 rather than a
+            // serialization crash on every subsequent turn).
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                debug!(
+                    ?field,
+                    payload_bytes = bytes.len(),
+                    "re-emitting chat reasoning artifact"
+                );
+                // Write the decoded text to the field named by the artifact's
+                // tag (only when that field is currently None — explicit
+                // values still win), so re-emission targets the same wire
+                // field the provider used at capture.
+                let target = match field {
+                    ChatReasoningField::ReasoningContent => &mut reasoning_content,
+                    ChatReasoningField::Reasoning => &mut reasoning,
+                    ChatReasoningField::ReasoningText => &mut reasoning_text,
+                };
+                if target.is_none() {
+                    *target = Some(text.to_string());
+                }
+            } else {
+                warn!(
+                    ?field,
+                    payload_bytes = bytes.len(),
+                    "dropping corrupt chat reasoning artifact (not valid UTF-8)",
+                );
             }
         }
 

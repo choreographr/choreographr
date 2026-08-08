@@ -473,6 +473,25 @@ fn test_thinking_payload_high() {
 }
 
 #[test]
+fn test_thinking_payload_minimal_and_xhigh_map_to_budgets() {
+    // The catalog advertises `minimal`/`xhigh` as valid Anthropic effort
+    // levels — they must enable thinking with a real budget instead of being
+    // silently treated as unknown and disabling thinking.
+    let minimal = super::thinking_payload("minimal", 32768);
+    assert!(minimal.is_some());
+    assert_eq!(minimal.unwrap().budget_tokens, 1024);
+    let xhigh = super::thinking_payload("xhigh", 65536);
+    assert!(xhigh.is_some());
+    assert_eq!(xhigh.unwrap().budget_tokens, 32768);
+}
+
+#[test]
+fn test_thinking_payload_unknown_slug_disables() {
+    // A truly unknown slug still degrades to no thinking (with a warn).
+    assert!(super::thinking_payload("turbo", 4096).is_none());
+}
+
+#[test]
 fn test_thinking_payload_clamped() {
     // max_tokens=3072 ⇒ budget_tokens can be at most 3072-1024=2048
     let result = super::thinking_payload("high", 3072);

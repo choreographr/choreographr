@@ -285,10 +285,12 @@ pub struct Turn {
     pub displayed_images: Vec<DisplayedImageRecord>,
     /// Opaque reasoning round-trip artifact (None when never captured or
     /// when the provider exposes no reusable artifact).
+    #[serde(default)]
     pub reasoning_artifact: Option<ReasoningArtifact>,
     /// Which provider+model produced `reasoning_artifact`. Set whenever the
     /// artifact is captured; used for the same-model check at build time
     /// (artifacts are model-bound and must be dropped after a model switch).
+    #[serde(default)]
     pub reasoning_producer: Option<ReasoningProducer>,
 }
 

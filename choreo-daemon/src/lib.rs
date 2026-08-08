@@ -7,6 +7,7 @@ pub mod diff_util;
 pub mod mcp;
 pub mod metrics;
 pub mod providers;
+mod reasoning;
 mod requests;
 pub mod server;
 mod sessions;
@@ -14,7 +15,7 @@ pub mod tools;
 
 pub use crate::daemon::{DaemonCommand, DaemonState};
 #[cfg(feature = "test-utils")]
-pub use crate::requests::build_chat_request_messages;
+pub use crate::reasoning::build_chat_request_messages;
 pub use crate::requests::{
     REQUEST_IMAGE_BYTES, REQUEST_IMAGE_HEIGHT, REQUEST_IMAGE_MIME_TYPE, REQUEST_IMAGE_WIDTH,
 };

@@ -1545,6 +1545,33 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_message_corrupt_artifact_is_dropped_not_fatal() {
+        // A persisted artifact whose bytes are not valid UTF-8 must NOT fail
+        // the whole request serialization (the pre-fix behavior surfaced a
+        // corrupted DB blob as a hard error on every subsequent turn). It is
+        // logged and dropped: the message serializes as a plain assistant
+        // message with no reasoning echo.
+        let msg = ChatRequestMessage {
+            role: "assistant",
+            content: Some("answer".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_text: None,
+            reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+                field: ChatReasoningField::ReasoningContent,
+                // 0xFF is never valid UTF-8.
+                bytes: vec![0xFF, 0xFE, 0x00, 0x41],
+            }),
+        };
+        let body = serde_json::to_value(&msg).unwrap();
+        assert_eq!(body["content"], "answer");
+        assert!(body.get("reasoning_content").is_none());
+        assert!(body.get("reasoning_artifact").is_none());
+    }
+
+    #[test]
     fn chat_request_message_non_assistant_role_drops_artifact() {
         // The artifact is assistant-only: a user message must never carry
         // `reasoning_content`, even if an artifact were attached.

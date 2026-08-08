@@ -678,12 +678,19 @@ fn build_tool_payloads(tools: &[ChatToolDefinition]) -> Vec<ToolPayload<'_>> {
 /// Map reasoning slug to Anthropic thinking config.
 /// "off" → None (no thinking block).
 /// Others → enabled thinking with budget_tokens.
+///
+/// The catalog advertises the Anthropic effort set as `off` / `minimal` /
+/// `low` / `medium` / `high` / `xhigh`; every slug except `off` must map to a
+/// real thinking budget — an unmapped slug used to silently disable thinking
+/// (only a warn), which made the advertised `minimal`/`xhigh` levels no-ops.
 pub(super) fn thinking_payload(slug: &str, max_tokens: u32) -> Option<ThinkingPayload> {
     match slug {
         "off" => None,
+        "minimal" => Some(budget_payload(1024, max_tokens)),
         "low" => Some(budget_payload(2048, max_tokens)),
         "medium" => Some(budget_payload(4096, max_tokens)),
         "high" => Some(budget_payload(16384, max_tokens)),
+        "xhigh" => Some(budget_payload(32768, max_tokens)),
         // Future: adaptive thinking for newer models
         other => {
             warn!(

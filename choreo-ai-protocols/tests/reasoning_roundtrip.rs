@@ -525,15 +525,16 @@ fn gemini_thought_signatures_reemitted() {
     );
 }
 
-// ── 4. Responses: opaque reasoning items re-emitted into input ──────────
+// ── 4. Responses: reasoning continuity via previous_response_id ────────
 
 /// OpenAI/xAI Responses providers do not echo `reasoning_content` (that field
-/// is chat-completions-only); continuity flows through opaque reasoning items
-/// re-emitted into `input` ahead of the assistant message, plus
-/// `previous_response_id` (daemon-side, see the daemon integration tests).
+/// is chat-completions-only); reasoning continuity flows through the server-
+/// side chain (`previous_response_id`) plus the opaque reasoning items, which
+/// are captured into the round-trip artifact and re-emitted into `input` only
+/// on non-chained turns (daemon-side, see the daemon integration tests).
 #[ignore]
 #[test]
-fn responses_reasoning_items_reemitted_into_input() {
+fn responses_chains_reasoning_continuity_via_response_id() {
     let tool_use_response = r#"{
         "id": "resp_1",
         "object": "response",
@@ -632,11 +633,22 @@ fn responses_reasoning_items_reemitted_into_input() {
     assert_eq!(items[0]["type"], "reasoning");
     assert_eq!(items[0]["id"], "rs_1");
 
-    // ── Turn 2 (tool loop): reasoning items re-emitted into `input` ──
+    // ── Turn 2 (fresh user turn chaining onto resp_1) ──
+    // The new request chains continuity via `previous_response_id`: the server
+    // retains the full conversation (including the reasoning items) up to the
+    // last response, so `input` must carry ONLY the messages that postdate
+    // the last assistant message — the new user message. Resending the full
+    // history would duplicate every prior turn on top of the chained context.
     let messages = vec![
         user_message("What's the weather in London?"),
         assistant_message_from_tool_use(&tool_use),
         tool_result_message(&tool_use),
+        // The final-text assistant turn (what resp_1's chain ended with).
+        ChatRequestMessage::simple(
+            "assistant",
+            "The weather in London is 72°F and sunny.".to_string(),
+        ),
+        user_message("What about Paris?"),
     ];
     let turn2 = client
         .chat_completion_turn(ChatTurnRequest {
@@ -664,29 +676,21 @@ fn responses_reasoning_items_reemitted_into_input() {
         Some("resp_1"),
         "responses continuity chains via previous_response_id",
     );
-    // The captured reasoning item is re-emitted into `input` verbatim. For a
-    // tool-use turn the assistant message carries no text content, so the
-    // input is: user message → replayed reasoning item → function_call_output
-    // (the turn's tool result) — the reasoning item rides ahead of the
-    // content that follows it, mirroring the provider's output ordering.
+    // The chained input is minimal: just the new user message. The old turns
+    // (and their reasoning items) are NOT replayed — the server already has
+    // them in resp_1's context, and re-sending them would duplicate them.
     let input = body2["input"].as_array().expect("input items");
+    assert_eq!(
+        input.len(),
+        1,
+        "chained turn sends only the new user message"
+    );
     assert_eq!(input[0]["type"], "message");
     assert_eq!(input[0]["role"], "user");
-    let reasoning_idx = input
-        .iter()
-        .position(|item| item["type"] == "reasoning" && item["id"] == "rs_1")
-        .expect("reasoning item in input");
-    let output_idx = input
-        .iter()
-        .position(|item| item["type"] == "function_call_output")
-        .expect("tool result in input");
+    assert_eq!(input[0]["content"], "What about Paris?");
     assert!(
-        reasoning_idx < output_idx,
-        "reasoning item must precede the turn's tool result",
-    );
-    assert_eq!(
-        input[reasoning_idx]["summary"][0]["text"], "deciding on tool",
-        "opaque reasoning items re-emitted verbatim",
+        input.iter().all(|item| item["type"] != "reasoning"),
+        "reasoning items stay in the chained context; they must not be re-sent",
     );
 }
 
