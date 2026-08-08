@@ -469,7 +469,7 @@ When chaining a fresh user turn via `previous_response_id`, the request `input` 
 
 A precondition guard (`warn_on_missing_reasoning_artifacts`) runs before any echo-policy request: a turn whose artifact is missing (e.g. pre-migration session state) or whose artifact was produced by a different model (a mid-session model switch — the builder never replays a foreign-model payload) is logged as a diagnosable warning instead of surfacing as a mysterious provider 400. `ToolLoop` policies check only tool-involving turns (that is where the provider demands the echo); `AllTurns`/`Signature` echo on every assistant message, so the guard checks every assistant turn there.
 
-Replayed reasoning is billed as input on keep-all models, so `estimate_prompt_tokens` counts the artifact bytes (UTF-8 text when decodable, else a bytes/4 heuristic). For chained requests the estimate additionally adds the last request's actual `prompt_tokens` (from usage): the request `messages` carry only the tail, but the provider bills the whole chained context, so without that addend the pre-request estimate would understate the real billed input.
+Replayed reasoning is billed as input on keep-all models, so `estimate_prompt_tokens` counts the artifact bytes (UTF-8 text when decodable, else a bytes/4 heuristic). The estimate counts the full conversation in `messages` as-is, which already covers the server-side chained context for `previous_response_id` requests: the adapter trims only the *wire* payload to the chain tail, but the provider bills the whole chain, and the full conversation in `messages` is that chain plus the new tail. There is deliberately no chained-context addend — adding the last request's `prompt_tokens` would count the conversation twice.
 
 Currently supports 79+ providers. Adding a new OpenAI-compatible provider requires only a catalog TOML file (and a line in `loader.rs`'s `include_str!` list) — zero client code.
 
@@ -1542,7 +1542,7 @@ Sessions support undo/redo via an `undone` boolean flag on each `Turn`:
 1. `SessionState::undo_turns()` finds the most recent non-undone turn with `user_text: Some(...)` via reverse scan.
 2. Marks that turn and all higher-ID turns as `undone = true`.
 3. Stores the undone turn IDs in `last_undo_turn_ids` for potential redo.
-4. If a `last_response_id` is set, clears it (and its producer) and persists the session record — an undo invalidates the server-side response chain, which would otherwise leak the undone turns' context back into the model on the next chained request (the builder skips undone turns, but the chain does not).
+4. If a `last_response_id` is set, clears it (and its producer) and persists the session record — an undo invalidates the server-side response chain, which would otherwise leak the undone turns' context back into the model on the next chained request (the builder skips undone turns, but the chain does not). If an undo lands while a request worker is in flight, the worker's snapshot (taken from a child session that never saw the undo) cannot resurrect the cleared id: `handle_request_finished` compares undone-ness between the snapshot and live state and drops the stale id from the snapshot before applying it, and it refuses to overwrite the undone turns with the worker's pre-undo copies.
 5. Persists each updated turn to the database.
 6. Broadcasts `DaemonMessage::TurnsUndone { turn_ids }` to all subscribers.
 7. The client removes the turns from its local history view.

@@ -1575,11 +1575,36 @@ fn handle_get_summary(
 /// Apply the worker's snapshot (config only) and merge turn state.
 fn handle_request_finished(
     request_id: u32,
-    snapshot: SessionSnapshot,
+    mut snapshot: SessionSnapshot,
     state: &mut SessionState,
     shutdown_requested: &bool,
     ctx: &RequestContext,
 ) -> bool {
+    // An undo processed while the request worker was in flight leaves the
+    // worker's snapshot stale in two ways: its turns carry no `undone` flags
+    // (the child session never saw the undo), and its `last_response_id`
+    // points at a response whose conversation includes the very turns being
+    // undone. Detect that race by comparing undone-ness: any turn the live
+    // state marks undone but the snapshot does not means the undo landed
+    // after the request started. Preserve the undo by dropping the stale
+    // response id before the snapshot's config is applied below (the undo
+    // already persisted the cleared record), and by refusing to overwrite
+    // those turns with the worker's pre-undo copies in the merge loop.
+    let undo_during_request = snapshot.turns.iter().any(|(&turn_id, snap_turn)| {
+        state
+            .turns
+            .get(&turn_id)
+            .is_some_and(|state_turn| state_turn.undone && !snap_turn.undone)
+    });
+    if undo_during_request {
+        debug!(
+            session_id = ctx.session_id,
+            request_id,
+            "undo landed while request was in flight; dropping stale response-id chain from worker snapshot",
+        );
+        snapshot.config.last_response_id = None;
+        snapshot.config.last_response_id_producer = None;
+    }
     // Apply config changes from the worker snapshot using the allowlist
     // on `SessionConfig` so that fields mutated mid-request through direct
     // SessionCommand calls (SetTitle, SetAccount, SetReasoningEffort) are
@@ -1610,6 +1635,18 @@ fn handle_request_finished(
     // Merge turns from the worker snapshot into the main session state.
     for (&turn_id, turn) in &snapshot.turns {
         let is_new = !state.turns.contains_key(&turn_id);
+        // Preserve an undo that landed mid-request: the worker's copy of a
+        // turn the user hid carries no `undone` flag, so overwriting would
+        // resurrect the hidden turn — and re-persisting it would resurrect
+        // it on disk too. Keep the undone state instead (its content is
+        // skipped by the message builder anyway).
+        if !is_new
+            && let Some(state_turn) = state.turns.get(&turn_id)
+            && state_turn.undone
+            && !turn.undone
+        {
+            continue;
+        }
         state.turns.insert(turn_id, turn.clone());
         if is_new {
             // Persist the newly created turn. The turn was already broadcast
@@ -3550,6 +3587,111 @@ mod tests {
         // older and stays visible (undo marks only the newest user subtree).
         assert!(state.turns.get(&1).expect("turn exists").undone);
         assert!(!state.turns.get(&0).expect("turn exists").undone);
+        assert!(!shutdown);
+    }
+
+    #[test]
+    fn request_finished_after_in_flight_undo_preserves_chain_break_and_undone_turns() {
+        // Regression: an undo processed while a request worker is in flight
+        // must survive the worker's snapshot merge. The worker's child session
+        // never saw the undo, so its snapshot carries the stale response id
+        // AND copies of the undone turns without `undone` set; without the
+        // guard in `handle_request_finished`, applying it resurrected the
+        // chain (the leak the undo exists to prevent) and un-hid the turns.
+        let (mut state, ctx) = broadcast_setup();
+        state.config.last_response_id = Some("resp_9".into());
+        state.config.last_response_id_producer = Some(ReasoningProducer {
+            provider_slug: "openai".into(),
+            model: "gpt-5.4".into(),
+        });
+        // Turn 1 is the newest user turn the undo will target.
+        let _ = state.start_turn(Some("user 2".into()));
+        let mut shutdown = false;
+
+        // 1. The undo lands while the request is in flight: it clears the
+        //    chain id and marks the newest user subtree undone.
+        process_command(SessionCommand::Undo, &mut state, &mut shutdown, &ctx);
+        assert_eq!(state.config.last_response_id, None);
+
+        // 2. The worker finishes; its snapshot predates the undo — the stale
+        //    id is back, its turn copies carry no `undone` flag, and it
+        //    created a genuinely new turn mid-flight (id 2).
+        let mut snapshot = state.snapshot();
+        snapshot.config.last_response_id = Some("resp_9".into());
+        snapshot.config.last_response_id_producer = Some(ReasoningProducer {
+            provider_slug: "openai".into(),
+            model: "gpt-5.4".into(),
+        });
+        for turn in snapshot.turns.values_mut() {
+            turn.undone = false;
+        }
+        let mut in_flight = snapshot.turns.get(&0).cloned().expect("seeded turn");
+        in_flight.user_text = Some("user 3 (in-flight)".into());
+        snapshot.turns.insert(2, in_flight);
+
+        process_command(
+            SessionCommand::RequestFinished {
+                request_id: 1,
+                snapshot,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        // The stale chain must NOT be resurrected — in memory or on disk.
+        assert_eq!(state.config.last_response_id, None);
+        assert_eq!(state.config.last_response_id_producer, None);
+        let record = SessionRecord::from(&state);
+        assert_eq!(record.last_response_id, None);
+        // The undone turn stays undone (the worker's pre-undo copy is
+        // dropped, not merged back over the undo).
+        assert!(state.turns.get(&1).expect("turn exists").undone);
+        // The worker's genuinely-new turn still merges into the session.
+        assert_eq!(
+            state
+                .turns
+                .get(&2)
+                .expect("turn exists")
+                .user_text
+                .as_deref(),
+            Some("user 3 (in-flight)"),
+        );
+        assert!(!shutdown);
+    }
+
+    #[test]
+    fn request_finished_without_undo_restores_chain_id() {
+        // Positive control: when no undo intervened, the worker's new response
+        // id must still survive the snapshot merge — the normal chaining path
+        // the undo guard must not disturb.
+        let (mut state, ctx) = broadcast_setup();
+        let mut snapshot = state.snapshot();
+        snapshot.config.last_response_id = Some("resp_10".into());
+        snapshot.config.last_response_id_producer = Some(ReasoningProducer {
+            provider_slug: "openai".into(),
+            model: "gpt-5.4".into(),
+        });
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::RequestFinished {
+                request_id: 1,
+                snapshot,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+        assert_eq!(state.config.last_response_id.as_deref(), Some("resp_10"));
+        assert_eq!(
+            state
+                .config
+                .last_response_id_producer
+                .as_ref()
+                .unwrap()
+                .model,
+            "gpt-5.4",
+        );
         assert!(!shutdown);
     }
 

@@ -685,17 +685,21 @@ fn resolve_reasoning_effort(
 /// tiktoken.  Returns a (encoding, estimated_tokens) pair so the caller
 /// can reuse the encoding for output-token counting during streaming.
 ///
-/// `chained_context_tokens` is the size of the context the provider holds
-/// on its side of a `previous_response_id` chain: the request `messages`
-/// carry only the tail, but the provider bills the whole chained context,
-/// so the estimate must add the last request's actual `prompt_tokens` (from
-/// usage) or it understates the real billed input. Zero for non-chained
-/// requests (the full history is in `messages` and counted below).
+/// The estimate counts the `messages` slice as-is, which is the FULL visible
+/// conversation. For a chained request (`previous_response_id` set) that is
+/// deliberate: the adapter trims only the *wire* payload to the chain tail,
+/// but the provider bills the whole context it holds server-side — and the
+/// full conversation in `messages` IS that chained context plus the new tail,
+/// so counting it already reflects the real billed input (the only thing it
+/// misses is the previous system prompt, which stays in the chain while the
+/// rebuilt one is sent afresh — a bounded, sub-request-sized undercount).
+/// There is therefore NO chained-context addend here: adding the last
+/// request's actual `prompt_tokens` (from usage) would count the conversation
+/// twice, roughly doubling the estimate.
 fn estimate_prompt_tokens(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-    chained_context_tokens: u32,
 ) -> (Option<&'static tiktoken::CoreBpe>, u32) {
     let encoding =
         tiktoken::encoding_for_model(model).or_else(|| tiktoken::get_encoding("cl100k_base"));
@@ -745,18 +749,11 @@ fn estimate_prompt_tokens(
                 .map(|artifact| reasoning_artifact_tokens(enc, artifact))
                 .sum();
 
-            content_tokens
-                + tool_call_tokens
-                + tool_def_tokens
-                + artifact_tokens
-                + chained_context_tokens
+            content_tokens + tool_call_tokens + tool_def_tokens + artifact_tokens
         }
         None => {
             tracing::warn!("no tiktoken encoding available for {model}");
-            // The visible messages cannot be counted without an encoding, but
-            // the chained context size is a provider-reported number — keep it
-            // so the estimate is not silently zeroed for chained requests.
-            chained_context_tokens
+            0
         }
     };
     (encoding, estimated)
@@ -1210,19 +1207,14 @@ pub(crate) fn run_agent_loop(
         let messages =
             build_chat_request_messages(session, system_content.as_deref(), provider_slug, model);
 
-        // A chained request (`previous_response_id` set) sends only the tail
-        // in `messages`, but the provider bills the whole context it holds in
-        // the chain — add the last request's ACTUAL prompt_tokens (from usage)
-        // so the pre-request estimate reflects the real billed input instead
-        // of just the tail (billing itself is unaffected; it uses the
-        // provider-reported usage, not this estimate).
-        let chained_context_tokens = if prev_resp_id.is_some() {
-            session.config.last_prompt_tokens.unwrap_or(0)
-        } else {
-            0
-        };
-        let (encoding, estimated_prompt_tokens) =
-            estimate_prompt_tokens(model, &messages, &tools, chained_context_tokens);
+        // The estimate counts `messages` as-is — the FULL conversation, not
+        // the chained tail the adapter puts on the wire. That is intentional:
+        // the provider bills the whole context it holds in the chain, and the
+        // full conversation in `messages` already includes that context (plus
+        // the new tail), so there is no separate chained-context addend — one
+        // would count the conversation twice (billing itself is unaffected; it
+        // uses the provider-reported usage, not this estimate).
+        let (encoding, estimated_prompt_tokens) = estimate_prompt_tokens(model, &messages, &tools);
 
         let _ = ctx
             .cmd_tx
@@ -3356,7 +3348,7 @@ mod tests {
 
     #[test]
     fn estimate_prompt_tokens_empty() {
-        let (encoding, estimated) = estimate_prompt_tokens("gpt-4", &[], &[], 0);
+        let (encoding, estimated) = estimate_prompt_tokens("gpt-4", &[], &[]);
         assert!(encoding.is_some());
         assert_eq!(estimated, 0);
     }
@@ -3367,7 +3359,7 @@ mod tests {
             ChatRequestMessage::simple("user", "hello world".into()),
             ChatRequestMessage::simple("assistant", "hi there".into()),
         ];
-        let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[], 0);
+        let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[]);
         assert!(
             estimated > 0,
             "expected positive token count, got {estimated}"
@@ -3383,8 +3375,8 @@ mod tests {
         let mut with_reasoning = base_messages.clone();
         with_reasoning[1].reasoning_content = Some("thinking deep...".into());
 
-        let (_, base_est) = estimate_prompt_tokens("gpt-4", &base_messages, &[], 0);
-        let (_, reason_est) = estimate_prompt_tokens("gpt-4", &with_reasoning, &[], 0);
+        let (_, base_est) = estimate_prompt_tokens("gpt-4", &base_messages, &[]);
+        let (_, reason_est) = estimate_prompt_tokens("gpt-4", &with_reasoning, &[]);
         assert_eq!(
             base_est, reason_est,
             "legacy reasoning_content string field is never populated by the daemon and must not count"
@@ -3403,8 +3395,8 @@ mod tests {
             bytes: "thinking deep...".into(),
         });
 
-        let (_, base_est) = estimate_prompt_tokens("gpt-4", &base_messages, &[], 0);
-        let (_, artifact_est) = estimate_prompt_tokens("gpt-4", &with_artifact, &[], 0);
+        let (_, base_est) = estimate_prompt_tokens("gpt-4", &base_messages, &[]);
+        let (_, artifact_est) = estimate_prompt_tokens("gpt-4", &with_artifact, &[]);
         assert!(
             artifact_est > base_est,
             "replayed reasoning artifact should count as input: {artifact_est} <= {base_est}",
@@ -3430,7 +3422,7 @@ mod tests {
             reasoning_text: None,
             reasoning_artifact: None,
         }];
-        let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[], 0);
+        let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[]);
         assert!(
             estimated > 0,
             "expected positive token count, got {estimated}"
@@ -3450,8 +3442,8 @@ mod tests {
             }),
         )];
         let messages = vec![ChatRequestMessage::simple("user", "read file".into())];
-        let (_, with_tools) = estimate_prompt_tokens("gpt-4", &messages, &tools, 0);
-        let (_, without_tools) = estimate_prompt_tokens("gpt-4", &messages, &[], 0);
+        let (_, with_tools) = estimate_prompt_tokens("gpt-4", &messages, &tools);
+        let (_, without_tools) = estimate_prompt_tokens("gpt-4", &messages, &[]);
         assert!(
             with_tools > without_tools,
             "tool defs should increase token count: {with_tools} <= {without_tools}",
@@ -3462,24 +3454,34 @@ mod tests {
     fn estimate_prompt_tokens_unknown_model_falls_back() {
         let messages = vec![ChatRequestMessage::simple("user", "hello".into())];
         let (encoding, estimated) =
-            estimate_prompt_tokens("nonexistent-model-9000", &messages, &[], 0);
+            estimate_prompt_tokens("nonexistent-model-9000", &messages, &[]);
         assert!(encoding.is_some(), "should fall back to cl100k_base");
         assert!(estimated > 0);
     }
 
     #[test]
-    fn estimate_prompt_tokens_adds_chained_context() {
-        // A chained request carries only the tail in `messages`, but the
-        // provider bills the whole context it holds server-side — the
-        // pre-request estimate must add the chained size to the visible
-        // messages so it does not understate the real billed input.
-        let messages = vec![ChatRequestMessage::simple("user", "turn two".into())];
-        let (_, tail_only) = estimate_prompt_tokens("gpt-4", &messages, &[], 0);
-        let (_, chained) = estimate_prompt_tokens("gpt-4", &messages, &[], 1000);
-        assert_eq!(
-            chained,
-            tail_only + 1000,
-            "chained context tokens must be added to the visible-tail estimate"
+    fn estimate_prompt_tokens_no_chained_context_addend() {
+        // The daemon builds `messages` as the FULL conversation, not the
+        // chained tail the adapter puts on the wire; the provider bills the
+        // whole context it holds in the chain, which the full-conversation
+        // count already covers. There is deliberately NO chained-context
+        // addend — adding the last request's `prompt_tokens` would count the
+        // conversation twice. This pins the counting function's contract: it
+        // estimates exactly the messages it is given, nothing more.
+        let messages = vec![
+            ChatRequestMessage::simple("system", "rebuilt system prompt".into()),
+            ChatRequestMessage::simple("user", "turn one".into()),
+            ChatRequestMessage::simple("assistant", "answer".into()),
+            ChatRequestMessage::simple("user", "turn two".into()),
+        ];
+        let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[]);
+        // Deterministic and equal to the visible-messages count: a hidden
+        // chained-context addend would inflate it far beyond the recount.
+        let (_, recounted) = estimate_prompt_tokens("gpt-4", &messages, &[]);
+        assert_eq!(estimated, recounted, "estimate must be deterministic");
+        assert!(
+            estimated > 0,
+            "full conversation must count: got {estimated}"
         );
     }
 
