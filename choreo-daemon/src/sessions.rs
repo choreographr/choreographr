@@ -1982,6 +1982,28 @@ fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
         turn_count = turn_ids.len(),
         "undo: marked turns as undone",
     );
+    // Undoing turns invalidates the server-side response chain: the persisted
+    // `previous_response_id` points at a response whose conversation includes
+    // the turns being undone, so restoring it on the next request would leak
+    // that context back into the model (the builder skips undone turns, but
+    // the chain does not). Clear it (and its provenance) so the next request
+    // falls back to a non-chained one carrying only the visible turns. Redo
+    // deliberately does NOT restore the id — the turns come back, but the
+    // chain is reset; a stateless request is always safe, and the old id was
+    // already discarded.
+    if state.config.last_response_id.is_some() {
+        state.config.last_response_id = None;
+        state.config.last_response_id_producer = None;
+        // Persist the cleared id so a daemon restart cannot resurrect the
+        // stale chain from the on-disk record. Writing the record directly
+        // (rather than `persist_session_metadata`) keeps undo's observable
+        // behavior unchanged: `last_modified` is not bumped, so the sessions
+        // list does not reorder.
+        let record = SessionRecord::from(&*state);
+        if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
+            tracing::warn!(error = %e, "failed to persist session record after Undo");
+        }
+    }
     // Persist the updated turns.
     for &id in &turn_ids {
         if let Some(turn) = state.turns.get(&id)
@@ -3484,6 +3506,51 @@ mod tests {
         // New user turn clears redo stack
         let _ = state.start_turn(Some("second".into()));
         assert!(state.redo_turns().is_none());
+    }
+
+    #[test]
+    fn undo_clears_last_response_id_for_chain_invalidation() {
+        // A persisted `previous_response_id` points at a server-side response
+        // whose conversation includes the undone turns — restoring it on the
+        // next request would leak the undone context back into the model. Undo
+        // must clear the id (and its provenance) so the next request falls
+        // back to a non-chained one carrying only the visible turns.
+        let (mut state, ctx) = broadcast_setup();
+        // Simulate a session that chained a Responses-policy response.
+        state.config.last_response_id = Some("resp_9".into());
+        state.config.last_response_id_producer = Some(ReasoningProducer {
+            provider_slug: "openai".into(),
+            model: "gpt-5.4".into(),
+        });
+        let _ = state.start_turn(Some("user 2".into()));
+
+        let mut shutdown = false;
+        process_command(SessionCommand::Undo, &mut state, &mut shutdown, &ctx);
+
+        assert_eq!(state.config.last_response_id, None);
+        assert_eq!(state.config.last_response_id_producer, None);
+        // The cleared id must also be persisted so a daemon restart cannot
+        // resurrect the stale chain from the on-disk record.
+        let record = SessionRecord::from(&state);
+        assert_eq!(record.last_response_id, None);
+        assert!(!shutdown);
+    }
+
+    #[test]
+    fn undo_without_response_id_leaves_session_untouched() {
+        // A session that never chained must be unaffected by the undo path's
+        // chain-invalidation (no record write, no id churn).
+        let (mut state, ctx) = broadcast_setup();
+        let _ = state.start_turn(Some("user 2".into()));
+        let mut shutdown = false;
+        process_command(SessionCommand::Undo, &mut state, &mut shutdown, &ctx);
+        assert_eq!(state.config.last_response_id, None);
+        assert_eq!(state.config.last_response_id_producer, None);
+        // The most recent user turn was marked undone; the seeded turn 0 is
+        // older and stays visible (undo marks only the newest user subtree).
+        assert!(state.turns.get(&1).expect("turn exists").undone);
+        assert!(!state.turns.get(&0).expect("turn exists").undone);
+        assert!(!shutdown);
     }
 
     // -- loaded_skill_bodies / context_cache field tests -------------------

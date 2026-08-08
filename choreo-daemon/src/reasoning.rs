@@ -254,26 +254,47 @@ pub(crate) fn warn_on_missing_reasoning_artifacts(
             .as_ref()
             .map(|p| (p.provider_slug.as_str(), p.model.as_str()))
             == Some((provider_slug, model));
-        if turn.reasoning_artifact.is_none() {
-            problems += 1;
-            warn!(
-                session_id,
-                turn_id,
-                provider_slug,
-                model,
-                passback = ?passback,
-                "reasoning artifact missing for turn; provider may reject this request",
-            );
-        } else if !same_producer {
-            problems += 1;
-            warn!(
-                session_id,
-                turn_id,
-                provider_slug,
-                model,
-                passback = ?passback,
-                "reasoning artifact produced by a different model; it will not be replayed and the provider may reject this request",
-            );
+        match (&turn.reasoning_artifact, turn.reasoning_producer.as_ref()) {
+            (None, _) => {
+                problems += 1;
+                warn!(
+                    session_id,
+                    turn_id,
+                    provider_slug,
+                    model,
+                    passback = ?passback,
+                    "reasoning artifact missing for turn; provider may reject this request",
+                );
+            }
+            // Artifact bytes exist but their provenance was never recorded (a
+            // pre-migration state or a capture bug): the builder cannot prove
+            // same-model provenance, so the payload is dropped — flag it like
+            // a missing artifact rather than claiming a model mismatch.
+            (Some(_), None) => {
+                problems += 1;
+                warn!(
+                    session_id,
+                    turn_id,
+                    provider_slug,
+                    model,
+                    passback = ?passback,
+                    "reasoning artifact present but its producer is unrecorded; it will not be replayed and the provider may reject this request",
+                );
+            }
+            (Some(_), Some(_)) if !same_producer => {
+                problems += 1;
+                warn!(
+                    session_id,
+                    turn_id,
+                    provider_slug,
+                    model,
+                    passback = ?passback,
+                    "reasoning artifact produced by a different model; it will not be replayed and the provider may reject this request",
+                );
+            }
+            // Artifact present and produced by the current model — the
+            // builder will replay it; clean.
+            (Some(_), Some(_)) => {}
         }
     }
     problems

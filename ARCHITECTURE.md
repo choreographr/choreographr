@@ -465,11 +465,11 @@ Reasoning text is not only *displayed* — for several providers it must also be
 
 **ResponseId continuity:** the agent loop persists the last `response_id` on `SessionConfig.last_response_id` after every model call and restores it at the top of the next `run_agent_loop` invocation, so a new user turn continues the chain (`previous_response_id` + `reasoning.context: all_turns` guidance) instead of resetting it. Other policies reset to `None` so a stale id never leaks into a request that does not understand it.
 
-When chaining a fresh user turn via `previous_response_id`, the request `input` carries only the messages that postdate the last assistant message (the new user message, plus the freshly rebuilt system prompt) — the server already holds everything up to the last response, and resending the full history would duplicate every prior turn on top of the chained context (billing + context-window inflation). Tool-loop turns keep sending only the new `function_call_output` items, as before. The adapter-level `messages_to_responses_input` still re-emits opaque reasoning items for non-chained (stateless-style) conversions.
+When chaining a fresh user turn via `previous_response_id`, the request `input` carries only the messages that postdate the last assistant message (the new user message, plus the freshly rebuilt system prompt) — the server already holds everything up to the last response, and resending the full history would duplicate every prior turn on top of the chained context (billing + context-window inflation). Tool-loop turns keep sending only the new `function_call_output` items, as before. The adapter-level `messages_to_responses_input` still re-emits opaque reasoning items for non-chained (stateless-style) conversions. An `/undo` invalidates the chain: the persisted id points at a response whose conversation includes the undone turns, so `handle_undo` clears `last_response_id` (and its producer) and persists the cleared record — the next request falls back to a non-chained one carrying only the visible turns (redo does not restore the id; a stateless request is always safe).
 
 A precondition guard (`warn_on_missing_reasoning_artifacts`) runs before any echo-policy request: a turn whose artifact is missing (e.g. pre-migration session state) or whose artifact was produced by a different model (a mid-session model switch — the builder never replays a foreign-model payload) is logged as a diagnosable warning instead of surfacing as a mysterious provider 400. `ToolLoop` policies check only tool-involving turns (that is where the provider demands the echo); `AllTurns`/`Signature` echo on every assistant message, so the guard checks every assistant turn there.
 
-Replayed reasoning is billed as input on keep-all models, so `estimate_prompt_tokens` counts the artifact bytes (UTF-8 text when decodable, else a bytes/4 heuristic).
+Replayed reasoning is billed as input on keep-all models, so `estimate_prompt_tokens` counts the artifact bytes (UTF-8 text when decodable, else a bytes/4 heuristic). For chained requests the estimate additionally adds the last request's actual `prompt_tokens` (from usage): the request `messages` carry only the tail, but the provider bills the whole chained context, so without that addend the pre-request estimate would understate the real billed input.
 
 Currently supports 79+ providers. Adding a new OpenAI-compatible provider requires only a catalog TOML file (and a line in `loader.rs`'s `include_str!` list) — zero client code.
 
@@ -1542,9 +1542,10 @@ Sessions support undo/redo via an `undone` boolean flag on each `Turn`:
 1. `SessionState::undo_turns()` finds the most recent non-undone turn with `user_text: Some(...)` via reverse scan.
 2. Marks that turn and all higher-ID turns as `undone = true`.
 3. Stores the undone turn IDs in `last_undo_turn_ids` for potential redo.
-4. Persists each updated turn to the database.
-5. Broadcasts `DaemonMessage::TurnsUndone { turn_ids }` to all subscribers.
-6. The client removes the turns from its local history view.
+4. If a `last_response_id` is set, clears it (and its producer) and persists the session record — an undo invalidates the server-side response chain, which would otherwise leak the undone turns' context back into the model on the next chained request (the builder skips undone turns, but the chain does not).
+5. Persists each updated turn to the database.
+6. Broadcasts `DaemonMessage::TurnsUndone { turn_ids }` to all subscribers.
+7. The client removes the turns from its local history view.
 
 **Redo flow** (`/redo` → `ClientMessage::Redo` → `SessionCommand::Redo` → `handle_redo`):
 1. `SessionState::redo_turns()` restores the turn IDs stored in `last_undo_turn_ids` from the prior undo.

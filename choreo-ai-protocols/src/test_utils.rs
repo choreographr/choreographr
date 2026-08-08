@@ -6,6 +6,14 @@
 //! integration tests enable it on their dev-dependency. It therefore never
 //! leaks into the published public API.
 //!
+//! Because it is consumed cross-crate (daemon integration tests link it as a
+//! dev-dependency), it cannot be gated with `#[cfg(test)]` — that flag is only
+//! set for the crate under test, never for its dependencies. The `test-utils`
+//! feature gate is the sanctioned stand-in: it is the one exception to
+//! AGENTS.md's rule that `unwrap`/`expect`/`panic!` live only in `#[cfg(test)]`
+//! modules and `tests/` files, and it is never compiled into a production
+//! build.
+//!
 //! The [`MockProvider`] here is the single scripted HTTP provider used by the
 //! reasoning round-trip wire tests in both `choreo-ai-protocols/tests/` and
 //! `choreo-daemon/tests/` — a `TcpListener` serving one canned response per

@@ -250,8 +250,11 @@ fn build_responses_input(
 /// already in the chained response's context and must not be resent.
 ///
 /// Only the *newest* system message is kept: any older system prompt is
-/// already in the chained context, and resending it would duplicate it. The
-/// system message is emitted first so it leads the request.
+/// already in the chained context, and resending it would duplicate it. In
+/// the daemon the system message sits at the head of the list, so it leads
+/// the request; in the defensive shapes where a system prompt appears
+/// mid-tail, it stays in its original position rather than being hoisted,
+/// so the conversation order is preserved.
 fn chain_input_messages(messages: &[ChatRequestMessage]) -> Vec<ChatRequestMessage> {
     match messages.iter().rposition(|m| m.role == "assistant") {
         // No assistant message yet — nothing has been chained, keep all. A
@@ -259,20 +262,21 @@ fn chain_input_messages(messages: &[ChatRequestMessage]) -> Vec<ChatRequestMessa
         // response, so this arm is defensive only.
         None => messages.to_vec(),
         Some(last_assistant) => {
-            let mut out = Vec::new();
-            if let Some(system) = messages.iter().rev().find(|m| m.role == "system") {
-                out.push(system.clone());
-            }
-            // Messages strictly after the last assistant message; the newest
-            // system message (if any) was already emitted above, so skip any
-            // system role in the tail to avoid duplicates.
-            out.extend(
-                messages[last_assistant + 1..]
-                    .iter()
-                    .filter(|m| m.role != "system")
-                    .cloned(),
-            );
-            out
+            // Single pass over every message: drop everything at/before the
+            // last assistant message (it is in the chained context) EXCEPT
+            // the newest system message, which is rebuilt every turn and must
+            // still reach the model. Older system messages — whether in the
+            // chained region or inside the tail — are dropped, so the newest
+            // one is never duplicated.
+            let newest_system = messages.iter().rposition(|m| m.role == "system");
+            messages
+                .iter()
+                .enumerate()
+                .filter(|(i, m)| {
+                    (*i > last_assistant && m.role != "system") || Some(*i) == newest_system
+                })
+                .map(|(_, m)| m.clone())
+                .collect()
         }
     }
 }
@@ -1728,6 +1732,33 @@ mod tests {
         assert_eq!(arr[0]["content"], "new system");
         assert_eq!(arr[1]["role"], "user");
         assert_eq!(arr[1]["content"], "turn two");
+    }
+
+    #[test]
+    fn build_responses_input_chained_preserves_mid_tail_order() {
+        // Defensive shape: a system prompt appearing INSIDE the tail (after a
+        // user message) must stay in its original position rather than being
+        // hoisted to the front — the conversation order is preserved. The
+        // pre-existing system message at the head is dropped (older prompt,
+        // already in the chained context).
+        let messages = vec![
+            ChatRequestMessage::simple("system", "old system".into()),
+            ChatRequestMessage::simple("user", "turn one".into()),
+            ChatRequestMessage::simple("assistant", "answer".into()),
+            ChatRequestMessage::simple("user", "mid".into()),
+            ChatRequestMessage::simple("system", "late system".into()),
+            ChatRequestMessage::simple("user", "turn two".into()),
+        ];
+        let result = build_responses_input(&[], &messages, Some("resp_1")).unwrap();
+        let value = result.expect("expected Some value");
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["role"], "user");
+        assert_eq!(arr[0]["content"], "mid");
+        assert_eq!(arr[1]["role"], "system");
+        assert_eq!(arr[1]["content"], "late system");
+        assert_eq!(arr[2]["role"], "user");
+        assert_eq!(arr[2]["content"], "turn two");
     }
 
     // ── Reasoning extraction tests ────────────────────────────────────
