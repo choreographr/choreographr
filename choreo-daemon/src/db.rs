@@ -117,8 +117,8 @@ pub fn write_session(
     session_id: u64,
     record: &SessionRecord,
 ) -> io::Result<()> {
-    let payload = postcard::to_allocvec(record)
-        .map_err(|e| db_err(format!("postcard encode session: {e}")))?;
+    let payload = rmp_serde::to_vec_named(record)
+        .map_err(|e| db_err(format!("codec encode session: {e}")))?;
     let write_txn = db
         .begin_write()
         .map_err(|e| db_err(format!("redb write txn: {e}")))?;
@@ -150,8 +150,8 @@ pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<S
         .map_err(|e| db_err(format!("redb get session: {e}")))?
     {
         Some(guard) => {
-            let record: SessionRecord = postcard::from_bytes(guard.value())
-                .map_err(|e| db_err(format!("postcard decode session: {e}")))?;
+            let record: SessionRecord = rmp_serde::from_slice::<SessionRecord>(guard.value())
+                .map_err(|e| db_err(format!("codec decode session: {e}")))?;
             Ok(Some(record))
         }
         None => Ok(None),
@@ -189,7 +189,7 @@ pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRec
                 continue;
             }
         };
-        match postcard::from_bytes::<SessionRecord>(value.value()) {
+        match rmp_serde::from_slice::<SessionRecord>(value.value()) {
             Ok(record) => {
                 sessions.push((key.value(), record));
             }
@@ -376,7 +376,7 @@ pub fn write_turn(
     turn: &Turn,
 ) -> io::Result<()> {
     let payload =
-        postcard::to_allocvec(turn).map_err(|e| db_err(format!("postcard encode turn: {e}")))?;
+        rmp_serde::to_vec_named(turn).map_err(|e| db_err(format!("codec encode turn: {e}")))?;
     let write_txn = db
         .begin_write()
         .map_err(|e| db_err(format!("redb write txn: {e}")))?;
@@ -409,7 +409,7 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
         let (key, value) = result.map_err(|e| db_err(format!("redb iter item: {e}")))?;
         let (sid, idx) = key.value();
         if sid == session_id {
-            match postcard::from_bytes::<Turn>(value.value()) {
+            match rmp_serde::from_slice::<Turn>(value.value()) {
                 Ok(turn) => turns.push((idx, turn)),
                 Err(e) => {
                     tracing::warn!(session_id, turn_id = idx, error = %e, "undecodable turn, skipping");

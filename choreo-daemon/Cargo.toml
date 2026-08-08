@@ -71,6 +71,7 @@ tiny_http = "0.12"
 ckb-vm = { version = "0.24.14", features = ["detect-asm"] }
 tempfile.workspace = true
 postcard.workspace = true
+rmp-serde.workspace = true
 # Native PDF parsing (pdf_classify / pdf_to_markdown).
 #
 # Pinned to a SHA on a contributor fork because upstream (firecrawl/pdf-inspector)
