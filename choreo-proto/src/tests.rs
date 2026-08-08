@@ -57,6 +57,24 @@ fn decode_rejects_wrong_version() {
 }
 
 #[test]
+fn decode_rejects_wrong_version_before_parsing_body() {
+    // The envelope is `[0x92, version, body]`. A wrong version must be
+    // rejected from the version byte alone — the message body is never
+    // deserialized, so bytes from a protocol this binary does not understand
+    // (here: garbage that could never parse as ClientMessage) still produce a
+    // clean UnsupportedVersion rather than a codec error.
+    let mut payload = vec![0x92, PROTOCOL_VERSION + 1];
+    payload.extend_from_slice(&[0xff, 0xff, 0xff]); // unrecognized body
+    let err = decode_frame::<ClientMessage>(&payload).expect_err("should fail");
+    match err {
+        ProtoError::UnsupportedVersion { version } => {
+            assert_eq!(version, PROTOCOL_VERSION + 1);
+        }
+        other => panic!("expected UnsupportedVersion, got {other:?}"),
+    }
+}
+
+#[test]
 fn decode_tolerates_array_encoded_struct() {
     // Named mode writes structs as maps with field-name keys, but decode also
     // accepts the array (field-order) form — that is the compatibility

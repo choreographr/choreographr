@@ -104,8 +104,10 @@ fn main() -> anyhow::Result<()> {
     let db = Arc::new(choreographr::db::open_db().context("failed to open database")?);
 
     // Bring the database up to the current schema version before any table
-    // access: stamps a fresh database (0 → 1), and refuses a newer-version
-    // database before any code can read or write it.
+    // access: open_db already stamped a fresh database at creation (0 → 1
+    // initialization); run_migrations applies any pending migrations from
+    // there up to SCHEMA_VERSION (a no-op today), and refuses a
+    // newer-version database before any code can read or write it.
     choreographr::db::run_migrations(&db).context("failed to migrate database")?;
 
     // Purge any sessions that were deleted while their still-shutting-down

@@ -28,25 +28,48 @@ fn open_db_creates_migrates_and_round_trips() {
         std::env::set_var("CHOREOGRAPHR_DB_PATH", &db_file);
     }
 
-    // Create path: open_db creates the database file; run_migrations stamps
-    // schema v1. This mirrors main.rs's startup sequence — open_db itself
-    // does not version the database, the stamp lives with the migration
-    // runner the daemon calls right after open_db.
+    // Create path: open_db creates the database file AND stamps the initial
+    // schema version (INITIAL_SCHEMA_VERSION) at creation, so a fresh
+    // database is versioned from the moment it exists. run_migrations then
+    // brings it up to SCHEMA_VERSION — a no-op fast path today, but the
+    // migrate-from-`current` path once the chain grows past 1. This mirrors
+    // main.rs's startup sequence.
     let db = db::open_db().unwrap();
-    db::run_migrations(&db).unwrap();
 
-    // The schema version must have been stamped by the startup sequence.
+    // open_db itself must have stamped the initial version — a fresh file
+    // must never be left "unversioned", or the first real migration
+    // (target > 1) would refuse it as pre-release leftovers.
     {
         let read_txn = db.begin_read().unwrap();
         let table = read_txn.open_table(META).unwrap();
         let version = table
             .get("schema_version")
             .unwrap()
-            .expect("schema_version must be stamped by open_db → run_migrations")
+            .expect("open_db must stamp the initial schema version at creation")
             .value();
         assert_eq!(
-            version, 1,
-            "fresh database must be stamped at schema version 1"
+            version,
+            db::INITIAL_SCHEMA_VERSION,
+            "open_db must initialize a fresh database to the initial schema version"
+        );
+    }
+
+    // The startup sequence then brings the database to the current version.
+    db::run_migrations(&db).unwrap();
+
+    // The schema version must be at the current version after the sequence.
+    {
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(META).unwrap();
+        let version = table
+            .get("schema_version")
+            .unwrap()
+            .expect("schema_version must be stamped by the open_db → run_migrations sequence")
+            .value();
+        assert_eq!(
+            version,
+            db::SCHEMA_VERSION,
+            "fresh database must be at the current schema version after startup"
         );
     }
 
@@ -88,6 +111,42 @@ fn open_db_creates_migrates_and_round_trips() {
 
     // Tidy: clear the override so this process falls back to the real data
     // directory (nextest process isolation makes this belt-and-braces).
+    unsafe {
+        std::env::remove_var("CHOREOGRAPHR_DB_PATH");
+    }
+}
+
+#[test]
+#[ignore]
+fn open_db_recreates_zero_byte_corpse_and_initializes() {
+    // A 0-byte `state.redb` is the corpse of an interrupted create (crash
+    // between file creation and the first write): it holds no recoverable
+    // data, so open_db must recreate it — and stamp the initial schema
+    // version, exactly like a brand-new file.
+    let dir = tempfile::tempdir().unwrap();
+    let db_file = dir.path().join("state.redb");
+    std::fs::write(&db_file, b"").unwrap();
+
+    unsafe {
+        std::env::set_var("CHOREOGRAPHR_DB_PATH", &db_file);
+    }
+
+    let db = db::open_db().unwrap();
+    {
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(META).unwrap();
+        let version = table
+            .get("schema_version")
+            .unwrap()
+            .expect("recreated database must be stamped with the initial schema version")
+            .value();
+        assert_eq!(version, db::INITIAL_SCHEMA_VERSION);
+    }
+
+    // The recreated database is a normal, usable database.
+    db::run_migrations(&db).unwrap();
+    assert!(db::read_all_sessions(&db).unwrap().is_empty());
+
     unsafe {
         std::env::remove_var("CHOREOGRAPHR_DB_PATH");
     }

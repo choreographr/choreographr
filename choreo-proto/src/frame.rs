@@ -62,6 +62,22 @@ pub fn decode_frame<T>(payload: &[u8]) -> Result<T, ProtoError>
 where
     T: for<'de> Deserialize<'de>,
 {
+    // Version gate BEFORE the full decode: the envelope is always a
+    // 2-element MessagePack array (`0x92`, fixarray of 2) whose first
+    // element is the version, encoded as a single-byte positive fixint for
+    // any plausible protocol version — so `payload[1]` is the version byte.
+    // Rejecting a mismatched peer here means its message body is never
+    // deserialized at all (a peer on a different protocol may send bytes
+    // this binary cannot meaningfully parse), and the documented "reject any
+    // frame whose version field does not match" contract holds at the
+    // earliest possible point. The tuple decode below re-checks the version
+    // as defense-in-depth in case the envelope shape ever changes.
+    match payload {
+        [0x92, version, ..] if *version != PROTOCOL_VERSION => {
+            return Err(ProtoError::UnsupportedVersion { version: *version });
+        }
+        _ => {}
+    }
     // rmp-serde 1.3.1 has no `from_slice_ref` (unlike postcard's
     // `take_from_bytes`), so decode through an explicit `Deserializer` over a
     // `Cursor` and use `position()` as the remainder probe: the cursor is not

@@ -99,6 +99,16 @@ pub fn db_path() -> io::Result<PathBuf> {
 /// MessagePack tolerates those without a migration.
 pub const SCHEMA_VERSION: u64 = 1;
 
+/// The version [`open_db`] stamps on a database file it creates. Fixed at 1:
+/// the 0 → 1 transition is *initialization* (a brand-new file, stamped at
+/// creation), never a migration, so it must not drift. [`run_migrations`]
+/// then brings the database from this version up to [`SCHEMA_VERSION`].
+/// Stamping here is what lets `run_migrations` treat any database still
+/// reporting version 0 at startup as a *pre-existing* unversioned file
+/// (pre-release leftovers) and refuse it once the chain grows past 1 — a
+/// fresh install is never mistaken for one.
+pub const INITIAL_SCHEMA_VERSION: u64 = 1;
+
 /// Key under which the current schema version is stored in [`META`].
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
@@ -126,13 +136,14 @@ struct Migration {
 }
 
 /// Ordered migration chain, empty at release: version 1 is the *initial*
-/// stamped version, reached by initialization, not by a migration. There is
-/// no v0 data worth migrating pre-release — leftover postcard-era blobs are
-/// skipped with a warning by `read_all_sessions`/`read_turns` on first read.
-/// The first real entry (`from == 1`, upgrading 1 → 2) lands with the first
-/// future breaking schema change; [`run_migrations_to`] validates that the
-/// chain is contiguous and covers every version from the first migration up
-/// to the target before applying anything.
+/// stamped version, reached by initialization at database creation
+/// ([`open_db`] stamps [`INITIAL_SCHEMA_VERSION`]), not by a migration. There
+/// is no v0 data worth migrating pre-release — leftover postcard-era blobs
+/// are skipped with a warning by `read_all_sessions`/`read_turns` on first
+/// read. The first real entry (`from == 1`, upgrading 1 → 2) lands with the
+/// first future breaking schema change; [`run_migrations_to`] validates that
+/// the chain is contiguous and covers every version from the first migration
+/// up to the target before applying anything.
 const MIGRATIONS: &[Migration] = &[];
 
 /// Read the persisted schema version, or `0` for an unversioned database
@@ -190,7 +201,10 @@ fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Result<()> {
 /// stamping and rewrites nothing, so no snapshot is taken (see
 /// [`run_migrations`]). Must be correct when the first real migration lands:
 /// one backup per source schema version, taken before any write, so a failed
-/// migration can always be rolled back from disk.
+/// migration can always be rolled back from disk. Safe to `fs::copy` the
+/// open file because this runs at startup, single-threaded, before any
+/// migration writes — the database is quiescent, so the on-disk image
+/// reflects the last committed transaction.
 fn backup_db_file(path: &std::path::Path, from: u64) -> io::Result<()> {
     let file_name = path
         .file_name()
@@ -223,14 +237,18 @@ pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
 /// - An unversioned database (version 0) is accepted only while the target
 ///   is 1, i.e. as the initial state. Once the chain grows past 1, a
 ///   no-meta database means pre-release leftovers and is refused with
-///   recreate/restore guidance.
+///   recreate/restore guidance. (Fresh installs never reach this state:
+///   [`open_db`] stamps [`INITIAL_SCHEMA_VERSION`] at creation.)
 /// - The chain must be contiguous: the entries' `from` values must cover
 ///   exactly `1..target` (the 0 → 1 transition is initialization, so no
 ///   entry has `from == 0`). A gap — or a misplaced entry — is a hard error
 ///   BEFORE anything is written: silently stamping a version whose data was
 ///   never migrated would corrupt reads far worse than failing startup.
-/// - The 0 → 1 transition is pure initialization: stamp, no backup, no
-///   migration (see [`MIGRATIONS`]).
+/// - The 0 → 1 transition is pure initialization, performed once at database
+///   creation ([`open_db`] stamps [`INITIAL_SCHEMA_VERSION`]): no backup, no
+///   migration (see [`MIGRATIONS`]). A database still at 0 at startup is a
+///   pre-existing unversioned file: stamped to 1 with a warning while the
+///   target is 1, refused once the chain grows past 1.
 fn run_migrations_to(db: &redb::Database, target: u64, migrations: &[Migration]) -> io::Result<()> {
     let current = current_schema_version(db)?;
     if current > target {
@@ -305,12 +323,24 @@ fn run_migrations_to(db: &redb::Database, target: u64, migrations: &[Migration])
     stamp_schema_version(db, target)
 }
 
+/// Stamp [`INITIAL_SCHEMA_VERSION`] on a database file that was just
+/// created. A fresh file has no `meta` table and would otherwise report
+/// version 0 — which [`run_migrations`] treats as a *pre-existing*
+/// unversioned file and refuses once the chain grows past 1. Performing the
+/// 0 → 1 initialization here, at creation, keeps every later startup on the
+/// migrate-from-`current` path regardless of [`SCHEMA_VERSION`].
+fn initialize_schema_version(db: &redb::Database) -> io::Result<()> {
+    stamp_schema_version(db, INITIAL_SCHEMA_VERSION)
+        .map_err(|e| io::Error::other(format!("failed to initialize schema version: {e}")))
+}
+
 /// Open (or create) the database file. The file is created when missing or
-/// empty (the corpse of an interrupted create), but schema versioning is
-/// deliberately NOT applied here — callers run [`run_migrations`] right
-/// after, before any table access (see `main.rs`). Hard-errors on a
-/// database it cannot open rather than recreating a potentially recoverable
-/// file (the old "trying to recreate" catch-all could silently clobber it).
+/// empty (the corpse of an interrupted create); a freshly created file is
+/// stamped with [`INITIAL_SCHEMA_VERSION`] here, but the *migration chain*
+/// is deliberately NOT applied — callers run [`run_migrations`] right after,
+/// before any table access (see `main.rs`). Hard-errors on a database it
+/// cannot open rather than recreating a potentially recoverable file (the
+/// old "trying to recreate" catch-all could silently clobber it).
 pub fn open_db() -> io::Result<redb::Database> {
     let path = db_path()?;
     info!(path = %path.display(), "opening database");
@@ -320,26 +350,35 @@ pub fn open_db() -> io::Result<redb::Database> {
     // A 0-byte file is the corpse of an interrupted `Database::create`
     // (crash between file creation and the first write): it holds no
     // recoverable data, so recreate it rather than hard-erroring like a
-    // potentially-valuable corrupt file. Version stamping stays with the
-    // caller (`run_migrations` right after `open_db`), exactly as for an
-    // existing database.
+    // potentially-valuable corrupt file. As with a brand-new file, the
+    // initial schema version is stamped immediately so the database is
+    // versioned from the moment it exists.
     if let Ok(metadata) = fs::metadata(&path)
         && metadata.len() == 0
     {
         warn!("database file exists but is empty (interrupted create?); recreating");
-        return redb::Database::create(&path)
-            .map_err(|e| io::Error::other(format!("failed to create database: {e}")));
+        let db = redb::Database::create(&path)
+            .map_err(|e| io::Error::other(format!("failed to create database: {e}")))?;
+        initialize_schema_version(&db)?;
+        return Ok(db);
     }
     match redb::Database::open(&path) {
         Ok(db) => Ok(db),
-        // File does not exist: fresh install. Create the database file; the
-        // caller brings it up to the current schema version via run_migrations.
+        // File does not exist: fresh install. Create the database file and
+        // stamp the initial schema version so `run_migrations` (called by
+        // the daemon right after `open_db`) sees a versioned database and
+        // migrates it from the initial version up to SCHEMA_VERSION. Without
+        // this stamp a fresh file would report version 0 — which the runner
+        // (correctly, for *pre-existing* unversioned files) refuses once the
+        // migration chain grows past 1.
         Err(redb::DatabaseError::Storage(redb::StorageError::Io(io_err)))
             if io_err.kind() == io::ErrorKind::NotFound =>
         {
             info!("database file not found, creating new database");
-            redb::Database::create(&path)
-                .map_err(|e| io::Error::other(format!("failed to create database: {e}")))
+            let db = redb::Database::create(&path)
+                .map_err(|e| io::Error::other(format!("failed to create database: {e}")))?;
+            initialize_schema_version(&db)?;
+            Ok(db)
         }
         // redb file-format bump: the file is a valid redb database but in a
         // newer file format than this binary can read. Hard error with
@@ -1358,14 +1397,17 @@ mod tests {
 
     #[test]
     fn run_migrations_stamps_fresh_database_v1() {
-        // A freshly created DB has no meta table → unversioned (0). The
-        // runner's 0 → 1 transition is pure initialization: stamp v1.
+        // A DB created directly with `redb::Database::create` (bypassing
+        // `open_db`, which stamps INITIAL_SCHEMA_VERSION at creation) has no
+        // meta table → unversioned (0). At target 1 that is still a valid
+        // pre-existing-unversioned database, so the runner's 0 → 1
+        // transition initializes it: stamp v1.
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
         assert_eq!(
             current_schema_version(&db).unwrap(),
             0,
-            "a freshly created database must be unversioned"
+            "a database created without open_db must be unversioned"
         );
         run_migrations(&db).unwrap();
         assert_eq!(
@@ -1373,6 +1415,19 @@ mod tests {
             SCHEMA_VERSION,
             "0 → 1 initialization must stamp the current schema version"
         );
+    }
+
+    #[test]
+    fn production_migration_chain_matches_schema_version() {
+        // The chain's `from` values must cover exactly 1..SCHEMA_VERSION
+        // (the 0 → 1 transition is initialization, not a migration, so no
+        // entry has `from == 0`). Pinning this in a test makes a misplaced
+        // entry fail CI immediately — the runner's runtime guard is skipped
+        // on the `current == target` fast path, so without this canary a
+        // broken chain would only error at the next schema bump.
+        let provided: Vec<u64> = MIGRATIONS.iter().map(|m| m.from).collect();
+        let expected: Vec<u64> = (1..SCHEMA_VERSION).collect();
+        assert_eq!(provided, expected);
     }
 
     #[test]
@@ -1580,6 +1635,50 @@ mod tests {
                 table.get("migrated").unwrap().is_none(),
                 "no migration may run when the chain is rejected"
             );
+        }
+    }
+
+    #[test]
+    fn run_migrations_refuses_unversioned_db_when_target_above_initial() {
+        // The flip side of the fresh-install fix: a database that is STILL
+        // unversioned (current == 0) at startup never went through open_db's
+        // creation-time initialization — it is a pre-existing file (pre-
+        // release leftovers). Once the chain grows past the initial version
+        // (target > 1) the runner must refuse it rather than stamp over data
+        // that was never migrated. Fresh installs never hit this branch
+        // because open_db stamps INITIAL_SCHEMA_VERSION at creation.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+
+        let err = run_migrations_to(
+            &db,
+            2,
+            &[Migration {
+                from: 1,
+                run: dummy_migrate_1_to_2,
+            }],
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no schema version"),
+            "error must name the pre-release refusal: {msg}"
+        );
+        // Nothing was written: still unversioned, marker absent.
+        assert_eq!(current_schema_version(&db).unwrap(), 0);
+        {
+            let read_txn = db.begin_read().unwrap();
+            // The meta table may not exist at all (nothing was ever written)
+            // — that itself proves no migration ran.
+            match read_txn.open_table(META) {
+                Ok(table) => assert!(
+                    table.get("migrated").unwrap().is_none(),
+                    "no migration may run when a pre-existing unversioned DB is refused"
+                ),
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => panic!("unexpected table error: {e}"),
+            }
         }
     }
 }

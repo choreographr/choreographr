@@ -1477,10 +1477,14 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 ### Schema versioning & migrations
 
 The `meta` table persists the schema version under the `schema_version` key
-(`SCHEMA_VERSION`, currently `1`). On every startup the daemon runs
-`db::run_migrations` right after `open_db` and before any session data is read;
-it is idempotent — a database already at the current version exits immediately,
-and calling it repeatedly is safe.
+(`SCHEMA_VERSION`, currently `1`). A database file created by `open_db` (fresh
+install, or a 0-byte interrupted-create corpse) is stamped immediately with
+`INITIAL_SCHEMA_VERSION` (also `1`) — the 0 → 1 transition is *initialization*
+at creation, never a migration, so a fresh database is versioned from the
+moment it exists. On every startup the daemon then runs `db::run_migrations`
+right after `open_db` and before any session data is read; it is idempotent —
+a database already at the current version exits immediately, and calling it
+repeatedly is safe.
 
 - **Versioning policy (additive vs breaking).** An additive change — a new
   struct field with `#[serde(default)]`, or a new enum variant appended — needs
@@ -1494,22 +1498,25 @@ and calling it repeatedly is safe.
   as the old version would have written it, run the runner, assert contents +
   version stamp + idempotency + backup artifact).
 - **Migration chain.** `MIGRATIONS` is empty at release: version 1 is the
-  *initial* stamped version, reached by initialization rather than by a
-  migration. Each entry carries its source version explicitly (`from`, upgrading
-  `from → from + 1`), so an entry's position in the array is irrelevant — the
-  first real migration is `from == 1` (the 0 → 1 transition is initialization,
-  never a migration). Before applying anything, the runner validates that the
-  entries' `from` values form the exact contiguous sequence `1..SCHEMA_VERSION`;
-  a gap or misplaced entry is a hard error, never a silent stamp over data that
-  was not migrated. Every migration must be idempotent under re-run (crash
-  recovery re-applies from the last persisted version), transactional (one redb
-  write transaction), and shipped with a fixture-based unit test.
+  *initial* stamped version, reached by initialization at database creation
+  (`open_db` stamps `INITIAL_SCHEMA_VERSION`), never by a migration. Each entry
+  carries its source version explicitly (`from`, upgrading `from → from + 1`),
+  so an entry's position in the array is irrelevant — the first real migration
+  is `from == 1` (the 0 → 1 transition is initialization, never a migration).
+  Before applying anything, the runner validates that the entries' `from`
+  values form the exact contiguous sequence `1..SCHEMA_VERSION`; a gap or
+  misplaced entry is a hard error, never a silent stamp over data that was not
+  migrated. Every migration must be idempotent under re-run (crash recovery
+  re-applies from the last persisted version), transactional (one redb write
+  transaction), and shipped with a fixture-based unit test.
 - **Pre-release legacy data.** A database with no `meta` table reports version
-  0. At release that is either a freshly created DB (stamped to 1; nothing else
-  happens) or a pre-release dev DB whose postcard-era blobs are *not* migrated —
-  `read_all_sessions` / `read_turns` skip undecodable entries with a warning, and
-  single-record `read_session` treats an undecodable record as absent, so legacy
-  sessions drop out loudly-but-non-fatally on first read. Once the chain
+  0. Since `open_db` stamps fresh files at creation, a database still reporting
+  0 at startup is a *pre-existing* unversioned file: while the target is 1 it
+  is initialized the same way (stamped to 1; nothing else happens), and any
+  undecodable legacy blobs it holds are *not* migrated —
+  `read_all_sessions` / `read_turns` skip undecodable entries with a warning,
+  and single-record `read_session` treats an undecodable record as absent, so
+  legacy sessions drop out loudly-but-non-fatally on first read. Once the chain
   grows past 1, a no-meta database is treated as pre-release leftovers and
   `run_migrations` refuses to start.
 - **Backups.** A pre-migration snapshot (`state.redb` → `state.redb.bak-v{from}`,
@@ -1526,7 +1533,8 @@ and calling it repeatedly is safe.
   likewise errors at startup with "upgrade choreographr before continuing". A
   0-byte `state.redb` (the corpse of an interrupted create) is the one exception
   to the refuse-to-recreate rule — it holds no recoverable data, so `open_db`
-  recreates it and the startup `run_migrations` stamps it like a fresh database.
+  recreates it and stamps `INITIAL_SCHEMA_VERSION`, exactly like a fresh
+  database.
 
 ### Session state (in-memory)
 
