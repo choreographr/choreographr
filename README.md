@@ -274,8 +274,9 @@ Alternatives:
   `curl -fsSL https://choreographr.com/install.sh | sh`
 - **cargo binstall** — installs the prebuilt tarball, no toolchain:
   `cargo binstall choreographr`
-- **cargo install** — builds from source; needs Zig at build time:
-  `cargo install choreographr`
+- **cargo install** — builds from source; needs Zig at build time. Installs the
+  whole suite (daemon + TUI + IM + ACP): `cargo install choreographr` — add
+  the GUI with `cargo install choreographr --features gui`
 
 ### Linux
 
@@ -288,7 +289,7 @@ Alternatives:
 - **Any distro** — tarball + installer, or cargo:
   `curl -fsSL https://choreographr.com/install.sh | sh` ·
   `cargo binstall choreographr` (prebuilt, no toolchain) ·
-  `cargo install choreographr` (source build, needs Zig)
+  `cargo install choreographr` (source build, needs Zig — installs the whole suite; `--features gui` adds the GUI)
 
 ### Running the daemon
 
@@ -339,13 +340,13 @@ cargo run --release -p choreographr -- -q   # warnings only
 RUST_LOG=debug cargo run --release -p choreographr
 ```
 
-Then a client:
+Then a client — the suite binaries live in the root package, selected with `--bin`:
 
 ```bash
-cargo run --release -p choreo-tui     # terminal UI
-cargo run --release -p choreo-gui     # desktop app
-cargo run --release -p choreo-im      # IM bridge
-cargo run --release -p choreo-acp     # ACP bridge for editors
+cargo run --release -p choreographr --bin choreo-tui                 # terminal UI
+cargo run --release -p choreographr --bin choreo-gui --features gui  # desktop app
+cargo run --release -p choreographr --bin choreo-im                  # IM bridge
+cargo run --release -p choreographr --bin choreo-acp                 # ACP bridge for editors
 ```
 
 ### First conversation
@@ -372,7 +373,7 @@ cargo run --release -p choreo-acp     # ACP bridge for editors
 
 ## Crates
 
-A Rust workspace of twelve crates (resolver = "3"):
+A Rust workspace of thirteen crates (resolver = "3"):
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the daemon's
 internals — threading model, provider architecture, tool system, and session
@@ -380,7 +381,8 @@ data model.
 
 | Crate | Description |
 |---|---|
-| `choreographr` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
+| `choreographr` | Workspace root — the suite installer. Declares the five binaries (`choreographr choreo-tui choreo-im choreo-acp`, plus `choreo-gui` behind `--features gui`); `cargo run -p choreographr` / `cargo install choreographr` default to the daemon binary via `default-run` |
+| `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
 | `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (79+ providers) |
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
 | `choreo-keystore` | X25519 keypair + ECDH/AES-256-GCM crypto library for encrypted credentials |

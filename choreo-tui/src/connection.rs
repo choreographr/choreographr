@@ -1,9 +1,12 @@
+use crate::image_worker::{ImageResult, ImageWorker};
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
     AIProvidersView, App, INPUT_PAD, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView,
     UiEvent, find_turn_at_row, input_inner_width,
 };
+use crate::terminal_progress;
+use crate::{ShellCommand, build_picker, parse_input_line};
 use choreo_client_core::{
     ClientError, ConnectionMode, broken_pipe, build_add_credential_message,
     dispatch_daemon_message, is_valid_account_name, resolve_private_key,
@@ -11,9 +14,6 @@ use choreo_client_core::{
 };
 use choreo_keystore::ensure_keypair;
 use choreo_proto::{ClientMessage, DaemonMessage};
-use choreo_tui::image_worker::{ImageResult, ImageWorker};
-use choreo_tui::terminal_progress;
-use choreo_tui::{ShellCommand, build_picker, parse_input_line};
 use crossbeam::channel;
 use crossbeam::select;
 use crossterm::event::{

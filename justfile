@@ -150,25 +150,25 @@ ci: fmt-check clippy-strict test-all
 
 #   just daemon -v            # debug logging
 # just daemon "-v -q"       # multiple flags
-# Run the daemon (`choreographr`) — args pass through after `--`
+# Run the daemon (`choreographr`) — default-run selects it from the root package
 daemon args="": _require-zig
     cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr -- {{ args }}
 
-# Run the terminal UI client
+# Run the terminal UI client (root package bin)
 tui args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-tui -- {{ args }}
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --bin choreo-tui -- {{ args }}
 
-# Run the desktop GUI client
+# Run the desktop GUI client (root package bin, gated behind the gui feature)
 gui args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-gui -- {{ args }}
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --bin choreo-gui --features gui -- {{ args }}
 
 # Run the instant-messaging bridge (e.g. `just im telegram`)
 im args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-im -- {{ args }}
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --bin choreo-im -- {{ args }}
 
 # Run the ACP bridge for ACP-compatible editors
 acp args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-acp -- {{ args }}
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --bin choreo-acp -- {{ args }}
 
 # Run any workspace crate's binary. e.g. `just run choreographr -v`
 run crate args="": _require-zig

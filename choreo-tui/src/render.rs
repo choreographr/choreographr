@@ -1,3 +1,4 @@
+use crate::RenderedImage;
 use crate::diff_render::truncate_str;
 use crate::markdown_render::{display_width, reasoning_expanded_default, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
@@ -7,7 +8,6 @@ use crate::state::{
     cached_visual_lines, input_inner_width,
 };
 use choreo_proto::{SessionStatus, TokenUsage};
-use choreo_tui::RenderedImage;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
@@ -127,7 +127,7 @@ fn render_fullscreen_image(
     {
         Some(img) => {
             if let Some(protocol) = img.protocols.get_mut(&full) {
-                let target = protocol.size_for(choreo_tui::IMAGE_RESIZE, full);
+                let target = protocol.size_for(crate::IMAGE_RESIZE, full);
                 let centered = Rect {
                     x: area.x + (area.width.saturating_sub(target.width)) / 2,
                     y: area.y + (area.height.saturating_sub(target.height)) / 2,
@@ -135,7 +135,7 @@ fn render_fullscreen_image(
                     height: target.height.min(area.height),
                 };
                 frame.render_stateful_widget(
-                    StatefulImage::new().resize(choreo_tui::IMAGE_RESIZE),
+                    StatefulImage::new().resize(crate::IMAGE_RESIZE),
                     centered,
                     protocol,
                 );
@@ -161,7 +161,7 @@ fn render_fullscreen_image(
             img.data.clone(),
             img.metadata.clone(),
             full,
-            choreo_tui::IMAGE_RESIZE,
+            crate::IMAGE_RESIZE,
         );
     }
 
@@ -657,7 +657,7 @@ fn render_turn_image(
                     // Center the image within the block using the protocol's actual
                     // rendered dimensions, preventing visual reflow when only part
                     // of the block is visible.
-                    let rendered_at = protocol.size_for(choreo_tui::IMAGE_RESIZE, inline_size);
+                    let rendered_at = protocol.size_for(crate::IMAGE_RESIZE, inline_size);
                     let centered = Rect {
                         x: inner.x + (inner.width.saturating_sub(rendered_at.width)) / 2,
                         y: inner.y + (inner.height.saturating_sub(rendered_at.height)) / 2,
@@ -665,7 +665,7 @@ fn render_turn_image(
                         height: rendered_at.height.min(inner.height),
                     };
                     frame.render_stateful_widget(
-                        StatefulImage::new().resize(choreo_tui::IMAGE_RESIZE),
+                        StatefulImage::new().resize(crate::IMAGE_RESIZE),
                         centered,
                         protocol,
                     );
@@ -695,7 +695,7 @@ fn render_turn_image(
             data,
             meta.clone(),
             inline_size,
-            choreo_tui::IMAGE_RESIZE,
+            crate::IMAGE_RESIZE,
         );
     }
 

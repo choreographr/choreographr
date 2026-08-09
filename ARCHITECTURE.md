@@ -27,10 +27,14 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 
 ## Workspace topology
 
-Twelve crates in a single Cargo workspace (resolver = "3"):
+Thirteen crates in a single Cargo workspace (resolver = "3") — the root
+package plus twelve members:
 
 ```
 Choreographr (workspace)
+├── choreographr          Workspace root — the suite installer: declares the five
+│                       binaries (choreographr choreo-tui choreo-im choreo-acp,
+│                       plus choreo-gui behind `--features gui`)
 ├── choreo-proto           Wire protocol (shared types + framing)
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── choreo-transport       Noise IK encrypted TCP transport abstraction
@@ -41,7 +45,8 @@ Choreographr (workspace)
 ├── choreo-ai-protocols    Provider protocols — OpenAI-compatible, Anthropic Messages, and
 │                       Google Gemini clients, the ProviderClient trait, and the provider
 │                       catalog (bundled TOML data)
-├── choreographr          Unix socket server — the core engine
+├── choreo-daemon          Unix socket server — the core engine (library; the daemon
+│                       binary `choreographr` lives in the root package)
 ├── choreo-acp             ACP bridge — translates the Agent Communication Protocol
 │                       (JSON-RPC over stdin/stdout) into choreo-proto messages over the
 │                       daemon's Unix socket, enabling ACP-compatible editors (Claude
@@ -65,7 +70,7 @@ Choreographr (workspace)
               ┌──────────────┼──────────────────────────────┐
               │              │                              │
       ┌───────▼────────┐    │                ┌──────────────▼──────────────┐
-      │ choreo-client-core │    │                │         choreographr        │
+      │ choreo-client-core │    │                │        choreo-daemon        │
       └───────┬───┬────┘    │                └───────┬──────────────┬───────┘
               │   │         │                        │              │
               │  ┌▼─────────▼────────┐  ┌────────────▼─────────┐  ┌──▼────────┐
@@ -172,20 +177,24 @@ with `systemctl --user enable --now choreographr` (Linux) or
 The workspace inherits crates.io-required fields from `[workspace.package]`
 in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
 `readme`, `description`), and members opt into publishing by *not* setting
-`publish = false`. The **publish set** is therefore:
+`publish = false`. The **publish set** is therefore twelve crates:
 
-`choreo-proto`, `choreo-keystore`, `choreo-transport`, `choreo-mcp`,
-`choreo-ai-protocols`, `choreographr`
+`choreographr` (root), `choreo-daemon`, `choreo-tui`, `choreo-im`,
+`choreo-acp`, `choreo-proto`, `choreo-keystore`, `choreo-transport`,
+`choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`,
+`choreo-markdown`
 
-The six client/internal crates set `publish = false` and never reach
-crates.io: `choreo-tui`, `choreo-gui`, `choreo-im`, `choreo-acp`,
-`choreo-client-core`, `choreo-markdown`.
+`choreo-gui` is the one private member (`publish = false`): it stays
+excluded from crates.io and is only built through the root package's
+`gui` feature.
 
-The daemon crate additionally declares `[package.metadata.binstall]`, so
+The root package declares `[package.metadata.binstall]`, so
 `cargo binstall choreographr` resolves the GitHub release asset naming
 (`choreographr-<version>-<target>.<ext>`) from the package itself instead of
 requiring a manual `--pkg-url`; `bin-dir = ""` matches the tarball's
-binaries-at-top-level layout.
+binaries-at-top-level layout. The daemon crate is `choreo-daemon` (library
+`choreo_daemon`, no `[[bin]]` target) — the `choreographr` binary it backs
+lives in the root package's `src/bin/`.
 
 ---
 
@@ -266,7 +275,7 @@ foreign reader will ever touch the bytes.
 ### `choreo-keystore` — Identity keypair & credential crypto
 
 Provides the cryptographic primitives for credential management. No longer a standalone
-CLI binary — it is a library used by `choreo-client-core` and `choreographr`.
+CLI binary — it is a library used by `choreo-client-core` and `choreo-daemon`.
 
 **Identity keypair (X25519):**
 The daemon's identity is an X25519 keypair stored as two files:
@@ -306,14 +315,14 @@ in the `redb` database alongside sessions.
 ### `choreo-transport` — Noise IK encrypted transport
 
 A small crate providing Noise IK handshake and encrypted message I/O over
-TCP.  Used by both `choreo-client-core` (client side) and `choreographr` (server side).
+TCP.  Used by both `choreo-client-core` (client side) and `choreo-daemon` (server side).
 
 | Module | Purpose |
 |---|---|
 | `noise.rs` | `NoiseStream` — wraps `TcpStream` + `snow::TransportState` with length-prefixed AES-256-GCM framing. `handshake_initiator()` (client) and `handshake_responder()` (server) implement the Noise IK handshake with X25519 key agreement. |
 | `error.rs` | `TransportError` enum — `Io`, `Noise`, `Protocol`, `AuthFailed`, `ConnectionClosed`. |
 
-The server-side TCP/Noise handler lives in `choreographr/src/server/connection.rs`
+The server-side TCP/Noise handler lives in `choreo-daemon/src/server/connection.rs`
 (`tcp_client_thread`), where the Noise IK handshake is performed and the
 encrypted stream enters the same dispatch loop as Unix socket clients.
 
@@ -338,7 +347,7 @@ Used by `choreo-tui`, `choreo-gui`, and `choreo-im`.
 ### `choreo-mcp` — MCP client (Model Context Protocol)
 
 Communicates with MCP server subprocesses over JSON-RPC 2.0 stdio transport.
-Used by `choreographr` to spawn external MCP servers and register their tools.
+Used by `choreo-daemon` to spawn external MCP servers and register their tools.
 
 | Module | Purpose |
 |---|---|
@@ -355,7 +364,7 @@ implementations (`openai`, `anthropic`, `google`), the `ProviderClient` trait
 and shared turn/error/message types they all use, the retry machinery, and
 the static provider catalog.  It is free of daemon concerns — no metrics, no
 account configuration, no sessions — so it can be consumed independently of
-`choreographr` (the daemon supplies those concerns at the boundary, e.g. via
+`choreo-daemon` (the daemon supplies those concerns at the boundary, e.g. via
 [`ProviderOverrides`] and by timing calls itself).
 
 | Module | Purpose |
@@ -431,9 +440,11 @@ main()
   to ACP `session/update` notifications, and finalized with a JSON-RPC response on `Done`/`Failed`/`Cancelled`.
 
 
-### `choreographr` — Core server
+### `choreo-daemon` — Core server (binary `choreographr`)
 
-Entry point: `src/main.rs` → initializes tracing, creates `DaemonState`, runs socket server.
+Entry point: `choreo_daemon::main` — invoked from the root package's
+`src/bin/choreographr.rs` wrapper — initializes tracing, creates
+`DaemonState`, runs socket server.
 
 **Concurrency model:** Pure OS threads with message passing (actor model). No async code
 in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads.
@@ -502,7 +513,7 @@ Each client implementation maps the `&str` effort slug to its wire format:
 - **Google**: `thinkingConfig` with `includeThoughts: true` (slug ≠ `"off"` enables thinking)
 - **Mistral**: `reasoning_effort` field (`"off"` omits the field, otherwise slug → `"low"`/`"medium"`/`"high"`)
 
-**2. `InferenceProvider` struct (`choreographr/src/providers/mod.rs`):**
+**2. `InferenceProvider` struct (`choreo-daemon/src/providers/mod.rs`):**
 ```rust
 pub struct InferenceProvider {
     client: Arc<dyn ProviderClient>,
@@ -568,11 +579,11 @@ Reasoning text is not only *displayed* — for several providers it must also be
 |---|---|
 | Catalog (`choreo-ai-protocols/src/catalog/`) | `reasoning_passback` format enum (`ReasoningPassback`), per-model + protocol-defaulted — *how* to send |
 | Adapters (`openai/`, `anthropic/`, `google/`) | capture the artifact verbatim at the parse boundary; re-emit it verbatim in their own wire format on request build |
-| Daemon (`build_chat_request_messages` in `choreographr/src/reasoning.rs`) | derives *whether* to send (same-model provenance + passback policy); never interprets the payload |
+| Daemon (`build_chat_request_messages` in `choreo-daemon/src/reasoning.rs`) | derives *whether* to send (same-model provenance + passback policy); never interprets the payload |
 
 **Capture** happens inside each adapter before the display field is consumed: OpenAI chat wraps the raw reasoning string — from whichever chat field the provider populated (`reasoning_content`, `reasoning`, or `reasoning_text`, with that precedence) — into `ChatReasoning { field, bytes }`, tagging the artifact with the field it came from; Anthropic serializes the ordered thinking / redacted_thinking blocks (signatures + redacted data intact, order preserved) into `AnthropicThinking`; Google collects the `thoughtSignature` values (the `thought: true` marker may carry a signature on **any** part type — the wire-format fix; there is no separate `thinking` key) into `GoogleSignatures`; Responses collects the raw reasoning output items verbatim — type tag, id, summary, `encrypted_content` in stateless mode, and any unknown fields (e.g. a newer `content` shape), preserved exactly as returned — into `ResponsesItems`. The artifact rides out of the provider crate on `ChatAssistantToolUse`/`FinalTextResult.reasoning_artifact` and is stored on the `Turn` by the agent loop via `SessionState::set_assistant_response` — which now takes an `AssistantResponse` struct bundling text, reasoning, tool calls, usage, and the artifact + producer pair — alongside `Turn.reasoning_producer` (provider slug + model).
 
-**Carry** is a pure store-and-forward: the daemon never reads the payload bytes. It also strips the artifact (and its producer) from every client-bound `DaemonMessage` payload — `TurnAppended`, `TurnFinalized`, `SessionState`, and `TurnsRedone` carry client copies with `reasoning_artifact`/`reasoning_producer` set to `None` (see `turn_for_client` in `choreographr/src/sessions.rs`), so the bytes never leave the daemon process; only the request builder consumes them, from the authoritative `Turn` in `SessionState` and the DB. The builder's only job is the *whether*: an artifact is attached to an assistant message only when (1) **same-model provenance** holds — `turn.reasoning_producer == {current provider_slug, current model}` — so a turn produced by a different model (mid-session `/model` switch) never replays its possibly-encrypted payload, and (2) the resolved `ReasoningPassback` policy says to:
+**Carry** is a pure store-and-forward: the daemon never reads the payload bytes. It also strips the artifact (and its producer) from every client-bound `DaemonMessage` payload — `TurnAppended`, `TurnFinalized`, `SessionState`, and `TurnsRedone` carry client copies with `reasoning_artifact`/`reasoning_producer` set to `None` (see `turn_for_client` in `choreo-daemon/src/sessions.rs`), so the bytes never leave the daemon process; only the request builder consumes them, from the authoritative `Turn` in `SessionState` and the DB. The builder's only job is the *whether*: an artifact is attached to an assistant message only when (1) **same-model provenance** holds — `turn.reasoning_producer == {current provider_slug, current model}` — so a turn produced by a different model (mid-session `/model` switch) never replays its possibly-encrypted payload, and (2) the resolved `ReasoningPassback` policy says to:
 
 | `reasoning_passback` | Meaning | Wire behavior |
 |---|---|---|
@@ -682,13 +693,13 @@ LLM provider (API response)
      ChatTurnResult (FinalText | ToolUse).usage: Option<TokenUsage>
        │
        ▼
-      run_agent_loop (choreographr/src/requests.rs)
+      run_agent_loop (choreo-daemon/src/requests.rs)
         ├─ embeds per-turn TokenUsage into SessionMessageKind::AssistantText / SessionMessageKind::AssistantToolUse
         ├─ tracks last_prompt_tokens = Some(usage.input_tokens) for context-window display
         └─ accumulates into SessionState.config.accumulated_usage (TokenUsage)
         │
         ▼
-      SessionState (choreographr/src/sessions.rs)
+      SessionState (choreo-daemon/src/sessions.rs)
         ├─ persisted via SessionRecord.accumulated_usage (through SessionConfig)
         ├─ sent to subscribers via DaemonMessage::SessionState.token_usage
         ├─ sent to clients via DaemonMessage::Done.token_usage
@@ -1120,7 +1131,7 @@ enabling compact cross-VM communication.
 ### `define_tool!` macro
 
 The `define_tool!` macro reduces boilerplate for the common tool case
-(`Return = String`, no credentials needed). It lives in `choreographr/src/tools/mod.rs`.
+(`Return = String`, no credentials needed). It lives in `choreo-daemon/src/tools/mod.rs`.
 The JSON schema is auto-derived from the args type via `schemars`, so no manual
 schema parameter is needed. The macro now takes 7 arguments — the 7th is a
 `fn(&Args) -> String` path that provides the invocation description:
@@ -1224,7 +1235,7 @@ parser built on `lopdf`. The parser has no JavaScript engine, never renders page
 never executes embedded files or `/Launch` actions, so the classic PDF malware
 *execution* vectors are excluded by construction.
 
-> **Dependency pin — security.** `choreographr` depends on `pdf-inspector` by **SHA**
+> **Dependency pin — security.** `choreo-daemon` depends on `pdf-inspector` by **SHA**
 > (`omeileo/pdf-inspector@f86decf`, upstream PR firecrawl/pdf-inspector#198) rather than
 > a crates.io release, because upstream still ships `lopdf ^0.41.0` which is vulnerable to
 > RUSTSEC-2026-0187: a ~21 KB crafted PDF with ~10,000-deep nested objects aborts the
@@ -1233,7 +1244,7 @@ never executes embedded files or `/Launch` actions, so the classic PDF malware
 > the PR author (860 tests green; the PoC now yields `Type: SCANNED` and exit 0 instead of
 > SIGABRT). The regression guard is `nested_array_poc_does_not_abort_process` in
 > `tests/pdf_tool_integration.rs`. Revert to a crates.io release once upstream merges and
-> publishes the fix (see the comment in `choreographr/Cargo.toml`).
+> publishes the fix (see the comment in `choreo-daemon/Cargo.toml`).
 
 - **`pdf_classify`** runs `pdf_inspector::detect_pdf_mem` (DetectOnly mode, ~10–50ms) and
   reports `pdf_type` (text_based / scanned / image_based / mixed), `confidence`,
@@ -1369,7 +1380,7 @@ Implementation details:
   `ToolRegistry::build()`, using `ToolContext.daemon_tx` to communicate with the
   daemon command loop
 - Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell}`)
-- `ToolGroup` struct and `GROUPS` constant live in `choreographr/src/tools/mod.rs`
+- `ToolGroup` struct and `GROUPS` constant live in `choreo-daemon/src/tools/mod.rs`
 - Group metadata is appended to the system prompt in `context::build_base_prompt()`
 
 ### Concurrent tool dispatch
@@ -2220,12 +2231,12 @@ disable_claude_code_prompt = false                 # skip ~/.claude/CLAUDE.md
 
 The stable base prompt (`messages[0]`) is loaded from
 `~/.config/choreographr/system.md` if it exists. Otherwise, a built-in default is
-used. The default lives at `choreographr/system.md` in the repository and is
+used. The default lives at `choreo-daemon/system.md` in the repository and is
 embedded at compile time via `include_str!`.
 
 ### Module
 
-Implementation lives in `choreographr/src/context.rs`. Key entry points:
+Implementation lives in `choreo-daemon/src/context.rs`. Key entry points:
 
 | Function | Purpose |
 |---|---|
@@ -2413,12 +2424,17 @@ already gone.
 |---|---|---|
 | Protocol | Framing, version handling, round-trip encode/decode | `choreo-proto/src/tests.rs` |
 | Client core | Shell parsing, markdown→HTML, image assembly, history | `choreo-client-core/src/tests.rs` |
-| Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `choreographr/src/tests.rs`, `choreographr/tests/integration.rs` |
+| Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `choreo-daemon/src/tests.rs`, `choreo-daemon/tests/integration.rs` |
 | MCP (choreo-mcp) | Server spawn, tool discovery, echo tool call/response | `choreo-mcp/tests/mcp_integration.rs` |
-| MCP (daemon) | McpManager + ToolRegistry integration, dynamic group registration, tool execution | `choreographr/tests/mcp_integration.rs` |
+| MCP (daemon) | McpManager + ToolRegistry integration, dynamic group registration, tool execution | `choreo-daemon/tests/mcp_integration.rs` |
 | Providers (`choreo-ai-protocols`) | SSE parsing, HTTP request construction, chat completions + responses serialization, content-block deserialisation, config overrides, catalog lookups | `choreo-ai-protocols/src/openai/tests.rs`, `choreo-ai-protocols/src/openai/chat_completions.rs`, `choreo-ai-protocols/src/openai/config.rs`, `choreo-ai-protocols/src/anthropic/tests.rs`, `choreo-ai-protocols/src/google/tests.rs`, `choreo-ai-protocols/src/catalog/mod.rs` |
 | choreo-tui | SVG rasterization, Unicode width, app state | `choreo-tui/src/app_tests.rs`, `choreo-tui/src/lib_tests.rs` |
 | choreo-gui | App state, render helpers | `choreo-gui/src/app_tests.rs` |
+
+> **Binary-spawning integration tests.** Integration tests live in their
+> crates and test the libs. Any future binary-spawning integration test (via
+> `env!("CARGO_BIN_EXE_...")`) must live in the ROOT package's `tests/`,
+> because the root package owns the binaries.
 
 **Test infrastructure:** Tests use `UnixStream::pair()` for socket-less daemon↔client
 communication, and mock HTTP servers for API simulation.
@@ -2428,7 +2444,7 @@ communication, and mock HTTP servers for API simulation.
 tests). Cargo aliases `test-fast` (unit tests), `test-integration` (the
 `#[ignore]` suite), and `test-all` (both) invoke it with `--workspace`; plain
 `cargo test` / `cargo test -- --ignored` still work via libtest. Nextest runs
-every test in its own process — a large wall-time win for this 12-crate
+every test in its own process — a large wall-time win for this 13-crate
 workspace, since libtest serializes test binaries and threads their tests
 within one process. Global *process-local* state needs no special handling
 under nextest's process-per-test model — e.g. the keystore test-config-root
@@ -2459,7 +2475,7 @@ declared via `rust-version` in every crate manifest (inherited from
 `[workspace.package]` in the root `Cargo.toml`). Keep code and dependencies
 within this floor; the CI MSRV job enforces it.
 
-The `choreographr` crate depends on `zlob` (a Zig-implemented glob and
+The `choreo-daemon` crate depends on `zlob` (a Zig-implemented glob and
 gitignore-aware directory walker used by `grep`, `find`, `delete_files`, and
 pathspec matching). Building it therefore requires the **Zig toolchain** on
 `PATH` (or the `ZIG` environment variable pointing at the `zig` binary).
@@ -2472,17 +2488,17 @@ cargo build
 # Build release
 cargo build --release
 
-# Run daemon
+# Run daemon (default-run selects the choreographr bin)
 cargo run -p choreographr
 
 # Run terminal client
-cargo run -p choreo-tui
+cargo run -p choreographr --bin choreo-tui
 
-# Run desktop client
-cargo run -p choreo-gui
+# Run desktop client (gui feature)
+cargo run -p choreographr --bin choreo-gui --features gui
 
 # Run IM bridge (Telegram)
-cargo run -p choreo-im -- telegram
+cargo run -p choreographr --bin choreo-im -- telegram
 ```
 
 
@@ -2557,7 +2573,7 @@ for programmatic consumers.
 The postcard binary path encodes all outcomes as a nested
 `Result<Result<R, E>, ToolError>`: `Ok(Ok(ret))` for success, `Ok(Err(e))` for a
 structured tool error, and `Err(e)` for an infrastructure failure. The `encode_outer()`
-helper in `choreographr/src/tools/mod.rs` handles this serialization.
+helper in `choreo-daemon/src/tools/mod.rs` handles this serialization.
 
 `ToolOutput` replaces the old `ToolExecutionOutput` and `ToolResult` types. The `ToolOutputFormat`
 enum lets callers choose between `Text` (human-readable via `return_string`) and `Json`

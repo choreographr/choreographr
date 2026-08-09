@@ -1,8 +1,11 @@
 [package]
 name = "choreo-acp"
 version.workspace = true
-# Internal workspace crate — never published to crates.io.
-publish = false
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 edition = "2024"
 rust-version.workspace = true
 

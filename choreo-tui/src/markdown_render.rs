@@ -1,5 +1,5 @@
+use crate::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 use choreo_proto::{ToolResultRecord, Turn};
-use choreo_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;

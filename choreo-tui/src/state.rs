@@ -1,11 +1,11 @@
+use crate::RenderedImage;
+use crate::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
 use choreo_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use choreo_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
 use choreo_proto::{
     AccountInfo, ClientMessage, OutputStream, ReasoningCapability, SessionStatus, SessionSummary,
     TokenUsage, ToolResultRecord, Turn,
 };
-use choreo_tui::RenderedImage;
-use choreo_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use std::borrow::Cow;
@@ -5834,7 +5834,7 @@ mod tests {
 
     #[test]
     fn apply_image_result_clears_pending_job_and_records_failure() {
-        use choreo_tui::image_worker::next_job_id;
+        use crate::image_worker::next_job_id;
 
         let mut app = test_app();
         app.history_viewport.width = 80;
@@ -5884,7 +5884,7 @@ mod tests {
         img.pending_job = Some(img_id);
 
         let inline_size = Size::new(app.history_viewport.width, app.image_block_height());
-        let result = choreo_tui::image_worker::ImageResult {
+        let result = crate::image_worker::ImageResult {
             id: img_id,
             protocol: None,
             cell_size: inline_size,
@@ -5905,7 +5905,7 @@ mod tests {
 
     #[test]
     fn apply_image_result_records_failure_at_any_size() {
-        use choreo_tui::image_worker::next_job_id;
+        use crate::image_worker::next_job_id;
 
         let mut app = test_app();
         app.history_viewport.width = 80;
@@ -5956,7 +5956,7 @@ mod tests {
 
         // Use a cell_size that is NOT the inline size.
         let non_inline_size = Size::new(80, app.image_block_height() + 1);
-        let result = choreo_tui::image_worker::ImageResult {
+        let result = crate::image_worker::ImageResult {
             id: img_id,
             protocol: None,
             cell_size: non_inline_size,

@@ -1,9 +1,67 @@
+[package]
+name = "choreographr"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+# `cargo run -p choreographr` (and `cargo install choreographr`) default to the
+# daemon binary; the other suite binaries remain explicit targets.
+default-run = "choreographr"
+
+[features]
+# The GUI is opt-in: it drags in a heavy native-widget dependency tree, so the
+# default install (daemon + TUI + bridges) stays lean. The gui bin target is
+# gated on this feature via `required-features` below.
+default = []
+gui = ["dep:choreo-gui"]
+
+[dependencies]
+choreo-daemon = { path = "choreo-daemon", version = "0.1" }
+choreo-tui = { path = "choreo-tui", version = "0.1" }
+choreo-im = { path = "choreo-im", version = "0.1" }
+choreo-acp = { path = "choreo-acp", version = "0.1" }
+choreo-gui = { path = "choreo-gui", version = "0.1", optional = true }
+anyhow.workspace = true
+
+[[bin]]
+name = "choreographr"
+path = "src/bin/choreographr.rs"
+
+[[bin]]
+name = "choreo-tui"
+path = "src/bin/choreo-tui.rs"
+
+[[bin]]
+name = "choreo-im"
+path = "src/bin/choreo-im.rs"
+
+[[bin]]
+name = "choreo-acp"
+path = "src/bin/choreo-acp.rs"
+
+[[bin]]
+name = "choreo-gui"
+path = "src/bin/choreo-gui.rs"
+required-features = ["gui"]
+
+# cargo-binstall metadata: lets `cargo binstall choreographr` resolve our
+# GitHub release asset naming (`choreographr-<version>-<target>.<ext>`) from
+# the package itself, instead of needing a manual `--pkg-url`. The `{ ... }`
+# tokens are binstall template variables; spaces inside them are ignored.
+[package.metadata.binstall]
+pkg-url = "https://github.com/ethernomad/choreographr/releases/download/{ version }/choreographr-{ version }-{ target }.{ archive-suffix }"
+bin-dir = ""
+
 [workspace]
 members = [
     "choreo-acp",
     "choreo-ai-protocols",
     "choreo-client-core",
-    "choreographr",
+    "choreo-daemon",
     "choreo-keystore",
     "choreo-markdown",
     "choreo-mcp",
@@ -59,14 +117,14 @@ thiserror = "2"
 futures-channel = "0.3"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
-choreo-ai-protocols = { path = "choreo-ai-protocols" }
-choreo-client-core = { path = "choreo-client-core" }
-choreo-keystore = { path = "choreo-keystore" }
-choreo-proto = { path = "choreo-proto" }
-choreo-im = { path = "choreo-im" }
-choreo-markdown = { path = "choreo-markdown" }
-choreo-mcp = { path = "choreo-mcp" }
-choreo-transport = { path = "choreo-transport" }
+choreo-ai-protocols = { path = "choreo-ai-protocols", version = "0.1" }
+choreo-client-core = { path = "choreo-client-core", version = "0.1" }
+choreo-keystore = { path = "choreo-keystore", version = "0.1" }
+choreo-proto = { path = "choreo-proto", version = "0.1" }
+choreo-im = { path = "choreo-im", version = "0.1" }
+choreo-markdown = { path = "choreo-markdown", version = "0.1" }
+choreo-mcp = { path = "choreo-mcp", version = "0.1" }
+choreo-transport = { path = "choreo-transport", version = "0.1" }
 ureq = { version = "3", features = ["json"] }
 ammonia = "4"
 base64 = "0.23"
