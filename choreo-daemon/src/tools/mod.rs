@@ -146,6 +146,10 @@ pub mod http;
 mod image;
 pub(crate) mod notify;
 pub(crate) mod nu;
+// Native PDF tools — behind the `pdf` feature (see Cargo.toml): the parser
+// dep is a registry version patched to a security fork in the workspace root,
+// and crates.io must never see the fork in a published manifest.
+#[cfg(feature = "pdf")]
 pub(crate) mod pdf;
 pub(crate) mod random;
 pub(crate) mod read_file;
@@ -647,7 +651,9 @@ impl ToolRegistry {
         reg.register(exec::Exec);
         reg.register(grep::Grep);
         reg.register(find::Find);
+        #[cfg(feature = "pdf")]
         reg.register(pdf::PdfClassify);
+        #[cfg(feature = "pdf")]
         reg.register(pdf::PdfToMarkdown);
         reg.register(random::Random);
         reg.register(notify::NotifySend);

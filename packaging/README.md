@@ -67,8 +67,11 @@ bump checklist. The manual steps that must stay in lockstep:
 - **AUR** — bump `pkgver` in `aur/PKGBUILD`, reset `pkgrel` to 1, update the
   `source` URL and `sha256sums`, then regenerate `aur/.SRCINFO`:
   `makepkg --printsrcinfo > .SRCINFO`.
-- **crates.io** — `cargo release publish` for the publish-set members (gated
-  on the pdf-inspector registry fix).
+- **crates.io** — `cargo release publish` for the publish-set members in
+  dependency order. The native PDF tools are feature-gated and **off by default**
+  on crates.io (the parser dep is a registry version patched to a security fork
+  only in the workspace root, which crates.io never sees); release binaries
+  build them via `scripts/release.sh --features pdf`.
 - **choreographr.com** — publish `scripts/install.sh` and add download
   redirects for the new version.
 

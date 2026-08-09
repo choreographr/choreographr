@@ -7,6 +7,13 @@
 //! with the unit tests via a `#[path]` include (integration tests cannot
 //! `use` items from `src/` directly). Marked `#[ignore]` per repo
 //! conventions: `cargo test -- --ignored pdf`.
+//!
+//! The whole module is gated on the `pdf` feature: the parser dependency is a
+//! crates.io registry version patched to a security fork only in the workspace
+//! root (never published), and these tests exercise the fork's behavior (e.g.
+//! the RUSTSEC-2026-0187 regression guard below), so they only build where the
+//! patch is in effect.
+#![cfg(feature = "pdf")]
 
 use choreo_ai_protocols::ChatToolCall;
 use choreo_daemon::tools::{ToolOutputFormat, ToolRegistry};

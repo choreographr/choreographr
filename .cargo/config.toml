@@ -10,9 +10,14 @@ incompatible-rust-versions = "fallback"
 # README's libtest split (`cargo test` = unit tests, `-- --ignored` = integration
 # tests) while running every test in its own process, in parallel, across all
 # 16-ish cores. `--run-ignored only` matches libtest's `--ignored` semantics.
+#
+# `--all-features` keeps feature-gated code exercised: the native PDF tools
+# (and their tests) live behind the `pdf` feature, which resolves to a security
+# fork only via the workspace `[patch.crates-io]` — running the suite with all
+# features on is what keeps those tests in CI.
 [alias]
-test-fast = "nextest run --workspace"                 # unit tests
+test-fast = "nextest run --workspace --all-features"                 # unit tests
 # integration tests (the #[ignore] suite)
-test-integration = "nextest run --workspace --run-ignored only"
+test-integration = "nextest run --workspace --all-features --run-ignored only"
 # everything: unit + integration in one pass
-test-all = "nextest run --workspace --run-ignored all"
+test-all = "nextest run --workspace --all-features --run-ignored all"

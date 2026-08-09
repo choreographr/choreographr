@@ -68,7 +68,13 @@ echo "==> building release binaries (root package)"
 # Build only the four shipped binaries: `-p choreographr` pulls in the daemon,
 # TUI, IM, and ACP transitively but NOT choreo-gui (its dioxus/webkit2gtk stack
 # is not shipped and must not be a build requirement of the release machine).
-cargo build --release -p choreographr
+# `--features pdf` enables the native PDF tools (pdf_classify / pdf_to_markdown)
+# for the shipped binaries: the pdf-inspector dep is feature-gated off by default
+# so the published crates.io manifests stay free of the git-pinned security fork
+# (crates.io rejects git deps — see the root Cargo.toml [patch.crates-io] and
+# choreo-daemon/Cargo.toml). Building from the git tree applies the workspace
+# patch, so release binaries get the RUSTSEC-2026-0187-hardened parser.
+cargo build --release -p choreographr --features pdf
 
 # Stage the tarball contents: the four binaries plus both service files, all
 # at the top level of the archive (no bin/ prefix) so install.sh and the
@@ -132,8 +138,10 @@ echo "  - Homebrew: bump packaging/homebrew/choreographr.rb (version, urls,"
 echo "    shasum -a 256) and push to the ethernomad/homebrew-choreographr tap"
 echo "  - AUR: bump pkgver in packaging/aur/PKGBUILD + regenerate .SRCINFO"
 echo "    (makepkg --printsrcinfo > .SRCINFO)"
-echo "  - crates.io: cargo release publish (gated on the pdf-inspector"
-echo "    registry fix)"
+echo "  - crates.io: cargo release publish (publish-set members in dependency"
+echo "    order; the native PDF tools are feature-gated and off by default on"
+echo "    crates.io — release binaries build them via --features pdf, see the"
+echo "    [patch.crates-io] section of the root Cargo.toml)"
 echo "  - choreographr.com: publish scripts/install.sh and add download"
 echo "    redirects for v${VERSION}"
 

@@ -73,23 +73,29 @@ ckb-vm = { version = "0.24.14", features = ["detect-asm"] }
 tempfile.workspace = true
 postcard.workspace = true
 rmp-serde.workspace = true
-# Native PDF parsing (pdf_classify / pdf_to_markdown).
+# Native PDF parsing (pdf_classify / pdf_to_markdown), behind the `pdf` feature.
 #
-# Pinned to a SHA on a contributor fork because upstream (firecrawl/pdf-inspector)
-# still ships lopdf ^0.41.0, which is vulnerable to RUSTSEC-2026-0187: a ~21 KB
-# crafted PDF with ~10,000-deep nested objects aborts the process via stack
-# overflow — a SIGABRT that `catch_unwind` CANNOT intercept. The fix is lopdf
-# 0.42.0 (MAX_NESTING_DEPTH), and upstream PR firecrawl/pdf-inspector#198
-# (omeileo, single commit f86decf) bumps it, verified source-compatible with
-# 860 green tests and a clean error instead of SIGABRT on the PoC.
+# This is a REGISTRY dep (`pdf-inspector = "0.1"`) — deliberately NOT a git pin,
+# because crates.io refuses to publish crates whose manifests reference git
+# sources. The security pin lives in the workspace root's `[patch.crates-io]`
+# (see the root Cargo.toml), which redirects this crates.io version to a
+# contributor fork for local/release builds: upstream (firecrawl/pdf-inspector)
+# still ships lopdf ^0.41.0, vulnerable to RUSTSEC-2026-0187 — a ~21 KB crafted
+# PDF with ~10,000-deep nested objects aborts the process via stack overflow,
+# a SIGABRT that `catch_unwind` CANNOT intercept. The fork bumps lopdf to 0.42.0
+# (MAX_NESTING_DEPTH), verified source-compatible with 860 green tests and a
+# clean error instead of SIGABRT on the PoC (upstream PR
+# firecrawl/pdf-inspector#198, omeileo commit f86decf).
 #
-# Re-checked 2026-08-09: crates.io pdf-inspector 0.1.7 (latest, published
-# 2026-07-31) still depends on lopdf ^0.41.0 (vulnerable to RUSTSEC-2026-0187),
-# so the fork pin remains. Once upstream merges #198/#222 and publishes with
-# lopdf >= 0.42, switch back to:
-#   pdf-inspector = "0.1"  # (or the fixed release)
-# and drop this comment.
-pdf-inspector = { git = "https://github.com/omeileo/pdf-inspector", rev = "f86decf82d72e4bc318aaf54c04f854763cbed1c" }
+# The feature is off by default: a `cargo install` from crates.io has no
+# `[patch]` available (patches are workspace-local and never published), so it
+# resolves the unpatched registry version — shipping the PDF tools unpatched
+# would re-introduce the RUSTSEC-2026-0187 crash surface. Re-checked 2026-08-09:
+# crates.io pdf-inspector 0.1.7 (latest, published 2026-07-31) still depends on
+# lopdf ^0.41.0, so the fork pin stays. Once upstream publishes with lopdf
+# >= 0.42: drop the `[patch.crates-io]` entry from the root Cargo.toml, turn
+# this back into a plain dependency, and remove the `pdf` feature gate.
+pdf-inspector = { version = "0.1", optional = true }
 
 # Desktop notifications — DBus on Linux, macOS Notification Center on macOS.
 # notify-rust auto-selects the macOS backend when target_os = "macos".
@@ -100,6 +106,12 @@ notify-rust = { version = "4.18.0", default-features = false, features = ["d"] }
 notify-rust = { version = "4.18.0", default-features = false }
 
 [features]
+# Native PDF tools (pdf_classify / pdf_to_markdown). Off by default so the
+# published manifest stays free of the git-pinned fork (crates.io rejects git
+# dependencies); release binaries are built with `--features pdf` and get the
+# fork via the workspace `[patch.crates-io]`. See the pdf-inspector comment
+# above for the security rationale and the revert path.
+pdf = ["dep:pdf-inspector"]
 # Test-only: exposes the bounded-shutdown seam (`join_session_shutdown_with_grace_for_test`)
 # used by tests/session_shutdown.rs.  Enabled for test builds via the self
 # dev-dependency below, so it never leaks into the published public API.
