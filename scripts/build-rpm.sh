@@ -12,7 +12,8 @@
 # exact layout %files expects (/usr/bin/*, /usr/lib/systemd/user/...). We then
 # point rpmbuild's --buildroot at that staging root so the spec's %files
 # section picks up the staged files verbatim. __os_install_post is disabled so
-# rpm's brp scripts don't strip/rewrite our prebuilt binaries' build-ids.
+# rpm's brp scripts don't re-process the prebuilt binaries — which are already
+# stripped by the workspace [profile.release] strip = "symbols" setting.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

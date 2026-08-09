@@ -74,6 +74,14 @@ bump checklist. The manual steps that must stay in lockstep:
 
 ## Notes
 
+- **Binaries are stripped and thin-LTO'd.** The workspace `[profile.release]`
+  sets `strip = "symbols"` and `lto = "thin"` (root `Cargo.toml`), so the
+  tarball, `.deb`, and `.rpm` all ship stripped binaries (~22% smaller) with
+  cross-crate optimization. Panic `file:line` locations survive (compiled-in
+  constants); only `RUST_BACKTRACE=1` symbolization is lost. `panic = "abort"`
+  is deliberately NOT set (the daemon catches request-worker panics with
+  `catch_unwind`). The RPM spec's `__os_install_post %{nil}` stays so brp
+  never re-processes the already-stripped binaries.
 - The `-bin` suffix in `choreographr-bin` is an Arch convention **required**
   for prebuilt packages; the plain name is reserved for a source package. A
   future source `choreographr` package with `makedepends=(zig)` is a planned

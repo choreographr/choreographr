@@ -32,6 +32,27 @@ homepage = "https://choreographr.com"
 readme = "README.md"
 description = "Agentic coding assistant — daemon, TUI, and bridges"
 
+# Release profile for shipped binaries (all four artifact types build with
+# `cargo build --release`). Two deliberate settings, one deliberate omission:
+#
+# - strip = "symbols": cuts shipped size ~22% (tarball ~10%). Panic messages
+#   keep their file:line locations (compiled-in string constants via
+#   #[track_caller]); only RUST_BACKTRACE=1 symbolization is lost, and nothing
+#   in the daemon emits backtraces. Keep .deb/.rpm/tarball uniform: the RPM
+#   path disables brp post-install processing (__os_install_post %{nil}) so
+#   rpm never re-processes these already-stripped binaries.
+# - lto = "thin": cross-crate optimization at a fraction of fat-LTO's build
+#   time. Works with the wild linker (used on this machine via
+#   -fuse-ld=wild, see ~/.cargo/config.toml) through its linker-plugin LTO
+#   support, which wild lists as functional-with-known-issues — if a future
+#   wild regression breaks linking, drop back to lto = false.
+# - NO panic = "abort": the daemon isolates request-worker panics with
+#   catch_unwind (sessions.rs) — abort would turn any single request panic
+#   into a whole-daemon crash.
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
 [workspace.dependencies]
 anyhow = "1"
 thiserror = "2"

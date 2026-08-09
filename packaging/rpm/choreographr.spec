@@ -7,8 +7,10 @@
 # packaging/choreographr.service — into a staging root, then invokes:
 #     rpmbuild -bb --buildroot <staging> --define __os_install_post <nil> \
 #       packaging/rpm/choreographr.spec
-# (the __os_install_post define disables rpm's brp post-install processing,
-# so our prebuilt binaries are not stripped/rewritten).
+# (the __os_install_post define disables rpm's brp post-install processing.
+# Our binaries are already stripped by the workspace [profile.release] strip =
+# "symbols" — see the root Cargo.toml — so brp-strip would be a no-op anyway;
+# we disable it so brp never re-processes or rewrites the prebuilt artifacts.)
 # %files below therefore lists the staged layout verbatim; there are no
 # BuildRequires, no Source tarball, and no %prep/%build/%install sections.
 #
