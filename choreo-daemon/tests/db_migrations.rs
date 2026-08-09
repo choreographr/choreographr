@@ -5,7 +5,7 @@
 //! These tests bind the system boundary (the `CHOREOGRAPHR_DB_PATH`
 //! environment variable, the filesystem, and a real redb database), so per
 //! AGENTS.md they belong in the `#[ignore]` suite:
-//! `cargo nextest run -p choreographr --run-ignored only`.
+//! `cargo nextest run -p choreo-daemon --run-ignored only`.
 
 use choreo_daemon::db;
 use redb::ReadableDatabase;

@@ -86,7 +86,10 @@ else
     exit 1
 fi
 
-BIN_DIR="${XDG_BIN_HOME:-$HOME/.local}/bin"
+# Where the binaries go. XDG_BIN_HOME (if set) is already the bin directory
+# per the XDG convention — do NOT append "/bin" to it; the default matches
+# the systemd unit's ExecStart=%h/.local/bin/choreographr.
+BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 
 if [ "$UNINSTALL" -eq 1 ]; then
     echo "==> removing binaries from $BIN_DIR" >&2
@@ -138,7 +141,15 @@ mkdir -p "$BIN_DIR"
 # shellcheck disable=SC2086 # deliberate: split the fixed, non-user BINARIES list into member names (POSIX sh has no arrays)
 tar -xzf "$TMP/$ASSET" -C "$BIN_DIR" $BINARIES
 for b in $BINARIES; do
-    chmod +x "$BIN_DIR/$b" # tar preserves modes; chmod is belt-and-braces
+    # Belt-and-braces: tar preserves modes, but never chmod through a symlink
+    # (chmod follows links — a hostile archive member could point at a user
+    # file). Refuse symlinks and non-files instead.
+    if [ -L "$BIN_DIR/$b" ] || [ ! -f "$BIN_DIR/$b" ]; then
+        echo "$0: error: extracted '$b' is not a regular file — aborting" >&2
+        rm -f "$BIN_DIR/$b"
+        exit 1
+    fi
+    chmod +x "$BIN_DIR/$b"
 done
 
 case "${OS}-${ARCH}" in

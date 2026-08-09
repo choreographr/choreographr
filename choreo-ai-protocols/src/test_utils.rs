@@ -16,7 +16,7 @@
 //!
 //! The [`MockProvider`] here is the single scripted HTTP provider used by the
 //! reasoning round-trip wire tests in both `choreo-ai-protocols/tests/` and
-//! `choreographr/tests/` — a `TcpListener` serving one canned response per
+//! `choreo-daemon/tests/` — a `TcpListener` serving one canned response per
 //! request and recording every request head/body so tests can assert on the
 //! actual wire.
 

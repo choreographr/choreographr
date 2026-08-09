@@ -1,10 +1,22 @@
 [package]
 name = "choreo-gui"
 version.workspace = true
-# Stub, not shipped — never published to crates.io.
-publish = false
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 edition = "2024"
 rust-version.workspace = true
+
+# The desktop GUI is a publishable crate so `cargo install choreo-gui` works
+# from crates.io, but it is intentionally NOT part of the prebuilt release
+# artifacts (tarball/.deb/.rpm/Homebrew/AUR ship the daemon, TUI, and bridges
+# only) — it is a stub and drags in the dioxus/webkit2gtk native-widget tree,
+# which has no place in the lean default install.
+[[bin]]
+name = "choreo-gui"
+path = "src/bin/choreo-gui.rs"
 
 [dependencies]
 base64.workspace = true

@@ -1,4 +1,3 @@
-pub mod cli;
 mod error;
 mod frame;
 mod io;

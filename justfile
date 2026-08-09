@@ -1,11 +1,11 @@
 # Choreographr — `just` task runner
 #
-# One-stop entry point for building, testing, linting, and running the
-# workspace. Bare `just` lists all recipes.
+# One-stop entry point for building, testing, linting, running, and releasing
+# the workspace. Bare `just` lists all recipes.
 #
 # Requirements:
 #   - cargo          Rust toolchain >= 1.91 (the workspace MSRV — see Cargo.toml)
-#   - zig            builds `zlob`, the glob/walker dependency of choreographr
+#   - zig            builds `zlob`, the glob/walker dependency of choreo-daemon
 #                    (install with `brew install zig` on macOS, `apt install zig`
 #                    on Debian/Ubuntu, or from ziglang.org)
 #   - cargo-nextest  optional but recommended: the primary test runner
@@ -42,7 +42,7 @@ help:
 preflight:
     @echo "==> checking toolchain"
     @command -v cargo >/dev/null 2>&1 || { echo "error: cargo not found — install Rust via rustup (https://rustup.rs/)" >&2; exit 1; }
-    @command -v zig >/dev/null 2>&1 || { echo "error: zig not found — install it (choreographr's zlob dependency needs it)" >&2; exit 1; }
+    @command -v zig >/dev/null 2>&1 || { echo "error: zig not found — install it (choreo-daemon's zlob dependency needs it)" >&2; exit 1; }
     @command -v cargo-nextest >/dev/null 2>&1 || echo "note: cargo-nextest not found (recommended — run \`just install-nextest\`)"
     @echo "==> toolchain OK: cargo $(cargo --version | cut -d' ' -f2) · zig $(zig version)"
 
@@ -55,7 +55,7 @@ install-nextest:
 # Fail fast with a hint when zig is missing. zig builds the zlob glob/walker
 # dependency of choreographr, so every compile/test recipe needs it.
 _require-zig:
-    @command -v zig >/dev/null 2>&1 || { echo "error: zig not found — run \`brew install zig\` (choreographr's zlob dependency needs it)" >&2; exit 1; }
+    @command -v zig >/dev/null 2>&1 || { echo "error: zig not found — run \`brew install zig\` (choreo-daemon's zlob dependency needs it)" >&2; exit 1; }
 
 # Fail fast with a hint when cargo-nextest is missing. The test-* recipes are
 # the README's primary runner; failing here beats cargo's cryptic "no such
@@ -158,9 +158,9 @@ daemon args="": _require-zig
 tui args="": _require-zig
     cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --bin choreo-tui -- {{ args }}
 
-# Run the desktop GUI client (root package bin, gated behind the gui feature)
+# Run the desktop GUI client (its own crate — owns its binary)
 gui args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --bin choreo-gui --features gui -- {{ args }}
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-gui -- {{ args }}
 
 # Run the instant-messaging bridge (e.g. `just im telegram`)
 im args="": _require-zig
@@ -173,6 +173,57 @@ acp args="": _require-zig
 # Run any workspace crate's binary. e.g. `just run choreographr -v`
 run crate args="": _require-zig
     cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p {{ crate }} -- {{ args }}
+
+# ── release & packaging ──────────────────────────────────────────────────────
+
+# Release version — read from the workspace manifest (the single source of
+# truth that scripts/release.sh, the Homebrew formula, and the AUR PKGBUILD
+# mirror). Evaluated when `just` loads; the release scripts re-read it.
+VERSION := `sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1`
+
+# Host release target — the same two-target set scripts/release.sh and
+# scripts/install.sh hardcode (Linux x86_64 / macOS arm64).
+TARGET := `case "$(uname -s)-$(uname -m)" in Linux-x86_64) echo x86_64-unknown-linux-gnu ;; Darwin-arm64) echo aarch64-apple-darwin ;; *) echo unsupported ;; esac`
+
+# The tarball `just release` produces — used as the default for
+# `just smoke-test` (built by concatenation: just does not recursively
+# interpolate `{{ }}` inside a variable's value, so the pieces must be
+# joined here, not nested).
+release-tarball := "dist/choreographr-" + VERSION + "-" + TARGET + ".tar.gz"
+
+# Pass extra flags through after `--`, e.g. `just release -- --upload --allow-dirty`.
+# Dry-run release: build the four shipped binaries, pack the release tarball,
+# write SHA256SUMS, build the .deb/.rpm when the tools are present — never uploads.
+release args="": _require-zig
+    ./scripts/release.sh {{ args }}
+
+# Build everything AND run `gh release create` (requires gh, a clean tree,
+# and a tag).
+# Full release: the dry run plus upload.
+release-upload: _require-zig
+    ./scripts/release.sh --upload
+
+# Release from a dirty tree (CI-style flows that stage files first).
+release-allow-dirty: _require-zig
+    ./scripts/release.sh --allow-dirty
+
+# (just parameter defaults are literal, so the fallback is an `if` expression.)
+# Smoke-test a release tarball — defaults to the one `just release` just built.
+smoke-test tarball="":
+    ./scripts/smoke-test.sh "{{ if tarball == "" { release-tarball } else { tarball } }}"
+
+# Build the fat .deb from existing target/release artifacts (Linux only)
+package-deb:
+    ./scripts/build-deb.sh
+
+# Build the fat .rpm from existing target/release artifacts (Linux only)
+package-rpm:
+    ./scripts/build-rpm.sh
+
+# Pass flags through, e.g. `just install -- --uninstall`.
+# Run the pinned-version installer locally (instead of curl|sh).
+install args="":
+    ./scripts/install.sh {{ args }}
 
 # ── docs & maintenance ────────────────────────────────────────────────────────
 

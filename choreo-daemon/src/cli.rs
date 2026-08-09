@@ -12,6 +12,26 @@ use std::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
+/// Shared clap [`Styles`] for this crate's CLI binary.
+///
+/// Each CLI crate keeps its own copy (choreo-proto is the wire protocol and
+/// must not host CLI styling); if this ever grows, promote it to a dedicated
+/// micro-crate instead of putting it in choreo-proto.
+///
+/// Uses real ANSI hues (green headers/usage, cyan literals/placeholders) rather
+/// than bold/underline only, so help output stays legible even in terminals whose
+/// bold text isn't visually distinct (e.g. themes that don't remap the bold color).
+/// `Styles::styled()` keeps clap's default error/invalid/valid coloring; the
+/// overrides colorize the help elements.
+fn clap_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{AnsiColor, Effects, Styles};
+    Styles::styled()
+        .header(AnsiColor::Green.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+}
+
 #[derive(Parser)]
 // Bare `version` wires `--version`/`-V` to CARGO_PKG_VERSION (the crate
 // version), which the Homebrew formula test, installer, and smoke tests rely on.
@@ -22,7 +42,7 @@ use tracing_subscriber::{EnvFilter, fmt};
     version,
     about = "Choreographr AI daemon",
     color = clap::ColorChoice::Auto,
-    styles = choreo_proto::cli::clap_styles()
+    styles = clap_styles()
 )]
 struct Cli {
     /// Increase logging verbosity (-v debug, -vv trace)

@@ -12,19 +12,11 @@ readme.workspace = true
 # daemon binary; the other suite binaries remain explicit targets.
 default-run = "choreographr"
 
-[features]
-# The GUI is opt-in: it drags in a heavy native-widget dependency tree, so the
-# default install (daemon + TUI + bridges) stays lean. The gui bin target is
-# gated on this feature via `required-features` below.
-default = []
-gui = ["dep:choreo-gui"]
-
 [dependencies]
 choreo-daemon = { path = "choreo-daemon", version = "0.1" }
 choreo-tui = { path = "choreo-tui", version = "0.1" }
 choreo-im = { path = "choreo-im", version = "0.1" }
 choreo-acp = { path = "choreo-acp", version = "0.1" }
-choreo-gui = { path = "choreo-gui", version = "0.1", optional = true }
 anyhow.workspace = true
 
 [[bin]]
@@ -42,11 +34,6 @@ path = "src/bin/choreo-im.rs"
 [[bin]]
 name = "choreo-acp"
 path = "src/bin/choreo-acp.rs"
-
-[[bin]]
-name = "choreo-gui"
-path = "src/bin/choreo-gui.rs"
-required-features = ["gui"]
 
 # cargo-binstall metadata: lets `cargo binstall choreographr` resolve our
 # GitHub release asset naming (`choreographr-<version>-<target>.<ext>`) from

@@ -275,8 +275,8 @@ Alternatives:
 - **cargo binstall** — installs the prebuilt tarball, no toolchain:
   `cargo binstall choreographr`
 - **cargo install** — builds from source; needs Zig at build time. Installs the
-  whole suite (daemon + TUI + IM + ACP): `cargo install choreographr` — add
-  the GUI with `cargo install choreographr --features gui`
+  whole suite (daemon + TUI + IM + ACP): `cargo install choreographr` — install
+  the desktop GUI separately with `cargo install choreo-gui`
 
 ### Linux
 
@@ -289,7 +289,7 @@ Alternatives:
 - **Any distro** — tarball + installer, or cargo:
   `curl -fsSL https://choreographr.com/install.sh | sh` ·
   `cargo binstall choreographr` (prebuilt, no toolchain) ·
-  `cargo install choreographr` (source build, needs Zig — installs the whole suite; `--features gui` adds the GUI)
+  `cargo install choreographr` (source build, needs Zig — installs the whole suite; `cargo install choreo-gui` adds the GUI)
 
 ### Running the daemon
 
@@ -340,11 +340,12 @@ cargo run --release -p choreographr -- -q   # warnings only
 RUST_LOG=debug cargo run --release -p choreographr
 ```
 
-Then a client — the suite binaries live in the root package, selected with `--bin`:
+Then a client — the suite binaries live in the root package, selected with `--bin`;
+the desktop GUI is a separate crate (`choreo-gui`):
 
 ```bash
 cargo run --release -p choreographr --bin choreo-tui                 # terminal UI
-cargo run --release -p choreographr --bin choreo-gui --features gui  # desktop app
+cargo run --release -p choreo-gui                                    # desktop app
 cargo run --release -p choreographr --bin choreo-im                  # IM bridge
 cargo run --release -p choreographr --bin choreo-acp                 # ACP bridge for editors
 ```
@@ -381,7 +382,7 @@ data model.
 
 | Crate | Description |
 |---|---|
-| `choreographr` | Workspace root — the suite installer. Declares the five binaries (`choreographr choreo-tui choreo-im choreo-acp`, plus `choreo-gui` behind `--features gui`); `cargo run -p choreographr` / `cargo install choreographr` default to the daemon binary via `default-run` |
+| `choreographr` | Workspace root — the suite installer. Declares the four binaries (`choreographr choreo-tui choreo-im choreo-acp`); `cargo run -p choreographr` / `cargo install choreographr` default to the daemon binary via `default-run` |
 | `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
 | `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (79+ providers) |
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
@@ -713,6 +714,17 @@ recipes (`test`, `test-fast`, `test-integration`, `test-all`, `test-crate`,
 Release tooling lives in [`scripts/`](./scripts) and the packaging assets it
 consumes in [`packaging/`](./packaging) — see `packaging/README.md` for the
 per-asset breakdown. The one-command flow is:
+
+```bash
+just release                # dry-run: build, tarball, SHA256SUMS, .deb/.rpm (never uploads)
+just release-upload         # also run `gh release create`
+just release-allow-dirty    # dry-run from a dirty tree (staged-but-uncommitted changes)
+just smoke-test             # validate the tarball `just release` just built
+just package-deb / package-rpm   # rebuild only the .deb / .rpm from existing artifacts
+just install                # run the pinned-version installer locally (not via curl|sh)
+```
+
+Equivalently, invoke the scripts directly:
 
 ```bash
 scripts/release.sh                 # dry-run: build, tarball, SHA256SUMS, .deb/.rpm

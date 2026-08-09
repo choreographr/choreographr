@@ -32,9 +32,9 @@ package plus twelve members:
 
 ```
 Choreographr (workspace)
-├── choreographr          Workspace root — the suite installer: declares the five
-│                       binaries (choreographr choreo-tui choreo-im choreo-acp,
-│                       plus choreo-gui behind `--features gui`)
+├── choreographr          Workspace root — the suite installer: declares the four
+│                       binaries (choreographr choreo-tui choreo-im choreo-acp;
+│                       the desktop GUI is a separate crate, choreo-gui)
 ├── choreo-proto           Wire protocol (shared types + framing)
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── choreo-transport       Noise IK encrypted TCP transport abstraction
@@ -92,10 +92,15 @@ Releases are cut **locally** — there is no CI pipeline. The orchestrator,
 [`scripts/release.sh`](../scripts/release.sh), is a dry-run by default: it
 reads the version from the root `Cargo.toml` (the single source of truth that
 the Homebrew formula, AUR PKGBUILD, and installer mirror), runs
-`cargo build --release --workspace`, packs the release tarball, writes
+`cargo build --release -p choreographr` (the four shipped binaries only —
+choreo-gui's dioxus/webkit2gtk stack is excluded from the release build),
+packs the release tarball, writes
 `SHA256SUMS`, builds the `.deb`/`.rpm` when the tools are present, and prints
 the exact upload + checklist commands. Only `--upload` runs
-`gh release create`; `--allow-dirty` skips the clean-tree guard.
+`gh release create`; `--allow-dirty` skips the clean-tree guard. The
+`just` front door wraps all of it: `just release`, `just release-upload`,
+`just release-allow-dirty`, `just smoke-test`, `just package-deb`,
+`just package-rpm`, and `just install` (see the README).
 
 ### Shipped artifacts
 
@@ -177,16 +182,18 @@ with `systemctl --user enable --now choreographr` (Linux) or
 The workspace inherits crates.io-required fields from `[workspace.package]`
 in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
 `readme`, `description`), and members opt into publishing by *not* setting
-`publish = false`. The **publish set** is therefore twelve crates:
+`publish = false`. The **publish set** is therefore all thirteen crates:
 
 `choreographr` (root), `choreo-daemon`, `choreo-tui`, `choreo-im`,
 `choreo-acp`, `choreo-proto`, `choreo-keystore`, `choreo-transport`,
-`choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`,
-`choreo-markdown`
+`choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`, `choreo-markdown`,
+`choreo-gui`
 
-`choreo-gui` is the one private member (`publish = false`): it stays
-excluded from crates.io and is only built through the root package's
-`gui` feature.
+`choreo-gui` was `publish = false` while its binary lived in the root
+package's `gui` feature; now that the crate owns its `choreo-gui` binary
+(`src/bin/`), it is publishable so `cargo install choreo-gui` works — but it
+is still NOT shipped in the prebuilt release artifacts (tarball/.deb/.rpm/
+Homebrew/AUR), which carry the daemon, TUI, and bridges only.
 
 The root package declares `[package.metadata.binstall]`, so
 `cargo binstall choreographr` resolves the GitHub release asset naming
@@ -859,7 +866,9 @@ while !app.should_quit:
 
 ### `choreo-gui` — Desktop client
 
-Entry point: `src/main.rs`
+Entry point: `src/bin/choreo-gui.rs` (thin wrapper calling `choreo_gui::main()`
+in `src/lib.rs`) — the crate owns its binary, unlike the daemon/TUI/IM/ACP
+which live in the root package.
 
 Unix socket or Noise IK encrypted TCP transport (selected via `--tcp-addr` / `--server-pk` CLI flags),
 rendered via Dioxus components. Uses hooks to spawn async reader/writer tasks inside
@@ -872,7 +881,7 @@ the Dioxus runtime.
 | `client.rs` | `run_client()` — socket split, reader/writer, daemon message dispatch |
 | `state.rs` | `AppState` with input, request tracking, `ClientHistory` |
 | `render.rs` | RSX rendering of history items: markdown → sanitized HTML, images via `data:` URLs, structured diffs via `format_diff_file` |
-| `main.rs` | Dioxus `App` component, toolbar, history pane, textarea composer, CSS |
+| `lib.rs` | clap CLI, Dioxus `App` component, toolbar, history pane, textarea composer, CSS |
 
 
 ### `choreo-im` — IM platform bridge
@@ -882,8 +891,9 @@ Entry point: `src/lib.rs` (the root package's `src/bin/choreo-im.rs` is a thin w
 Single binary (`choreo-im`) that bridges IM platforms to the daemon.
 The binary takes a single required positional platform argument via clap:
 `choreo-im telegram`. Like the rest of the suite it supports `--help` and
-`--version`, with help output styled by the shared `choreo_proto::cli::clap_styles()`
-and `ColorChoice::Auto` (color only on a TTY).
+`--version`, with help output styled by a per-crate `clap_styles()` helper
+(duplicated in each CLI crate — choreo-proto is the wire protocol and does
+not host CLI styling) and `ColorChoice::Auto` (color only on a TTY).
 
 **Credentials:** The daemon serves platform credentials via the `GetCredential` wire
 message. The admin stores credentials via `/add-key` or `/add-x` at runtime, which
@@ -2427,7 +2437,7 @@ already gone.
 |---|---|---|
 | Protocol | Framing, version handling, round-trip encode/decode | `choreo-proto/src/tests.rs` |
 | Client core | Shell parsing, markdown→HTML, image assembly, history | `choreo-client-core/src/tests.rs` |
-| Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `choreo-daemon/src/tests.rs`, `choreo-daemon/tests/integration.rs` |
+| Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `choreo-daemon/src/tests.rs`, `choreo-daemon/tests/session_integration.rs`, `choreo-daemon/tests/lifecycle_integration.rs` |
 | MCP (choreo-mcp) | Server spawn, tool discovery, echo tool call/response | `choreo-mcp/tests/mcp_integration.rs` |
 | MCP (daemon) | McpManager + ToolRegistry integration, dynamic group registration, tool execution | `choreo-daemon/tests/mcp_integration.rs` |
 | Providers (`choreo-ai-protocols`) | SSE parsing, HTTP request construction, chat completions + responses serialization, content-block deserialisation, config overrides, catalog lookups | `choreo-ai-protocols/src/openai/tests.rs`, `choreo-ai-protocols/src/openai/chat_completions.rs`, `choreo-ai-protocols/src/openai/config.rs`, `choreo-ai-protocols/src/anthropic/tests.rs`, `choreo-ai-protocols/src/google/tests.rs`, `choreo-ai-protocols/src/catalog/mod.rs` |
@@ -2497,8 +2507,8 @@ cargo run -p choreographr
 # Run terminal client
 cargo run -p choreographr --bin choreo-tui
 
-# Run desktop client (gui feature)
-cargo run -p choreographr --bin choreo-gui --features gui
+# Run desktop client (its own crate — owns its binary)
+cargo run -p choreo-gui
 
 # Run IM bridge (Telegram)
 cargo run -p choreographr --bin choreo-im -- telegram

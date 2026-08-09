@@ -64,8 +64,11 @@ esac
 # The four release binaries (must match scripts/install.sh and the formula).
 BINARIES=(choreographr choreo-tui choreo-im choreo-acp)
 
-echo "==> building release binaries (workspace)"
-cargo build --release --workspace
+echo "==> building release binaries (root package)"
+# Build only the four shipped binaries: `-p choreographr` pulls in the daemon,
+# TUI, IM, and ACP transitively but NOT choreo-gui (its dioxus/webkit2gtk stack
+# is not shipped and must not be a build requirement of the release machine).
+cargo build --release -p choreographr
 
 # Stage the tarball contents: the four binaries plus both service files, all
 # at the top level of the archive (no bin/ prefix) so install.sh and the

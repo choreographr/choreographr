@@ -87,6 +87,26 @@ pub mod terminal_progress;
 use anyhow::Context;
 use clap::Parser;
 
+/// Shared clap [`Styles`] for this crate's CLI binary.
+///
+/// Each CLI crate keeps its own copy (choreo-proto is the wire protocol and
+/// must not host CLI styling); if this ever grows, promote it to a dedicated
+/// micro-crate instead of putting it in choreo-proto.
+///
+/// Uses real ANSI hues (green headers/usage, cyan literals/placeholders) rather
+/// than bold/underline only, so help output stays legible even in terminals whose
+/// bold text isn't visually distinct (e.g. themes that don't remap the bold color).
+/// `Styles::styled()` keeps clap's default error/invalid/valid coloring; the
+/// overrides colorize the help elements.
+fn clap_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{AnsiColor, Effects, Styles};
+    Styles::styled()
+        .header(AnsiColor::Green.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+}
+
 #[derive(Parser)]
 // Bare `version` makes `--version` print the crate version (CARGO_PKG_VERSION);
 // clap handles it before the app starts, so it works headless too.
@@ -97,7 +117,7 @@ use clap::Parser;
     version,
     about = "Choreographr terminal UI",
     color = clap::ColorChoice::Auto,
-    styles = choreo_proto::cli::clap_styles()
+    styles = clap_styles()
 )]
 struct Cli {
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)

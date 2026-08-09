@@ -19,6 +19,26 @@ use std::sync::OnceLock;
 /// Global connection mode, set once at startup from CLI args.
 static CONNECTION_MODE: OnceLock<ConnectionMode> = OnceLock::new();
 
+/// Shared clap [`Styles`] for this crate's CLI binary.
+///
+/// Each CLI crate keeps its own copy (choreo-proto is the wire protocol and
+/// must not host CLI styling); if this ever grows, promote it to a dedicated
+/// micro-crate instead of putting it in choreo-proto.
+///
+/// Uses real ANSI hues (green headers/usage, cyan literals/placeholders) rather
+/// than bold/underline only, so help output stays legible even in terminals whose
+/// bold text isn't visually distinct (e.g. themes that don't remap the bold color).
+/// `Styles::styled()` keeps clap's default error/invalid/valid coloring; the
+/// overrides colorize the help elements.
+fn clap_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{AnsiColor, Effects, Styles};
+    Styles::styled()
+        .header(AnsiColor::Green.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+}
+
 #[derive(Parser)]
 // Bare `version` wires `--version`/`-V` to CARGO_PKG_VERSION, matching the
 // other suite binaries (Homebrew formula test + smoke test rely on it).
@@ -29,7 +49,7 @@ static CONNECTION_MODE: OnceLock<ConnectionMode> = OnceLock::new();
     version,
     about = "Choreographr desktop GUI",
     color = clap::ColorChoice::Auto,
-    styles = choreo_proto::cli::clap_styles()
+    styles = clap_styles()
 )]
 struct Cli {
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
@@ -43,8 +63,10 @@ struct Cli {
 
 /// Entry point for the `choreo-gui` desktop binary.
 ///
-/// The workspace root declares this crate's binary as a thin wrapper that
-/// simply calls this function, so the actual logic lives here in the lib.
+/// This crate declares its own `choreo-gui` binary target (`src/bin/`), a
+/// thin wrapper that calls this function, so `cargo install choreo-gui` /
+/// `cargo run -p choreo-gui` produce the executable directly — the GUI is not
+/// part of the root `choreographr` suite package.
 pub fn main() {
     let cli = Cli::parse();
 
