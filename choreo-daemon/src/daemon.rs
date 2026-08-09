@@ -485,9 +485,14 @@ impl DaemonState {
     }
 
     /// Send a message to all summary subscribers, removing dead ones.
+    ///
+    /// Non-blocking: a slow subscriber gets its message dropped on a full
+    /// buffer instead of stalling the daemon's single-threaded command loop.
+    /// The drop-on-full / evict-on-disconnect policy is shared with the
+    /// activity broadcast and the per-session broadcast (see `crate::broadcast`).
     fn broadcast(&mut self, msg: DaemonMessage) {
         self.summary_subscribers
-            .retain(|_id, tx| tx.send(msg.clone()).is_ok());
+            .retain(|client_id, tx| crate::broadcast::try_send_keep_on_full(tx, *client_id, &msg));
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1116,31 +1121,13 @@ impl DaemonState {
             {
                 return true;
             }
-            match tx.try_send(msg.clone()) {
-                Ok(()) => true,
-                // A momentarily-full buffer must NOT evict the subscriber.
-                // The TUI registers as an activity subscriber exactly once at
-                // startup and never re-subscribes, so evicting it here would
-                // permanently blind it to every background session: its
-                // per-session displays would stop accumulating streamed
-                // content, and switching into a streaming session would show
-                // a blank turn until the next chunk arrived over the (just
-                // attached) per-session path.  Drop the message and keep the
-                // subscriber — same policy as the per-session `broadcast()`
-                // in sessions.rs, which also drops on Full but retains the
-                // subscriber.
-                Err(mpsc::TrySendError::Full(_)) => {
-                    debug!(
-                        "broadcast_activity dropped message for subscriber {client_id}: buffer full"
-                    );
-                    true
-                }
-                // A disconnected receiver is a dead client — stop sending to it.
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    warn!("removing disconnected activity subscriber {client_id}");
-                    false
-                }
-            }
+            // Shared drop-on-full / evict-on-disconnect policy (see
+            // crate::broadcast): a momentarily-full writer buffer must NOT
+            // evict the subscriber — the TUI registers for all activity once
+            // at startup and never re-subscribes, so evicting it would
+            // permanently blind it to every background session.  Only a
+            // disconnected receiver removes the subscriber.
+            crate::broadcast::try_send_keep_on_full(tx, *client_id, &msg)
         });
     }
 
@@ -2530,6 +2517,39 @@ mod tests {
         state.broadcast(DaemonMessage::SessionDeleted { session_id: 42 });
         // Dead subscriber should be removed
         assert!(!state.summary_subscribers.contains_key(&1));
+    }
+
+    #[test]
+    fn broadcast_drops_on_full_buffer_and_keeps_subscriber() {
+        let (mut state, _rx) = make_daemon_state();
+        // Capacity-1 channel: fill it with one message so the next broadcast
+        // cannot enqueue.  The summary broadcast must drop the message (not
+        // block the daemon loop) while retaining the subscriber.
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
+        state.summary_subscribers.insert(1, tx);
+        let filler = DaemonMessage::SessionDeleted { session_id: 41 };
+        state
+            .summary_subscribers
+            .get(&1)
+            .expect("subscriber registered")
+            .send(filler.clone())
+            .expect("filler fits in capacity-1 channel");
+
+        // Buffer is full: the broadcast message is dropped, not queued, and
+        // the subscriber survives.
+        let msg = DaemonMessage::SessionDeleted { session_id: 42 };
+        state.broadcast(msg.clone());
+        assert!(
+            state.summary_subscribers.contains_key(&1),
+            "a full buffer must not evict the summary subscriber"
+        );
+        assert_eq!(rx.recv().unwrap(), filler);
+        assert!(rx.try_recv().is_err(), "message dropped while buffer full");
+
+        // Once the buffer drains, later broadcasts flow again.
+        state.broadcast(msg.clone());
+        assert_eq!(rx.recv().unwrap(), msg);
+        assert!(state.summary_subscribers.contains_key(&1));
     }
 
     #[test]

@@ -837,25 +837,11 @@ fn broadcast(
     // session individually.
     let _ = daemon_tx.send(DaemonCommand::BroadcastActivity(message.clone()));
 
-    subscribers.retain(|client_id, tx| {
-        match tx.try_send(message.clone()) {
-            Ok(()) => true,
-            Err(mpsc::TrySendError::Full(_)) => {
-                // Subscriber is too slow to keep up — drop this message.
-                // For streaming chunks this is acceptable since the final
-                // ToolCallFinished + SessionMessageAppended(ToolResult)
-                // deliver the complete content.  Other broadcast messages
-                // (status, metadata) are also not critical enough to block
-                // the session thread.
-                debug!("broadcast dropped message for subscriber {client_id}: buffer full");
-                true // keep the subscriber, it may catch up
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                warn!("removing disconnected subscriber {client_id}");
-                false
-            }
-        }
-    });
+    // Shared drop-on-full / evict-on-disconnect policy (see crate::broadcast):
+    // a slow subscriber must never stall this session thread, and a transient
+    // full buffer must never permanently evict it.
+    subscribers
+        .retain(|client_id, tx| crate::broadcast::try_send_keep_on_full(tx, *client_id, &message));
 }
 
 fn fail_request(

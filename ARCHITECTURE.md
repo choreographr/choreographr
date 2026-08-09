@@ -1829,6 +1829,17 @@ permanently blind it to every background session, so switching into a
 streaming session would show a blank turn until the next chunk arrived over
 the (just attached) per-session path instead of the accumulated content.
 
+All three subscriber fan-outs share this drop-on-full / evict-on-disconnect
+rule via the single `crate::broadcast::try_send_keep_on_full` helper: the
+all-activity broadcast (`handle_broadcast_activity`), the summary broadcast
+(`DaemonState::broadcast`), and the per-session `broadcast()` in sessions.rs.
+The helper is the only place the policy lives, so the paths cannot drift.  It
+is non-blocking by construction (`try_send`), so a slow subscriber can never
+stall the daemon's single-threaded command loop or a session thread — the
+summary broadcast previously used a blocking `send` here, which let one slow
+client freeze the whole daemon loop; aligning it with the shared policy
+removed that stall.
+
 Token bookkeeping follows the same per-session rule.  `LiveOutputTokenCount`
 (during streaming) and `SessionState` snapshots (attach / `load_tools` /
 `unload_tools` broadcasts) are routed to the display of the session they
