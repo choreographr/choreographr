@@ -1116,7 +1116,31 @@ impl DaemonState {
             {
                 return true;
             }
-            tx.try_send(msg.clone()).is_ok()
+            match tx.try_send(msg.clone()) {
+                Ok(()) => true,
+                // A momentarily-full buffer must NOT evict the subscriber.
+                // The TUI registers as an activity subscriber exactly once at
+                // startup and never re-subscribes, so evicting it here would
+                // permanently blind it to every background session: its
+                // per-session displays would stop accumulating streamed
+                // content, and switching into a streaming session would show
+                // a blank turn until the next chunk arrived over the (just
+                // attached) per-session path.  Drop the message and keep the
+                // subscriber — same policy as the per-session `broadcast()`
+                // in sessions.rs, which also drops on Full but retains the
+                // subscriber.
+                Err(mpsc::TrySendError::Full(_)) => {
+                    debug!(
+                        "broadcast_activity dropped message for subscriber {client_id}: buffer full"
+                    );
+                    true
+                }
+                // A disconnected receiver is a dead client — stop sending to it.
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    warn!("removing disconnected activity subscriber {client_id}");
+                    false
+                }
+            }
         });
     }
 
@@ -3233,6 +3257,72 @@ mod tests {
 
         // Dead subscriber should be removed
         assert!(!state.activity_subscribers.contains_key(&10));
+    }
+
+    #[test]
+    fn handle_broadcast_activity_keeps_slow_subscriber_on_full_buffer() {
+        // Regression test: a momentarily-full writer buffer must drop the
+        // message but KEEP the activity subscriber.  The TUI subscribes to
+        // all activity exactly once at startup and never re-subscribes;
+        // evicting it on a full buffer would permanently blind it to every
+        // background session, so switching into a streaming session would
+        // show a blank turn until the next chunk arrived over the per-session
+        // path instead of the accumulated content.
+        let (mut state, _rx) = make_daemon_state();
+        // A capacity-1 channel lets us fill the buffer with a single message
+        // so the next try_send fails with Full.
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
+
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx,
+        });
+
+        // Fill the subscriber's buffer so the broadcast below cannot enqueue.
+        let filler = DaemonMessage::SessionStatusChanged {
+            session_id: 1,
+            status: SessionStatus::Inactive,
+            last_modified: 0,
+        };
+        // Send the filler through the real subscriber channel by grabbing the
+        // registered sender out of the state map.
+        state
+            .activity_subscribers
+            .get(&10)
+            .expect("subscriber registered")
+            .send(filler.clone())
+            .expect("filler fits in capacity-1 channel");
+
+        // Broadcast a second message — the buffer is full, so it must be
+        // dropped, not delivered, and the subscriber must survive.
+        let broadcast = DaemonMessage::OutputChunk {
+            session_id: 7,
+            request_id: 99,
+            stream: choreo_proto::OutputStream::Answer,
+            data: b"hello".to_vec(),
+        };
+        state.handle_command(DaemonCommand::BroadcastActivity(broadcast.clone()));
+
+        // The subscriber is still registered after the dropped message.
+        assert!(
+            state.activity_subscribers.contains_key(&10),
+            "a full buffer must not evict the activity subscriber"
+        );
+
+        // The filler was delivered; the broadcast message was dropped.
+        assert_eq!(rx.recv().unwrap(), filler);
+        assert!(
+            rx.try_recv().is_err(),
+            "broadcast message should have been dropped while the buffer was full"
+        );
+
+        // Once the buffer drains, later broadcasts flow again.
+        state.handle_command(DaemonCommand::BroadcastActivity(broadcast.clone()));
+        assert_eq!(rx.recv().unwrap(), broadcast);
+        assert!(
+            state.activity_subscribers.contains_key(&10),
+            "subscriber must still be present after recovering"
+        );
     }
 
     #[test]

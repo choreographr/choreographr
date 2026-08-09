@@ -1819,6 +1819,16 @@ the next chunk arrives.  (Cold-starting clients that were never subscribed
 to the session still miss pre-attach content — the worker owns the live turn
 and only syncs back on `RequestFinished`.)
 
+The all-activity subscription is **sticky**: the daemon's activity broadcast
+(`handle_broadcast_activity`) drops messages for a subscriber whose writer
+buffer is momentarily full but never evicts the subscriber — only a
+disconnected receiver is removed.  This mirrors the per-session `broadcast()`
+policy and matters because the TUI registers for all activity exactly once at
+startup and never re-subscribes: evicting it on a full buffer would
+permanently blind it to every background session, so switching into a
+streaming session would show a blank turn until the next chunk arrived over
+the (just attached) per-session path instead of the accumulated content.
+
 Token bookkeeping follows the same per-session rule.  `LiveOutputTokenCount`
 (during streaming) and `SessionState` snapshots (attach / `load_tools` /
 `unload_tools` broadcasts) are routed to the display of the session they
