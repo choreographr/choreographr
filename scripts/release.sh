@@ -8,6 +8,9 @@
 #   scripts/release.sh                 # dry-run: artifacts + instructions
 #   scripts/release.sh --upload        # also run `gh release create`
 #   scripts/release.sh --allow-dirty   # skip the dirty-tree guard
+#
+# Requires: cargo install cargo-zigbuild (the Linux x86_64 musl tarball build
+# below cross-compiles via zig).
 set -euo pipefail
 
 usage() {
@@ -51,8 +54,10 @@ fi
 
 # Host-target detection mirrors scripts/install.sh: exactly two targets in
 # $VERSION. (Cross-compiling other targets is out of scope for this script.)
+# Linux-x86_64 maps to the static musl triple — the Linux release tarball is a
+# fully static musl build (see below); macOS stays the native host build.
 case "$(uname -s)-$(uname -m)" in
-    Linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+    Linux-x86_64) TARGET="x86_64-unknown-linux-musl" ;;
     Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
     *)
         echo "error: unsupported platform: $(uname -s) $(uname -m)" >&2
@@ -74,7 +79,34 @@ echo "==> building release binaries (root package)"
 # (crates.io rejects git deps — see the root Cargo.toml [patch.crates-io] and
 # choreo-daemon/Cargo.toml). Building from the git tree applies the workspace
 # patch, so release binaries get the RUSTSEC-2026-0187-hardened parser.
-cargo build --release -p choreographr --features pdf
+
+# ── Tarball build ────────────────────────────────────────────────────────────
+# The Linux tarball is a fully static x86_64-unknown-linux-musl cross-build.
+# A static musl build is viable because the shipped binaries link no C
+# libraries: the desktop-notify tool (notify-rust/libdbus-sys — the last C
+# dependency) was removed from the daemon, so nothing requires glibc anymore.
+# Static musl also replaces the old "build inside an old-glibc container"
+# compatibility dance: a musl binary runs on any Linux kernel regardless of
+# the host's glibc version. The `mimalloc` feature swaps in mimalloc's
+# per-thread allocator, which is markedly better than musl's default malloc
+# (see the `#[global_allocator]` blocks in src/bin/*.rs). The macOS tarball is
+# the native aarch64-apple-darwin host build (no musl, no mimalloc — Apple
+# builds keep the system allocator).
+#
+# The cross-build runs through cargo-zigbuild because cc-rs passes the full
+# Rust triple `x86_64-unknown-linux-musl` to the C compiler, and `zig cc`'s
+# target-query grammar rejects the `unknown` vendor slot
+# (`UnknownOperatingSystem`); cargo-zigbuild translates the Rust triple to
+# zig's grammar (`x86_64-linux-musl`) for both cc-rs and the linker, which is
+# the standard solution. zlob is unaffected — its build.rs already maps the
+# triple itself.
+if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
+    cargo zigbuild --release -p choreographr --target x86_64-unknown-linux-musl --features pdf,mimalloc
+    TARBALL_BIN_DIR="target/x86_64-unknown-linux-musl/release"
+else
+    cargo build --release -p choreographr --features pdf
+    TARBALL_BIN_DIR="target/release"
+fi
 
 # Stage the tarball contents: the four binaries plus both service files, all
 # at the top level of the archive (no bin/ prefix) so install.sh and the
@@ -83,26 +115,35 @@ mkdir -p dist
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 for b in "${BINARIES[@]}"; do
-    [ -x "target/release/$b" ] || {
-        echo "error: missing target/release/$b — build did not produce it" >&2
+    [ -x "$TARBALL_BIN_DIR/$b" ] || {
+        echo "error: missing $TARBALL_BIN_DIR/$b — build did not produce it" >&2
         exit 1
     }
-    install -m 0755 "target/release/$b" "$STAGE/$b"
+    install -m 0755 "$TARBALL_BIN_DIR/$b" "$STAGE/$b"
 done
 install -m 0644 packaging/choreographr.service "$STAGE/choreographr.service"
 install -m 0644 packaging/com.choreographr.daemon.plist "$STAGE/com.choreographr.daemon.plist"
 
-# NOTE: for wide glibc compatibility the tarball should be produced from a
-# build inside an old-glibc container (Debian oldstable / Ubuntu 20.04); a
-# host build on a rolling-release distro links a newer glibc than many users
-# have. A static musl build is NOT viable: libdbus-sys (notify-rust's Linux
-# DBus backend) requires the glibc-linked system libdbus.
 TARBALL="dist/choreographr-${VERSION}-${TARGET}.tar.gz"
 tar czf "$TARBALL" -C "$STAGE" \
     "${BINARIES[@]}" choreographr.service com.choreographr.daemon.plist
 
 # Checksums ship beside the tarball (install.sh verifies against this file).
 ( cd dist && sha256sum "choreographr-${VERSION}-${TARGET}.tar.gz" > SHA256SUMS )
+
+# ── .deb/.rpm build (host glibc, no mimalloc) ───────────────────────────────
+# The .deb/.rpm stay native glibc host-target builds WITHOUT the mimalloc
+# feature and WITHOUT the musl target: they target glibc distros
+# (Debian/Fedora/openSUSE), where the system allocator is competitive — static
+# musl + mimalloc is a property of the tarball (which serves general Linux AND
+# the AUR `-bin` package in one artifact), not of the distro packages. They
+# consume `target/release/` from a plain host build; the musl tarball build
+# above does NOT populate that directory, so build it here. (On macOS this
+# step is skipped — dpkg/rpmbuild are not present.)
+if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
+    echo "==> building host (glibc) release binaries for .deb/.rpm"
+    cargo build --release -p choreographr --features pdf
+fi
 
 # .deb/.rpm are best-effort: skip with a warning when the toolchain is absent
 # so a Linux-x86_64 release can still proceed without dpkg/rpmbuild installed.
@@ -138,8 +179,9 @@ echo "  - Homebrew: bump packaging/homebrew/choreographr.rb (version, urls,"
 echo "    shasum -a 256) and push to the ethernomad/homebrew-choreographr tap"
 echo "  - AUR: bump pkgver in packaging/aur/PKGBUILD + regenerate .SRCINFO"
 echo "    (makepkg --printsrcinfo > .SRCINFO)"
-echo "  - crates.io: cargo release publish (publish-set members in dependency"
-echo "    order; the native PDF tools are feature-gated and off by default on"
+echo "  - crates.io: cargo release (version bump + tag + publish of the 12"
+echo "    publish-set members in dependency order) runs BEFORE this script;"
+echo "    the native PDF tools are feature-gated and off by default on"
 echo "    crates.io — release binaries build them via --features pdf, see the"
 echo "    [patch.crates-io] section of the root Cargo.toml)"
 echo "  - choreographr.com: publish scripts/install.sh and add download"

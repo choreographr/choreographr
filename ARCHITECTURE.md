@@ -122,10 +122,16 @@ only"), and `release.sh` builds whichever of the two it is run on:
 
 | Target | Platform | Asset |
 |---|---|---|
-| `x86_64-unknown-linux-gnu` | Linux x86_64 | `choreographr-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| `x86_64-unknown-linux-musl` | Linux x86_64 | `choreographr-<version>-x86_64-unknown-linux-musl.tar.gz` |
 | `aarch64-apple-darwin` | macOS arm64 | `choreographr-<version>-aarch64-apple-darwin.tar.gz` |
 
-The tarball holds the four binaries at the **top level** (no `bin/` prefix)
+The Linux tarball is a **fully static musl build** — `release.sh` cross-builds
+it to `x86_64-unknown-linux-musl` with `--features mimalloc`, so one artifact
+runs on any Linux kernel regardless of the host's glibc version (this also
+replaces the old "build inside an old-glibc container" compatibility dance).
+The `.deb`/`.rpm` remain native glibc host-target builds without the
+`mimalloc` feature — see `scripts/release.sh`. The tarball holds the four
+binaries at the **top level** (no `bin/` prefix)
 plus both service files, exec bits preserved — `install.sh` and the Homebrew
 formula reference them directly.
 
@@ -140,6 +146,12 @@ with cross-crate optimization. Panic messages keep their `file:line` locations
 request-worker panics with `catch_unwind` (sessions.rs), which abort would
 defeat. The RPM spec keeps `__os_install_post %{nil}` so rpm's brp scripts
 never re-process the already-stripped binaries.
+
+The desktop-notify tool (`notify_send`, backed by notify-rust) was removed
+from the daemon, so the shipped binaries link no C libraries on the glibc
+targets — and the only C component on the musl tarball is the mimalloc
+allocator, enabled via `--features mimalloc` (the only shipped artifact with a
+non-system allocator).
 
 ### `packaging/` assets
 
@@ -182,18 +194,27 @@ with `systemctl --user enable --now choreographr` (Linux) or
 The workspace inherits crates.io-required fields from `[workspace.package]`
 in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
 `readme`, `description`), and members opt into publishing by *not* setting
-`publish = false`. The **publish set** is therefore all thirteen crates:
+`publish = false`. The **publish set** is therefore twelve of the thirteen
+workspace members — everything except `choreo-gui`:
 
 `choreographr` (root), `choreo-daemon`, `choreo-tui`, `choreo-im`,
 `choreo-acp`, `choreo-proto`, `choreo-keystore`, `choreo-transport`,
-`choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`, `choreo-markdown`,
-`choreo-gui`
+`choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`, `choreo-markdown`
 
-`choreo-gui` was `publish = false` while its binary lived in the root
-package's `gui` feature; now that the crate owns its `choreo-gui` binary
-(`src/bin/`), it is publishable so `cargo install choreo-gui` works — but it
-is still NOT shipped in the prebuilt release artifacts (tarball/.deb/.rpm/
-Homebrew/AUR), which carry the daemon, TUI, and bridges only.
+`choreo-gui` sets `publish = false`: it is a stub that drags in the
+dioxus/webkit2gtk native-widget tree and is not part of the shipped suite, so
+it is neither published to crates.io (`cargo install choreo-gui` does not
+exist) nor included in the prebuilt release artifacts (tarball/.deb/.rpm/
+Homebrew/AUR), which carry the daemon, TUI, and bridges only. The root
+`choreographr` package transitively depends on the other 11 publish-set
+members, so releasing the suite publishes 12 crates in dependency order.
+
+Releases are driven by **cargo-release** (`[workspace.metadata.release]` in
+the root `Cargo.toml`): it bumps versions, tags, and publishes the 12 crates
+to crates.io topologically. With `dependent-version = "fix"`, published
+manifest requirements (e.g. `choreo-tui = "0.1"`) stay in lockstep across
+minor/major bumps. The crates.io publish runs before `scripts/release.sh`
+builds the prebuilt artifacts.
 
 The root package declares `[package.metadata.binstall]`, so
 `cargo binstall choreographr` resolves the GitHub release asset naming
@@ -1328,7 +1349,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
   specific error variants (e.g. `DbError::NotFound`, `HttpError::InvalidUrl`).
 - **Tool call frame (VM → host):** `[tool_name: postcard String][args: postcard-encoded Args]`
 
-### Available tools (up to 46 total, some dependent on installed binaries)
+### Available tools (up to 45 total, some dependent on installed binaries)
 
 | Group | Tools |
 |---|---|
@@ -1346,7 +1367,6 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 | **Shell** | `exec` (direct program execution), `sh` (bash/dash/zsh — detected at startup), `nushell` (if `nu` is installed), `fish` (if `fish` is installed) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
 | **DB** | `db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count` |
-| **Desktop** | `notify_send` (desktop notifications with configurable summary, body, urgency, and icon) |
 | **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
 
 ### Tool groups
@@ -1357,7 +1377,6 @@ via `fn group() -> &'static str` on the `Tool` trait. Groups are:
 | Group | Default | Description |
 |---|---|---|
 | `core` | always on | File system, HTTP, images, PDF classification/Markdown extraction, file search, random values, and time queries |
-| `desktop` | off | Desktop notifications via notify-send |
 | `db` | off | Session-scoped key-value database |
 | `git` | on | Local Git operations |
 | `shell` | on | Shell and exec |

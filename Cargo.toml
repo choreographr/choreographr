@@ -18,6 +18,7 @@ choreo-tui = { path = "choreo-tui", version = "0.1" }
 choreo-im = { path = "choreo-im", version = "0.1" }
 choreo-acp = { path = "choreo-acp", version = "0.1" }
 anyhow.workspace = true
+mimalloc = { version = "0.1", optional = true }
 
 [features]
 # Native PDF tools (pdf_classify / pdf_to_markdown) for the shipped binaries.
@@ -27,6 +28,11 @@ anyhow.workspace = true
 # scripts/release.sh builds the release binaries with `--features pdf`, which
 # resolves the fork via the workspace patch.
 pdf = ["choreo-daemon/pdf"]
+# mimalloc — process-wide allocator, enabled ONLY by the static musl tarball
+# build in scripts/release.sh (musl's default malloc is weaker; mimalloc's
+# per-thread heaps replace it). Off by default so crates.io / `cargo install`
+# builds stay on the system allocator and need no C compiler.
+mimalloc = ["dep:mimalloc"]
 
 [[bin]]
 name = "choreographr"
@@ -85,6 +91,15 @@ repository = "https://github.com/ethernomad/choreographr"
 homepage = "https://choreographr.com"
 readme = "README.md"
 description = "Agentic coding assistant — daemon, TUI, and bridges"
+
+# cargo-release config (see the Phase 4 publish-set note in ARCHITECTURE.md).
+# `dependent-version = "fix"` keeps published manifest version requirements
+# (`choreo-tui = "0.1"` etc.) in lockstep across minor/major bumps: when a
+# dependency's version moves, dependents' requirements are bumped along with
+# it so a `cargo release` of the workspace always leaves mutually-compatible
+# manifests on crates.io.
+[workspace.metadata.release]
+dependent-version = "fix"
 
 # Release profile for shipped binaries (all four artifact types build with
 # `cargo build --release`). Two deliberate settings, one deliberate omission:

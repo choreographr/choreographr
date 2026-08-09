@@ -45,6 +45,10 @@ correctly once the user loads it, but loading is always the user's action.
 choreo-im choreo-acp` — plus both service files into
 `dist/choreographr-<version>-<target>.tar.gz`, with the binaries at the **top
 level** of the archive (no `bin/` prefix) and their exec bits preserved. The
+Linux tarball is a **fully static `x86_64-unknown-linux-musl`** build (with
+mimalloc as the allocator), so one artifact serves general Linux — including
+the AUR `choreographr-bin` package — regardless of the host's glibc version;
+the macOS tarball is the native `aarch64-apple-darwin` build. The
 tarball is published to the GitHub release
 (`https://github.com/ethernomad/choreographr/releases`) and mirrored at
 `https://choreographr.com/download/<version>/`, where a `SHA256SUMS` file sits

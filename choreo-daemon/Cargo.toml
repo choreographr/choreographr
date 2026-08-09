@@ -97,14 +97,6 @@ rmp-serde.workspace = true
 # this back into a plain dependency, and remove the `pdf` feature gate.
 pdf-inspector = { version = "0.1", optional = true }
 
-# Desktop notifications — DBus on Linux, macOS Notification Center on macOS.
-# notify-rust auto-selects the macOS backend when target_os = "macos".
-[target.'cfg(target_os = "linux")'.dependencies]
-notify-rust = { version = "4.18.0", default-features = false, features = ["d"] }
-
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-notify-rust = { version = "4.18.0", default-features = false }
-
 [features]
 # Native PDF tools (pdf_classify / pdf_to_markdown). Off by default so the
 # published manifest stays free of the git-pinned fork (crates.io rejects git

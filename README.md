@@ -275,8 +275,9 @@ Alternatives:
 - **cargo binstall** — installs the prebuilt tarball, no toolchain:
   `cargo binstall choreographr`
 - **cargo install** — builds from source; needs Zig at build time. Installs the
-  whole suite (daemon + TUI + IM + ACP): `cargo install choreographr` — install
-  the desktop GUI separately with `cargo install choreo-gui`
+  whole suite (daemon + TUI + IM + ACP — the root package owns all four
+  `[[bin]]` targets; `default-run` only affects `cargo run`):
+  `cargo install choreographr`
 
 ### Linux
 
@@ -288,8 +289,11 @@ Alternatives:
   `paru -S choreographr-bin` (or `yay -S choreographr-bin`)
 - **Any distro** — tarball + installer, or cargo:
   `curl -fsSL https://choreographr.com/install.sh | sh` ·
-  `cargo binstall choreographr` (prebuilt, no toolchain) ·
-  `cargo install choreographr` (source build, needs Zig — installs the whole suite; `cargo install choreo-gui` adds the GUI)
+  `cargo binstall choreographr` (prebuilt, no toolchain — fetches the static
+  musl tarball from GitHub Releases; on a glibc host binstall may need
+  `--target x86_64-unknown-linux-musl`, verify at release time) ·
+  `cargo install choreographr` (source build, needs Zig — installs the whole
+  suite: `choreographr`, `choreo-tui`, `choreo-im`, `choreo-acp`)
 
 ### Running the daemon
 
@@ -729,7 +733,7 @@ Equivalently, invoke the scripts directly:
 ```bash
 scripts/release.sh                 # dry-run: build, tarball, SHA256SUMS, .deb/.rpm
 scripts/release.sh --upload        # also run `gh release create` (never uploads by default)
-scripts/smoke-test.sh dist/choreographr-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+scripts/smoke-test.sh dist/choreographr-0.1.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 Prebuilt installs (no Rust toolchain needed) use `scripts/install.sh`, which

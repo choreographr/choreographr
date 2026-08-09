@@ -12,7 +12,7 @@ set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
     echo "usage: $0 <release-tarball>" >&2
-    echo "  e.g. $0 dist/choreographr-0.1.0-x86_64-unknown-linux-gnu.tar.gz" >&2
+    echo "  e.g. $0 dist/choreographr-0.1.0-x86_64-unknown-linux-musl.tar.gz" >&2
     exit 1
 fi
 TARBALL="$1"

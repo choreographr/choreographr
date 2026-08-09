@@ -182,8 +182,9 @@ run crate args="": _require-zig
 VERSION := `sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1`
 
 # Host release target — the same two-target set scripts/release.sh and
-# scripts/install.sh hardcode (Linux x86_64 / macOS arm64).
-TARGET := `case "$(uname -s)-$(uname -m)" in Linux-x86_64) echo x86_64-unknown-linux-gnu ;; Darwin-arm64) echo aarch64-apple-darwin ;; *) echo unsupported ;; esac`
+# scripts/install.sh hardcode (Linux x86_64 / macOS arm64). Linux maps to the
+# static musl triple: the release tarball is a fully static musl build.
+TARGET := `case "$(uname -s)-$(uname -m)" in Linux-x86_64) echo x86_64-unknown-linux-musl ;; Darwin-arm64) echo aarch64-apple-darwin ;; *) echo unsupported ;; esac`
 
 # The tarball `just release` produces — used as the default for
 # `just smoke-test` (built by concatenation: just does not recursively

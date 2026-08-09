@@ -64,9 +64,10 @@ struct Cli {
 /// Entry point for the `choreo-gui` desktop binary.
 ///
 /// This crate declares its own `choreo-gui` binary target (`src/bin/`), a
-/// thin wrapper that calls this function, so `cargo install choreo-gui` /
-/// `cargo run -p choreo-gui` produce the executable directly — the GUI is not
-/// part of the root `choreographr` suite package.
+/// thin wrapper that calls this function, so `cargo run -p choreo-gui` in the
+/// workspace produces the executable directly — the GUI is not part of the
+/// root `choreographr` suite package and is not published to crates.io
+/// (`publish = false`), so it is built from the workspace tree only.
 pub fn main() {
     let cli = Cli::parse();
 
