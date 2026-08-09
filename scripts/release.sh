@@ -128,9 +128,6 @@ TARBALL="dist/choreographr-${VERSION}-${TARGET}.tar.gz"
 tar czf "$TARBALL" -C "$STAGE" \
     "${BINARIES[@]}" choreographr.service com.choreographr.daemon.plist
 
-# Checksums ship beside the tarball (install.sh verifies against this file).
-( cd dist && sha256sum "choreographr-${VERSION}-${TARGET}.tar.gz" > SHA256SUMS )
-
 # ── .deb/.rpm build (host glibc, no mimalloc) ───────────────────────────────
 # The .deb/.rpm stay native glibc host-target builds WITHOUT the mimalloc
 # feature and WITHOUT the musl target: they target glibc distros
@@ -158,12 +155,29 @@ else
     echo "warning: rpmbuild not found — skipping .rpm (install with: pacman -S rpm-tools)" >&2
 fi
 
+# ── Checksums over EVERY artifact for this version ──────────────────────────
+# SHA256SUMS ships beside the tarball (install.sh verifies against this file).
+# It covers every `choreographr-${VERSION}-*` file already in dist/: this host's
+# tarball, the .deb/.rpm just built above, and any other-arch tarball an
+# operator staged into dist/ before upload (the macOS tarball copied over from
+# the MacBook — see RELEASE.md Phase 4). Regenerating here, after the .deb/.rpm
+# step and from the glob rather than the single host tarball, means a combined
+# file is produced and `--upload` never clobbers it with a single-host one.
+( cd dist && sha256sum choreographr-${VERSION}-* > SHA256SUMS )
+
 echo
 echo "==> artifacts in dist/:"
 ls -lh dist/
 
-# Assemble the artifact list the same way for printing and uploading.
-GH_ARTIFACTS=("dist/choreographr-${VERSION}-${TARGET}.tar.gz" "dist/SHA256SUMS")
+# Assemble the artifact list the same way for printing and uploading: every
+# tarball present in dist/ for this version (the host's plus any staged
+# other-arch tarballs), the checksum file, then the .deb/.rpm when built. The
+# glob always matches at least the host tarball just created, so it needs no
+# nullglob guard under `set -u`.
+GH_ARTIFACTS=("dist/SHA256SUMS")
+for tarball in dist/choreographr-${VERSION}-*.tar.gz; do
+    GH_ARTIFACTS+=("$tarball")
+done
 [ -f "dist/choreographr-${VERSION}-x86_64.deb" ] && GH_ARTIFACTS+=("dist/choreographr-${VERSION}-x86_64.deb")
 [ -f "dist/choreographr-${VERSION}-x86_64.rpm" ] && GH_ARTIFACTS+=("dist/choreographr-${VERSION}-x86_64.rpm")
 

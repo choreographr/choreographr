@@ -717,7 +717,9 @@ recipes (`test`, `test-fast`, `test-integration`, `test-all`, `test-crate`,
 
 Release tooling lives in [`scripts/`](./scripts) and the packaging assets it
 consumes in [`packaging/`](./packaging) — see `packaging/README.md` for the
-per-asset breakdown. The one-command flow is:
+per-asset breakdown. The end-to-end runbook for cutting a release (crates.io
+publish, both build machines, GitHub release, Homebrew/AUR/choreographr.com
+updates) is [`RELEASE.md`](./RELEASE.md). The one-command flow is:
 
 ```bash
 just release                # dry-run: build, tarball, SHA256SUMS, .deb/.rpm (never uploads)

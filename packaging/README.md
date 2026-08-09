@@ -1,7 +1,8 @@
 # Packaging
 
 This directory holds the packaging assets for Choreographr releases. The
-release scripts that consume them live in [`../scripts`](../scripts).
+release scripts that consume them live in [`../scripts`](../scripts), and the
+end-to-end release runbook is [`../RELEASE.md`](../RELEASE.md).
 
 All service files follow one policy, stated up front so no installer, package
 post-install hook, or release script ever gets clever:
