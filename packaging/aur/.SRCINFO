@@ -1,0 +1,11 @@
+pkgbase = choreographr-bin
+	pkgdesc = Agentic coding assistant — daemon, TUI, and bridges
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://choreographr.com
+	arch = x86_64
+	license = Apache-2.0
+	source = https://github.com/ethernomad/choreographr/releases/download/v0.1.0/choreographr-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums = <SHA256>
+
+pkgname = choreographr-bin

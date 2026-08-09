@@ -23,7 +23,7 @@ pub(crate) const OPENCODE_SESSION_ID: &str = "choreographr";
 ///
 /// Provider-level settings (endpoints, timeouts, retry, token limits,
 /// request format) live here; daemon-level settings live in
-/// `choreo-daemon`'s `config::DaemonConfig`.
+/// `choreographr`'s `config::DaemonConfig`.
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
     pub base_url: String,

@@ -1,9 +1,17 @@
 [package]
 name = "choreo-ai-protocols"
-version = "0.1.0"
+version.workspace = true
+# Kept as this crate's own description (instead of inheriting the generic
+# workspace one): it names the concrete provider protocols and the
+# ProviderClient trait, which is genuinely useful metadata on crates.io.
+# All other crates.io-required fields are inherited from the workspace.
+description = "Provider protocols for Choreographr — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the ProviderClient trait, and the provider catalog"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 edition = "2024"
 rust-version.workspace = true
-description = "Provider protocols for Choreographr — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the ProviderClient trait, and the provider catalog"
 
 [lib]
 name = "choreo_ai_protocols"
@@ -23,7 +31,7 @@ zeroize.workspace = true
 [features]
 # Test-only: exposes the shared scripted HTTP mock provider (`test_utils::
 # MockProvider`) used by the reasoning round-trip wire tests in this crate's
-# tests/ and choreo-daemon's tests/. Enabled for test builds via the self
+# tests/ and choreographr's tests/. Enabled for test builds via the self
 # dev-dependency below, so it never leaks into the published public API.
 test-utils = []
 

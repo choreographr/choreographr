@@ -1,6 +1,11 @@
 [package]
-name = "choreo-daemon"
-version = "0.1.0"
+name = "choreographr"
+version.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 edition = "2024"
 rust-version.workspace = true
 
@@ -108,7 +113,15 @@ filetime = "0.2"
 serial_test.workspace = true
 # Enable the `test-utils` feature when building tests/examples/benchmarks for
 # this package (a package may depend on itself in dev-dependencies).
-choreo-daemon = { path = ".", features = ["test-utils"] }
+choreographr = { path = ".", features = ["test-utils"] }
 # The shared scripted HTTP mock provider for the reasoning round-trip wire
 # tests lives in choreo-ai-protocols behind its `test-utils` feature.
 choreo-ai-protocols = { workspace = true, features = ["test-utils"] }
+
+# cargo-binstall metadata: lets `cargo binstall choreographr` resolve our
+# GitHub release asset naming (`choreographr-<version>-<target>.<ext>`) from
+# the package itself, instead of needing a manual `--pkg-url`. The `{ ... }`
+# tokens are binstall template variables; spaces inside them are ignored.
+[package.metadata.binstall]
+pkg-url = "https://github.com/ethernomad/choreographr/releases/download/{ version }/choreographr-{ version }-{ target }.{ archive-suffix }"
+bin-dir = ""

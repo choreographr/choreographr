@@ -13,7 +13,9 @@ use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser)]
-#[command(name = "choreographr", about = "Choreographr AI daemon")]
+// Bare `version` wires `--version`/`-V` to CARGO_PKG_VERSION (the crate
+// version), which the Homebrew formula test, installer, and smoke tests rely on.
+#[command(name = "choreographr", version, about = "Choreographr AI daemon")]
 struct Cli {
     /// Increase logging verbosity (-v debug, -vv trace)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
@@ -238,5 +240,22 @@ mod tests {
     #[test]
     fn parse_max_turns_env_rejects_empty() {
         assert!(parse_max_turns_env("").is_err());
+    }
+
+    /// `--version` is handled by clap before any real arg parsing: it exits
+    /// with a `DisplayVersion` error whose message is the version string.
+    /// Assert both so the flag stays wired to CARGO_PKG_VERSION (it breaks
+    /// silently if the derive attribute loses the bare `version` marker).
+    #[test]
+    fn version_flag_displays_package_version() {
+        // clap returns the version as a `DisplayVersion` error instead of a
+        // value; match it out by hand (Cli doesn't derive Debug, so
+        // `unwrap_err()`'s Debug bound doesn't apply).
+        let err = match Cli::try_parse_from(["choreographr", "--version"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--version should short-circuit before arg validation"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 }

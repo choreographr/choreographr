@@ -11,7 +11,9 @@ use anyhow::Context;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "choreo-tui", about = "Choreographr terminal UI")]
+// Bare `version` makes `--version` print the crate version (CARGO_PKG_VERSION);
+// clap handles it before the app starts, so it works headless too.
+#[command(name = "choreo-tui", version, about = "Choreographr terminal UI")]
 struct Cli {
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
     #[arg(long = "tcp-addr")]

@@ -7,7 +7,7 @@
 //! base URL, and curated model lists.
 //!
 //! The crate is intentionally free of daemon concerns: no metrics, no
-//! account configuration, no sessions.  The daemon (`choreo-daemon`)
+//! account configuration, no sessions.  The daemon (`choreographr`)
 //! depends on this crate and supplies those concerns at the boundary
 //! (e.g. via `ProviderOverrides` and by timing calls itself).
 //!

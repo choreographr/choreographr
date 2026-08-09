@@ -81,6 +81,102 @@ Choreographr (workspace)
 
 ---
 
+## Release & packaging
+
+Releases are cut **locally** — there is no CI pipeline. The orchestrator,
+[`scripts/release.sh`](../scripts/release.sh), is a dry-run by default: it
+reads the version from the root `Cargo.toml` (the single source of truth that
+the Homebrew formula, AUR PKGBUILD, and installer mirror), runs
+`cargo build --release --workspace`, packs the release tarball, writes
+`SHA256SUMS`, builds the `.deb`/`.rpm` when the tools are present, and prints
+the exact upload + checklist commands. Only `--upload` runs
+`gh release create`; `--allow-dirty` skips the clean-tree guard.
+
+### Shipped artifacts
+
+Exactly **four binaries** ship in every artifact (tarball, `.deb`, `.rpm`,
+Homebrew, AUR):
+
+- `choreographr` — the daemon
+- `choreo-tui` — terminal UI client
+- `choreo-im` — IM bridge
+- `choreo-acp` — ACP bridge
+
+`choreo-mcp` is a **library-only crate** (the MCP client the daemon spawns
+for tool servers) — it has no `[[bin]]` target and is never shipped as a
+binary. `choreo-gui` is a stub and is not shipped either.
+
+The shipped target set is exactly two; `release.sh` and `install.sh` hardcode
+this pair and refuse any other platform ("ships Linux x86_64 and macOS arm64
+only"), and `release.sh` builds whichever of the two it is run on:
+
+| Target | Platform | Asset |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | Linux x86_64 | `choreographr-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| `aarch64-apple-darwin` | macOS arm64 | `choreographr-<version>-aarch64-apple-darwin.tar.gz` |
+
+The tarball holds the four binaries at the **top level** (no `bin/` prefix)
+plus both service files, exec bits preserved — `install.sh` and the Homebrew
+formula reference them directly.
+
+### `packaging/` assets
+
+| Asset | Purpose |
+|---|---|
+| `choreographr.service` | systemd **user** unit (`ExecStart=%h/.local/bin/choreographr`, `Restart=on-failure`, `WantedBy=default.target`) — shipped in the tarball, `.deb`, and `.rpm`; installed to `~/.config/systemd/user/` by `install.sh` |
+| `com.choreographr.daemon.plist` | launchd agent for **non-Homebrew** macOS installs (`RunAtLoad`/`KeepAlive` true, logs to `/tmp/choreographr.log`, hardcoded `/opt/homebrew/bin/choreographr`) — shipped in the tarball; Homebrew installs use the formula's `service do` block instead |
+| `homebrew/choreographr.rb` | Homebrew formula for the `ethernomad/choreographr` tap — prebuilt-tarball variant (no build toolchain); its `service do` block backs `brew services` |
+| `aur/PKGBUILD` + `aur/.SRCINFO` | Arch `choreographr-bin` (prebuilt; empty `depends=` — static binaries) |
+| `rpm/choreographr.spec` | RPM spec for the fat package — compiles nothing: `build-rpm.sh` stages the prebuilt binaries into the build root and disables `__os_install_post` so they are not stripped/rewritten |
+
+**Policy: installed, never auto-enabled.** The daemon is a *user* service
+that needs accounts and API keys before it is useful, so no package script,
+installer, or release tool ever enables it: no `%post`/`%preun` in the RPM
+spec, no `postinst` in the `.deb`, no `systemctl enable` in `install.sh`, and
+the launchd agent is loaded only on explicit user action. The user opts in
+with `systemctl --user enable --now choreographr` (Linux) or
+`launchctl load ~/Library/LaunchAgents/com.choreographr.daemon.plist`
+(macOS).
+
+### `scripts/` tooling
+
+| Script | Role |
+|---|---|
+| `install.sh` | curl\|sh installer — downloads the pinned-version tarball, verifies its SHA-256 against the `SHA256SUMS` fetched over the same TLS channel (no trust-on-first-use, no eval), extracts only the four binaries via an explicit member list, installs the platform service file, and never auto-enables. `--uninstall` removes everything; `CHOREOGRAPHR_BASE_URL` overrides the download base for testing/mirrors only. |
+| `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing all four binaries plus the systemd user unit, from existing `target/release/` artifacts |
+| `smoke-test.sh` | Extracts a release tarball, checks the four binaries exist and are executable, asserts `choreographr --version` reports the release version, and runs `--help` on the clap clients — `choreo-im` has no clap CLI, so it gets an existence/executable check only |
+| `release.sh` | The release orchestrator — local builds only, no CI; dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard |
+
+### Distribution channels (0.1)
+
+- **Homebrew tap** — `brew tap ethernomad/choreographr && brew install choreographr` (prebuilt formula)
+- **GitHub Releases** — the tarball, `SHA256SUMS`, and the `.deb`/`.rpm` at `https://github.com/ethernomad/choreographr/releases`
+- **choreographr.com** — `https://choreographr.com/download/<version>/` mirrors the tarball and `SHA256SUMS` (this is what `install.sh` fetches); `https://choreographr.com/install.sh` serves the installer, and per-version download redirects are added at release time
+- **AUR** — `choreographr-bin`
+- **crates.io** — `cargo install choreographr` (source build, needs Zig) and `cargo binstall choreographr` (prebuilt; asset naming resolved via `[package.metadata.binstall]` below)
+
+### crates.io metadata
+
+The workspace inherits crates.io-required fields from `[workspace.package]`
+in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
+`readme`, `description`), and members opt into publishing by *not* setting
+`publish = false`. The **publish set** is therefore:
+
+`choreo-proto`, `choreo-keystore`, `choreo-transport`, `choreo-mcp`,
+`choreo-ai-protocols`, `choreographr`
+
+The six client/internal crates set `publish = false` and never reach
+crates.io: `choreo-tui`, `choreo-gui`, `choreo-im`, `choreo-acp`,
+`choreo-client-core`, `choreo-markdown`.
+
+The daemon crate additionally declares `[package.metadata.binstall]`, so
+`cargo binstall choreographr` resolves the GitHub release asset naming
+(`choreographr-<version>-<target>.<ext>`) from the package itself instead of
+requiring a manual `--pkg-url`; `bin-dir = ""` matches the tarball's
+binaries-at-top-level layout.
+
+---
+
 ## Crate details
 
 ### `choreo-proto` — Wire protocol
@@ -247,7 +343,7 @@ implementations (`openai`, `anthropic`, `google`), the `ProviderClient` trait
 and shared turn/error/message types they all use, the retry machinery, and
 the static provider catalog.  It is free of daemon concerns — no metrics, no
 account configuration, no sessions — so it can be consumed independently of
-`choreo-daemon` (the daemon supplies those concerns at the boundary, e.g. via
+`choreographr` (the daemon supplies those concerns at the boundary, e.g. via
 [`ProviderOverrides`] and by timing calls itself).
 
 | Module | Purpose |
@@ -394,7 +490,7 @@ Each client implementation maps the `&str` effort slug to its wire format:
 - **Google**: `thinkingConfig` with `includeThoughts: true` (slug ≠ `"off"` enables thinking)
 - **Mistral**: `reasoning_effort` field (`"off"` omits the field, otherwise slug → `"low"`/`"medium"`/`"high"`)
 
-**2. `InferenceProvider` struct (`choreo-daemon/src/providers/mod.rs`):**
+**2. `InferenceProvider` struct (`choreographr/src/providers/mod.rs`):**
 ```rust
 pub struct InferenceProvider {
     client: Arc<dyn ProviderClient>,
@@ -464,7 +560,7 @@ Reasoning text is not only *displayed* — for several providers it must also be
 
 **Capture** happens inside each adapter before the display field is consumed: OpenAI chat wraps the raw reasoning string — from whichever chat field the provider populated (`reasoning_content`, `reasoning`, or `reasoning_text`, with that precedence) — into `ChatReasoning { field, bytes }`, tagging the artifact with the field it came from; Anthropic serializes the ordered thinking / redacted_thinking blocks (signatures + redacted data intact, order preserved) into `AnthropicThinking`; Google collects the `thoughtSignature` values (the `thought: true` marker may carry a signature on **any** part type — the wire-format fix; there is no separate `thinking` key) into `GoogleSignatures`; Responses collects the raw reasoning output items verbatim — type tag, id, summary, `encrypted_content` in stateless mode, and any unknown fields (e.g. a newer `content` shape), preserved exactly as returned — into `ResponsesItems`. The artifact rides out of the provider crate on `ChatAssistantToolUse`/`FinalTextResult.reasoning_artifact` and is stored on the `Turn` by the agent loop via `SessionState::set_assistant_response` — which now takes an `AssistantResponse` struct bundling text, reasoning, tool calls, usage, and the artifact + producer pair — alongside `Turn.reasoning_producer` (provider slug + model).
 
-**Carry** is a pure store-and-forward: the daemon never reads the payload bytes. It also strips the artifact (and its producer) from every client-bound `DaemonMessage` payload — `TurnAppended`, `TurnFinalized`, `SessionState`, and `TurnsRedone` carry client copies with `reasoning_artifact`/`reasoning_producer` set to `None` (see `turn_for_client` in `choreo-daemon/src/sessions.rs`), so the bytes never leave the daemon process; only the request builder consumes them, from the authoritative `Turn` in `SessionState` and the DB. The builder's only job is the *whether*: an artifact is attached to an assistant message only when (1) **same-model provenance** holds — `turn.reasoning_producer == {current provider_slug, current model}` — so a turn produced by a different model (mid-session `/model` switch) never replays its possibly-encrypted payload, and (2) the resolved `ReasoningPassback` policy says to:
+**Carry** is a pure store-and-forward: the daemon never reads the payload bytes. It also strips the artifact (and its producer) from every client-bound `DaemonMessage` payload — `TurnAppended`, `TurnFinalized`, `SessionState`, and `TurnsRedone` carry client copies with `reasoning_artifact`/`reasoning_producer` set to `None` (see `turn_for_client` in `choreographr/src/sessions.rs`), so the bytes never leave the daemon process; only the request builder consumes them, from the authoritative `Turn` in `SessionState` and the DB. The builder's only job is the *whether*: an artifact is attached to an assistant message only when (1) **same-model provenance** holds — `turn.reasoning_producer == {current provider_slug, current model}` — so a turn produced by a different model (mid-session `/model` switch) never replays its possibly-encrypted payload, and (2) the resolved `ReasoningPassback` policy says to:
 
 | `reasoning_passback` | Meaning | Wire behavior |
 |---|---|---|
@@ -1116,7 +1212,7 @@ parser built on `lopdf`. The parser has no JavaScript engine, never renders page
 never executes embedded files or `/Launch` actions, so the classic PDF malware
 *execution* vectors are excluded by construction.
 
-> **Dependency pin — security.** `choreo-daemon` depends on `pdf-inspector` by **SHA**
+> **Dependency pin — security.** `choreographr` depends on `pdf-inspector` by **SHA**
 > (`omeileo/pdf-inspector@f86decf`, upstream PR firecrawl/pdf-inspector#198) rather than
 > a crates.io release, because upstream still ships `lopdf ^0.41.0` which is vulnerable to
 > RUSTSEC-2026-0187: a ~21 KB crafted PDF with ~10,000-deep nested objects aborts the
@@ -1125,7 +1221,7 @@ never executes embedded files or `/Launch` actions, so the classic PDF malware
 > the PR author (860 tests green; the PoC now yields `Type: SCANNED` and exit 0 instead of
 > SIGABRT). The regression guard is `nested_array_poc_does_not_abort_process` in
 > `tests/pdf_tool_integration.rs`. Revert to a crates.io release once upstream merges and
-> publishes the fix (see the comment in `choreo-daemon/Cargo.toml`).
+> publishes the fix (see the comment in `choreographr/Cargo.toml`).
 
 - **`pdf_classify`** runs `pdf_inspector::detect_pdf_mem` (DetectOnly mode, ~10–50ms) and
   reports `pdf_type` (text_based / scanned / image_based / mixed), `confidence`,
@@ -2351,7 +2447,7 @@ declared via `rust-version` in every crate manifest (inherited from
 `[workspace.package]` in the root `Cargo.toml`). Keep code and dependencies
 within this floor; the CI MSRV job enforces it.
 
-The `choreo-daemon` crate depends on `zlob` (a Zig-implemented glob and
+The `choreographr` crate depends on `zlob` (a Zig-implemented glob and
 gitignore-aware directory walker used by `grep`, `find`, `delete_files`, and
 pathspec matching). Building it therefore requires the **Zig toolchain** on
 `PATH` (or the `ZIG` environment variable pointing at the `zig` binary).

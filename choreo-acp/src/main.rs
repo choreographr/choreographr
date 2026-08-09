@@ -6,7 +6,9 @@ use clap::Parser;
 use tracing_subscriber::prelude::*;
 
 #[derive(Parser)]
-#[command(name = "choreo-acp", about = "ACP bridge for Choreographr")]
+// Bare `version` makes `--version` print the crate version (CARGO_PKG_VERSION);
+// clap handles it before the app starts, so it works headless too.
+#[command(name = "choreo-acp", version, about = "ACP bridge for Choreographr")]
 struct Cli {
     /// Path to the Choreographr Unix socket.
     #[arg(long = "socket-path", default_value_t = choreo_proto::socket_path())]

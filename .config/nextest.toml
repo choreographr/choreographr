@@ -14,7 +14,7 @@ fail-fast = false
 # failure. (The intermediate "slow" marking is just reporter signal — the kill
 # happens at the full budget.) This is the CI-level guard against hung tests —
 # it replaces ad-hoc watchdog threads in integration tests (e.g. the 120s abort
-# thread in choreo-daemon/tests/mcp_integration.rs) while leaving the
+# thread in choreographr/tests/mcp_integration.rs) while leaving the
 # libtest-only `cargo test -- --ignored` path with its own in-test watchdog.
 # Healthy tests finish in well under a minute; anything slower is a regression.
 slow-timeout = { period = "60s", terminate-after = 2 }

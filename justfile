@@ -5,7 +5,7 @@
 #
 # Requirements:
 #   - cargo          Rust toolchain >= 1.91 (the workspace MSRV — see Cargo.toml)
-#   - zig            builds `zlob`, the glob/walker dependency of choreo-daemon
+#   - zig            builds `zlob`, the glob/walker dependency of choreographr
 #                    (install with `brew install zig` on macOS, `apt install zig`
 #                    on Debian/Ubuntu, or from ziglang.org)
 #   - cargo-nextest  optional but recommended: the primary test runner
@@ -42,7 +42,7 @@ help:
 preflight:
     @echo "==> checking toolchain"
     @command -v cargo >/dev/null 2>&1 || { echo "error: cargo not found — install Rust via rustup (https://rustup.rs/)" >&2; exit 1; }
-    @command -v zig >/dev/null 2>&1 || { echo "error: zig not found — install it (choreo-daemon's zlob dependency needs it)" >&2; exit 1; }
+    @command -v zig >/dev/null 2>&1 || { echo "error: zig not found — install it (choreographr's zlob dependency needs it)" >&2; exit 1; }
     @command -v cargo-nextest >/dev/null 2>&1 || echo "note: cargo-nextest not found (recommended — run \`just install-nextest\`)"
     @echo "==> toolchain OK: cargo $(cargo --version | cut -d' ' -f2) · zig $(zig version)"
 
@@ -53,9 +53,9 @@ install-nextest:
 # ── hidden prerequisites ──────────────────────────────────────────────────────
 
 # Fail fast with a hint when zig is missing. zig builds the zlob glob/walker
-# dependency of choreo-daemon, so every compile/test recipe needs it.
+# dependency of choreographr, so every compile/test recipe needs it.
 _require-zig:
-    @command -v zig >/dev/null 2>&1 || { echo "error: zig not found — run \`brew install zig\` (choreo-daemon's zlob dependency needs it)" >&2; exit 1; }
+    @command -v zig >/dev/null 2>&1 || { echo "error: zig not found — run \`brew install zig\` (choreographr's zlob dependency needs it)" >&2; exit 1; }
 
 # Fail fast with a hint when cargo-nextest is missing. The test-* recipes are
 # the README's primary runner; failing here beats cargo's cryptic "no such
@@ -152,7 +152,7 @@ ci: fmt-check clippy-strict test-all
 # just daemon "-v -q"       # multiple flags
 # Run the daemon (`choreographr`) — args pass through after `--`
 daemon args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-daemon -- {{ args }}
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr -- {{ args }}
 
 # Run the terminal UI client
 tui args="": _require-zig
@@ -170,7 +170,7 @@ im args="": _require-zig
 acp args="": _require-zig
     cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-acp -- {{ args }}
 
-# Run any workspace crate's binary. e.g. `just run choreo-daemon -v`
+# Run any workspace crate's binary. e.g. `just run choreographr -v`
 run crate args="": _require-zig
     cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p {{ crate }} -- {{ args }}
 

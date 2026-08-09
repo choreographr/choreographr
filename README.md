@@ -39,7 +39,7 @@ Other clients being developed:
 - **`choreo-gui`** — GUI built with [Dioxus](https://dioxuslabs.com/) - just a placeholder for now, it will support Linux, macOS, Windows, Android and iOS.
 - **`choreo-im`** — instant-messaging bridge (Telegram, more platforms coming) - chat with your agent on the go!
 - **`choreo-acp`** — ACP bridge so ACP-compatible editors (Claude Code, Cline, …) can drive Choreographr sessions over JSON-RPC.
-- **`choreo-daemon`** — Choreographr servers will be able to connect to other servers to deploy work elsewhere.
+- **`choreographr`** — Choreographr servers will be able to connect to other servers to deploy work elsewhere.
 
 ### RISC-V Virtual Machine
 
@@ -240,9 +240,83 @@ parallel and can be interacted with independently. How the other agents compare:
   a coordinator, and parallel tool batches are judge-approved before execution.
 
 
-## Quick start
+## Install
 
-Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.91** — and a [Zig toolchain](https://ziglang.org/) (`brew install zig`), which `choreo-daemon` needs to compile the `zlob` glob/walker dependency.
+Prebuilt releases ship exactly four binaries — `choreographr choreo-tui
+choreo-im choreo-acp` (`choreo-mcp` is a library-only crate and ships no
+binary) — for **x86_64 Linux** and **macOS (Apple Silicon)**. All installs
+below use prebuilt binaries; no Rust or Zig toolchain is required.
+
+### macOS
+
+**Homebrew (recommended).** The `ethernomad/choreographr` tap provides a
+prebuilt formula — no toolchain needed:
+
+```bash
+brew tap ethernomad/choreographr
+brew install choreographr
+brew services start choreographr
+```
+
+`brew services` registers a **launchd agent**, so the daemon starts at login
+and is kept alive — but only because you asked; nothing is ever auto-enabled.
+
+Alternatives:
+
+- **GitHub Releases tarball** — download
+  `choreographr-0.1.0-aarch64-apple-darwin.tar.gz` from the
+  [releases page](https://github.com/ethernomad/choreographr/releases) and
+  put the four binaries on your `PATH`. The binaries are unsigned, so
+  Gatekeeper quarantines them: clear the attribute with
+  `xattr -dr com.apple.quarantine /path/to/choreographr`, or right-click →
+  Open once.
+- **curl installer** — pinned version, SHA-256 verified:
+  `curl -fsSL https://choreographr.com/install.sh | sh`
+- **cargo binstall** — installs the prebuilt tarball, no toolchain:
+  `cargo binstall choreographr`
+- **cargo install** — builds from source; needs Zig at build time:
+  `cargo install choreographr`
+
+### Linux
+
+- **Debian / Ubuntu** — install the `.deb` from the release:
+  `sudo apt install ./choreographr-0.1.0-x86_64.deb`
+- **Fedora / RHEL / openSUSE** — install the `.rpm` from the release:
+  `sudo dnf install ./choreographr-0.1.0-x86_64.rpm`
+- **Arch Linux (AUR)** — the prebuilt `choreographr-bin` package:
+  `paru -S choreographr-bin` (or `yay -S choreographr-bin`)
+- **Any distro** — tarball + installer, or cargo:
+  `curl -fsSL https://choreographr.com/install.sh | sh` ·
+  `cargo binstall choreographr` (prebuilt, no toolchain) ·
+  `cargo install choreographr` (source build, needs Zig)
+
+### Running the daemon
+
+In 0.1 the daemon is a user service that **you** start — installers place
+the service file but never enable it. One of:
+
+```bash
+systemctl --user enable --now choreographr       # Linux: unit ships with the .deb/.rpm and the tarball
+brew services start choreographr                 # macOS: Homebrew launchd agent
+launchctl load ~/Library/LaunchAgents/com.choreographr.daemon.plist   # macOS: non-Homebrew (curl installer)
+choreographr                                     # ...or just run it in a terminal
+```
+
+The non-Homebrew launchd plist expects `/opt/homebrew/bin/choreographr` —
+edit its `ProgramArguments` if your binaries live elsewhere. Once the daemon
+is up, attach a client (`choreo-tui`, `choreo-im`, `choreo-acp`) and follow
+[First conversation](#first-conversation) below. The daemon listens on the
+Unix socket `/tmp/Choreographr.sock` and stores its data under
+`~/.local/share/choreographr/` (see [Configuration](#configuration)).
+
+> **Zig?** Only source builds need it. Homebrew, the `.deb`/`.rpm`, the AUR
+> `-bin` package, the tarball, and `cargo binstall` all use prebuilt
+> binaries — `cargo install` and the [Build from source](#build-from-source)
+> path need the Zig toolchain.
+
+## Build from source
+
+Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.91** — and a [Zig toolchain](https://ziglang.org/) (`brew install zig`), which `choreographr` needs to compile the `zlob` glob/walker dependency.
 
 ```bash
 rustup install stable
@@ -253,16 +327,16 @@ cargo build --release
 Start the daemon:
 
 ```bash
-cargo run --release -p choreo-daemon         # default log level: info
-cargo run --release -p choreo-daemon -- -v   # debug
-cargo run --release -p choreo-daemon -- -vv  # trace
-cargo run --release -p choreo-daemon -- -q   # warnings only
+cargo run --release -p choreographr         # default log level: info
+cargo run --release -p choreographr -- -v   # debug
+cargo run --release -p choreographr -- -vv  # trace
+cargo run --release -p choreographr -- -q   # warnings only
 ```
 
 `RUST_LOG` takes precedence over the CLI flags:
 
 ```bash
-RUST_LOG=debug cargo run --release -p choreo-daemon
+RUST_LOG=debug cargo run --release -p choreographr
 ```
 
 Then a client:
@@ -306,7 +380,7 @@ data model.
 
 | Crate | Description |
 |---|---|
-| `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
+| `choreographr` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
 | `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (79+ providers) |
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
 | `choreo-keystore` | X25519 keypair + ECDH/AES-256-GCM crypto library for encrypted credentials |
@@ -549,7 +623,7 @@ stored credential blobs into memory.
 The daemon can expose an OpenMetrics (Prometheus) endpoint:
 
 ```bash
-cargo run --release -p choreo-daemon -- --metrics-addr 127.0.0.1:9464
+cargo run --release -p choreographr -- --metrics-addr 127.0.0.1:9464
 ```
 
 When `--metrics-addr` is provided, a dedicated HTTP thread serves `GET /metrics`
@@ -603,8 +677,9 @@ to them is rejected by cargo (conflicting flags) — run
 A [`justfile`](./justfile) wraps the common workflows above (and the daemon run
 commands) in one place — `just` lists every recipe, and `just help` explains the
 prerequisites. Install `just` with `cargo install just` (or `brew install just`
-on macOS); the recipes require the same toolchain as the README quick start
-(cargo ≥ 1.91 + zig), and nextest only where noted:
+on macOS); the recipes require the same toolchain as the
+[Build from source](#build-from-source) section (cargo ≥ 1.91 + zig), and
+nextest only where noted:
 
 ```bash
 just preflight            # verify cargo + zig (+ optional nextest) are present
@@ -630,6 +705,26 @@ just tui / gui / im / acp # run the other clients (im takes e.g. `just im telegr
 `CARGO_FLAGS` (env) appends flags to every cargo invocation. The nextest-backed
 recipes (`test`, `test-fast`, `test-integration`, `test-all`, `test-crate`,
 `shard`, `retry`) fail with an install hint until `cargo-nextest` is on `PATH`.
+
+## Packaging & releases
+
+Release tooling lives in [`scripts/`](./scripts) and the packaging assets it
+consumes in [`packaging/`](./packaging) — see `packaging/README.md` for the
+per-asset breakdown. The one-command flow is:
+
+```bash
+scripts/release.sh                 # dry-run: build, tarball, SHA256SUMS, .deb/.rpm
+scripts/release.sh --upload        # also run `gh release create` (never uploads by default)
+scripts/smoke-test.sh dist/choreographr-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+```
+
+Prebuilt installs (no Rust toolchain needed) use `scripts/install.sh`, which
+pins the version and verifies a SHA-256 checksum before extracting the four
+binaries (`choreographr choreo-tui choreo-im choreo-acp` — `choreo-mcp` is a
+library-only crate and ships no binary). The systemd unit / launchd agent is
+installed but **never auto-enabled** — the daemon is a user service and
+starting it is an explicit choice (`systemctl --user enable --now
+choreographr`).
 
 ## Troubleshooting
 

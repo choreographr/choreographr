@@ -1,6 +1,8 @@
 [package]
 name = "choreo-gui"
-version = "0.1.0"
+version.workspace = true
+# Stub, not shipped — never published to crates.io.
+publish = false
 edition = "2024"
 rust-version.workspace = true
 

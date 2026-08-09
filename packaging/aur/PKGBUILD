@@ -1,0 +1,35 @@
+# Maintainer: Choreographr Maintainers <maintainers@choreographr.com>
+#
+# choreographr-bin — PREBUILT package. The -bin suffix is an Arch convention
+# that is REQUIRED for packages installing prebuilt binaries rather than
+# building from source; the plain name (choreographr) is reserved for a source
+# package. A future source package could build from the release source tarball
+# with `makedepends=(zig)` (the workspace needs zig for the zlob dependency)
+# — left as a future option for now.
+#
+# Bump procedure: bump pkgver, reset pkgrel to 1, update the source URL and
+# sha256sums (from scripts/release.sh's dist/SHA256SUMS), then regenerate
+# packaging/aur/.SRCINFO with: makepkg --printsrcinfo > .SRCINFO
+
+pkgname=choreographr-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Agentic coding assistant — daemon, TUI, and bridges"
+arch=('x86_64')
+url="https://choreographr.com"
+license=('Apache-2.0')
+# Empty depends: the release binaries are static — no runtime dependencies.
+depends=()
+source=("https://github.com/ethernomad/choreographr/releases/download/v0.1.0/choreographr-0.1.0-x86_64-unknown-linux-gnu.tar.gz")
+sha256sums=('<SHA256>')
+
+package() {
+    # Release tarball layout: the four binaries at the top level, exec bits
+    # preserved (see scripts/release.sh). choreo-mcp is a library-only crate
+    # (no binary) and is not in the tarball.
+    cd "$srcdir"
+    install -Dm755 choreographr "$pkgdir/usr/bin/choreographr"
+    install -Dm755 choreo-tui      "$pkgdir/usr/bin/choreo-tui"
+    install -Dm755 choreo-im       "$pkgdir/usr/bin/choreo-im"
+    install -Dm755 choreo-acp      "$pkgdir/usr/bin/choreo-acp"
+}

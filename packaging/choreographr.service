@@ -1,0 +1,17 @@
+# Choreographr systemd USER unit.
+#
+# Policy: installed, never auto-enabled. Installers place this file in
+# ~/.config/systemd/user/ but must NOT enable it — starting the daemon is an
+# explicit user choice (it needs accounts/keys configured first). The user
+# opts in with: systemctl --user enable --now choreographr
+[Unit]
+Description=Choreographr daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/choreographr
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -2,7 +2,7 @@
 //!
 //! This module is compiled only when the `test-utils` feature is enabled,
 //! which happens exclusively for test builds: this crate's own integration
-//! tests enable it via the self dev-dependency, and `choreo-daemon`'s
+//! tests enable it via the self dev-dependency, and `choreographr`'s
 //! integration tests enable it on their dev-dependency. It therefore never
 //! leaks into the published public API.
 //!
@@ -16,7 +16,7 @@
 //!
 //! The [`MockProvider`] here is the single scripted HTTP provider used by the
 //! reasoning round-trip wire tests in both `choreo-ai-protocols/tests/` and
-//! `choreo-daemon/tests/` — a `TcpListener` serving one canned response per
+//! `choreographr/tests/` — a `TcpListener` serving one canned response per
 //! request and recording every request head/body so tests can assert on the
 //! actual wire.
 
