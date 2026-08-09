@@ -1,6 +1,0 @@
-name = "lmstudio"
-display_name = "LM Studio"
-kind = "openai"
-base_url = "${LMSTUDIO_HOST}/v1/chat/completions"
-api_key_env = "LMSTUDIO_API_KEY"
-
