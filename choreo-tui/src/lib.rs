@@ -90,7 +90,15 @@ use clap::Parser;
 #[derive(Parser)]
 // Bare `version` makes `--version` print the crate version (CARGO_PKG_VERSION);
 // clap handles it before the app starts, so it works headless too.
-#[command(name = "choreo-tui", version, about = "Choreographr terminal UI")]
+// `color` is explicitly `Auto` (clap's default) to document the intent that
+// help/error output is colored only when stdout/stderr is a TTY.
+#[command(
+    name = "choreo-tui",
+    version,
+    about = "Choreographr terminal UI",
+    color = clap::ColorChoice::Auto,
+    styles = choreo_proto::cli::clap_styles()
+)]
 struct Cli {
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
     #[arg(long = "tcp-addr")]
@@ -127,6 +135,28 @@ pub fn main() -> anyhow::Result<()> {
 
     connection::run_app(mode)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    /// `--version` is handled by clap before any real arg parsing: it exits
+    /// with a `DisplayVersion` error whose message is the version string.
+    /// Assert both so the flag stays wired to CARGO_PKG_VERSION (it breaks
+    /// silently if the derive attribute loses the bare `version` marker).
+    #[test]
+    fn version_flag_displays_package_version() {
+        // clap returns the version as a `DisplayVersion` error instead of a
+        // value; match it out by hand (Cli doesn't derive Debug, so
+        // `unwrap_err()`'s Debug bound doesn't apply).
+        let err = match Cli::try_parse_from(["choreo-tui", "--version"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--version should short-circuit before arg validation"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
 }
 
 #[cfg(test)]

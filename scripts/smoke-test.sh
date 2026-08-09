@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 # smoke-test.sh — smoke test for a release tarball produced by
 # scripts/release.sh. Extracts the tarball, checks the four binaries are
-# present and executable, verifies `choreographr --version` reports the
-# release version, and confirms the clap clients' --help exits 0.
+# present and executable, verifies each binary's `--version` reports the
+# release version, and confirms each binary's `--help` exits 0.
 #
-# Why the timeout guard: the TUI/ACP clients cannot run fully headless (they
-# try to connect to the daemon), but --help must never hang or crash.
-# timeout(1) converts a hang into a 124 failure instead of wedging the test.
-#
-# choreo-im special case: it has NO clap CLI — it does not support --help or
-# --version (pre-existing behavior; it requires a running daemon). We only
-# assert that the binary exists and is executable, and never run it here.
+# Why the timeout guard: the TUI/ACP/IM clients cannot run fully headless
+# (they try to connect to the daemon), but --help/--version must never hang
+# or crash. timeout(1) converts a hang into a 124 failure instead of wedging
+# the test.
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
@@ -54,25 +51,26 @@ for b in "${BINARIES[@]}"; do
     fi
 done
 
-echo "==> choreographr --version (expect $VERSION)"
-VER_OUT="$(run_guarded "$TMP/choreographr" --version 2>&1)" || {
-    echo "  FAIL: choreographr --version exited non-zero" >&2
-    FAIL=1
-}
-case "$VER_OUT" in
-    *"$VERSION"*) echo "  ok: reports $VERSION" ;;
-    *)
-        echo "  FAIL: --version output did not contain $VERSION: $(printf '%s' "$VER_OUT" | head -c 200)" >&2
+echo "==> --version must report $VERSION (all four binaries)"
+for b in "${BINARIES[@]}"; do
+    VER_OUT="$(run_guarded "$TMP/$b" --version 2>&1)" || {
+        echo "  FAIL: $b --version exited non-zero" >&2
         FAIL=1
-        ;;
-esac
+        continue
+    }
+    case "$VER_OUT" in
+        *"$VERSION"*) echo "  ok: $b --version reports $VERSION" ;;
+        *)
+            echo "  FAIL: $b --version output did not contain $VERSION: $(printf '%s' "$VER_OUT" | head -c 200)" >&2
+            FAIL=1
+            ;;
+    esac
+done
 
-# choreo-im: its existence/executable check above is the complete assertion —
-# it has no clap CLI, so a --help/--version run would just hang waiting for
-# the daemon it requires. Only the clap clients get a --help run (exit 0).
-echo "  note: choreo-im has no clap CLI — existence/executable check only"
-echo "==> clap clients: --help must exit 0 without hanging"
-for b in choreo-tui choreo-acp; do
+# All four binaries are clap clients, so --help is safe on every one of
+# them: clap handles it before any daemon connection attempt.
+echo "==> --help must exit 0 without hanging (all four binaries)"
+for b in "${BINARIES[@]}"; do
     if run_guarded "$TMP/$b" --help >/dev/null 2>&1; then
         echo "  ok: $b --help"
     else

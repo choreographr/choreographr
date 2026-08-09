@@ -161,7 +161,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 |---|---|
 | `install.sh` | curl\|sh installer — downloads the pinned-version tarball, verifies its SHA-256 against the `SHA256SUMS` fetched over the same TLS channel (no trust-on-first-use, no eval), extracts only the four binaries via an explicit member list, installs the platform service file, and never auto-enables. `--uninstall` removes everything; `CHOREOGRAPHR_BASE_URL` overrides the download base for testing/mirrors only. |
 | `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing all four binaries plus the systemd user unit, from existing `target/release/` artifacts |
-| `smoke-test.sh` | Extracts a release tarball, checks the four binaries exist and are executable, asserts `choreographr --version` reports the release version, and runs `--help` on the clap clients — `choreo-im` has no clap CLI, so it gets an existence/executable check only |
+| `smoke-test.sh` | Extracts a release tarball, checks the four binaries exist and are executable, asserts each binary's `--version` reports the release version, and runs `--help` on all four clap clients |
 | `release.sh` | The release orchestrator — local builds only, no CI; dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard |
 
 ### Distribution channels (0.1)
@@ -877,10 +877,13 @@ the Dioxus runtime.
 
 ### `choreo-im` — IM platform bridge
 
-Entry point: `src/main.rs`
+Entry point: `src/lib.rs` (the root package's `src/bin/choreo-im.rs` is a thin wrapper calling `choreo_im::main()`)
 
 Single binary (`choreo-im`) that bridges IM platforms to the daemon.
-The binary accepts a platform subcommand: `choreo-im telegram`.
+The binary takes a single required positional platform argument via clap:
+`choreo-im telegram`. Like the rest of the suite it supports `--help` and
+`--version`, with help output styled by the shared `choreo_proto::cli::clap_styles()`
+and `ColorChoice::Auto` (color only on a TTY).
 
 **Credentials:** The daemon serves platform credentials via the `GetCredential` wire
 message. The admin stores credentials via `/add-key` or `/add-x` at runtime, which
@@ -891,7 +894,7 @@ all stored credentials into memory using its private key.
 
 | Module | Purpose |
 |---|---|
-| `main.rs` | CLI entry, daemon handshake (Unlock, GetCredential), platform dispatch |
+| `lib.rs` | CLI entry (clap), daemon handshake (Unlock, GetCredential), platform dispatch |
 | `bridge.rs` | `DaemonBridge` — Unix socket read/write tasks, text buffering, image assembly, `BridgeEvent` enum |
 | `telegram.rs` | Telegram bot: teloxide polling, admin-only filter, command dispatch, HTML formatting |
 

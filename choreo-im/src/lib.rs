@@ -1,5 +1,6 @@
 use anyhow::{Context, bail};
 use choreo_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
+use clap::Parser;
 use std::env;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
@@ -9,6 +10,22 @@ use tracing_subscriber::{EnvFilter, fmt};
 pub mod bridge;
 pub mod telegram;
 pub mod tg_api;
+
+#[derive(Parser)]
+// Bare `version` wires `--version`/`-V` to CARGO_PKG_VERSION, matching the
+// rest of the suite. ColorChoice is explicitly Auto (clap's default): color
+// only on a TTY, never forced into pipes.
+#[command(
+    name = "choreo-im",
+    version,
+    about = "IM platform bridge for Choreographr",
+    color = clap::ColorChoice::Auto,
+    styles = choreo_proto::cli::clap_styles()
+)]
+struct Cli {
+    /// IM platform to bridge (e.g. telegram)
+    platform: String,
+}
 
 /// Entry point for the `choreo-im` platform bridge binary.
 ///
@@ -22,15 +39,8 @@ pub fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    let mut args = env::args().skip(1);
-
-    let platform = match args.next().as_deref() {
-        Some(p) => p.to_string(),
-        None => {
-            error!("usage: choreo-im telegram");
-            bail!("usage: choreo-im telegram");
-        }
-    };
+    let cli = Cli::parse();
+    let platform = cli.platform;
 
     let unlock_passphrase = env::var("CHOREOGRAPHR_KEYSTORE_PASSPHRASE").ok();
 
@@ -150,5 +160,42 @@ fn run_platform(
         other => {
             bail!("unknown platform: {other}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    /// `--version` is handled by clap before any real arg parsing: it exits
+    /// with a `DisplayVersion` error whose message is the version string.
+    /// Assert both so the flag stays wired to CARGO_PKG_VERSION (it breaks
+    /// silently if the derive attribute loses the bare `version` marker).
+    #[test]
+    fn version_flag_displays_package_version() {
+        // clap returns the version as a `DisplayVersion` error instead of a
+        // value; match it out by hand (Cli doesn't derive Debug, so
+        // `unwrap_err()`'s Debug bound doesn't apply).
+        let err = match super::Cli::try_parse_from(["choreo-im", "--version"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--version should short-circuit before arg validation"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// The platform is a required positional; a normal invocation parses it.
+    #[test]
+    fn parses_platform_positional() {
+        let cli = super::Cli::try_parse_from(["choreo-im", "telegram"])
+            .expect("telegram is a valid platform arg");
+        assert_eq!(cli.platform, "telegram");
+    }
+
+    /// clap enforces the required positional: missing args are a parse error
+    /// (replacing the old hand-rolled usage message).
+    #[test]
+    fn missing_platform_is_a_parse_error() {
+        assert!(super::Cli::try_parse_from(["choreo-im"]).is_err());
     }
 }

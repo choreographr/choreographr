@@ -20,7 +20,17 @@ use std::sync::OnceLock;
 static CONNECTION_MODE: OnceLock<ConnectionMode> = OnceLock::new();
 
 #[derive(Parser)]
-#[command(name = "choreo-gui", about = "Choreographr desktop GUI")]
+// Bare `version` wires `--version`/`-V` to CARGO_PKG_VERSION, matching the
+// other suite binaries (Homebrew formula test + smoke test rely on it).
+// ColorChoice is explicitly Auto (clap's default): color only on a TTY,
+// never forced into pipes.
+#[command(
+    name = "choreo-gui",
+    version,
+    about = "Choreographr desktop GUI",
+    color = clap::ColorChoice::Auto,
+    styles = choreo_proto::cli::clap_styles()
+)]
 struct Cli {
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
     #[arg(long = "tcp-addr")]
@@ -132,6 +142,28 @@ fn App() -> Element {
 }
 
 const APP_CSS: &str = include_str!("style.css");
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    /// `--version` is handled by clap before any real arg parsing: it exits
+    /// with a `DisplayVersion` error whose message is the version string.
+    /// Assert both so the flag stays wired to CARGO_PKG_VERSION (it breaks
+    /// silently if the derive attribute loses the bare `version` marker).
+    #[test]
+    fn version_flag_displays_package_version() {
+        // clap returns the version as a `DisplayVersion` error instead of a
+        // value; match it out by hand (Cli doesn't derive Debug, so
+        // `unwrap_err()`'s Debug bound doesn't apply).
+        let err = match Cli::try_parse_from(["choreo-gui", "--version"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--version should short-circuit before arg validation"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+}
 
 #[cfg(test)]
 mod app_tests;

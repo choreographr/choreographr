@@ -11,6 +11,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 choreo-proto.workspace = true
 choreo-keystore.workspace = true
 choreo-client-core.workspace = true

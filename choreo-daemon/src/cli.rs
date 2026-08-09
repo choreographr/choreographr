@@ -15,7 +15,15 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[derive(Parser)]
 // Bare `version` wires `--version`/`-V` to CARGO_PKG_VERSION (the crate
 // version), which the Homebrew formula test, installer, and smoke tests rely on.
-#[command(name = "choreographr", version, about = "Choreographr AI daemon")]
+// `color` is explicitly `Auto` (clap's default) to document the intent that
+// help/error output is colored only when stdout/stderr is a TTY.
+#[command(
+    name = "choreographr",
+    version,
+    about = "Choreographr AI daemon",
+    color = clap::ColorChoice::Auto,
+    styles = choreo_proto::cli::clap_styles()
+)]
 struct Cli {
     /// Increase logging verbosity (-v debug, -vv trace)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
