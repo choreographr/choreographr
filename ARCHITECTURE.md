@@ -1840,6 +1840,18 @@ summary broadcast previously used a blocking `send` here, which let one slow
 client freeze the whole daemon loop; aligning it with the shared policy
 removed that stall.
 
+Dropped messages are not lost silently: every drop-on-full increments the
+`choreo_broadcast_dropped_total{path}` Prometheus counter (paths `summary`,
+`activity`, `session`, `attach`) served on `/metrics`, so a permanently
+wedged subscriber — one whose buffer stays full forever — remains observable
+even though per-message logging is deliberately skipped as noise under a fast
+burst.  The one place a drop is more consequential than a routine broadcast
+is the attach snapshot (`handle_attach` in sessions.rs): it is the joining
+client's only complete view of accumulated content, so a full buffer there
+also logs a `warn!` while still refusing to block the session thread (the
+client stays subscribed and the in-flight turn's `ToolCallFinished` +
+`SessionMessageAppended` resyncs it).
+
 Token bookkeeping follows the same per-session rule.  `LiveOutputTokenCount`
 (during streaming) and `SessionState` snapshots (attach / `load_tools` /
 `unload_tools` broadcasts) are routed to the display of the session they

@@ -840,8 +840,9 @@ fn broadcast(
     // Shared drop-on-full / evict-on-disconnect policy (see crate::broadcast):
     // a slow subscriber must never stall this session thread, and a transient
     // full buffer must never permanently evict it.
-    subscribers
-        .retain(|client_id, tx| crate::broadcast::try_send_keep_on_full(tx, *client_id, &message));
+    subscribers.retain(|client_id, tx| {
+        crate::broadcast::try_send_keep_on_full(tx, *client_id, "session", &message)
+    });
 }
 
 fn fail_request(
@@ -1487,11 +1488,16 @@ fn handle_attach(
     // already a subscriber of this session via the per-session path, and
     // the broadcast_activity filter in the daemon won't see this message
     // anyway (it's sent directly, not through session's broadcast()).
+    //
+    // They are advisory: `try_send` drops them if the client's writer
+    // buffer is momentarily full (the session thread must never block on
+    // a slow client), and the snapshot below — or the next broadcast —
+    // supersedes them anyway.
     if !state.active_requests.is_empty()
         && let Some(tx) = state.subscribers.get(&client_id)
     {
         for (&request_id, active) in &state.active_requests {
-            let _ = tx.send(DaemonMessage::Started {
+            let _ = tx.try_send(DaemonMessage::Started {
                 session_id: ctx.session_id,
                 request_id,
                 turn_id: active.turn_id,
@@ -1500,9 +1506,37 @@ fn handle_attach(
         }
     }
 
+    // The snapshot is the new client's only complete view of accumulated
+    // content, so a drop here is more consequential than a routine
+    // broadcast drop — but the session thread must STILL never block: a
+    // client whose 128-deep writer buffer is full is already far behind
+    // (and would otherwise stall the entire session command loop, which
+    // also forwards to the daemon's activity broadcast for every other
+    // subscriber).  Drop on full, warn, count it in /metrics, and keep the
+    // client subscribed — it stays live for subsequent broadcasts and the
+    // in-flight turn's final `ToolCallFinished` + `SessionMessageAppended`
+    // will resync the complete content.
     let snapshot = state.session_state_message(ctx.session_id);
     if let Some(tx) = state.subscribers.get(&client_id) {
-        let _ = tx.send(snapshot);
+        match tx.try_send(snapshot) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                warn!(
+                    "session {}: dropped attach snapshot for client {}: writer buffer full",
+                    ctx.session_id, client_id
+                );
+                crate::metrics::record_broadcast_dropped("attach");
+            }
+            // The client disconnected between registration and the
+            // snapshot — nothing to deliver; the disconnect/untrack path
+            // cleans up the stale subscription.
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                debug!(
+                    "session {}: attach snapshot for client {} dropped: receiver gone",
+                    ctx.session_id, client_id
+                );
+            }
+        }
     }
     false
 }
@@ -2621,6 +2655,64 @@ mod tests {
             &mut shutdown,
             &ctx,
         );
+        assert!(!shutdown);
+    }
+
+    #[test]
+    fn broadcast_keeps_slow_subscriber_on_full_buffer() {
+        // Regression test mirroring the daemon-level broadcast tests: a
+        // momentarily-full writer buffer must drop the message but KEEP the
+        // session subscriber.  The TUI registers per-session once at attach
+        // and relies on the stream (final `ToolCallFinished` +
+        // `SessionMessageAppended` delivers complete content), so evicting it
+        // on a full buffer would blind it to this session's stream.
+        let (mut state, ctx) = broadcast_setup();
+        // A capacity-1 channel lets us fill the buffer with a single message
+        // so the next try_send fails with Full.
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
+        state.subscribers.insert(10, tx);
+
+        // Fill the subscriber's buffer so the broadcast below cannot enqueue.
+        let filler = DaemonMessage::Pong;
+        state
+            .subscribers
+            .get(&10)
+            .expect("subscriber registered")
+            .send(filler.clone())
+            .expect("filler fits in capacity-1 channel");
+
+        // Buffer is full: the broadcast message is dropped, not queued, and
+        // the subscriber must survive.
+        let broadcast = DaemonMessage::Done {
+            session_id: ctx.session_id,
+            request_id: 5,
+            token_usage: None,
+            last_prompt_tokens: None,
+        };
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Broadcast(broadcast.clone()),
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        assert!(
+            state.subscribers.contains_key(&10),
+            "a full buffer must not evict the session subscriber"
+        );
+        assert_eq!(rx.recv().unwrap(), filler);
+        assert!(rx.try_recv().is_err(), "message dropped while buffer full");
+
+        // Once the buffer drains, later broadcasts flow again.
+        process_command(
+            SessionCommand::Broadcast(broadcast.clone()),
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+        assert_eq!(rx.recv().unwrap(), broadcast);
+        assert!(state.subscribers.contains_key(&10));
         assert!(!shutdown);
     }
 

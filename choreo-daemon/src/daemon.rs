@@ -491,8 +491,9 @@ impl DaemonState {
     /// The drop-on-full / evict-on-disconnect policy is shared with the
     /// activity broadcast and the per-session broadcast (see `crate::broadcast`).
     fn broadcast(&mut self, msg: DaemonMessage) {
-        self.summary_subscribers
-            .retain(|client_id, tx| crate::broadcast::try_send_keep_on_full(tx, *client_id, &msg));
+        self.summary_subscribers.retain(|client_id, tx| {
+            crate::broadcast::try_send_keep_on_full(tx, *client_id, "summary", &msg)
+        });
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1102,9 +1103,10 @@ impl DaemonState {
 
     /// Broadcast a message to all activity subscribers, removing dead ones.
     ///
-    /// Uses `try_send` so a slow subscriber does not block the daemon's
-    /// single-threaded command loop (mirroring the behaviour in the per-session
-    /// `broadcast()` function in sessions.rs).
+    /// Non-blocking: a slow subscriber gets its message dropped on a full
+    /// buffer instead of stalling the daemon's single-threaded command loop.
+    /// The drop-on-full / evict-on-disconnect policy is shared with the
+    /// summary broadcast and the per-session broadcast (see `crate::broadcast`).
     ///
     /// Skips delivery to clients that are also direct session subscribers of
     /// the originating session — those clients receive the message through
@@ -1127,7 +1129,7 @@ impl DaemonState {
             // at startup and never re-subscribes, so evicting it would
             // permanently blind it to every background session.  Only a
             // disconnected receiver removes the subscriber.
-            crate::broadcast::try_send_keep_on_full(tx, *client_id, &msg)
+            crate::broadcast::try_send_keep_on_full(tx, *client_id, "activity", &msg)
         });
     }
 

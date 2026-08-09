@@ -16,6 +16,7 @@ struct Metrics {
     api_errors_total: IntCounterVec,
     connections_total: IntCounter,
     turns_total: IntCounterVec,
+    broadcast_dropped_total: IntCounterVec,
     request_duration_seconds: HistogramVec,
     tool_execution_duration_seconds: HistogramVec,
     api_call_duration_seconds: HistogramVec,
@@ -68,6 +69,11 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "choreo_turns_total",
             "Total number of agent loop turns by model",
             &["model"]
+        )?,
+        broadcast_dropped_total: prometheus::register_int_counter_vec!(
+            "choreo_broadcast_dropped_total",
+            "Messages dropped because a subscriber's writer buffer was full, by broadcast path",
+            &["path"]
         )?,
         request_duration_seconds: prometheus::register_histogram_vec!(
             "choreo_request_duration_seconds",
@@ -190,6 +196,19 @@ pub fn record_api_error(model: &str, error_type: &str) {
         m.api_errors_total
             .with_label_values(&[model, error_type])
             .inc();
+    }
+}
+
+/// Count a message dropped because a subscriber's writer buffer was full.
+///
+/// `path` identifies the fan-out that dropped it ("summary", "activity",
+/// "session", "attach") so a wedged subscriber is observable via `/metrics`
+/// even though the drop itself is deliberately silent in the logs (one line
+/// per dropped message would be noise under a fast burst).  This is a no-op
+/// when metrics were never initialized (e.g. unit-test binaries).
+pub fn record_broadcast_dropped(path: &str) {
+    if let Some(m) = METRICS.get() {
+        m.broadcast_dropped_total.with_label_values(&[path]).inc();
     }
 }
 
@@ -328,6 +347,24 @@ mod tests {
 
     #[serial(metrics)]
     #[test]
+    fn test_broadcast_dropped_increments_counter() {
+        ensure_init();
+        let m = METRICS.get().unwrap();
+        let before = m
+            .broadcast_dropped_total
+            .with_label_values(&["summary"])
+            .get();
+        record_broadcast_dropped("summary");
+        assert_eq!(
+            m.broadcast_dropped_total
+                .with_label_values(&["summary"])
+                .get(),
+            before + 1
+        );
+    }
+
+    #[serial(metrics)]
+    #[test]
     fn test_metrics_output_contains_help_and_type_lines() {
         ensure_init();
         // Call each metric function at least once to seed label values.
@@ -342,6 +379,7 @@ mod tests {
         record_turn("test_model");
         record_client_connected();
         record_connection_accepted();
+        record_broadcast_dropped("summary");
         // Gather and encode all metrics via the text encoder, verify
         // that the output contains expected HELP/TYPE lines.
         let metric_families = prometheus::gather();
@@ -354,6 +392,8 @@ mod tests {
         assert!(output.contains("# TYPE choreo_sessions_active gauge"));
         assert!(output.contains("# HELP choreo_requests_total"));
         assert!(output.contains("# TYPE choreo_requests_total counter"));
+        assert!(output.contains("# HELP choreo_broadcast_dropped_total"));
+        assert!(output.contains("# TYPE choreo_broadcast_dropped_total counter"));
         assert!(output.contains("# HELP choreo_request_duration_seconds"));
         assert!(output.contains("# TYPE choreo_request_duration_seconds histogram"));
     }

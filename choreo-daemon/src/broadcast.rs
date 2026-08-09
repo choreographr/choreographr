@@ -15,7 +15,9 @@
 //!   final message of a turn (`ToolCallFinished` + `SessionMessageAppended`)
 //!   delivers the complete content anyway.  Evicting here would permanently
 //!   blind a subscriber that never re-subscribes (the TUI registers for all
-//!   activity exactly once at startup).
+//!   activity exactly once at startup).  Each drop is counted by
+//!   `metrics::record_broadcast_dropped` under the caller's `path` label, so
+//!   a wedged subscriber stays observable via `/metrics` without log noise.
 //! * receiver gone -> evict the subscriber.  A disconnected client is dead;
 //!   keeping its sender would leak the entry and burn a `try_send` + clone on
 //!   every future broadcast.
@@ -31,16 +33,19 @@ use tracing::warn;
 /// Try to deliver `message` to one subscriber, returning whether the
 /// subscriber should remain registered.
 ///
-/// This is meant to be used as the retain predicate of the subscriber maps:
+/// `path` labels the fan-out in the drop metric ("summary", "activity",
+/// "session").  This is meant to be used as the retain predicate of the
+/// subscriber maps:
 ///
 /// ```ignore
-/// subscribers.retain(|client_id, tx| try_send_keep_on_full(tx, *client_id, &msg));
+/// subscribers.retain(|client_id, tx| try_send_keep_on_full(tx, *client_id, "summary", &msg));
 /// ```
 ///
 /// See the module docs for the drop-on-full / evict-on-disconnect policy.
 pub(crate) fn try_send_keep_on_full(
     tx: &mpsc::SyncSender<DaemonMessage>,
     client_id: u64,
+    path: &str,
     message: &DaemonMessage,
 ) -> bool {
     match tx.try_send(message.clone()) {
@@ -48,8 +53,13 @@ pub(crate) fn try_send_keep_on_full(
         Ok(()) => true,
         // Buffer full: drop the message but KEEP the subscriber.  Logging
         // every dropped chunk here would be pure noise under a fast burst
-        // (one line per message per subscriber), so we stay silent.
-        Err(mpsc::TrySendError::Full(_)) => true,
+        // (one line per message per subscriber), so we stay silent in the
+        // logs and instead count the drop so a wedged subscriber remains
+        // observable via /metrics.
+        Err(mpsc::TrySendError::Full(_)) => {
+            crate::metrics::record_broadcast_dropped(path);
+            true
+        }
         // Receiver gone — the client is dead, stop sending to it.
         Err(mpsc::TrySendError::Disconnected(_)) => {
             warn!("removing disconnected subscriber {client_id}");
@@ -76,7 +86,7 @@ mod tests {
     fn try_send_keep_on_full_delivers_and_keeps_subscriber() {
         let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
         let msg = status_msg(1);
-        assert!(try_send_keep_on_full(&tx, 7, &msg));
+        assert!(try_send_keep_on_full(&tx, 7, "summary", &msg));
         assert_eq!(rx.recv().unwrap(), msg);
     }
 
@@ -90,12 +100,12 @@ mod tests {
 
         let broadcast = status_msg(2);
         // Full buffer: the message is dropped but the subscriber is retained.
-        assert!(try_send_keep_on_full(&tx, 7, &broadcast));
+        assert!(try_send_keep_on_full(&tx, 7, "session", &broadcast));
         assert_eq!(rx.recv().unwrap(), filler);
         assert!(rx.try_recv().is_err(), "full-buffer message was dropped");
 
         // Once the buffer drains, delivery resumes.
-        assert!(try_send_keep_on_full(&tx, 7, &broadcast));
+        assert!(try_send_keep_on_full(&tx, 7, "session", &broadcast));
         assert_eq!(rx.recv().unwrap(), broadcast);
     }
 
@@ -103,6 +113,6 @@ mod tests {
     fn try_send_keep_on_full_evicts_on_disconnected() {
         let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
         drop(rx); // Disconnect the receiver
-        assert!(!try_send_keep_on_full(&tx, 7, &status_msg(1)));
+        assert!(!try_send_keep_on_full(&tx, 7, "summary", &status_msg(1)));
     }
 }
