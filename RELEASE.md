@@ -124,7 +124,11 @@ just preflight               # checks cargo + zig, notes nextest
 
 4. **Tag the bump commit** (cargo-release reads the version back from
    `Cargo.toml`): `cargo release tag -x` → creates `vX.Y.Z` at HEAD. The tag
-   is pushed together with the commit once Phase 2 has published.
+   is pushed together with the commit once Phase 2 has published. First
+   release only: if `v0.1.0` was already tagged locally before the release
+   tooling existed (`git tag -l`), `cargo release tag` reports `disabled due
+   to existing tag` and skips — that's fine as long as the tag sits on the
+   commit you're shipping; just push it in Phase 2.
 
 **Gate:** `just ci` green, tree clean, no conflicting tag.
 
@@ -137,11 +141,20 @@ bump, and `cargo install` must resolve the published crates). From either
 machine, on the clean tree:
 
 ```bash
-cargo release publish          # publishes the Phase-1-bumped version in
-                               # topological order — publish does NOT bump
-                               # or tag (that was `cargo release version`
-                               # and `cargo release tag` in Phase 1)
+cargo release publish --workspace  # publishes the Phase-1-bumped version in
+                                   # topological order — publish does NOT bump
+                                   # or tag (that was `cargo release version`
+                                   # and `cargo release tag` in Phase 1)
 ```
+
+`--workspace` is **mandatory**. cargo-release ≥ 1.0 selects only the current
+package by default: a bare `cargo release publish` plans just `choreographr`,
+marks every workspace member as `disabled by user, skipping`, and then dies
+with `error: choreographr 0.1.0 depends on unpublished workspace package
+choreo-*` — the root's deps are neither in the publish set nor on crates.io
+yet. `--workspace` puts all 12 publish-set members in the set; cargo-release
+hands them to a single `cargo publish` call and cargo uploads them in
+dependency order (`choreo-gui` drops out on its own via `publish = false`).
 
 - `[workspace.metadata.release]` sets `dependent-version = "fix"`, so
   cross-crate requirements (`choreo-tui = "0.1"`, …) stay in lockstep across
@@ -160,6 +173,40 @@ export CARGO_HOME=$(mktemp -d)
 cargo install choreographr --locked
 ~/.cargo/bin/choreographr --version    # must print X.Y.Z
 ```
+
+#### First release: the new-crate rate limit
+
+crates.io throttles **new-crate creation** per account to a burst of **5** with
+refill of **1 every 10 minutes** (a token bucket; updates to existing crates
+get burst 30/minute — so only the first release is affected). cargo-release
+mirrors this via `rate-limit-new-packages` in `[workspace.metadata.release]`
+(default 5) and refuses upfront:
+
+```
+error: attempting to publish 12 new crates which is above the rate limit: 5
+error: dry-run failed, resolve the above errors and try again.
+```
+
+Raising `rate-limit-new-packages` only silences the guard — the crates.io
+server itself still returns 429 on the 6th new crate. Two ways through:
+
+1. **Ask crates.io for a burst override** on the publishing account (the
+   crates.io team raises the per-user burst in `publish_rate_overrides`). Then
+   set `rate-limit-new-packages` to match and publish in one shot:
+   `cargo release publish --workspace -x`.
+2. **Stage the first release in dependency-closed batches of ≤ 5 new crates**
+   using `-p` selection, waiting ~10 minutes (one token refill) between
+   batches. Every workspace dependency of a batched crate is either in the
+   batch or already published:
+   - Batch 1: `cargo release publish -p choreo-proto -p choreo-keystore -p choreo-markdown -p choreo-mcp -p choreo-transport -x`
+   - Batch 2: `cargo release publish -p choreo-acp -p choreo-ai-protocols -p choreo-client-core -x`
+   - Batch 3: `cargo release publish -p choreo-daemon -p choreo-im -p choreo-tui -x`
+   - Batch 4: `cargo release publish -p choreographr -x`
+
+   Dry-run each batch first (omit `-x`) and confirm it plans only that
+   batch's crates. Once all 12 exist on crates.io, later releases (0.1.1,
+   0.2.0, …) are *updates* and go in a single `cargo release publish
+   --workspace -x`.
 
 **Gate:** 12 crates published, `cargo install choreographr --locked` works in
 a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
@@ -360,7 +407,8 @@ repo and push.
 
 - [ ] `just ci` green; tree clean; master pulled
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
-- [ ] `cargo release publish` → 12 crates on crates.io; `cargo install --locked` verified
+- [ ] `cargo release publish --workspace` → 12 crates on crates.io; `cargo install --locked` verified
+- [ ] First release only: 12 new crates staged in ≤5-crate batches (or crates.io burst override) — see Phase 2
 - [ ] Linux box: `just release` + `just smoke-test` → musl tarball, `.deb`, `.rpm`, `SHA256SUMS`
 - [ ] MacBook: `just release` + `just smoke-test` + daemon/keystore/plist/TUI smoke test
 - [ ] macOS tarball copied to Linux box; combined `SHA256SUMS` regenerated
