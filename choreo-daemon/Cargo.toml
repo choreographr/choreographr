@@ -67,8 +67,10 @@ unicode-general-category = "1.1"
 # OpenMetrics / Prometheus monitoring.
 # The `process` feature exposes process-level metrics (RSS, CPU, FD count)
 # alongside our application-level gauges, counters, and histograms.
-prometheus = { version = "0.14", features = ["process"] }
-tiny_http = "0.12"
+# Both are optional, pulled in by the `metrics` feature (on by default) so a
+# `--no-default-features` build drops the whole prometheus/tiny_http tree.
+prometheus = { version = "0.14", features = ["process"], optional = true }
+tiny_http = { version = "0.12", optional = true }
 ckb-vm = { version = "0.24.14", features = ["detect-asm"] }
 tempfile.workspace = true
 postcard.workspace = true
@@ -98,6 +100,14 @@ rmp-serde.workspace = true
 pdf-inspector = { version = "0.1", optional = true }
 
 [features]
+# Prometheus/OpenMetrics instrumentation and the `/metrics` HTTP server
+# (src/metrics.rs). On by default; `--no-default-features` compiles it out
+# entirely (no prometheus/tiny_http dependencies). The module's public API
+# degrades to no-op stubs when disabled, so the daemon's instrumentation call
+# sites compile unchanged in both configurations — and `--metrics-addr` then
+# fails startup with a clear error instead of being silently ignored.
+default = ["metrics"]
+metrics = ["dep:prometheus", "dep:tiny_http"]
 # Native PDF tools (pdf_classify / pdf_to_markdown). Off by default so the
 # published manifest stays free of the git-pinned fork (crates.io rejects git
 # dependencies); release binaries are built with `--features pdf` and get the

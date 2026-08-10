@@ -95,22 +95,38 @@ pub fn run_server(
 
     // Initialize the metrics registry so that instrumented code throughout
     // the daemon can safely call record_* functions (they no-op when
-    // uninitialized).  This must happen before the accept loop starts.
+    // uninitialized, and are compiled-out no-ops when the `metrics` feature
+    // is disabled).  This must happen before the accept loop starts.
     crate::metrics::init().map_err(io::Error::other)?;
 
     // Metrics HTTP server thread (if `--metrics-addr` was provided).
     // Spawned before the accept loop so it's reachable immediately.
+    //
+    // When the `metrics` feature is disabled the flag is still parsed (so a
+    // script that passes it gets a clear, actionable error instead of clap's
+    // confusing "unexpected argument"), but the daemon refuses to start
+    // rather than silently ignoring the requested endpoint.
     if let Some(ref addr_str) = metrics_addr {
-        let addr: SocketAddr = addr_str.parse().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid --metrics-addr: {e}"),
-            )
-        })?;
-        let shutdown_flag = Arc::clone(&shutdown);
-        thread::spawn(move || {
-            crate::metrics::serve_metrics(addr, shutdown_flag);
-        });
+        #[cfg(feature = "metrics")]
+        {
+            let addr: SocketAddr = addr_str.parse().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid --metrics-addr: {e}"),
+                )
+            })?;
+            let shutdown_flag = Arc::clone(&shutdown);
+            thread::spawn(move || {
+                crate::metrics::serve_metrics(addr, shutdown_flag);
+            });
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            return Err(io::Error::other(format!(
+                "--metrics-addr {addr_str}: this build was compiled without the \
+                 `metrics` feature; rebuild with `--features metrics` to serve /metrics"
+            )));
+        }
     }
 
     // TCP listener for Noise IK clients.

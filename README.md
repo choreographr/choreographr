@@ -639,6 +639,17 @@ include session counts, connection counts, request latency, API call latency,
 tool execution time, error breakdowns, and process-level metrics (RSS, CPU,
 file descriptors).
 
+Metrics are compiled in by default via the `metrics` cargo feature. For a lean
+build without the Prometheus machinery, disable them:
+
+```bash
+cargo build --release -p choreographr --no-default-features
+```
+
+In such a build the `--metrics-addr` flag is still accepted but the daemon
+refuses to start with a clear error telling you to rebuild with
+`--features metrics`.
+
 ## Testing & development
 
 The workspace uses [cargo-nextest](https://nexte.st) as its primary test runner:

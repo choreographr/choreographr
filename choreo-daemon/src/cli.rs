@@ -55,6 +55,10 @@ struct Cli {
 
     /// Enable Prometheus metrics HTTP server on this socket address
     /// (e.g. 127.0.0.1:9464).  When absent no metrics server is started.
+    ///
+    /// Requires the `metrics` cargo feature (on by default).  When the binary
+    /// is built with `--no-default-features`, passing this flag is a startup
+    /// error rather than a silent no-op.
     #[arg(long = "metrics-addr")]
     metrics_addr: Option<String>,
 

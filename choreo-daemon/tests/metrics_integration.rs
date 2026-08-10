@@ -1,3 +1,10 @@
+//! Prometheus `/metrics` endpoint integration test.
+//!
+//! Only compiles when the `metrics` feature is enabled (on by default). With
+//! `--no-default-features` the daemon is built with no-op stubs and there is
+//! no HTTP server to scrape, so this suite would have nothing to test.
+#![cfg(feature = "metrics")]
+
 use choreo_daemon::metrics;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};

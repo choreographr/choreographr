@@ -489,7 +489,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `providers/mod.rs` | `InferenceProvider` — protocol-erased facade wrapping `Arc<dyn ProviderClient>` plus the catalog slug. `from_account_config()` dispatches by `ProviderProtocol` and constructs the right client from `choreo-ai-protocols`. Records API metrics (`record_api_call`/`record_api_error`) around each turn — timing lives here, not in the provider crate. |
 | `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional working directory. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
-| `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
+| `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. Compiled only when the `metrics` cargo feature is enabled (on by default); disabled builds get no-op stubs so the instrumentation call sites compile unchanged. |
 | `tools/` | `Tool` trait (with `output_schema` for programmatic tool calling, `allowed_callers` for caller-level gating), `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 30+ registered tools (including `list_sessions`, `get_session`, `load_skill` via `admin/`). |
 | `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, selected model, working directory) passed to tools that need DB or daemon access or parent config for sub-sessions. |
 | `tools/db/` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`), one file per tool (`set.rs`, `get.rs`, `delete.rs`, `delete_range.rs`, `get_range.rs`, `list.rs`, `count.rs`) with shared `DbError`/`DbValue` in `db/mod.rs`. |
@@ -1847,6 +1847,17 @@ from the database, ensuring `ListModels` and metadata queries see the correct
 The daemon can expose a `/metrics` HTTP endpoint in the OpenMetrics format
 (suitable for Prometheus scraping).
 
+> **Feature gate.** The metrics machinery lives behind the `metrics` cargo
+> feature, **on by default** at both the `choreo-daemon` crate and the root
+> `choreographr` package. Building with `--no-default-features` compiles it out
+> entirely — no `prometheus`/`tiny_http` dependencies, and the module's public
+> API degrades to inert no-op stubs so the ~20 instrumentation call sites across
+> the daemon compile unchanged. In a feature-off build the `--metrics-addr`
+> flag is still accepted (so scripts that pass it get a clear, actionable error
+> instead of clap's "unexpected argument") but the daemon refuses to start
+> rather than silently ignoring the requested endpoint. The integration test
+> (`tests/metrics_integration.rs`) is gated with `#![cfg(feature = "metrics")]`.
+
 **CLI flag:** `--metrics-addr <ADDR>` (e.g. `127.0.0.1:9464`). When the flag is
 absent no metrics server is started — the daemon runs exactly as before.
 
@@ -1873,11 +1884,14 @@ crate's `process` feature.
 
 ### Implementation
 
-The metrics module (`src/metrics.rs`) uses `std::sync::LazyLock` for a single
-static `Metrics` struct that wraps Prometheus counters/gauges/histograms. All
-operations are atomic (no `Arc<Mutex>` needed). A dedicated thread serves the
-`/metrics` endpoint via `tiny_http`; it polls the shutdown flag every 1 second
-and exits cleanly when the daemon shuts down.
+The metrics module (`src/metrics.rs`) keeps the real implementation in a
+feature-gated `backend` module (selected by `#[cfg(feature = "metrics")]`,
+with a no-op stub backend when disabled, re-exported behind the same public
+API) using `std::sync::OnceLock` for a single static `Metrics` struct that
+wraps Prometheus counters/gauges/histograms. All operations are atomic (no
+`Arc<Mutex>` needed). A dedicated thread serves the `/metrics` endpoint via
+`tiny_http`; it polls the shutdown flag every 1 second and exits cleanly when
+the daemon shuts down.
 
 ### Instrumentation points
 
@@ -2625,6 +2639,6 @@ enum lets callers choose between `Text` (human-readable via `return_string`) and
 (JSON-encoded via `serde_json::to_string`) output formats.
 | `gix` | daemon | Git operations |
 | `teloxide` | choreo-im | Telegram Bot API client |
-| `prometheus` | daemon | OpenMetrics instrumentation, process metrics |
-| `tiny_http` | daemon | Metrics HTTP server for `/metrics` endpoint |
+| `prometheus` | daemon | OpenMetrics instrumentation, process metrics (optional — behind the `metrics` feature, on by default) |
+| `tiny_http` | daemon | Metrics HTTP server for `/metrics` endpoint (optional — behind the `metrics` feature, on by default) |
 | `tracing` | daemon | Structured logging |
