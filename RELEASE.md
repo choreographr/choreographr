@@ -68,17 +68,28 @@ just preflight               # checks cargo + zig, notes nextest
 
 ## Phase 1 — Decide & bump the version
 
-1. Decide the bump level (patch/minor/major; 0.1.x is a patch), then set it
-   with cargo-release. `[workspace.package] version` is the single source of
-   truth — every member inherits it via `version.workspace = true`, so the
-   bump is **one edit**, not twelve. `cargo release version` previews a dry
-   run by default; `-x` applies it:
+1. **Decide the level** — the release conductor's judgment call, made before
+   any tooling runs. There are only three options; which one applies is
+   determined by what changed since the last tag:
+
+   | Level | Bump | When to pick it |
+   |---|---|---|
+   | `patch` | 0.1.0 → 0.1.1 | Bug fixes, security fixes, doc/UX polish — no new user-facing features |
+   | `minor` | 0.1.1 → 0.2.0 | New features or behavior changes. While on 0.x, breaking changes also land here (semver treats 0.x minor as "may break") |
+   | `major` | 0.2.0 → 1.0.0 | Breaking changes after 1.0, or the deliberate move to 1.0.0 (stability commitment) |
+
+2. **Enact the decision** — the level you chose in step 1 **is the argument**
+   to `cargo release version`. `[workspace.package] version` is the single
+   source of truth; every member inherits it via `version.workspace = true`,
+   so the bump is **one edit**, not twelve. The command previews a dry run by
+   default; `-x` applies it:
 
    ```bash
-   cargo release version patch    # dry-run by default: preview the bump plan
-   cargo release version patch -x # apply: edits [workspace.package] version in
+   cargo release version minor    # dry-run: preview the bump plan (substitute
+                                  # the level from step 1: patch / minor / major)
+   cargo release version minor -x # apply: edits [workspace.package] version in
                                   # Cargo.toml (and Cargo.lock); all 12 members
-                                  # follow — likewise for minor / major
+                                  # follow
    ```
 
    `cargo release version` only edits the manifests — it does **not** commit
@@ -90,14 +101,14 @@ just preflight               # checks cargo + zig, notes nextest
    git commit -m "release: bump to X.Y.Z"
    ```
 
-   (Prefer this over the one-shot `cargo release patch`, which bumps, tags,
+   (Prefer this over the one-shot `cargo release <level>`, which bumps, tags,
    publishes, and pushes in a single cargo-release-made commit — fine when
    nothing else needs to ride along with the bump.)
 
-2. **Tag name check:** confirm no tag `vX.Y.Z` exists yet:
+3. **Tag name check:** confirm no tag `vX.Y.Z` exists yet:
    `git ls-remote --tags origin | grep vX.Y.Z`.
 
-3. **Tag the bump commit** (cargo-release reads the version back from
+4. **Tag the bump commit** (cargo-release reads the version back from
    `Cargo.toml`): `cargo release tag -x` → creates `vX.Y.Z` at HEAD. The tag
    is pushed together with the commit once Phase 2 has published.
 
