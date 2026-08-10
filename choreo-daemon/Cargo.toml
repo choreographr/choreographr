@@ -110,7 +110,7 @@ pdf-inspector = { version = "0.1", optional = true }
 metrics = ["dep:prometheus", "dep:tiny_http"]
 # Native PDF tools (pdf_classify / pdf_to_markdown). Off by default so the
 # published manifest stays free of the git-pinned fork (crates.io rejects git
-# dependencies); release binaries are built with `--features pdf` and get the
+# dependencies); release binaries are built with `--features pdf,metrics` and get the
 # fork via the workspace `[patch.crates-io]`. See the pdf-inspector comment
 # above for the security rationale and the revert path.
 pdf = ["dep:pdf-inspector"]

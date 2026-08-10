@@ -5437,6 +5437,16 @@ fn attached_subsession_finished_detects_active_to_idle_only() {
         app.attached_subsession_finished(42, &SessionStatus::Inactive),
         None
     );
+
+    // The parent no longer exists in the summary (deleted while the child
+    // ran): switching would attach to a dead session id — no switch.
+    app.attached_session_id = Some(99);
+    app.session_mgr
+        .set_sessions(vec![make_subsession(99, "orphan task", 42)]);
+    assert_eq!(
+        app.attached_subsession_finished(99, &SessionStatus::Inactive),
+        None
+    );
 }
 
 #[test]
@@ -5486,6 +5496,10 @@ fn subsession_finish_switches_back_to_parent_with_notification() {
         app.status.as_deref(),
         Some("Subsession \"child task\" finished. Switched back to parent \"parent session\".")
     );
+    // The status bar immediately reflects the parent's (idle) summary status
+    // instead of holding the child's just-applied "inactive" until the
+    // daemon's SessionAttached reply lands.
+    assert_eq!(app.attached_status, Some(SessionStatus::Inactive));
 }
 
 #[test]
@@ -5547,6 +5561,39 @@ fn top_level_session_finish_does_not_switch() {
     assert_eq!(app.attached_session_id, Some(42));
     assert_eq!(app.status, None);
     assert!(rx.try_iter().next().is_none());
+}
+
+#[test]
+fn subsession_finish_with_missing_parent_does_not_switch() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // The parent was deleted while the child ran; the summary only holds the
+    // orphaned child.  The switch-back must not fire — attaching to a dead
+    // session id would strand the user on a session the daemon rejects.
+    app.attached_session_id = Some(99);
+    app.active_session_id = Some(99);
+    app.session_mgr
+        .set_sessions(vec![make_subsession(99, "orphan task", 42)]);
+
+    handle_daemon_message(
+        DaemonMessage::SessionStatusChanged {
+            session_id: 99,
+            status: SessionStatus::Inactive,
+            last_modified: 1705315000000,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionStatusChanged");
+
+    // The view stays on the finished child; no attach is attempted.
+    assert_eq!(app.attached_session_id, Some(99));
+    assert_eq!(app.active_session_id, Some(99));
+    assert_eq!(app.status, None);
+    assert!(
+        rx.try_iter().next().is_none(),
+        "no attach may be sent when the parent is missing from the summary"
+    );
 }
 
 #[test]

@@ -15,8 +15,17 @@ incompatible-rust-versions = "fallback"
 # (and their tests) live behind the `pdf` feature, which resolves to a security
 # fork only via the workspace `[patch.crates-io]` — running the suite with all
 # features on is what keeps those tests in CI.
+#
+# `test-lean` is the complement: it runs the unit suite with every optional
+# feature off (the default configuration). That is the only way the metrics
+# no-op stub backend and the feature-off `--metrics-addr` refusal in
+# `server/lifecycle.rs` get compiled — the `--all-features` aliases never build
+# that path, so `test-lean` guards against the stub signatures drifting apart
+# from the real backend.
 [alias]
 test-fast = "nextest run --workspace --all-features"                 # unit tests
+# unit tests with every optional feature off (metrics/pdf/mimalloc stubs)
+test-lean = "nextest run --workspace"
 # integration tests (the #[ignore] suite)
 test-integration = "nextest run --workspace --all-features --run-ignored only"
 # everything: unit + integration in one pass

@@ -87,6 +87,13 @@ test: test-all
 test-fast: _require-nextest _require-zig
     cargo test-fast
 
+# Unit tests with every optional feature off (the default config) — compiles
+# the metrics no-op stubs and the feature-off `--metrics-addr` refusal that the
+# `--all-features` recipes never build
+# (see .cargo/config.toml for why this guards against stub drift)
+test-lean: _require-nextest _require-zig
+    cargo test-lean
+
 # Integration tests — the #[ignore] suite — via nextest
 test-integration: _require-nextest _require-zig
     cargo test-integration

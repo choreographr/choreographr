@@ -665,6 +665,7 @@ and are marked `#[ignore]` (see AGENTS.md):
 
 ```bash
 cargo test-fast          # unit tests (nextest, parallel)
+cargo test-lean          # unit tests with every optional feature off (nextest)
 cargo test-integration   # integration tests — the #[ignore] suite (nextest)
 cargo test-all           # everything in one pass (nextest)
 
@@ -673,6 +674,13 @@ cargo test -- --ignored     # integration tests (libtest)
 cargo clippy --workspace    # lints
 cargo fmt --all             # formatting
 ```
+
+`cargo test-lean` is the feature-off run: it compiles the workspace with every
+optional feature disabled (metrics, pdf, mimalloc), which is the only way the
+metrics no-op stub backend and the feature-off `--metrics-addr` startup refusal
+in `server/lifecycle.rs` get built — the `--all-features` aliases never compile
+that configuration, so `test-lean` guards against the stubs drifting out of
+sync with the real backend.
 
 The nextest profile lives in `.config/nextest.toml`: `fail-fast = false` (run
 the whole suite even after a failure) and a 120s `slow-timeout` that aborts any
@@ -709,6 +717,7 @@ just check                # cargo check --workspace --all-targets (fastest CI si
 
 just test                 # full suite via nextest (alias of just test-all)
 just test-fast            # unit tests via nextest
+just test-lean            # unit tests, every optional feature off (nextest)
 just test-integration     # integration tests (the #[ignore] suite) via nextest
 just test-libtest         # unit tests via libtest (no nextest required)
 just test-crate choreo-proto   # a single crate via nextest
@@ -724,8 +733,9 @@ just tui / gui / im / acp # run the other clients (im takes e.g. `just im telegr
 
 `just --set profile debug build` switches the build profile (default `release`);
 `CARGO_FLAGS` (env) appends flags to every cargo invocation. The nextest-backed
-recipes (`test`, `test-fast`, `test-integration`, `test-all`, `test-crate`,
-`shard`, `retry`) fail with an install hint until `cargo-nextest` is on `PATH`.
+recipes (`test`, `test-fast`, `test-lean`, `test-integration`, `test-all`,
+`test-crate`, `shard`, `retry`) fail with an install hint until `cargo-nextest`
+is on `PATH`.
 
 ## Packaging & releases
 

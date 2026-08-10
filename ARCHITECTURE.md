@@ -1274,7 +1274,7 @@ never executes embedded files or `/Launch` actions, so the classic PDF malware
 > `[patch.crates-io]` redirects that version to a contributor fork
 > (`omeileo/pdf-inspector@f86decf`, upstream PR firecrawl/pdf-inspector#198) for **local
 > builds only** — dev, tests (`--all-features`), and the release binaries
-> (`scripts/release.sh --features pdf`). The fork exists because upstream still ships
+> (`scripts/release.sh --features pdf,metrics`). The fork exists because upstream still ships
 > `lopdf ^0.41.0`, vulnerable to RUSTSEC-2026-0187: a ~21 KB crafted PDF with ~10,000-deep
 > nested objects aborts the process via stack overflow — a SIGABRT that `catch_unwind`
 > **cannot** intercept. The fork bumps `lopdf` to 0.42.0 (MAX_NESTING_DEPTH), verified
@@ -1858,7 +1858,10 @@ The daemon can expose a `/metrics` HTTP endpoint in the OpenMetrics format
 > that pass it get a clear, actionable error instead of clap's "unexpected
 > argument") but the daemon refuses to start rather than silently ignoring the
 > requested endpoint. The integration test (`tests/metrics_integration.rs`)
-> is gated with `#![cfg(feature = "metrics")]`.
+> is gated with `#![cfg(feature = "metrics")]`, and `cargo test-lean` — the
+> feature-off unit run — is what keeps the no-op stubs and the `--metrics-addr`
+> refusal path compiled: the `--all-features` test aliases never build that
+> configuration.
 
 **CLI flag:** `--metrics-addr <ADDR>` (e.g. `127.0.0.1:9464`). When the flag is
 absent no metrics server is started — the daemon runs exactly as before.
@@ -2103,8 +2106,13 @@ counts survive the attach instead of regressing.
   pre-transition active status is what distinguishes "just finished" from a
   duplicate idle→idle broadcast (summary refresh, re-attach of an already
   finished child), which never re-fires.  The switch (`App::switch_back_to_parent`)
-  reuses the Session Manager attach sequence — `UnsubscribeSessionsSummary`
-  then `AttachSession` — so a broken pipe leaves the view untouched.
+  delegates to the shared `App::attach_to_session` sequence used by every
+  attach path (Session Manager list/detail Enter included) —
+  `UnsubscribeSessionsSummary` then `AttachSession`, sent before the local
+  state is mutated — so a broken pipe leaves the view untouched.  The check
+  also requires the parent to still exist in the summary list: a child whose
+  parent was deleted while it ran stays put instead of attaching to a dead
+  session id.
 
 
 ---

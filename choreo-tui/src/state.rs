@@ -2963,7 +2963,8 @@ impl App {
     /// Returns the parent session id to switch back to, or `None` when the
     /// user is not viewing a finishing sub-session.  The parent id (and the
     /// titles for the notification) come from the summary list, so a missing
-    /// summary is a graceful no-op rather than a misdirected switch.
+    /// summary — or a parent that no longer exists in it — is a graceful
+    /// no-op rather than a misdirected switch.
     pub(crate) fn attached_subsession_finished(
         &self,
         session_id: u64,
@@ -2985,20 +2986,72 @@ impl App {
         // Only the active → idle transition counts as "finished".  Idle →
         // idle (e.g. a summary refresh after the child already finished)
         // must not yank the view away while the user is still reading.
-        if summary.status.is_active() && !new_status.is_active() {
+        if summary.status.is_active()
+            && !new_status.is_active()
+            // The parent must still exist in the summary: if it was deleted
+            // while the child ran, switching would attach to a dead session
+            // id and strand the user on a session the daemon rejects.
+            && self
+                .session_mgr
+                .sessions
+                .iter()
+                .any(|s| s.session_id == parent_id)
+        {
             Some(parent_id)
         } else {
             None
         }
     }
 
+    /// Attach the Chat view to `session_id` via the shared sequence every
+    /// attach path follows (Session Manager list/detail Enter, and the
+    /// sub-session finish switch-back).
+    ///
+    /// The daemon messages are sent *before* the local state is mutated, so a
+    /// broken pipe leaves the view on the previous session instead of
+    /// stranding the user on a session that was never attached.
+    /// `UnsubscribeSessionsSummary` is idempotent on the daemon (removing a
+    /// client that was never registered is a no-op), so it is safe to send
+    /// unconditionally.  `reset_for_session_switch` runs before `set_page` so
+    /// the subsequent `set_page` marks the target's display dirty — the one
+    /// that will actually render next — and `attached_status` is refreshed
+    /// immediately from the summary instead of waiting for the daemon's
+    /// `SessionAttached` reply to arrive.
+    pub(crate) fn attach_to_session(
+        &mut self,
+        session_id: u64,
+        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    ) -> Result<(), ClientError> {
+        client_tx
+            .send(ClientMessage::UnsubscribeSessionsSummary)
+            .map_err(broken_pipe)?;
+        client_tx
+            .send(ClientMessage::AttachSession { session_id })
+            .map_err(broken_pipe)?;
+        // reset_for_session_switch first so the subsequent set_page marks the
+        // target's display dirty — the one that will actually render next.
+        self.reset_for_session_switch(session_id);
+        self.set_page(Page::Chat);
+        self.attached_session_id = Some(session_id);
+        // Refresh the status bar right away from the summary; the daemon's
+        // SessionAttached reply re-applies the same (possibly newer) value.
+        self.attached_status = self
+            .session_mgr
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_id)
+            .map(|s| s.status.clone());
+        Ok(())
+    }
+
     /// Switch the Chat view back to the parent session of a sub-session that
     /// just finished, and surface a status notification explaining the jump.
     ///
-    /// Mirrors the Session Manager Enter handler's attach sequence: the
-    /// daemon messages are sent *before* the local state is mutated, so a
-    /// broken pipe leaves the view on the finished sub-session instead of
-    /// stranding the user on a session that was never attached.
+    /// Delegates to [`attach_to_session`] — the same sequence the Session
+    /// Manager Enter handlers use — so the daemon messages are sent *before*
+    /// the local state is mutated, and a broken pipe leaves the view on the
+    /// finished sub-session instead of stranding the user on a session that
+    /// was never attached.
     pub(crate) fn switch_back_to_parent(
         &mut self,
         finished_session_id: u64,
@@ -3019,22 +3072,7 @@ impl App {
         let subsession_title = title(finished_session_id);
         let parent_title = title(parent_id);
 
-        // UnsubscribeSessionsSummary is idempotent on the daemon (removing a
-        // client that was never registered is a no-op), so it is safe to send
-        // unconditionally, matching the Session Manager attach path.
-        client_tx
-            .send(ClientMessage::UnsubscribeSessionsSummary)
-            .map_err(broken_pipe)?;
-        client_tx
-            .send(ClientMessage::AttachSession {
-                session_id: parent_id,
-            })
-            .map_err(broken_pipe)?;
-        // reset_for_session_switch first so the subsequent set_page marks the
-        // parent's display dirty — the one that will actually render next.
-        self.reset_for_session_switch(parent_id);
-        self.set_page(Page::Chat);
-        self.attached_session_id = Some(parent_id);
+        self.attach_to_session(parent_id, client_tx)?;
 
         self.status = Some(format!(
             "Subsession \"{subsession_title}\" finished. Switched back to parent \"{parent_title}\"."

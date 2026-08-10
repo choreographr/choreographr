@@ -25,7 +25,7 @@ mimalloc = { version = "0.1", optional = true }
 # Off by default so `cargo install choreographr` from crates.io never pulls the
 # git-pinned pdf-inspector fork (crates.io rejects git deps, and the unpatched
 # registry version re-opens RUSTSEC-2026-0187 — see [patch.crates-io] below).
-# scripts/release.sh builds the release binaries with `--features pdf`, which
+# scripts/release.sh builds the release binaries with `--features pdf,metrics`, which
 # resolves the fork via the workspace patch.
 pdf = ["choreo-daemon/pdf"]
 # Prometheus/OpenMetrics instrumentation + `/metrics` HTTP server. Off by
@@ -192,7 +192,7 @@ unicode-segmentation = "1.13"
 # no-git-dependencies rule. This workspace-root patch then redirects that
 # registry version to `omeileo/pdf-inspector@f86decf` whenever we build from
 # the git tree (dev builds, tests with `--all-features`, and the release
-# binaries via `scripts/release.sh --features pdf`). Patches are never
+# binaries via `scripts/release.sh --features pdf,metrics`). Patches are never
 # included in published manifests, so crates.io consumers resolve the plain
 # registry version — which is exactly why the `pdf` feature is off by default
 # (see the comments in the root [features] and `choreo-daemon/Cargo.toml`).

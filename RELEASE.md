@@ -115,8 +115,9 @@ Both machines run the same dry-run flow. `scripts/release.sh`:
 
 - reads the version from `Cargo.toml`,
 - guards against a dirty tree,
-- builds with `--features pdf` (the workspace patch hardens the PDF parser
-  for the shipped binaries even though crates.io doesn't get it),
+- builds with `--features pdf,metrics` (the workspace patch hardens the PDF
+  parser for the shipped binaries even though crates.io doesn't get it, and
+  the `/metrics` endpoint stays available as the README advertises),
 - writes the tarball + `SHA256SUMS` (covering everything already in `dist/`
   for this version) into `dist/`,
 - builds `.deb`/`.rpm` best-effort (Linux only, host glibc, no mimalloc),

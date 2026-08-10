@@ -14,6 +14,39 @@ use std::thread;
 use std::time::Duration;
 use tracing::{error, info};
 
+/// Resolve and spawn the `/metrics` HTTP server thread.
+///
+/// Feature-on build: parse the socket address (rejecting garbage with an
+/// actionable message) and serve on it until the shutdown flag is set.
+#[cfg(feature = "metrics")]
+fn start_metrics_server(addr_str: &str, shutdown: &Arc<AtomicBool>) -> io::Result<()> {
+    let addr: SocketAddr = addr_str.parse().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid --metrics-addr: {e}"),
+        )
+    })?;
+    let shutdown_flag = Arc::clone(shutdown);
+    thread::spawn(move || {
+        crate::metrics::serve_metrics(addr, shutdown_flag);
+    });
+    Ok(())
+}
+
+/// Refuse startup when `--metrics-addr` is passed to a feature-off build.
+///
+/// The flag is still parsed by clap (so scripts that pass it get this clear,
+/// actionable error instead of clap's confusing "unexpected argument"), but
+/// the daemon refuses to start rather than silently ignoring the requested
+/// endpoint.
+#[cfg(not(feature = "metrics"))]
+fn start_metrics_server(addr_str: &str, _shutdown: &Arc<AtomicBool>) -> io::Result<()> {
+    Err(io::Error::other(format!(
+        "--metrics-addr {addr_str}: this build was compiled without the \
+         `metrics` feature; rebuild with `--features metrics` to serve /metrics"
+    )))
+}
+
 pub fn run_server(
     socket_path: &str,
     mut state: DaemonState,
@@ -107,26 +140,7 @@ pub fn run_server(
     // confusing "unexpected argument"), but the daemon refuses to start
     // rather than silently ignoring the requested endpoint.
     if let Some(ref addr_str) = metrics_addr {
-        #[cfg(feature = "metrics")]
-        {
-            let addr: SocketAddr = addr_str.parse().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid --metrics-addr: {e}"),
-                )
-            })?;
-            let shutdown_flag = Arc::clone(&shutdown);
-            thread::spawn(move || {
-                crate::metrics::serve_metrics(addr, shutdown_flag);
-            });
-        }
-        #[cfg(not(feature = "metrics"))]
-        {
-            return Err(io::Error::other(format!(
-                "--metrics-addr {addr_str}: this build was compiled without the \
-                 `metrics` feature; rebuild with `--features metrics` to serve /metrics"
-            )));
-        }
+        start_metrics_server(addr_str, &shutdown)?;
     }
 
     // TCP listener for Noise IK clients.
@@ -261,4 +275,39 @@ pub fn run_server(
         std::fs::remove_file(socket_path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feature-on builds parse the address before spawning the server thread,
+    /// so a malformed `--metrics-addr` must be a startup error — and the
+    /// message must say why (no server is spawned for a bad address).
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn metrics_addr_rejects_malformed_socket() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let err = start_metrics_server("not-a-socket-address", &shutdown).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --metrics-addr"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Feature-off builds refuse startup entirely and must point the operator
+    /// at the opt-in feature.  This is the path `cargo test-lean` keeps honest:
+    /// the `--all-features` test aliases never compile it.
+    #[cfg(not(feature = "metrics"))]
+    #[test]
+    fn metrics_addr_refused_when_feature_off() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let err = start_metrics_server("127.0.0.1:9464", &shutdown).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--metrics-addr"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("--features metrics"),
+            "error must point at the opt-in feature: {msg}"
+        );
+    }
 }
