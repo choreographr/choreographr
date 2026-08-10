@@ -26,7 +26,7 @@ pub struct TextEditArgs {
     pub replace_all: Option<bool>,
 }
 
-pub(crate) fn execute_edit_file_tool(
+pub fn execute_edit_file_tool(
     args: &EditFileArgs,
     working_dir: Option<&Path>,
 ) -> Result<String, ToolExecError> {

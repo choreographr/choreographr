@@ -32,7 +32,9 @@ pub use crate::sessions::{
 pub use crate::tools::exec::{ExecArgs, execute_exec_tool};
 pub use crate::tools::find::{FindArgs, execute_find_tool};
 pub use crate::tools::fish::{FishArgs, execute_fish_tool};
-pub use crate::tools::fs::{ListFilesArgs, execute_list_files_tool};
+pub use crate::tools::fs::{
+    EditFileArgs, ListFilesArgs, TextEditArgs, execute_edit_file_tool, execute_list_files_tool,
+};
 pub use crate::tools::git::{
     GitAddArgs, GitCommitArgs, GitDiffArgs, GitLogArgs, GitPushArgs, GitRepoArgs, GitShowArgs,
     execute_git_add_tool, execute_git_commit_tool, execute_git_diff_tool, execute_git_log_tool,
@@ -50,7 +52,7 @@ pub(crate) use crate::tools::sha256_hex;
 pub use crate::tools::vm::{RunRiscVInput, execute_run_riscv_tool};
 
 #[cfg(test)]
-pub(crate) use crate::tools::fs::{execute_edit_file_tool, execute_write_file_tool};
+pub(crate) use crate::tools::fs::execute_write_file_tool;
 
 #[cfg(test)]
 mod tests;
