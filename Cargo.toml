@@ -60,16 +60,20 @@ path = "src/bin/choreo-acp.rs"
 # the package itself, instead of needing a manual `--pkg-url`. The `{ ... }`
 # tokens are binstall template variables; spaces inside them are ignored.
 [package.metadata.binstall]
-pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-{ target }.{ archive-suffix }"
+pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-{ target }{ archive-suffix }"
 bin-dir = ""
+pkg-fmt = "tgz"
 
 # Linux glibc hosts (x86_64-unknown-linux-gnu) get no release tarball: the
 # Linux tarball is the static musl build. Map that target to the musl asset so
 # plain `cargo binstall choreographr` works on glibc distros without --target.
-# ({ version } renders as bare 0.1.0; the `v` prefix on the tag is written
-# explicitly in the path — see binstall's DEFAULT_PKG_URL template.)
+#
+# Template notes (binstall semantics): `{ version }` renders as the bare semver
+# (0.1.0) — the `v` prefix on the tag is written explicitly in the path — and
+# `{ archive-suffix }` already includes the leading dot (`.tar.gz`), so there
+# is NO literal dot before it (`.{ archive-suffix }` would produce `..tar.gz`).
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
-pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-x86_64-unknown-linux-musl.{ archive-suffix }"
+pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-x86_64-unknown-linux-musl{ archive-suffix }"
 
 [workspace]
 members = [
