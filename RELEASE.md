@@ -78,18 +78,19 @@ just preflight               # checks cargo + zig, notes nextest
    | `minor` | 0.1.1 → 0.2.0 | New features or behavior changes. While on 0.x, breaking changes also land here (semver treats 0.x minor as "may break") |
    | `major` | 0.2.0 → 1.0.0 | Breaking changes after 1.0, or the deliberate move to 1.0.0 (stability commitment) |
 
-2. **Enact the decision** — the level you chose in step 1 **is the argument**
-   to `cargo release version`. `[workspace.package] version` is the single
-   source of truth; every member inherits it via `version.workspace = true`,
-   so the bump is **one edit**, not twelve. The command previews a dry run by
-   default; `-x` applies it:
+2. **Enact the decision** — the command that carries it out is
+   `cargo release version <level>`, where `<level>` is replaced with the
+   level you decided in step 1 (`patch` / `minor` / `major`). Nothing else
+   needs to know the decision: `cargo release publish` takes no level, and
+   there is no config flag — the level is this one argument. The command
+   makes the single `[workspace.package] version` edit (plus `Cargo.lock`);
+   all 12 members inherit it. Dry-run first (the default); `-x` applies it:
 
    ```bash
-   cargo release version minor    # dry-run: preview the bump plan (substitute
-                                  # the level from step 1: patch / minor / major)
-   cargo release version minor -x # apply: edits [workspace.package] version in
-                                  # Cargo.toml (and Cargo.lock); all 12 members
-                                  # follow
+   cargo release version <level>    # dry-run: preview the bump plan
+   cargo release version <level> -x # apply — e.g. decided `minor`:
+                                    #   cargo release version minor -x
+                                    # edits version = "0.1.1" → "0.2.0"
    ```
 
    `cargo release version` only edits the manifests — it does **not** commit
@@ -316,7 +317,7 @@ repo and push.
 ## Quick checklist (condensed)
 
 - [ ] `just ci` green; tree clean; master pulled
-- [ ] `cargo release version patch -x` → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
+- [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
 - [ ] `cargo release publish` → 12 crates on crates.io; `cargo install --locked` verified
 - [ ] Linux box: `just release` + `just smoke-test` → musl tarball, `.deb`, `.rpm`, `SHA256SUMS`
 - [ ] MacBook: `just release` + `just smoke-test` + daemon/keystore/plist/TUI smoke test
