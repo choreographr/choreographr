@@ -1,14 +1,14 @@
 //! Prometheus/OpenMetrics instrumentation and the `/metrics` HTTP server.
 //!
-//! Compiled only when the `metrics` cargo feature is enabled (on by default;
-//! `--no-default-features` compiles it out along with the prometheus and
-//! tiny_http dependencies). The public API is identical in both
-//! configurations — with the feature off, every function is an inert no-op
-//! stub — so the daemon's ~20 instrumentation call sites compile unchanged
-//! and can never drift apart from the real signatures. This also mirrors the
-//! real implementation's existing "no-op when never initialized" behavior
-//! (see the `METRICS.get()` guards), so feature-off builds behave exactly
-//! like feature-on builds that never called [`init`].
+//! Compiled only when the `metrics` cargo feature is enabled (off by default;
+//! build with `--features metrics` to opt in — plain builds drop the
+//! prometheus and tiny_http dependencies entirely). The public API is
+//! identical in both configurations — with the feature off, every function is
+//! an inert no-op stub — so the daemon's ~20 instrumentation call sites
+//! compile unchanged and can never drift apart from the real signatures. This
+//! also mirrors the real implementation's existing "no-op when never
+//! initialized" behavior (see the `METRICS.get()` guards), so feature-off
+//! builds behave exactly like feature-on builds that never called [`init`].
 
 #[cfg(feature = "metrics")]
 mod backend {

@@ -73,12 +73,14 @@ echo "==> building release binaries (root package)"
 # Build only the four shipped binaries: `-p choreographr` pulls in the daemon,
 # TUI, IM, and ACP transitively but NOT choreo-gui (its dioxus/webkit2gtk stack
 # is not shipped and must not be a build requirement of the release machine).
-# `--features pdf` enables the native PDF tools (pdf_classify / pdf_to_markdown)
-# for the shipped binaries: the pdf-inspector dep is feature-gated off by default
-# so the published crates.io manifests stay free of the git-pinned security fork
-# (crates.io rejects git deps — see the root Cargo.toml [patch.crates-io] and
-# choreo-daemon/Cargo.toml). Building from the git tree applies the workspace
-# patch, so release binaries get the RUSTSEC-2026-0187-hardened parser.
+# `--features pdf,metrics` enables the native PDF tools (pdf_classify /
+# pdf_to_markdown) and the Prometheus `/metrics` endpoint for the shipped
+# binaries — both are off by default so the published crates.io manifests stay
+# lean (the pdf-inspector dep is feature-gated off by default because crates.io
+# rejects git deps, and the security fork is workspace-local; see the root
+# Cargo.toml [patch.crates-io] and choreo-daemon/Cargo.toml). Building from the
+# git tree applies the workspace patch, so release binaries get the
+# RUSTSEC-2026-0187-hardened parser.
 
 # ── Tarball build ────────────────────────────────────────────────────────────
 # The Linux tarball is a fully static x86_64-unknown-linux-musl cross-build.
@@ -101,10 +103,10 @@ echo "==> building release binaries (root package)"
 # the standard solution. zlob is unaffected — its build.rs already maps the
 # triple itself.
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
-    cargo zigbuild --release -p choreographr --target x86_64-unknown-linux-musl --features pdf,mimalloc
+    cargo zigbuild --release -p choreographr --target x86_64-unknown-linux-musl --features pdf,metrics,mimalloc
     TARBALL_BIN_DIR="target/x86_64-unknown-linux-musl/release"
 else
-    cargo build --release -p choreographr --features pdf
+    cargo build --release -p choreographr --features pdf,metrics
     TARBALL_BIN_DIR="target/release"
 fi
 
@@ -139,7 +141,7 @@ tar czf "$TARBALL" -C "$STAGE" \
 # step is skipped — dpkg/rpmbuild are not present.)
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     echo "==> building host (glibc) release binaries for .deb/.rpm"
-    cargo build --release -p choreographr --features pdf
+    cargo build --release -p choreographr --features pdf,metrics
 fi
 
 # .deb/.rpm are best-effort: skip with a warning when the toolchain is absent

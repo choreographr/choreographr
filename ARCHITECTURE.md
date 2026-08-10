@@ -489,7 +489,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `providers/mod.rs` | `InferenceProvider` — protocol-erased facade wrapping `Arc<dyn ProviderClient>` plus the catalog slug. `from_account_config()` dispatches by `ProviderProtocol` and constructs the right client from `choreo-ai-protocols`. Records API metrics (`record_api_call`/`record_api_error`) around each turn — timing lives here, not in the provider crate. |
 | `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional working directory. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
-| `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. Compiled only when the `metrics` cargo feature is enabled (on by default); disabled builds get no-op stubs so the instrumentation call sites compile unchanged. |
+| `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. Compiled only when the `metrics` cargo feature is enabled (off by default; release binaries opt in via `scripts/release.sh`); disabled builds get no-op stubs so the instrumentation call sites compile unchanged. |
 | `tools/` | `Tool` trait (with `output_schema` for programmatic tool calling, `allowed_callers` for caller-level gating), `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 30+ registered tools (including `list_sessions`, `get_session`, `load_skill` via `admin/`). |
 | `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, selected model, working directory) passed to tools that need DB or daemon access or parent config for sub-sessions. |
 | `tools/db/` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`), one file per tool (`set.rs`, `get.rs`, `delete.rs`, `delete_range.rs`, `get_range.rs`, `list.rs`, `count.rs`) with shared `DbError`/`DbValue` in `db/mod.rs`. |
@@ -1848,15 +1848,17 @@ The daemon can expose a `/metrics` HTTP endpoint in the OpenMetrics format
 (suitable for Prometheus scraping).
 
 > **Feature gate.** The metrics machinery lives behind the `metrics` cargo
-> feature, **on by default** at both the `choreo-daemon` crate and the root
-> `choreographr` package. Building with `--no-default-features` compiles it out
-> entirely — no `prometheus`/`tiny_http` dependencies, and the module's public
-> API degrades to inert no-op stubs so the ~20 instrumentation call sites across
-> the daemon compile unchanged. In a feature-off build the `--metrics-addr`
-> flag is still accepted (so scripts that pass it get a clear, actionable error
-> instead of clap's "unexpected argument") but the daemon refuses to start
-> rather than silently ignoring the requested endpoint. The integration test
-> (`tests/metrics_integration.rs`) is gated with `#![cfg(feature = "metrics")]`.
+> feature, **off by default** at both the `choreo-daemon` crate and the root
+> `choreographr` package — a plain build compiles it out entirely, with no
+> `prometheus`/`tiny_http` dependencies and the module's public API degraded
+> to inert no-op stubs, so the ~20 instrumentation call sites across the
+> daemon compile unchanged. Opt in with `cargo build --features metrics`
+> (release binaries enable it explicitly via `scripts/release.sh`). In a
+> feature-off build the `--metrics-addr` flag is still accepted (so scripts
+> that pass it get a clear, actionable error instead of clap's "unexpected
+> argument") but the daemon refuses to start rather than silently ignoring the
+> requested endpoint. The integration test (`tests/metrics_integration.rs`)
+> is gated with `#![cfg(feature = "metrics")]`.
 
 **CLI flag:** `--metrics-addr <ADDR>` (e.g. `127.0.0.1:9464`). When the flag is
 absent no metrics server is started — the daemon runs exactly as before.
@@ -2639,6 +2641,6 @@ enum lets callers choose between `Text` (human-readable via `return_string`) and
 (JSON-encoded via `serde_json::to_string`) output formats.
 | `gix` | daemon | Git operations |
 | `teloxide` | choreo-im | Telegram Bot API client |
-| `prometheus` | daemon | OpenMetrics instrumentation, process metrics (optional — behind the `metrics` feature, on by default) |
-| `tiny_http` | daemon | Metrics HTTP server for `/metrics` endpoint (optional — behind the `metrics` feature, on by default) |
+| `prometheus` | daemon | OpenMetrics instrumentation, process metrics (optional — behind the `metrics` feature, off by default) |
+| `tiny_http` | daemon | Metrics HTTP server for `/metrics` endpoint (optional — behind the `metrics` feature, off by default) |
 | `tracing` | daemon | Structured logging |

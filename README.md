@@ -639,16 +639,19 @@ include session counts, connection counts, request latency, API call latency,
 tool execution time, error breakdowns, and process-level metrics (RSS, CPU,
 file descriptors).
 
-Metrics are compiled in by default via the `metrics` cargo feature. For a lean
-build without the Prometheus machinery, disable them:
+Metrics are compiled in via the `metrics` cargo feature, which is
+**off by default**. A plain build omits the Prometheus machinery entirely. To
+enable the endpoint:
 
 ```bash
-cargo build --release -p choreographr --no-default-features
+cargo run --release -p choreographr --features metrics -- --metrics-addr 127.0.0.1:9464
 ```
 
-In such a build the `--metrics-addr` flag is still accepted but the daemon
-refuses to start with a clear error telling you to rebuild with
-`--features metrics`.
+Release binaries enable `metrics` explicitly (alongside `pdf`) via
+`scripts/release.sh`, so installed binaries keep the `/metrics` endpoint. When
+a build was made without the feature, the `--metrics-addr` flag is still
+accepted but the daemon refuses to start with a clear error telling you to
+rebuild with `--features metrics`.
 
 ## Testing & development
 

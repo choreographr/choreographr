@@ -13,10 +13,7 @@ readme.workspace = true
 default-run = "choreographr"
 
 [dependencies]
-# default-features = false so `cargo build --no-default-features` at the root
-# yields a truly lean daemon (no prometheus/tiny_http). The daemon's `metrics`
-# feature is re-enabled here via the root `default`/`metrics` features below.
-choreo-daemon = { path = "choreo-daemon", version = "0.1", default-features = false }
+choreo-daemon = { path = "choreo-daemon", version = "0.1" }
 choreo-tui = { path = "choreo-tui", version = "0.1" }
 choreo-im = { path = "choreo-im", version = "0.1" }
 choreo-acp = { path = "choreo-acp", version = "0.1" }
@@ -24,11 +21,6 @@ anyhow.workspace = true
 mimalloc = { version = "0.1", optional = true }
 
 [features]
-# Default feature set: Prometheus metrics only. Mirrors what the daemon
-# always shipped, re-enabled explicitly because the dep above opts out of
-# defaults (`default-features = false`) so that `--no-default-features` here
-# actually drops the metrics machinery from all four shipped binaries.
-default = ["metrics"]
 # Native PDF tools (pdf_classify / pdf_to_markdown) for the shipped binaries.
 # Off by default so `cargo install choreographr` from crates.io never pulls the
 # git-pinned pdf-inspector fork (crates.io rejects git deps, and the unpatched
@@ -36,9 +28,10 @@ default = ["metrics"]
 # scripts/release.sh builds the release binaries with `--features pdf`, which
 # resolves the fork via the workspace patch.
 pdf = ["choreo-daemon/pdf"]
-# Prometheus/OpenMetrics instrumentation + `/metrics` HTTP server. On by
-# default (see `default` above); disable with `--no-default-features` for a
-# lean build without the prometheus/tiny_http dependency tree.
+# Prometheus/OpenMetrics instrumentation + `/metrics` HTTP server. Off by
+# default (mirrors `choreo-daemon`); build with `--features metrics` (or
+# `--features pdf,metrics` for release binaries) to opt in. Release binaries
+# ship it via scripts/release.sh, keeping the advertised `/metrics` endpoint.
 metrics = ["choreo-daemon/metrics"]
 # mimalloc — process-wide allocator, enabled ONLY by the static musl tarball
 # build in scripts/release.sh (musl's default malloc is weaker; mimalloc's
