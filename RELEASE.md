@@ -7,7 +7,7 @@ A release ships three things:
 
 1. **12 crates to crates.io** (everything except `choreo-gui`, in dependency
    order) — enables `cargo install choreographr` / `cargo binstall`.
-2. **GitHub release `vX.Y.Z`** on `ethernomad/choreographr` with prebuilt
+2. **GitHub release `vX.Y.Z`** on `choreographr/choreographr` with prebuilt
    artifacts (tarballs, `.deb`, `.rpm`, `SHA256SUMS`) — enables Homebrew,
    AUR, `cargo binstall`, and the `choreographr.com` installer.
 3. **Channel updates** — Homebrew tap, AUR, choreographr.com.
@@ -253,7 +253,7 @@ gh release create vX.Y.Z \
 
 ## Phase 5 — Channel updates
 
-### Homebrew tap (`ethernomad/homebrew-choreographr`)
+### Homebrew tap (`choreographr/homebrew-choreographr`)
 
 Edit `Formula/choreographr.rb` (mirrored in this repo at
 `packaging/homebrew/choreographr.rb`):
@@ -297,7 +297,7 @@ Exercise every install route from a clean environment:
 |---|---|---|
 | crates.io (source) | `cargo install choreographr --locked` (with zig) | builds, `--version` = X.Y.Z |
 | binstall (prebuilt) | `cargo binstall choreographr` | fetches tarball, no toolchain |
-| Homebrew | `brew tap ethernomad/choreographr && brew install choreographr` | no quarantine friction |
+| Homebrew | `brew tap choreographr/choreographr && brew install choreographr` | no quarantine friction |
 | AUR | `choreographr-bin` | installs, `choreographr --version` |
 | curl installer | `curl -fsSL https://choreographr.com/install.sh \| sh` | sha256-verified extract |
 | .deb / .rpm | `dpkg -i` / `dnf install` on clean distro VMs | installs; unit present, **not enabled** |

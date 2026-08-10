@@ -60,7 +60,7 @@ path = "src/bin/choreo-acp.rs"
 # the package itself, instead of needing a manual `--pkg-url`. The `{ ... }`
 # tokens are binstall template variables; spaces inside them are ignored.
 [package.metadata.binstall]
-pkg-url = "https://github.com/ethernomad/choreographr/releases/download/{ version }/choreographr-{ version }-{ target }.{ archive-suffix }"
+pkg-url = "https://github.com/choreographr/choreographr/releases/download/{ version }/choreographr-{ version }-{ target }.{ archive-suffix }"
 bin-dir = ""
 
 [workspace]
@@ -92,7 +92,7 @@ resolver = "3"
 rust-version = "1.91"
 version = "0.1.0"
 license = "Apache-2.0"
-repository = "https://github.com/ethernomad/choreographr"
+repository = "https://github.com/choreographr/choreographr"
 homepage = "https://choreographr.com"
 readme = "README.md"
 description = "Agentic coding assistant — daemon, TUI, and bridges"

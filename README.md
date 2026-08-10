@@ -249,11 +249,11 @@ below use prebuilt binaries; no Rust or Zig toolchain is required.
 
 ### macOS
 
-**Homebrew (recommended).** The `ethernomad/choreographr` tap provides a
+**Homebrew (recommended).** The `choreographr/choreographr` tap provides a
 prebuilt formula — no toolchain needed:
 
 ```bash
-brew tap ethernomad/choreographr
+brew tap choreographr/choreographr
 brew install choreographr
 brew services start choreographr
 ```
@@ -265,7 +265,7 @@ Alternatives:
 
 - **GitHub Releases tarball** — download
   `choreographr-0.1.0-aarch64-apple-darwin.tar.gz` from the
-  [releases page](https://github.com/ethernomad/choreographr/releases) and
+  [releases page](https://github.com/choreographr/choreographr/releases) and
   put the four binaries on your `PATH`. The binaries are unsigned, so
   Gatekeeper quarantines them: clear the attribute with
   `xattr -dr com.apple.quarantine /path/to/choreographr`, or right-click →

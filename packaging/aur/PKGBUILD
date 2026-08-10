@@ -23,7 +23,7 @@ depends=()
 # The Linux release tarball is the fully static musl build (see
 # scripts/release.sh): one artifact serves general Linux AND the AUR -bin
 # package.
-source=("https://github.com/ethernomad/choreographr/releases/download/v0.1.0/choreographr-0.1.0-x86_64-unknown-linux-musl.tar.gz")
+source=("https://github.com/choreographr/choreographr/releases/download/v0.1.0/choreographr-0.1.0-x86_64-unknown-linux-musl.tar.gz")
 # SKIP: the real digest is computed at release time (scripts/release.sh writes
 # dist/SHA256SUMS); replace with it when bumping pkgver.
 sha256sums=('SKIP')

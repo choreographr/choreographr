@@ -36,7 +36,7 @@ correctly once the user loads it, but loading is always the user's action.
 |---|---|---|
 | `choreographr.service` | systemd **user** unit (runs `~/.local/bin/choreographr`, `Restart=on-failure`) | inside the release tarball, the `.deb`, and the `.rpm`; installed by `scripts/install.sh` |
 | `com.choreographr.daemon.plist` | launchd agent for **non-Homebrew** macOS installs (logs to `/tmp/choreographr.log`) | inside the release tarball; installed by `scripts/install.sh`. Homebrew installs use the formula's `service do` block instead |
-| `homebrew/choreographr.rb` | Homebrew formula — prebuilt tarball variant, no build toolchain | the `ethernomad/homebrew-choreographr` tap |
+| `homebrew/choreographr.rb` | Homebrew formula — prebuilt tarball variant, no build toolchain | the `choreographr/homebrew-choreographr` tap |
 | `aur/PKGBUILD` + `aur/.SRCINFO` | Arch package `choreographr-bin` (prebuilt, empty `depends=` — static binaries) | the AUR |
 | `rpm/choreographr.spec` | RPM spec for the fat package (four binaries + systemd unit) | consumed by `scripts/build-rpm.sh`; the resulting `.rpm` ships in the GitHub release |
 
@@ -51,7 +51,7 @@ mimalloc as the allocator), so one artifact serves general Linux — including
 the AUR `choreographr-bin` package — regardless of the host's glibc version;
 the macOS tarball is the native `aarch64-apple-darwin` build. The
 tarball is published to the GitHub release
-(`https://github.com/ethernomad/choreographr/releases`) and mirrored at
+(`https://github.com/choreographr/choreographr/releases`) and mirrored at
 `https://choreographr.com/download/<version>/`, where a `SHA256SUMS` file sits
 beside it for `scripts/install.sh`.
 

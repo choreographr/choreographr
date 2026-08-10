@@ -202,7 +202,7 @@ echo "    gh release create v${VERSION} ${GH_ARTIFACTS[*]} --title \"choreograph
 echo
 echo "==> post-publish checklist:"
 echo "  - Homebrew: bump packaging/homebrew/choreographr.rb (version, urls,"
-echo "    shasum -a 256) and push to the ethernomad/homebrew-choreographr tap"
+echo "    shasum -a 256) and push to the choreographr/homebrew-choreographr tap"
 echo "  - AUR: bump pkgver in packaging/aur/PKGBUILD + regenerate .SRCINFO"
 echo "    (makepkg --printsrcinfo > .SRCINFO)"
 echo "  - crates.io: cargo release (version bump + tag + publish of the 12"

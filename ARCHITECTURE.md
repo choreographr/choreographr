@@ -159,7 +159,7 @@ non-system allocator).
 |---|---|
 | `choreographr.service` | systemd **user** unit (`ExecStart=%h/.local/bin/choreographr`, `Restart=on-failure`, `WantedBy=default.target`) — shipped in the tarball, `.deb`, and `.rpm`; installed to `~/.config/systemd/user/` by `install.sh` |
 | `com.choreographr.daemon.plist` | launchd agent for **non-Homebrew** macOS installs (`RunAtLoad`/`KeepAlive` true, logs to `/tmp/choreographr.log`, hardcoded `/opt/homebrew/bin/choreographr`) — shipped in the tarball; Homebrew installs use the formula's `service do` block instead |
-| `homebrew/choreographr.rb` | Homebrew formula for the `ethernomad/choreographr` tap — prebuilt-tarball variant (no build toolchain); its `service do` block backs `brew services` |
+| `homebrew/choreographr.rb` | Homebrew formula for the `choreographr/choreographr` tap — prebuilt-tarball variant (no build toolchain); its `service do` block backs `brew services` |
 | `aur/PKGBUILD` + `aur/.SRCINFO` | Arch `choreographr-bin` (prebuilt; empty `depends=` — static binaries) |
 | `rpm/choreographr.spec` | RPM spec for the fat package — compiles nothing: `build-rpm.sh` stages the prebuilt binaries into the build root and disables `__os_install_post` so they are not stripped/rewritten |
 
@@ -183,8 +183,8 @@ with `systemctl --user enable --now choreographr` (Linux) or
 
 ### Distribution channels (0.1)
 
-- **Homebrew tap** — `brew tap ethernomad/choreographr && brew install choreographr` (prebuilt formula)
-- **GitHub Releases** — the tarball, `SHA256SUMS`, and the `.deb`/`.rpm` at `https://github.com/ethernomad/choreographr/releases`
+- **Homebrew tap** — `brew tap choreographr/choreographr && brew install choreographr` (prebuilt formula)
+- **GitHub Releases** — the tarball, `SHA256SUMS`, and the `.deb`/`.rpm` at `https://github.com/choreographr/choreographr/releases`
 - **choreographr.com** — `https://choreographr.com/download/<version>/` mirrors the tarball and `SHA256SUMS` (this is what `install.sh` fetches); `https://choreographr.com/install.sh` serves the installer, and per-version download redirects are added at release time
 - **AUR** — `choreographr-bin`
 - **crates.io** — `cargo install choreographr` (source build, needs Zig) and `cargo binstall choreographr` (prebuilt; asset naming resolved via `[package.metadata.binstall]` below)

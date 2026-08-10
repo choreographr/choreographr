@@ -1,4 +1,4 @@
-# Choreographr — Homebrew formula for the ethernomad/homebrew-choreographr tap.
+# Choreographr — Homebrew formula for the choreographr/homebrew-choreographr tap.
 #
 # Bump procedure per release (keep in lockstep with scripts/release.sh and
 # packaging/aur/PKGBUILD):
@@ -21,11 +21,11 @@ class Choreographr < Formula
   # branch means adding them later is a one-digest change rather than a
   # formula restructure.
   if Hardware::CPU.arm?
-    url "https://github.com/ethernomad/choreographr/releases/download/v0.1.0/choreographr-0.1.0-aarch64-apple-darwin.tar.gz"
+    url "https://github.com/choreographr/choreographr/releases/download/v0.1.0/choreographr-0.1.0-aarch64-apple-darwin.tar.gz"
     sha256 "<sha256-aarch64>"
   else
     # x86_64 macOS is not shipped in 0.1 — kept for future-proofing.
-    url "https://github.com/ethernomad/choreographr/releases/download/v0.1.0/choreographr-0.1.0-x86_64-apple-darwin.tar.gz"
+    url "https://github.com/choreographr/choreographr/releases/download/v0.1.0/choreographr-0.1.0-x86_64-apple-darwin.tar.gz"
     sha256 "<sha256-x86_64>"
   end
 
