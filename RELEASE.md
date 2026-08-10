@@ -36,7 +36,7 @@ before upload (see [Phase 4](#phase-4--assemble-and-upload)).
 - **Version source of truth:** `[workspace.package] version` in the root
   `Cargo.toml`. `scripts/release.sh`, the Homebrew formula, and the AUR
   PKGBUILD all mirror it — do not edit them by hand for a version bump; let
-  `cargo release` do it (Phase 2).
+  `cargo release` do it (Phase 1).
 - **Tag format:** `vX.Y.Z` (e.g. `v0.1.1`). Release notes are generated from
   the tag diff (`gh release create --generate-notes`).
 - **crates.io gate (pdf-inspector):** the `pdf` feature is **off by default**
@@ -68,11 +68,38 @@ just preflight               # checks cargo + zig, notes nextest
 
 ## Phase 1 — Decide & bump the version
 
-1. Decide the bump level (patch/minor/major; 0.1.x is a patch). Update any
-   user-facing docs that state a version or install command (README install
-   section) in the **same commit** as the bump.
+1. Decide the bump level (patch/minor/major; 0.1.x is a patch), then set it
+   with cargo-release. `[workspace.package] version` is the single source of
+   truth — every member inherits it via `version.workspace = true`, so the
+   bump is **one edit**, not twelve. `cargo release version` previews a dry
+   run by default; `-x` applies it:
+
+   ```bash
+   cargo release version patch    # dry-run by default: preview the bump plan
+   cargo release version patch -x # apply: edits [workspace.package] version in
+                                  # Cargo.toml (and Cargo.lock); all 12 members
+                                  # follow — likewise for minor / major
+   ```
+
+   `cargo release version` only edits the manifests — it does **not** commit
+   or tag. Commit the bump together with any user-facing docs that state a
+   version or install command (README install section):
+
+   ```bash
+   git add Cargo.toml Cargo.lock README.md   # + any other docs touched
+   git commit -m "release: bump to X.Y.Z"
+   ```
+
+   (Prefer this over the one-shot `cargo release patch`, which bumps, tags,
+   publishes, and pushes in a single cargo-release-made commit — fine when
+   nothing else needs to ride along with the bump.)
+
 2. **Tag name check:** confirm no tag `vX.Y.Z` exists yet:
    `git ls-remote --tags origin | grep vX.Y.Z`.
+
+3. **Tag the bump commit** (cargo-release reads the version back from
+   `Cargo.toml`): `cargo release tag -x` → creates `vX.Y.Z` at HEAD. The tag
+   is pushed together with the commit once Phase 2 has published.
 
 **Gate:** `just ci` green, tree clean, no conflicting tag.
 
@@ -85,14 +112,19 @@ bump, and `cargo install` must resolve the published crates). From either
 machine, on the clean tree:
 
 ```bash
-cargo release publish          # bumps version in all 12 members (dependent-version = "fix"),
-                               # tags vX.Y.Z, publishes in topological order
+cargo release publish          # publishes the Phase-1-bumped version in
+                               # topological order — publish does NOT bump
+                               # or tag (that was `cargo release version`
+                               # and `cargo release tag` in Phase 1)
 ```
 
 - `[workspace.metadata.release]` sets `dependent-version = "fix"`, so
   cross-crate requirements (`choreo-tui = "0.1"`, …) stay in lockstep across
-  the whole publish set. Exact subcommand/flags vary by cargo-release
-  version — `cargo release --help` for the installed one.
+  the whole publish set — `cargo release version` already rewrote them when
+  it bumped. Exact subcommand/flags vary by cargo-release version —
+  `cargo release --help` for the installed one.
+- Push the bump commit and the `vX.Y.Z` tag created in Phase 1:
+  `git push origin master --tags`.
 - **Never** publish with the `pdf` feature enabled; the published manifests
   must stay free of the git patch (they are — patches don't propagate).
 - Verify the published suite installs cleanly from source in a scratch
@@ -273,6 +305,7 @@ repo and push.
 ## Quick checklist (condensed)
 
 - [ ] `just ci` green; tree clean; master pulled
+- [ ] `cargo release version patch -x` → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
 - [ ] `cargo release publish` → 12 crates on crates.io; `cargo install --locked` verified
 - [ ] Linux box: `just release` + `just smoke-test` → musl tarball, `.deb`, `.rpm`, `SHA256SUMS`
 - [ ] MacBook: `just release` + `just smoke-test` + daemon/keystore/plist/TUI smoke test
