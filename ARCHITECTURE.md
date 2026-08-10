@@ -99,8 +99,9 @@ packs the release tarball, writes
 the exact upload + checklist commands. Only `--upload` runs
 `gh release create`; `--allow-dirty` skips the clean-tree guard. The
 `just` front door wraps all of it: `just release`, `just release-upload`,
-`just release-allow-dirty`, `just smoke-test`, `just package-deb`,
-`just package-rpm`, and `just install` (see the README).
+`just release-allow-dirty`, `just release-tap`, `just smoke-test`,
+`just package-deb`, `just package-rpm`, and `just install` (see the
+README).
 
 ### Shipped artifacts
 
@@ -180,6 +181,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 | `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing all four binaries plus the systemd user unit, from existing `target/release/` artifacts |
 | `smoke-test.sh` | Extracts a release tarball, checks the four binaries exist and are executable, asserts each binary's `--version` reports the release version, and runs `--help` on all four clap clients |
 | `release.sh` | The release orchestrator — local builds only, no CI; dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard |
+| `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine instead of GitHub Actions (no CI by design) |
 
 ### Distribution channels (0.1)
 

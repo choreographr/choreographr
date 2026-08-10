@@ -215,6 +215,15 @@ release-upload: _require-zig
 release-allow-dirty: _require-zig
     ./scripts/release.sh --allow-dirty
 
+# Pass flags through, e.g. `just release-tap -- --push`.
+# Bump the Homebrew tap formula to the release version — dry-run by default:
+# clones choreographr/homebrew-choreographr, rewrites Formula/choreographr.rb
+# from the dist/ tarballs (version, urls, sha256 digests), validates, and
+# prints the diff. `--push` commits + pushes to the tap repo. Run on the
+# Linux box after Phase 4 (macOS tarball staged in dist/).
+release-tap args="":
+    ./scripts/update-homebrew-tap.sh {{ args }}
+
 # (just parameter defaults are literal, so the fallback is an `if` expression.)
 # Smoke-test a release tarball — defaults to the one `just release` just built.
 smoke-test tarball="":

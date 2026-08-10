@@ -1,7 +1,9 @@
 # Choreographr — Homebrew formula for the choreographr/homebrew-choreographr tap.
 #
 # Bump procedure per release (keep in lockstep with scripts/release.sh and
-# packaging/aur/PKGBUILD):
+# packaging/aur/PKGBUILD): scripts/update-homebrew-tap.sh automates steps
+# 1-3 and 5 from the Linux box (dry-run by default; --push commits + pushes);
+# step 4 needs real Homebrew and stays a MacBook step.
 #   1. Bump `version` to the new release tag (e.g. 0.1.1).
 #   2. Update both `url` lines — tag, filename, and embedded version.
 #   3. Recompute the checksums and paste them into the `sha256` fields:

@@ -255,12 +255,41 @@ gh release create vX.Y.Z \
 
 ### Homebrew tap (`choreographr/homebrew-choreographr`)
 
-Edit `Formula/choreographr.rb` (mirrored in this repo at
-`packaging/homebrew/choreographr.rb`):
+Run the tap updater on the Linux box — after Phase 4, so the macOS tarball
+is staged in `dist/`:
 
-1. Bump `version` to `X.Y.Z`.
-2. Update the `url` line — tag, filename, and embedded version.
-3. Recompute the digest: `curl -fL -O <url> && shasum -a 256 <downloaded>.tar.gz`.
+```bash
+scripts/update-homebrew-tap.sh            # dry-run: shows the diff, pushes nothing
+scripts/update-homebrew-tap.sh --push     # commit + push to the tap repo
+```
+
+`scripts/update-homebrew-tap.sh` reads the version from `Cargo.toml`,
+recomputes both `sha256` digests from the `dist/` tarballs (no re-download —
+it hashes the exact artifacts that were uploaded), rewrites
+`Formula/choreographr.rb` in `choreographr/homebrew-choreographr` (version,
+both `url` lines, both digests), validates the result (exact-count rewrite
+checks, no stale version/placeholder, `ruby -c` syntax check when ruby is
+present), and prints the diff. `--push` commits and pushes to the tap repo's
+default branch. The x86_64 branch is left untouched when no
+`choreographr-<V>-x86_64-apple-darwin.tar.gz` is in `dist/` (Intel macOS is
+not shipped yet — the branch stays a placeholder).
+
+The one step that stays manual, on the MacBook (Homebrew is macOS-only):
+
+```bash
+brew install ./choreographr.rb && choreographr --version
+```
+
+…then commit the mirrored-formula drift in this repo
+(`packaging/homebrew/choreographr.rb`) during Phase 6.
+
+Manual fallback (what the script automates — only when the script cannot be
+run):
+
+1. Bump `version` to `X.Y.Z` in `Formula/choreographr.rb` (mirrored in this
+   repo at `packaging/homebrew/choreographr.rb`).
+2. Update both `url` lines — tag, filename, and embedded version.
+3. Recompute the digests: `curl -fL -O <url> && shasum -a 256 <downloaded>.tar.gz`.
 4. Sanity-check: `brew install ./choreographr.rb && choreographr --version`.
 5. Commit + push to the **tap repo** (not this repo).
 
@@ -336,7 +365,7 @@ repo and push.
 - [ ] MacBook: `just release` + `just smoke-test` + daemon/keystore/plist/TUI smoke test
 - [ ] macOS tarball copied to Linux box; combined `SHA256SUMS` regenerated
 - [ ] `just release-upload` → `gh release create vX.Y.Z` with all 5 assets
-- [ ] Homebrew formula bumped + pushed to tap; `brew install` verified
+- [ ] `scripts/update-homebrew-tap.sh --push` run (tap formula bumped from `dist/`, pushed); `brew install` verified on the MacBook
 - [ ] AUR `pkgver`/`sha256sums` bumped, `.SRCINFO` regenerated, pushed
 - [ ] choreographr.com: `install.sh`, `/download/vX.Y.Z/` redirects, `/releases/SHA256SUMS`
 - [ ] All install routes verified (`cargo install`/`binstall`, brew, AUR, curl, .deb, .rpm)

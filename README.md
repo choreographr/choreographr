@@ -749,6 +749,8 @@ updates) is [`RELEASE.md`](./RELEASE.md). The one-command flow is:
 just release                # dry-run: build, tarball, SHA256SUMS, .deb/.rpm (never uploads)
 just release-upload         # also run `gh release create`
 just release-allow-dirty    # dry-run from a dirty tree (staged-but-uncommitted changes)
+just release-tap            # dry-run: bump the Homebrew tap formula from dist/ (never pushes)
+just release-tap -- --push  # commit + push the tap bump to choreographr/homebrew-choreographr
 just smoke-test             # validate the tarball `just release` just built
 just package-deb / package-rpm   # rebuild only the .deb / .rpm from existing artifacts
 just install                # run the pinned-version installer locally (not via curl|sh)
@@ -759,6 +761,8 @@ Equivalently, invoke the scripts directly:
 ```bash
 scripts/release.sh                 # dry-run: build, tarball, SHA256SUMS, .deb/.rpm
 scripts/release.sh --upload        # also run `gh release create` (never uploads by default)
+scripts/update-homebrew-tap.sh     # dry-run: bump the tap formula (never pushes)
+scripts/update-homebrew-tap.sh --push   # commit + push to choreographr/homebrew-choreographr
 scripts/smoke-test.sh dist/choreographr-0.1.0-x86_64-unknown-linux-musl.tar.gz
 ```
 

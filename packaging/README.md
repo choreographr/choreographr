@@ -66,7 +66,12 @@ root `Cargo.toml`, release build, tarball, `SHA256SUMS`, optional
 `.deb`/`.rpm`, and prints the `gh release create` command plus the manual
 bump checklist. The manual steps that must stay in lockstep:
 
-- **Homebrew** — bump `version`, both `url` lines, and both `sha256` values
+- **Homebrew** — run `scripts/update-homebrew-tap.sh` (dry-run) then
+  `scripts/update-homebrew-tap.sh --push` from the Linux box: it reads the
+  version from `Cargo.toml`, recomputes both `sha256` digests from the `dist/`
+  tarballs (no re-download), rewrites `homebrew/choreographr.rb` (version,
+  both `url` lines, both digests), and commits + pushes to the tap repo. The
+  manual fallback: bump `version`, both `url` lines, and both `sha256` values
   (recompute each digest with `shasum -a 256 <downloaded>.tar.gz`) in
   `homebrew/choreographr.rb`, then push to the tap repo.
 - **AUR** — bump `pkgver` in `aur/PKGBUILD`, reset `pkgrel` to 1, update the
