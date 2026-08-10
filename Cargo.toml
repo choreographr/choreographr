@@ -61,7 +61,7 @@ path = "src/bin/choreo-acp.rs"
 # tokens are binstall template variables; spaces inside them are ignored.
 [package.metadata.binstall]
 pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-{ target }{ archive-suffix }"
-bin-dir = ""
+bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
 # Linux glibc hosts (x86_64-unknown-linux-gnu) get no release tarball: the
@@ -72,6 +72,9 @@ pkg-fmt = "tgz"
 # (0.1.0) — the `v` prefix on the tag is written explicitly in the path — and
 # `{ archive-suffix }` already includes the leading dot (`.tar.gz`), so there
 # is NO literal dot before it (`.{ archive-suffix }` would produce `..tar.gz`).
+# `bin-dir` must not be empty: the tarball has the binaries at the archive root,
+# which is spelled `{ bin }{ binary-ext }` — an empty `bin-dir` renders an empty
+# source path and binstall rejects it.
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-x86_64-unknown-linux-musl{ archive-suffix }"
 
