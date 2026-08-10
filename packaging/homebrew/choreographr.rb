@@ -24,7 +24,7 @@ class Choreographr < Formula
   # formula restructure.
   if Hardware::CPU.arm?
     url "https://github.com/choreographr/choreographr/releases/download/v0.1.0/choreographr-0.1.0-aarch64-apple-darwin.tar.gz"
-    sha256 "<sha256-aarch64>"
+    sha256 "6868667065443332116656b28cef352b4da2613302f43d402d1ea0925f7d361e"
   else
     # x86_64 macOS is not shipped in 0.1 — kept for future-proofing.
     url "https://github.com/choreographr/choreographr/releases/download/v0.1.0/choreographr-0.1.0-x86_64-apple-darwin.tar.gz"
