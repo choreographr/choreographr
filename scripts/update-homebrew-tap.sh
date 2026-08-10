@@ -21,6 +21,11 @@
 #                            choreographr/homebrew-choreographr). Useful for
 #                            testing against a local bare repo.
 #
+# When the tap formula is already at the Cargo.toml version (e.g. the
+# scaffolded formula with placeholder digests), the script still updates any
+# digest that differs from the dist/ tarballs — matching the version alone is
+# not "nothing to do".
+#
 # Requires: git, sha256sum (or shasum -a 256), sed, grep. Optional: ruby
 # (formula syntax check), gh (release-existence check).
 #
@@ -158,18 +163,40 @@ fi
 OLD_VERSION="$(sed -n 's/^  version "\([^"]*\)"/\1/p' "$FORMULA" | head -n1)"
 [ -n "$OLD_VERSION" ] || { echo "error: could not read version from $FORMULA" >&2; exit 1; }
 
-if [ "$OLD_VERSION" = "$VERSION" ]; then
-    echo "==> tap formula already at v${VERSION} — nothing to do"
-    exit 0
-fi
-echo "==> tap formula at v${OLD_VERSION} — bumping to v${VERSION}"
-
-# The old digests are needed as literal needles (the arm64 one is a
-# "<sha256-aarch64>" placeholder until the first real release).
+# The old digests are needed as literal needles AND for the same-version
+# comparison below (the arm64 one is a "<sha256-aarch64>" placeholder until
+# the first real release).
 OLD_ARM64_SHA="$(sed -n '/if Hardware::CPU.arm?/,/^  else/ s/^    sha256 "\([^"]*\)"/\1/p' "$FORMULA" | head -n1)"
 OLD_X86_64_SHA="$(sed -n '/^  else/,/^  end/ s/^    sha256 "\([^"]*\)"/\1/p' "$FORMULA" | head -n1)"
 [ -n "$OLD_ARM64_SHA" ] || { echo "error: could not read arm64 sha256 from $FORMULA" >&2; exit 1; }
 [ -n "$OLD_X86_64_SHA" ] || { echo "error: could not read x86_64 sha256 from $FORMULA" >&2; exit 1; }
+
+# Decide which fields need updating. The version/url fields change only when
+# the version differs; the digests can differ at the SAME version too — e.g.
+# the scaffolded formula was pushed with placeholder digests, or a tarball
+# was re-uploaded for a re-cut release. So "nothing to do" requires the
+# version AND every shippable digest to match, not just the version line.
+NEEDS_REWRITE=0
+NEEDS_DIGEST=0
+if [ "$OLD_VERSION" != "$VERSION" ]; then
+    NEEDS_REWRITE=1
+    NEEDS_DIGEST=1
+elif [ "$OLD_ARM64_SHA" != "$ARM64_SHA" ]; then
+    NEEDS_DIGEST=1
+elif [ -n "$X86_64_SHA" ] && [ "$OLD_X86_64_SHA" != "$X86_64_SHA" ]; then
+    NEEDS_DIGEST=1
+fi
+
+if [ "$NEEDS_REWRITE" -eq 0 ] && [ "$NEEDS_DIGEST" -eq 0 ]; then
+    echo "==> tap formula already at v${VERSION} with matching digests — nothing to do"
+    exit 0
+fi
+
+if [ "$NEEDS_REWRITE" -eq 1 ]; then
+    echo "==> tap formula at v${OLD_VERSION} — bumping version + urls to v${VERSION}"
+else
+    echo "==> tap formula already at v${VERSION} — updating digests"
+fi
 
 # ── rewrite ──────────────────────────────────────────────────────────────────
 # replace_literal <needle> <replacement> <expected_count> <what>
@@ -195,18 +222,25 @@ replace_literal() {
 
 echo "==> rewriting $FORMULA"
 
-# 1. The class-level `version "X.Y.Z"` line (exactly one in the formula).
-replace_literal "version \"$OLD_VERSION\"" "version \"$VERSION\"" 1 "version line"
-# 2. The tag inside both download URLs: /download/vOLD/ → /download/vNEW/.
-replace_literal "v$OLD_VERSION/" "v$VERSION/" 2 "url tag"
-# 3. The embedded version inside both tarball filenames.
-replace_literal "choreographr-$OLD_VERSION-" "choreographr-$VERSION-" 2 "url filename"
-# 4. The arm64 digest (the sha256 line inside the `if Hardware::CPU.arm?` block).
-replace_literal "sha256 \"$OLD_ARM64_SHA\"" "sha256 \"$ARM64_SHA\"" 1 "arm64 digest"
-# 5. The x86_64 digest (the sha256 line in the `else` branch) — only when the
+# 1. Version + urls — only when the version actually changed.
+if [ "$NEEDS_REWRITE" -eq 1 ]; then
+    # The class-level `version "X.Y.Z"` line (exactly one in the formula).
+    replace_literal "version \"$OLD_VERSION\"" "version \"$VERSION\"" 1 "version line"
+    # The tag inside both download URLs: /download/vOLD/ → /download/vNEW/.
+    replace_literal "v$OLD_VERSION/" "v$VERSION/" 2 "url tag"
+    # The embedded version inside both tarball filenames.
+    replace_literal "choreographr-$OLD_VERSION-" "choreographr-$VERSION-" 2 "url filename"
+fi
+# 2. Digests — whenever they differ from the dist/ tarballs (placeholder
+#    digests count as different). The x86_64 digest is only touched when that
 #    tarball exists; otherwise the documented placeholder stays in place.
-if [ -n "$X86_64_SHA" ]; then
-    replace_literal "sha256 \"$OLD_X86_64_SHA\"" "sha256 \"$X86_64_SHA\"" 1 "x86_64 digest"
+if [ "$NEEDS_DIGEST" -eq 1 ]; then
+    # The arm64 digest (the sha256 line inside the `if Hardware::CPU.arm?` block).
+    replace_literal "sha256 \"$OLD_ARM64_SHA\"" "sha256 \"$ARM64_SHA\"" 1 "arm64 digest"
+    # The x86_64 digest (the sha256 line in the `else` branch).
+    if [ -n "$X86_64_SHA" ]; then
+        replace_literal "sha256 \"$OLD_X86_64_SHA\"" "sha256 \"$X86_64_SHA\"" 1 "x86_64 digest"
+    fi
 fi
 
 # ── post-verification: every field must now be exactly what we expect ────────
@@ -237,9 +271,12 @@ else
 fi
 # Exactly two sha256 fields must remain (arm64 + x86_64 branches).
 verify_count 'sha256 "' 2 "sha256 fields"
-# No stale version references may survive in the URL lines.
-verify_count "v$OLD_VERSION/" 0 "stale url tag"
-verify_count "choreographr-$OLD_VERSION-" 0 "stale url filename"
+# Stale-version checks apply only when the version/urls were rewritten: at the
+# same version the URL lines legitimately still contain v$VERSION/.
+if [ "$NEEDS_REWRITE" -eq 1 ]; then
+    verify_count "v$OLD_VERSION/" 0 "stale url tag"
+    verify_count "choreographr-$OLD_VERSION-" 0 "stale url filename"
+fi
 # The arm64 placeholder must be gone (it would break checksum verification).
 verify_count '<sha256-aarch64>' 0 "arm64 placeholder"
 
