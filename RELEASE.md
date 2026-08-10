@@ -78,6 +78,14 @@ just preflight               # checks cargo + zig, notes nextest
    | `minor` | 0.1.1 → 0.2.0 | New features or behavior changes. While on 0.x, breaking changes also land here (semver treats 0.x minor as "may break") |
    | `major` | 0.2.0 → 1.0.0 | Breaking changes after 1.0, or the deliberate move to 1.0.0 (stability commitment) |
 
+   **After 1.0.0 this policy shifts.** `minor` (1.0.0 → 1.1.0) starts
+   *promising* backwards compatibility, so breaking changes move from
+   `minor` to `major` (1.x → 2.x) and the everyday bump becomes `minor`, not
+   `patch`. The inter-crate requirements flip from `"0.1"` (which Cargo reads
+   as `< 0.2`) to `"1"` (`< 2`), so `dependent-version = "fix"` stops
+   rewriting manifests on ordinary releases and only fires on a major. Update
+   this table's examples when 1.0.0 ships (Phase 6 commits doc drift).
+
 2. **Enact the decision** — the command that carries it out is
    `cargo release version <level>`, where `<level>` is replaced with the
    level you decided in step 1 (`patch` / `minor` / `major`). Nothing else
