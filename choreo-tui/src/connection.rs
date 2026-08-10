@@ -1969,7 +1969,16 @@ pub(crate) fn handle_daemon_message(
             status,
             last_modified,
         } => {
+            // Detect an attached sub-session finishing BEFORE the status is
+            // applied: the finish check needs the pre-transition (active)
+            // status to distinguish "just finished" from "still idle".
+            let switch_back = app.attached_subsession_finished(*session_id, status);
             app.handle_session_status_changed(*session_id, status, *last_modified);
+            // The user was reading the sub-session on the Chat page and it
+            // just finished — jump back to its parent with a notification.
+            if let Some(parent_id) = switch_back {
+                app.switch_back_to_parent(*session_id, parent_id, client_tx)?;
+            }
             // Return early: the generic dispatch would call the same handler
             // again via the TurnEventHandler trait, and the sessions-page
             // re-sort must only run once.

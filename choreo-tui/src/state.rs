@@ -2949,6 +2949,99 @@ impl App {
         }
     }
 
+    /// Detect when the user is reading an agent-spawned sub-session on the
+    /// Chat page and that sub-session just finished running.
+    ///
+    /// A sub-session "finishes" when its status transitions from an active
+    /// state (inference / tool call / retrying) to an idle one (inactive /
+    /// sleeping) — the daemon broadcasts exactly one such transition when the
+    /// child's request completes.  The check reads the *pre-update* summary
+    /// status (the caller invokes this before applying the new status), so
+    /// duplicate idle→idle broadcasts — summary refreshes, or re-attaching to
+    /// a child that finished earlier — never re-fire the switch.
+    ///
+    /// Returns the parent session id to switch back to, or `None` when the
+    /// user is not viewing a finishing sub-session.  The parent id (and the
+    /// titles for the notification) come from the summary list, so a missing
+    /// summary is a graceful no-op rather than a misdirected switch.
+    pub(crate) fn attached_subsession_finished(
+        &self,
+        session_id: u64,
+        new_status: &SessionStatus,
+    ) -> Option<u64> {
+        // Only the Chat page: the Session Manager is a browsing view, and
+        // auto-jumping away from it would fight the user's navigation.
+        if self.page != Page::Chat || self.attached_session_id != Some(session_id) {
+            return None;
+        }
+        // The finishing session must be an agent-spawned sub-session; its
+        // parent is only known from the session summary list.
+        let summary = self
+            .session_mgr
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_id)?;
+        let parent_id = summary.parent_session_id?;
+        // Only the active → idle transition counts as "finished".  Idle →
+        // idle (e.g. a summary refresh after the child already finished)
+        // must not yank the view away while the user is still reading.
+        if summary.status.is_active() && !new_status.is_active() {
+            Some(parent_id)
+        } else {
+            None
+        }
+    }
+
+    /// Switch the Chat view back to the parent session of a sub-session that
+    /// just finished, and surface a status notification explaining the jump.
+    ///
+    /// Mirrors the Session Manager Enter handler's attach sequence: the
+    /// daemon messages are sent *before* the local state is mutated, so a
+    /// broken pipe leaves the view on the finished sub-session instead of
+    /// stranding the user on a session that was never attached.
+    pub(crate) fn switch_back_to_parent(
+        &mut self,
+        finished_session_id: u64,
+        parent_id: u64,
+        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    ) -> Result<(), ClientError> {
+        // Titles come from the summary list — the same source that told us
+        // the sub-session's parent — falling back to "untitled" exactly like
+        // the session list renderer does.
+        let title = |id: u64| {
+            self.session_mgr
+                .sessions
+                .iter()
+                .find(|s| s.session_id == id)
+                .and_then(|s| s.title.clone())
+                .unwrap_or_else(|| "untitled".to_string())
+        };
+        let subsession_title = title(finished_session_id);
+        let parent_title = title(parent_id);
+
+        // UnsubscribeSessionsSummary is idempotent on the daemon (removing a
+        // client that was never registered is a no-op), so it is safe to send
+        // unconditionally, matching the Session Manager attach path.
+        client_tx
+            .send(ClientMessage::UnsubscribeSessionsSummary)
+            .map_err(broken_pipe)?;
+        client_tx
+            .send(ClientMessage::AttachSession {
+                session_id: parent_id,
+            })
+            .map_err(broken_pipe)?;
+        // reset_for_session_switch first so the subsequent set_page marks the
+        // parent's display dirty — the one that will actually render next.
+        self.reset_for_session_switch(parent_id);
+        self.set_page(Page::Chat);
+        self.attached_session_id = Some(parent_id);
+
+        self.status = Some(format!(
+            "Subsession \"{subsession_title}\" finished. Switched back to parent \"{parent_title}\"."
+        ));
+        Ok(())
+    }
+
     pub(crate) fn handle_accounts(&mut self, accounts: &[AccountInfo]) {
         self.ai_providers.set_accounts(accounts.to_vec());
         self.refresh_attached_provider_slug();

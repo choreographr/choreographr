@@ -5368,6 +5368,187 @@ fn session_created_for_user_session_attaches_on_chat_page() {
     );
 }
 
+// ── Sub-session finish auto-switches back to the parent ─────────────
+
+/// Build a session summary for a running sub-session: same fields as
+/// `make_session`, plus a parent id and an active (streaming) status.
+fn make_subsession(id: u64, title: &str, parent_id: u64) -> choreo_proto::SessionSummary {
+    let mut s = make_session(id, title, "m1", 0);
+    s.parent_session_id = Some(parent_id);
+    s.status = choreo_proto::SessionStatus::Inference;
+    s
+}
+
+#[test]
+fn attached_subsession_finished_detects_active_to_idle_only() {
+    let mut app = test_app();
+    app.attached_session_id = Some(99);
+    app.active_session_id = Some(99);
+    app.session_mgr.set_sessions(vec![
+        make_session(42, "parent session", "m1", 3),
+        make_subsession(99, "child task", 42),
+    ]);
+
+    // Viewing the running sub-session on the Chat page: an active → idle
+    // transition means it finished — report the parent id.
+    assert_eq!(
+        app.attached_subsession_finished(99, &SessionStatus::Inactive),
+        Some(42)
+    );
+    assert_eq!(
+        app.attached_subsession_finished(99, &SessionStatus::Sleeping),
+        Some(42)
+    );
+    // The new status must be idle: a same-status re-broadcast of an active
+    // status is not a finish.
+    assert_eq!(
+        app.attached_subsession_finished(99, &SessionStatus::Inference),
+        None
+    );
+
+    // Idle → idle (the child already finished; this is a duplicate or a
+    // summary refresh) must not re-fire.
+    app.handle_session_status_changed(99, &SessionStatus::Inactive, 1705315000000);
+    assert_eq!(
+        app.attached_subsession_finished(99, &SessionStatus::Inactive),
+        None,
+        "idle → idle must not be treated as a finish"
+    );
+
+    // Not attached / different attached session: no switch.
+    app.attached_session_id = Some(7);
+    assert_eq!(
+        app.attached_subsession_finished(99, &SessionStatus::Inactive),
+        None
+    );
+    app.attached_session_id = Some(99);
+
+    // Browsing the Session Manager page: no auto-jump away from it.
+    app.page = Page::SessionManager;
+    assert_eq!(
+        app.attached_subsession_finished(99, &SessionStatus::Inactive),
+        None
+    );
+    app.page = Page::Chat;
+
+    // A top-level session (no parent) is not a sub-session: no switch.
+    app.attached_session_id = Some(42);
+    assert_eq!(
+        app.attached_subsession_finished(42, &SessionStatus::Inactive),
+        None
+    );
+}
+
+#[test]
+fn subsession_finish_switches_back_to_parent_with_notification() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // The user opened the sub-session 99 from the Session Manager and is now
+    // reading it on the Chat page while it streams.
+    app.attached_session_id = Some(99);
+    app.active_session_id = Some(99);
+    app.session_mgr.set_sessions(vec![
+        make_session(42, "parent session", "m1", 3),
+        make_subsession(99, "child task", 42),
+    ]);
+
+    handle_daemon_message(
+        DaemonMessage::SessionStatusChanged {
+            session_id: 99,
+            status: SessionStatus::Inactive,
+            last_modified: 1705315000000,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionStatusChanged");
+
+    // The view jumped back to the parent session.
+    assert_eq!(app.attached_session_id, Some(42));
+    assert_eq!(app.active_session_id, Some(42));
+    // The daemon was asked to attach to the parent, mirroring the Session
+    // Manager Enter path (summary unsubscription first, then attach).
+    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            ClientMessage::AttachSession { session_id } if *session_id == 42
+        )),
+        "must attach to the parent session"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, ClientMessage::UnsubscribeSessionsSummary)),
+        "must unsubscribe from the sessions summary like other attach paths"
+    );
+    // The notification names both sessions.
+    assert_eq!(
+        app.status.as_deref(),
+        Some("Subsession \"child task\" finished. Switched back to parent \"parent session\".")
+    );
+}
+
+#[test]
+fn subsession_finish_does_not_fire_on_duplicate_idle_broadcast() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // The child already finished before the user opened it; its summary is
+    // idle.  A re-broadcast of the idle status (summary refresh / re-attach)
+    // must not yank the view back to the parent.
+    app.attached_session_id = Some(99);
+    app.active_session_id = Some(99);
+    app.session_mgr.set_sessions(vec![
+        make_session(42, "parent session", "m1", 3),
+        make_subsession(99, "child task", 42),
+    ]);
+    app.handle_session_status_changed(99, &SessionStatus::Inactive, 1705315000000);
+
+    handle_daemon_message(
+        DaemonMessage::SessionStatusChanged {
+            session_id: 99,
+            status: SessionStatus::Inactive,
+            last_modified: 1705315000000,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionStatusChanged");
+
+    assert_eq!(app.attached_session_id, Some(99));
+    assert_eq!(app.status, None);
+    assert!(
+        rx.try_iter().next().is_none(),
+        "no attach may be sent for an idle → idle broadcast"
+    );
+}
+
+#[test]
+fn top_level_session_finish_does_not_switch() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.session_mgr
+        .set_sessions(vec![make_session(42, "my session", "m1", 3)]);
+
+    handle_daemon_message(
+        DaemonMessage::SessionStatusChanged {
+            session_id: 42,
+            status: SessionStatus::Inactive,
+            last_modified: 1705315000000,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionStatusChanged");
+
+    // A top-level session finishing is normal lifecycle — no switch, no
+    // notification, no messages.
+    assert_eq!(app.attached_session_id, Some(42));
+    assert_eq!(app.status, None);
+    assert!(rx.try_iter().next().is_none());
+}
+
 #[test]
 fn session_attached_does_not_regress_accumulated_live_state() {
     let mut app = test_app();

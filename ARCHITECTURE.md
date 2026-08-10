@@ -2094,6 +2094,17 @@ counts survive the attach instead of regressing.
   would make the daemon reply with `Sessions`, whose handler writes the
   global status line and reflows the viewed viewport.  User-created sessions
   (`parent_session_id = None`) keep the auto-attach behavior.
+- The mirror-image rule: when the user *is* reading a sub-session on the Chat
+  page and it finishes (its status transitions from active — inference / tool
+  call / retrying — to idle), the TUI switches back to the parent session and
+  shows `Subsession "…" finished. Switched back to parent "…".` on the
+  status line.  Detection runs in the `SessionStatusChanged` dispatch *before*
+  the status is applied (`App::attached_subsession_finished`), so the
+  pre-transition active status is what distinguishes "just finished" from a
+  duplicate idle→idle broadcast (summary refresh, re-attach of an already
+  finished child), which never re-fires.  The switch (`App::switch_back_to_parent`)
+  reuses the Session Manager attach sequence — `UnsubscribeSessionsSummary`
+  then `AttachSession` — so a broken pipe leaves the view untouched.
 
 
 ---
