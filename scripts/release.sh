@@ -37,6 +37,16 @@ for arg in "$@"; do
     esac
 done
 
+# The release build's thin-LTO link opens thousands of object files at once;
+# on machines with a low default soft fd limit (e.g. 1024) rustc dies with
+# "ProcessFdQuotaExceeded". Raise the soft limit best-effort — the hard limit
+# is typically far higher (here 1048576). If this fails, the operator must
+# run the build under a raised limit (e.g. `ulimit -n 65536 && just release`)
+# or the link will fail the same way.
+if ! ulimit -n 65536 2>/dev/null; then
+    echo "warning: could not raise fd limit — release linking may fail with ProcessFdQuotaExceeded; run under a raised limit (ulimit -n 65536)" >&2
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 

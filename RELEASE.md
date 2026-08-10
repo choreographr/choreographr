@@ -62,6 +62,11 @@ just ci
 #    Linux box:  zig, cargo-zigbuild, gh, (dpkg-deb, rpmbuild optional)
 #    MacBook:    zig, gh
 just preflight               # checks cargo + zig, notes nextest
+#
+# Note: `just release` raises the fd soft limit itself (release.sh runs
+# `ulimit -n 65536` — thin-LTO linking opens thousands of files and dies
+# with ProcessFdQuotaExceeded at the default 1024). If your shell refuses
+# the raise, run it under a raised limit: `ulimit -n 65536 && just release`.
 ```
 
 ---
