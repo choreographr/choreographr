@@ -3,6 +3,7 @@ use crate::tools::{ToolExecError, resolve_path, sha256_hex};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EditFileArgs {
@@ -64,12 +65,18 @@ pub fn execute_edit_file_tool(
     }
 
     match write_text_file(&resolved, &edit_summary.content, true) {
-        Ok(()) => Ok(format_edit_result(
-            "edited",
-            &resolved.display().to_string(),
-            &edit_summary,
-        )),
-        Err(error) => Err(ToolExecError(format!("{error}"))),
+        Ok(()) => {
+            info!(path = %resolved.display(), replacement_count = edit_summary.replacement_count, "edit_file: applied edits");
+            Ok(format_edit_result(
+                "edited",
+                &resolved.display().to_string(),
+                &edit_summary,
+            ))
+        }
+        Err(error) => {
+            warn!(path = %resolved.display(), error = %error, "edit_file: failed to write edited content");
+            Err(ToolExecError(format!("{error}")))
+        }
     }
 }
 

@@ -3,7 +3,7 @@
 //! These exercise real filesystem I/O (TempDir + writes) and therefore live
 //! in `tests/` per the project's Test Discipline policy rather than in
 //! `src/` unit-test modules. They are marked `#[ignore]` so `cargo test`
-//! runs only unit tests; run with `cargo test -- --ignored`.
+//! runs only unit tests; run with `cargo test-integration`.
 
 use choreo_daemon::{ListFilesArgs, execute_list_files_tool};
 

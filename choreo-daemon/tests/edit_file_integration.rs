@@ -47,10 +47,10 @@ fn edit_preserves_execute_permissions() {
     assert_eq!(mode, 0o755, "edit must preserve the executable bit");
 }
 
-// The inverse of the above: a restrictive mode must not be widened back to
-// the tempfile default (0600) — the target is 0600 here, so this guards
-// against the persist *dropping* permissions rather than widening them. (A
-// 0644 file edited through the buggy code silently became 0600.)
+// The inverse of the above: the buggy code could also *narrow* permissions —
+// a 0644 file silently became 0600, losing group/other readability. This
+// guards against the persist dropping permission bits (the tempfile default
+// is 0600), rather than widening them.
 #[cfg(unix)]
 #[test]
 #[ignore]
@@ -79,4 +79,36 @@ fn edit_replaces_content() {
 
     let content = std::fs::read_to_string(&file).unwrap();
     assert_eq!(content, "goodbye\n");
+}
+
+// Editing through a symlink must update the real target and keep the link:
+// the atomic replace resolves the target before swapping, so the persist
+// lands on the file the link points to instead of replacing the link itself
+// with a regular file.
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn edit_through_symlink_updates_target_and_keeps_link() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real.txt");
+    let link = dir.path().join("link.txt");
+    std::fs::write(&real, "original\n").unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    execute_edit_file_tool(&edit_args(&link, "original", "edited"), None).unwrap();
+
+    assert!(link.is_symlink(), "the symlink must survive the edit");
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "edited\n",
+        "the target file must hold the new content"
+    );
+    let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o644,
+        "target mode must be preserved through the link"
+    );
 }

@@ -3,6 +3,7 @@ use crate::tools::{ToolExecError, resolve_path};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{io, path::Path};
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WriteFileArgs {
@@ -16,7 +17,7 @@ pub struct WriteFileArgs {
     pub create_parents: Option<bool>,
 }
 
-pub(crate) fn execute_write_file_tool(
+pub fn execute_write_file_tool(
     args: &WriteFileArgs,
     working_dir: Option<&Path>,
 ) -> Result<String, ToolExecError> {
@@ -26,6 +27,7 @@ pub(crate) fn execute_write_file_tool(
 
     match write_text_file(&resolved, &args.content, args.overwrite.unwrap_or(true)) {
         Ok(()) => {
+            info!(path = %resolved.display(), bytes = args.content.len(), "write_file: wrote file");
             let lang = ext_to_lang(&resolved.display().to_string());
             let fenced = fence_content(&args.content, lang);
             Ok(format!("wrote file: {}\n\n{}", resolved.display(), fenced))
@@ -33,11 +35,13 @@ pub(crate) fn execute_write_file_tool(
         Err(error) => {
             let overwrite = args.overwrite.unwrap_or(true);
             if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
+                warn!(path = %resolved.display(), "write_file: refusing to overwrite existing file");
                 Err(ToolExecError(format!(
                     "refusing to overwrite existing file: {}",
                     resolved.display()
                 )))
             } else {
+                warn!(path = %resolved.display(), error = %error, "write_file: failed to write file");
                 Err(ToolExecError(format!("{error}")))
             }
         }
