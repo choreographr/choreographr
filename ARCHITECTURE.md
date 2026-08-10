@@ -222,7 +222,8 @@ The root package declares `[package.metadata.binstall]`, so
 `cargo binstall choreographr` resolves the GitHub release asset naming
 (`choreographr-<version>-<target>.<ext>`) from the package itself instead of
 requiring a manual `--pkg-url`; `bin-dir = ""` matches the tarball's
-binaries-at-top-level layout. The daemon crate is `choreo-daemon` (library
+binaries-at-top-level layout, and an `x86_64-unknown-linux-gnu` override
+maps glibc hosts to the static musl tarball (the only Linux asset shipped). The daemon crate is `choreo-daemon` (library
 `choreo_daemon`, no `[[bin]]` target) — the `choreographr` binary it backs
 lives in the root package's `src/bin/`.
 

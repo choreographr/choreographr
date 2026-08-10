@@ -290,8 +290,8 @@ Alternatives:
 - **Any distro** — tarball + installer, or cargo:
   `curl -fsSL https://choreographr.com/install.sh | sh` ·
   `cargo binstall choreographr` (prebuilt, no toolchain — fetches the static
-  musl tarball from GitHub Releases; on a glibc host binstall may need
-  `--target x86_64-unknown-linux-musl`, verify at release time) ·
+  musl tarball from GitHub Releases; the binstall manifest maps glibc x86_64
+  hosts to the musl asset, so no `--target` is needed) ·
   `cargo install choreographr` (source build, needs Zig — installs the whole
   suite: `choreographr`, `choreo-tui`, `choreo-im`, `choreo-acp`)
 
