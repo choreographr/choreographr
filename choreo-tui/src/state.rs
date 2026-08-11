@@ -1083,7 +1083,19 @@ pub(crate) struct App {
     pub(crate) last_terminal_size: Option<(u16, u16)>,
     pub(crate) terminal_resized: bool,
     pub(crate) history_index: Option<usize>,
+    /// The user's real draft while they are stepping through history: captured
+    /// on the first Up press, restored by `restore_history_draft`.  Kept as a
+    /// separate stash because the input bar holds a history entry while
+    /// `history_index` is `Some`.  The cursor position is stashed alongside so
+    /// exiting history navigation (or switching sessions mid-navigation)
+    /// restores the exact editing position, not the end of the text.
     pub(crate) saved_draft: String,
+    pub(crate) saved_draft_cursor: usize,
+    /// The text of the history entry currently shown in the input bar, so
+    /// `restore_history_draft` can tell whether the user edited the entry on
+    /// top of it: a buffer that no longer matches the loaded entry *is* the
+    /// user's real draft and must be kept, not discarded.
+    pub(crate) history_entry_text: Option<String>,
     pub(crate) fullscreen_image_target: Option<(u64, u32, usize)>,
     pub(crate) status: Option<String>,
     pub(crate) error: Option<String>,
@@ -2109,6 +2121,8 @@ impl App {
             scrollbar_dragging: false,
             history_index: None,
             saved_draft: String::new(),
+            saved_draft_cursor: 0,
+            history_entry_text: None,
             fullscreen_image_target: None,
             status: None,
             error: None,
@@ -2574,7 +2588,10 @@ impl App {
             return;
         }
         if self.history_index.is_none() {
+            // First Up press: stash the user's real draft (text *and* cursor)
+            // before loading the newest history entry into the buffer.
             self.saved_draft = self.input.text.clone();
+            self.saved_draft_cursor = self.input.cursor;
             self.load_history_entry(0, &texts);
             return;
         }
@@ -2636,30 +2653,54 @@ impl App {
 
     /// Load the history entry at `idx` into the input: stash the index, set
     /// the text, move the cursor to the end, and keep it visible.  Shared by
-    /// all the "step through history" paths so they can't drift apart.
+    /// all the "step through history" paths so they can't drift apart.  The
+    /// loaded text is recorded too, so `restore_history_draft` can detect when
+    /// the user has edited the entry on top of it.
     fn load_history_entry(&mut self, idx: usize, texts: &[String]) {
         self.history_index = Some(idx);
-        self.input.text = texts[idx].to_string();
+        let entry = texts[idx].clone();
+        self.history_entry_text = Some(entry.clone());
+        self.input.text = entry;
         self.input.generation += 1;
         self.input.cursor = self.input.text.len();
         self.ensure_input_cursor_visible();
     }
 
     /// Drop history navigation and put the user's saved draft back in the
-    /// input, clearing the stash. Shared by all the "exit to draft" paths.
+    /// input, clearing the stash.  Shared by all the "exit to draft" paths.
+    ///
+    /// The cursor stashed on the first Up press is restored too, so exiting
+    /// mid-editing lands back exactly where the user was typing.  If the
+    /// buffer was edited after the history entry loaded, those edits are the
+    /// user's real draft — keep the buffer as-is instead of silently
+    /// discarding them in favour of the pre-Up stash.
     fn restore_history_draft(&mut self) {
         self.history_index = None;
+        if let Some(entry) = self.history_entry_text.take()
+            && self.input.text != entry
+        {
+            // The buffer diverged from the loaded history entry: the user
+            // typed over it, so the buffer holds what they actually want.
+            tracing::debug!("[choreo-tui] history entry edited; keeping buffer as the draft");
+            self.saved_draft.clear();
+            self.saved_draft_cursor = 0;
+            return;
+        }
         // Move the draft out of its stash rather than cloning it: the stash
         // is consumed here and the input buffer takes ownership of the bytes.
+        let cursor = self.saved_draft_cursor;
         self.input.text = std::mem::take(&mut self.saved_draft);
+        self.saved_draft_cursor = 0;
         self.input.generation += 1;
-        self.input.cursor = self.input.text.len();
+        self.input.cursor = cursor;
         self.ensure_input_cursor_visible();
     }
 
     pub(crate) fn commit_to_history(&mut self) {
         self.history_index = None;
+        self.history_entry_text = None;
         self.saved_draft.clear();
+        self.saved_draft_cursor = 0;
     }
 
     /// Clear the draft stashed for the currently attached session, mirroring
@@ -2669,6 +2710,9 @@ impl App {
     pub(crate) fn clear_current_draft(&mut self) {
         if let Some(session_id) = self.attached_session_id {
             let display = self.display_for(session_id);
+            if !display.draft.is_empty() {
+                tracing::trace!(session_id, "cleared per-session draft after submit");
+            }
             display.draft.clear();
             display.draft_cursor = 0;
         }
@@ -2746,10 +2790,10 @@ impl App {
         client_tx
             .send(ClientMessage::ListSessions)
             .map_err(broken_pipe)?;
-        // The input bar may hold an unsent prompt belonging to the session the
-        // user was viewing before the new session was created — stash it there
-        // and load the (empty) draft of the brand-new session, so the prompt
-        // doesn't leak into a session it was never meant for.
+        // The input bar may hold an unsent prompt belonging to the session
+        // the user was viewing before the new session was created — hand it
+        // over via `persist_input_draft` so the prompt can't leak into a
+        // session it was never meant for.
         self.persist_input_draft(session_id);
         self.reset_for_session_switch(session_id);
         self.attached_session_id = Some(session_id);
@@ -3046,32 +3090,59 @@ impl App {
     /// through past prompts (Up), the buffer holds a history entry rather
     /// than their real draft — first drop back to the draft
     /// (`restore_history_draft`) so the stash captures what they actually
-    /// typed instead of a history entry.
+    /// typed instead of a history entry.  With nothing attached (the startup
+    /// auto-attach), there is no outgoing session to stash into; text already
+    /// in the bar is kept rather than clobbered, and only a target with an
+    /// empty bar gets its draft loaded.
     pub(crate) fn persist_input_draft(&mut self, target_session_id: u64) {
         if self.history_index.is_some() {
             self.restore_history_draft();
         }
-        // Stash the outgoing session's draft before overwriting the buffer
-        // with the incoming session's.  Move the text out of the buffer
-        // (rather than cloning) so the bytes are transferred, then rebind
-        // `attached_session_id`-derived display fields; the input generation
-        // is bumped below to invalidate the visual-lines cache.
-        if let Some(prev_id) = self.attached_session_id {
-            let text = std::mem::take(&mut self.input.text);
-            let cursor = self.input.cursor;
-            let display = self.display_for(prev_id);
+        // Destructure `self` so the input buffer and the per-session display
+        // map can be borrowed mutably at the same time (disjoint fields via
+        // the pattern) — the hand-off below then moves `String`s around
+        // instead of cloning them.
+        let Self {
+            input,
+            session_displays,
+            attached_session_id,
+            ..
+        } = self;
+        // Stash the outgoing session's input into its display, overwriting any
+        // earlier draft.  The text is moved out of the buffer (not cloned), so
+        // switching sessions transfers the bytes without allocating.
+        if let Some(prev_id) = attached_session_id {
+            let had_draft = !input.text.is_empty();
+            let text = std::mem::take(&mut input.text);
+            let cursor = input.cursor;
+            let display = session_displays.entry(*prev_id).or_default();
             display.draft = text;
             display.draft_cursor = cursor;
+            tracing::debug!(
+                from_session = *prev_id,
+                to_session = target_session_id,
+                had_draft,
+                "session switch: stashed outgoing input as per-session draft",
+            );
+        } else if !input.text.is_empty() {
+            // Nothing is attached yet (the startup auto-attach path): the
+            // input bar holds text typed before any session existed.  There is
+            // no session to stash it into, so clobbering it with the target's
+            // (empty) draft would silently destroy the user's typing — keep it.
+            tracing::debug!(
+                to_session = target_session_id,
+                "auto-attach: keeping pre-attach input (no outgoing session)",
+            );
+            return;
         }
-        self.input.generation += 1;
-        // Load the target session's draft (empty for a never-typed session)
-        // and restore its cursor position.
-        let (draft, cursor) = {
-            let display = self.display_for(target_session_id);
-            (display.draft.clone(), display.draft_cursor)
-        };
-        self.input.text = draft;
-        self.input.cursor = cursor;
+        // Move the target session's draft into the input bar.  Swapping
+        // rather than cloning transfers the bytes; the target's draft slot is
+        // emptied, which is fine — the input bar now owns that content and the
+        // slot is overwritten again on the next switch away.
+        let display = session_displays.entry(target_session_id).or_default();
+        std::mem::swap(&mut input.text, &mut display.draft);
+        std::mem::swap(&mut input.cursor, &mut display.draft_cursor);
+        input.generation += 1;
         self.ensure_input_cursor_visible();
     }
 
@@ -3100,11 +3171,10 @@ impl App {
         client_tx
             .send(ClientMessage::AttachSession { session_id })
             .map_err(broken_pipe)?;
-        // Hand the input bar's unsent prompt to the session the user is
-        // leaving and load the target session's saved draft, so an unsubmitted
-        // prompt never follows the user across sessions.  Must run before
-        // `attached_session_id` is rebound below — it still names the session
-        // the input bar's current contents belong to.
+        // Hand the input bar over to the target session (stash the outgoing
+        // session's input, load the target's draft) before `attached_session_id`
+        // is rebound below — it still names the session the input bar's
+        // current contents belong to.  See `persist_input_draft`.
         self.persist_input_draft(session_id);
         // reset_for_session_switch first so the subsequent set_page marks the
         // target's display dirty — the one that will actually render next.
@@ -3205,9 +3275,9 @@ impl App {
                     // same tick cannot auto-attach again to a different
                     // session, and so the page renders the target session
                     // instead of a blank screen until SessionAttached arrives.
-                    // Hand the input bar over too (no-op stash: nothing is
-                    // attached yet; loads the target's — empty — draft) so the
-                    // attach paths stay uniform.
+                    // Hand the input bar over like every other attach path;
+                    // with nothing attached yet this only loads the target's
+                    // draft (see `persist_input_draft`).
                     self.persist_input_draft(first.session_id);
                     self.reset_for_session_switch(first.session_id);
                     self.attached_session_id = Some(first.session_id);
@@ -3251,6 +3321,12 @@ impl App {
             // (and its draft) are gone above, so drop the input bar too
             // rather than leak the orphaned text into whichever session gets
             // attached next.
+            let had_input = !self.input.text.is_empty();
+            tracing::debug!(
+                session_id,
+                had_input,
+                "deleted attached session: dropping its input draft",
+            );
             self.input.clear();
             self.commit_to_history();
         }

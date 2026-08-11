@@ -6220,24 +6220,34 @@ mod unsent_draft_tests {
         app.display_for(1).view.insert_or_replace(0, turn);
         // The user typed a fresh draft and pressed Up: the buffer now shows
         // the history entry, with the real draft stashed for the round trip.
+        // The cursor sits mid-text (not at the end) to pin the position
+        // fidelity of the stash/restore.
         app.input.text = "my draft".to_string();
-        app.input.cursor = 8;
+        app.input.cursor = 5;
         app.navigate_history_up();
         assert_eq!(app.input.text, "past prompt");
         assert_eq!(app.saved_draft, "my draft");
+        assert_eq!(app.saved_draft_cursor, 5, "cursor stashed on Up");
 
         // Switching sessions must stash the *real* draft, not the history
         // entry the buffer happens to be showing.
         app.attach_to_session(2, &tx).expect("attach to session 2");
         assert_eq!(app.display_for(1).draft, "my draft");
+        assert_eq!(
+            app.display_for(1).draft_cursor,
+            5,
+            "mid-text cursor survives the switch"
+        );
         assert!(app.saved_draft.is_empty(), "history stash must be consumed");
         assert_eq!(app.history_index, None);
         assert!(app.input.is_empty(), "session 2 starts with no draft");
 
-        // Returning to session 1 restores the user's own draft.
+        // Returning to session 1 restores the user's own draft, cursor
+        // position included.
         app.attach_to_session(1, &tx)
             .expect("attach back to session 1");
         assert_eq!(app.input.text, "my draft");
+        assert_eq!(app.input.cursor, 5, "mid-text cursor restored");
         assert_eq!(app.history_index, None);
     }
 
@@ -6321,5 +6331,90 @@ mod unsent_draft_tests {
         // The draft lives in the removed display, so nothing is left to
         // resurface on a later switch either.
         assert!(!app.session_displays.contains_key(&1));
+    }
+
+    #[test]
+    fn auto_attach_keeps_pre_attach_input() {
+        // Startup race: no session is attached yet, but the user has already
+        // typed into the input bar.  The auto-attach must not clobber that
+        // text — there is no outgoing session to stash it into, so replacing
+        // it with the target's (empty) draft would destroy the typing.
+        let mut app = test_app();
+        app.attached_session_id = None;
+        app.input.text = "startup prompt".to_string();
+        app.input.cursor = 3;
+
+        app.persist_input_draft(7);
+
+        assert_eq!(
+            app.input.text, "startup prompt",
+            "pre-attach input must survive the auto-attach"
+        );
+        assert_eq!(app.input.cursor, 3);
+        assert_eq!(app.display_for(7).draft, "");
+    }
+
+    #[test]
+    fn auto_attach_loads_target_draft_when_input_is_empty() {
+        // With an empty input bar and nothing attached, the auto-attach loads
+        // the target session's saved draft like every other attach path.
+        let mut app = test_app();
+        app.attached_session_id = None;
+        app.display_for(9).draft = "saved for 9".to_string();
+        app.display_for(9).draft_cursor = 4;
+
+        app.persist_input_draft(9);
+
+        assert_eq!(app.input.text, "saved for 9");
+        assert_eq!(app.input.cursor, 4);
+    }
+
+    #[test]
+    fn editing_history_entry_becomes_the_draft_on_switch() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.attached_session_id = Some(1);
+        app.active_session_id = Some(1);
+        // Session 1 has one past prompt the user can navigate back to.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("past prompt".to_string()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        app.display_for(1).view.insert_or_replace(0, turn);
+        app.input.text = "my draft".to_string();
+        app.input.cursor = 3;
+        app.navigate_history_up();
+        assert_eq!(app.input.text, "past prompt");
+
+        // The user types over the history entry instead of exiting it.
+        app.input.insert_char_at_cursor('X');
+        assert_eq!(app.input.text, "past promptX");
+
+        // Switching sessions must keep the edited buffer — the user's real
+        // draft — rather than restoring the pre-Up stash and discarding the
+        // edits.
+        app.attach_to_session(2, &tx).expect("attach to session 2");
+        assert_eq!(
+            app.display_for(1).draft,
+            "past promptX",
+            "edits on top of a history entry become the session draft"
+        );
+        assert!(app.saved_draft.is_empty());
+        assert_eq!(app.history_index, None);
+
+        // Round-trip restores the edited text.
+        app.attach_to_session(1, &tx)
+            .expect("attach back to session 1");
+        assert_eq!(app.input.text, "past promptX");
     }
 }
