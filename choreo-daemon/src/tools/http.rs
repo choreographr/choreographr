@@ -3,6 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::{collections::HashMap, path::Path, time::Duration};
+use tracing::debug;
 use ureq::RequestBuilder;
 
 /// Hard cap on the response body bytes read for a text response. The final
@@ -175,6 +176,11 @@ fn read_bounded_text_body(response: ureq::http::Response<ureq::Body>) -> String 
         .into_reader()
         .take(MAX_HTTP_BODY_BYTES as u64);
     if let Err(e) = reader.read_to_end(&mut bytes) {
+        debug!(
+            error = %e,
+            bytes_read = bytes.len(),
+            "http: body read failed before the byte cap"
+        );
         return format!("body omitted: failed to read response body: {e}");
     }
 
@@ -184,6 +190,12 @@ fn read_bounded_text_body(response: ureq::http::Response<ureq::Body>) -> String 
     // U+FFFD and the sanitizer handles the rest); a fully-read body keeps the
     // strict decode semantics (genuinely invalid UTF-8 → body omitted).
     let truncated = bytes.len() as u64 >= MAX_HTTP_BODY_BYTES as u64;
+    if truncated {
+        debug!(
+            cap_bytes = MAX_HTTP_BODY_BYTES,
+            "http: response body cut at the read cap (hostile or huge body)"
+        );
+    }
     let text = if truncated {
         String::from_utf8_lossy(&bytes).into_owned()
     } else {

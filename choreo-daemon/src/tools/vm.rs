@@ -1,6 +1,6 @@
 use crate::tools::{
     MAX_TOOL_OUTPUT_BYTES, Tool, ToolExecError, ToolOutput, ToolRegistry, context::ToolContext,
-    finish_tool_output, tool_err, tool_ok,
+    finish_tool_output_sanitized, tool_err, tool_ok,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_keystore::ServiceCredential;
@@ -1230,8 +1230,10 @@ fn run_riscv_impl(
             // changes, and it reserves room inside the budget for the exit
             // footer (and the truncation marker, when output was cut) so the
             // signal always survives — including the transcript re-cap in
-            // `record_tool_completion`, which re-applies the byte cap after
-            // sanitizing.
+            // `record_tool_completion`. `finish_tool_output_sanitized`
+            // sanitizes the raw guest output *before* the cap (the guest is
+            // untrusted and can emit Cf-heavy bytes that expand on escaping);
+            // without it, the re-cap would cut the footer off the transcript.
             let footer = if truncated {
                 format!(
                     "{TRUNCATION_MARKER}\n[VM: exited with code {exit_code} in {cycles} cycles]"
@@ -1239,7 +1241,7 @@ fn run_riscv_impl(
             } else {
                 format!("[VM: exited with code {exit_code} in {cycles} cycles]")
             };
-            tool_ok(finish_tool_output(&out_str, Some(footer)))
+            tool_ok(finish_tool_output_sanitized(&out_str, Some(footer)))
         }
         Err(e) => {
             let cycles = trace.machine.cycles();
@@ -1258,9 +1260,12 @@ fn run_riscv_impl(
             // long message must not exceed the shared budget. When the tail
             // was itself cut at the write cap, the marker rides in the
             // finish footer (finish_tool_output reserves room for it inside
-            // the budget) so the truncation stays visible.
+            // the budget) so the truncation stays visible. Sanitizing before
+            // the cap (via `finish_tool_output_sanitized`) keeps the footer
+            // alive through the transcript re-cap even for Cf-heavy guest
+            // output (see the ok-path comment).
             let marker = truncated.then(|| TRUNCATION_MARKER.to_string());
-            tool_err(finish_tool_output(&msg, marker))
+            tool_err(finish_tool_output_sanitized(&msg, marker))
         }
     }
 }

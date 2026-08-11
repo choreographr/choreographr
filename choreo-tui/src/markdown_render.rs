@@ -80,8 +80,8 @@ pub(crate) fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
 /// newlines, printable ASCII, the joiners, and safe non-ASCII; escapes
 /// everything else — C0/C1 controls (including lone CR: a carriage return not
 /// followed by a line feed would let hostile content overwrite its own
-/// rendered line; a CRLF pair is a normal line ending and is folded through),
-/// non-SGR ESC sequences (OSC/DCS/CSI — the terminal-injection vector), the
+/// rendered line; a CRLF pair is folded to a single line feed), non-SGR ESC
+/// sequences (OSC/DCS/CSI — the terminal-injection vector), the
 /// line/paragraph separators U+2028/U+2029, and Unicode format chars (bidi,
 /// ZWSP, …) except the joiners — via `char::escape_default` (e.g. `\u{1b}`,
 /// `\u{202e}`), so hostile content renders as inert text.
@@ -106,12 +106,13 @@ fn sanitize_for_terminal(text: &str) -> String {
     // output can contain hundreds).
     let mut seq = String::new();
     while let Some(c) = chars.next() {
-        // Fold CRLF: a carriage return immediately followed by a line feed is
-        // a normal line ending, not hostile content — a *lone* CR is what
-        // would overwrite the rendered line, and it is escaped below. Keeping
-        // the pair intact avoids littering legitimate CRLF text with `\r`.
+        // Fold CRLF to a single LF: a carriage return followed by a line feed
+        // is a normal line ending, but passing the `\r` through would put a
+        // control char in the rendered cell stream (crossterm prints it to the
+        // terminal). Folding — the same normalization the daemon's line
+        // sanitizers apply — keeps the pair off the wire entirely. A *lone*
+        // CR (the overwrite vector) is escaped below.
         if c == '\r' && chars.peek() == Some(&'\n') {
-            out.push('\r');
             out.push('\n');
             chars.next(); // consume the '\n'
             continue;
@@ -169,7 +170,7 @@ fn sanitize_for_terminal(text: &str) -> String {
 
 /// Whether a single char passes through the terminal filter unchanged: tabs,
 /// newlines, printable ASCII, and safe non-ASCII. Everything else — every
-/// C0/C1 control (including lone CR; a CRLF pair is folded by
+/// C0/C1 control (including lone CR; a CRLF pair is folded to `\n` by
 /// [`sanitize_for_terminal`] before this predicate runs), the line/paragraph
 /// separators, and the non-joiner format-char spoofing class via the shared
 /// [`is_unsafe_unicode`] predicate (owned by `choreo-sanitize`, the same
@@ -555,6 +556,15 @@ pub(crate) fn render_turn_lines(
     // always fall through to the regular markdown path.
     const DIFF_EXCLUDED_TOOLS: &[&str] = &["pdf_to_markdown"];
 
+    /// Tools whose result content is Markdown by design and may therefore use
+    /// the styled markdown renderer. Everything else renders as **plain
+    /// text** — verbatim — so `**` in a grep match or shell line is data, not
+    /// emphasis, and a hostile result cannot weaponize markdown syntax to
+    /// restyle or hide part of the output. Fail-closed: a tool not listed
+    /// here never reaches `markdown_lines`, mirroring how `DIFF_EXCLUDED_TOOLS`
+    /// gates diff auto-detection.
+    const MARKDOWN_TOOLS: &[&str] = &["pdf_to_markdown"];
+
     for (i, tr) in turn.tool_results.iter().enumerate() {
         let accent = if tr.is_error {
             Color::Red
@@ -652,8 +662,14 @@ pub(crate) fn render_turn_lines(
                     && let Some(diff_lines) = try_render_diff_content(&content, tool_content_width)
                 {
                     body.extend(diff_lines);
-                } else {
+                } else if MARKDOWN_TOOLS.contains(&tr.name.as_str()) {
+                    // Tools that emit markdown by design (e.g. pdf_to_markdown)
+                    // keep the styled renderer; everything else is verbatim
+                    // data and must NOT be re-interpreted as markdown (see
+                    // MARKDOWN_TOOLS).
                     body.extend(markdown_lines(&content, tool_content_width));
+                } else {
+                    body.extend(plain_text_lines(&content));
                 }
             }
         }
@@ -3159,6 +3175,97 @@ content ---"
     }
 
     #[test]
+    fn render_turn_lines_grep_bold_is_literal_plain_text() {
+        // grep/sh results are data, not markdown: `**bold**` in a matched
+        // line or shell output must render as literal text (no BOLD
+        // modifier, asterisks visible), even though the same string renders
+        // bold in the assistant's markdown reply. Regression for the
+        // markdown-fallback routing that restyled every non-ANSI tool result.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "grep".into(),
+                content: "src/main.rs:2:**bold**".into(),
+                is_error: false,
+                invocation_description: "Searching for `bold`.".into(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("**bold**"),
+            "asterisks must appear literally in a grep result:\n{text}"
+        );
+        let has_bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            !has_bold,
+            "grep result content must not be styled bold by markdown:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_pdf_to_markdown_keeps_markdown_rendering() {
+        // The markdown allowlist: pdf_to_markdown emits markdown by design
+        // and keeps the styled renderer (bold applied, syntax hidden).
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "pdf_to_markdown".into(),
+                content: "**bold**".into(),
+                is_error: false,
+                invocation_description: String::new(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let has_bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            has_bold,
+            "pdf_to_markdown content should render bold:\n{text}"
+        );
+        assert!(
+            !text.contains("**"),
+            "markdown syntax should not appear literally for markdown tools:\n{text}"
+        );
+    }
+
+    #[test]
     fn render_turn_lines_tool_results_error() {
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
@@ -3361,22 +3468,31 @@ content ---"
         assert_eq!(sanitize_for_terminal("a\u{2028}b"), "a\\u{2028}b");
         assert_eq!(sanitize_for_terminal("a\u{200c}b"), "a\u{200c}b");
         assert_eq!(sanitize_for_terminal("a\u{200d}b"), "a\u{200d}b");
+        assert_eq!(sanitize_for_terminal("a\tb\nc\n日本語"), "a\tb\nc\n日本語");
         assert_eq!(
             sanitize_for_terminal("a\tb\nc\r\n日本語"),
-            "a\tb\nc\r\n日本語"
+            "a\tb\nc\n日本語",
+            "CRLF must fold to a single LF"
         );
     }
 
     #[test]
     fn sanitize_for_terminal_folds_crlf_but_escapes_lone_cr() {
-        // CRLF is a normal line ending and passes through intact; a lone CR
-        // (which would overwrite the rendered line) is escaped.
-        assert_eq!(sanitize_for_terminal("a\r\nb"), "a\r\nb");
+        // CRLF is a normal line ending and folds to a single LF (no control
+        // char reaches the rendered cell stream); a lone CR (which would
+        // overwrite the rendered line) is escaped.
+        assert_eq!(sanitize_for_terminal("a\r\nb"), "a\nb");
         assert_eq!(sanitize_for_terminal("a\rb"), "a\\rb");
         // A lone CR is escaped even when it precedes a folded CRLF pair.
-        assert_eq!(sanitize_for_terminal("a\r\r\nb"), "a\\r\r\nb");
+        assert_eq!(sanitize_for_terminal("a\r\r\nb"), "a\\r\nb");
         // CR at end of input (no following LF) is escaped.
         assert_eq!(sanitize_for_terminal("a\r"), "a\\r");
+        // No raw CR may survive the filter in any case — the sink defense
+        // must keep control chars out of the terminal entirely.
+        assert!(
+            !sanitize_for_terminal("a\r\nb\rc").contains('\r'),
+            "filter output must never contain a raw CR"
+        );
     }
 
     #[test]

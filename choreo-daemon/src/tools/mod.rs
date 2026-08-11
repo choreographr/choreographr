@@ -1197,6 +1197,28 @@ pub(crate) fn sanitize_transcript(text: &str) -> String {
     out
 }
 
+/// Cap `body` at the shared byte budget with `marker` (if any) reserved
+/// *inside* the budget, sanitizing the body for the LLM transcript first.
+///
+/// `record_tool_completion` re-applies `sanitize_transcript` + the byte cap
+/// at the choke point for every tool. Escaping *expands* (a 3-byte bidi char
+/// becomes the 7-byte `\u{202e}`), so a raw body that `finish_tool_output`
+/// kept ≤ [`MAX_TOOL_OUTPUT_BYTES`] could exceed the budget once escaped and
+/// the re-cap would cut the tool's tail — the VM exit footer, the `find`/
+/// `grep` "at least N results" marker, or `pdf_to_markdown`'s closing
+/// untrusted-content delimiter — off the transcript.
+///
+/// Sanitizing *before* the cap closes that gap: the escape output is plain
+/// ASCII, so the choke point's re-sanitize is a no-op (the function is
+/// idempotent on its own output) and its re-cap is a no-op (body + tail
+/// already ≤ the budget) — the tail survives end to end. `sanitize_transcript`
+/// preserves ESC/ANSI, newlines, and tabs, so shell/VM colors and structure
+/// are unaffected. Callers that append a critical tail to raw output (VM,
+/// shell exit code, pdf framing) must use this instead of `finish_tool_output`.
+pub(crate) fn finish_tool_output_sanitized(body: &str, marker: Option<String>) -> String {
+    finish_tool_output(&sanitize_transcript(body), marker)
+}
+
 /// Escape control characters and Unicode format chars in a *multi-line*
 /// body while preserving structural line breaks.
 ///
@@ -2644,6 +2666,43 @@ mod tests {
             "the truncation marker must survive the composition"
         );
         std::str::from_utf8(capped.as_bytes()).expect("capped output must be valid UTF-8");
+    }
+
+    #[test]
+    fn finish_tool_output_sanitized_tail_survives_transcript_recap() {
+        // The residual gap: escaping *expands* (a 2-byte soft hyphen becomes
+        // the 6-byte `\u{ad}`), so a tail reserved inside the budget against
+        // the RAW body length gets cut by the transcript choke point's re-cap
+        // when the body is Cf-heavy and near the cap. `finish_tool_output_sanitized`
+        // escapes BEFORE the cap, making the choke point's re-sanitize (a
+        // no-op on ASCII escape output) and re-cap (a no-op on content already
+        // ≤ the budget) both inert — the tool's critical tail survives end to
+        // end. This pins the composition the VM footer / shell exit code /
+        // pdf framing delimiter all rely on.
+        let footer = "[VM: exited with code 0 in 100 cycles]";
+        // ~128 KiB of 2-byte soft hyphens — expands to ~384 KiB when escaped.
+        let body = "\u{00ad}".repeat(super::MAX_TOOL_OUTPUT_BYTES / 2);
+        let finished = super::finish_tool_output_sanitized(&body, Some(footer.to_string()));
+        assert!(
+            finished.len() <= super::MAX_TOOL_OUTPUT_BYTES,
+            "body + tail must stay within the budget: {} bytes",
+            finished.len()
+        );
+        // The transcript choke point's composition (sanitize then re-cap)
+        // must be a no-op on already-sanitized, within-budget content.
+        let recapped = super::truncate_tool_output(&super::sanitize_transcript(&finished));
+        assert_eq!(recapped, finished, "re-sanitize + re-cap must be a no-op");
+        assert!(
+            recapped.ends_with(footer),
+            "footer must survive the transcript re-cap"
+        );
+        // Sanitizing at the source really did escape the Cf chars: the body
+        // is inert ASCII in the finished output, not live bidi.
+        assert!(
+            !recapped.contains('\u{00ad}'),
+            "soft hyphens must be escaped, not passed through"
+        );
+        std::str::from_utf8(recapped.as_bytes()).expect("capped output must be valid UTF-8");
     }
 
     #[test]

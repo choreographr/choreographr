@@ -271,9 +271,11 @@ fn run_find_walk(
         return Ok(String::new());
     }
 
-    // Cap the body at the shared byte budget, appending the truncation marker
-    // *after* the cap so the "N of many more" signal always survives even when
-    // the result body alone exceeds the budget.
+    // Cap the body at the shared byte budget, reserving room *inside* the
+    // budget for the truncation marker (see `finish_tool_output`) so the
+    // "N of many more" signal always survives even when the result body
+    // alone exceeds the budget — including the transcript re-cap in
+    // `record_tool_completion`, which re-applies the cap after sanitizing.
     Ok(finish_tool_output(&results.join("\n"), marker))
 }
 
@@ -576,8 +578,10 @@ mod tests {
         };
         let result = tool.execute(args, None, None, None).unwrap();
 
-        // The joined body stays within the byte budget; only the marker is
-        // appended past it (finish_tool_output convention).
+        // The joined body stays within the byte budget; the marker is
+        // reserved inside the budget by `finish_tool_output` (the walk
+        // stops at MAX_TOOL_OUTPUT_BYTES, so the body is re-capped at
+        // budget minus marker/tail headroom).
         assert!(
             result.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
             "output must fit budget + marker: {} bytes",

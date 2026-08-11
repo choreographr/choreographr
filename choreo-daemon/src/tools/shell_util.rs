@@ -1,4 +1,4 @@
-use super::{MAX_TOOL_OUTPUT_BYTES, ToolExecError, truncate_tool_output};
+use super::{MAX_TOOL_OUTPUT_BYTES, ToolExecError, finish_tool_output_sanitized};
 use choreo_sanitize::ByteBudget;
 use crossbeam_channel;
 use std::{
@@ -670,6 +670,13 @@ pub fn run_shell_streaming(
 }
 
 /// Format the tool output string for a shell-style command.
+///
+/// The body is sanitized for the transcript and capped with the exit code
+/// reserved *inside* the budget (`finish_tool_output_sanitized`), so the
+/// "Exit code" signal always survives — including the transcript re-cap in
+/// `record_tool_completion`, which re-applies the cap after `sanitize_transcript`
+/// (escaping expands Cf chars, so a raw near-cap body could otherwise push
+/// past the budget and lose its tail).
 pub(crate) fn format_shell_output(
     display_cmd: &str,
     output: &Output,
@@ -677,17 +684,21 @@ pub(crate) fn format_shell_output(
     was_killed: bool,
 ) -> String {
     if was_killed {
-        return truncate_tool_output(&format!(
-            "$ {display_cmd}\n\n[command timed out after {timeout_ms}ms]\n\nExit code: -1"
-        ));
+        return finish_tool_output_sanitized(
+            &format!("$ {display_cmd}"),
+            Some(format!(
+                "\n[command timed out after {timeout_ms}ms]\n\nExit code: -1"
+            )),
+        );
     }
     let mut combined = output.stdout.clone();
     combined.extend_from_slice(&output.stderr);
     let combined_str = String::from_utf8_lossy(&combined);
     let exit_code = output.status.code().unwrap_or(-1);
-    truncate_tool_output(&format!(
-        "$ {display_cmd}\n{combined_str}\n\nExit code: {exit_code}"
-    ))
+    finish_tool_output_sanitized(
+        &format!("$ {display_cmd}\n{combined_str}"),
+        Some(format!("\nExit code: {exit_code}")),
+    )
 }
 
 #[cfg(test)]

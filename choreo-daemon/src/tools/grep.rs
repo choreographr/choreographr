@@ -1352,9 +1352,10 @@ impl Tool for Grep {
     }
 }
 
-/// Assemble the final grep output, capped at the shared byte budget with the
-/// truncation marker appended **past** the cap so the "N of many more" count
-/// signal always survives even when the body alone exceeds the budget.
+/// Assemble the final grep output, capped at the shared byte budget with
+/// the truncation marker reserved *inside* the budget (see
+/// `finish_tool_output`) so the "N of many more" count signal always
+/// survives — including the transcript re-cap in `record_tool_completion`.
 fn assemble_grep_output(body: String, truncated: bool, max_results: usize, noun: &str) -> String {
     let marker = truncation_marker(truncated, max_results, noun);
     finish_tool_output(&body, marker)

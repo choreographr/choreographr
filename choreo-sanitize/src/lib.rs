@@ -174,15 +174,15 @@ impl ByteBudget {
         }
     }
 
-    /// True once the budget has been exhausted by a chunk that did not fully
-    /// fit (i.e. output was cut).
-    pub fn is_truncated(&self) -> bool {
-        self.truncated
-    }
-
     /// The one-time truncation marker ([`TRUNCATION_SUFFIX`]) — `Some` on the
     /// first call after the budget was crossed, `None` afterwards (and before
     /// any truncation).
+    ///
+    /// This is the *only* way to observe truncation: the budget latches (a
+    /// chunk that did not fully fit marks it truncated forever), so a bare
+    /// `is_truncated()`-style re-check would re-arm on every subsequent
+    /// chunk. `take_marker` consumes the signal exactly once — the same
+    /// one-shot contract the streaming paths rely on.
     pub fn take_marker(&mut self) -> Option<&'static str> {
         if self.truncated && !self.marker_sent {
             self.marker_sent = true;
@@ -343,9 +343,8 @@ mod tests {
         // everything after is dropped.
         let mut b = ByteBudget::new(10);
         assert_eq!(b.fit(4), 4, "chunks that fit are forwarded whole");
-        assert!(!b.is_truncated());
+        assert_eq!(b.take_marker(), None, "no marker before any truncation");
         assert_eq!(b.fit(10), 6, "crossing chunk keeps a fitting prefix");
-        assert!(b.is_truncated());
         assert_eq!(b.take_marker(), Some(TRUNCATION_SUFFIX));
         assert_eq!(b.take_marker(), None, "marker is one-time");
         assert_eq!(b.fit(5), 0, "nothing fits past the cap");
@@ -356,11 +355,9 @@ mod tests {
         // A chunk that lands exactly on the limit is a full fit, not a cut.
         let mut b = ByteBudget::new(8);
         assert_eq!(b.fit(8), 8);
-        assert!(!b.is_truncated());
-        assert_eq!(b.take_marker(), None);
+        assert_eq!(b.take_marker(), None, "exact fit is not a cut");
         // The next chunk is what trips the cap.
         assert_eq!(b.fit(1), 0);
-        assert!(b.is_truncated());
         assert_eq!(b.take_marker(), Some(TRUNCATION_SUFFIX));
     }
 
@@ -368,7 +365,6 @@ mod tests {
     fn byte_budget_zero_limit_immediately_truncates() {
         let mut b = ByteBudget::new(0);
         assert_eq!(b.fit(1), 0);
-        assert!(b.is_truncated());
         assert_eq!(b.take_marker(), Some(TRUNCATION_SUFFIX));
     }
 }

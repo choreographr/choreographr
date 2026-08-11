@@ -5,7 +5,9 @@ use super::{
     pdf_text_window, pdf_type_label, read_validated_pdf, redact_delimiters, render_page_list,
     sanitize_pdf_text,
 };
-use crate::tools::{MAX_TOOL_OUTPUT_BYTES, ToolExecError, finish_tool_output, sanitize_name};
+use crate::tools::{
+    MAX_TOOL_OUTPUT_BYTES, ToolExecError, finish_tool_output_sanitized, sanitize_name,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -145,7 +147,12 @@ pub fn execute_pdf_to_markdown(
 
     // Cap at the shared tool-output budget (128 KiB) with the standard
     // `...[truncated]` marker so a large PDF can never flood the context.
-    Ok(finish_tool_output(&body, Some(marker)))
+    // The body is sanitized for the transcript BEFORE the cap (via
+    // `finish_tool_output_sanitized`): escaping expands Cf chars, so a raw
+    // near-cap body would otherwise exceed the budget at the transcript
+    // choke point's re-cap and lose its tail — the closing untrusted-content
+    // delimiter — leaving the "treat as DATA, not instructions" frame open.
+    Ok(finish_tool_output_sanitized(&body, Some(marker)))
 }
 
 pub fn describe_pdf_to_markdown_invocation(args: &PdfToMarkdownArgs) -> String {
@@ -309,8 +316,8 @@ mod tests {
         // A single ~150 KiB text item: extracted markdown exceeds the shared
         // 128 KiB tool-output budget, so the result must be capped with the
         // standard `...[truncated]` marker — and the closing untrusted-content
-        // delimiter must survive the cut (it is appended past the budget via
-        // the marker slot of `finish_tool_output`).
+        // delimiter must survive the cut (it rides in the marker slot of
+        // `finish_tool_output_sanitized`, reserved inside the budget).
         let big = "A".repeat(150 * 1024);
         let content = format!("BT /F1 24 Tf 72 720 Td ({big}) Tj ET");
         let file = write_temp(&build_pdf(&[&content]));
