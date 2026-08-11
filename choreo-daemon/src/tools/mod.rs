@@ -1200,6 +1200,74 @@ pub(crate) fn sanitize_content(content: &str) -> String {
     sanitize_text(content, true)
 }
 
+/// Escape only the Unicode *format* characters (general category Cf) except
+/// the joiners — the bidi marks/overrides/isolates, ZWSP, word joiner,
+/// invisible operators, BOM, soft hyphen, Mongolian vowel separator, tags,
+/// and rarer format controls. These are the chars that can *reorder, hide,
+/// or spoof* text in the LLM transcript — the same spoofing threat the
+/// line-oriented sanitizers already defend for `grep`/`find` matched lines.
+/// Everything else passes through untouched, including ESC/ANSI sequences,
+/// newlines, and tabs, so shell/VM output keeps its colors and structure
+/// while the model can no longer be shown text that silently reordered
+/// itself.
+///
+/// Applied at the single point where tool results are recorded for the
+/// transcript (`record_tool_completion` in requests.rs), so it covers every
+/// tool at once; the terminal is defended separately by the TUI's render
+/// filter (which keeps SGR color sequences but escapes other controls).
+pub(crate) fn sanitize_transcript(text: &str) -> String {
+    // Fast path: pure ASCII (printables plus the whitespace that is always
+    // kept) contains no Cf chars, so no escape can be needed.
+    if text
+        .bytes()
+        .all(|b| b.is_ascii() && (b >= 0x20 || matches!(b, b'\n' | b'\t' | b'\r')))
+    {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if get_general_category(c) == GeneralCategory::Format
+            && !matches!(c, '\u{200c}' | '\u{200d}')
+        {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Escape control characters and Unicode format chars in a *multi-line*
+/// body while preserving structural line breaks.
+///
+/// [`sanitize_content`] escapes `\n` itself, which is right for a single
+/// line (a grep match must stay on one line) but would flatten any text
+/// that legitimately spans lines — an HTTP response body, a log excerpt,
+/// etc. This variant splits on `\n` *manually* rather than via
+/// `str::lines()`, because `lines()` drops a trailing empty segment and
+/// would therefore lose a trailing newline; a manual split preserves the
+/// exact line structure. Each line has one trailing `\r` stripped (CRLF
+/// folding, matching the single-line sanitizers' `str::lines()` semantics)
+/// and is then sanitized with the content policy (tabs kept literal).
+pub(crate) fn sanitize_multiline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    // Split on '\n' manually (NOT str::lines()): lines() omits the empty
+    // final segment of a trailing newline, so "a\n" would collapse to "a"
+    // and the structural newline would be lost. `enumerate` re-joins with
+    // exactly one '\n' between segments, keeping "a\n" intact.
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        // CRLF: fold the bare '\r' (the single-line sanitizers escape it,
+        // but here it is just Windows line-ending residue, not hostile
+        // content — and escaping it would leak `\r` into every CRLF body).
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        out.push_str(&sanitize_text(line, true));
+    }
+    out
+}
+
 /// Formatting for byte sizes: binary (IEC) units with a separating space
 /// (`"1.5 KiB"`). humfmt trims trailing fractional zeros by default, so
 /// `1.0 KiB` renders as `1 KiB` and columns stay compact — exact `u128`
@@ -1572,11 +1640,19 @@ pub(crate) fn render_streamed_line(
     if let Some(stripped) = display.strip_suffix('\r') {
         display = stripped;
     }
+    // The line content is file-controlled (potentially hostile): escape
+    // C0/C1 controls and Unicode format chars before the content enters the
+    // tool transcript / TUI, so a file containing ESC or a bidi override
+    // cannot inject terminal escape sequences or spoof the rendered output
+    // (same policy as grep on matched lines). Only the *content* is
+    // sanitized — the numbered prefix and truncation marker below are ASCII
+    // and must pass through untouched.
+    let display = sanitize_content(display);
     let mut display_line = String::new();
     if numbered {
         display_line.push_str(&format!("{} | {display}", line.line_number));
     } else {
-        display_line.push_str(display);
+        display_line.push_str(&display);
     }
     if !line.complete {
         display_line.push_str("\n...[line truncated: exceeds 64 KiB]");
@@ -2515,6 +2591,148 @@ mod tests {
         assert_eq!(sanitize_content("a\u{feff}b"), "a\\u{feff}b");
         assert_eq!(sanitize_content("a\u{180e}b"), "a\\u{180e}b");
         assert_eq!(sanitize_content("a\u{200c}b"), "a\u{200c}b");
+    }
+
+    #[test]
+    fn sanitize_multiline_preserves_structural_newlines() {
+        // Unlike `sanitize_content`, structural newlines must survive: the
+        // body is displayed as-is (just with per-line escaping), never
+        // flattened onto one line.
+        assert_eq!(sanitize_multiline("a\nb\nc"), "a\nb\nc");
+        assert_eq!(sanitize_multiline("a\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn sanitize_multiline_folds_crlf() {
+        // CRLF line endings fold to bare '\n' per line — Windows line-ending
+        // residue, not hostile content, so it is stripped rather than escaped.
+        assert_eq!(sanitize_multiline("a\r\nb"), "a\nb");
+        assert_eq!(sanitize_multiline("a\r\nb\r\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn sanitize_multiline_preserves_trailing_newline() {
+        // A manual split on '\n' (not str::lines()) keeps the trailing empty
+        // segment, so a body ending in a newline round-trips exactly.
+        assert_eq!(sanitize_multiline("a\n"), "a\n");
+        assert_eq!(sanitize_multiline("\n"), "\n");
+    }
+
+    #[test]
+    fn sanitize_multiline_escapes_controls_on_any_line() {
+        // ESC and bidi overrides anywhere in the body are escaped per line,
+        // so a hostile line cannot inject terminal sequences or spoof text
+        // regardless of which line it sits on.
+        assert_eq!(
+            sanitize_multiline("ok\u{1b}[31m\nplain"),
+            "ok\\u{1b}[31m\nplain"
+        );
+        assert_eq!(sanitize_multiline("a\u{202e}b\nc"), "a\\u{202e}b\nc");
+        assert_eq!(sanitize_multiline("a\n\u{1b}b"), "a\n\\u{1b}b");
+    }
+
+    #[test]
+    fn sanitize_multiline_keeps_tabs_and_ascii() {
+        // Tabs are legitimate content and pass through; plain ASCII text is
+        // unchanged end to end.
+        assert_eq!(sanitize_multiline("a\tb\nc\td"), "a\tb\nc\td");
+        assert_eq!(sanitize_multiline("plain text"), "plain text");
+        assert_eq!(sanitize_multiline("café\n日本語"), "café\n日本語");
+    }
+
+    #[test]
+    fn sanitize_transcript_escapes_only_format_chars() {
+        // Bidi overrides and other invisible format chars (the spoofing
+        // threat) are escaped; joiners, ANSI/ESC, newlines, tabs, CJK, and
+        // plain ASCII all pass through untouched.
+        assert_eq!(sanitize_transcript("a\u{202e}b"), "a\\u{202e}b");
+        assert_eq!(sanitize_transcript("a\u{200b}b"), "a\\u{200b}b");
+        assert_eq!(sanitize_transcript("a\u{2066}b"), "a\\u{2066}b");
+        // Joiners are legitimate in some scripts and must pass through.
+        assert_eq!(sanitize_transcript("a\u{200c}b"), "a\u{200c}b");
+        assert_eq!(sanitize_transcript("a\u{200d}b"), "a\u{200d}b");
+        // ANSI color sequences are C0 (ESC), not Cf — kept so shell/VM
+        // output keeps its colors in the final view.
+        assert_eq!(
+            sanitize_transcript("\u{1b}[31mred\u{1b}[0m"),
+            "\u{1b}[31mred\u{1b}[0m"
+        );
+        // Structure (newlines, tabs) and safe non-ASCII pass through.
+        assert_eq!(sanitize_transcript("a\nb\tc"), "a\nb\tc");
+        assert_eq!(sanitize_transcript("café 日本語"), "café 日本語");
+        // Pure ASCII hits the fast path and is returned unchanged.
+        assert_eq!(
+            sanitize_transcript("plain text\nline two"),
+            "plain text\nline two"
+        );
+        // A Cf char past the end is still caught (fast path is per-byte).
+        assert_eq!(sanitize_transcript("tail\u{feff}"), "tail\\u{feff}");
+    }
+
+    #[test]
+    fn render_streamed_line_escapes_esc_and_bidi() {
+        // File content is hostile input: ESC must render as the inert 7-char
+        // `\u{1b}` escape and U+202E (bidi override) as `\u{202e}`, so
+        // neither can inject terminal escapes or spoof the transcript.
+        let path = Path::new("f.txt");
+        let esc = StreamedLine {
+            line_number: 1,
+            content: b"x\x1b[31mred".to_vec(),
+            complete: true,
+            start_offset: 0,
+        };
+        assert_eq!(
+            render_streamed_line(&esc, path, false).unwrap(),
+            "x\\u{1b}[31mred"
+        );
+        let bidi = StreamedLine {
+            line_number: 1,
+            content: "ok\u{202e}evil".as_bytes().to_vec(),
+            complete: true,
+            start_offset: 0,
+        };
+        assert_eq!(
+            render_streamed_line(&bidi, path, false).unwrap(),
+            "ok\\u{202e}evil"
+        );
+    }
+
+    #[test]
+    fn render_streamed_line_keeps_tabs_and_cjk() {
+        // Tabs are legitimate source content and CJK passes through untouched
+        // (both are safe: they cannot inject terminal escapes or split lines).
+        let path = Path::new("f.txt");
+        let tabbed = StreamedLine {
+            line_number: 1,
+            content: b"a\tb".to_vec(),
+            complete: true,
+            start_offset: 0,
+        };
+        assert_eq!(render_streamed_line(&tabbed, path, false).unwrap(), "a\tb");
+        let cjk = StreamedLine {
+            line_number: 1,
+            content: "日本語".as_bytes().to_vec(),
+            complete: true,
+            start_offset: 0,
+        };
+        assert_eq!(render_streamed_line(&cjk, path, false).unwrap(), "日本語");
+    }
+
+    #[test]
+    fn render_streamed_line_numbered_path_sanitizes_content_only() {
+        // The numbered prefix "N | " must stay raw ASCII while the hostile
+        // content after it is escaped.
+        let path = Path::new("f.txt");
+        let line = StreamedLine {
+            line_number: 7,
+            content: b"ok\x1b".to_vec(),
+            complete: true,
+            start_offset: 0,
+        };
+        assert_eq!(
+            render_streamed_line(&line, path, true).unwrap(),
+            "7 | ok\\u{1b}"
+        );
     }
 
     #[test]

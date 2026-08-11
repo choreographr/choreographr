@@ -1,6 +1,6 @@
 use super::{
-    Tool, ToolExecError, context::ToolContext, finish_tool_output, human_size, sanitize_name,
-    symlink_target_label, truncation_marker,
+    MAX_TOOL_OUTPUT_BYTES, Tool, ToolExecError, context::ToolContext, finish_tool_output,
+    human_size, sanitize_name, symlink_target_label, truncation_marker,
 };
 use choreo_keystore::ServiceCredential;
 use crossbeam_channel;
@@ -88,6 +88,10 @@ fn normalize_find_pattern<'a>(
 
 /// Run the find walk with the given parameters, optionally streaming each
 /// match to `output_tx` as it is found (for incremental client display).
+/// The walk stops early on either the `max_results` cap or the shared byte
+/// budget ([`MAX_TOOL_OUTPUT_BYTES`]) — both set `truncated` so the caller
+/// reports "at least N results". The byte-budget stop keeps the streamed
+/// live view from ever exceeding what the final (capped) result shows.
 fn run_find_walk(
     resolved: &Path,
     pattern: &str,
@@ -130,6 +134,11 @@ fn run_find_walk(
     // Set when the walk stops early at the max_results cap; drives the
     // `...[truncated at N results]` marker so the caller knows more exist.
     let mut truncated = false;
+    // Running byte total of the *rendered* lines (each charges its length
+    // plus one joining newline). Drives the byte-budget stop below so the
+    // buffered and streamed output can never exceed what the final
+    // `finish_tool_output` cap would show anyway.
+    let mut content_bytes: usize = 0;
 
     let mut builder = WalkBuilder::new(resolved)
         .map_err(|e| ToolExecError(format!("failed to create walker: {e}")))?;
@@ -206,6 +215,23 @@ fn run_find_walk(
                 WalkEntryKind::Unknown => rel,
             };
 
+            // Byte-budget stop: a tree whose rendered output would exceed the
+            // shared cap must stop the walk exactly like the max_results cap,
+            // so the streamed view never exceeds what the final result can
+            // show (previously the walker streamed every match and only the
+            // final join was capped — the live view could diverge unboundedly
+            // from the recorded result). Charges `line.len() + 1` for the
+            // joining newline, matching the final render. The first match is
+            // always accepted (even if it alone overflows) so a pathological
+            // single huge line cannot produce an empty result — the final
+            // `finish_tool_output` byte-caps it instead.
+            let line_bytes = line.len() + 1;
+            if !results.is_empty() && content_bytes + line_bytes > MAX_TOOL_OUTPUT_BYTES {
+                truncated = true; // more results exist; marker reports "at least N"
+                return WalkState::Quit;
+            }
+            content_bytes += line_bytes;
+
             // Stream the result if a sender is configured so the client can
             // display matches incrementally rather than waiting for the
             // entire walk to complete.
@@ -232,8 +258,11 @@ fn run_find_walk(
 
     // When the cap cut the walk short, append an explicit marker (and stream
     // it as a final chunk) so the caller can tell "exactly N results" from
-    // "N of many more".
-    let marker = truncation_marker(truncated, max_results, "results");
+    // "N of many more". The marker reports the count *actually collected*,
+    // which is the cap value for a max_results stop and the budget-limited
+    // count for a byte-budget stop — in both cases an honest "at least N"
+    // figure.
+    let marker = truncation_marker(truncated, results.len(), "results");
     if let (Some(marker), Some(tx)) = (&marker, output_tx) {
         let _ = tx.send(format!("{marker}\n").into_bytes());
     }
@@ -517,6 +546,54 @@ mod tests {
         assert!(
             result.contains("...[truncated at 1 results]"),
             "expected truncation marker:\n{result}"
+        );
+    }
+
+    #[test]
+    fn byte_budget_stops_walk_with_truncation_marker() {
+        // A tree whose rendered output exceeds the shared byte budget must
+        // stop the walk exactly like the max_results cap: the joined body
+        // stays within the budget (only the marker is appended past it) and
+        // the marker reports the collected count. Long nested paths make
+        // each line ~1 KiB, so the byte budget binds (~120 lines) well
+        // before the 200-result max_results cap.
+        let dir = TempDir::new().expect("temp dir for find byte-budget test");
+        let mut cur = dir.path().to_path_buf();
+        for _ in 0..4 {
+            cur = cur.join("f".repeat(210));
+            std::fs::create_dir(&cur).expect("create nested dir");
+        }
+        for i in 0..200u32 {
+            std::fs::write(cur.join(format!("f{i}")), "").expect("write file");
+        }
+
+        let tool = Find;
+        let args = FindArgs {
+            pattern: "f".to_string(),
+            glob: false,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: Some(200),
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+
+        // The joined body stays within the byte budget; only the marker is
+        // appended past it (finish_tool_output convention).
+        assert!(
+            result.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
+            "output must fit budget + marker: {} bytes",
+            result.len()
+        );
+        assert!(
+            result.contains("truncated"),
+            "byte-budget stop must report truncation:\n{}",
+            &result[..result.len().min(200)]
+        );
+        // The budget — not an empty search — stopped the walk: many results
+        // were collected before the stop.
+        assert!(
+            result.lines().count() > 100,
+            "a healthy number of results plus marker expected: {} lines",
+            result.lines().count()
         );
     }
 

@@ -1,6 +1,6 @@
 use super::{
     STREAMING_CHANNEL_CAPACITY, Tool, ToolExecError, ToolOutputFormat, ToolRegistry,
-    context::ToolContext,
+    context::ToolContext, finish_tool_output,
 };
 use choreo_ai_protocols::ChatToolCall;
 use choreo_keystore::ServiceCredential;
@@ -290,13 +290,18 @@ fn execute_series(
         step_outputs.insert(step_idx, output.content);
     }
 
-    serde_json::to_string(&step_outputs)
-        .map_err(|e| ToolExecError(format!("failed to serialize series results: {e}")))
+    let json = serde_json::to_string(&step_outputs)
+        .map_err(|e| ToolExecError(format!("failed to serialize series results: {e}")))?;
+    // Each step's content is individually capped, but N steps joined can far
+    // exceed the shared byte budget; cap the aggregated JSON like every other
+    // tool's final content so a long series cannot flood the transcript.
+    Ok(finish_tool_output(&json, None))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::MAX_TOOL_OUTPUT_BYTES;
     use crate::tools::ToolRegistry;
     use std::sync::Arc;
 
@@ -610,6 +615,40 @@ mod tests {
         let parsed: HashMap<String, String> = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.len(), 1);
         assert!(parsed.contains_key("1"));
+    }
+
+    #[test]
+    fn aggregated_json_is_capped_at_byte_budget() {
+        // Each step's content is individually capped, but N steps joined can
+        // far exceed the shared byte budget: the aggregated JSON must be
+        // truncated with the shared marker so a long series cannot flood the
+        // transcript.
+        let reg = test_registry();
+        let series = RunSeries::new(Arc::downgrade(&reg));
+        let big = "x".repeat(100 * 1024);
+        let input = RunSeriesInput {
+            steps: vec![
+                SeriesStep {
+                    tool: "echo_test".into(),
+                    arguments: serde_json::json!({"big": big.clone()}),
+                },
+                SeriesStep {
+                    tool: "echo_test".into(),
+                    arguments: serde_json::json!({"big": big}),
+                },
+            ],
+        };
+
+        let result = series.execute(input, None, None, None).unwrap();
+        assert!(
+            result.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
+            "aggregated JSON must fit budget + marker: {} bytes",
+            result.len()
+        );
+        assert!(
+            result.contains("...[truncated]"),
+            "expected byte-cap marker"
+        );
     }
 
     #[test]

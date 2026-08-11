@@ -1,4 +1,4 @@
-use super::truncate_tool_output;
+use super::{sanitize_multiline, sanitize_name, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, time::Duration};
@@ -139,7 +139,16 @@ pub fn execute_http_request_tool(
         String::new()
     } else if is_text_content_type(&content_type) {
         match response.into_body().read_to_string() {
-            Ok(text) => truncate_tool_output(&text),
+            Ok(text) => {
+                // The body is attacker-controlled (the URL is arbitrary): a
+                // hostile response could embed ESC or a Unicode bidi override
+                // that would inject terminal escapes or spoof text in the
+                // tool transcript / TUI. Escape C0/C1 controls and format
+                // chars per line — the same policy as grep on matched lines —
+                // while preserving structural newlines so the body stays
+                // readable as multi-line text.
+                truncate_tool_output(&sanitize_multiline(&text))
+            }
             Err(error) => format!("body omitted: failed to decode response text: {error}"),
         }
     } else {
@@ -196,7 +205,13 @@ fn format_http_response(
         output.push('\n');
         output.push_str(name);
         output.push_str(": ");
-        output.push_str(value);
+        // Header values come from the remote server (untrusted): a hostile
+        // value containing a newline would split the header onto extra lines
+        // (breaking the line-oriented output) and ESC/bidi chars could inject
+        // terminal sequences. `sanitize_name` escapes all of those; header
+        // *names* are already lowercased ASCII (validated before the request
+        // and produced by ureq), so only values need sanitizing.
+        output.push_str(&sanitize_name(value));
     }
 
     output.push_str("\n\n");

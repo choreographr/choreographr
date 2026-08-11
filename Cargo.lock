@@ -2377,6 +2377,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-prompts",
+ "unicode-general-category",
  "unicode-segmentation",
  "unicode-width",
 ]

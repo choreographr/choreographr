@@ -1,5 +1,6 @@
 use crate::tools::{
-    Tool, ToolExecError, ToolOutput, ToolRegistry, context::ToolContext, tool_err, tool_ok,
+    MAX_TOOL_OUTPUT_BYTES, Tool, ToolExecError, ToolOutput, ToolRegistry, context::ToolContext,
+    finish_tool_output, tool_err, tool_ok,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_keystore::ServiceCredential;
@@ -715,6 +716,12 @@ struct ChoreographrSyscall {
     output_tx: mpsc::Sender<Vec<u8>>,
     write_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
     ctx: Option<crate::tools::context::ToolContext>,
+    /// Running total of guest WRITE bytes forwarded to both the accumulated
+    /// output and the streamed live view. Capped at [`MAX_TOOL_OUTPUT_BYTES`]
+    /// so a guest that emits unbounded output cannot balloon daemon memory or
+    /// the client's live display past the shared budget (the guest keeps
+    /// running; output past the cap is dropped).
+    streamed_bytes: usize,
 }
 
 impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall {
@@ -770,9 +777,18 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
                 if len > 0 {
                     trace!(len, "guest WRITE syscall");
                     let data = machine.memory_mut().load_bytes(ptr, len)?;
-                    let _ = self.output_tx.send(data.to_vec());
-                    if let Some(tx) = &self.write_tx {
-                        let _ = tx.send(data.into());
+                    // Bound the forwarded total (both the accumulated copy and
+                    // the streamed live view) at the shared byte budget: a
+                    // guest can write unbounded bytes, and without the cap the
+                    // final content and the live stream would both balloon far
+                    // past what the transcript can ever show. The guest keeps
+                    // running; output beyond the cap is simply dropped.
+                    self.streamed_bytes += data.len();
+                    if self.streamed_bytes <= MAX_TOOL_OUTPUT_BYTES {
+                        let _ = self.output_tx.send(data.to_vec());
+                        if let Some(tx) = &self.write_tx {
+                            let _ = tx.send(data.into());
+                        }
                     }
                 }
                 Ok(true)
@@ -1106,6 +1122,7 @@ fn run_riscv_impl(
         output_tx,
         write_tx,
         ctx,
+        streamed_bytes: 0,
     };
 
     // Single-hart VM: there is only one instruction stream, so the RISC-V A
@@ -1173,12 +1190,18 @@ fn run_riscv_impl(
 
             let out_str = String::from_utf8_lossy(&drain_vm_output(&output_rx)).to_string();
 
-            let mut result = out_str;
-            result.push_str(&format!(
-                "\n[VM: exited with code {exit_code} in {cycles} cycles]"
-            ));
-
-            tool_ok(result)
+            // The guest output is already capped at MAX_TOOL_OUTPUT_BYTES by
+            // the WRITE syscall, so `finish_tool_output` is a no-op on the
+            // body — but it still guarantees the bound if that cap ever
+            // changes, and it appends the exit footer *past* the budget (the
+            // same marker-past-cap convention the other tools use) so the
+            // exit signal always survives.
+            tool_ok(finish_tool_output(
+                &out_str,
+                Some(format!(
+                    "[VM: exited with code {exit_code} in {cycles} cycles]"
+                )),
+            ))
         }
         Err(e) => {
             let cycles = trace.machine.cycles();
@@ -1191,7 +1214,10 @@ fn run_riscv_impl(
             } else {
                 format!("VM error after {cycles} cycles: {e}\noutput so far:\n{out_str}")
             };
-            tool_err(msg)
+            // Bound the error message too: `e` can be verbose and the
+            // "output so far" tail is capped only by the write cap, so a
+            // long message must not exceed the shared budget.
+            tool_err(finish_tool_output(&msg, None))
         }
     }
 }
@@ -1808,6 +1834,75 @@ mod tests {
             out.extend_from_slice(&chunk);
         }
         assert_eq!(out, b"abc");
+    }
+
+    #[test]
+    fn guest_write_output_is_capped_at_byte_budget() {
+        // A guest that writes far more than MAX_TOOL_OUTPUT_BYTES must have
+        // its output dropped past the cap: neither the accumulated copy nor
+        // the streamed live view may exceed the shared budget. Exercised at
+        // the syscall level (no cross-compilation needed): two 64 KiB writes
+        // fit under the 128 KiB cap, the third must be dropped entirely.
+        let mut core = DefaultCoreMachine::<u64, FlatMemory<u64>>::new_with_memory(
+            ISA_IMC,
+            VERSION2,
+            1_000_000,
+            256 * 1024,
+        );
+        let chunk = vec![0x61u8; 64 * 1024];
+        let addr = 4096u64;
+        core.memory_mut()
+            .store_bytes(addr, &chunk)
+            .expect("store payload");
+
+        let (accum_tx, accum_rx) = mpsc::channel::<Vec<u8>>();
+        let (stream_tx, stream_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let mut syscall = ChoreographrSyscall {
+            registry: Arc::new(ToolRegistry::new()),
+            x_credentials: None,
+            working_dir: None,
+            output_tx: accum_tx,
+            write_tx: Some(stream_tx),
+            ctx: None,
+            streamed_bytes: 0,
+        };
+
+        let write = |syscall: &mut ChoreographrSyscall,
+                     core: &mut DefaultCoreMachine<u64, FlatMemory<u64>>| {
+            core.set_register(registers::A7, 1);
+            core.set_register(registers::A0, addr);
+            core.set_register(registers::A1, chunk.len() as u64);
+            syscall.ecall(core).expect("ecall")
+        };
+
+        // Three 64 KiB writes: the first two stay under the cap (128 KiB
+        // total), the third crosses it and must be dropped.
+        assert!(write(&mut syscall, &mut core));
+        assert!(write(&mut syscall, &mut core));
+        assert!(write(&mut syscall, &mut core));
+
+        // Drop the syscall to close the accumulation sender before draining.
+        drop(syscall);
+        let mut accumulated = Vec::new();
+        while let Ok(part) = accum_rx.recv() {
+            accumulated.extend_from_slice(&part);
+        }
+        assert_eq!(
+            accumulated.len(),
+            128 * 1024,
+            "accumulated output must stop at the cap"
+        );
+        assert!(
+            accumulated.iter().all(|&b| b == 0x61),
+            "payload bytes expected"
+        );
+
+        // The streamed live view is capped identically (same guard).
+        let mut streamed = 0usize;
+        while let Ok(part) = stream_rx.try_recv() {
+            streamed += part.len();
+        }
+        assert_eq!(streamed, 128 * 1024, "streamed output must stop at the cap");
     }
 
     // ── Batch ecall tests ─────────────────────────────────────────

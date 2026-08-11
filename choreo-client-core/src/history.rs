@@ -1,6 +1,36 @@
 use choreo_proto::{AssistantToolCallRecord, OutputStream, ToolResultRecord, Turn};
 use std::collections::{BTreeMap, HashMap};
 
+/// Cap on the live accumulated content of a streaming tool result. The
+/// daemon's final (authoritative) content is capped at
+/// `MAX_TOOL_OUTPUT_BYTES` (128 KiB) and replaces this accumulation when the
+/// turn completes; the cap here bounds the *in-flight* view so a streaming
+/// tool that out-produces the budget (shell/VM/find) cannot balloon client
+/// memory before the final record lands. Deliberately mirrors the daemon's
+/// cap so the live view and the recorded result agree.
+const MAX_STREAMED_TOOL_CONTENT_BYTES: usize = 128 * 1024;
+
+/// Append `data` to `content`, stopping at [`MAX_STREAMED_TOOL_CONTENT_BYTES`]
+/// with the shared `...[truncated]` byte-cap marker once the cap is crossed;
+/// later chunks are dropped. Cuts on a char boundary so a multi-byte char is
+/// never split. Shared by the append and stub-creation paths of
+/// `SessionView::tool_result_chunk`.
+fn push_capped(content: &mut String, data: &str) {
+    if content.len() >= MAX_STREAMED_TOOL_CONTENT_BYTES {
+        return;
+    }
+    let remaining = MAX_STREAMED_TOOL_CONTENT_BYTES - content.len();
+    if data.len() <= remaining {
+        content.push_str(data);
+    } else {
+        // Same byte-cap marker the daemon's `truncate_tool_output` appends,
+        // so the live view reads exactly like the final capped result.
+        let cut = data.floor_char_boundary(remaining);
+        content.push_str(&data[..cut]);
+        content.push_str("\n...[truncated]");
+    }
+}
+
 /// Client-side view of a session's turn history.
 ///
 /// Maps `turn_id → Turn` (ordered) and `request_id → turn_id` for
@@ -125,7 +155,7 @@ impl SessionView {
             return;
         };
         match turn.tool_results.iter_mut().find(|r| r.call_id == call_id) {
-            Some(result) => result.content.push_str(data),
+            Some(result) => push_capped(&mut result.content, data),
             None => {
                 // Stub created out of order (chunk before ToolCallStarted).
                 // Resolve the tool name from the turn's tool_calls so the
@@ -139,10 +169,12 @@ impl SessionView {
                     .find(|tc| tc.call_id == call_id)
                     .map(|tc| tc.name.clone())
                     .unwrap_or_default();
+                let mut content = String::new();
+                push_capped(&mut content, data);
                 turn.tool_results.push(ToolResultRecord {
                     call_id: call_id.to_string(),
                     name,
-                    content: data.to_string(),
+                    content,
                     is_error: false,
                     invocation_description: String::new(),
                 });
@@ -225,6 +257,73 @@ mod tests {
         let turn = view.get(1).unwrap();
         assert_eq!(turn.tool_results.len(), 1, "chunks append, never duplicate");
         assert_eq!(turn.tool_results[0].content, "firstsecond");
+    }
+
+    #[test]
+    fn tool_result_chunk_caps_live_accumulation() {
+        // A streaming tool that out-produces the budget must not balloon the
+        // in-flight view: the accumulation stops at the daemon's 128 KiB cap
+        // with one marker, and later chunks are dropped entirely.
+        let mut view = SessionView::new();
+        let mut turn = turn_with_tool_call("call-1", "sh");
+        let prefix = "x".repeat(MAX_STREAMED_TOOL_CONTENT_BYTES - 10);
+        turn.tool_results.push(ToolResultRecord {
+            call_id: "call-1".into(),
+            name: "sh".into(),
+            content: prefix.clone(),
+            is_error: false,
+            invocation_description: String::new(),
+        });
+        view.insert_or_replace(1, turn);
+        view.request_to_turn.insert(7, 1);
+
+        // A 20-byte chunk only has 10 bytes of headroom: it is cut on a
+        // char boundary and the marker appended once.
+        view.tool_result_chunk(7, "call-1", "12345678901234567890");
+        let content = &view.get(1).unwrap().tool_results[0].content;
+        assert!(
+            content.starts_with(&prefix),
+            "accumulated content must keep the pre-cap prefix"
+        );
+        assert!(
+            content.ends_with("...[truncated]"),
+            "cap crossing must append the marker once"
+        );
+        assert!(
+            content.len() <= MAX_STREAMED_TOOL_CONTENT_BYTES + "\n...[truncated]".len(),
+            "content must stay within cap + marker"
+        );
+
+        // Everything after the cap is dropped.
+        let len_before = content.len();
+        view.tool_result_chunk(7, "call-1", "more data");
+        assert_eq!(
+            view.get(1).unwrap().tool_results[0].content.len(),
+            len_before,
+            "chunks past the cap must be dropped"
+        );
+    }
+
+    #[test]
+    fn tool_result_chunk_caps_giant_stub_chunk() {
+        // A single first chunk larger than the cap (pathological) must be
+        // capped even on the out-of-order stub-creation path.
+        let mut view = SessionView::new();
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
+        view.request_to_turn.insert(7, 1);
+
+        let giant = "y".repeat(MAX_STREAMED_TOOL_CONTENT_BYTES + 1000);
+        view.tool_result_chunk(7, "call-1", &giant);
+
+        let content = &view.get(1).unwrap().tool_results[0].content;
+        assert!(
+            content.ends_with("...[truncated]"),
+            "stub must carry the marker"
+        );
+        assert!(
+            content.len() <= MAX_STREAMED_TOOL_CONTENT_BYTES + "\n...[truncated]".len(),
+            "stub content must stay within cap + marker"
+        );
     }
 
     #[test]

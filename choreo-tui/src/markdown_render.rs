@@ -74,6 +74,78 @@ pub(crate) fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
     }
 }
 
+/// Terminal-safe filter for tool-result content: keeps SGR color sequences
+/// (`ESC [ params m`) so ANSI coloring still works, plus tabs/newlines,
+/// printable ASCII, the joiners, and safe non-ASCII; escapes everything else
+/// — C0/C1 controls, non-SGR ESC sequences (OSC/DCS/CSI — the
+/// terminal-injection vector), the line/paragraph separators U+2028/U+2029,
+/// and Unicode format chars (bidi, ZWSP, …) except the joiners — via
+/// `char::escape_default` (e.g. `\u{1b}`, `\u{202e}`), so hostile content
+/// renders as inert text.
+///
+/// This is the *sink* defense: it protects the terminal from every tool at
+/// once, including the streaming shell/VM tools whose raw output the daemon
+/// deliberately does not escape (colors are a feature). The daemon separately
+/// escapes the same char classes at the source for the line-oriented tools
+/// and for the LLM transcript; the render filter is what makes raw content
+/// safe to draw. Escaping happens *before* the `contains("\x1b[")` gate so
+/// that only genuine SGR sequences ever reach the ANSI parser.
+fn sanitize_for_terminal(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // Keep a complete SGR sequence (ESC [ params m) verbatim so ANSI
+        // coloring survives; every other use of ESC is escaped. A non-SGR
+        // CSI (`\x1b[2J`) or OSC (`\x1b]…`) therefore renders as the inert
+        // `\u{1b}` followed by literal text instead of reaching the
+        // terminal as a live control sequence.
+        if c == '\u{1b}' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            let mut j = i + 2;
+            // Intermediate bytes are 0x30-0x3F (digits, ';', ':', …).
+            while j < chars.len() && (0x30..=0x3f).contains(&(chars[j] as u32)) {
+                j += 1;
+            }
+            if j < chars.len() && (0x40..=0x7e).contains(&(chars[j] as u32)) && chars[j] == 'm' {
+                // Valid SGR — keep the whole sequence verbatim.
+                out.extend(&chars[i..=j]);
+                i = j + 1;
+                continue;
+            }
+        }
+        // Kept: whitespace, printable ASCII, and safe non-ASCII (not a
+        // control and not in the spoofing class). Everything else is escaped.
+        let keep = c == '\t'
+            || c == '\n'
+            || c == '\r'
+            || (c.is_ascii() && (' '..='~').contains(&c))
+            || (!c.is_ascii() && !c.is_control() && !is_terminal_unsafe_unicode(c));
+        if keep {
+            out.push(c);
+        } else {
+            out.extend(c.escape_default());
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Whether a non-ASCII char must still be escaped for terminal rendering:
+/// the line/paragraph separators (which terminals render as line breaks) and
+/// every Unicode *format* char (general category Cf) except the joiners —
+/// the same Cf-set policy the daemon's sanitizers use (see
+/// `is_unsafe_unicode` in choreo-daemon's tools/mod.rs). The Cf set comes
+/// from the Unicode data tables via `unicode-general-category`, so
+/// newly-assigned format characters are escaped automatically on a crate
+/// bump.
+fn is_terminal_unsafe_unicode(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
+        || (unicode_general_category::get_general_category(c)
+            == unicode_general_category::GeneralCategory::Format
+            && !matches!(c, '\u{200c}' | '\u{200d}'))
+}
+
 /// Render ANSI-escape-coded text as styled ratatui lines, wrapping at `width`.
 /// Falls back to [`plain_text_lines`] on parse failure.
 fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
@@ -528,18 +600,23 @@ pub(crate) fn render_turn_lines(
             // state: expanding a quiet tool reveals the verbatim content.
             if !tr.content.is_empty() {
                 body.push(Line::from(Span::styled(String::new(), Style::default())));
+                // Terminal-safety gate: escape everything except SGR color
+                // sequences so hostile file/URL/shell bytes (OSC clipboard
+                // writes, CSI clears, bidi overrides, …) render as inert text
+                // regardless of which tool produced them. SGR survives, so
+                // ANSI coloring still works below.
+                let content = sanitize_for_terminal(&tr.content);
                 // Content with ANSI escape codes gets colored rendering.
-                if tr.content.contains("\x1b[") {
-                    body.extend(ansi_lines(&tr.content, tool_content_width));
+                if content.contains("\x1b[") {
+                    body.extend(ansi_lines(&content, tool_content_width));
                 } else if tr.is_error {
-                    body.extend(plain_text_lines(&tr.content));
+                    body.extend(plain_text_lines(&content));
                 } else if !DIFF_EXCLUDED_TOOLS.contains(&tr.name.as_str())
-                    && let Some(diff_lines) =
-                        try_render_diff_content(&tr.content, tool_content_width)
+                    && let Some(diff_lines) = try_render_diff_content(&content, tool_content_width)
                 {
                     body.extend(diff_lines);
                 } else {
-                    body.extend(markdown_lines(&tr.content, tool_content_width));
+                    body.extend(markdown_lines(&content, tool_content_width));
                 }
             }
         }
@@ -3196,6 +3273,75 @@ content ---"
         let result = ansi_lines("", 80);
         assert_eq!(result.len(), 1, "empty input → one line");
         assert_eq!(result[0].width(), 0, "line should be empty");
+    }
+
+    // ── sanitize_for_terminal ────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_for_terminal_keeps_sgr_sequences() {
+        // Genuine SGR color sequences survive the filter verbatim so the
+        // ANSI renderer below can still colorize shell/VM output.
+        assert_eq!(
+            sanitize_for_terminal("\x1b[31mred\x1b[0m"),
+            "\x1b[31mred\x1b[0m"
+        );
+        assert_eq!(
+            sanitize_for_terminal("\x1b[1;31m bold red \x1b[m"),
+            "\x1b[1;31m bold red \x1b[m"
+        );
+    }
+
+    #[test]
+    fn sanitize_for_terminal_escapes_osc_csi_and_controls() {
+        // OSC (clipboard writes, title changes), non-SGR CSI (clear screen),
+        // backspace, and BEL must never reach the terminal as live control
+        // sequences — they render as inert escaped text instead.
+        let osc = sanitize_for_terminal("\x1b]52;c;evil\x07");
+        assert!(osc.contains("\\u{1b}"), "OSC ESC must be escaped: {osc:?}");
+        assert!(!osc.contains('\x1b'), "no live ESC may survive: {osc:?}");
+        assert!(!osc.contains('\x07'), "BEL must be escaped: {osc:?}");
+
+        let csi = sanitize_for_terminal("\x1b[2J");
+        assert_eq!(csi, "\\u{1b}[2J", "non-SGR CSI must render inert");
+
+        let bs = sanitize_for_terminal("a\x08b");
+        assert_eq!(bs, "a\\u{8}b");
+
+        // An unterminated ESC at end of input is escaped, not passed through.
+        assert_eq!(sanitize_for_terminal("tail\x1b"), "tail\\u{1b}");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_escapes_bidi_and_separators_keeps_joiners() {
+        // The spoofing class: bidi overrides and other invisible format chars
+        // must not be able to reorder or hide rendered text; joiners are
+        // legitimate in some scripts and pass through. Tabs/newlines/CJK stay.
+        assert_eq!(sanitize_for_terminal("a\u{202e}b"), "a\\u{202e}b");
+        assert_eq!(sanitize_for_terminal("a\u{200b}b"), "a\\u{200b}b");
+        assert_eq!(sanitize_for_terminal("a\u{2028}b"), "a\\u{2028}b");
+        assert_eq!(sanitize_for_terminal("a\u{200c}b"), "a\u{200c}b");
+        assert_eq!(sanitize_for_terminal("a\u{200d}b"), "a\u{200d}b");
+        assert_eq!(
+            sanitize_for_terminal("a\tb\nc\r\n日本語"),
+            "a\tb\nc\r\n日本語"
+        );
+    }
+
+    #[test]
+    fn ansi_coloring_survives_the_terminal_filter() {
+        // End-to-end: content with SGR passes through the filter and the ANSI
+        // renderer still colorizes it — the filter must not break coloring.
+        let filtered = sanitize_for_terminal("\x1b[31mhello\x1b[0m");
+        let result = ansi_lines(&filtered, 80);
+        assert_eq!(result.len(), 1);
+        let has_red = result[0]
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(Color::Red));
+        assert!(
+            has_red,
+            "red SGR must survive the filter into ratatui styles"
+        );
     }
 
     #[test]

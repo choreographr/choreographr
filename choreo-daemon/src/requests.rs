@@ -13,7 +13,7 @@ use crate::tools::set_working_dir::{SetWorkingDirArgs, resolve_working_dir_path}
 use crate::tools::unload_tools::{UnloadToolsArgs, apply_unload_tools};
 use crate::tools::{
     PreparedImage, STREAMING_CHANNEL_CAPACITY, ToolError, ToolOutput, ToolOutputFormat,
-    ToolRegistry,
+    ToolRegistry, sanitize_transcript,
 };
 use choreo_ai_protocols::openai::{ChatRequestMessage, ChatToolDefinition};
 use choreo_ai_protocols::{
@@ -1986,6 +1986,15 @@ fn record_tool_completion(
     known_hint_paths: &mut Vec<PathBuf>,
     pending_hints: &mut Vec<String>,
 ) {
+    // Escape Unicode format characters (bidi overrides, ZWSP, …) before the
+    // content enters the transcript — the session record AND the next-call
+    // accumulator both derive from `output.content`, so this single point
+    // covers every tool at once. ESC/ANSI, newlines, and tabs pass through
+    // untouched (shell/VM colors survive); only the text-reordering chars
+    // that could spoof the model are escaped. The terminal is defended
+    // separately by the TUI's render filter.
+    output.content = sanitize_transcript(&output.content);
+
     if let Some(image) = image {
         emit_image(
             &ctx.cmd_tx,

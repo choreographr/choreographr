@@ -28,6 +28,11 @@ choreo-keystore.workspace = true
 choreo-markdown.workspace = true
 unicode-segmentation.workspace = true
 unicode-width = "0.2"
+# Unicode general-category property (see `sanitize_for_terminal` in
+# markdown_render.rs): generated from the Unicode data tables, so the Cf set
+# used to escape invisible format characters stays complete across Unicode
+# releases without a hand-maintained enumeration.
+unicode-general-category.workspace = true
 choreo-proto.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -1,4 +1,4 @@
-use super::{ToolExecError, truncate_tool_output};
+use super::{MAX_TOOL_OUTPUT_BYTES, ToolExecError, truncate_tool_output};
 use crossbeam_channel;
 use std::{
     io::Read,
@@ -292,8 +292,12 @@ fn poll_readable(
 
 /// Read `reader` (whose raw fd must be `fd`) to EOF, or until `stop_rx` is
 /// signalled, returning everything read. `on_data` is invoked with each chunk
-/// (used for line-streaming). The returned buffer always contains the full
-/// byte stream regardless of what `on_data` does with it.
+/// (used for line-streaming). When `accumulate_cap` is `Some(n)`, the
+/// returned buffer stops growing once it reaches `n` bytes — the *first* `n`
+/// bytes are kept, matching the byte-cap truncation the final tool result
+/// applies — while `on_data` still sees every chunk and the drain keeps
+/// consuming, so a child that out-produces the cap can never deadlock on a
+/// full pipe.
 ///
 /// The fd is put in non-blocking mode first so the drain loop can consume
 /// every byte available per `poll` verdict (full throughput for large
@@ -306,6 +310,7 @@ fn drain_fd<R: Read + AsFd>(
     stop_rx: mpsc::Receiver<()>,
     poll_ms: i32,
     on_data: &mut dyn FnMut(&[u8]),
+    accumulate_cap: Option<usize>,
 ) -> Vec<u8> {
     // Keep the raw fd around purely for the trace log below; all syscalls use
     // the BorrowedFd from `reader.as_fd()`, so there is no raw-fd unsafe.
@@ -331,7 +336,21 @@ fn drain_fd<R: Read + AsFd>(
                 Ok(0) => return full, // EOF: all pipe write ends are closed
                 Ok(n) => {
                     on_data(&buf[..n]);
-                    full.extend_from_slice(&buf[..n]);
+                    // The accumulation cap only bounds the *returned* copy:
+                    // on_data still receives every chunk and the read loop
+                    // keeps consuming, so a child that out-produces the cap
+                    // never blocks on a full pipe. Without the cap, a
+                    // `cat /dev/zero`-class command would buffer its entire
+                    // output in daemon memory even though the final tool
+                    // result is truncated at MAX_TOOL_OUTPUT_BYTES anyway.
+                    match accumulate_cap {
+                        Some(cap) if full.len() < cap => {
+                            let take = (cap - full.len()).min(n);
+                            full.extend_from_slice(&buf[..take]);
+                        }
+                        None => full.extend_from_slice(&buf[..n]),
+                        _ => {}
+                    }
                     if !nonblocking {
                         break; // blocking fallback: one read per poll
                     }
@@ -412,14 +431,28 @@ pub(crate) fn spawn_with_watchdog(
     // Output field empty — matching the old wait_with_output behaviour.
     let (out_stop_tx, out_stop_rx) = mpsc::channel::<()>();
     let (err_stop_tx, err_stop_rx) = mpsc::channel::<()>();
-    let stdout_thread = child
-        .stdout
-        .take()
-        .map(|s| std::thread::spawn(move || drain_fd(s, out_stop_rx, DRAIN_POLL_MS, &mut |_| {})));
-    let stderr_thread = child
-        .stderr
-        .take()
-        .map(|s| std::thread::spawn(move || drain_fd(s, err_stop_rx, DRAIN_POLL_MS, &mut |_| {})));
+    let stdout_thread = child.stdout.take().map(|s| {
+        std::thread::spawn(move || {
+            drain_fd(
+                s,
+                out_stop_rx,
+                DRAIN_POLL_MS,
+                &mut |_| {},
+                Some(MAX_TOOL_OUTPUT_BYTES),
+            )
+        })
+    });
+    let stderr_thread = child.stderr.take().map(|s| {
+        std::thread::spawn(move || {
+            drain_fd(
+                s,
+                err_stop_rx,
+                DRAIN_POLL_MS,
+                &mut |_| {},
+                Some(MAX_TOOL_OUTPUT_BYTES),
+            )
+        })
+    });
 
     let status = child.wait()?;
     let _ = done_tx.send(());
@@ -448,6 +481,61 @@ pub(crate) fn spawn_with_watchdog(
         },
         was_killed,
     ))
+}
+
+/// Forward a bounded total of bytes through a streaming channel, appending
+/// the shared `...[truncated]` byte-cap marker exactly once when the cap is
+/// hit and dropping everything after. The bounded streaming *channel* only
+/// bounds in-flight chunks (backpressure); this caps the *total*, so a
+/// long-running command cannot push an unbounded live view to the client.
+/// The final recorded result is separately truncated by
+/// `format_shell_output`, but the streamed view must not diverge from it.
+struct StreamByteCap {
+    limit: usize,
+    sent: usize,
+    marker_sent: bool,
+    tx: crossbeam_channel::Sender<Vec<u8>>,
+}
+
+impl StreamByteCap {
+    fn new(limit: usize, tx: crossbeam_channel::Sender<Vec<u8>>) -> Self {
+        Self {
+            limit,
+            sent: 0,
+            marker_sent: false,
+            tx,
+        }
+    }
+
+    /// Forward `chunk` if the cap allows; once the cap is hit, emit the
+    /// marker once and drop everything after. A chunk that would cross the
+    /// cap is sent as a fitting prefix first (a partial final line is fine —
+    /// the client lossy-decodes UTF-8 and the final result is truncated the
+    /// same way), then the marker.
+    fn push(&mut self, chunk: Vec<u8>) {
+        if self.sent >= self.limit {
+            self.send_marker();
+            return;
+        }
+        let remaining = self.limit - self.sent;
+        if chunk.len() > remaining {
+            let _ = self.tx.send(chunk[..remaining].to_vec());
+            self.sent = self.limit;
+            self.send_marker();
+            return;
+        }
+        self.sent += chunk.len();
+        let _ = self.tx.send(chunk);
+    }
+
+    fn send_marker(&mut self) {
+        if !self.marker_sent {
+            self.marker_sent = true;
+            // Same byte-cap marker `truncate_tool_output` appends, so the
+            // live view reads exactly like the final (capped) result.
+            let _ = self.tx.send(b"\n...[truncated]".to_vec());
+        }
+    }
 }
 
 /// Spawn the command with piped stdout/stderr and stream stdout lines
@@ -490,29 +578,47 @@ pub fn spawn_with_streaming(
     let (err_stop_tx, err_stop_rx) = mpsc::channel::<()>();
 
     // Thread: read stdout, forward each complete line (newline restored,
-    // CRLF folded to LF) to output_tx, and accumulate the full output.
+    // CRLF folded to LF) to output_tx, and accumulate the full output.  The
+    // accumulated copy and the streamed total are both capped at
+    // MAX_TOOL_OUTPUT_BYTES so neither daemon memory nor the client's live
+    // view can grow unboundedly with a chatty command.
     let stdout_thread = std::thread::spawn(move || {
         let mut pending: Vec<u8> = Vec::new();
-        let full = drain_fd(stdout, out_stop_rx, DRAIN_POLL_MS, &mut |chunk: &[u8]| {
-            forward_complete_lines(chunk, &mut pending, &mut |line| {
-                let _ = output_tx.send(line);
-            });
-        });
+        let mut stream_cap = StreamByteCap::new(MAX_TOOL_OUTPUT_BYTES, output_tx);
+        let full = drain_fd(
+            stdout,
+            out_stop_rx,
+            DRAIN_POLL_MS,
+            &mut |chunk: &[u8]| {
+                forward_complete_lines(chunk, &mut pending, &mut |line| {
+                    stream_cap.push(line);
+                });
+            },
+            Some(MAX_TOOL_OUTPUT_BYTES),
+        );
         // Flush any final unterminated line (matches `BufRead::lines()`
         // yielding a last line without a trailing newline). The bytes are
         // already included in `full` (drain_fd accumulates everything); this
-        // only forwards the streamed copy.
+        // only forwards the streamed copy — through the same cap so the
+        // streamed total can never exceed the limit + one marker.
         if !pending.is_empty() {
-            let _ = output_tx.send(pending);
+            stream_cap.push(pending);
         }
         full
     });
 
     // Thread: drain stderr concurrently so the child can never block on a
     // full stderr pipe buffer.  Not streamed — just accumulated and returned
-    // in the final Output struct.
-    let stderr_thread =
-        std::thread::spawn(move || drain_fd(stderr, err_stop_rx, DRAIN_POLL_MS, &mut |_| {}));
+    // in the final Output struct (bounded at the same byte cap).
+    let stderr_thread = std::thread::spawn(move || {
+        drain_fd(
+            stderr,
+            err_stop_rx,
+            DRAIN_POLL_MS,
+            &mut |_| {},
+            Some(MAX_TOOL_OUTPUT_BYTES),
+        )
+    });
 
     // Watchdog thread: enforce timeout. Shared with the buffered path so the
     // two timeout semantics stay identical (see `spawn_watchdog`).
@@ -716,7 +822,7 @@ mod tests {
         drop(writer); // EOF
 
         let (_stop_tx, stop_rx) = mpsc::channel::<()>();
-        let got = drain_fd(reader, stop_rx, 0, &mut |_| {});
+        let got = drain_fd(reader, stop_rx, 0, &mut |_| {}, None);
         assert_eq!(got, b"line1\nline2\n");
     }
 
@@ -732,7 +838,7 @@ mod tests {
         drop(writer); // EOF
 
         let (_stop_tx, stop_rx) = mpsc::channel::<()>();
-        let got = drain_fd(reader, stop_rx, 0, &mut |_| {});
+        let got = drain_fd(reader, stop_rx, 0, &mut |_| {}, None);
         assert_eq!(got, payload);
     }
 
@@ -748,12 +854,43 @@ mod tests {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         stop_tx.send(()).expect("signal stop");
 
-        let got = drain_fd(reader, stop_rx, 0, &mut |_| {});
+        let got = drain_fd(reader, stop_rx, 0, &mut |_| {}, None);
         assert_eq!(
             got, b"hello",
             "buffered data must be drained before stopping"
         );
         drop(writer);
+    }
+
+    #[test]
+    fn drain_fd_caps_accumulation_at_requested_limit() {
+        // The accumulation cap must bound the returned buffer while still
+        // consuming every byte (no pipe deadlock) and invoking on_data for
+        // each chunk. Deterministic — all data is buffered and EOF is
+        // signalled by drop before the drain starts (poll_ms = 0). The
+        // payload must stay under the OS pipe buffer (16 KiB on macOS, 64 KiB
+        // on Linux) or the blocking write_all would deadlock against a drain
+        // that has not started yet.
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let payload = vec![b'x'; 12 * 1024];
+        writer.write_all(&payload).expect("write");
+        drop(writer); // EOF
+
+        let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+        let mut seen = 0usize;
+        let got = drain_fd(
+            reader,
+            stop_rx,
+            0,
+            &mut |chunk: &[u8]| seen += chunk.len(),
+            Some(8 * 1024),
+        );
+        assert_eq!(got.len(), 8 * 1024, "accumulation must stop at the cap");
+        assert_eq!(
+            seen,
+            payload.len(),
+            "on_data must still observe every byte past the cap"
+        );
     }
 
     #[test]
@@ -815,5 +952,54 @@ mod tests {
         assert!(result.contains("stdout"));
         assert!(result.contains("stderr"));
         assert!(result.contains("Exit code: 1"));
+    }
+
+    #[test]
+    fn spawn_with_streaming_caps_total_forwarded_bytes() {
+        // A chatty command must not push an unbounded live view: the streamed
+        // total is capped at MAX_TOOL_OUTPUT_BYTES with one `...[truncated]`
+        // marker, and the accumulated stdout copy is capped the same way.
+        // Deterministic — the command finishes quickly and EOF closes the
+        // pipes; no time-based waits in the test itself (the watchdog
+        // timeout is a safety net, not a synchronization mechanism).
+        let mut cmd = std::process::Command::new("sh");
+        // ~400 KiB of stdout across 5000 lines.
+        cmd.args([
+            "-c",
+            "i=0; while [ $i -lt 5000 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n'; i=$((i+1)); done",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+        let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (output, _was_killed) =
+            spawn_with_streaming(&mut cmd, 30_000, output_tx).expect("spawn");
+
+        let mut forwarded = 0usize;
+        let mut marker_count = 0usize;
+        for chunk in output_rx {
+            if chunk.as_slice() == b"\n...[truncated]" {
+                marker_count += 1;
+            }
+            forwarded += chunk.len();
+        }
+
+        assert_eq!(
+            marker_count, 1,
+            "truncation marker must be sent exactly once"
+        );
+        assert!(
+            forwarded <= super::MAX_TOOL_OUTPUT_BYTES + b"\n...[truncated]".len(),
+            "streamed total must not exceed cap + one marker: {forwarded}"
+        );
+        assert!(
+            output.stdout.len() <= super::MAX_TOOL_OUTPUT_BYTES,
+            "accumulated stdout must be capped: {}",
+            output.stdout.len()
+        );
+        assert!(
+            forwarded > 0,
+            "the command's output must actually be streamed"
+        );
     }
 }
