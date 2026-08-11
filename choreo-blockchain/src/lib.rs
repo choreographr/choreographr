@@ -33,6 +33,12 @@ pub use error::BlockchainError;
 /// modules keep importing it from `crate`. A single query (e.g. a full
 /// Substrate block dump) can never flood the conversation.
 pub(crate) use choreo_sanitize::MAX_TOOL_OUTPUT_BYTES;
+/// The non-control Unicode that must still be escaped — line / paragraph
+/// separators plus the non-joiner format-char spoofing class — is the shared
+/// `choreo_sanitize::is_unsafe_unicode` predicate (the leaf crate that owns
+/// the Unicode-safety policy, used by the daemon and the TUI too). The
+/// code-space sweep guarding it lives next to it.
+pub(crate) use choreo_sanitize::is_unsafe_unicode;
 /// Byte-cap + truncation marker for blockchain tool output — shared from
 /// `choreo-sanitize` (the leaf crate that owns the output byte budget), so
 /// the daemon's tools, the blockchain tools, and the client all cap and mark
@@ -148,13 +154,6 @@ fn sanitize_keeps(c: char) -> bool {
     }
     !c.is_control() && !is_unsafe_unicode(c)
 }
-
-/// The non-control Unicode that must still be escaped — line / paragraph
-/// separators plus the non-joiner format-char spoofing class — is the shared
-/// `choreo_sanitize::is_unsafe_unicode` predicate (the leaf crate that owns
-/// the Unicode-safety policy, used by the daemon and the TUI too). The
-/// code-space sweep guarding it lives next to it.
-use choreo_sanitize::is_unsafe_unicode;
 
 /// Run `fut` to completion on the sidecar tokio runtime.
 ///

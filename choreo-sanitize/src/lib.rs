@@ -80,30 +80,51 @@ pub fn is_unsafe_unicode(c: char) -> bool {
     matches!(c, '\u{2028}' | '\u{2029}') || is_non_joiner_format_char(c)
 }
 
-/// Cap `content` at [`MAX_TOOL_OUTPUT_BYTES`], appending
-/// [`TRUNCATION_SUFFIX`] when the cap is hit. Cuts on a char boundary so a
-/// multi-byte UTF-8 char is never split.
-pub fn truncate_tool_output(content: &str) -> String {
-    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
+/// Cap `content` at `cap` bytes, appending [`TRUNCATION_SUFFIX`] when the cap
+/// is hit. Cuts on a char boundary so a multi-byte UTF-8 char is never split.
+/// Shared by [`truncate_tool_output`] and [`finish_tool_output`] (the latter
+/// caps at a smaller budget to leave room for its tail).
+fn truncate_tool_output_at(content: &str, cap: usize) -> String {
+    if content.len() <= cap {
         return content.to_string();
     }
     // Cut on a char boundary so we never split a multi-byte UTF-8 char.
-    let split = content.floor_char_boundary(MAX_TOOL_OUTPUT_BYTES);
+    let split = content.floor_char_boundary(cap);
     let mut truncated = content[..split].to_string();
     truncated.push_str(TRUNCATION_SUFFIX);
     truncated
 }
 
-/// Cap `body` at the shared byte budget, then append `marker` (if any)
-/// **after** the cap so the truncation signal always survives the byte cut.
-/// The marker is short and critical ("N of many more"), so it is appended
-/// past the budget — the same convention the file-read tools use for their
-/// truncation markers.
+/// Cap `content` at [`MAX_TOOL_OUTPUT_BYTES`], appending
+/// [`TRUNCATION_SUFFIX`] when the cap is hit. Cuts on a char boundary so a
+/// multi-byte UTF-8 char is never split.
+pub fn truncate_tool_output(content: &str) -> String {
+    truncate_tool_output_at(content, MAX_TOOL_OUTPUT_BYTES)
+}
+
+/// Cap `body` at the shared byte budget, then append `marker` (if any).
+/// The marker is short and critical ("N of many more"), so room for it is
+/// reserved *inside* the budget: `body` is capped at [`MAX_TOOL_OUTPUT_BYTES`]
+/// minus the space the tail (and the generic truncation marker, when the
+/// body itself must be cut) needs, so `body + tail` never exceeds the
+/// budget.
+///
+/// Keeping the tail within the hard budget — rather than riding *past* it —
+/// lets it survive the transcript re-cap in `record_tool_completion`, which
+/// re-applies the byte cap after `sanitize_transcript` (escaping expands a
+/// Cf char into `\u{202e}`). A tail appended past the cap would be cut off
+/// there; a tail kept inside the budget passes through untouched.
 pub fn finish_tool_output(body: &str, marker: Option<String>) -> String {
-    let mut out = truncate_tool_output(body);
-    if let Some(marker) = marker {
-        out.push_str(&format!("\n{marker}"));
-    }
+    let Some(marker) = marker else {
+        return truncate_tool_output(body);
+    };
+    let tail = format!("\n{marker}");
+    // Reserve room for the tail plus the generic truncation marker (in case
+    // the body itself must be cut and the generic marker appears in its
+    // place), so the finished string stays within the budget in every case.
+    let body_cap = MAX_TOOL_OUTPUT_BYTES.saturating_sub(tail.len() + TRUNCATION_SUFFIX.len());
+    let mut out = truncate_tool_output_at(body, body_cap);
+    out.push_str(&tail);
     out
 }
 
@@ -157,12 +178,6 @@ impl ByteBudget {
     /// fit (i.e. output was cut).
     pub fn is_truncated(&self) -> bool {
         self.truncated
-    }
-
-    /// Bytes admitted so far (the first `used` bytes of the stream were kept;
-    /// useful for honest "at least N bytes shown" reporting).
-    pub fn used(&self) -> usize {
-        self.used
     }
 
     /// The one-time truncation marker ([`TRUNCATION_SUFFIX`]) — `Some` on the
@@ -267,10 +282,12 @@ mod tests {
     }
 
     #[test]
-    fn finish_tool_output_keeps_marker_past_byte_cap() {
+    fn finish_tool_output_keeps_marker_within_budget() {
         // A body larger than the shared byte budget: the byte-cap truncation
         // marker appears, and the caller's marker must survive appended after
-        // it — the count signal is the whole point of the marker.
+        // it — the count signal is the whole point of the marker. The tail
+        // stays *within* the budget (room is reserved for it), so it also
+        // survives the transcript re-cap in `record_tool_completion`.
         let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 100);
         let out = finish_tool_output(&big, Some("...[truncated at 5 results]".to_string()));
         assert!(out.contains("...[truncated]"), "expected byte-cap marker");
@@ -278,6 +295,37 @@ mod tests {
             out.ends_with("...[truncated at 5 results]"),
             "marker must survive the cap: …{}",
             &out[out.len().saturating_sub(60)..]
+        );
+        assert!(
+            out.len() <= MAX_TOOL_OUTPUT_BYTES,
+            "body + tail must stay within the budget: {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn finish_tool_output_tail_survives_transcript_recap() {
+        // Regression: `record_tool_completion` re-applies the byte cap after
+        // `sanitize_transcript` (escaping expands Cf chars). A tool tail
+        // (exit footer / count marker) appended by `finish_tool_output` must
+        // survive that re-cap — guaranteed by keeping body + tail within the
+        // budget, so the re-cap is a no-op. This pins the composition: a body
+        // exactly at the cap plus a footer must not have the footer cut off.
+        let body = "x".repeat(MAX_TOOL_OUTPUT_BYTES);
+        let footer = "[VM: exited with code 0 in 100 cycles]";
+        let out = finish_tool_output(&body, Some(footer.to_string()));
+        assert!(
+            out.len() <= MAX_TOOL_OUTPUT_BYTES,
+            "body + footer must fit within the budget: {} bytes",
+            out.len()
+        );
+        // The transcript choke point's truncation is a no-op on content that
+        // already fits, so the footer is preserved end to end.
+        let recapped = truncate_tool_output(&out);
+        assert_eq!(recapped, out, "re-cap must be a no-op so the tail survives");
+        assert!(
+            recapped.ends_with(footer),
+            "footer must survive the transcript re-cap"
         );
     }
 
@@ -296,14 +344,11 @@ mod tests {
         let mut b = ByteBudget::new(10);
         assert_eq!(b.fit(4), 4, "chunks that fit are forwarded whole");
         assert!(!b.is_truncated());
-        assert_eq!(b.used(), 4);
         assert_eq!(b.fit(10), 6, "crossing chunk keeps a fitting prefix");
         assert!(b.is_truncated());
-        assert_eq!(b.used(), 10);
         assert_eq!(b.take_marker(), Some(TRUNCATION_SUFFIX));
         assert_eq!(b.take_marker(), None, "marker is one-time");
         assert_eq!(b.fit(5), 0, "nothing fits past the cap");
-        assert_eq!(b.used(), 10, "used never exceeds the limit");
     }
 
     #[test]

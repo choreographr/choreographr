@@ -1,8 +1,16 @@
-use super::{sanitize_multiline, sanitize_name, truncate_tool_output};
+use super::{MAX_TOOL_OUTPUT_BYTES, sanitize_multiline, sanitize_name, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::{collections::HashMap, path::Path, time::Duration};
 use ureq::RequestBuilder;
+
+/// Hard cap on the response body bytes read for a text response. The final
+/// tool content is capped at [`MAX_TOOL_OUTPUT_BYTES`] anyway, so reading a
+/// bounded prefix (with slack for the sanitizer's per-line escaping, which
+/// can expand) is enough — a hostile server cannot balloon daemon memory
+/// with a multi-gigabyte body.
+const MAX_HTTP_BODY_BYTES: usize = MAX_TOOL_OUTPUT_BYTES + 64 * 1024;
 
 /// HTTP tool errors — a structured error type for http_request failures.
 #[derive(Debug, Serialize, Deserialize, thiserror::Error)]
@@ -138,24 +146,54 @@ pub fn execute_http_request_tool(
     let body = if args.method == "HEAD" {
         String::new()
     } else if is_text_content_type(&content_type) {
-        match response.into_body().read_to_string() {
-            Ok(text) => {
-                // The body is attacker-controlled (the URL is arbitrary): a
-                // hostile response could embed ESC or a Unicode bidi override
-                // that would inject terminal escapes or spoof text in the
-                // tool transcript / TUI. Escape C0/C1 controls and format
-                // chars per line — the same policy as grep on matched lines —
-                // while preserving structural newlines so the body stays
-                // readable as multi-line text.
-                truncate_tool_output(&sanitize_multiline(&text))
-            }
-            Err(error) => format!("body omitted: failed to decode response text: {error}"),
-        }
+        read_bounded_text_body(response)
     } else {
         "body omitted: non-text response".to_string()
     };
 
     Ok(format_http_response(status, &headers, &body))
+}
+
+/// Read a text response body with a hard byte cap ([`MAX_HTTP_BODY_BYTES`]),
+/// then sanitize it per line (the same policy as `grep` on matched lines:
+/// C0/C1 controls and format chars escaped, structural newlines preserved) and
+/// cap it at the shared tool-output budget.
+///
+/// The body is attacker-controlled (the URL is arbitrary): a hostile response
+/// could embed ESC or a Unicode bidi override that would inject terminal
+/// escapes or spoof text in the tool transcript / TUI. The read cap bounds
+/// daemon memory first; the sanitizer then neutralizes the content.
+fn read_bounded_text_body(response: ureq::http::Response<ureq::Body>) -> String {
+    // Read at most MAX_HTTP_BODY_BYTES so a hostile server cannot balloon
+    // daemon memory (the final content is capped at MAX_TOOL_OUTPUT_BYTES
+    // anyway; the slack leaves room for the sanitizer's escaping to expand
+    // before the final cap applies). `into_reader` yields an owned `Read`;
+    // `take` bounds it so a multi-gigabyte body is never buffered.
+    let mut bytes = Vec::with_capacity(64 * 1024);
+    let mut reader = response
+        .into_body()
+        .into_reader()
+        .take(MAX_HTTP_BODY_BYTES as u64);
+    if let Err(e) = reader.read_to_end(&mut bytes) {
+        return format!("body omitted: failed to read response body: {e}");
+    }
+
+    // Distinguish "the cap cut the body short" from "the server sent the
+    // whole body": a cut body is decoded lossily (a mid-UTF-8-char cut at
+    // the cap must not fail the decode — the incomplete char renders as
+    // U+FFFD and the sanitizer handles the rest); a fully-read body keeps the
+    // strict decode semantics (genuinely invalid UTF-8 → body omitted).
+    let truncated = bytes.len() as u64 >= MAX_HTTP_BODY_BYTES as u64;
+    let text = if truncated {
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => return format!("body omitted: failed to decode response text: {e}"),
+        }
+    };
+
+    truncate_tool_output(&sanitize_multiline(&text))
 }
 
 fn is_text_content_type(content_type: &str) -> bool {

@@ -75,15 +75,16 @@ pub(crate) fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
     }
 }
 
-/// Terminal-safe filter for tool-result content: keeps SGR color sequences
-/// (`ESC [ params m`) so ANSI coloring still works, plus tabs/newlines,
-/// printable ASCII, the joiners, and safe non-ASCII; escapes everything else
-/// — C0/C1 controls (including CR: a carriage return in rendered content
-/// would let a hostile result overwrite its own line), non-SGR ESC sequences
-/// (OSC/DCS/CSI — the terminal-injection vector), the line/paragraph
-/// separators U+2028/U+2029, and Unicode format chars (bidi, ZWSP, …) except
-/// the joiners — via `char::escape_default` (e.g. `\u{1b}`, `\u{202e}`), so
-/// hostile content renders as inert text.
+/// Terminal-safe filter for tool-result content: keeps complete SGR color
+/// sequences (`ESC [ params m`) so ANSI coloring still works, plus tabs,
+/// newlines, printable ASCII, the joiners, and safe non-ASCII; escapes
+/// everything else — C0/C1 controls (including lone CR: a carriage return not
+/// followed by a line feed would let hostile content overwrite its own
+/// rendered line; a CRLF pair is a normal line ending and is folded through),
+/// non-SGR ESC sequences (OSC/DCS/CSI — the terminal-injection vector), the
+/// line/paragraph separators U+2028/U+2029, and Unicode format chars (bidi,
+/// ZWSP, …) except the joiners — via `char::escape_default` (e.g. `\u{1b}`,
+/// `\u{202e}`), so hostile content renders as inert text.
 ///
 /// This is the *sink* defense: it protects the terminal from every tool at
 /// once, including the streaming shell/VM tools whose raw output the daemon
@@ -94,13 +95,27 @@ pub(crate) fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
 /// that only genuine SGR sequences ever reach the ANSI parser.
 ///
 /// Iterates the input with a `Peekable<Chars>` (no intermediate `Vec<char>`),
-/// so the per-chunk cost during streaming stays O(chunk) with a single output
-/// allocation — it is called inside `render_turn_lines` for the in-flight
-/// turn on every streamed chunk.
+/// so the per-chunk cost during streaming stays O(chunk) with one output
+/// allocation plus one reused ESC-sequence buffer — it is called inside
+/// `render_turn_lines` for the in-flight turn on every streamed chunk.
 fn sanitize_for_terminal(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
+    // Reused ESC-sequence assembly buffer: one heap allocation for all the
+    // color sequences in a chunk, not one per sequence (ANSI-heavy shell
+    // output can contain hundreds).
+    let mut seq = String::new();
     while let Some(c) = chars.next() {
+        // Fold CRLF: a carriage return immediately followed by a line feed is
+        // a normal line ending, not hostile content — a *lone* CR is what
+        // would overwrite the rendered line, and it is escaped below. Keeping
+        // the pair intact avoids littering legitimate CRLF text with `\r`.
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            out.push('\r');
+            out.push('\n');
+            chars.next(); // consume the '\n'
+            continue;
+        }
         // Keep a complete SGR sequence (ESC [ params m) verbatim so ANSI
         // coloring survives; every other use of ESC is escaped. A non-SGR
         // CSI (`\x1b[2J`) or OSC (`\x1b]…`) therefore renders as the inert
@@ -108,7 +123,9 @@ fn sanitize_for_terminal(text: &str) -> String {
         // terminal as a live control sequence.
         if c == '\u{1b}' && chars.peek() == Some(&'[') {
             chars.next(); // consume '['
-            let mut seq = String::from("\u{1b}[");
+            seq.clear();
+            seq.push('\u{1b}');
+            seq.push('[');
             let mut sgr = false;
             loop {
                 match chars.peek().copied() {
@@ -152,12 +169,13 @@ fn sanitize_for_terminal(text: &str) -> String {
 
 /// Whether a single char passes through the terminal filter unchanged: tabs,
 /// newlines, printable ASCII, and safe non-ASCII. Everything else — every
-/// C0/C1 control (including CR, see [`sanitize_for_terminal`]), the
-/// line/paragraph separators, and the non-joiner format-char spoofing class
-/// via the shared [`is_unsafe_unicode`] predicate (owned by `choreo-sanitize`,
-/// the same policy the daemon's sanitizers use) — is escaped. SGR sequences
-/// are handled separately by the filter (kept whole), so the per-char
-/// predicate needs no ESC case.
+/// C0/C1 control (including lone CR; a CRLF pair is folded by
+/// [`sanitize_for_terminal`] before this predicate runs), the line/paragraph
+/// separators, and the non-joiner format-char spoofing class via the shared
+/// [`is_unsafe_unicode`] predicate (owned by `choreo-sanitize`, the same
+/// policy the daemon's sanitizers use) — is escaped. SGR sequences are
+/// handled separately by the filter (kept whole), so the per-char predicate
+/// needs no ESC case.
 fn terminal_keeps(c: char) -> bool {
     c == '\t'
         || c == '\n'
@@ -3335,8 +3353,9 @@ content ---"
         // The spoofing class: bidi overrides and other invisible format chars
         // must not be able to reorder or hide rendered text; joiners are
         // legitimate in some scripts and pass through. Tabs/newlines/CJK stay;
-        // CR is escaped (a carriage return would let hostile content overwrite
-        // its own rendered line).
+        // a CRLF pair is a normal line ending and is folded through, while a
+        // lone CR is escaped (a carriage return would let hostile content
+        // overwrite its own rendered line).
         assert_eq!(sanitize_for_terminal("a\u{202e}b"), "a\\u{202e}b");
         assert_eq!(sanitize_for_terminal("a\u{200b}b"), "a\\u{200b}b");
         assert_eq!(sanitize_for_terminal("a\u{2028}b"), "a\\u{2028}b");
@@ -3344,17 +3363,30 @@ content ---"
         assert_eq!(sanitize_for_terminal("a\u{200d}b"), "a\u{200d}b");
         assert_eq!(
             sanitize_for_terminal("a\tb\nc\r\n日本語"),
-            "a\tb\nc\\r\n日本語"
+            "a\tb\nc\r\n日本語"
         );
+    }
+
+    #[test]
+    fn sanitize_for_terminal_folds_crlf_but_escapes_lone_cr() {
+        // CRLF is a normal line ending and passes through intact; a lone CR
+        // (which would overwrite the rendered line) is escaped.
+        assert_eq!(sanitize_for_terminal("a\r\nb"), "a\r\nb");
+        assert_eq!(sanitize_for_terminal("a\rb"), "a\\rb");
+        // A lone CR is escaped even when it precedes a folded CRLF pair.
+        assert_eq!(sanitize_for_terminal("a\r\r\nb"), "a\\r\r\nb");
+        // CR at end of input (no following LF) is escaped.
+        assert_eq!(sanitize_for_terminal("a\r"), "a\\r");
     }
 
     #[test]
     fn terminal_keep_policy_sweeps_all_chars() {
         // The sink keep-policy must agree with the shared spoofing predicate
         // for *every* char: keep tabs, newlines, printable ASCII, and safe
-        // non-ASCII; escape every C0/C1 control (including CR — a carriage
+        // non-ASCII; escape every C0/C1 control (including CR — a lone carriage
         // return in rendered content would let a hostile result overwrite its
-        // own line) and every shared-unsafe Unicode char. The predicate's own
+        // own line; CRLF pairs are folded by the filter before this predicate
+        // runs) and every shared-unsafe Unicode char. The predicate's own
         // correctness against the Unicode tables is guarded by the code-space
         // sweep in choreo-sanitize; this sweep pins the TUI's per-char policy
         // (the SGR passthrough is handled separately and has its own tests).

@@ -4,7 +4,7 @@ use crate::tools::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_keystore::ServiceCredential;
-use choreo_sanitize::{ByteBudget, TRUNCATION_MARKER, TRUNCATION_SUFFIX};
+use choreo_sanitize::{ByteBudget, TRUNCATION_MARKER};
 use ckb_vm::Bytes;
 use ckb_vm::machine::VERSION2;
 use ckb_vm::{
@@ -802,10 +802,15 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
                             let _ = tx.send(data[..n].into());
                         }
                     }
-                    if self.budget.is_truncated() {
+                    // `take_marker` (not `is_truncated`): it latches, so a
+                    // bare `is_truncated()` check would re-fire the signal and
+                    // re-send the streamed marker on *every* guest WRITE after
+                    // the cap — `take_marker` yields it exactly once (the same
+                    // one-shot contract the shell streaming paths use).
+                    if let Some(marker) = self.budget.take_marker() {
                         let _ = self.trunc_tx.send(());
                         if let Some(tx) = &self.write_tx {
-                            let _ = tx.send(TRUNCATION_SUFFIX.as_bytes().to_vec());
+                            let _ = tx.send(marker.as_bytes().to_vec());
                         }
                     }
                 }
@@ -1213,18 +1218,20 @@ fn run_riscv_impl(
 
             // The syscall fired the one-shot channel the first time guest
             // WRITE output was cut at the byte budget. The marker then rides
-            // *past* the cap in the finish footer (finish_tool_output's
-            // marker-past-cap convention), so the body stays clean at
-            // MAX_TOOL_OUTPUT_BYTES while the truncation is still visible.
+            // in the finish footer (finish_tool_output reserves room for the
+            // tail inside the budget), so the body stays at MAX_TOOL_OUTPUT_BYTES
+            // while the truncation and the exit signal stay visible.
             let truncated = trunc_rx.try_recv().is_ok();
             let out_str = String::from_utf8_lossy(&drain_vm_output(&output_rx)).to_string();
 
             // The guest output is already capped at MAX_TOOL_OUTPUT_BYTES by
             // the WRITE syscall, so `finish_tool_output` is a no-op on the
             // body — but it still guarantees the bound if that cap ever
-            // changes, and it appends the exit footer *past* the budget (the
-            // same marker-past-cap convention the other tools use) so the
-            // exit signal always survives.
+            // changes, and it reserves room inside the budget for the exit
+            // footer (and the truncation marker, when output was cut) so the
+            // signal always survives — including the transcript re-cap in
+            // `record_tool_completion`, which re-applies the byte cap after
+            // sanitizing.
             let footer = if truncated {
                 format!(
                     "{TRUNCATION_MARKER}\n[VM: exited with code {exit_code} in {cycles} cycles]"
@@ -1249,9 +1256,9 @@ fn run_riscv_impl(
             // Bound the error message too: `e` can be verbose and the
             // "output so far" tail is capped only by the write cap, so a
             // long message must not exceed the shared budget. When the tail
-            // was itself cut at the write cap, the marker is appended past
-            // the budget (finish_tool_output's marker-past-cap convention)
-            // so the truncation stays visible.
+            // was itself cut at the write cap, the marker rides in the
+            // finish footer (finish_tool_output reserves room for it inside
+            // the budget) so the truncation stays visible.
             let marker = truncated.then(|| TRUNCATION_MARKER.to_string());
             tool_err(finish_tool_output(&msg, marker))
         }
@@ -1441,6 +1448,7 @@ pub fn execute_run_riscv_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use choreo_sanitize::TRUNCATION_SUFFIX;
 
     #[test]
     fn format_rust_source_returns_input_when_rustfmt_unavailable() {
@@ -1916,7 +1924,11 @@ mod tests {
         // Three 64 KiB writes: the first two stay under the cap (128 KiB
         // total), the third crosses it and is cut to a zero-length prefix —
         // nothing of it is forwarded, but the budget reports truncation and
-        // the one-shot signal fires.
+        // the one-shot signal fires. A fourth write past the cap must NOT
+        // re-fire the signal or re-send the marker (regression for the
+        // latch-and-recheck bug: `is_truncated()` stays true forever, so a
+        // bare check re-armed on every subsequent WRITE).
+        assert!(write(&mut syscall, &mut core));
         assert!(write(&mut syscall, &mut core));
         assert!(write(&mut syscall, &mut core));
         assert!(write(&mut syscall, &mut core));
