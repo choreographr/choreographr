@@ -108,14 +108,14 @@ pdf-inspector = { version = "0.1", optional = true }
 # Prometheus/OpenMetrics instrumentation and the `/metrics` HTTP server
 # (src/metrics.rs). Off by default (like `pdf`): a plain build compiles it
 # out entirely (no prometheus/tiny_http dependencies), and release binaries
-# opt in via `scripts/release.sh --features pdf,metrics`. The module's public
+# opt in via `scripts/release.sh --features pdf,metrics,blockchain`. The module's public
 # API degrades to no-op stubs when disabled, so the daemon's instrumentation
 # call sites compile unchanged in both configurations — and `--metrics-addr`
 # then fails startup with a clear error instead of being silently ignored.
 metrics = ["dep:prometheus", "dep:tiny_http"]
 # Native PDF tools (pdf_classify / pdf_to_markdown). Off by default so the
 # published manifest stays free of the git-pinned fork (crates.io rejects git
-# dependencies); release binaries are built with `--features pdf,metrics` and get the
+# dependencies); release binaries are built with `--features pdf,metrics,blockchain` and get the
 # fork via the workspace `[patch.crates-io]`. See the pdf-inspector comment
 # above for the security rationale and the revert path.
 pdf = ["dep:pdf-inspector"]

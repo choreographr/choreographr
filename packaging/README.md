@@ -78,11 +78,11 @@ bump checklist. The manual steps that must stay in lockstep:
   `source` URL and `sha256sums`, then regenerate `aur/.SRCINFO`:
   `makepkg --printsrcinfo > .SRCINFO`.
 - **crates.io** — `cargo release publish` for the publish-set members in
-  dependency order. The native PDF tools and Prometheus metrics are
-  feature-gated and **off by default** on crates.io (the parser dep is a
-  registry version patched to a security fork only in the workspace root,
-  which crates.io never sees); release binaries build them via
-  `scripts/release.sh --features pdf,metrics`.
+  dependency order. The native PDF tools, Prometheus metrics, and blockchain
+  tools are feature-gated and **off by default** on crates.io (the parser dep
+  is a registry version patched to a security fork only in the workspace
+  root, which crates.io never sees); release binaries build them via
+  `scripts/release.sh --features pdf,metrics,blockchain`.
 - **choreographr.com** — publish `scripts/install.sh` and add download
   redirects for the new version.
 

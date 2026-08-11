@@ -1283,7 +1283,7 @@ never executes embedded files or `/Launch` actions, so the classic PDF malware
 > `[patch.crates-io]` redirects that version to a contributor fork
 > (`omeileo/pdf-inspector@f86decf`, upstream PR firecrawl/pdf-inspector#198) for **local
 > builds only** — dev, tests (`--all-features`), and the release binaries
-> (`scripts/release.sh --features pdf,metrics`). The fork exists because upstream still ships
+> (`scripts/release.sh --features pdf,metrics,blockchain`). The fork exists because upstream still ships
 > `lopdf ^0.41.0`, vulnerable to RUSTSEC-2026-0187: a ~21 KB crafted PDF with ~10,000-deep
 > nested objects aborts the process via stack overflow — a SIGABRT that `catch_unwind`
 > **cannot** intercept. The fork bumps `lopdf` to 0.42.0 (MAX_NESTING_DEPTH), verified
