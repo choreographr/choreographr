@@ -1,5 +1,6 @@
 use super::{
     EvmCallArgs, alloy_err, block_id, block_on, connect, log_execution, parse_block_tag, rpc_call,
+    strip_hex_prefix,
 };
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::network::TransactionBuilder;
@@ -18,10 +19,7 @@ async fn evm_call_impl(
     let to = Address::from_str(to_str)
         .map_err(|e| BlockchainError::Other(format!("invalid 'to' address: {e}")))?;
 
-    let data_hex = data_str
-        .strip_prefix("0x")
-        .or_else(|| data_str.strip_prefix("0X"))
-        .unwrap_or(data_str);
+    let data_hex = strip_hex_prefix(data_str);
     let input_data = hex::decode(data_hex)
         .map_err(|e| BlockchainError::Other(format!("invalid hex data: {e}")))?;
     let tx = TransactionRequest::default()

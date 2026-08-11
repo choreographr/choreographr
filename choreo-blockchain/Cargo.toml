@@ -34,3 +34,7 @@ thiserror.workspace = true
 url.workspace = true
 hex.workspace = true
 tracing.workspace = true
+# Unicode general-category property for the output sanitizer (the same Cf-set
+# logic the daemon uses in tools/mod.rs): chain/ENS/node-supplied strings are
+# escaped before they enter the line-oriented tool output.
+unicode-general-category.workspace = true

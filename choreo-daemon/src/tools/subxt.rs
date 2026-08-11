@@ -74,7 +74,7 @@ pub(crate) struct SubxtQuery;
 define_tool!(
     SubxtQuery,
     "subxt_query",
-    "Query a storage value from a Substrate/Polkadot blockchain by pallet and storage item name. Returns the decoded SCALE value as JSON.",
+    "Query a storage value from a Substrate/Polkadot blockchain by pallet and storage item name. Returns the decoded SCALE value as JSON. The optional `key` is hex-encoded bytes for the storage key — the UN-HASHED value the pallet's hasher expects (e.g. the raw 32-byte account id for System.Account), NOT a pre-computed 32-byte storage key (subxt applies the pallet's hasher itself, so a pre-hashed key would be double-hashed and never match).",
     choreo_blockchain::subxt::SubxtQueryArgs,
     execute_subxt_query_tool,
     "blockchain",

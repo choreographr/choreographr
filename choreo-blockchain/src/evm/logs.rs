@@ -1,4 +1,7 @@
-use super::{EvmLogsArgs, alloy_err, block_on, connect, log_execution, parse_block_tag, rpc_call};
+use super::{
+    EvmLogsArgs, alloy_err, block_on, connect, log_execution, parse_block_tag, rpc_call,
+    strip_hex_prefix,
+};
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
@@ -23,8 +26,9 @@ async fn evm_logs_impl(
     }
 
     if let Some(t0) = topic0_str {
-        let stripped = t0.strip_prefix("0x").unwrap_or(t0);
-        let topic = B256::from_str(stripped)
+        // Shared helper tolerates both `0x` and `0X` — a raw 32-byte topic is
+        // also accepted (alloy's B256 parse is case-insensitive on the hex).
+        let topic = B256::from_str(strip_hex_prefix(t0))
             .map_err(|e| BlockchainError::Other(format!("invalid topic0: {e}")))?;
         filter = filter.event_signature(topic);
     }

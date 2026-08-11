@@ -205,6 +205,11 @@ humfmt = "0.6.0"
 hex = "0.4"
 nix = "0.31.3"
 unicode-segmentation = "1.13"
+# Unicode general-category property (see the sanitizer in choreo-daemon's
+# tools/mod.rs and choreo-blockchain's lib.rs): generated from the Unicode
+# data tables, so the Cf set used to escape invisible format characters stays
+# complete across Unicode releases without a hand-maintained enumeration.
+unicode-general-category = "1.1"
 
 # Patch crates.io `pdf-inspector` to the security fork — LOCAL builds only.
 #

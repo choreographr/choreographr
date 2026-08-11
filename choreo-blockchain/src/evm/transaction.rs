@@ -1,4 +1,6 @@
-use super::{EvmTransactionArgs, alloy_err, block_on, connect, log_execution, rpc_call};
+use super::{
+    EvmTransactionArgs, alloy_err, block_on, connect, log_execution, rpc_call, strip_hex_prefix,
+};
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::primitives::B256;
 use alloy::providers::Provider;
@@ -7,10 +9,7 @@ use std::str::FromStr;
 async fn evm_transaction_impl(rpc_url: &str, tx_hash_str: &str) -> Result<String, BlockchainError> {
     let provider = connect(rpc_url)?;
 
-    let stripped = tx_hash_str
-        .strip_prefix("0x")
-        .or_else(|| tx_hash_str.strip_prefix("0X"))
-        .unwrap_or(tx_hash_str);
+    let stripped = strip_hex_prefix(tx_hash_str);
     let hash = B256::from_str(stripped)
         .map_err(|e| BlockchainError::Other(format!("invalid tx hash: {e}")))?;
 

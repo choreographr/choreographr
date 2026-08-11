@@ -1,6 +1,6 @@
 use super::{
     EvmTokenBalanceArgs, alloy_err, balanceOfCall, block_on, connect, log_execution, rpc_call,
-    symbolCall,
+    sanitize_value, symbolCall,
 };
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::network::TransactionBuilder;
@@ -47,7 +47,9 @@ async fn evm_token_balance_impl(
     if let Ok(sym_result) = provider.call(sym_tx).await
         && let Ok(sym_ret) = symbolCall::abi_decode_returns(&sym_result)
     {
-        out.push_str(&format!("\nsymbol: {sym_ret}"));
+        // `symbol()` is contract-controlled free-form text — sanitize it so a
+        // hostile token cannot corrupt the line-oriented output.
+        out.push_str(&format!("\nsymbol: {}\n", sanitize_value(&sym_ret)));
     }
 
     Ok(out)

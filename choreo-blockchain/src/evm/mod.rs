@@ -8,7 +8,7 @@
 
 use crate::BlockchainError;
 pub(crate) use crate::block_on;
-pub(crate) use crate::{log_execution, rpc_call};
+pub(crate) use crate::{log_execution, rpc_call, sanitize_value, strip_hex_prefix};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::eth::{BlockId, BlockNumberOrTag};
 use alloy::sol;
@@ -116,34 +116,46 @@ pub struct EvmResolveArgs {
 
 // ── Shared client helpers ───────────────────────────────────────────────
 
-/// Build an alloy HTTP provider for `rpc_url`, validating the URL up front.
+/// Build an alloy HTTP provider for `rpc_url`, validating the URL and its
+/// scheme up front.
 ///
 /// Note: the URL is model-supplied and may point anywhere — the same trust
 /// surface as the daemon's `http_request` tool (see the crate-level trust
-/// model in `lib.rs`).
+/// model in `lib.rs`). The scheme is restricted to `http`/`https` so a
+/// mistyped `ftp://`/`file://` fails here with a clear error instead of
+/// surfacing a confusing transport failure from the client.
 pub(crate) fn connect(rpc_url: &str) -> Result<impl Provider, BlockchainError> {
     let url: Url = rpc_url
         .parse()
         .map_err(|e| BlockchainError::InvalidUrl(format!("invalid RPC URL: {e}")))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(BlockchainError::InvalidUrl(format!(
+                "invalid RPC URL scheme '{other}' (expected http or https)"
+            )));
+        }
+    }
     tracing::debug!(rpc_url = %rpc_url, "connecting to EVM RPC endpoint");
     Ok(ProviderBuilder::default().connect_http(url))
 }
 
 /// Parse a user-supplied block tag ("latest", "safe", a decimal number, or a
-/// 0x-hex number) into alloy's `BlockNumberOrTag`.
+/// 0x-hex number) into alloy's `BlockNumberOrTag`. Whitespace is tolerated
+/// around the tag, and the named tags are case-insensitive.
 pub(crate) fn parse_block_tag(tag: &str) -> Result<BlockNumberOrTag, BlockchainError> {
-    match tag.to_lowercase().as_str() {
+    match tag.trim().to_lowercase().as_str() {
         "latest" => Ok(BlockNumberOrTag::Latest),
         "finalized" => Ok(BlockNumberOrTag::Finalized),
         "safe" => Ok(BlockNumberOrTag::Safe),
         "pending" => Ok(BlockNumberOrTag::Pending),
         "earliest" => Ok(BlockNumberOrTag::Earliest),
         hex_or_dec => {
-            if let Some(hex) = hex_or_dec
-                .strip_prefix("0x")
-                .or_else(|| hex_or_dec.strip_prefix("0X"))
-            {
-                let n = u64::from_str_radix(hex, 16).map_err(|e| {
+            // A leading `0x` (the tag is already lowercased) selects hex
+            // parsing; otherwise accept a plain decimal number.
+            let stripped = strip_hex_prefix(hex_or_dec);
+            if stripped.len() != hex_or_dec.len() {
+                let n = u64::from_str_radix(stripped, 16).map_err(|e| {
                     BlockchainError::Other(format!("invalid hex block number: {e}"))
                 })?;
                 Ok(BlockNumberOrTag::Number(n))
@@ -238,13 +250,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_block_tag_tolerates_whitespace() {
+        // Trailing/leading whitespace from the model should not fail the parse.
+        let tag = parse_block_tag(" 12345 ").unwrap();
+        assert!(matches!(tag, BlockNumberOrTag::Number(12345)));
+        let tag = parse_block_tag(" latest\n").unwrap();
+        assert!(matches!(tag, BlockNumberOrTag::Latest));
+    }
+
+    #[test]
+    fn parse_block_tag_uppercase_hex_prefix() {
+        // `0X` must be accepted just like `0x` (shared strip_hex_prefix).
+        let tag = parse_block_tag("0X3039").unwrap();
+        assert!(matches!(tag, BlockNumberOrTag::Number(12345)));
+    }
+
+    #[test]
     fn parse_block_tag_invalid() {
         assert!(parse_block_tag("not_a_block").is_err());
     }
 
     #[test]
+    fn block_id_maps_every_tag_variant() {
+        // The `evm_call` block_tag fix routes every parsed tag through this
+        // mapping; pin each variant so a regression cannot silently send calls
+        // to the wrong block.
+        assert_eq!(block_id(BlockNumberOrTag::Latest), BlockId::latest());
+        assert_eq!(block_id(BlockNumberOrTag::Finalized), BlockId::finalized());
+        assert_eq!(block_id(BlockNumberOrTag::Safe), BlockId::safe());
+        assert_eq!(block_id(BlockNumberOrTag::Pending), BlockId::pending());
+        assert_eq!(block_id(BlockNumberOrTag::Earliest), BlockId::earliest());
+        assert_eq!(block_id(BlockNumberOrTag::Number(42)), BlockId::number(42));
+    }
+
+    #[test]
     fn connect_rejects_bad_url() {
         assert!(connect("not a url").is_err());
+    }
+
+    #[test]
+    fn connect_rejects_non_http_schemes() {
+        // ftp/file URLs parse as Url but are not HTTP RPC endpoints — they
+        // must fail here with a clear error, not later in the transport.
+        let err = connect("ftp://example.com")
+            .err()
+            .expect("ftp must be rejected");
+        assert!(err.to_string().contains("scheme"), "{err}");
+        assert!(connect("file:///tmp/node").is_err());
+        assert!(connect("https://ethereum-rpc.publicnode.com").is_ok());
     }
 
     #[test]

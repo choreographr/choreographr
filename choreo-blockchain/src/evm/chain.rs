@@ -1,4 +1,4 @@
-use super::{RpcUrlArgs, alloy_err, block_on, connect, log_execution, rpc_call};
+use super::{RpcUrlArgs, alloy_err, block_on, connect, log_execution, rpc_call, sanitize_value};
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::providers::Provider;
 
@@ -19,7 +19,12 @@ async fn evm_chain_impl(rpc_url: &str) -> Result<String, BlockchainError> {
     out.push_str(&format!("block_number: {block_number}\n"));
     out.push_str(&format!("gas_price: {gas_price} wei\n"));
     out.push_str(&format!("max_priority_fee: {max_priority_fee} wei\n"));
-    out.push_str(&format!("client_version: {client_version}"));
+    // client_version is a free-form node-supplied string (may embed control
+    // chars / terminal escapes from a hostile endpoint) — sanitize it.
+    out.push_str(&format!(
+        "client_version: {}\n",
+        sanitize_value(&client_version)
+    ));
     Ok(out)
 }
 

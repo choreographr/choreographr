@@ -2229,7 +2229,10 @@ counts survive the attach instead of regressing.
     instead of a leaked thread. The tools accept an arbitrary `rpc_url`/`ws_url` from the
     model and open HTTP(S)/WebSocket connections to it — the same trust surface as the
     `http_request` tool, not a new capability — which is why the whole feature (and the
-    network reach it adds) is off by default. This simplifies the mental model (each thread owns
+    network reach it adds) is off by default. Node-supplied strings (chain names, ENS
+    records, decoded storage/block JSON) are run through a sanitizer that escapes control
+    chars, line/paragraph separators, and Unicode format chars (the same Cf-set policy the
+    daemon's line-oriented tools use) before they enter the tool transcript. This simplifies the mental model (each thread owns
     its data, no `Send` bounds on shared state, no `Pin<Box<dyn Future>>`), improves stack
     traces, and avoids the complexity of async cancellation.
 

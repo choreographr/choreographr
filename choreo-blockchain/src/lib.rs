@@ -14,8 +14,11 @@
 //! trust surface as the daemon's `http_request` tool (any URL is reachable),
 //! not a new capability — but these tools are gated behind the `blockchain`
 //! feature (off by default) precisely because they extend the daemon's
-//! network reach into chain-specific clients. Output is capped at
-//! [`MAX_TOOL_OUTPUT_BYTES`] and every call is bounded by [`RPC_TIMEOUT`].
+//! network reach into chain-specific clients. Every node-supplied string is
+//! sanitized before it enters the tool transcript: scalar strings (chain
+//! names, ENS records) via [`sanitize_value`], serde-rendered JSON (decoded
+//! storage/block values) via [`sanitize_json`]. Output is capped at
+//! [`MAX_TOOL_OUTPUT_BYTES`], and every call is bounded by [`RPC_TIMEOUT`].
 
 pub mod evm;
 pub mod runtime;
@@ -45,6 +48,113 @@ pub(crate) const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// daemon logs the tool call centrally, but the RPC-level detail lives here).
 pub(crate) fn log_execution(tool: &'static str, rpc_target: &str) {
     tracing::debug!(tool, rpc_target = %rpc_target, "blockchain tool executing");
+}
+
+/// Strip an optional `0x` / `0X` prefix from a hex string, returning the input
+/// unchanged when there is no prefix.
+///
+/// Every hex parser in this crate routes through this helper so they all
+/// tolerate both prefix spellings consistently (the model will sometimes send
+/// uppercase `0X`).
+pub(crate) fn strip_hex_prefix(s: &str) -> &str {
+    s.strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s)
+}
+
+/// Escape control characters and Unicode line/paragraph separators in a
+/// node-supplied value so it cannot corrupt the line-oriented tool output or
+/// inject terminal escape sequences.
+///
+/// The RPC endpoints these tools talk to are arbitrary and untrusted (see the
+/// crate-level trust model), so every string that originates off-process —
+/// chain names, `client_version`, ENS records, decoded storage/block JSON —
+/// is passed through this before being interpolated into a `key: value` line.
+/// This mirrors the daemon's `sanitize_name` policy (see `sanitize_text` in
+/// choreo-daemon's `tools/mod.rs`):
+///
+/// - C0/C1 control characters (`char::is_control`) are escaped via
+///   `escape_default` (`\n`, `\t`, `\u{1b}`, …).
+/// - U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR are **not**
+///   `is_control` (categories Zl/Zp), yet terminals render them as line
+///   breaks — they must be escaped to preserve the one-line-per-value
+///   invariant.
+/// - Unicode format characters (category Cf) are invisible but can reorder,
+///   hide, or spoof rendered text: bidi marks/overrides/isolates, zero-width
+///   space and word joiner, invisible operators, the BOM, and more. The
+///   joiners U+200C/U+200D (ZWNJ/ZWJ) do not reorder or hide text and are
+///   legitimate in some scripts, so they pass through.
+pub(crate) fn sanitize_value(text: &str) -> String {
+    // Fast path: ASCII printables need no escaping. Multi-byte UTF-8 bytes
+    // are all >= 0x80, so any non-ASCII text falls through to the slow path
+    // (it may hide a separator or bidi char).
+    if text.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if sanitize_keeps(c) {
+            out.push(c);
+        } else {
+            // escape_default renders the special escapes (`\t`, `\r`, `\n`,
+            // …) and everything else control-related as `\u{...}` — all inert
+            // ASCII text, so nothing terminal-affecting or line-splitting leaks.
+            out.extend(c.escape_default());
+        }
+    }
+    out
+}
+
+/// Sanitize serde-produced JSON text for the tool transcript, preserving its
+/// structural line breaks.
+///
+/// [`sanitize_value`] escapes newlines (they are C0 controls), which would
+/// flatten a pretty-printed JSON blob into one long line of literal `\n`
+/// sequences. That is the right policy for *scalar* node strings — a hostile
+/// chain name must not be able to inject a line — but JSON is different:
+/// serde_json never emits an unescaped control character (a hostile value
+/// inside a JSON string renders as the two-character `\n` / `\u00xx` escape),
+/// so the *only* literal newlines in JSON output are the structural separators
+/// serde itself emitted. This function splits on those, sanitizes each line
+/// via [`sanitize_value`] — catching the Cf format chars (bidi, ZWSP, …) that
+/// serde does NOT escape — and re-joins with real newlines.
+///
+/// Only the first `budget` bytes are processed (cut on a char boundary), so a
+/// pathological node response (e.g. a multi-megabyte full-block JSON) cannot
+/// force a full-size sanitize copy before the caller's final
+/// [`truncate_tool_output`] applies the authoritative cap and marker.
+pub(crate) fn sanitize_json(text: &str, budget: usize) -> String {
+    // Clamp before floor_char_boundary: it panics on indices past the string.
+    let end = text.floor_char_boundary(budget.min(text.len()));
+    text[..end]
+        .lines()
+        .map(sanitize_value)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `c` passes through [`sanitize_value`] unchanged. ASCII can never be
+/// a Unicode line/paragraph separator or format char, so the general-category
+/// lookup only runs for non-ASCII input.
+fn sanitize_keeps(c: char) -> bool {
+    if c.is_ascii() {
+        return (' '..='~').contains(&c);
+    }
+    !c.is_control() && !is_unsafe_unicode(c)
+}
+
+/// The non-control Unicode that must still be escaped: line / paragraph
+/// separators and Unicode *format* characters (general category Cf) except
+/// the joiners (see [`sanitize_value`]). The Cf set is taken from the Unicode
+/// general-category property via `unicode-general-category` (generated from
+/// the Unicode data tables), so newly-assigned format characters are escaped
+/// automatically on a crate bump instead of drifting until someone re-reads
+/// the tables.
+fn is_unsafe_unicode(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
+        || (unicode_general_category::get_general_category(c)
+            == unicode_general_category::GeneralCategory::Format
+            && !matches!(c, '\u{200c}' | '\u{200d}'))
 }
 
 /// Cap `content` at [`MAX_TOOL_OUTPUT_BYTES`], cutting on a char boundary so a
@@ -102,10 +212,14 @@ where
     F: std::future::Future<Output = Result<T, BlockchainError>>,
 {
     tokio::time::timeout(timeout, fut).await.map_err(|_| {
-        BlockchainError::Other(format!(
-            "RPC request timed out after {} seconds",
-            timeout.as_secs()
-        ))
+        // Sub-second budgets (tests) report millis; the production 30s budget
+        // reports seconds — the number stays honest at both scales.
+        let rendered = if timeout.as_secs() >= 1 {
+            format!("{} seconds", timeout.as_secs())
+        } else {
+            format!("{} ms", timeout.as_millis())
+        };
+        BlockchainError::Other(format!("RPC request timed out after {rendered}"))
     })?
 }
 
@@ -190,5 +304,69 @@ mod tests {
         .expect("block_on must run")
         .expect_err("the pending future must time out");
         assert!(err.to_string().contains("timed out after"));
+        // The sub-second budget is reported in ms, not "0 seconds".
+        assert!(err.to_string().contains("10 ms"), "{err}");
+    }
+
+    #[test]
+    fn strip_hex_prefix_handles_both_spellings() {
+        // The shared helper must accept raw hex, lowercase `0x`, and uppercase
+        // `0X` — every parser in the crate routes through it, so the behavior
+        // they all rely on is pinned here rather than in a re-implemented copy.
+        assert_eq!(strip_hex_prefix("deadbeef"), "deadbeef");
+        assert_eq!(strip_hex_prefix("0xdeadbeef"), "deadbeef");
+        assert_eq!(strip_hex_prefix("0XDEADBEEF"), "DEADBEEF");
+        assert_eq!(strip_hex_prefix(""), "");
+        assert_eq!(strip_hex_prefix("0x"), "");
+    }
+
+    #[test]
+    fn sanitize_value_escapes_control_and_separator_chars() {
+        // C0/C1 controls, the Zl/Zp separators, and Cf format chars must be
+        // escaped so a hostile node value cannot split or spoof output lines.
+        assert_eq!(sanitize_value("plain value"), "plain value");
+        assert_eq!(sanitize_value("line\nbreak"), "line\\nbreak");
+        assert_eq!(sanitize_value("tab\there"), "tab\\there");
+        assert_eq!(sanitize_value("esc\u{1b}[31m"), "esc\\u{1b}[31m");
+        assert_eq!(sanitize_value("sep\u{2028}arator"), "sep\\u{2028}arator");
+        assert_eq!(sanitize_value("bidi\u{202e}evil"), "bidi\\u{202e}evil");
+        // Joiners are legitimate in some scripts and pass through.
+        assert_eq!(sanitize_value("a\u{200c}b"), "a\u{200c}b");
+        // Non-ASCII but safe text passes through untouched.
+        assert_eq!(sanitize_value("café"), "café");
+    }
+
+    #[test]
+    fn sanitize_json_preserves_structural_newlines_and_escapes_chars() {
+        // serde's pretty JSON emits literal \n only as structural separators
+        // (control chars inside string values are escaped by serde), so the
+        // sanitizer can keep the multi-line structure while still escaping the
+        // Cf format chars (bidi, ZWSP, …) that serde does NOT escape.
+        let pretty = "{\n  \"k\": \"v\u{202e}\"\n}";
+        assert_eq!(
+            sanitize_json(pretty, MAX_TOOL_OUTPUT_BYTES),
+            "{\n  \"k\": \"v\\u{202e}\"\n}"
+        );
+        // Compact JSON stays single-line.
+        let compact = "{\"k\":\"v\u{202e}\"}";
+        assert_eq!(
+            sanitize_json(compact, MAX_TOOL_OUTPUT_BYTES),
+            "{\"k\":\"v\\u{202e}\"}"
+        );
+    }
+
+    #[test]
+    fn sanitize_json_caps_before_sanitizing() {
+        // The sanitize pass must be bounded: content beyond `budget` bytes is
+        // dropped before any escaping runs, so a huge node response cannot
+        // force a full-size copy — and a hostile char past the cap cannot
+        // slip into the output.
+        let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES * 4) + "\u{1b}";
+        let out = sanitize_json(&big, MAX_TOOL_OUTPUT_BYTES);
+        assert_eq!(out.len(), MAX_TOOL_OUTPUT_BYTES);
+        assert!(
+            !out.contains('\u{1b}'),
+            "ESC beyond the cap must be dropped"
+        );
     }
 }
