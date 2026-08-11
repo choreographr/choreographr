@@ -20,6 +20,17 @@ const MAX_STREAMED_TOOL_CONTENT_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
 /// like the daemon's final capped result.
 fn push_capped(content: &mut String, data: &str) {
     if content.len() >= MAX_STREAMED_TOOL_CONTENT_BYTES {
+        // At or past the cap. When a chunk previously landed *exactly* on
+        // the cap, no marker was appended then — but any further chunk
+        // proves more output existed, so the stream was truncated: append
+        // the shared marker once (after it, content.len() > cap and every
+        // later chunk early-returns here). The daemon's ByteBudget fires
+        // its marker under the same condition, so the live view stays in
+        // lockstep with the recorded result instead of silently dropping
+        // the remainder with no truncation signal.
+        if content.len() == MAX_STREAMED_TOOL_CONTENT_BYTES && !data.is_empty() {
+            content.push_str(TRUNCATION_SUFFIX);
+        }
         return;
     }
     let remaining = MAX_STREAMED_TOOL_CONTENT_BYTES - content.len();
@@ -326,6 +337,53 @@ mod tests {
         assert!(
             content.len() <= MAX_STREAMED_TOOL_CONTENT_BYTES + "\n...[truncated]".len(),
             "stub content must stay within cap + marker"
+        );
+    }
+
+    #[test]
+    fn tool_result_chunk_exact_fit_to_cap_still_marks_truncation() {
+        // Regression: a chunk landing exactly on the cap appends no marker
+        // at that moment, but any *later* chunk proves more output existed —
+        // the live view must then show the truncation marker once, not
+        // silently drop the remainder with no signal (the daemon's
+        // ByteBudget fires under the same condition, so the views stay in
+        // lockstep).
+        let mut view = SessionView::new();
+        let mut turn = turn_with_tool_call("call-1", "sh");
+        let exact = "x".repeat(MAX_STREAMED_TOOL_CONTENT_BYTES);
+        turn.tool_results.push(ToolResultRecord {
+            call_id: "call-1".into(),
+            name: "sh".into(),
+            content: exact.clone(),
+            is_error: false,
+            invocation_description: String::new(),
+        });
+        view.insert_or_replace(1, turn);
+        view.request_to_turn.insert(7, 1);
+
+        // A later chunk proves truncation: the marker appears exactly once.
+        view.tool_result_chunk(7, "call-1", "more");
+        let len_after_marker = {
+            let content = &view.get(1).unwrap().tool_results[0].content;
+            assert!(
+                content.ends_with("...[truncated]"),
+                "post-exact-fit chunk must append the marker: {:?}",
+                &content[content.len().saturating_sub(40)..]
+            );
+            content.len()
+        };
+        assert_eq!(
+            len_after_marker,
+            MAX_STREAMED_TOOL_CONTENT_BYTES + TRUNCATION_SUFFIX.len(),
+            "cap + one marker"
+        );
+
+        // Subsequent chunks are dropped; the marker is not duplicated.
+        view.tool_result_chunk(7, "call-1", "even more");
+        assert_eq!(
+            view.get(1).unwrap().tool_results[0].content.len(),
+            len_after_marker,
+            "chunks past the cap must be dropped without re-marking"
         );
     }
 

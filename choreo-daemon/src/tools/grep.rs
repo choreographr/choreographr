@@ -5,6 +5,7 @@ use super::{
     truncation_marker,
 };
 use choreo_keystore::ServiceCredential;
+use choreo_sanitize::TRUNCATION_SUFFIX;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
@@ -308,8 +309,9 @@ fn decimal_len(n: u64) -> usize {
 enum StopReason {
     /// The max_results cap was hit — at least `max_results` results exist.
     Cap,
-    /// The buffered output passed [`MAX_TOOL_OUTPUT_BYTES`] — collection
-    /// stopped before the cap; the marker reports the count collected.
+    /// The buffered output passed the sink's collection budget (MAX minus
+    /// the finish tail reservation) — collection stopped before the cap; the
+    /// marker reports the count collected.
     ByteBudget,
 }
 
@@ -374,13 +376,23 @@ struct GrepSink {
     // the sanitized label (see [`ContentBucket`]).
     content_files: Vec<ContentBucket>,
     content_match_count: usize,
+    /// Collection byte budget for Content mode — [`MAX_TOOL_OUTPUT_BYTES`]
+    /// minus the room [`finish_tool_output`] reserves for the truncation
+    /// marker and the generic `...[truncated]` suffix it appends when the
+    /// body is cut. The marker's length depends on the count collected
+    /// (unknown mid-walk), so the worst case — the max_results marker — is
+    /// reserved: collection then stops exactly where the final cap would,
+    /// so the rendered body is never re-cut (no doubled marker) and the
+    /// buffered bytes are never wasted.
+    budget: usize,
     /// Running byte total of the *rendered* output buffered in `content_files`
     /// — each item charges `label + separator + line number + content +
     /// newline`, the exact bytes `render_content` will produce. The renderer
-    /// caps the final output at [`MAX_TOOL_OUTPUT_BYTES`], so buffering more
-    /// than that is pure waste — and on a pathological tree (200 matches ×
-    /// 201 context lines × 64 KiB lines) it could otherwise be gigabytes
-    /// before `finish_grep` ever trims it.
+    /// caps the final output at the sink's collection budget (which itself
+    /// reserves the finish tail), so buffering more than that is pure waste —
+    /// and on a pathological tree (200 matches × 201 context lines × 64 KiB
+    /// lines) it could otherwise be gigabytes before `finish_grep` ever trims
+    /// it.
     content_bytes: usize,
 
     // FilesWithMatches-mode state: one path per file (first hit only).
@@ -424,6 +436,16 @@ impl GrepSink {
         resolved: &Path,
         single_file: bool,
     ) -> Self {
+        // Reserve the finish tail inside the collection budget (see the
+        // `budget` field docs): `finish_tool_output` caps the body at MAX
+        // minus the tail it appends, so charging against raw MAX would
+        // over-collect by up to tail + suffix bytes and the final cap would
+        // re-cut the body, dropping buffered matches and emitting a doubled
+        // truncation marker.
+        let max_marker_len =
+            truncation_marker(true, max_results, output_mode.cap_noun()).map_or(0, |m| m.len());
+        let budget =
+            MAX_TOOL_OUTPUT_BYTES.saturating_sub(1 + max_marker_len + TRUNCATION_SUFFIX.len());
         GrepSink {
             output_mode,
             max_results,
@@ -434,6 +456,7 @@ impl GrepSink {
             current_label: String::new(),
             content_files: Vec::new(),
             content_match_count: 0,
+            budget,
             content_bytes: 0,
             matched_files: Vec::new(),
             count_file_lines: 0,
@@ -554,7 +577,7 @@ impl GrepSink {
             + decimal_len(line_number)
             + content_len
             + self.joining_newline();
-        if estimate > MAX_TOOL_OUTPUT_BYTES {
+        if estimate > self.budget {
             self.stop = Some(StopReason::ByteBudget);
             return false;
         }
@@ -643,9 +666,10 @@ impl GrepSink {
         // first (`render_content` joins with "\n", so the first item has no
         // preceding newline). This matches the bytes the renderer produces
         // exactly, so collection stops at the same threshold the renderer
-        // caps at.
+        // caps at — the reserved budget (MAX minus the finish tail), so the
+        // final `finish_tool_output` never re-cuts the body.
         let rendered = item.render_len(&self.current_label) + self.joining_newline();
-        if self.content_bytes + rendered > MAX_TOOL_OUTPUT_BYTES {
+        if self.content_bytes + rendered > self.budget {
             self.stop = Some(StopReason::ByteBudget);
             return false;
         }
@@ -1955,6 +1979,34 @@ mod tests {
             rendered.len(),
             "charged bytes must match rendered output"
         );
+    }
+
+    #[test]
+    fn byte_budget_stops_before_finish_tail_reservation() {
+        // `finish_tool_output` reserves room *inside* the budget for the
+        // truncation marker (and the generic `...[truncated]` suffix it
+        // appends when the body is cut), so the sink's collection budget is
+        // MAX minus that tail. An item that would land inside the reserved
+        // tail window must be rejected at push time — otherwise the final
+        // cap would re-cut the rendered body, dropping buffered matches and
+        // emitting a doubled truncation marker.
+        let mut sink = GrepSink::new(GrepOutputMode::Content, 200, 0, Path::new("root"), false);
+        sink.begin_file(Path::new("a.txt"));
+        // Charge the body to within the tail reservation but under raw MAX:
+        // with a raw-MAX budget this item would be accepted; the reserved
+        // budget must reject it (label "a.txt" = 5, match = 2 + 1 + 15,
+        // joining newline = 1 → rendered = 24; MAX − 30 + 24 ≤ MAX but
+        // > MAX − 44ish budget).
+        sink.content_bytes = MAX_TOOL_OUTPUT_BYTES - 30;
+        let accepted = sink.push_item(GrepItem::Match {
+            line_number: 1,
+            content: "x".repeat(15),
+        });
+        assert!(
+            !accepted,
+            "an item in the finish tail reservation must be rejected"
+        );
+        assert_eq!(sink.stop, Some(StopReason::ByteBudget));
     }
 
     #[test]

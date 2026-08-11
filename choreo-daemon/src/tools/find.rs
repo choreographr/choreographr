@@ -3,6 +3,7 @@ use super::{
     human_size, sanitize_name, symlink_target_label, truncation_marker,
 };
 use choreo_keystore::ServiceCredential;
+use choreo_sanitize::TRUNCATION_SUFFIX;
 use crossbeam_channel;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -139,6 +140,17 @@ fn run_find_walk(
     // buffered and streamed output can never exceed what the final
     // `finish_tool_output` cap would show anyway.
     let mut content_bytes: usize = 0;
+    // The walk's byte budget reserves room for the tail `finish_tool_output`
+    // will append: the "at least N results" marker plus the generic
+    // `...[truncated]` suffix it holds back in case the body itself is cut.
+    // The marker's length depends on the collected count (unknown mid-walk),
+    // so reserve the worst case — the count is capped at `max_results` — and
+    // the walk then stops exactly where the final cap would: the joined body
+    // never exceeds `finish_tool_output`'s body budget, so the recorded
+    // result matches the streamed view (no re-cut, no doubled marker).
+    let max_marker_len = format!("...[truncated at {max_results} results]").len();
+    let walk_budget =
+        MAX_TOOL_OUTPUT_BYTES.saturating_sub(1 + max_marker_len + TRUNCATION_SUFFIX.len());
 
     let mut builder = WalkBuilder::new(resolved)
         .map_err(|e| ToolExecError(format!("failed to create walker: {e}")))?;
@@ -221,12 +233,15 @@ fn run_find_walk(
             // show (previously the walker streamed every match and only the
             // final join was capped — the live view could diverge unboundedly
             // from the recorded result). Charges `line.len() + 1` for the
-            // joining newline, matching the final render. The first match is
-            // always accepted (even if it alone overflows) so a pathological
-            // single huge line cannot produce an empty result — the final
-            // `finish_tool_output` byte-caps it instead.
+            // joining newline, matching the final render, against the
+            // `walk_budget` — MAX minus the finish tail reservation — so the
+            // joined body never gets re-cut (and double-marked) by
+            // `finish_tool_output`. The first match is always accepted (even
+            // if it alone overflows) so a pathological single huge line cannot
+            // produce an empty result — the final `finish_tool_output`
+            // byte-caps it instead.
             let line_bytes = line.len() + 1;
-            if !results.is_empty() && content_bytes + line_bytes > MAX_TOOL_OUTPUT_BYTES {
+            if !results.is_empty() && content_bytes + line_bytes > walk_budget {
                 truncated = true; // more results exist; marker reports "at least N"
                 return WalkState::Quit;
             }
@@ -579,18 +594,26 @@ mod tests {
         let result = tool.execute(args, None, None, None).unwrap();
 
         // The joined body stays within the byte budget; the marker is
-        // reserved inside the budget by `finish_tool_output` (the walk
-        // stops at MAX_TOOL_OUTPUT_BYTES, so the body is re-capped at
-        // budget minus marker/tail headroom).
+        // reserved *inside* the budget by `finish_tool_output`, and the walk
+        // stops at the same reserved budget — so the final result is never
+        // re-cut (no standalone generic marker, no dropped tail results).
         assert!(
-            result.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
-            "output must fit budget + marker: {} bytes",
+            result.len() <= MAX_TOOL_OUTPUT_BYTES,
+            "output must stay within the budget: {} bytes",
             result.len()
         );
         assert!(
             result.contains("truncated"),
             "byte-budget stop must report truncation:\n{}",
             &result[..result.len().min(200)]
+        );
+        // The generic `...[truncated]` suffix must not appear as its own
+        // line: the walk stopped inside the reserved budget, so
+        // `finish_tool_output` had nothing to re-cut.
+        assert!(
+            !result.lines().any(|l| l == "...[truncated]"),
+            "no standalone generic marker: the walk must stop inside the reserved budget:\n{}",
+            &result[..result.len().min(400)]
         );
         // The budget — not an empty search — stopped the walk: many results
         // were collected before the stop.

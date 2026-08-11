@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -1177,14 +1178,20 @@ pub(crate) fn sanitize_content(content: &str) -> String {
 /// transcript (`record_tool_completion` in requests.rs), so it covers every
 /// tool at once; the terminal is defended separately by the TUI's render
 /// filter (which keeps SGR color sequences but escapes other controls).
-pub(crate) fn sanitize_transcript(text: &str) -> String {
+///
+/// Returns a [`Cow`]: the fast path (pure ASCII — the common case for tool
+/// output) borrows the input with no copy, avoiding a full up-to-128-KiB
+/// allocation on every recorded result; only content that actually needs
+/// escaping allocates.
+pub(crate) fn sanitize_transcript(text: &str) -> Cow<'_, str> {
     // Fast path: pure ASCII (printables plus the whitespace that is always
-    // kept) contains no Cf chars, so no escape can be needed.
+    // kept) contains no Cf chars, so no escape can be needed — return the
+    // input borrowed instead of copying it.
     if text
         .bytes()
         .all(|b| b.is_ascii() && (b >= 0x20 || matches!(b, b'\n' | b'\t' | b'\r')))
     {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -1194,7 +1201,7 @@ pub(crate) fn sanitize_transcript(text: &str) -> String {
             out.push(c);
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Cap `body` at the shared byte budget with `marker` (if any) reserved

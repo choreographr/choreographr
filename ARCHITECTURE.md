@@ -1381,7 +1381,9 @@ diverge unboundedly from the recorded result:
   can never disagree.
 - `find`'s walk enforces the byte budget during collection (charging each rendered line
   plus its joining newline), stopping the walk and reporting the collected count in the
-  marker — the streamed view and the final result now agree.
+  marker — the streamed view and the final result now agree. The walk's budget reserves
+  the finish tail *inside* it (the truncation marker plus the generic `...[truncated]`
+  suffix `finish_tool_output` holds back), so the final cap never re-cuts the body.
 - `run_riscv` caps guest `WRITE` output at the syscall via `ByteBudget` (both the
   accumulated and the streamed copies): a write that would cross the cap is kept as a
   fitting prefix, the one-shot truncation signal fires, and the streamed live view gets
@@ -1393,7 +1395,8 @@ diverge unboundedly from the recorded result:
   capped, but N steps joined could exceed the budget).
 - The clients cap their *live* accumulation too: `SessionView::tool_result_chunk` in
   `choreo-client-core` stops at the same shared `MAX_TOOL_OUTPUT_BYTES` (128 KiB)
-  budget with the same one-time `...[truncated]` marker, so a
+  budget with the same one-time `...[truncated]` marker (a chunk landing exactly on the
+  cap still marks the next chunk truncated, matching the daemon's `ByteBudget`), so a
   chatty tool cannot balloon client memory before the (authoritative, capped) final
   record replaces it.
 

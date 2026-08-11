@@ -6,11 +6,14 @@ use std::{collections::HashMap, path::Path, time::Duration};
 use tracing::debug;
 use ureq::RequestBuilder;
 
-/// Hard cap on the response body bytes read for a text response. The final
-/// tool content is capped at [`MAX_TOOL_OUTPUT_BYTES`] anyway, so reading a
-/// bounded prefix (with slack for the sanitizer's per-line escaping, which
-/// can expand) is enough — a hostile server cannot balloon daemon memory
-/// with a multi-gigabyte body.
+/// Hard cap on the response body bytes read for a text response. This is the
+/// *memory* bound: it limits what a hostile server can make the daemon buffer
+/// to a bounded prefix, no matter how large the advertised body is. The
+/// prefix deliberately exceeds [`MAX_TOOL_OUTPUT_BYTES`] (the final content
+/// cap) so a just-under-budget body is read whole and the strict decode path
+/// applies; escaping can expand a Cf/control-heavy body past the slack, but
+/// the final `truncate_tool_output` cap keeps the tool result at the budget
+/// regardless.
 const MAX_HTTP_BODY_BYTES: usize = MAX_TOOL_OUTPUT_BYTES + 64 * 1024;
 
 /// HTTP tool errors — a structured error type for http_request failures.
@@ -166,9 +169,10 @@ pub fn execute_http_request_tool(
 /// daemon memory first; the sanitizer then neutralizes the content.
 fn read_bounded_text_body(response: ureq::http::Response<ureq::Body>) -> String {
     // Read at most MAX_HTTP_BODY_BYTES so a hostile server cannot balloon
-    // daemon memory (the final content is capped at MAX_TOOL_OUTPUT_BYTES
-    // anyway; the slack leaves room for the sanitizer's escaping to expand
-    // before the final cap applies). `into_reader` yields an owned `Read`;
+    // daemon memory. The final content is capped at MAX_TOOL_OUTPUT_BYTES
+    // anyway; the slack absorbs most of the sanitizer's escaping expansion
+    // (a worst-case Cf-heavy body can still outgrow it — the final cap is
+    // the backstop, not the slack). `into_reader` yields an owned `Read`;
     // `take` bounds it so a multi-gigabyte body is never buffered.
     let mut bytes = Vec::with_capacity(64 * 1024);
     let mut reader = response

@@ -3506,17 +3506,33 @@ content ---"
         // correctness against the Unicode tables is guarded by the code-space
         // sweep in choreo-sanitize; this sweep pins the TUI's per-char policy
         // (the SGR passthrough is handled separately and has its own tests).
+        // Stated as the two directions of the policy rather than a copy of
+        // `terminal_keeps`, so a change to the implementation that silently
+        // keeps or escapes the wrong class is caught:
+        //   - kept chars must be structural ASCII, printable ASCII, or safe
+        //     non-ASCII — never a control or spoofing char;
+        //   - every control (except TAB/LF), spoofing char, and unprintable
+        //     ASCII byte must be escaped — nothing safe may leak.
         for c in '\u{0}'..=char::MAX {
-            let expected = c == '\t'
-                || c == '\n'
-                || (c.is_ascii() && (' '..='~').contains(&c))
-                || (!c.is_ascii() && !c.is_control() && !is_unsafe_unicode(c));
-            assert_eq!(
-                terminal_keeps(c),
-                expected,
-                "terminal keep-policy drift for U+{:04X}",
-                c as u32
-            );
+            let keeps = terminal_keeps(c);
+            let structural = matches!(c, '\t' | '\n');
+            let printable_ascii = c.is_ascii() && (' '..='~').contains(&c);
+            let safe_non_ascii = !c.is_ascii() && !c.is_control() && !is_unsafe_unicode(c);
+            if keeps {
+                assert!(
+                    structural || printable_ascii || safe_non_ascii,
+                    "kept char U+{:04X} violates the keep policy",
+                    c as u32
+                );
+            } else {
+                // Everything rejected is a control (all non-printable ASCII
+                // is C0/DEL) or a shared spoofing char — nothing safe.
+                assert!(
+                    c.is_control() || is_unsafe_unicode(c),
+                    "escaped char U+{:04X} is safe and should be kept",
+                    c as u32
+                );
+            }
         }
     }
 

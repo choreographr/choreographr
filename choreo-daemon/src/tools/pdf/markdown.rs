@@ -114,7 +114,7 @@ pub fn execute_pdf_to_markdown(
     // fully inside the window is redacted, and one straddling the window
     // edge is only a partial match in the output, which cannot close the
     // frame (the genuine closing line is appended by `finish_tool_output`
-    // itself, past the byte budget).
+    // itself, reserved inside the budget).
     let window = pdf_text_window(&markdown, MAX_TOOL_OUTPUT_BYTES);
     let markdown = sanitize_pdf_text(window);
     // Frame-spoofing guard: redact the framing literals if the PDF embedded
@@ -130,9 +130,10 @@ pub fn execute_pdf_to_markdown(
     };
 
     // The untrusted-content header opens the frame; the closing delimiter is
-    // passed as the *marker* so `finish_tool_output` appends it past the
-    // shared byte budget — a truncated extraction still closes its frame
-    // instead of leaving the "untrusted" block dangling open at the cut.
+    // passed as the *marker* so `finish_tool_output_sanitized` appends it,
+    // reserved *inside* the shared byte budget — a truncated extraction
+    // still closes its frame instead of leaving the "untrusted" block
+    // dangling open at the cut.
     // The encoding note rides along outside the frame (it is trusted text).
     let body = format!("{UNTRUSTED_CONTENT_HEADER}\n\n{markdown}");
     let marker = format!("{UNTRUSTED_CONTENT_FOOTER}{encoding_note}");
@@ -341,15 +342,13 @@ mod tests {
         let cut = out.find("...[truncated]").unwrap();
         let close = out.find(UNTRUSTED_CONTENT_FOOTER).unwrap();
         assert!(cut < close, "delimiter must follow the truncation marker");
-        // Exact bound: body capped at the budget + truncation marker, then
-        // finish_tool_output appends "\n" + the marker (closing delimiter).
-        let max_expected = crate::tools::MAX_TOOL_OUTPUT_BYTES
-            + "\n...[truncated]".len()
-            + 1
-            + UNTRUSTED_CONTENT_FOOTER.len();
+        // Exact bound: `finish_tool_output_sanitized` caps body + tail at
+        // the shared budget (the closing delimiter rides in the reserved
+        // tail slot, never past it), so the finished output never exceeds
+        // MAX — no marker-past-cap allowance needed.
         assert!(
-            out.len() <= max_expected,
-            "output too large: {} > {max_expected}",
+            out.len() <= crate::tools::MAX_TOOL_OUTPUT_BYTES,
+            "body + tail must stay within the budget: {}",
             out.len()
         );
     }
