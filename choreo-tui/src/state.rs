@@ -822,6 +822,14 @@ pub(crate) struct SessionDisplayState {
     pub(crate) token_usage: Option<TokenUsage>,
     pub(crate) context_window: Option<u32>,
     pub(crate) last_prompt_tokens: Option<u32>,
+    /// Unsent prompt draft: the text (and cursor position) the user had
+    /// typed but not yet submitted when they last left this session.  The
+    /// input bar is a single shared buffer, so each session stashes its own
+    /// draft here and it is restored on the next visit — an unsubmitted
+    /// prompt must never leak into a different session.  Cleared on submit
+    /// and dropped when the session (and its display) is deleted.
+    pub(crate) draft: String,
+    pub(crate) draft_cursor: usize,
 }
 
 impl Default for SessionDisplayState {
@@ -855,6 +863,8 @@ impl Default for SessionDisplayState {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            draft: String::new(),
+            draft_cursor: 0,
         }
     }
 }
@@ -2652,6 +2662,18 @@ impl App {
         self.saved_draft.clear();
     }
 
+    /// Clear the draft stashed for the currently attached session, mirroring
+    /// the input bar being cleared when a prompt is submitted.  Without this
+    /// a submitted prompt would resurface the next time the user returns to
+    /// the session — the draft must reflect only *unsent* text.
+    pub(crate) fn clear_current_draft(&mut self) {
+        if let Some(session_id) = self.attached_session_id {
+            let display = self.display_for(session_id);
+            display.draft.clear();
+            display.draft_cursor = 0;
+        }
+    }
+
     pub(crate) fn ensure_input_cursor_visible(&mut self) {
         if let Some((term_w, _)) = self.last_terminal_size {
             // inner width must match the renderer's drawing width so the
@@ -2724,6 +2746,11 @@ impl App {
         client_tx
             .send(ClientMessage::ListSessions)
             .map_err(broken_pipe)?;
+        // The input bar may hold an unsent prompt belonging to the session the
+        // user was viewing before the new session was created — stash it there
+        // and load the (empty) draft of the brand-new session, so the prompt
+        // doesn't leak into a session it was never meant for.
+        self.persist_input_draft(session_id);
         self.reset_for_session_switch(session_id);
         self.attached_session_id = Some(session_id);
         // Set display fields immediately so they're available when
@@ -3003,6 +3030,51 @@ impl App {
         }
     }
 
+    /// Persist the input bar's current contents as the draft of the session
+    /// the user is leaving, then load the target session's saved draft into
+    /// the input bar.
+    ///
+    /// The input bar is a single shared buffer; without this hand-off an
+    /// unsent prompt typed in one session would follow the user into the
+    /// next.  Drafts live in the per-session display state, so they survive
+    /// session switches and are dropped only when the session itself is
+    /// deleted (`handle_session_deleted` removes the whole display).
+    ///
+    /// Callers invoke this *before* rebinding `attached_session_id` so it
+    /// still names the session the input bar's current contents belong to.
+    /// History navigation interacts with the draft: if the user was stepping
+    /// through past prompts (Up), the buffer holds a history entry rather
+    /// than their real draft — first drop back to the draft
+    /// (`restore_history_draft`) so the stash captures what they actually
+    /// typed instead of a history entry.
+    pub(crate) fn persist_input_draft(&mut self, target_session_id: u64) {
+        if self.history_index.is_some() {
+            self.restore_history_draft();
+        }
+        // Stash the outgoing session's draft before overwriting the buffer
+        // with the incoming session's.  Move the text out of the buffer
+        // (rather than cloning) so the bytes are transferred, then rebind
+        // `attached_session_id`-derived display fields; the input generation
+        // is bumped below to invalidate the visual-lines cache.
+        if let Some(prev_id) = self.attached_session_id {
+            let text = std::mem::take(&mut self.input.text);
+            let cursor = self.input.cursor;
+            let display = self.display_for(prev_id);
+            display.draft = text;
+            display.draft_cursor = cursor;
+        }
+        self.input.generation += 1;
+        // Load the target session's draft (empty for a never-typed session)
+        // and restore its cursor position.
+        let (draft, cursor) = {
+            let display = self.display_for(target_session_id);
+            (display.draft.clone(), display.draft_cursor)
+        };
+        self.input.text = draft;
+        self.input.cursor = cursor;
+        self.ensure_input_cursor_visible();
+    }
+
     /// Attach the Chat view to `session_id` via the shared sequence every
     /// attach path follows (Session Manager list/detail Enter, and the
     /// sub-session finish switch-back).
@@ -3028,6 +3100,12 @@ impl App {
         client_tx
             .send(ClientMessage::AttachSession { session_id })
             .map_err(broken_pipe)?;
+        // Hand the input bar's unsent prompt to the session the user is
+        // leaving and load the target session's saved draft, so an unsubmitted
+        // prompt never follows the user across sessions.  Must run before
+        // `attached_session_id` is rebound below — it still names the session
+        // the input bar's current contents belong to.
+        self.persist_input_draft(session_id);
         // reset_for_session_switch first so the subsequent set_page marks the
         // target's display dirty — the one that will actually render next.
         self.reset_for_session_switch(session_id);
@@ -3127,6 +3205,10 @@ impl App {
                     // same tick cannot auto-attach again to a different
                     // session, and so the page renders the target session
                     // instead of a blank screen until SessionAttached arrives.
+                    // Hand the input bar over too (no-op stash: nothing is
+                    // attached yet; loads the target's — empty — draft) so the
+                    // attach paths stay uniform.
+                    self.persist_input_draft(first.session_id);
                     self.reset_for_session_switch(first.session_id);
                     self.attached_session_id = Some(first.session_id);
                     client_tx
@@ -3165,6 +3247,12 @@ impl App {
             self.attached_session_id = None;
             self.active_session_id = None;
             self.attached_provider_slug = None;
+            // The deleted session's unsent prompt dies with it — the display
+            // (and its draft) are gone above, so drop the input bar too
+            // rather than leak the orphaned text into whichever session gets
+            // attached next.
+            self.input.clear();
+            self.commit_to_history();
         }
     }
 

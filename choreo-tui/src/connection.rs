@@ -912,6 +912,9 @@ fn handle_chat_event(
                 KeyCode::Enter => {
                     let line = app.input.text.trim().to_string();
                     app.input.clear();
+                    // The prompt was sent — forget the per-session draft so it
+                    // doesn't resurface when the user returns to this session.
+                    app.clear_current_draft();
                     app.commit_to_history();
                     match parse_input_line(&line, &mut app.next_request_id, app.attached_session_id)
                     {

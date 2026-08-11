@@ -6098,3 +6098,228 @@ fn ime_text_event_must_not_insert_nul_into_chat_input() {
         "a NUL from a mangled IME text event must never enter the buffer"
     );
 }
+
+// ── Unsent prompt drafts are stored per session ──
+//
+// The input bar is a single shared buffer, so when the user switches
+// sessions an unsubmitted prompt must be stashed against the session it was
+// typed in and the target session's own draft loaded in its place.  These
+// tests pin the hand-off in `attach_to_session` / `handle_session_created`
+// and the clear-on-submit behaviour in the Enter handler.
+
+#[cfg(test)]
+mod unsent_draft_tests {
+    use super::*;
+    use crate::connection::handle_terminal_event;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Attach to a session with a fresh (empty) display, mirroring what
+    /// `attach_to_session` does for a session the user has never opened.
+    fn attach(app: &mut App, session_id: u64) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.attach_to_session(session_id, &tx)
+            .expect("attach_to_session succeeds");
+    }
+
+    #[test]
+    fn switching_sessions_keeps_unsent_prompt_with_its_session() {
+        let mut app = test_app();
+        app.attached_session_id = Some(1);
+        app.display_for(1); // ensure session 1 has a display to stash into
+        app.input.text = "hello from session 1".to_string();
+        app.input.cursor = 5;
+
+        // Switch to session 2: session 2 has no draft yet, so the input bar
+        // must come up empty — the prompt must not follow the user over.
+        attach(&mut app, 2);
+        assert_eq!(app.attached_session_id, Some(2));
+        assert!(
+            app.input.is_empty(),
+            "new session must not inherit the prompt"
+        );
+        assert_eq!(app.display_for(1).draft, "hello from session 1");
+        assert_eq!(app.display_for(1).draft_cursor, 5);
+
+        // Switch back to session 1: its unsent prompt is restored, cursor
+        // position included.
+        attach(&mut app, 1);
+        assert_eq!(app.input.text, "hello from session 1");
+        assert_eq!(app.input.cursor, 5);
+    }
+
+    #[test]
+    fn empty_draft_does_not_clobber_target_session_draft() {
+        let mut app = test_app();
+        app.attached_session_id = Some(1);
+        app.display_for(1);
+        // Session 1 has a saved draft from an earlier visit.
+        app.display_for(2).draft = "session 2 draft".to_string();
+        app.display_for(2).draft_cursor = 3;
+        // The user is typing a *different* prompt in session 1…
+        app.input.text = "session 1 draft".to_string();
+
+        // …and switches to session 2: session 1's in-progress text is
+        // stashed (replacing its old draft) and session 2's draft loaded.
+        attach(&mut app, 2);
+        assert_eq!(app.display_for(1).draft, "session 1 draft");
+        assert_eq!(app.input.text, "session 2 draft");
+        assert_eq!(app.input.cursor, 3);
+    }
+
+    #[test]
+    fn submitting_prompt_clears_session_draft() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.attached_session_id = Some(1);
+        app.display_for(1);
+        app.input.text = "hello".to_string();
+        app.input.cursor = 5;
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("submit prompt");
+
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.display_for(1).draft,
+            "",
+            "submitted prompt must not resurface"
+        );
+        assert_eq!(app.display_for(1).draft_cursor, 0);
+
+        // Round-trip through another session: still gone.
+        attach(&mut app, 2);
+        attach(&mut app, 1);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn switching_while_in_history_navigation_stashes_real_draft() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.attached_session_id = Some(1);
+        app.active_session_id = Some(1);
+        // Session 1 has one past prompt the user can navigate back to.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("past prompt".to_string()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        app.display_for(1).view.insert_or_replace(0, turn);
+        // The user typed a fresh draft and pressed Up: the buffer now shows
+        // the history entry, with the real draft stashed for the round trip.
+        app.input.text = "my draft".to_string();
+        app.input.cursor = 8;
+        app.navigate_history_up();
+        assert_eq!(app.input.text, "past prompt");
+        assert_eq!(app.saved_draft, "my draft");
+
+        // Switching sessions must stash the *real* draft, not the history
+        // entry the buffer happens to be showing.
+        app.attach_to_session(2, &tx).expect("attach to session 2");
+        assert_eq!(app.display_for(1).draft, "my draft");
+        assert!(app.saved_draft.is_empty(), "history stash must be consumed");
+        assert_eq!(app.history_index, None);
+        assert!(app.input.is_empty(), "session 2 starts with no draft");
+
+        // Returning to session 1 restores the user's own draft.
+        app.attach_to_session(1, &tx)
+            .expect("attach back to session 1");
+        assert_eq!(app.input.text, "my draft");
+        assert_eq!(app.history_index, None);
+    }
+
+    #[test]
+    fn session_manager_switch_preserves_unsent_prompt_per_session() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.page = Page::SessionManager;
+        app.session_mgr.set_sessions(vec![
+            make_session(1, "first", "gpt-4", 3),
+            make_session(2, "second", "claude", 5),
+        ]);
+        // The user was viewing session 1 with an unsent prompt.
+        app.attached_session_id = Some(1);
+        app.input.text = "draft for session 1".to_string();
+        app.input.cursor = 5;
+
+        // Session manager → Down → Enter attaches to session 2.
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("move down to session 2");
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("attach to session 2");
+        assert_eq!(app.page, Page::Chat);
+        assert_eq!(app.attached_session_id, Some(2));
+        assert!(
+            app.input.is_empty(),
+            "session 2 must not inherit session 1's unsent prompt"
+        );
+
+        // Back to the session manager, Up to session 1, Enter to attach.
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            &mut app,
+            &tx,
+        )
+        .expect("open session manager");
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("move up to session 1");
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("attach back to session 1");
+
+        assert_eq!(app.attached_session_id, Some(1));
+        assert_eq!(
+            app.input.text, "draft for session 1",
+            "returning to session 1 restores its unsent prompt"
+        );
+        assert_eq!(app.input.cursor, 5, "cursor position is restored too");
+    }
+
+    #[test]
+    fn deleting_attached_session_drops_its_unsent_prompt() {
+        let mut app = test_app();
+        app.attached_session_id = Some(1);
+        app.display_for(1).draft = "orphaned draft".to_string();
+        app.input.text = "orphaned draft".to_string();
+        app.input.cursor = 7;
+
+        app.handle_session_deleted(1);
+
+        assert_eq!(app.attached_session_id, None);
+        assert!(
+            app.input.is_empty(),
+            "deleting the attached session must not leak its prompt into the next attach"
+        );
+        // The draft lives in the removed display, so nothing is left to
+        // resurface on a later switch either.
+        assert!(!app.session_displays.contains_key(&1));
+    }
+}
