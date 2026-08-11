@@ -1378,9 +1378,15 @@ diverge unboundedly from the recorded result:
   onto one channel in arrival order; a single consumer forwards the lines
   through the shared `ByteBudget` (the same "first N bytes + one marker"
   engine) and accumulates the same capped bytes into the returned body. The
-  final result is built from that exact body, so the recorded output is
-  byte-identical to the live view — a tool that writes progress to stderr
-  (cargo, nextest, make, …) streams live instead of appearing all at once.
+  stream budget reserves `format_shell_output`'s framing (the `$ {cmd}\n`
+  prefix, the exit-code footer, and the truncation marker) *inside* the cap,
+  so the final cap is a no-op: the recorded body contains exactly the streamed
+  bytes — truncation marker included — even when the stream is cut, and a
+  tool that writes progress to stderr (cargo, nextest, make, …) streams live
+  instead of appearing all at once. Oversized unterminated lines are flushed
+  forward as partial chunks (never splitting a UTF-8 char, holding back a
+  trailing `\r` so CRLF still folds) so a newline-less firehose cannot
+  balloon daemon memory.
 - `find`'s walk enforces the byte budget during collection (charging each rendered line
   plus its joining newline), stopping the walk and reporting the collected count in the
   marker — the streamed view and the final result now agree. The walk's budget reserves
@@ -2658,9 +2664,11 @@ already gone.
 
 On the streaming path (`spawn_with_streaming`), both drains split their
 output into complete lines and forward them through a single merge channel
-in arrival order, so the live view interleaves stdout and stderr exactly as
-the child produced them — and the final result body is built from that same
-merged stream, making the recorded output match what was streamed.
+in arrival order — each stream keeps its relative order; the stdout/stderr
+interleave itself is scheduling-dependent. The final result body is built
+from that same merged stream, so the recorded output contains exactly what
+was streamed, truncation marker included (the stream budget reserves the
+record framing so the final cap never re-cuts the body).
 
 
 | Layer | What's tested | Location |
