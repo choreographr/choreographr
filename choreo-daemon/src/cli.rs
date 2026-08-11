@@ -131,6 +131,14 @@ pub fn main() -> anyhow::Result<()> {
 
     info!(effective_level = ?log_level.unwrap_or("from RUST_LOG"), "logging initialized");
 
+    // The blockchain tools (EVM/Substrate) run on a tokio sidecar runtime owned
+    // by the `choreo-blockchain` crate. Initialize it once at startup when the
+    // `blockchain` feature is enabled (off by default); without the feature the
+    // tools — and tokio itself — are compiled out entirely.
+    #[cfg(feature = "blockchain")]
+    choreo_blockchain::runtime::init()
+        .map_err(|e| anyhow::anyhow!("failed to initialize blockchain tokio runtime: {e}"))?;
+
     let max_turns = resolve_max_turns().context("failed to resolve tool-loop iteration limit")?;
     info!(max_turns, "tool loop iteration limit");
     info!("choreographr starting (locked)");

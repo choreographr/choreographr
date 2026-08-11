@@ -33,6 +33,9 @@ pdf = ["choreo-daemon/pdf"]
 # `--features pdf,metrics` for release binaries) to opt in. Release binaries
 # ship it via scripts/release.sh, keeping the advertised `/metrics` endpoint.
 metrics = ["choreo-daemon/metrics"]
+# Blockchain tools (EVM / Substrate-Polkadot) from choreo-daemon. Off by
+# default; opt in with `--features blockchain`.
+blockchain = ["choreo-daemon/blockchain"]
 # mimalloc — process-wide allocator, enabled ONLY by the static musl tarball
 # build in scripts/release.sh (musl's default malloc is weaker; mimalloc's
 # per-thread heaps replace it). Off by default so crates.io / `cargo install`
@@ -82,6 +85,7 @@ pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ ver
 members = [
     "choreo-acp",
     "choreo-ai-protocols",
+    "choreo-blockchain",
     "choreo-client-core",
     "choreo-daemon",
     "choreo-keystore",
@@ -149,6 +153,7 @@ futures-channel = "0.3"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 choreo-ai-protocols = { path = "choreo-ai-protocols", version = "0.1" }
+choreo-blockchain = { path = "choreo-blockchain", version = "0.1" }
 choreo-client-core = { path = "choreo-client-core", version = "0.1" }
 choreo-keystore = { path = "choreo-keystore", version = "0.1" }
 choreo-proto = { path = "choreo-proto", version = "0.1" }

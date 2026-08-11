@@ -196,11 +196,11 @@ with `systemctl --user enable --now choreographr` (Linux) or
 The workspace inherits crates.io-required fields from `[workspace.package]`
 in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
 `readme`, `description`), and members opt into publishing by *not* setting
-`publish = false`. The **publish set** is therefore twelve of the thirteen
+`publish = false`. The **publish set** is therefore thirteen of the fourteen
 workspace members — everything except `choreo-gui`:
 
-`choreographr` (root), `choreo-daemon`, `choreo-tui`, `choreo-im`,
-`choreo-acp`, `choreo-proto`, `choreo-keystore`, `choreo-transport`,
+`choreographr` (root), `choreo-daemon`, `choreo-blockchain`, `choreo-tui`,
+`choreo-im`, `choreo-acp`, `choreo-proto`, `choreo-keystore`, `choreo-transport`,
 `choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`, `choreo-markdown`
 
 `choreo-gui` sets `publish = false`: it is a stub that drags in the
@@ -208,11 +208,11 @@ dioxus/webkit2gtk native-widget tree and is not part of the shipped suite, so
 it is neither published to crates.io (`cargo install choreo-gui` does not
 exist) nor included in the prebuilt release artifacts (tarball/.deb/.rpm/
 Homebrew/AUR), which carry the daemon, TUI, and bridges only. The root
-`choreographr` package transitively depends on the other 11 publish-set
-members, so releasing the suite publishes 12 crates in dependency order.
+`choreographr` package transitively depends on the other 12 publish-set
+members, so releasing the suite publishes 13 crates in dependency order.
 
 Releases are driven by **cargo-release** (`[workspace.metadata.release]` in
-the root `Cargo.toml`): it bumps versions, tags, and publishes the 12 crates
+the root `Cargo.toml`): it bumps versions, tags, and publishes the 13 crates
 to crates.io topologically. With `dependent-version = "fix"`, published
 manifest requirements (e.g. `choreo-tui = "0.1"`) stay in lockstep across
 minor/major bumps. The crates.io publish runs before `scripts/release.sh`
@@ -479,7 +479,10 @@ Entry point: `choreo_daemon::main` — invoked from the root package's
 `DaemonState`, runs socket server.
 
 **Concurrency model:** Pure OS threads with message passing (actor model). No async code
-in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads.
+in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads. The one
+exception is the optional `blockchain` feature: `choreo-blockchain` (linked only then)
+holds a tokio sidecar runtime for the async alloy/subxt clients, and the daemon calls its
+synchronous `execute_*` entry points (which `block_on` internally).
 
 **Module breakdown:**
 
@@ -499,6 +502,8 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `tools/db/` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`), one file per tool (`set.rs`, `get.rs`, `delete.rs`, `delete_range.rs`, `get_range.rs`, `list.rs`, `count.rs`) with shared `DbError`/`DbValue` in `db/mod.rs`. |
 | `tools/fs/` | Core filesystem tools (`list_files`, `line_count`, `write_file`, `edit_file`, `delete_files`), one file per tool with shared write helpers in `fs/mod.rs`. |
 | `tools/x/` | X/Twitter API tools (`x_post`, `x_search_recent`, `x_user_lookup`), one file per tool with shared OAuth1/HTTP plumbing in `x/mod.rs`. |
+| `tools/evm/` | Thin `Tool` wrappers over the EVM blockchain tools (`evm_chain`, `evm_balance`, …) — the implementations live in `choreo-blockchain`; compiled only with the `blockchain` feature. |
+| `tools/subxt.rs` | Thin `Tool` wrappers over the Substrate/Polkadot blockchain tools (`subxt_chain`, `subxt_balance`, `subxt_query`, `subxt_block`) — implementations in `choreo-blockchain`; compiled only with the `blockchain` feature. |
 | `tools/admin/` | Session-admin tools (`list_sessions`, `get_session`, `load_skill`), one file per tool. |
 | `tools/pdf/` | Native PDF ingestion tools (`pdf_classify`, `pdf_to_markdown`), one file per tool (`classify.rs`, `markdown.rs`) with shared input-gating / output-hygiene helpers in `pdf/mod.rs` and the shared PDF fixture builders in `pdf/test_fixtures.rs`. |
 | `tools/glob_util.rs` | `GlobFilter` — shared glob-matching utility used by `delete_files` and `grep` that follows gitignore conventions (patterns without `/` match basename, patterns with `/` match full path). |
@@ -1353,7 +1358,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
   specific error variants (e.g. `DbError::NotFound`, `HttpError::InvalidUrl`).
 - **Tool call frame (VM → host):** `[tool_name: postcard String][args: postcard-encoded Args]`
 
-### Available tools (up to 45 total, some dependent on installed binaries)
+### Available tools (up to 59 total, some dependent on installed binaries / the `blockchain` feature)
 
 | Group | Tools |
 |---|---|
@@ -1362,7 +1367,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 | **Image** | `display_image` (from path, URL, base64, or SVG text) |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push`, `git_show` |
 > **`git_diff` output:** Always returns a line-by-line unified diff wrapped in a ````diff` fenced code block. The old `full` parameter (which previously toggled between summary-only and full diff modes) has been removed — the tool now always produces full diffs. The diff output for each file change is enclosed in ````diff` ... ```` fences for clear markdown formatting.
-| **EVM** | `evm_chain`, `evm_balance`, `evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`, `evm_logs`, `evm_nonce`, `evm_resolve` |
+| **Blockchain** | `evm_chain`, `evm_balance`, `evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`, `evm_logs`, `evm_nonce`, `evm_resolve`, `subxt_chain`, `subxt_balance`, `subxt_query`, `subxt_block` — **behind the `blockchain` cargo feature** (off by default; the tools live in the `choreo-blockchain` crate) |
 | **File search** | `grep` (file content search), `find` (file name search) |
 > **`find` output:** One match per line. Files render with a human-readable size (`blob.bin  4 KiB`), directories with a trailing `/`, symlinks as `name -> target`. Glob patterns containing `/` (e.g. `src/*.rs`) are matched natively by the walker against root-relative paths and prune traversal outside the pattern's literal prefix; bare patterns match file names (basename). A leading `./` is stripped and absolute patterns are converted to root-relative (erroring when outside the search root). `grep`'s `include` glob follows the same split — patterns with `/` match root-relative paths in directory mode (the file name for a directly-named file), bare patterns match basenames.
 >
@@ -1386,6 +1391,7 @@ via `fn group() -> &'static str` on the `Tool` trait. Groups are:
 | `shell` | on | Shell and exec |
 | `x` | off | X/Twitter API |
 | `vm` | off | RISC-V sandboxed code execution |
+| `blockchain` | off | EVM and Substrate/Polkadot blockchain queries (alloy/subxt) — only present when the `blockchain` cargo feature is enabled |
 
 The system prompt lists all groups and their descriptions. The model uses `load_tools` to
 activate additional groups and `unload_tools` to deactivate them. **core** cannot be unloaded.
@@ -2212,10 +2218,13 @@ counts survive the attach instead of regressing.
     the daemon's `InferenceProvider` is the thin dispatch/metrics facade.
 
 12. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
-    where third-party libraries (alloy) require it. A global `OnceLock<tokio::runtime::Runtime>`
-    serves as a sidecar for those async calls via `block_on()`. This simplifies the mental model
-    (each thread owns its data, no `Send` bounds on shared state, no `Pin<Box<dyn Future>>`),
-    improves stack traces, and avoids the complexity of async cancellation.
+    where third-party libraries (alloy, subxt) require it. Both live in the `choreo-blockchain`
+    crate, which holds a global `OnceLock<tokio::runtime::Runtime>` as a sidecar and runs its
+    clients via `block_on()`. The daemon links that crate only behind the `blockchain` cargo
+    feature (off by default) and calls its synchronous `execute_*` entry points, so tokio is
+    never a direct dependency of the daemon. This simplifies the mental model (each thread owns
+    its data, no `Send` bounds on shared state, no `Pin<Box<dyn Future>>`), improves stack
+    traces, and avoids the complexity of async cancellation.
 
 13. **Reasoning round-trip as an opaque artifact** — reasoning is not only display text: for
     Anthropic (thinking blocks + signatures), DeepSeek/Kimi (`reasoning_content`), Gemini
@@ -2592,7 +2601,9 @@ cargo run -p choreographr --bin choreo-im -- telegram
 
 | Crate | Used by | Purpose |
 |---|---|---|
-| `tokio` | tui, dioxus, im | Async runtime |
+| `tokio` | choreo-blockchain | Async runtime — the sidecar the blockchain tools run on; the only workspace crate that depends on it (linked via the daemon's `blockchain` feature) |
+| `alloy` | choreo-blockchain | EVM blockchain tools (behind the `blockchain` feature) |
+| `subxt` | choreo-blockchain | Substrate/Polkadot blockchain tools (behind the `blockchain` feature) |
 | `serde` + `rmp-serde` | proto, daemon | Wire protocol framing and DB value encoding (MessagePack, named mode) |
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
 | `ureq` | daemon | HTTP client |

@@ -1,0 +1,33 @@
+[package]
+name = "choreo-blockchain"
+version.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+edition = "2024"
+rust-version.workspace = true
+
+[lib]
+name = "choreo_blockchain"
+path = "src/lib.rs"
+
+[dependencies]
+# EVM client — the daemon's blockchain tools talk to Ethereum-compatible nodes
+# over JSON-RPC. Only pulled in when choreo-daemon's `blockchain` feature is
+# enabled (this crate is a workspace member but nothing links it by default).
+alloy = { version = "2.3", features = ["providers", "rpc-types-eth", "sol-types"] }
+# Substrate/Polkadot client (light-client + JSON-RPC paths).
+subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
+# Sidecar async runtime. This crate is the *only* place in the workspace that
+# depends on tokio: the daemon stays thread-only and calls into this crate's
+# blocking `execute_*` functions, which `block_on` here.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+url.workspace = true
+hex = "0.4"
+tracing.workspace = true

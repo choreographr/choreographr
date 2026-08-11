@@ -71,6 +71,11 @@ unicode-general-category = "1.1"
 # plain build drops the whole prometheus/tiny_http tree.
 prometheus = { version = "0.14", features = ["process"], optional = true }
 tiny_http = { version = "0.12", optional = true }
+# Blockchain tools (EVM via alloy, Substrate/Polkadot via subxt). The tool
+# implementations — and the tokio sidecar runtime they need — live in the
+# `choreo-blockchain` crate, so tokio/alloy/subxt are never direct deps here.
+# This optional dep is enabled by the `blockchain` feature (off by default).
+choreo-blockchain = { workspace = true, optional = true }
 ckb-vm = { version = "0.24.14", features = ["detect-asm"] }
 tempfile.workspace = true
 postcard.workspace = true
@@ -114,6 +119,11 @@ metrics = ["dep:prometheus", "dep:tiny_http"]
 # fork via the workspace `[patch.crates-io]`. See the pdf-inspector comment
 # above for the security rationale and the revert path.
 pdf = ["dep:pdf-inspector"]
+# EVM (alloy) and Substrate/Polkadot (subxt) blockchain tools. Off by default:
+# enabling it pulls in the choreo-blockchain crate (tokio + alloy/subxt client
+# stacks) that a plain build has no use for. Opt in with `--features blockchain`
+# (or the root package's `blockchain` feature, which forwards here).
+blockchain = ["dep:choreo-blockchain"]
 # Test-only: exposes the bounded-shutdown seam (`join_session_shutdown_with_grace_for_test`)
 # used by tests/session_shutdown.rs.  Enabled for test builds via the self
 # dev-dependency below, so it never leaks into the published public API.

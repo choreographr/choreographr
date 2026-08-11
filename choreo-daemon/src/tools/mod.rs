@@ -83,6 +83,13 @@ pub use error::ToolError;
 pub use error::ToolExecError;
 pub(crate) use error::{tool_err, tool_ok};
 
+#[cfg(feature = "blockchain")]
+impl From<choreo_blockchain::BlockchainError> for ToolExecError {
+    fn from(e: choreo_blockchain::BlockchainError) -> Self {
+        ToolExecError(e.to_string())
+    }
+}
+
 /// Capacity of the bounded channel between a tool's execution thread and its
 /// forwarding thread (`requests.rs`'s `spawn_tool_execution`), and between a
 /// `run_series` sub-tool and its relay thread (`series.rs`).
@@ -136,6 +143,12 @@ impl<'de> Deserialize<'de> for EmptyArgs {
 pub mod context;
 pub(crate) mod db;
 pub(crate) mod exec;
+// Blockchain tools (EVM + Substrate/Polkadot) — behind the `blockchain`
+// feature (off by default). The implementations live in the `choreo-blockchain`
+// crate (which owns the tokio sidecar runtime); these modules are thin `Tool`
+// wrappers over its synchronous `execute_*` entry points.
+#[cfg(feature = "blockchain")]
+pub(crate) mod evm;
 pub(crate) mod find;
 pub(crate) mod fish;
 pub(crate) mod fs;
@@ -145,6 +158,8 @@ pub(crate) mod grep;
 pub mod http;
 mod image;
 pub(crate) mod nu;
+#[cfg(feature = "blockchain")]
+pub(crate) mod subxt;
 // Native PDF tools — behind the `pdf` feature (see Cargo.toml): the parser
 // dep is a registry version patched to a security fork in the workspace root,
 // and crates.io must never see the fork in a published manifest.
@@ -574,7 +589,9 @@ impl<T: Tool + 'static> ToolDyn for T {
 pub fn static_groups() -> &'static [ToolGroup] {
     static GROUPS: OnceLock<Vec<ToolGroup>> = OnceLock::new();
     GROUPS.get_or_init(|| {
-        vec![
+        // `mut` is only needed when the `blockchain` feature pushes its group.
+        #[allow(unused_mut)]
+        let mut groups = vec![
             ToolGroup {
                 name: "core".into(),
                 description: "File system operations, HTTP requests, image display, PDF classification and Markdown extraction, file search, random values, time queries, and series execution".into(),
@@ -599,7 +616,16 @@ pub fn static_groups() -> &'static [ToolGroup] {
                 name: "vm".into(),
                 description: "RISC-V sandboxed code execution".into(),
             },
-        ]
+        ];
+        // The blockchain group only exists when the `blockchain` feature is
+        // compiled in (the tools are registered conditionally too), so
+        // `load_tools` never advertises a group whose tools don't exist.
+        #[cfg(feature = "blockchain")]
+        groups.push(ToolGroup {
+            name: "blockchain".into(),
+            description: "EVM and Substrate/Polkadot blockchain queries (alloy/subxt)".into(),
+        });
+        groups
     })
 }
 
@@ -650,6 +676,25 @@ impl ToolRegistry {
         reg.register(pdf::PdfClassify);
         #[cfg(feature = "pdf")]
         reg.register(pdf::PdfToMarkdown);
+        // Blockchain tools — registered only when the `blockchain` feature is
+        // enabled; the tools themselves live in the `choreo-blockchain` crate.
+        #[cfg(feature = "blockchain")]
+        {
+            reg.register(evm::EvmChain);
+            reg.register(evm::EvmBalance);
+            reg.register(evm::EvmTokenBalance);
+            reg.register(evm::EvmBlock);
+            reg.register(evm::EvmTransaction);
+            reg.register(evm::EvmCall);
+            reg.register(evm::EvmGas);
+            reg.register(evm::EvmLogs);
+            reg.register(evm::EvmNonce);
+            reg.register(evm::EvmResolve);
+            reg.register(subxt::SubxtChain);
+            reg.register(subxt::SubxtBalance);
+            reg.register(subxt::SubxtQuery);
+            reg.register(subxt::SubxtBlock);
+        }
         reg.register(random::Random);
         reg.register(time::GetCurrentTime);
         reg.register(x::XPost);
@@ -1564,6 +1609,44 @@ mod tests {
                 "missing {tool} in core definitions: {names:?}"
             );
         }
+    }
+
+    #[cfg(feature = "blockchain")]
+    #[test]
+    fn blockchain_group_registers_all_tools() {
+        // With the `blockchain` feature enabled, every EVM + Substrate tool
+        // must be registered under the "blockchain" group and the group must
+        // appear in the catalog (so `load_tools blockchain` works).
+        let registry = ToolRegistry::new().build();
+        let active: HashSet<String> = ["blockchain".into()].into_iter().collect();
+        let defs = registry.available_definitions(&active);
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        for tool in [
+            "evm_chain",
+            "evm_balance",
+            "evm_token_balance",
+            "evm_block",
+            "evm_transaction",
+            "evm_call",
+            "evm_gas",
+            "evm_logs",
+            "evm_nonce",
+            "evm_resolve",
+            "subxt_chain",
+            "subxt_balance",
+            "subxt_query",
+            "subxt_block",
+        ] {
+            assert!(
+                names.contains(&tool),
+                "missing {tool} in blockchain definitions: {names:?}"
+            );
+        }
+        let groups: Vec<String> = registry.groups().into_iter().map(|g| g.name).collect();
+        assert!(
+            groups.iter().any(|g| g == "blockchain"),
+            "blockchain group missing: {groups:?}"
+        );
     }
 
     #[test]

@@ -71,7 +71,7 @@ LLMs can create persistent key/value databases. The LLM / VM can store data and 
 
 Currently the codebase doesn't use any async code - this reduces the complexity of the codebase significantly. It uses real kernel threads with event loops and message passing. Mutable state is not shared between threads (except for the message passing). Everything is event driven without polling.
 
-Extensions may require tokio to use certain crates.
+The one exception is the optional `blockchain` feature: the `choreo-blockchain` crate (linked only then) holds a tokio sidecar runtime for the async alloy/subxt clients, and the daemon calls its synchronous `execute_*` entry points.
 
 choreo-tui is entirely event driven, and runs in immediate mode. The terminal is updated immediately upon receiving a keystroke or networking event. There is no maximum framerate. Additionally, it has O(1) scrolling and O(1) streaming. It is ultra-smooth!
 
@@ -378,7 +378,7 @@ cargo run --release -p choreographr --bin choreo-acp                 # ACP bridg
 
 ## Crates
 
-A Rust workspace of thirteen crates (resolver = "3"):
+A Rust workspace of fourteen crates (resolver = "3"):
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the daemon's
 internals — threading model, provider architecture, tool system, and session
@@ -389,6 +389,7 @@ data model.
 | `choreographr` | Workspace root — the suite installer. Declares the four binaries (`choreographr choreo-tui choreo-im choreo-acp`); `cargo run -p choreographr` / `cargo install choreographr` default to the daemon binary via `default-run` |
 | `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
 | `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (79+ providers) |
+| `choreo-blockchain` | Blockchain tools — EVM (alloy) and Substrate/Polkadot (subxt) read-only queries plus the tokio sidecar runtime they run on; pulled in by the daemon's `blockchain` feature (off by default) |
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
 | `choreo-keystore` | X25519 keypair + ECDH/AES-256-GCM crypto library for encrypted credentials |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
@@ -425,7 +426,7 @@ Markdown, query blockchains, post to X, etc.). Tools implement the `Tool` trait
 `ToolRegistry` at daemon startup.
 
 **Tool group.** Tools are organized into groups (`core`, `git`, `shell`, `x`,
-`vm`, `db`, `mcp`). Only `core`, `git`, and `shell` are active by default. The
+`vm`, `db`, `mcp`, `blockchain`). Only `core`, `git`, and `shell` are active by default. The
 model can activate additional groups with `load_tools` and deactivate them with
 `unload_tools`. Groups are a discovery mechanism, not access control — the
 RISC-V VM always has access to all tools.
@@ -652,6 +653,24 @@ Release binaries enable `metrics` explicitly (alongside `pdf`) via
 a build was made without the feature, the `--metrics-addr` flag is still
 accepted but the daemon refuses to start with a clear error telling you to
 rebuild with `--features metrics`.
+
+## Blockchain tools
+
+Read-only EVM and Substrate/Polkadot queries (`evm_chain`, `evm_balance`,
+`evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`,
+`evm_logs`, `evm_nonce`, `evm_resolve`, `subxt_chain`, `subxt_balance`,
+`subxt_query`, `subxt_block`) live in the `choreo-blockchain` crate (alloy +
+subxt + the tokio sidecar runtime they need). They are compiled in via the
+`blockchain` cargo feature, which is **off by default** — a plain build omits
+alloy/subxt/tokio entirely. To enable:
+
+```bash
+cargo run --release -p choreographr --features blockchain
+```
+
+Once enabled, the tools are registered under the `blockchain` tool group, which
+the model activates per-session with `load_tools blockchain`. In a session, they
+need no credentials — they query public RPC endpoints.
 
 ## Testing & development
 
