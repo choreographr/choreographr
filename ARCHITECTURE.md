@@ -1373,12 +1373,14 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
 *in-flight* chunks (backpressure); the *total* is capped too, so the live view can never
 diverge unboundedly from the recorded result:
 
-- `spawn_with_streaming` (sh/exec/fish/nu) caps the accumulated stdout/stderr copies at
-  `MAX_TOOL_OUTPUT_BYTES` (`drain_fd`'s `accumulate_cap`) and forwards at most that
-  many streamed bytes, appending the shared `...[truncated]` marker once. Both the
-  drain cap and the streaming forwarder run on the shared `choreo_sanitize::ByteBudget`
-  (the same "first N bytes + one marker" engine), so the raw copy and the streamed copy
-  can never disagree.
+- `spawn_with_streaming` (sh/exec/fish/nu) streams **both** stdout and stderr:
+  the two pipes are drained in background threads, split into lines, and merged
+  onto one channel in arrival order; a single consumer forwards the lines
+  through the shared `ByteBudget` (the same "first N bytes + one marker"
+  engine) and accumulates the same capped bytes into the returned body. The
+  final result is built from that exact body, so the recorded output is
+  byte-identical to the live view — a tool that writes progress to stderr
+  (cargo, nextest, make, …) streams live instead of appearing all at once.
 - `find`'s walk enforces the byte budget during collection (charging each rendered line
   plus its joining newline), stopping the walk and reporting the collected count in the
   marker — the streamed view and the final result now agree. The walk's budget reserves
@@ -2653,6 +2655,12 @@ surviving grandchild that holds a pipe write end (a backgrounded
 `sleep 10 &`, or a process that raced the killpg sweep) would keep the drain
 thread blocked in `read(2)` past the timeout even though the direct child is
 already gone.
+
+On the streaming path (`spawn_with_streaming`), both drains split their
+output into complete lines and forward them through a single merge channel
+in arrival order, so the live view interleaves stdout and stderr exactly as
+the child produced them — and the final result body is built from that same
+merged stream, making the recorded output match what was streamed.
 
 
 | Layer | What's tested | Location |

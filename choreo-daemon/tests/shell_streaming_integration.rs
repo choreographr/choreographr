@@ -31,17 +31,92 @@ fn spawn_with_streaming_produces_stdout() {
 
 #[test]
 #[ignore]
-fn spawn_with_streaming_stderr_is_accumulated() {
+fn spawn_with_streaming_stderr_is_streamed_into_the_body() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "echo errmsg >&2", dir);
     let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
     let (output, was_killed) = spawn_with_streaming(&mut c, 5000, tx).unwrap();
-    drop(rx);
+    // The channel is unbounded, so every forwarded chunk is buffered by the
+    // time the tool returns — collect them all.
+    let streamed: String = rx
+        .try_iter()
+        .map(|c| String::from_utf8_lossy(&c).into_owned())
+        .collect();
     assert!(!was_killed);
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("errmsg"), "stderr: {stderr}");
+    // stderr content lands in the interleaved body (returned as stdout)…
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("errmsg"), "body: {body}");
+    // …and is forwarded live: stderr is streamed, not just accumulated, so a
+    // tool that writes progress to stderr shows a live view matching the
+    // final result.
+    assert!(streamed.contains("errmsg"), "streamed: {streamed}");
+}
+
+#[test]
+#[ignore]
+fn spawn_with_streaming_interleaves_stdout_and_stderr() {
+    let dir = Path::new("/tmp");
+    // The exact interleave of the three lines is scheduling-dependent; what
+    // must hold is that ALL of them appear, and each stream keeps its order.
+    let mut c = cmd("bash", "echo out1; echo err1 >&2; echo out2", dir);
+    let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+
+    let (output, _was_killed) = spawn_with_streaming(&mut c, 5000, tx).unwrap();
+    let streamed: String = rx
+        .try_iter()
+        .map(|c| String::from_utf8_lossy(&c).into_owned())
+        .collect();
+
+    let body = String::from_utf8_lossy(&output.stdout);
+    let pos1 = body.find("out1").expect("out1 in body");
+    let pos2 = body.find("out2").expect("out2 in body");
+    assert!(pos1 < pos2, "stdout order preserved: {body}");
+    assert!(body.contains("err1"), "stderr present in body: {body}");
+    for needle in ["out1", "err1", "out2"] {
+        assert!(
+            streamed.contains(needle),
+            "stream missing {needle}: {streamed}"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn run_shell_streaming_final_body_matches_streamed_body() {
+    let dir = Path::new("/tmp");
+    let mut c = cmd("bash", "echo line1; echo err1 >&2; echo line2", dir);
+    let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+    let collector = std::thread::spawn(move || {
+        let mut s = String::new();
+        for chunk in rx {
+            s.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        s
+    });
+
+    let result = run_shell_streaming(&mut c, "echo", 5000, tx).unwrap();
+    let streamed = collector.join().unwrap();
+
+    // The final body is exactly `$ echo\n` + the streamed body (stdout and
+    // stderr interleaved, byte-identical to the live view) + the exit-code
+    // footer. `format_shell_output` appends the footer as `\n` + `\nExit code: 0`
+    // on top of the body's own trailing newline, hence the two `\n` before the
+    // footer in the expected string. For ASCII output sanitize_transcript is a
+    // no-op, so the equality is exact — this is the contract "streaming matches
+    // the final output".
+    assert_eq!(
+        result,
+        format!("$ echo\n{streamed}\n\nExit code: 0"),
+        "final body must equal the streamed body"
+    );
+    for needle in ["line1", "err1", "line2"] {
+        assert!(
+            streamed.contains(needle),
+            "stream missing {needle}: {streamed}"
+        );
+    }
 }
 
 #[test]

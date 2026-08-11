@@ -1,4 +1,6 @@
-use super::{MAX_TOOL_OUTPUT_BYTES, ToolExecError, finish_tool_output_sanitized};
+use super::{
+    MAX_TOOL_OUTPUT_BYTES, STREAMING_CHANNEL_CAPACITY, ToolExecError, finish_tool_output_sanitized,
+};
 use choreo_sanitize::ByteBudget;
 use crossbeam_channel;
 use std::{
@@ -515,7 +517,12 @@ impl StreamByteCap {
     /// cap is sent as a fitting prefix first (a partial final line is fine —
     /// the client lossy-decodes UTF-8 and the final result is truncated the
     /// same way), then the marker.
-    fn push(&mut self, chunk: Vec<u8>) {
+    ///
+    /// Returns the number of bytes forwarded (excluding the marker), so a
+    /// caller that also accumulates the body (the streaming paths) can keep
+    /// the accumulated copy byte-identical to the forwarded view — the
+    /// recorded result then contains exactly what was streamed.
+    fn push(&mut self, chunk: &[u8]) -> usize {
         let n = self.budget.fit(chunk.len());
         if n > 0 {
             let _ = self.tx.send(chunk[..n].to_vec());
@@ -525,13 +532,14 @@ impl StreamByteCap {
             // live view reads exactly like the final (capped) result.
             let _ = self.tx.send(marker.as_bytes().to_vec());
         }
+        n
     }
 }
 
-/// Spawn the command with piped stdout/stderr and stream stdout lines
-/// through `output_tx` in real time as the process produces them.
-/// Enforces a timeout via watchdog and returns the collected output
-/// along with a was-killed flag.
+/// Spawn the command with piped stdout/stderr and stream their lines through
+/// `output_tx` in real time as the process produces them. Enforces a timeout
+/// via watchdog and returns the collected output along with a was-killed
+/// flag.
 ///
 /// Applies child-process hardening (`setup_child`) before spawning, pins the
 /// child's identity with a pidfd on Linux so a timeout kill can never be
@@ -539,10 +547,15 @@ impl StreamByteCap {
 /// grandchild cannot hang the tool past the timeout. The caller must set
 /// `Stdio::piped()` on both stdout and stderr before calling this.
 ///
-/// IMPORTANT: Both stdout and stderr are drained in background threads
-/// so that the child process can never block on a full pipe buffer
-/// (the classic pipe deadlock).  stderr is not streamed — it is only
-/// accumulated and returned in the final `Output`.
+/// IMPORTANT: Both stdout and stderr are drained in background threads so
+/// the child can never block on a full pipe buffer (the classic pipe
+/// deadlock), and **both are streamed**: complete lines from either stream
+/// are forwarded through the same byte budget in the order the child
+/// produced them, and the returned `Output.stdout` is exactly that
+/// interleaved body (`stderr` is empty) — so `format_shell_output`'s final
+/// body is byte-identical to what the client saw live. A tool that writes
+/// its progress to stderr (cargo, nextest, make, …) therefore shows a live
+/// view instead of appearing all at once when it exits.
 pub fn spawn_with_streaming(
     cmd: &mut Command,
     timeout_ms: u64,
@@ -567,47 +580,85 @@ pub fn spawn_with_streaming(
     let (out_stop_tx, out_stop_rx) = mpsc::channel::<()>();
     let (err_stop_tx, err_stop_rx) = mpsc::channel::<()>();
 
-    // Thread: read stdout, forward each complete line (newline restored,
-    // CRLF folded to LF) to output_tx, and accumulate the full output.  The
-    // accumulated copy and the streamed total are both capped at
-    // MAX_TOOL_OUTPUT_BYTES so neither daemon memory nor the client's live
-    // view can grow unboundedly with a chatty command.
+    // ── Merge channel ────────────────────────────────────────────────────
+    //
+    // Both drain threads forward complete lines here in arrival order; a
+    // single consumer (the merger thread below) forwards them to the client
+    // and accumulates the body. Merging through a channel — rather than
+    // having the two drains write to a shared buffer — keeps the interleave
+    // deterministic (FIFO channel order) without sharing mutable state
+    // between threads. Bounded so a stalled client backpressures the child
+    // (the merger blocks on `output_tx`, the channel fills, the drains
+    // block, the child blocks on its pipe) instead of buffering unboundedly.
+    let (merge_tx, merge_rx) = crossbeam_channel::bounded::<Vec<u8>>(STREAMING_CHANNEL_CAPACITY);
+
+    // Thread: read stdout, split into complete lines (newline restored, CRLF
+    // folded to LF), and forward each to the merge channel. `accumulate_cap`
+    // is 0 because the merger accumulates the body — drain_fd still consumes
+    // every byte (no pipe deadlock) and calls on_data for each chunk.
+    let stdout_merge_tx = merge_tx.clone();
     let stdout_thread = std::thread::spawn(move || {
         let mut pending: Vec<u8> = Vec::new();
-        let mut stream_cap = StreamByteCap::new(MAX_TOOL_OUTPUT_BYTES, output_tx);
-        let full = drain_fd(
+        drain_fd(
             stdout,
             out_stop_rx,
             DRAIN_POLL_MS,
             &mut |chunk: &[u8]| {
                 forward_complete_lines(chunk, &mut pending, &mut |line| {
-                    stream_cap.push(line);
+                    let _ = stdout_merge_tx.send(line);
                 });
             },
-            Some(MAX_TOOL_OUTPUT_BYTES),
+            Some(0),
         );
         // Flush any final unterminated line (matches `BufRead::lines()`
-        // yielding a last line without a trailing newline). The bytes are
-        // already included in `full` (drain_fd accumulates everything); this
-        // only forwards the streamed copy — through the same cap so the
-        // streamed total can never exceed the limit + one marker.
+        // yielding a last line without a trailing newline).
         if !pending.is_empty() {
-            stream_cap.push(pending);
+            let _ = stdout_merge_tx.send(pending);
         }
-        full
     });
 
     // Thread: drain stderr concurrently so the child can never block on a
-    // full stderr pipe buffer.  Not streamed — just accumulated and returned
-    // in the final Output struct (bounded at the same byte cap).
+    // full stderr pipe buffer. Also split into lines and forward — stderr is
+    // streamed just like stdout (see the doc comment for why).
+    let stderr_merge_tx = merge_tx.clone();
     let stderr_thread = std::thread::spawn(move || {
+        let mut pending: Vec<u8> = Vec::new();
         drain_fd(
             stderr,
             err_stop_rx,
             DRAIN_POLL_MS,
-            &mut |_| {},
-            Some(MAX_TOOL_OUTPUT_BYTES),
-        )
+            &mut |chunk: &[u8]| {
+                forward_complete_lines(chunk, &mut pending, &mut |line| {
+                    let _ = stderr_merge_tx.send(line);
+                });
+            },
+            Some(0),
+        );
+        if !pending.is_empty() {
+            let _ = stderr_merge_tx.send(pending);
+        }
+    });
+
+    // The main thread drops its sender so the merge channel disconnects the
+    // moment BOTH drain threads finish — that disconnect is what terminates
+    // the merger below. Without this drop, the merger would wait forever.
+    drop(merge_tx);
+
+    // Thread: consume merged lines in arrival order, forward each through the
+    // shared byte cap (the live view), and accumulate the same capped bytes
+    // into the body returned to the caller. One budget for both streams keeps
+    // the streamed total and the recorded body capped at
+    // MAX_TOOL_OUTPUT_BYTES with a single `...[truncated]` marker — the same
+    // "first N bytes + one marker" contract as the client's live
+    // accumulation, so the recorded result reads exactly like the stream.
+    let merger_thread = std::thread::spawn(move || {
+        let mut stream_cap = StreamByteCap::new(MAX_TOOL_OUTPUT_BYTES, output_tx);
+        let mut full: Vec<u8> = Vec::new();
+        while let Ok(line) = merge_rx.recv() {
+            let n = stream_cap.push(&line);
+            full.extend_from_slice(&line[..n]);
+        }
+        full
     });
 
     // Watchdog thread: enforce timeout. Shared with the buffered path so the
@@ -625,14 +676,22 @@ pub fn spawn_with_streaming(
     let _ = out_stop_tx.send(());
     let _ = err_stop_tx.send(());
 
-    let stdout_buf = match stdout_thread.join() {
+    // Join the drain threads first so the merge channel disconnects, then
+    // the merger — its `recv` loop ends on that disconnect and returns the
+    // fully accumulated interleaved body.
+    if let Err(e) = stdout_thread.join() {
+        warn!("stdout reader thread panicked: {:?}", e);
+    }
+    if let Err(e) = stderr_thread.join() {
+        warn!("stderr reader thread panicked: {:?}", e);
+    }
+    let body = match merger_thread.join() {
         Ok(buf) => buf,
         Err(e) => {
-            warn!("stdout reader thread panicked: {:?}", e);
+            warn!("stream merger thread panicked: {:?}", e);
             Vec::new()
         }
     };
-    let stderr_buf = stderr_thread.join().unwrap_or_default();
     if let Err(e) = watchdog.join() {
         warn!("watchdog thread panicked: {:?}", e);
     }
@@ -640,8 +699,12 @@ pub fn spawn_with_streaming(
 
     Ok((
         Output {
-            stdout: stdout_buf,
-            stderr: stderr_buf,
+            // stdout carries the interleaved stdout+stderr body; stderr is
+            // empty (see the doc comment). format_shell_output then produces
+            // `$ cmd\n<body>\nExit code: N` with the body byte-identical to
+            // what the client saw streamed.
+            stdout: body,
+            stderr: Vec::new(),
             status,
         },
         was_killed,
@@ -953,5 +1016,109 @@ mod tests {
         assert!(result.contains("stdout"));
         assert!(result.contains("stderr"));
         assert!(result.contains("Exit code: 1"));
+    }
+
+    #[test]
+    fn stream_byte_cap_reports_forwarded_bytes() {
+        // The forwarder must report how many bytes it sent (excluding the
+        // marker) so a caller that accumulates the body in lockstep with the
+        // stream never diverges from the live view.
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let mut cap = StreamByteCap::new(10, tx);
+
+        assert_eq!(cap.push(b"abcd"), 4, "fitting chunks are forwarded whole");
+        assert_eq!(
+            cap.push(b"0123456789"),
+            6,
+            "a crossing chunk keeps a fitting prefix"
+        );
+        assert_eq!(cap.push(b"xyz"), 0, "nothing fits past the cap");
+
+        assert_eq!(rx.try_recv().unwrap(), b"abcd");
+        assert_eq!(rx.try_recv().unwrap(), b"012345");
+        assert_eq!(rx.try_recv().unwrap(), b"\n...[truncated]");
+        assert!(rx.try_recv().is_err(), "only the marker follows the cap");
+    }
+
+    #[test]
+    fn merged_streams_preserve_each_streams_line_order() {
+        // Two pre-filled pipes drained concurrently into one merge channel
+        // (the `spawn_with_streaming` pattern): the merged sequence must be a
+        // valid interleaving — each stream's lines keep their relative order
+        // no matter how the scheduler interleaves the two drains.
+        // Deterministic: all data is buffered before the drains start and EOF
+        // is signalled by dropping the writers, so no real time passes
+        // (poll_ms = 0).
+        let (out_r, mut out_w) = std::io::pipe().expect("pipe");
+        let (err_r, mut err_w) = std::io::pipe().expect("pipe");
+        out_w.write_all(b"o1\no2\no3\n").expect("write stdout");
+        err_w.write_all(b"e1\ne2\n").expect("write stderr");
+        drop(out_w);
+        drop(err_w);
+
+        let (merge_tx, merge_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let out_tx = merge_tx.clone();
+        let t1 = std::thread::spawn(move || {
+            let mut pending = Vec::new();
+            let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+            drain_fd(
+                out_r,
+                stop_rx,
+                0,
+                &mut |chunk| {
+                    forward_complete_lines(chunk, &mut pending, &mut |line| {
+                        let _ = out_tx.send(line);
+                    });
+                },
+                None,
+            );
+            if !pending.is_empty() {
+                let _ = out_tx.send(pending);
+            }
+        });
+        let err_tx = merge_tx.clone();
+        let t2 = std::thread::spawn(move || {
+            let mut pending = Vec::new();
+            let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+            drain_fd(
+                err_r,
+                stop_rx,
+                0,
+                &mut |chunk| {
+                    forward_complete_lines(chunk, &mut pending, &mut |line| {
+                        let _ = err_tx.send(line);
+                    });
+                },
+                None,
+            );
+            if !pending.is_empty() {
+                let _ = err_tx.send(pending);
+            }
+        });
+        t1.join().expect("stdout drain");
+        t2.join().expect("stderr drain");
+        drop(merge_tx);
+
+        let merged: Vec<String> = merge_rx
+            .try_iter()
+            .map(|l| String::from_utf8_lossy(&l).into_owned())
+            .collect();
+        let outs: Vec<String> = merged
+            .iter()
+            .filter(|l| l.starts_with('o'))
+            .cloned()
+            .collect();
+        let errs: Vec<String> = merged
+            .iter()
+            .filter(|l| l.starts_with('e'))
+            .cloned()
+            .collect();
+        assert_eq!(
+            outs,
+            vec!["o1\n", "o2\n", "o3\n"],
+            "stdout lines keep their relative order"
+        );
+        assert_eq!(errs, vec!["e1\n", "e2\n"], "stderr lines keep their order");
+        assert_eq!(merged.len(), 5, "every line from both streams is merged");
     }
 }
