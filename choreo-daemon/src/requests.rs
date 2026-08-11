@@ -13,7 +13,7 @@ use crate::tools::set_working_dir::{SetWorkingDirArgs, resolve_working_dir_path}
 use crate::tools::unload_tools::{UnloadToolsArgs, apply_unload_tools};
 use crate::tools::{
     PreparedImage, STREAMING_CHANNEL_CAPACITY, ToolError, ToolOutput, ToolOutputFormat,
-    ToolRegistry, sanitize_transcript,
+    ToolRegistry, sanitize_transcript, truncate_tool_output,
 };
 use choreo_ai_protocols::openai::{ChatRequestMessage, ChatToolDefinition};
 use choreo_ai_protocols::{
@@ -1993,7 +1993,13 @@ fn record_tool_completion(
     // untouched (shell/VM colors survive); only the text-reordering chars
     // that could spoof the model are escaped. The terminal is defended
     // separately by the TUI's render filter.
-    output.content = sanitize_transcript(&output.content);
+    //
+    // Escaping *expands* (a Cf char becomes `\u{202e}`), so content that was
+    // byte-capped at the source as raw output (shell/VM/series) could exceed
+    // the budget after sanitizing; re-applying the cap after the escape keeps
+    // the transcript within MAX_TOOL_OUTPUT_BYTES for every tool. The cap is
+    // idempotent — already-capped content passes through unchanged.
+    output.content = truncate_tool_output(&sanitize_transcript(&output.content));
 
     if let Some(image) = image {
         emit_image(

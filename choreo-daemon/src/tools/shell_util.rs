@@ -1,4 +1,5 @@
 use super::{MAX_TOOL_OUTPUT_BYTES, ToolExecError, truncate_tool_output};
+use choreo_sanitize::ByteBudget;
 use crossbeam_channel;
 use std::{
     io::Read,
@@ -323,6 +324,10 @@ fn drain_fd<R: Read + AsFd>(
         );
     }
     let mut full: Vec<u8> = Vec::new();
+    // The accumulation cap is tracked by a shared ByteBudget (the same
+    // "first N bytes" engine the streaming paths use) so the raw copy and
+    // the streamed copy can never disagree on the cap.
+    let mut budget = accumulate_cap.map(ByteBudget::new);
     let mut buf = [0u8; 8192];
     loop {
         if !poll_readable(reader.as_fd(), &stop_rx, poll_ms) {
@@ -343,13 +348,12 @@ fn drain_fd<R: Read + AsFd>(
                     // `cat /dev/zero`-class command would buffer its entire
                     // output in daemon memory even though the final tool
                     // result is truncated at MAX_TOOL_OUTPUT_BYTES anyway.
-                    match accumulate_cap {
-                        Some(cap) if full.len() < cap => {
-                            let take = (cap - full.len()).min(n);
+                    match budget.as_mut() {
+                        Some(budget) => {
+                            let take = budget.fit(n);
                             full.extend_from_slice(&buf[..take]);
                         }
                         None => full.extend_from_slice(&buf[..n]),
-                        _ => {}
                     }
                     if !nonblocking {
                         break; // blocking fallback: one read per poll
@@ -490,50 +494,36 @@ pub(crate) fn spawn_with_watchdog(
 /// long-running command cannot push an unbounded live view to the client.
 /// The final recorded result is separately truncated by
 /// `format_shell_output`, but the streamed view must not diverge from it.
+/// The cap accounting itself is the shared [`ByteBudget`] (the same engine
+/// `drain_fd` and the VM's guest-WRITE path use), so all streaming paths
+/// agree on the "first N bytes + one marker" contract.
 struct StreamByteCap {
-    limit: usize,
-    sent: usize,
-    marker_sent: bool,
+    budget: ByteBudget,
     tx: crossbeam_channel::Sender<Vec<u8>>,
 }
 
 impl StreamByteCap {
     fn new(limit: usize, tx: crossbeam_channel::Sender<Vec<u8>>) -> Self {
         Self {
-            limit,
-            sent: 0,
-            marker_sent: false,
+            budget: ByteBudget::new(limit),
             tx,
         }
     }
 
-    /// Forward `chunk` if the cap allows; once the cap is hit, emit the
+    /// Forward `chunk` if the budget allows; once the cap is hit, emit the
     /// marker once and drop everything after. A chunk that would cross the
     /// cap is sent as a fitting prefix first (a partial final line is fine —
     /// the client lossy-decodes UTF-8 and the final result is truncated the
     /// same way), then the marker.
     fn push(&mut self, chunk: Vec<u8>) {
-        if self.sent >= self.limit {
-            self.send_marker();
-            return;
+        let n = self.budget.fit(chunk.len());
+        if n > 0 {
+            let _ = self.tx.send(chunk[..n].to_vec());
         }
-        let remaining = self.limit - self.sent;
-        if chunk.len() > remaining {
-            let _ = self.tx.send(chunk[..remaining].to_vec());
-            self.sent = self.limit;
-            self.send_marker();
-            return;
-        }
-        self.sent += chunk.len();
-        let _ = self.tx.send(chunk);
-    }
-
-    fn send_marker(&mut self) {
-        if !self.marker_sent {
-            self.marker_sent = true;
+        if let Some(marker) = self.budget.take_marker() {
             // Same byte-cap marker `truncate_tool_output` appends, so the
             // live view reads exactly like the final (capped) result.
-            let _ = self.tx.send(b"\n...[truncated]".to_vec());
+            let _ = self.tx.send(marker.as_bytes().to_vec());
         }
     }
 }

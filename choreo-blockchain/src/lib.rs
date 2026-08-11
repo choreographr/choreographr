@@ -28,10 +28,16 @@ mod error;
 
 pub use error::BlockchainError;
 
-/// Shared byte budget for blockchain tool output, mirroring the daemon's
-/// `MAX_TOOL_OUTPUT_BYTES` (128 KiB ≈ ~32K tokens for ASCII). A single query
-/// (e.g. a full Substrate block dump) can never flood the conversation.
-pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
+/// Shared byte budget for blockchain tool output — owned by `choreo-sanitize`
+/// (see `MAX_TOOL_OUTPUT_BYTES` there) and re-exported here so the evm/subxt
+/// modules keep importing it from `crate`. A single query (e.g. a full
+/// Substrate block dump) can never flood the conversation.
+pub(crate) use choreo_sanitize::MAX_TOOL_OUTPUT_BYTES;
+/// Byte-cap + truncation marker for blockchain tool output — shared from
+/// `choreo-sanitize` (the leaf crate that owns the output byte budget), so
+/// the daemon's tools, the blockchain tools, and the client all cap and mark
+/// truncation identically.
+pub(crate) use choreo_sanitize::truncate_tool_output;
 
 /// Wall-clock cap for one blockchain tool call's async work (client setup
 /// plus every RPC request it issues). The daemon already bounds the whole
@@ -143,31 +149,12 @@ fn sanitize_keeps(c: char) -> bool {
     !c.is_control() && !is_unsafe_unicode(c)
 }
 
-/// The non-control Unicode that must still be escaped: line / paragraph
-/// separators and Unicode *format* characters (general category Cf) except
-/// the joiners (see [`sanitize_value`]). The Cf set is taken from the Unicode
-/// general-category property via `unicode-general-category` (generated from
-/// the Unicode data tables), so newly-assigned format characters are escaped
-/// automatically on a crate bump instead of drifting until someone re-reads
-/// the tables.
-fn is_unsafe_unicode(c: char) -> bool {
-    matches!(c, '\u{2028}' | '\u{2029}')
-        || (unicode_general_category::get_general_category(c)
-            == unicode_general_category::GeneralCategory::Format
-            && !matches!(c, '\u{200c}' | '\u{200d}'))
-}
-
-/// Cap `content` at [`MAX_TOOL_OUTPUT_BYTES`], cutting on a char boundary so a
-/// multi-byte UTF-8 char is never split, and append a truncation marker.
-pub(crate) fn truncate_tool_output(content: &str) -> String {
-    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
-        return content.to_string();
-    }
-    let split = content.floor_char_boundary(MAX_TOOL_OUTPUT_BYTES);
-    let mut truncated = content[..split].to_string();
-    truncated.push_str("\n...[truncated]");
-    truncated
-}
+/// The non-control Unicode that must still be escaped — line / paragraph
+/// separators plus the non-joiner format-char spoofing class — is the shared
+/// `choreo_sanitize::is_unsafe_unicode` predicate (the leaf crate that owns
+/// the Unicode-safety policy, used by the daemon and the TUI too). The
+/// code-space sweep guarding it lives next to it.
+use choreo_sanitize::is_unsafe_unicode;
 
 /// Run `fut` to completion on the sidecar tokio runtime.
 ///
@@ -226,30 +213,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn truncate_keeps_short_content_untouched() {
-        assert_eq!(truncate_tool_output("hello"), "hello");
-        assert_eq!(truncate_tool_output(""), "");
-    }
-
-    #[test]
-    fn truncate_caps_long_content() {
-        let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 100);
-        let out = truncate_tool_output(&big);
-        assert!(out.ends_with("...[truncated]"));
-        // body (capped at the budget) + "\n...[truncated]" marker
-        assert_eq!(out.len(), MAX_TOOL_OUTPUT_BYTES + "\n...[truncated]".len());
-    }
-
-    #[test]
-    fn truncate_never_splits_utf8() {
-        // 3-byte chars where the cap lands mid-char must stay valid UTF-8.
-        let big = "€".repeat((MAX_TOOL_OUTPUT_BYTES / 3) + 10);
-        let out = truncate_tool_output(&big);
-        assert!(out.ends_with("...[truncated]"));
-        std::str::from_utf8(out.as_bytes()).expect("truncated output must be valid UTF-8");
-    }
 
     #[test]
     fn block_on_without_runtime_is_an_error() {

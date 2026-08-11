@@ -2159,6 +2159,7 @@ name = "choreo-blockchain"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "choreo-sanitize",
  "hex",
  "schemars 1.2.2",
  "serde",
@@ -2167,7 +2168,6 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
- "unicode-general-category",
  "url",
 ]
 
@@ -2177,6 +2177,7 @@ version = "0.1.0"
 dependencies = [
  "choreo-keystore",
  "choreo-proto",
+ "choreo-sanitize",
  "choreo-transport",
  "postcard",
  "tempfile",
@@ -2196,6 +2197,7 @@ dependencies = [
  "choreo-keystore",
  "choreo-mcp",
  "choreo-proto",
+ "choreo-sanitize",
  "choreo-transport",
  "chrono",
  "ckb-vm",
@@ -2234,7 +2236,6 @@ dependencies = [
  "toml 1.1.4+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
- "unicode-general-category",
  "unicode-segmentation",
  "ureq",
  "url",
@@ -2332,6 +2333,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "choreo-sanitize"
+version = "0.1.0"
+dependencies = [
+ "unicode-general-category",
+]
+
+[[package]]
 name = "choreo-transport"
 version = "0.1.0"
 dependencies = [
@@ -2357,6 +2365,7 @@ dependencies = [
  "choreo-keystore",
  "choreo-markdown",
  "choreo-proto",
+ "choreo-sanitize",
  "chrono",
  "clap",
  "crossbeam",
@@ -2377,7 +2386,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-prompts",
- "unicode-general-category",
  "unicode-segmentation",
  "unicode-width",
 ]

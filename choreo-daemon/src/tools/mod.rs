@@ -15,7 +15,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::mpsc;
-use unicode_general_category::{GeneralCategory, get_general_category};
+// The shared spoofing predicates come from choreo-sanitize (the leaf crate
+// that owns the Unicode-safety policy), and the shared output byte budget /
+// truncation primitives are re-exported so every `super::` / `crate::tools::`
+// importer in this crate keeps resolving them through this module.
+pub(crate) use choreo_sanitize::{MAX_TOOL_OUTPUT_BYTES, finish_tool_output, truncate_tool_output};
+use choreo_sanitize::{is_non_joiner_format_char, is_unsafe_unicode};
 
 /// Helper: encode Result<Result<R, E>, ToolError> as postcard bytes.
 /// Used by `execute_postcard` to produce a single byte buffer containing
@@ -1030,33 +1035,15 @@ pub(crate) fn sha256_hex(content: &str) -> String {
     hex::encode(digest)
 }
 
-/// Shared byte budget for tool output (128 KiB ≈ ~32K tokens for ASCII,
-/// ~43K for CJK — far below any modern context window, yet a single call
-/// can never flood the conversation). Measured in *bytes* rather than chars
-/// so the effective token cost is roughly uniform across scripts: ASCII and
-/// CJK both sit at ~3-4 bytes per token, whereas char counts vary 4x.
-pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
-
-/// Number of leading bytes inspected when deciding whether a file is binary.
-/// Mirrors ripgrep's heuristic: a NUL byte in the head marks the file as
-/// binary (text files virtually never contain NUL).
+/// Shared byte budget for tool output — owned by `choreo-sanitize` (see
+/// `MAX_TOOL_OUTPUT_BYTES` there) and re-exported here so this crate's
+/// modules and tests can refer to it as before.
 pub(crate) const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
 /// Per-line display cap for the file-read tools. Guards against pathological
 /// single-line files (minified bundles, base64 blobs, 1 GiB one-liners) that
 /// would otherwise force an unbounded line buffer into memory.
 pub(crate) const MAX_LINE_DISPLAY_BYTES: usize = 64 * 1024;
-
-pub(crate) fn truncate_tool_output(content: &str) -> String {
-    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
-        return content.to_string();
-    }
-    // Cut on a char boundary so we never split a multi-byte UTF-8 char.
-    let split = content.floor_char_boundary(MAX_TOOL_OUTPUT_BYTES);
-    let mut truncated = content[..split].to_string();
-    truncated.push_str("\n...[truncated]");
-    truncated
-}
 
 /// Whether every byte is an ASCII printable (`0x20..=0x7e`), or a TAB when
 /// `keep_tabs` — the fast path shared by [`sanitize_text`] and
@@ -1149,36 +1136,11 @@ pub(crate) fn sanitize_text_len(text: &str, keep_tabs: bool) -> usize {
         .sum()
 }
 
-/// The non-control Unicode that must still be escaped: line / paragraph
-/// separators and Unicode *format* characters (general category Cf) except
-/// the joiners (see [`sanitize_text`]).
-///
-/// U+2028/U+2029 are Zl/Zp — not `is_control` — yet terminals render them
-/// as line breaks, breaking the one-line-per-result invariant.
-///
-/// The Cf set itself is not enumerated here: it is taken from the Unicode
-/// general-category property via `unicode-general-category` (generated from
-/// the Unicode data tables, currently Unicode 16.0), so newly-assigned
-/// format characters are escaped automatically on a crate bump instead of
-/// drifting until someone re-reads the tables. Format characters are
-/// invisible but spoofing-capable — bidi marks/overrides/isolates, ZWSP and
-/// word joiner, invisible operators, the BOM, soft hyphen, Mongolian vowel
-/// separator, tags, and the rarer format controls — they can hide text in
-/// identifiers, split tokens, or reorder rendered output.
-///
-/// The joiners U+200C/U+200D are deliberately excluded: they affect
-/// ligation, not ordering or visibility, and are required by scripts like
-/// Persian (ZWNJ) and Devanagari (ZWJ/ZWNJ conjuncts), so escaping them
-/// would mangle legitimate text for no safety gain.
-fn is_unsafe_unicode(c: char) -> bool {
-    // Line/paragraph separators are escaped unconditionally (they split
-    // lines, which no format char should be able to do).
-    matches!(c, '\u{2028}' | '\u{2029}')
-        // The rest of the unsafe set is Unicode format characters minus
-        // the two joiners (which pass through, see above).
-        || (get_general_category(c) == GeneralCategory::Format
-            && !matches!(c, '\u{200c}' | '\u{200d}'))
-}
+// The spoofing predicate — line/paragraph separators plus the non-joiner
+// format-char class (bidi marks/overrides/isolates, ZWSP, invisible
+// operators, …) — is shared from `choreo-sanitize` (the leaf crate that
+// owns the Unicode-safety policy). See `choreo_sanitize::is_unsafe_unicode`
+// for the full rationale; the code-space sweep guarding it lives next to it.
 
 /// Escape control characters in a name so a pathological name (e.g. one
 /// containing a newline) cannot corrupt the line-oriented tool output — every
@@ -1226,9 +1188,7 @@ pub(crate) fn sanitize_transcript(text: &str) -> String {
     }
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if get_general_category(c) == GeneralCategory::Format
-            && !matches!(c, '\u{200c}' | '\u{200d}')
-        {
+        if is_non_joiner_format_char(c) {
             out.extend(c.escape_default());
         } else {
             out.push(c);
@@ -1309,19 +1269,6 @@ pub(crate) fn symlink_target_label(path: &Path) -> String {
         _ => target,
     };
     sanitize_name(&label)
-}
-
-/// Cap `body` at the shared byte budget, then append `marker` (if any)
-/// **after** the cap so the truncation signal always survives the byte cut.
-/// The marker is short and critical ("N of many more"), so it is appended
-/// past the budget — the same convention the file-read tools use for their
-/// truncation markers (see ARCHITECTURE.md).
-pub(crate) fn finish_tool_output(body: &str, marker: Option<String>) -> String {
-    let mut out = truncate_tool_output(body);
-    if let Some(marker) = marker {
-        out.push_str(&format!("\n{marker}"));
-    }
-    out
 }
 
 /// Marker appended when a search tool (`find`/`grep`) stops at its
@@ -2670,6 +2617,36 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_transcript_then_truncate_stays_within_budget() {
+        // Finding 1 guard: escaping *expands* (a Cf char becomes `\u{202e}`),
+        // so content that was byte-capped at the source as raw bytes (shell /
+        // VM / series) could exceed MAX_TOOL_OUTPUT_BYTES after
+        // `sanitize_transcript`. `record_tool_completion` re-applies the cap
+        // after escaping; this test pins that composition — a cap-sized,
+        // Cf-heavy body must stay within budget + marker, and the marker must
+        // survive.
+        let raw = "\u{00ad}".repeat(super::MAX_TOOL_OUTPUT_BYTES / 2); // 2-byte Cf char
+        let sanitized = sanitize_transcript(&raw);
+        assert!(
+            sanitized.len() > super::MAX_TOOL_OUTPUT_BYTES,
+            "escaping must expand past the raw byte cap: {} > {}",
+            sanitized.len(),
+            super::MAX_TOOL_OUTPUT_BYTES
+        );
+        let capped = truncate_tool_output(&sanitized);
+        assert!(
+            capped.len() <= super::MAX_TOOL_OUTPUT_BYTES + "\n...[truncated]".len(),
+            "sanitize-then-truncate must stay within budget + marker: {}",
+            capped.len()
+        );
+        assert!(
+            capped.ends_with("...[truncated]"),
+            "the truncation marker must survive the composition"
+        );
+        std::str::from_utf8(capped.as_bytes()).expect("capped output must be valid UTF-8");
+    }
+
+    #[test]
     fn render_streamed_line_escapes_esc_and_bidi() {
         // File content is hostile input: ESC must render as the inert 7-char
         // `\u{1b}` escape and U+202E (bidi override) as `\u{202e}`, so
@@ -2765,30 +2742,26 @@ mod tests {
     #[test]
     fn sanitize_keeps_matches_policy_for_all_chars() {
         // The keep-predicate must agree with the policy for *every* char:
-        // escape C0/C1 controls, the line/paragraph separators U+2028/U+2029,
-        // and every Unicode format character except the joiners; pass through
-        // everything else (plus tabs under the content policy). Sweeping the
-        // full code space makes the contract explicit and keeps it honest as
-        // the `unicode-general-category` tables are updated by a future crate
-        // bump — a newly-assigned format char is escaped here, never silently
-        // passed through.
+        // escape C0/C1 controls plus every char the shared spoofing predicate
+        // flags; pass through everything else (plus tabs under the content
+        // policy). The predicate's own correctness against the Unicode tables
+        // is guarded by the code-space sweep in choreo-sanitize; this sweep
+        // validates the daemon's keep policy against that shared predicate.
         for c in '\u{0}'..=char::MAX {
             let is_control = c.is_control();
-            let is_separator = matches!(c, '\u{2028}' | '\u{2029}');
-            let is_cf = get_general_category(c) == GeneralCategory::Format;
-            let is_joiner = matches!(c, '\u{200c}' | '\u{200d}');
-            // Name policy (tabs escaped): every control, separator, and
-            // non-joiner format char is escaped; nothing else.
+            let is_unsafe = is_unsafe_unicode(c);
+            // Name policy (tabs escaped): every control and spoofing char is
+            // escaped; nothing else.
             assert_eq!(
                 sanitize_keeps(c, false),
-                !is_control && !is_separator && !(is_cf && !is_joiner),
+                !is_control && !is_unsafe,
                 "name-policy keep drift for U+{:04X}",
                 c as u32
             );
             // Content policy (tabs literal): identical, but TAB passes through.
             assert_eq!(
                 sanitize_keeps(c, true),
-                (c == '\t') || (!is_control && !is_separator && !(is_cf && !is_joiner)),
+                (c == '\t') || (!is_control && !is_unsafe),
                 "content-policy keep drift for U+{:04X}",
                 c as u32
             );
@@ -2807,27 +2780,6 @@ mod tests {
         symlink(target_name, dir.path().join("link")).expect("symlink");
         let label = symlink_target_label(&dir.path().join("link"));
         assert_eq!(label, "evil\\ntarget.txt");
-    }
-
-    #[test]
-    fn finish_tool_output_keeps_marker_past_byte_cap() {
-        // A body larger than the shared byte budget: the byte-cap truncation
-        // marker appears, and the caller's marker must survive appended after
-        // it — the count signal is the whole point of the marker.
-        let big = "x".repeat(super::MAX_TOOL_OUTPUT_BYTES + 100);
-        let out = finish_tool_output(&big, Some("...[truncated at 5 results]".to_string()));
-        assert!(out.contains("...[truncated]"), "expected byte-cap marker");
-        assert!(
-            out.ends_with("...[truncated at 5 results]"),
-            "marker must survive the cap: …{}",
-            &out[out.len().saturating_sub(60)..]
-        );
-    }
-
-    #[test]
-    fn finish_tool_output_without_marker_is_plain_cap() {
-        let body = "a\nb";
-        assert_eq!(finish_tool_output(body, None), body);
     }
 
     #[test]

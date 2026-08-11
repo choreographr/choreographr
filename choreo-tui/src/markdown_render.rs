@@ -1,5 +1,6 @@
 use crate::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 use choreo_proto::{ToolResultRecord, Turn};
+use choreo_sanitize::is_unsafe_unicode;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
@@ -77,11 +78,12 @@ pub(crate) fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
 /// Terminal-safe filter for tool-result content: keeps SGR color sequences
 /// (`ESC [ params m`) so ANSI coloring still works, plus tabs/newlines,
 /// printable ASCII, the joiners, and safe non-ASCII; escapes everything else
-/// — C0/C1 controls, non-SGR ESC sequences (OSC/DCS/CSI — the
-/// terminal-injection vector), the line/paragraph separators U+2028/U+2029,
-/// and Unicode format chars (bidi, ZWSP, …) except the joiners — via
-/// `char::escape_default` (e.g. `\u{1b}`, `\u{202e}`), so hostile content
-/// renders as inert text.
+/// — C0/C1 controls (including CR: a carriage return in rendered content
+/// would let a hostile result overwrite its own line), non-SGR ESC sequences
+/// (OSC/DCS/CSI — the terminal-injection vector), the line/paragraph
+/// separators U+2028/U+2029, and Unicode format chars (bidi, ZWSP, …) except
+/// the joiners — via `char::escape_default` (e.g. `\u{1b}`, `\u{202e}`), so
+/// hostile content renders as inert text.
 ///
 /// This is the *sink* defense: it protects the terminal from every tool at
 /// once, including the streaming shell/VM tools whose raw output the daemon
@@ -90,60 +92,77 @@ pub(crate) fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
 /// and for the LLM transcript; the render filter is what makes raw content
 /// safe to draw. Escaping happens *before* the `contains("\x1b[")` gate so
 /// that only genuine SGR sequences ever reach the ANSI parser.
+///
+/// Iterates the input with a `Peekable<Chars>` (no intermediate `Vec<char>`),
+/// so the per-chunk cost during streaming stays O(chunk) with a single output
+/// allocation — it is called inside `render_turn_lines` for the in-flight
+/// turn on every streamed chunk.
 fn sanitize_for_terminal(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         // Keep a complete SGR sequence (ESC [ params m) verbatim so ANSI
         // coloring survives; every other use of ESC is escaped. A non-SGR
         // CSI (`\x1b[2J`) or OSC (`\x1b]…`) therefore renders as the inert
         // `\u{1b}` followed by literal text instead of reaching the
         // terminal as a live control sequence.
-        if c == '\u{1b}' && i + 1 < chars.len() && chars[i + 1] == '[' {
-            let mut j = i + 2;
-            // Intermediate bytes are 0x30-0x3F (digits, ';', ':', …).
-            while j < chars.len() && (0x30..=0x3f).contains(&(chars[j] as u32)) {
-                j += 1;
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            let mut seq = String::from("\u{1b}[");
+            let mut sgr = false;
+            loop {
+                match chars.peek().copied() {
+                    // Intermediate bytes are 0x30-0x3F (digits, ';', ':', …).
+                    Some(n) if (0x30..=0x3f).contains(&(n as u32)) => {
+                        seq.push(n);
+                        chars.next();
+                    }
+                    // Final byte 0x40-0x7E; only 'm' is SGR.
+                    Some(n) if (0x40..=0x7e).contains(&(n as u32)) => {
+                        seq.push(n);
+                        chars.next();
+                        sgr = n == 'm';
+                        break;
+                    }
+                    // EOF or a non-CSI byte — not a CSI sequence at all.
+                    _ => break,
+                }
             }
-            if j < chars.len() && (0x40..=0x7e).contains(&(chars[j] as u32)) && chars[j] == 'm' {
+            if sgr {
                 // Valid SGR — keep the whole sequence verbatim.
-                out.extend(&chars[i..=j]);
-                i = j + 1;
-                continue;
+                out.push_str(&seq);
+            } else {
+                // Non-SGR ESC use: render the ESC inert and the consumed
+                // `[` + intermediate bytes as plain text (`seq` is
+                // ESC + '[' + … , so `seq[1..]` keeps everything after the
+                // ESC byte).
+                out.push_str("\\u{1b}");
+                out.push_str(&seq[1..]);
             }
+            continue;
         }
-        // Kept: whitespace, printable ASCII, and safe non-ASCII (not a
-        // control and not in the spoofing class). Everything else is escaped.
-        let keep = c == '\t'
-            || c == '\n'
-            || c == '\r'
-            || (c.is_ascii() && (' '..='~').contains(&c))
-            || (!c.is_ascii() && !c.is_control() && !is_terminal_unsafe_unicode(c));
-        if keep {
+        if terminal_keeps(c) {
             out.push(c);
         } else {
             out.extend(c.escape_default());
         }
-        i += 1;
     }
     out
 }
 
-/// Whether a non-ASCII char must still be escaped for terminal rendering:
-/// the line/paragraph separators (which terminals render as line breaks) and
-/// every Unicode *format* char (general category Cf) except the joiners —
-/// the same Cf-set policy the daemon's sanitizers use (see
-/// `is_unsafe_unicode` in choreo-daemon's tools/mod.rs). The Cf set comes
-/// from the Unicode data tables via `unicode-general-category`, so
-/// newly-assigned format characters are escaped automatically on a crate
-/// bump.
-fn is_terminal_unsafe_unicode(c: char) -> bool {
-    matches!(c, '\u{2028}' | '\u{2029}')
-        || (unicode_general_category::get_general_category(c)
-            == unicode_general_category::GeneralCategory::Format
-            && !matches!(c, '\u{200c}' | '\u{200d}'))
+/// Whether a single char passes through the terminal filter unchanged: tabs,
+/// newlines, printable ASCII, and safe non-ASCII. Everything else — every
+/// C0/C1 control (including CR, see [`sanitize_for_terminal`]), the
+/// line/paragraph separators, and the non-joiner format-char spoofing class
+/// via the shared [`is_unsafe_unicode`] predicate (owned by `choreo-sanitize`,
+/// the same policy the daemon's sanitizers use) — is escaped. SGR sequences
+/// are handled separately by the filter (kept whole), so the per-char
+/// predicate needs no ESC case.
+fn terminal_keeps(c: char) -> bool {
+    c == '\t'
+        || c == '\n'
+        || (c.is_ascii() && (' '..='~').contains(&c))
+        || (!c.is_ascii() && !c.is_control() && !is_unsafe_unicode(c))
 }
 
 /// Render ANSI-escape-coded text as styled ratatui lines, wrapping at `width`.
@@ -3315,7 +3334,9 @@ content ---"
     fn sanitize_for_terminal_escapes_bidi_and_separators_keeps_joiners() {
         // The spoofing class: bidi overrides and other invisible format chars
         // must not be able to reorder or hide rendered text; joiners are
-        // legitimate in some scripts and pass through. Tabs/newlines/CJK stay.
+        // legitimate in some scripts and pass through. Tabs/newlines/CJK stay;
+        // CR is escaped (a carriage return would let hostile content overwrite
+        // its own rendered line).
         assert_eq!(sanitize_for_terminal("a\u{202e}b"), "a\\u{202e}b");
         assert_eq!(sanitize_for_terminal("a\u{200b}b"), "a\\u{200b}b");
         assert_eq!(sanitize_for_terminal("a\u{2028}b"), "a\\u{2028}b");
@@ -3323,8 +3344,32 @@ content ---"
         assert_eq!(sanitize_for_terminal("a\u{200d}b"), "a\u{200d}b");
         assert_eq!(
             sanitize_for_terminal("a\tb\nc\r\n日本語"),
-            "a\tb\nc\r\n日本語"
+            "a\tb\nc\\r\n日本語"
         );
+    }
+
+    #[test]
+    fn terminal_keep_policy_sweeps_all_chars() {
+        // The sink keep-policy must agree with the shared spoofing predicate
+        // for *every* char: keep tabs, newlines, printable ASCII, and safe
+        // non-ASCII; escape every C0/C1 control (including CR — a carriage
+        // return in rendered content would let a hostile result overwrite its
+        // own line) and every shared-unsafe Unicode char. The predicate's own
+        // correctness against the Unicode tables is guarded by the code-space
+        // sweep in choreo-sanitize; this sweep pins the TUI's per-char policy
+        // (the SGR passthrough is handled separately and has its own tests).
+        for c in '\u{0}'..=char::MAX {
+            let expected = c == '\t'
+                || c == '\n'
+                || (c.is_ascii() && (' '..='~').contains(&c))
+                || (!c.is_ascii() && !c.is_control() && !is_unsafe_unicode(c));
+            assert_eq!(
+                terminal_keeps(c),
+                expected,
+                "terminal keep-policy drift for U+{:04X}",
+                c as u32
+            );
+        }
     }
 
     #[test]

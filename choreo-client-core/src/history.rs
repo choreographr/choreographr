@@ -1,20 +1,23 @@
 use choreo_proto::{AssistantToolCallRecord, OutputStream, ToolResultRecord, Turn};
+use choreo_sanitize::{MAX_TOOL_OUTPUT_BYTES, TRUNCATION_SUFFIX};
 use std::collections::{BTreeMap, HashMap};
 
 /// Cap on the live accumulated content of a streaming tool result. The
 /// daemon's final (authoritative) content is capped at
-/// `MAX_TOOL_OUTPUT_BYTES` (128 KiB) and replaces this accumulation when the
-/// turn completes; the cap here bounds the *in-flight* view so a streaming
-/// tool that out-produces the budget (shell/VM/find) cannot balloon client
-/// memory before the final record lands. Deliberately mirrors the daemon's
-/// cap so the live view and the recorded result agree.
-const MAX_STREAMED_TOOL_CONTENT_BYTES: usize = 128 * 1024;
+/// [`choreo_sanitize::MAX_TOOL_OUTPUT_BYTES`] (128 KiB) and replaces this
+/// accumulation when the turn completes; the cap here bounds the *in-flight*
+/// view so a streaming tool that out-produces the budget (shell/VM/find)
+/// cannot balloon client memory before the final record lands. Deliberately
+/// mirrors the daemon's cap so the live view and the recorded result agree.
+const MAX_STREAMED_TOOL_CONTENT_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
 
 /// Append `data` to `content`, stopping at [`MAX_STREAMED_TOOL_CONTENT_BYTES`]
 /// with the shared `...[truncated]` byte-cap marker once the cap is crossed;
 /// later chunks are dropped. Cuts on a char boundary so a multi-byte char is
 /// never split. Shared by the append and stub-creation paths of
-/// `SessionView::tool_result_chunk`.
+/// `SessionView::tool_result_chunk`. The marker text is the shared
+/// [`choreo_sanitize::TRUNCATION_SUFFIX`], so the live view reads exactly
+/// like the daemon's final capped result.
 fn push_capped(content: &mut String, data: &str) {
     if content.len() >= MAX_STREAMED_TOOL_CONTENT_BYTES {
         return;
@@ -27,7 +30,7 @@ fn push_capped(content: &mut String, data: &str) {
         // so the live view reads exactly like the final capped result.
         let cut = data.floor_char_boundary(remaining);
         content.push_str(&data[..cut]);
-        content.push_str("\n...[truncated]");
+        content.push_str(TRUNCATION_SUFFIX);
     }
 }
 

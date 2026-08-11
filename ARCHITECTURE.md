@@ -27,8 +27,8 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 
 ## Workspace topology
 
-Thirteen crates in a single Cargo workspace (resolver = "3") — the root
-package plus twelve members:
+Fifteen crates in a single Cargo workspace (resolver = "3") — the root
+package plus fourteen members:
 
 ```
 Choreographr (workspace)
@@ -36,6 +36,8 @@ Choreographr (workspace)
 │                       binaries (choreographr choreo-tui choreo-im choreo-acp;
 │                       the desktop GUI is a separate crate, choreo-gui)
 ├── choreo-proto           Wire protocol (shared types + framing)
+├── choreo-sanitize        Internal leaf crate — shared Unicode "spoofing" predicates
+│                       and the tool-output byte budget + truncation marker
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── choreo-transport       Noise IK encrypted TCP transport abstraction
 ├── choreo-client-core     Shared client logic (parsing, images, history, credentials)
@@ -83,6 +85,12 @@ Choreographr (workspace)
 ```
 
 (`choreo-markdown` is consumed by `choreo-client-core` and `choreo-tui`; it is omitted from the graph for brevity.)
+
+`choreo-sanitize` is a leaf crate (no workspace deps) consumed by
+`choreo-daemon`, `choreo-tui`, `choreo-client-core`, and `choreo-blockchain` —
+it owns the Unicode "spoofing" predicates and the shared tool-output byte
+budget / `...[truncated]` marker, so every sanitizer and streaming cap in the
+workspace agrees on the same policy and budget.
 
 ---
 
@@ -196,8 +204,10 @@ with `systemctl --user enable --now choreographr` (Linux) or
 The workspace inherits crates.io-required fields from `[workspace.package]`
 in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
 `readme`, `description`), and members opt into publishing by *not* setting
-`publish = false`. The **publish set** is therefore thirteen of the fourteen
-workspace members — everything except `choreo-gui`:
+`publish = false`. The **publish set** is therefore thirteen of the fifteen
+workspace members — everything except `choreo-gui` and `choreo-sanitize`
+(both private: the GUI is a non-shipped stub, and `choreo-sanitize` is an
+internal leaf whose exact contents are not a published API):
 
 `choreographr` (root), `choreo-daemon`, `choreo-blockchain`, `choreo-tui`,
 `choreo-im`, `choreo-acp`, `choreo-proto`, `choreo-keystore`, `choreo-transport`,
@@ -302,6 +312,37 @@ boundary: the client↔daemon wire and the values in `sessions`/`session_turns`.
 Postcard is retained only on Rust-only, language-isolated internal channels —
 the RISC-V VM↔host protocol and the encrypted credential pipeline — where no
 foreign reader will ever touch the bytes.
+
+
+### `choreo-sanitize` — Shared string-safety primitives
+
+An internal leaf crate (`publish = false`, no workspace deps beyond
+`unicode-general-category`) that is the single source of truth for two things
+every consumer of tool output must agree on:
+
+- **The Unicode "spoofing" predicates.** [`is_unsafe_unicode`] (line/paragraph
+  separators U+2028/U+2029 plus every Unicode *format* character — general
+  category Cf — except the joiners U+200C/U+200D) is used by the daemon's
+  line-oriented sanitizers (`sanitize_keeps`), the TUI's terminal sink filter
+  (`terminal_keeps` in `markdown_render.rs`), and the blockchain tools'
+  node-output sanitizer. [`is_non_joiner_format_char`] is the Cf-only subset
+  the LLM-transcript sanitizer (`sanitize_transcript`) escapes. The Cf set
+  comes from the Unicode data tables, so newly-assigned format characters are
+  escaped automatically on a crate bump; a code-space sweep test next to the
+  predicates guards them against the tables.
+- **The tool-output byte budget.** [`MAX_TOOL_OUTPUT_BYTES`] (128 KiB) and the
+  shared `...[truncated]` marker (`TRUNCATION_MARKER` / `TRUNCATION_SUFFIX`),
+  with [`truncate_tool_output`] / [`finish_tool_output`] applying the cap and
+  [`ByteBudget`] tracking it incrementally on streaming paths. The daemon
+  (`tools/mod.rs` re-exports them), the blockchain crate, and the client's
+  live streaming cap (`history.rs`) all use these, so the final record, the
+  streamed live view, and the client's live accumulation read identically.
+
+Previously this logic was duplicated across `choreo-daemon`'s `tools/mod.rs`,
+`choreo-blockchain`'s `lib.rs`, `choreo-tui`'s `markdown_render.rs`, and
+`choreo-client-core`'s `history.rs`; consolidating it into one leaf crate means
+a policy or budget change (or a Unicode table bump) is applied everywhere at
+once, and the guard tests live next to the code they protect.
 
 
 ### `choreo-keystore` — Identity keypair & credential crypto
@@ -888,7 +929,7 @@ while !app.should_quit:
 | `state.rs` | `App` struct: input buffer, request tracking, `HashMap<u64, SessionDisplayState>` for per-session display state (session view, scroll state, height prefix-sum array, render cache, markers, streaming state, active requests, live token estimates, per-turn reasoning-collapse overrides, per-(turn, call_id) tool-result collapse overrides, and the unsent prompt draft — the input bar is a single shared buffer, so each session stashes its own unsubmitted prompt (text plus cursor position) here and it is restored on the next visit; `attach_to_session`/`handle_session_created` hand the buffer over via `persist_input_draft`, which drops active history navigation first so the real draft is saved (cursor included, and any edits made on top of a history entry are kept as the draft), while the startup auto-attach keeps pre-attach input rather than clobbering it, and submitting or deleting the session clears the draft), `active_session_id` for the currently active session, and the per-frame scroll accumulator (`scroll_accumulator`) consumed by `apply_scroll_delta()`. `chat_page_layout` is the single source of truth for the Chat page's vertical layout: `render_chat`, the mouse hit-test in `input_box_rect`, and `update_viewport_from_terminal_size` (which sizes the history viewport from the layout's history chunk, minus the scrollbar column) all run the identical `Layout::split`, so they agree even on tiny terminals where the solver shrinks the fixed-height chunks. The render cache key includes the effective reasoning visibility and the per-result tool collapse state, and each `TurnLayout` stores the reasoning header's visual-row range plus the derived default-expanded flag and each tool result header's visual-row range (O(1) click hit-testing and per-frame effective-state lookup without re-scanning turn text). The streaming fast path (`apply_streaming_update`) re-renders the in-flight turn every chunk with the effective per-result visibility, so an expanded tool result streams live while a collapsed one stays flat. `find_turn_at_row` maps screen rows to content lines with a single bottom-anchored formula that covers both the scrolled case and the no-scrollbar case (where the blank band above bottom-anchored content must not resolve to a turn), so header/image clicks work regardless of scroll state or viewport fill. `ModelSelectorState` backs the `Ctrl+M` popup: the daemon's model list, the active-model marker, a case-insensitive substring filter (reusing `InputBuffer` so editing is grapheme-aware), and a focus/scroll window that keeps the highlighted row visible; `window()` is pure (`&self`) so the renderer can call it during `terminal.draw()` without mutating scroll/focus. |
 | `render.rs` | Ratatui rendering: history pane (top) + command input + status bar (bottom), word wrap, Unicode width. Does **not** mutate scroll state or viewport dimensions — those are updated in the event loop before `terminal.draw()`. The model-selector popup is drawn last as a centered bordered overlay (`Clear` + `Block`): a filter row with a live cursor, the model list (active model marked `●`, keyboard highlight marked `>`), and a footer hint; loading/error/empty states replace the list. |
 | `syntax.rs` | Shared syntect helpers (`syntax_set`, `highlight_theme`, `to_ratatui_color`). Used by `markdown_render.rs` for code-block syntax highlighting. |
-| `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `choreo-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Code blocks are syntax-highlighted via `syntect` (shared setup from `syntax.rs`). Tool results are rendered as collapsible sections: each result's header row (triangle + first line of the invocation description, falling back to the `tool result:`/`tool error:` label while the description is empty) is always drawn, the full invocation description (including any wrapped continuation lines) stays visible beneath it, and the body (label row + content) appears below only when expanded — the description is wrapped two columns narrower than the content width so the triangle-prefixed header row never overflows the viewport. Content is checked for diff output first: non-error content that `diff_render::try_render_diff_content` recognises is drawn as a side-by-side/unified diff, otherwise it falls through to the markdown path (ANSI-escaped content takes the colored `ansi_lines` path). Every tool-result body first passes through `sanitize_for_terminal`, which keeps complete SGR color sequences verbatim (so `ansi_lines` coloring survives) but escapes every other control/format char — the sink defense that makes raw shell/VM streams safe to draw (see "Tool output sanitization and bounding"). Diff auto-detection is gated by tool name — `DIFF_EXCLUDED_TOOLS` (`pdf_to_markdown`) skips diff detection entirely, because its framed output opens with a `--- UNTRUSTED content extracted from PDF; …` delimiter line that the `--- ` heuristic would misparse as a `--- a/` diff path header (rendering a bogus diff and dropping the extraction). Collapse defaults come from `tool_result_default_collapsed`: quiet tools (`read_file`, `read_file_range`, `http_request`) default collapsed — the old hard suppression of their verbatim bodies is now just a default state, so expanding a quiet tool reveals the content — while error results and everything else default expanded. Tool call labels (`tool: name(args)`) have been removed from the assistant block — tool invocations are now visible through the `invocation_description` rendered in each result's header, and through streaming output. The assistant block renders the response first, followed by a collapsible reasoning section: a dimmed header line (arrow glyph + "Reasoning") is always shown when reasoning content exists, with the reasoning body below it only when expanded (▼), or hidden behind a right-pointing arrow (▶) once the response arrives. `render_turn_lines` returns a `RenderedTurnLines` struct carrying the reasoning header's semantic-line index and each tool result header's semantic-line index, so callers never re-scan the rendered output to locate them. |
+| `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `choreo-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Code blocks are syntax-highlighted via `syntect` (shared setup from `syntax.rs`). Tool results are rendered as collapsible sections: each result's header row (triangle + first line of the invocation description, falling back to the `tool result:`/`tool error:` label while the description is empty) is always drawn, the full invocation description (including any wrapped continuation lines) stays visible beneath it, and the body (label row + content) appears below only when expanded — the description is wrapped two columns narrower than the content width so the triangle-prefixed header row never overflows the viewport. Content is checked for diff output first: non-error content that `diff_render::try_render_diff_content` recognises is drawn as a side-by-side/unified diff, otherwise it falls through to the markdown path (ANSI-escaped content takes the colored `ansi_lines` path). Every tool-result body first passes through `sanitize_for_terminal`, which keeps complete SGR color sequences verbatim (so `ansi_lines` coloring survives) but escapes every other control/format char — including CR, and via the shared `choreo_sanitize::is_unsafe_unicode` predicate — the sink defense that makes raw shell/VM streams safe to draw (see "Tool output sanitization and bounding"); it iterates with a `Peekable<Chars>` (no intermediate `Vec<char>`), so the streaming fast path stays O(chunk) per chunk. Diff auto-detection is gated by tool name — `DIFF_EXCLUDED_TOOLS` (`pdf_to_markdown`) skips diff detection entirely, because its framed output opens with a `--- UNTRUSTED content extracted from PDF; …` delimiter line that the `--- ` heuristic would misparse as a `--- a/` diff path header (rendering a bogus diff and dropping the extraction). Collapse defaults come from `tool_result_default_collapsed`: quiet tools (`read_file`, `read_file_range`, `http_request`) default collapsed — the old hard suppression of their verbatim bodies is now just a default state, so expanding a quiet tool reveals the content — while error results and everything else default expanded. Tool call labels (`tool: name(args)`) have been removed from the assistant block — tool invocations are now visible through the `invocation_description` rendered in each result's header, and through streaming output. The assistant block renders the response first, followed by a collapsible reasoning section: a dimmed header line (arrow glyph + "Reasoning") is always shown when reasoning content exists, with the reasoning body below it only when expanded (▼), or hidden behind a right-pointing arrow (▶) once the response arrives. `render_turn_lines` returns a `RenderedTurnLines` struct carrying the reasoning header's semantic-line index and each tool result header's semantic-line index, so callers never re-scan the rendered output to locate them. |
 | `lib.rs` | `RenderedImage` struct, `build_picker()` helper, public re-exports |
 | `image_worker.rs` | Background worker thread for SVG rasterization and terminal protocol encoding. Communicates with the UI thread via `mpsc` channels; raw image data shared through `Arc<Vec<u8>>` to avoid copies. |
 | `terminal_progress.rs` | Terminal-native progress bar via OSC 9;4 escape sequences. Cached capability detection, percentage/indeterminate/remove modes based on `last_prompt_tokens` vs `context_window`. |
@@ -1233,10 +1274,12 @@ full absolute path. The `~user` form is *not* expanded and is passed through unc
 lives in its own module (`tools/read_file.rs`, `tools/read_file_range.rs`); the shared
 streaming and binary-sniff helpers (`open_text_reader`, `TextStream`, `render_streamed_line`,
 `OutputBudget`, `read_line_capped`, `drain_rest_of_line`) live in `tools/mod.rs` alongside
-`truncate_tool_output` and the shared output-formatting helpers (`sanitize_name`,
-`human_size`, `symlink_target_label`, `truncation_marker`, `finish_tool_output`)
-used by the line-oriented
-tools (`list_files`, `find`, `grep`). `finish_tool_output` caps a body at the shared
+the shared output-formatting helpers (`sanitize_name`, `human_size`,
+`symlink_target_label`, `truncation_marker`) used by the line-oriented
+tools (`list_files`, `find`, `grep`); the shared byte budget,
+`truncate_tool_output`, and `finish_tool_output` now live in the
+`choreo-sanitize` leaf crate and are re-exported from `tools/mod.rs`.
+`finish_tool_output` caps a body at the shared
 byte budget and appends the truncation marker *past* the cap so the count signal
 survives even a byte-capped result. `TextStream` yields one capped line at a time
 with byte accounting; `render_streamed_line` validates and renders a single line (NUL /
@@ -1283,7 +1326,10 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
 - **Source.** `sanitize_text` / `sanitize_name` / `sanitize_content` (in `tools/mod.rs`)
   escape C0/C1 controls, the line/paragraph separators U+2028/U+2029, and every Unicode
   *format* character (general category Cf) except the joiners U+200C/U+200D, via
-  `char::escape_default`. The line-oriented tools use them so every listing stays one
+  `char::escape_default`. The spoofing predicate itself is the shared
+  `choreo_sanitize::is_unsafe_unicode` (the leaf crate that owns the policy — the
+  blockchain tools and the TUI use the same one). The line-oriented tools use them so
+  every listing stays one
   line per entry and a hostile name/line cannot inject terminal escapes (`grep` on match
   and context lines; `find` and `list_files` on paths and symlink targets; `pdf_*` on
   log fields and invocation descriptions). The same policy now covers the raw-content
@@ -1295,13 +1341,19 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
 - **Transcript.** `sanitize_transcript` escapes only the Cf format chars (the spoofing
   class — bidi overrides, ZWSP, invisible operators, …) at the single point where every
   tool result is recorded (`record_tool_completion` in `requests.rs`), preserving
-  ESC/ANSI, newlines, and tabs so shell/VM colors survive. This closes the remaining
+  ESC/ANSI, newlines, and tabs so shell/VM colors survive. Because escaping *expands*
+  (a Cf char becomes `\u{202e}`), the choke point re-applies the byte cap **after**
+  sanitizing (`truncate_tool_output(&sanitize_transcript(…))`), so content that was
+  capped at the source as raw bytes (shell/VM/series) cannot exceed the budget once
+  escaped. This closes the remaining
   LLM-spoofing gap for the streaming tools whose raw output is deliberately not
   source-escaped.
 - **Sink.** `choreo-tui`'s `sanitize_for_terminal` filter runs over every tool-result
   body before rendering: it keeps complete SGR color sequences (`ESC [ … m`, so ANSI
   coloring still works) and escapes everything else — OSC/CSI/DCS sequences, C0/C1
-  controls, U+2028/U+2029, and the Cf spoofing class. This is what makes the raw
+  controls (including CR: a carriage return would let hostile content overwrite its own
+  rendered line), U+2028/U+2029, and the Cf spoofing class (via the same shared
+  `choreo_sanitize::is_unsafe_unicode`). This is what makes the raw
   shell/VM streams safe to draw; it defends against terminal-escape injection (OSC-52
   clipboard writes, clear-screen, title changes, …) for every tool at once, including
   the tools that never sanitize at the source.
@@ -1312,17 +1364,24 @@ diverge unboundedly from the recorded result:
 
 - `spawn_with_streaming` (sh/exec/fish/nu) caps the accumulated stdout/stderr copies at
   `MAX_TOOL_OUTPUT_BYTES` (`drain_fd`'s `accumulate_cap`) and forwards at most that
-  many streamed bytes, appending the shared `...[truncated]` marker once.
+  many streamed bytes, appending the shared `...[truncated]` marker once. Both the
+  drain cap and the streaming forwarder run on the shared `choreo_sanitize::ByteBudget`
+  (the same "first N bytes + one marker" engine), so the raw copy and the streamed copy
+  can never disagree.
 - `find`'s walk enforces the byte budget during collection (charging each rendered line
   plus its joining newline), stopping the walk and reporting the collected count in the
   marker — the streamed view and the final result now agree.
-- `run_riscv` caps guest `WRITE` output at the syscall (both the accumulated and the
-  streamed copies) and wraps the final content in `finish_tool_output` so the exit
-  footer always survives past the budget.
+- `run_riscv` caps guest `WRITE` output at the syscall via `ByteBudget` (both the
+  accumulated and the streamed copies): a write that would cross the cap is kept as a
+  fitting prefix, the one-shot truncation signal fires, and the streamed live view gets
+  the shared marker. `finish_tool_output` then wraps the final content so the exit
+  footer (and the truncation marker, when output was cut) always survives past the
+  budget.
 - `run_series` caps the aggregated step JSON with `finish_tool_output` (each step is
   capped, but N steps joined could exceed the budget).
 - The clients cap their *live* accumulation too: `SessionView::tool_result_chunk` in
-  `choreo-client-core` stops at the same 128 KiB budget with a one-time marker, so a
+  `choreo-client-core` stops at the same shared `MAX_TOOL_OUTPUT_BYTES` (128 KiB)
+  budget with the same one-time `...[truncated]` marker, so a
   chatty tool cannot balloon client memory before the (authoritative, capped) final
   record replaces it.
 

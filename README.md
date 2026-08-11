@@ -378,7 +378,7 @@ cargo run --release -p choreographr --bin choreo-acp                 # ACP bridg
 
 ## Crates
 
-A Rust workspace of fourteen crates (resolver = "3"):
+A Rust workspace of fifteen crates (resolver = "3"):
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the daemon's
 internals — threading model, provider architecture, tool system, and session
@@ -391,6 +391,7 @@ data model.
 | `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (79+ providers) |
 | `choreo-blockchain` | Blockchain tools — EVM (alloy) and Substrate/Polkadot (subxt) read-only queries plus the tokio sidecar runtime they run on; pulled in by the daemon's `blockchain` feature (off by default) |
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
+| `choreo-sanitize` | Internal leaf crate — the single source of truth for the Unicode "spoofing" predicates (bidi/ZWSP escaping) and the shared tool-output byte budget + `...[truncated]` marker, used by the daemon, TUI, blockchain tools, and client |
 | `choreo-keystore` | X25519 keypair + ECDH/AES-256-GCM crypto library for encrypted credentials |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
 | `choreo-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio |

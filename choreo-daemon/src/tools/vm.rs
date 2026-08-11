@@ -4,6 +4,7 @@ use crate::tools::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_keystore::ServiceCredential;
+use choreo_sanitize::{ByteBudget, TRUNCATION_MARKER, TRUNCATION_SUFFIX};
 use ckb_vm::Bytes;
 use ckb_vm::machine::VERSION2;
 use ckb_vm::{
@@ -716,12 +717,19 @@ struct ChoreographrSyscall {
     output_tx: mpsc::Sender<Vec<u8>>,
     write_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
     ctx: Option<crate::tools::context::ToolContext>,
-    /// Running total of guest WRITE bytes forwarded to both the accumulated
-    /// output and the streamed live view. Capped at [`MAX_TOOL_OUTPUT_BYTES`]
-    /// so a guest that emits unbounded output cannot balloon daemon memory or
-    /// the client's live display past the shared budget (the guest keeps
-    /// running; output past the cap is dropped).
-    streamed_bytes: usize,
+    /// Shared byte budget for guest WRITE output (accumulated and streamed
+    /// copies both draw from it). Keeps the first [`MAX_TOOL_OUTPUT_BYTES`]
+    /// bytes with a fitting prefix — the same "first N bytes + one marker"
+    /// contract as the shell streaming paths — so a guest that emits
+    /// unbounded output cannot balloon daemon memory or the client's live
+    /// display past the shared budget.
+    budget: ByteBudget,
+    /// One-shot signal fired the first time a guest WRITE is cut at the byte
+    /// budget. Message-passing (per AGENTS.md): the syscall holds the sender,
+    /// the runner holds the receiver, and the signal is read once after the
+    /// machine exits, so the finish footer can carry the truncation marker
+    /// without polluting the capped body.
+    trunc_tx: mpsc::Sender<()>,
 }
 
 impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall {
@@ -781,13 +789,23 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
                     // the streamed live view) at the shared byte budget: a
                     // guest can write unbounded bytes, and without the cap the
                     // final content and the live stream would both balloon far
-                    // past what the transcript can ever show. The guest keeps
-                    // running; output beyond the cap is simply dropped.
-                    self.streamed_bytes += data.len();
-                    if self.streamed_bytes <= MAX_TOOL_OUTPUT_BYTES {
-                        let _ = self.output_tx.send(data.to_vec());
+                    // past what the transcript can ever show. A write that
+                    // would cross the cap is kept as a fitting prefix (the
+                    // same contract as the shell streaming paths), the
+                    // truncation signal is fired once, and the streamed live
+                    // view gets the shared marker; the guest keeps running and
+                    // output beyond the cap is dropped.
+                    let n = self.budget.fit(data.len());
+                    if n > 0 {
+                        let _ = self.output_tx.send(data[..n].to_vec());
                         if let Some(tx) = &self.write_tx {
-                            let _ = tx.send(data.into());
+                            let _ = tx.send(data[..n].into());
+                        }
+                    }
+                    if self.budget.is_truncated() {
+                        let _ = self.trunc_tx.send(());
+                        if let Some(tx) = &self.write_tx {
+                            let _ = tx.send(TRUNCATION_SUFFIX.as_bytes().to_vec());
                         }
                     }
                 }
@@ -1115,6 +1133,10 @@ fn run_riscv_impl(
     }
 
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+    // One-shot truncation signal from the guest-WRITE syscall: the runner
+    // reads it after the machine exits to decide whether the finish footer
+    // carries the `...[truncated]` marker (see the syscall struct docs).
+    let (trunc_tx, trunc_rx) = mpsc::channel::<()>();
     let syscall = ChoreographrSyscall {
         registry,
         x_credentials: x_credentials.cloned(),
@@ -1122,7 +1144,8 @@ fn run_riscv_impl(
         output_tx,
         write_tx,
         ctx,
-        streamed_bytes: 0,
+        budget: ByteBudget::new(MAX_TOOL_OUTPUT_BYTES),
+        trunc_tx,
     };
 
     // Single-hart VM: there is only one instruction stream, so the RISC-V A
@@ -1188,6 +1211,12 @@ fn run_riscv_impl(
             // blocking recv() loop that terminates deterministically.
             drop(trace);
 
+            // The syscall fired the one-shot channel the first time guest
+            // WRITE output was cut at the byte budget. The marker then rides
+            // *past* the cap in the finish footer (finish_tool_output's
+            // marker-past-cap convention), so the body stays clean at
+            // MAX_TOOL_OUTPUT_BYTES while the truncation is still visible.
+            let truncated = trunc_rx.try_recv().is_ok();
             let out_str = String::from_utf8_lossy(&drain_vm_output(&output_rx)).to_string();
 
             // The guest output is already capped at MAX_TOOL_OUTPUT_BYTES by
@@ -1196,18 +1225,21 @@ fn run_riscv_impl(
             // changes, and it appends the exit footer *past* the budget (the
             // same marker-past-cap convention the other tools use) so the
             // exit signal always survives.
-            tool_ok(finish_tool_output(
-                &out_str,
-                Some(format!(
-                    "[VM: exited with code {exit_code} in {cycles} cycles]"
-                )),
-            ))
+            let footer = if truncated {
+                format!(
+                    "{TRUNCATION_MARKER}\n[VM: exited with code {exit_code} in {cycles} cycles]"
+                )
+            } else {
+                format!("[VM: exited with code {exit_code} in {cycles} cycles]")
+            };
+            tool_ok(finish_tool_output(&out_str, Some(footer)))
         }
         Err(e) => {
             let cycles = trace.machine.cycles();
             error!(cycles, error = %e, "VM error");
             drop(trace);
 
+            let truncated = trunc_rx.try_recv().is_ok();
             let out_str = String::from_utf8_lossy(&drain_vm_output(&output_rx)).to_string();
             let msg = if out_str.is_empty() {
                 format!("VM error after {cycles} cycles: {e}")
@@ -1216,8 +1248,12 @@ fn run_riscv_impl(
             };
             // Bound the error message too: `e` can be verbose and the
             // "output so far" tail is capped only by the write cap, so a
-            // long message must not exceed the shared budget.
-            tool_err(finish_tool_output(&msg, None))
+            // long message must not exceed the shared budget. When the tail
+            // was itself cut at the write cap, the marker is appended past
+            // the budget (finish_tool_output's marker-past-cap convention)
+            // so the truncation stays visible.
+            let marker = truncated.then(|| TRUNCATION_MARKER.to_string());
+            tool_err(finish_tool_output(&msg, marker))
         }
     }
 }
@@ -1857,6 +1893,7 @@ mod tests {
 
         let (accum_tx, accum_rx) = mpsc::channel::<Vec<u8>>();
         let (stream_tx, stream_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (trunc_tx, trunc_rx) = mpsc::channel::<()>();
         let mut syscall = ChoreographrSyscall {
             registry: Arc::new(ToolRegistry::new()),
             x_credentials: None,
@@ -1864,7 +1901,8 @@ mod tests {
             output_tx: accum_tx,
             write_tx: Some(stream_tx),
             ctx: None,
-            streamed_bytes: 0,
+            budget: ByteBudget::new(MAX_TOOL_OUTPUT_BYTES),
+            trunc_tx,
         };
 
         let write = |syscall: &mut ChoreographrSyscall,
@@ -1876,10 +1914,19 @@ mod tests {
         };
 
         // Three 64 KiB writes: the first two stay under the cap (128 KiB
-        // total), the third crosses it and must be dropped.
+        // total), the third crosses it and is cut to a zero-length prefix —
+        // nothing of it is forwarded, but the budget reports truncation and
+        // the one-shot signal fires.
         assert!(write(&mut syscall, &mut core));
         assert!(write(&mut syscall, &mut core));
         assert!(write(&mut syscall, &mut core));
+        // The truncation signal must have been fired exactly once.
+        assert_eq!(trunc_rx.try_recv(), Ok(()), "truncation must be signalled");
+        assert_eq!(
+            trunc_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "truncation must be signalled exactly once"
+        );
 
         // Drop the syscall to close the accumulation sender before draining.
         drop(syscall);
@@ -1897,12 +1944,21 @@ mod tests {
             "payload bytes expected"
         );
 
-        // The streamed live view is capped identically (same guard).
-        let mut streamed = 0usize;
+        // The streamed live view is capped identically and carries the
+        // one-time marker (the same suffix `truncate_tool_output` appends).
+        let mut streamed = Vec::new();
         while let Ok(part) = stream_rx.try_recv() {
-            streamed += part.len();
+            streamed.extend_from_slice(&part);
         }
-        assert_eq!(streamed, 128 * 1024, "streamed output must stop at the cap");
+        assert_eq!(
+            streamed.len(),
+            128 * 1024 + TRUNCATION_SUFFIX.len(),
+            "streamed output must stop at the cap plus one marker"
+        );
+        assert!(
+            streamed.ends_with(TRUNCATION_SUFFIX.as_bytes()),
+            "streamed output must end with the truncation marker"
+        );
     }
 
     // ── Batch ecall tests ─────────────────────────────────────────
