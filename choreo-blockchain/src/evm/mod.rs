@@ -8,8 +8,9 @@
 
 use crate::BlockchainError;
 pub(crate) use crate::block_on;
+pub(crate) use crate::{log_execution, rpc_call};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::eth::BlockNumberOrTag;
+use alloy::rpc::types::eth::{BlockId, BlockNumberOrTag};
 use alloy::sol;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -116,10 +117,15 @@ pub struct EvmResolveArgs {
 // ── Shared client helpers ───────────────────────────────────────────────
 
 /// Build an alloy HTTP provider for `rpc_url`, validating the URL up front.
+///
+/// Note: the URL is model-supplied and may point anywhere — the same trust
+/// surface as the daemon's `http_request` tool (see the crate-level trust
+/// model in `lib.rs`).
 pub(crate) fn connect(rpc_url: &str) -> Result<impl Provider, BlockchainError> {
     let url: Url = rpc_url
         .parse()
         .map_err(|e| BlockchainError::InvalidUrl(format!("invalid RPC URL: {e}")))?;
+    tracing::debug!(rpc_url = %rpc_url, "connecting to EVM RPC endpoint");
     Ok(ProviderBuilder::default().connect_http(url))
 }
 
@@ -147,6 +153,19 @@ pub(crate) fn parse_block_tag(tag: &str) -> Result<BlockNumberOrTag, BlockchainE
                 Err(BlockchainError::Other(format!("invalid block tag: {tag}")))
             }
         }
+    }
+}
+
+/// Convert a parsed [`BlockNumberOrTag`] into a [`BlockId`] for builders that
+/// take a block selector (e.g. `EthCall::block` in the `evm_call` tool).
+pub(crate) fn block_id(tag: BlockNumberOrTag) -> BlockId {
+    match tag {
+        BlockNumberOrTag::Latest => BlockId::latest(),
+        BlockNumberOrTag::Finalized => BlockId::finalized(),
+        BlockNumberOrTag::Safe => BlockId::safe(),
+        BlockNumberOrTag::Pending => BlockId::pending(),
+        BlockNumberOrTag::Earliest => BlockId::earliest(),
+        BlockNumberOrTag::Number(n) => BlockId::number(n),
     }
 }
 

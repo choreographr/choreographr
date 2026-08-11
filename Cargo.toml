@@ -202,6 +202,7 @@ crossbeam-channel = "0.5"
 snow = "0.10"
 url = "2"
 humfmt = "0.6.0"
+hex = "0.4"
 nix = "0.31.3"
 unicode-segmentation = "1.13"
 

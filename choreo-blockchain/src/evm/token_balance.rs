@@ -1,4 +1,7 @@
-use super::{EvmTokenBalanceArgs, alloy_err, balanceOfCall, block_on, connect, symbolCall};
+use super::{
+    EvmTokenBalanceArgs, alloy_err, balanceOfCall, block_on, connect, log_execution, rpc_call,
+    symbolCall,
+};
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes};
@@ -53,11 +56,12 @@ async fn evm_token_balance_impl(
 /// Synchronous entry point: runs [`evm_token_balance_impl`] on the sidecar
 /// runtime and caps the output at the shared byte budget.
 pub fn execute_evm_token_balance(args: &EvmTokenBalanceArgs) -> Result<String, BlockchainError> {
-    let output = block_on(evm_token_balance_impl(
+    log_execution("evm_token_balance", &args.rpc_url);
+    let output = block_on(rpc_call(evm_token_balance_impl(
         &args.rpc_url,
         &args.token_address,
         &args.address,
-    ))??;
+    )))??;
     Ok(truncate_tool_output(&output))
 }
 

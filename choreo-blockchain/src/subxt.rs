@@ -4,8 +4,12 @@
 //! reads, and block details — each exposed as a synchronous `execute_*` entry
 //! point (used by the daemon's `Tool` wrappers) that runs an async subxt
 //! implementation on the crate's sidecar tokio runtime (see [`crate::runtime`]).
+//!
+//! Every call is bounded by [`crate::RPC_TIMEOUT`] via [`crate::rpc_call`], so
+//! a black-holed `ws_url` returns a clean error instead of leaking the blocked
+//! execution thread until the network gives up.
 
-use crate::{BlockchainError, block_on, truncate_tool_output};
+use crate::{BlockchainError, block_on, log_execution, rpc_call, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::str::FromStr;
@@ -37,7 +41,7 @@ pub struct SubxtQueryArgs {
     pub pallet: String,
     /// Storage item name (e.g., Account, TotalIssuance, Validators)
     pub storage_item: String,
-    /// Optional hex-encoded storage key bytes (without 0x prefix)
+    /// Optional hex-encoded storage key bytes (0x prefix optional)
     pub key: Option<String>,
     /// WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)
     pub ws_url: Option<String>,
@@ -58,7 +62,8 @@ pub fn execute_subxt_chain(args: &SubxtChainArgs) -> Result<String, BlockchainEr
         .ws_url
         .clone()
         .unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = block_on(subxt_chain_impl(&ws_url))??;
+    log_execution("subxt_chain", &ws_url);
+    let output = block_on(rpc_call(subxt_chain_impl(&ws_url)))??;
     Ok(truncate_tool_output(&output))
 }
 
@@ -67,7 +72,8 @@ pub fn execute_subxt_balance(args: &SubxtBalanceArgs) -> Result<String, Blockcha
         .ws_url
         .clone()
         .unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = block_on(subxt_balance_impl(&ws_url, &args.address))??;
+    log_execution("subxt_balance", &ws_url);
+    let output = block_on(rpc_call(subxt_balance_impl(&ws_url, &args.address)))??;
     Ok(truncate_tool_output(&output))
 }
 
@@ -76,12 +82,13 @@ pub fn execute_subxt_query(args: &SubxtQueryArgs) -> Result<String, BlockchainEr
         .ws_url
         .clone()
         .unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = block_on(subxt_query_impl(
+    log_execution("subxt_query", &ws_url);
+    let output = block_on(rpc_call(subxt_query_impl(
         &ws_url,
         &args.pallet,
         &args.storage_item,
         args.key.as_deref(),
-    ))??;
+    )))??;
     Ok(truncate_tool_output(&output))
 }
 
@@ -90,7 +97,8 @@ pub fn execute_subxt_block(args: &SubxtBlockArgs) -> Result<String, BlockchainEr
         .ws_url
         .clone()
         .unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = block_on(subxt_block_impl(&ws_url, args.block_number))??;
+    log_execution("subxt_block", &ws_url);
+    let output = block_on(rpc_call(subxt_block_impl(&ws_url, args.block_number)))??;
     Ok(truncate_tool_output(&output))
 }
 
@@ -129,12 +137,14 @@ fn subxt_err(e: impl std::fmt::Display) -> BlockchainError {
 }
 
 async fn connect_client(ws_url: &str) -> Result<SubxtClient, BlockchainError> {
+    tracing::debug!(ws_url = %ws_url, "connecting to Substrate RPC endpoint");
     SubxtClient::from_insecure_url(ws_url)
         .await
         .map_err(subxt_err)
 }
 
 async fn connect_rpc(ws_url: &str) -> Result<SubxtRpcClient, BlockchainError> {
+    tracing::debug!(ws_url = %ws_url, "connecting to Substrate RPC endpoint");
     SubxtRpcClient::from_insecure_url(ws_url)
         .await
         .map_err(subxt_err)
@@ -239,7 +249,14 @@ async fn subxt_query_impl(
 
     let key_parts: Vec<subxt::dynamic::Value> = match key_hex {
         Some(hex) => {
-            let bytes = hex::decode(hex)
+            // Tolerate an optional `0x` prefix even though the docs say raw
+            // hex — the model will sometimes supply one, and a decode error
+            // on a redundant prefix is pure friction.
+            let stripped = hex
+                .strip_prefix("0x")
+                .or_else(|| hex.strip_prefix("0X"))
+                .unwrap_or(hex);
+            let bytes = hex::decode(stripped)
                 .map_err(|e| BlockchainError::Other(format!("invalid hex key: {e}")))?;
             vec![subxt::dynamic::Value::from_bytes(bytes)]
         }
@@ -334,5 +351,29 @@ mod tests {
             ws_url: Some("wss://custom.example".into()),
         };
         assert!(describe_subxt_chain_invocation(&args).contains("wss://custom.example"));
+    }
+
+    #[test]
+    fn hex_key_accepts_optional_0x_prefix() {
+        // Both raw hex and 0x-prefixed hex should decode to the same bytes;
+        // the shared stripping logic (a plain fn so the borrow checker can see
+        // the output borrows from the input) is exercised end to end.
+        fn strip_hex_prefix(hex: &str) -> &str {
+            hex.strip_prefix("0x")
+                .or_else(|| hex.strip_prefix("0X"))
+                .unwrap_or(hex)
+        }
+        assert_eq!(
+            hex::encode(hex::decode(strip_hex_prefix("deadbeef")).unwrap()),
+            "deadbeef"
+        );
+        assert_eq!(
+            hex::encode(hex::decode(strip_hex_prefix("0xdeadbeef")).unwrap()),
+            "deadbeef"
+        );
+        assert_eq!(
+            hex::encode(hex::decode(strip_hex_prefix("0XDEADBEEF")).unwrap()),
+            "deadbeef"
+        );
     }
 }

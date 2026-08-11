@@ -2222,7 +2222,14 @@ counts survive the attach instead of regressing.
     crate, which holds a global `OnceLock<tokio::runtime::Runtime>` as a sidecar and runs its
     clients via `block_on()`. The daemon links that crate only behind the `blockchain` cargo
     feature (off by default) and calls its synchronous `execute_*` entry points, so tokio is
-    never a direct dependency of the daemon. This simplifies the mental model (each thread owns
+    never a direct dependency of the daemon. Every call is additionally bounded by a 30s
+    wall-clock `RPC_TIMEOUT` inside the crate: the daemon's own ~60s tool timeout can only
+    *abandon* the blocked execution thread (a synchronous `block_on` cannot be interrupted),
+    so the crate-level cap is what turns a black-holed RPC endpoint into a clean error
+    instead of a leaked thread. The tools accept an arbitrary `rpc_url`/`ws_url` from the
+    model and open HTTP(S)/WebSocket connections to it — the same trust surface as the
+    `http_request` tool, not a new capability — which is why the whole feature (and the
+    network reach it adds) is off by default. This simplifies the mental model (each thread owns
     its data, no `Send` bounds on shared state, no `Pin<Box<dyn Future>>`), improves stack
     traces, and avoids the complexity of async cancellation.
 

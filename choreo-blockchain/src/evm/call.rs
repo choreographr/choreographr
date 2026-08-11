@@ -1,4 +1,6 @@
-use super::{EvmCallArgs, alloy_err, block_on, connect};
+use super::{
+    EvmCallArgs, alloy_err, block_id, block_on, connect, log_execution, parse_block_tag, rpc_call,
+};
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes};
@@ -10,6 +12,7 @@ async fn evm_call_impl(
     rpc_url: &str,
     to_str: &str,
     data_str: &str,
+    block_tag: Option<&str>,
 ) -> Result<String, BlockchainError> {
     let provider = connect(rpc_url)?;
     let to = Address::from_str(to_str)
@@ -25,7 +28,14 @@ async fn evm_call_impl(
         .with_to(to)
         .with_input(input_data);
 
-    let result: Bytes = provider.call(tx).await.map_err(alloy_err)?;
+    // Apply the requested block tag (defaults to `latest` when omitted) so the
+    // advertised `block_tag` argument actually selects the state the call runs
+    // against instead of silently querying the latest block.
+    let mut call = provider.call(tx);
+    if let Some(tag) = block_tag {
+        call = call.block(block_id(parse_block_tag(tag)?));
+    }
+    let result: Bytes = call.await.map_err(alloy_err)?;
 
     Ok(format!(
         "to: {to_str}\ndata: {data_str}\nresult: 0x{}",
@@ -36,13 +46,25 @@ async fn evm_call_impl(
 /// Synchronous entry point: runs [`evm_call_impl`] on the sidecar runtime and
 /// caps the output at the shared byte budget.
 pub fn execute_evm_call(args: &EvmCallArgs) -> Result<String, BlockchainError> {
-    let output = block_on(evm_call_impl(&args.rpc_url, &args.to, &args.data))??;
+    log_execution("evm_call", &args.rpc_url);
+    let output = block_on(rpc_call(evm_call_impl(
+        &args.rpc_url,
+        &args.to,
+        &args.data,
+        args.block_tag.as_deref(),
+    )))??;
     Ok(truncate_tool_output(&output))
 }
 
 pub fn describe_evm_call_invocation(args: &EvmCallArgs) -> String {
-    format!(
-        "Executing read-only call to {} on {}.",
-        args.to, args.rpc_url
-    )
+    match args.block_tag.as_deref() {
+        Some(tag) => format!(
+            "Executing read-only call to {} on {} at block {tag}.",
+            args.to, args.rpc_url
+        ),
+        None => format!(
+            "Executing read-only call to {} on {}.",
+            args.to, args.rpc_url
+        ),
+    }
 }

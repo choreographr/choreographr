@@ -1,4 +1,4 @@
-use super::{EvmTransactionArgs, alloy_err, block_on, connect};
+use super::{EvmTransactionArgs, alloy_err, block_on, connect, log_execution, rpc_call};
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::primitives::B256;
 use alloy::providers::Provider;
@@ -45,7 +45,8 @@ async fn evm_transaction_impl(rpc_url: &str, tx_hash_str: &str) -> Result<String
 /// Synchronous entry point: runs [`evm_transaction_impl`] on the sidecar
 /// runtime and caps the output at the shared byte budget.
 pub fn execute_evm_transaction(args: &EvmTransactionArgs) -> Result<String, BlockchainError> {
-    let output = block_on(evm_transaction_impl(&args.rpc_url, &args.tx_hash))??;
+    log_execution("evm_transaction", &args.rpc_url);
+    let output = block_on(rpc_call(evm_transaction_impl(&args.rpc_url, &args.tx_hash)))??;
     Ok(truncate_tool_output(&output))
 }
 

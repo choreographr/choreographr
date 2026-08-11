@@ -17,7 +17,8 @@ use std::sync::OnceLock;
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 /// Create the multi-threaded tokio runtime (with IO + time drivers) and store
-/// it in the process-wide sidecar. Idempotent: subsequent calls are no-ops.
+/// it in the process-wide sidecar. Idempotent: subsequent calls are no-ops,
+/// including calls that race a concurrent initializer.
 ///
 /// Fails only if the OS refuses to spawn the worker threads — surfaced as an
 /// error instead of panicking so the daemon can abort startup cleanly.
@@ -28,12 +29,12 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    // `set` only fails if a racing thread already initialized the runtime;
-    // the early return above makes that unreachable, but handle it gracefully.
-    RUNTIME
-        .set(rt)
-        .map_err(|_| std::io::Error::other("blockchain tokio runtime already initialized"))?;
-    tracing::info!("blockchain tokio runtime initialized");
+    // A racing thread may have initialized the runtime between the check above
+    // and this `set`; that is a success, not an error — the sidecar exists and
+    // our built runtime is simply discarded.
+    if RUNTIME.set(rt).is_ok() {
+        tracing::info!("blockchain tokio runtime initialized");
+    }
     Ok(())
 }
 

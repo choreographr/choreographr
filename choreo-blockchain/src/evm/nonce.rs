@@ -1,4 +1,4 @@
-use super::{EvmNonceArgs, alloy_err, block_on, connect};
+use super::{EvmNonceArgs, alloy_err, block_on, connect, log_execution, rpc_call};
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::primitives::Address;
 use alloy::providers::Provider;
@@ -22,7 +22,8 @@ async fn evm_nonce_impl(rpc_url: &str, address_str: &str) -> Result<String, Bloc
 /// Synchronous entry point: runs [`evm_nonce_impl`] on the sidecar runtime and
 /// caps the output at the shared byte budget.
 pub fn execute_evm_nonce(args: &EvmNonceArgs) -> Result<String, BlockchainError> {
-    let output = block_on(evm_nonce_impl(&args.rpc_url, &args.address))??;
+    log_execution("evm_nonce", &args.rpc_url);
+    let output = block_on(rpc_call(evm_nonce_impl(&args.rpc_url, &args.address)))??;
     Ok(truncate_tool_output(&output))
 }
 

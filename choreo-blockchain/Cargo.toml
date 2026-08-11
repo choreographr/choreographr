@@ -17,7 +17,10 @@ path = "src/lib.rs"
 # EVM client — the daemon's blockchain tools talk to Ethereum-compatible nodes
 # over JSON-RPC. Only pulled in when choreo-daemon's `blockchain` feature is
 # enabled (this crate is a workspace member but nothing links it by default).
-alloy = { version = "2.3", features = ["providers", "rpc-types-eth", "sol-types"] }
+# `ens` enables alloy-ens (Universal Resolver contract calls) for evm_resolve,
+# replacing the fabricated `ens_resolve`/`ens_reverse` RPC methods the old
+# implementation invoked (no node implements those).
+alloy = { version = "2.3", features = ["providers", "rpc-types-eth", "sol-types", "ens"] }
 # Substrate/Polkadot client (light-client + JSON-RPC paths).
 subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
 # Sidecar async runtime. This crate is the *only* place in the workspace that
@@ -29,5 +32,5 @@ serde_json.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
 url.workspace = true
-hex = "0.4"
+hex.workspace = true
 tracing.workspace = true

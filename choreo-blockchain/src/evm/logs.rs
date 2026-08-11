@@ -1,4 +1,4 @@
-use super::{EvmLogsArgs, alloy_err, block_on, connect, parse_block_tag};
+use super::{EvmLogsArgs, alloy_err, block_on, connect, log_execution, parse_block_tag, rpc_call};
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
@@ -62,13 +62,14 @@ async fn evm_logs_impl(
 /// Synchronous entry point: runs [`evm_logs_impl`] on the sidecar runtime and
 /// caps the output at the shared byte budget.
 pub fn execute_evm_logs(args: &EvmLogsArgs) -> Result<String, BlockchainError> {
-    let output = block_on(evm_logs_impl(
+    log_execution("evm_logs", &args.rpc_url);
+    let output = block_on(rpc_call(evm_logs_impl(
         &args.rpc_url,
         args.address.as_deref(),
         args.topic0.as_deref(),
         args.from_block.as_deref(),
         args.to_block.as_deref(),
-    ))??;
+    )))??;
     Ok(truncate_tool_output(&output))
 }
 

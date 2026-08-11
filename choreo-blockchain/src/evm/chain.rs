@@ -1,4 +1,4 @@
-use super::{RpcUrlArgs, alloy_err, block_on, connect};
+use super::{RpcUrlArgs, alloy_err, block_on, connect, log_execution, rpc_call};
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::providers::Provider;
 
@@ -26,7 +26,8 @@ async fn evm_chain_impl(rpc_url: &str) -> Result<String, BlockchainError> {
 /// Synchronous entry point: runs [`evm_chain_impl`] on the sidecar runtime and
 /// caps the output at the shared byte budget.
 pub fn execute_evm_chain(args: &RpcUrlArgs) -> Result<String, BlockchainError> {
-    let output = block_on(evm_chain_impl(&args.rpc_url))??;
+    log_execution("evm_chain", &args.rpc_url);
+    let output = block_on(rpc_call(evm_chain_impl(&args.rpc_url)))??;
     Ok(truncate_tool_output(&output))
 }
 

@@ -23,7 +23,7 @@ dirs.workspace = true
 zlob = "1.6"
 grep-regex = "0.1"
 grep-searcher = "0.1"
-hex = "0.4"
+hex.workspace = true
 # Type-safe syscall bindings for the process-control path (kill/pgid/pidfd),
 # the bounded pipe-drain poll loop, and the non-blocking fcntl on child pipes.
 rustix = { version = "1.1.4", features = ["event", "fs", "process"] }

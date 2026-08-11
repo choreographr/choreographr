@@ -1,4 +1,4 @@
-use super::{EvmBalanceArgs, alloy_err, block_on, connect};
+use super::{EvmBalanceArgs, alloy_err, block_on, connect, log_execution, rpc_call};
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::primitives::Address;
 use alloy::providers::Provider;
@@ -17,7 +17,8 @@ async fn evm_balance_impl(rpc_url: &str, address_str: &str) -> Result<String, Bl
 /// Synchronous entry point: runs [`evm_balance_impl`] on the sidecar runtime
 /// and caps the output at the shared byte budget.
 pub fn execute_evm_balance(args: &EvmBalanceArgs) -> Result<String, BlockchainError> {
-    let output = block_on(evm_balance_impl(&args.rpc_url, &args.address))??;
+    log_execution("evm_balance", &args.rpc_url);
+    let output = block_on(rpc_call(evm_balance_impl(&args.rpc_url, &args.address)))??;
     Ok(truncate_tool_output(&output))
 }
 
