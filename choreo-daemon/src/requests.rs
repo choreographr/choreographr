@@ -217,16 +217,19 @@ fn accumulate_token_usage(
     }
 }
 
-/// Broadcast the session's accumulated token usage to all subscribers so the
-/// UI can update its final token display at the end of a turn.
-fn broadcast_token_usage(session_id: u64, ctx: &RequestContext, session: &SessionState) {
-    let _ = ctx
-        .cmd_tx
-        .send(SessionCommand::Broadcast(DaemonMessage::TokenUsageUpdate {
-            session_id,
-            token_usage: session.config.accumulated_usage,
-            last_prompt_tokens: session.config.last_prompt_tokens,
-        }));
+/// Route the worker's cumulative token usage through the main session thread
+/// so the authoritative `config.accumulated_usage` is updated BEFORE the
+/// update is broadcast.  The worker accumulates usage on its private clone of
+/// `SessionState` and only merges it back at `RequestFinished`; a direct
+/// broadcast here would leave the main thread's config at the pre-request
+/// value for the whole turn, leaking stale totals into attach snapshots and
+/// session metadata.  Routing through `SyncAccumulatedUsage` keeps every
+/// consumer fresh mid-turn.
+fn broadcast_token_usage(ctx: &RequestContext, session: &SessionState) {
+    let _ = ctx.cmd_tx.send(SessionCommand::SyncAccumulatedUsage {
+        token_usage: session.config.accumulated_usage,
+        last_prompt_tokens: session.config.last_prompt_tokens,
+    });
 }
 
 /// Resolve the execution timeout for a tool by name.
@@ -1318,7 +1321,7 @@ pub(crate) fn run_agent_loop(
                 );
                 let token_usage = final_text.usage;
                 accumulate_token_usage(session, &token_usage, turn_iter, ctx);
-                broadcast_token_usage(ctx.session_id, ctx, session);
+                broadcast_token_usage(ctx, session);
                 // Write the reasoning artifact + producing model through to the
                 // turn (phase 4c): the builder re-emits it on the next request
                 // when the same model is still active and the passback policy
@@ -1355,7 +1358,7 @@ pub(crate) fn run_agent_loop(
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 let token_usage = tool_use.usage;
                 accumulate_token_usage(session, &token_usage, turn_iter, ctx);
-                broadcast_token_usage(ctx.session_id, ctx, session);
+                broadcast_token_usage(ctx, session);
                 // Build the call records once so the same ordered list seeds
                 // both the assistant message's tool_calls and the placeholder
                 // tool results (they must agree so the in-place updates below

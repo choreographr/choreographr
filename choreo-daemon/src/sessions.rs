@@ -181,6 +181,17 @@ pub enum SessionCommand {
     /// map so that workers always broadcast to the live subscriber set
     /// rather than a stale clone of it.
     Broadcast(DaemonMessage),
+    /// Mid-turn token-usage sync from the request worker.  The worker owns
+    /// the live accumulation (its private session clone), so the main
+    /// thread's `config.accumulated_usage` would otherwise stay at the
+    /// pre-request value until `RequestFinished` — leaking stale totals into
+    /// attach snapshots and session summaries for the whole turn.  Applying
+    /// the worker's cumulative total here (and re-broadcasting the update
+    /// from the authoritative state) keeps every consumer fresh mid-turn.
+    SyncAccumulatedUsage {
+        token_usage: TokenUsage,
+        last_prompt_tokens: Option<u32>,
+    },
     SetTitle {
         title: String,
     },
@@ -1045,6 +1056,10 @@ fn process_command(
             snapshot,
         } => handle_request_finished(request_id, snapshot, state, shutdown_requested, ctx),
         SessionCommand::Broadcast(message) => handle_broadcast(message, state, ctx),
+        SessionCommand::SyncAccumulatedUsage {
+            token_usage,
+            last_prompt_tokens,
+        } => handle_sync_accumulated_usage(token_usage, last_prompt_tokens, state, ctx),
         SessionCommand::SetTitle { title } => handle_set_title(title, state, ctx),
         SessionCommand::SetWorkingDir { path, reply } => {
             handle_set_working_dir(path, reply, state, ctx)
@@ -1729,6 +1744,46 @@ fn handle_broadcast(
     // Broadcast through the main session thread's live subscriber
     // map so that in-flight worker broadcasts respect detach.
     broadcast(&mut state.subscribers, &ctx.daemon_tx, message);
+    false
+}
+
+/// Apply the request worker's mid-turn cumulative token usage to the
+/// authoritative session config, then broadcast the update.
+///
+/// The agent loop accumulates usage on its private worker clone and only
+/// merges it back at `RequestFinished`; without this sync the main
+/// thread's `accumulated_usage` stays at the pre-request value for the
+/// whole turn, leaking stale totals into attach snapshots and session
+/// summaries.  `apply_worker_snapshot` at `RequestFinished` still applies
+/// the final value, which is >= this one — the two paths are idempotent.
+fn handle_sync_accumulated_usage(
+    token_usage: TokenUsage,
+    last_prompt_tokens: Option<u32>,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    state.config.accumulated_usage = token_usage;
+    if let Some(tokens) = last_prompt_tokens {
+        state.config.last_prompt_tokens = Some(tokens);
+    }
+    // Broadcast through the live subscriber map AFTER the state write so
+    // a client can never be ahead of the snapshot it receives on attach.
+    broadcast(
+        &mut state.subscribers,
+        &ctx.daemon_tx,
+        DaemonMessage::TokenUsageUpdate {
+            session_id: ctx.session_id,
+            token_usage: state.config.accumulated_usage,
+            last_prompt_tokens: state.config.last_prompt_tokens,
+        },
+    );
+    // Refresh the daemon's session-metadata index (no last_modified bump:
+    // this is a data refresh, not a modification) so session-list / detail
+    // token totals are accurate mid-turn on the next ListSessions.
+    let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
+        session_id: ctx.session_id,
+        metadata: SessionMetadata::from(&*state),
+    });
     false
 }
 
@@ -3295,6 +3350,133 @@ mod tests {
 
         let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut shutdown = false;
+        process_command(
+            SessionCommand::Attach {
+                client_id: 42,
+                tx: sub_tx,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        let msg = sub_rx.recv().unwrap();
+        match msg {
+            DaemonMessage::SessionState { token_usage, .. } => {
+                let usage = token_usage.expect("token_usage in SessionState");
+                assert_eq!(usage.input_tokens, 30);
+                assert_eq!(usage.output_tokens, 15);
+                assert_eq!(usage.total_tokens, 45);
+            }
+            other => panic!("expected SessionState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_accumulated_usage_updates_config_and_broadcasts() {
+        // A live daemon channel is required here: `broadcast_setup()` drops the
+        // receiver, but this test asserts the `UpdateMetadata` refresh lands.
+        let dir = tempdir().unwrap();
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let tool_registry = ToolRegistry::new().build();
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db,
+            tool_registry,
+            daemon_tx,
+            max_turns: 0,
+        };
+        let mut state = test_state();
+
+        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        state.subscribers.insert(42, sub_tx);
+
+        // The worker's cumulative total, as routed from the private clone in
+        // `broadcast_token_usage` (requests.rs).
+        let synced = TokenUsage {
+            input_tokens: 30,
+            output_tokens: 15,
+            total_tokens: 45,
+        };
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::SyncAccumulatedUsage {
+                token_usage: synced,
+                last_prompt_tokens: Some(30),
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        // The authoritative config is updated first, so attach snapshots and
+        // session metadata read the fresh mid-turn totals.
+        assert_eq!(state.config.accumulated_usage, synced);
+        assert_eq!(state.config.last_prompt_tokens, Some(30));
+
+        // ...and the update is broadcast from the authoritative state.
+        let msg = sub_rx.recv().unwrap();
+        match msg {
+            DaemonMessage::TokenUsageUpdate {
+                session_id,
+                token_usage,
+                last_prompt_tokens,
+            } => {
+                assert_eq!(session_id, ctx.session_id);
+                assert_eq!(token_usage, synced);
+                assert_eq!(last_prompt_tokens, Some(30));
+            }
+            other => panic!("expected TokenUsageUpdate, got {other:?}"),
+        }
+
+        // `broadcast` first forwards the activity to the daemon, then the
+        // handler refreshes the session-metadata index — both on the same
+        // thread, so ordering is deterministic.
+        match daemon_rx.recv().unwrap() {
+            DaemonCommand::BroadcastActivity(_) => {}
+            _ => panic!("expected BroadcastActivity forward before UpdateMetadata"),
+        }
+        match daemon_rx.recv().unwrap() {
+            DaemonCommand::UpdateMetadata {
+                session_id,
+                metadata,
+            } => {
+                assert_eq!(session_id, ctx.session_id);
+                assert_eq!(metadata.accumulated_usage, synced);
+            }
+            _ => panic!("expected UpdateMetadata with refreshed accumulated usage"),
+        }
+        assert!(!shutdown);
+    }
+
+    #[test]
+    fn attach_snapshot_carries_mid_turn_accumulated_usage() {
+        // Regression test for the stale-snapshot bug: the worker accumulates
+        // usage on its private session clone, so without `SyncAccumulatedUsage`
+        // the main config would still carry the pre-request total and the
+        // attach snapshot would leak that stale value for the whole turn.
+        let (mut state, ctx) = broadcast_setup();
+
+        let synced = TokenUsage {
+            input_tokens: 30,
+            output_tokens: 15,
+            total_tokens: 45,
+        };
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::SyncAccumulatedUsage {
+                token_usage: synced,
+                last_prompt_tokens: Some(30),
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         process_command(
             SessionCommand::Attach {
                 client_id: 42,
