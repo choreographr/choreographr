@@ -65,14 +65,85 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-pub(crate) fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
+pub(crate) fn plain_text_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     if text.is_empty() {
         vec![Line::from(Span::styled(String::new(), Style::default()))]
     } else {
-        text.split('\n')
-            .map(|line| Line::from(Span::styled(line.to_string(), Style::default())))
-            .collect()
+        let width = width as usize;
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for raw in text.split('\n') {
+            for wrapped in wrap_plain_line(raw, width) {
+                lines.push(Line::from(Span::styled(wrapped, Style::default())));
+            }
+        }
+        lines
     }
+}
+
+/// Wrap a single plain-text line at `width` display columns so no output line
+/// exceeds it, preserving every character (whitespace included) verbatim.
+///
+/// Unlike [`wrap_styled_line`] — which collapses whitespace runs and drops
+/// leading/trailing spaces because it reflows *styled* content — plain tool
+/// output (code, JSON, aligned shell output) must render exactly as the tool
+/// emitted it.  Breaks happen at whitespace boundaries when one fits within
+/// the width; a word wider than the width is hard-split by grapheme cluster.
+/// The greedy pass emits each grapheme exactly once, so concatenating the
+/// wrapped lines reproduces the input.
+///
+/// The pre-wrap is what keeps the rest of the pipeline consistent: the
+/// renderer draws lines into a non-wrapping `Paragraph`, and the height math
+/// (`wrapped_line_height` = `line_width.div_ceil(width)`) assumes no rendered
+/// line exceeds the content width.  `markdown_lines`/`ansi_lines`/the diff
+/// renderer all pre-wrap for the same reason — this is the plain-text sibling.
+fn wrap_plain_line(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    // Fast path: the line already fits — one verbatim line, no work.
+    if display_width(line) <= width {
+        return vec![line.to_string()];
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_width = 0usize;
+    // Byte length + display width of the last whitespace boundary seen on the
+    // current line.  When the line overflows we cut here (keeping the whole
+    // whitespace run on the previous line) so words stay whole where possible.
+    let mut last_space: Option<(usize, usize)> = None;
+
+    for g in unicode_segmentation::UnicodeSegmentation::graphemes(line, true) {
+        let g_width = grapheme_width(g);
+        buf.push_str(g);
+        buf_width += g_width;
+        if g.chars().all(|c| c.is_whitespace()) {
+            last_space = Some((buf.len(), buf_width));
+        }
+        if buf_width > width {
+            // Prefer cutting at the last whitespace boundary, but only if it
+            // itself fits within the width (a boundary beyond it would leave
+            // the cut line over-wide); otherwise hard-split at the grapheme
+            // that overflowed.  A cut at byte 0 means the single grapheme
+            // alone is wider than the line — emit it on its own line.
+            let cut = match last_space {
+                Some((b, w)) if w <= width => (b, w),
+                _ => (buf.len() - g.len(), buf_width - g_width),
+            };
+            if cut.0 == 0 {
+                out.push(buf.clone());
+                buf.clear();
+                buf_width = 0;
+            } else {
+                out.push(buf[..cut.0].to_string());
+                buf = buf[cut.0..].to_string();
+                buf_width -= cut.1;
+            }
+            last_space = None;
+        }
+    }
+    if !buf.is_empty() || out.is_empty() {
+        out.push(buf);
+    }
+    out
 }
 
 /// Terminal-safe filter for tool-result content: keeps complete SGR color
@@ -219,7 +290,7 @@ fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 text_len = text.len(),
                 "failed to parse ANSI escape codes, falling back to plain text"
             );
-            plain_text_lines(text)
+            plain_text_lines(text, width as u16)
         }
     }
 }
@@ -657,7 +728,7 @@ pub(crate) fn render_turn_lines(
                 if content.contains("\x1b[") {
                     body.extend(ansi_lines(&content, tool_content_width));
                 } else if tr.is_error {
-                    body.extend(plain_text_lines(&content));
+                    body.extend(plain_text_lines(&content, tool_content_width));
                 } else if !DIFF_EXCLUDED_TOOLS.contains(&tr.name.as_str())
                     && let Some(diff_lines) = try_render_diff_content(&content, tool_content_width)
                 {
@@ -669,7 +740,7 @@ pub(crate) fn render_turn_lines(
                     // MARKDOWN_TOOLS).
                     body.extend(markdown_lines(&content, tool_content_width));
                 } else {
-                    body.extend(plain_text_lines(&content));
+                    body.extend(plain_text_lines(&content, tool_content_width));
                 }
             }
         }
@@ -1952,25 +2023,114 @@ mod tests {
 
     #[test]
     fn plain_text_lines_empty() {
-        let result = plain_text_lines("");
+        let result = plain_text_lines("", 80);
         assert_eq!(result.len(), 1, "empty input → one empty line");
         assert_eq!(result[0].width(), 0);
     }
 
     #[test]
     fn plain_text_lines_single() {
-        let result = plain_text_lines("hello");
+        let result = plain_text_lines("hello", 80);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].to_string(), "hello");
     }
 
     #[test]
     fn plain_text_lines_multi() {
-        let result = plain_text_lines("a\nb\nc");
+        let result = plain_text_lines("a\nb\nc", 80);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].to_string(), "a");
         assert_eq!(result[1].to_string(), "b");
         assert_eq!(result[2].to_string(), "c");
+    }
+
+    #[test]
+    fn plain_text_lines_wraps_long_line() {
+        // A 200-char single-span line must wrap into ≤40-column lines — the
+        // regression fixed by passing the content width: previously plain
+        // tool output was emitted unwrapped and clipped at the viewport edge.
+        let long = "x".repeat(200);
+        let result = plain_text_lines(&long, 40);
+        assert_eq!(result.len(), 5, "200 chars at 40 wide = 5 lines");
+        for line in &result {
+            assert!(
+                line.width() <= 40,
+                "wrapped line width {} exceeds 40",
+                line.width()
+            );
+        }
+        // Concatenation reproduces the input exactly (nothing dropped).
+        let joined: String = result.iter().map(|l| l.to_string()).collect();
+        assert_eq!(joined, long);
+    }
+
+    #[test]
+    fn plain_text_lines_wraps_at_word_boundary() {
+        // Break at whitespace when it fits, keeping the whole word on the
+        // next line — but never dropping content (the space stays as trailing
+        // whitespace on the wrapped line, so concatenation is verbatim).
+        let result = plain_text_lines("hello world", 6);
+        let lines: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        assert_eq!(lines, vec!["hello ", "world"]);
+        let joined: String = result.iter().map(|l| l.to_string()).collect();
+        assert_eq!(joined, "hello world", "content preserved verbatim");
+    }
+
+    #[test]
+    fn plain_text_lines_preserves_leading_whitespace() {
+        // Indented plain output (code, aligned columns) must keep its
+        // indentation when wrapped — no whitespace collapsing.
+        let result = plain_text_lines("        let x = a_very_long_identifier;", 16);
+        let joined: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            joined.starts_with("        let"),
+            "leading indent must survive wrapping: {joined:?}"
+        );
+        for line in &result {
+            assert!(
+                line.width() <= 16,
+                "wrapped line width {} exceeds 16",
+                line.width()
+            );
+        }
+    }
+
+    #[test]
+    fn plain_text_lines_splits_oversized_word() {
+        // A single word wider than the width is hard-split by grapheme.
+        let result = plain_text_lines("abcdefghij", 3);
+        let lines: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        assert_eq!(lines, vec!["abc", "def", "ghi", "j"]);
+        let joined: String = result.iter().map(|l| l.to_string()).collect();
+        assert_eq!(joined, "abcdefghij");
+    }
+
+    #[test]
+    fn plain_text_lines_wide_grapheme_alone_on_line() {
+        // A grapheme wider than the width (e.g. an emoji at width 1) must not
+        // loop forever; it occupies its own over-wide line.
+        let result = plain_text_lines("😀", 1);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "😀");
+    }
+
+    #[test]
+    fn plain_text_lines_cjk_widths() {
+        // Display width (not char count) drives wrapping: 4 CJK chars = 8
+        // columns at width 4 → two lines of 2 chars each.
+        let result = plain_text_lines("日本語文", 4);
+        let lines: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        assert_eq!(lines, vec!["日本", "語文"]);
+    }
+
+    #[test]
+    fn plain_text_lines_trailing_newline_keeps_blank_line() {
+        // split('\n') semantics: a trailing newline yields a final blank
+        // line, matching the old behavior.
+        let result = plain_text_lines("a\n", 80);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].to_string(), "a");
+        assert_eq!(result[1].to_string(), "");
     }
 
     // ── lines_height ────────────────────────────────────────────────────
@@ -3218,6 +3378,68 @@ content ---"
         assert!(
             !has_bold,
             "grep result content must not be styled bold by markdown:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_plain_text_result_wraps_to_content_width() {
+        // Long plain-text tool output (a grep hit with a huge line, shell
+        // output, file content) must wrap to the tool content width instead of
+        // being clipped at the viewport edge.  Regression for the plain-text
+        // fallback introduced when markdown rendering was removed: it split on
+        // `\n` but never wrapped, and the renderer's `Paragraph` does not wrap
+        // either — so an over-long span ran off the right edge.
+        let long_line = "q".repeat(200);
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "grep".into(),
+                content: format!("src/main.rs:1:{long_line}"),
+                is_error: false,
+                invocation_description: "Searching for `x`.".into(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+        // tool_content_width = 85; each body line is wrapped to it, then gets
+        // a 2-col left indent + right margin, so the full line is ≤ 85 + 4.
+        // Before the fix the single 213-char span produced one 213+4-wide
+        // line that the non-wrapping Paragraph clipped.
+        for line in &lines {
+            assert!(
+                line.width() <= 85 + 4,
+                "rendered line width {} exceeds tool content width + margins",
+                line.width()
+            );
+        }
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Wrapping actually happened: the long content spans several lines.
+        assert!(text.contains("src/main.rs:1:"), "{text}");
+        let content_lines = text.lines().count();
+        assert!(
+            content_lines > 3,
+            "long tool output should wrap into {content_lines} lines, expected > 3"
+        );
+        // Wrapping must not drop or alter characters: every 'q' survives (the
+        // header/description contain none, so the count is exact).
+        let q_count = text.chars().filter(|&c| c == 'q').count();
+        assert_eq!(
+            q_count, 200,
+            "wrapped content must not drop characters, found {q_count}/200"
         );
     }
 

@@ -2180,7 +2180,7 @@ impl App {
         } else {
             return 0;
         };
-        let lines = plain_text_lines(text);
+        let lines = plain_text_lines(text, width);
         lines_height(&lines, width).max(1) as u16
     }
 
@@ -4285,7 +4285,10 @@ impl TurnEventHandler for App {
 
 #[cfg(test)]
 pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
-    lines_height(&crate::markdown_render::plain_text_lines(text), width)
+    lines_height(
+        &crate::markdown_render::plain_text_lines(text, width),
+        width,
+    )
 }
 
 /// Find the visible turn index and the content-line offset within that
