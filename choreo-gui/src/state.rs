@@ -94,11 +94,25 @@ impl TurnEventHandler for AppState {
         _last_prompt_tokens: Option<u32>,
     ) {
         trace!(%request_id, "handle_done");
+        // The final TurnAppended usually cleaned description entries via
+        // `insert_or_replace`; clear for this turn anyway (before the
+        // request→turn mapping is removed) so a dropped final broadcast
+        // can't leak them.
+        if let Some(&turn_id) = self.session_view.request_to_turn.get(&request_id) {
+            self.session_view.clear_tool_call_descriptions(turn_id);
+        }
         self.session_view.request_to_turn.remove(&request_id);
     }
 
     fn handle_failed(&mut self, _session_id: u64, request_id: u32, error: String) {
         trace!(%request_id, %error, "handle_failed");
+        // A failed request never re-broadcasts its turn, so `insert_or_replace`
+        // won't clean the description map — clear it here (before the
+        // request→turn mapping is removed) to keep the map bounded by
+        // in-flight calls even on the failure path.
+        if let Some(&turn_id) = self.session_view.request_to_turn.get(&request_id) {
+            self.session_view.clear_tool_call_descriptions(turn_id);
+        }
         self.session_view.request_to_turn.remove(&request_id);
         self.status_texts.push(format!("[error] {error}"));
     }

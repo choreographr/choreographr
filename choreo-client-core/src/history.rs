@@ -84,6 +84,23 @@ impl SessionView {
         self.turns.insert(turn_id, turn);
     }
 
+    /// Drop the invocation-description entries for every call of `turn_id`.
+    ///
+    /// [`Self::insert_or_replace`] cleans the map when the authoritative turn
+    /// replaces the accumulated one, but a request that fails mid-tool never
+    /// re-broadcasts its turn (`Failed` arrives with no final `TurnAppended`),
+    /// and a success whose final broadcast was dropped under load would
+    /// otherwise leak entries too.  Callers invoke this from their
+    /// request-terminal handlers (`handle_done` / `handle_failed`) so the map
+    /// stays bounded by in-flight calls even on those paths.
+    pub fn clear_tool_call_descriptions(&mut self, turn_id: u32) {
+        if let Some(turn) = self.turns.get(&turn_id) {
+            for tc in &turn.tool_calls {
+                self.tool_call_descriptions.remove(&tc.call_id);
+            }
+        }
+    }
+
     pub fn get(&self, turn_id: u32) -> Option<&Turn> {
         self.turns.get(&turn_id)
     }
@@ -200,18 +217,19 @@ impl SessionView {
             tracing::warn!(%turn_id, "tool_result_chunk: unknown turn");
             return;
         };
-        // The start event's description, if it arrived before this chunk
-        // (the normal FIFO order) — used to fill an empty placeholder/stub.
-        let pending_desc = self.tool_call_descriptions.get(call_id).cloned();
+        // The start event's description is only consulted when a record
+        // actually needs it: a placeholder/stub that already carries its
+        // description (the common seeded case) skips the map read and the
+        // String clone entirely on the per-chunk hot path.
         match turn.tool_results.iter_mut().find(|r| r.call_id == call_id) {
             Some(result) => {
                 // A record that predates the start event (e.g. the seeded
                 // placeholder when the ToolCallStarted broadcast was dropped)
                 // still gets its header from the first chunk onward.
                 if result.invocation_description.is_empty()
-                    && let Some(desc) = pending_desc
+                    && let Some(desc) = self.tool_call_descriptions.get(call_id)
                 {
-                    result.invocation_description = desc;
+                    result.invocation_description = desc.clone();
                 }
                 push_capped(&mut result.content, data);
             }
@@ -235,7 +253,13 @@ impl SessionView {
                     name,
                     content,
                     is_error: false,
-                    invocation_description: pending_desc.unwrap_or_default(),
+                    // The stub branch runs once per call, so the lookup +
+                    // clone here is off the per-chunk hot path.
+                    invocation_description: self
+                        .tool_call_descriptions
+                        .get(call_id)
+                        .cloned()
+                        .unwrap_or_default(),
                 });
             }
         }
@@ -594,5 +618,73 @@ mod tests {
             view.tool_call_descriptions.is_empty(),
             "replaced turn's call descriptions must be dropped"
         );
+    }
+
+    #[test]
+    fn clear_tool_call_descriptions_covers_failed_request_path() {
+        // A request that fails mid-tool never re-broadcasts its turn, so
+        // `insert_or_replace` never runs for it; the request-terminal
+        // handlers call `clear_tool_call_descriptions` instead so the map
+        // stays bounded by in-flight calls even then.
+        let mut view = SessionView::new();
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
+        view.request_to_turn.insert(7, 1);
+        view.tool_call_started(
+            7,
+            "call-1".into(),
+            "sh".into(),
+            "{}".into(),
+            "Running shell command: `ls`.".into(),
+        );
+        assert_eq!(view.tool_call_descriptions.len(), 1);
+
+        // No TurnAppended arrives; the failed-request handler clears by
+        // turn_id (looked up from request_to_turn before it is removed).
+        view.clear_tool_call_descriptions(1);
+        assert!(
+            view.tool_call_descriptions.is_empty(),
+            "failed-request cleanup must drop the stashed descriptions"
+        );
+
+        // Idempotent, and a no-op for unknown turns.
+        view.clear_tool_call_descriptions(1);
+        view.clear_tool_call_descriptions(999);
+    }
+
+    #[test]
+    fn tool_result_chunk_fills_empty_placeholder_from_stash() {
+        // A placeholder whose description is still empty (e.g. the seeded
+        // turn arrived but the start event's description was stashed for a
+        // record that predates it) must be filled from the stash on the
+        // first chunk — the append path, not just stub creation.
+        let mut view = SessionView::new();
+        let mut turn = turn_with_tool_call("call-1", "sh");
+        turn.tool_results.push(ToolResultRecord {
+            call_id: "call-1".into(),
+            name: "sh".into(),
+            content: String::new(),
+            is_error: false,
+            invocation_description: String::new(),
+        });
+        view.insert_or_replace(1, turn);
+        view.request_to_turn.insert(7, 1);
+
+        // The start event stashes the description (broadcast before chunks).
+        view.tool_call_started(
+            7,
+            "call-1".into(),
+            "sh".into(),
+            "{}".into(),
+            "Running shell command: `ls`.".into(),
+        );
+
+        view.tool_result_chunk(7, "call-1", "output\n");
+
+        let result = &view.get(1).unwrap().tool_results[0];
+        assert_eq!(
+            result.invocation_description, "Running shell command: `ls`.",
+            "append path must fill the empty placeholder from the stash"
+        );
+        assert_eq!(result.content, "output\n");
     }
 }

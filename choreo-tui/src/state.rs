@@ -4066,6 +4066,14 @@ impl TurnEventHandler for App {
             return;
         };
         let display = self.display_for(session_id);
+        // The final TurnAppended already cleaned description entries via
+        // `insert_or_replace`, but if that broadcast was dropped under load
+        // the map would keep them — clear for this turn so the map stays
+        // bounded by in-flight calls even when the terminal broadcast is
+        // lost.  (Looked up before `request_to_turn` is removed.)
+        if let Some(&turn_id) = display.view.request_to_turn.get(&request_id) {
+            display.view.clear_tool_call_descriptions(turn_id);
+        }
         display.view.request_to_turn.remove(&request_id);
         display.active.remove(&request_id);
         if let Some(usage) = token_usage {
@@ -4097,6 +4105,13 @@ impl TurnEventHandler for App {
         };
         let display = self.display_for(session_id);
         display.error = Some(error);
+        // A failed request never re-broadcasts its turn, so `insert_or_replace`
+        // won't clean the description map — clear it here (before the
+        // request→turn mapping is removed) to keep the map bounded by
+        // in-flight calls even on the failure path.
+        if let Some(&turn_id) = display.view.request_to_turn.get(&request_id) {
+            display.view.clear_tool_call_descriptions(turn_id);
+        }
         display.view.request_to_turn.remove(&request_id);
         display.active.remove(&request_id);
         display.streaming_turn_index = None;

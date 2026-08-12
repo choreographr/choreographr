@@ -104,10 +104,13 @@ fn wrap_plain_line(line: &str, width: usize) -> Vec<String> {
     }
     // A line with no whitespace at all can never break at a word boundary:
     // every overflow is a hard grapheme split, which [`grapheme_chunks`]
-    // implements (the shared hard-splitter).  Sanitized content has no
-    // standalone mid-line zero-width graphemes, so the chunk boundaries
-    // coincide exactly (common for huge single tokens — base64, URLs,
-    // minified JSON).  This also keeps the main loop below free of a
+    // implements (the shared hard-splitter).  With floor 0 it credits each
+    // grapheme exactly its display width — the same measure the main loop
+    // uses — so the chunk boundaries coincide exactly, whether or not the
+    // run happens to contain a zero-width grapheme (combining marks pass
+    // the terminal filter, but ratatui drops them at draw time, so they are
+    // genuinely invisible here).  Common for huge single tokens — base64,
+    // URLs, minified JSON.  This also keeps the main loop below free of a
     // per-overflow whitespace scan.
     if !line.contains(char::is_whitespace) {
         return grapheme_chunks(line, width, 0);
@@ -298,17 +301,21 @@ const TAB_STOP: usize = 8;
 
 /// Replace each `\t` with the spaces needed to reach the next `TAB_STOP`
 /// column, tracking the column per logical line (`\n` resets it).  Runs on
-/// already-sanitized content (no other control chars can reach it), so only
-/// tabs need handling; every other char advances the column by its display
-/// width.  O(1) for content without tabs (the common case), O(n) with one
-/// output allocation otherwise.
+/// already-sanitized content, so the only control chars that can reach it
+/// are `\t`, `\n`, and the bytes of a complete SGR color sequence (`ESC [`
+/// params `m`) — the latter are invisible on screen, so they are copied
+/// through *without* advancing the column (counting them would shrink the
+/// tab padding after a color code).  Every other char advances the column
+/// by its display width.  O(1) for content without tabs (the common case),
+/// O(n) with one output allocation otherwise.
 fn expand_tabs(text: &str) -> String {
     if !text.contains('\t') {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
     let mut col = 0usize;
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
             '\t' => {
                 // Advance to the next multiple of TAB_STOP from the line
@@ -320,6 +327,30 @@ fn expand_tabs(text: &str) -> String {
             '\n' => {
                 out.push('\n');
                 col = 0;
+            }
+            // A complete SGR sequence (the only ESC use the terminal filter
+            // keeps, per [`sanitize_for_terminal`]) is invisible — copy it
+            // verbatim and leave the column where it was.  Counting the
+            // escape bytes as visible columns would under-expand a tab that
+            // follows a color code (e.g. `\x1b[32mred\t` would pad to column
+            // 8 of the *raw* text instead of the visible column 3).
+            '\u{1b}' => {
+                out.push('\u{1b}');
+                if chars.peek() == Some(&'[') {
+                    out.push('[');
+                    chars.next();
+                    // Params are 0x30-0x3F, then the final byte 0x40-0x7E
+                    // ('m' for SGR).  sanitize_for_terminal only keeps
+                    // complete sequences, so the loop always terminates on
+                    // the final byte.
+                    while let Some(&n) = chars.peek() {
+                        out.push(n);
+                        chars.next();
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
             }
             _ => {
                 out.push(c);
@@ -3848,6 +3879,43 @@ content ---"
     fn expand_tabs_consecutive_tabs_chain() {
         // Two tabs at line start: col 0 → 8, then col 8 → 16.
         assert_eq!(expand_tabs("\t\tfoo"), "                foo");
+    }
+
+    #[test]
+    fn expand_tabs_ignores_sgr_sequences_for_column_tracking() {
+        // A complete SGR color sequence is invisible on screen: the column
+        // must advance only past the visible chars, so a tab after a color
+        // code pads to the correct 8-column stop instead of treating the
+        // escape bytes as visible columns.  "abc" sits at column 3 (the
+        // ESC[31m adds nothing) → 5 spaces.
+        assert_eq!(
+            expand_tabs("\x1b[31mabc\tdef"),
+            "\x1b[31mabc     def",
+            "SGR bytes must not count toward the column"
+        );
+        // Multi-param SGR and the reset form are handled the same way.
+        assert_eq!(
+            expand_tabs("\x1b[1;32mab\tcd"),
+            "\x1b[1;32mab      cd",
+            "multi-param SGR must not count toward the column"
+        );
+        assert_eq!(
+            expand_tabs("\x1b[0m\tfoo"),
+            "\x1b[0m        foo",
+            "a tab right after a reset code pads from column 0"
+        );
+        // The sequence is preserved verbatim (the ANSI renderer needs it).
+        assert!(expand_tabs("\x1b[31mred\t").starts_with("\x1b[31mred"));
+    }
+
+    #[test]
+    fn expand_tabs_sgr_and_newline_interaction() {
+        // Column tracking resets per line even when a color code spans lines:
+        // each logical line starts its own tab-stop cycle.
+        assert_eq!(
+            expand_tabs("\x1b[31mred\t\nblue\t"),
+            "\x1b[31mred     \nblue    "
+        );
     }
 
     #[test]

@@ -1375,10 +1375,25 @@ pub(crate) fn run_agent_loop(
                 // `…`.") from the moment the seeded turn is broadcast — before
                 // any output streams — instead of waiting for a streaming
                 // chunk that may be dropped or for the final record.
-                let invocation_descriptions: Vec<String> = tool_use
+                let description_by_call: HashMap<String, String> = tool_use
                     .tool_calls
                     .iter()
-                    .map(|tc| ctx.tool_registry.describe_invocation(tc))
+                    .map(|tc| (tc.id.clone(), ctx.tool_registry.describe_invocation(tc)))
+                    .collect();
+                // Seed in call order by deriving the parallel slice from the
+                // map, so `describe_invocation` runs exactly once per call.
+                // The map is reused by the serial/concurrent dispatch phases
+                // below — a second computation would be wasteful (`vm`
+                // formats its source via rustfmt, `series` describes every
+                // step).
+                let invocation_descriptions: Vec<String> = tool_call_records
+                    .iter()
+                    .map(|tc| {
+                        description_by_call
+                            .get(&tc.call_id)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
                     .collect();
                 // Record the producing provider+model once: it feeds both the
                 // turn's provenance and the persisted response-id provenance.
@@ -1463,14 +1478,17 @@ pub(crate) fn run_agent_loop(
                         break;
                     }
 
-                    // The invocation description is generated up front so the
-                    // ToolCallStarted broadcast carries it (clients render the
-                    // tool's context — e.g. "Running command: `…`." — from the
-                    // start event, not from a streaming chunk that may be
-                    // dropped) and the serial error/panic outputs carry it too
-                    // (a timed-out or cancelled tool renders with the same
+                    // The invocation description (computed once, above) rides
+                    // the ToolCallStarted broadcast so clients render the
+                    // tool's context — e.g. "Running command: `…`." — from
+                    // the start event, not from a streaming chunk that may be
+                    // dropped; the serial error/panic outputs carry it too (a
+                    // timed-out or cancelled tool renders with the same
                     // invocation context the concurrent path shows).
-                    let invocation_description = ctx.tool_registry.describe_invocation(&tool_call);
+                    let invocation_description = description_by_call
+                        .get(&tool_call.id)
+                        .cloned()
+                        .unwrap_or_default();
 
                     if let Err(e) =
                         ctx.cmd_tx
@@ -1566,12 +1584,14 @@ pub(crate) fn run_agent_loop(
                 // ── Phase 2: All remaining tools (concurrent) ───────
                 if !cancelled && !concurrent.is_empty() {
                     for tc in concurrent.iter() {
-                        // Carry the invocation description on the start event so
-                        // clients render the tool's context (e.g. "Running
-                        // command: `…`.") from the broadcast rather than from a
-                        // streaming chunk — chunks are droppable under load, and
-                        // this event is queued before the tool even starts.
-                        let invocation_description = ctx.tool_registry.describe_invocation(tc);
+                        // Carry the invocation description (computed once,
+                        // above) on the start event so clients render the
+                        // tool's context (e.g. "Running command: `…`.") from
+                        // the broadcast rather than from a streaming chunk —
+                        // chunks are droppable under load, and this event is
+                        // queued before the tool even starts.
+                        let invocation_description =
+                            description_by_call.get(&tc.id).cloned().unwrap_or_default();
                         if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::ToolCallStarted {
                                 session_id: ctx.session_id,
@@ -1635,7 +1655,10 @@ pub(crate) fn run_agent_loop(
                     let mut call_infos: Vec<CallInfo> = Vec::with_capacity(concurrent.len());
                     for tool_call in concurrent.into_iter() {
                         let timeout = determine_tool_timeout(&tool_call.name);
-                        let invocation_description = reg.describe_invocation(&tool_call);
+                        let invocation_description = description_by_call
+                            .get(&tool_call.id)
+                            .cloned()
+                            .unwrap_or_default();
                         // One dispatch-time instant for both the handle (delivered
                         // path) and the CallInfo (panic-synthesis path), so the
                         // collector's per-tool elapsed log is consistent either way.
