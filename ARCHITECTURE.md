@@ -1374,19 +1374,26 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
 diverge unboundedly from the recorded result:
 
 - `spawn_with_streaming` (sh/exec/fish/nu) streams **both** stdout and stderr:
-  the two pipes are drained in background threads, split into lines, and merged
-  onto one channel in arrival order; a single consumer forwards the lines
-  through the shared `ByteBudget` (the same "first N bytes + one marker"
-  engine) and accumulates the same capped bytes into the returned body. The
-  stream budget reserves `format_shell_output`'s framing (the `$ {cmd}\n`
-  prefix, the exit-code footer, and the truncation marker) *inside* the cap,
-  so the final cap is a no-op: the recorded body contains exactly the streamed
-  bytes — truncation marker included — even when the stream is cut, and a
-  tool that writes progress to stderr (cargo, nextest, make, …) streams live
-  instead of appearing all at once. Oversized unterminated lines are flushed
-  forward as partial chunks (never splitting a UTF-8 char, holding back a
-  trailing `\r` so CRLF still folds) so a newline-less firehose cannot
-  balloon daemon memory.
+  the two pipes are drained in background threads, split into lines (CRLF
+  folded; oversized unterminated lines are flushed forward as partial chunks
+  that never split a UTF-8 char and hold back a trailing `\r` so CRLF still
+  folds), and merged onto one channel in arrival order; a single consumer
+  escapes the Cf spoofing class (`sanitize_transcript`) *before* the bytes
+  enter the shared `ByteBudget`, then forwards the escaped lines (the same
+  "first N bytes + one marker" engine) and accumulates the same capped bytes
+  into the returned body. Budgeting the *escaped* form is what makes the
+  record byte-identical to the live view even for Cf-heavy output — escaping
+  expands, and charging the budget for the expanded bytes keeps
+  `finish_tool_output`'s cap a no-op (no re-cut, single marker). The stream
+  budget reserves `format_shell_output`'s framing (the `$ {cmd}\n` header —
+  measured at its escaped size — the exit-code footer, and the truncation
+  marker) *inside* the cap via `RecordFraming`, so the final cap is a no-op
+  and the exit-code footer always survives (including the transcript re-cap
+  in `record_tool_completion`). A tool that writes progress to stderr (cargo,
+  nextest, make, …) streams live instead of appearing all at once. On a
+  timeout the watchdog kills the child and signals an abort channel; the
+  merger selects on it while blocked on a full output channel, so a stalled
+  subscriber can never wedge the tool past its timeout.
 - `find`'s walk enforces the byte budget during collection (charging each rendered line
   plus its joining newline), stopping the walk and reporting the collected count in the
   marker — the streamed view and the final result now agree. The walk's budget reserves
@@ -2665,10 +2672,15 @@ already gone.
 On the streaming path (`spawn_with_streaming`), both drains split their
 output into complete lines and forward them through a single merge channel
 in arrival order — each stream keeps its relative order; the stdout/stderr
-interleave itself is scheduling-dependent. The final result body is built
-from that same merged stream, so the recorded output contains exactly what
-was streamed, truncation marker included (the stream budget reserves the
-record framing so the final cap never re-cuts the body).
+interleave itself is scheduling-dependent. The merger escapes Cf chars
+before the bytes enter the stream budget and accumulates that same escaped
+stream, so the recorded output contains exactly what was streamed,
+truncation marker included (the stream budget reserves the record framing
+via `RecordFraming` so the final cap never re-cuts the body). A watchdog
+timeout additionally signals an abort channel that the merger selects on
+while blocked on a full output channel, so a stalled subscriber cannot
+wedge the tool past its timeout; the error path (a rare `wait()` failure)
+tears every thread down before propagating.
 
 
 | Layer | What's tested | Location |

@@ -1,4 +1,4 @@
-use choreo_daemon::tools::shell_util::{run_shell_streaming, spawn_with_streaming};
+use choreo_daemon::tools::shell_util::{RecordFraming, run_shell_streaming, spawn_with_streaming};
 use choreo_daemon::{ShArgs, execute_sh_tool};
 use std::path::Path;
 
@@ -20,7 +20,8 @@ fn spawn_with_streaming_produces_stdout() {
     let mut c = cmd("bash", "echo hello world", dir);
     let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
-    let (output, was_killed) = spawn_with_streaming(&mut c, 5000, 0, tx).unwrap();
+    let (output, was_killed) =
+        spawn_with_streaming(&mut c, 5000, RecordFraming::none(), tx).unwrap();
     drop(rx);
     assert!(!was_killed, "should not have been killed by timeout");
 
@@ -36,7 +37,8 @@ fn spawn_with_streaming_stderr_is_streamed_into_the_body() {
     let mut c = cmd("bash", "echo errmsg >&2", dir);
     let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
-    let (output, was_killed) = spawn_with_streaming(&mut c, 5000, 0, tx).unwrap();
+    let (output, was_killed) =
+        spawn_with_streaming(&mut c, 5000, RecordFraming::none(), tx).unwrap();
     // The channel is unbounded, so every forwarded chunk is buffered by the
     // time the tool returns — collect them all.
     let streamed: String = rx
@@ -63,7 +65,8 @@ fn spawn_with_streaming_interleaves_stdout_and_stderr() {
     let mut c = cmd("bash", "echo out1; echo err1 >&2; echo out2", dir);
     let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
-    let (output, _was_killed) = spawn_with_streaming(&mut c, 5000, 0, tx).unwrap();
+    let (output, _was_killed) =
+        spawn_with_streaming(&mut c, 5000, RecordFraming::none(), tx).unwrap();
     let streamed: String = rx
         .try_iter()
         .map(|c| String::from_utf8_lossy(&c).into_owned())
@@ -126,7 +129,8 @@ fn spawn_with_streaming_timeout_kills() {
     let mut c = cmd("bash", "sleep 10", dir);
     let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
-    let (output, was_killed) = spawn_with_streaming(&mut c, 500, 0, tx).unwrap();
+    let (output, was_killed) =
+        spawn_with_streaming(&mut c, 500, RecordFraming::none(), tx).unwrap();
     drop(rx);
     assert!(was_killed, "should have been killed by timeout");
     assert!(!output.status.success(), "should have non-zero exit");
@@ -206,12 +210,12 @@ fn spawn_with_streaming_caps_total_forwarded_bytes() {
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
 
-    // Direct call with reservation 0: the stream caps at MAX (no record
-    // framing is reserved), so the accumulated stdout may carry the marker on
-    // top of the budget — see the assertion below.
+    // Direct call with `RecordFraming::none()`: the stream caps at MAX (no
+    // record framing is reserved), so the accumulated stdout may carry the
+    // marker on top of the budget — see the assertion below.
     let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (output, _was_killed) =
-        spawn_with_streaming(&mut cmd, 30_000, 0, output_tx).expect("spawn");
+        spawn_with_streaming(&mut cmd, 30_000, RecordFraming::none(), output_tx).expect("spawn");
 
     let mut forwarded = 0usize;
     let mut marker_count = 0usize;
@@ -295,4 +299,60 @@ fn run_shell_streaming_truncated_record_matches_streamed_body() {
     // The marker appears exactly once — inside the body, not re-appended by
     // a re-cut (which would also drop streamed bytes).
     assert_eq!(result.matches("...[truncated]").count(), 1);
+}
+
+#[test]
+#[ignore]
+fn run_shell_streaming_cf_heavy_record_matches_streamed_body() {
+    // Regression for the sanitize-expansion hole: Cf chars expand when
+    // escaped for the transcript (U+200B → `\u{200b}`, 3 → 7 bytes), so a
+    // raw-near-cap body previously overflowed `finish_tool_output`'s body cap
+    // at format time and got re-cut — the streamed tail vanished from the
+    // record and a second `...[truncated]` marker appeared. The stream budget
+    // now accounts for the *escaped* bytes (the merger sanitizes each line
+    // before forwarding), so the recorded body is byte-identical to the live
+    // view and the marker appears exactly once.
+    let dir = Path::new("/tmp");
+    // ~132 KiB of U+200B (ZWSP) — far past the budget once escaped.
+    let mut c = cmd(
+        "sh",
+        "i=0; while [ $i -lt 45000 ]; do printf '\\342\\200\\213'; i=$((i+1)); done",
+        dir,
+    );
+    let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+    let collector = std::thread::spawn(move || {
+        let mut s = Vec::new();
+        for chunk in rx {
+            s.extend_from_slice(&chunk);
+        }
+        s
+    });
+
+    let result = run_shell_streaming(&mut c, "sh", 30_000, tx).unwrap();
+    let streamed = collector.join().unwrap();
+
+    let body = result
+        .strip_prefix("$ sh\n")
+        .expect("header prefix")
+        .strip_suffix("\n\nExit code: 0")
+        .expect("footer suffix");
+    assert_eq!(
+        body.as_bytes(),
+        streamed,
+        "recorded body must equal the streamed view even for Cf-heavy output"
+    );
+    assert!(
+        streamed.ends_with(b"\n...[truncated]"),
+        "streamed view must show the truncation marker"
+    );
+    assert!(
+        result.len() <= choreo_sanitize::MAX_TOOL_OUTPUT_BYTES,
+        "recorded result must stay within the budget: {}",
+        result.len()
+    );
+    assert_eq!(
+        result.matches("...[truncated]").count(),
+        1,
+        "the marker must appear exactly once (no re-cut)"
+    );
 }

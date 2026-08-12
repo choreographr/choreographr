@@ -1,5 +1,6 @@
 use super::{
     MAX_TOOL_OUTPUT_BYTES, STREAMING_CHANNEL_CAPACITY, ToolExecError, finish_tool_output_sanitized,
+    sanitize_transcript,
 };
 use choreo_sanitize::{ByteBudget, TRUNCATION_SUFFIX};
 use crossbeam_channel;
@@ -217,6 +218,7 @@ fn spawn_watchdog(
     pidfd: Option<OwnedFd>,
     done_rx: mpsc::Receiver<()>,
     killed_tx: mpsc::Sender<()>,
+    abort_tx: Option<crossbeam_channel::Sender<()>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         if done_rx
@@ -235,6 +237,13 @@ fn spawn_watchdog(
                 timeout_ms, "shell tool timed out; killed child process group"
             );
             let _ = killed_tx.send(());
+            if let Some(abort_tx) = abort_tx {
+                // The streaming merger may be blocked on a full output
+                // channel (a stalled subscriber); signal it to abandon so the
+                // drain threads unblock and the timeout stays authoritative —
+                // a slow consumer can never wedge the tool past its timeout.
+                let _ = abort_tx.send(());
+            }
         }
     })
 }
@@ -293,14 +302,26 @@ fn poll_readable(
     }
 }
 
+/// How much of the bytes read by [`drain_fd`] is accumulated into its
+/// returned buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainAccumulate {
+    /// Discard everything — the caller consumes the bytes via `on_data`
+    /// (the streaming paths) and needs no second copy. Skips the cap
+    /// accounting entirely.
+    None,
+    /// Keep the first `cap` bytes — the *first* bytes win, matching the
+    /// byte-cap truncation the final tool result applies.
+    Capped(usize),
+}
+
 /// Read `reader` (whose raw fd must be `fd`) to EOF, or until `stop_rx` is
 /// signalled, returning everything read. `on_data` is invoked with each chunk
-/// (used for line-streaming). When `accumulate_cap` is `Some(n)`, the
-/// returned buffer stops growing once it reaches `n` bytes — the *first* `n`
-/// bytes are kept, matching the byte-cap truncation the final tool result
-/// applies — while `on_data` still sees every chunk and the drain keeps
-/// consuming, so a child that out-produces the cap can never deadlock on a
-/// full pipe.
+/// (used for line-streaming). [`DrainAccumulate::Capped`] bounds the returned
+/// buffer at `n` bytes — the *first* `n` bytes are kept, matching the
+/// byte-cap truncation the final tool result applies — while `on_data` still
+/// sees every chunk and the drain keeps consuming, so a child that
+/// out-produces the cap can never deadlock on a full pipe.
 ///
 /// The fd is put in non-blocking mode first so the drain loop can consume
 /// every byte available per `poll` verdict (full throughput for large
@@ -313,7 +334,7 @@ fn drain_fd<R: Read + AsFd>(
     stop_rx: mpsc::Receiver<()>,
     poll_ms: i32,
     on_data: &mut dyn FnMut(&[u8]),
-    accumulate_cap: Option<usize>,
+    accumulate: DrainAccumulate,
 ) -> Vec<u8> {
     // Keep the raw fd around purely for the trace log below; all syscalls use
     // the BorrowedFd from `reader.as_fd()`, so there is no raw-fd unsafe.
@@ -328,8 +349,13 @@ fn drain_fd<R: Read + AsFd>(
     let mut full: Vec<u8> = Vec::new();
     // The accumulation cap is tracked by a shared ByteBudget (the same
     // "first N bytes" engine the streaming paths use) so the raw copy and
-    // the streamed copy can never disagree on the cap.
-    let mut budget = accumulate_cap.map(ByteBudget::new);
+    // the streamed copy can never disagree on the cap. `DrainAccumulate::None`
+    // skips the accounting entirely — the caller processes every chunk via
+    // `on_data`.
+    let mut budget = match accumulate {
+        DrainAccumulate::None => None,
+        DrainAccumulate::Capped(cap) => Some(ByteBudget::new(cap)),
+    };
     let mut buf = [0u8; 8192];
     loop {
         if !poll_readable(reader.as_fd(), &stop_rx, poll_ms) {
@@ -398,16 +424,59 @@ fn set_nonblocking(fd: rustix::fd::BorrowedFd<'_>) -> bool {
 /// the byte stream is unchanged — only the chunking differs.
 const MAX_PENDING_LINE_BYTES: usize = 16 * 1024;
 
+/// Number of trailing bytes of `pending` that belong to an incomplete UTF-8
+/// sequence — plus a trailing `\r` held back for CRLF folding — that must
+/// NOT be flushed forward. Splitting only at char boundaries keeps the
+/// client's per-chunk lossy decode in sync with the final record (which
+/// decodes the whole stream at once): a char split across two chunks would
+/// render as replacement chars in the live view but as the real character
+/// in the record.
+fn partial_tail_len(pending: &[u8]) -> usize {
+    let mut i = pending.len();
+    // A trailing CR is held back so a `\n` arriving in a later chunk can
+    // still fold the CRLF (matching `BufRead::lines()`).
+    let cr = usize::from(i > 0 && pending[i - 1] == b'\r');
+    i -= cr;
+    // Walk back over continuation bytes (0b10xxxxxx) to the sequence lead.
+    let mut continuations = 0usize;
+    while i > 0 && (0x80..=0xBF).contains(&pending[i - 1]) {
+        i -= 1;
+        continuations += 1;
+    }
+    if i > 0 {
+        let lead = pending[i - 1];
+        // Continuation bytes the lead declares; 0 for ASCII and for the
+        // invalid leads 0xF8..=0xFF, which cannot start a valid sequence.
+        let expected = match lead {
+            0xC0..=0xDF => 1,
+            0xE0..=0xEF => 2,
+            0xF0..=0xF7 => 3,
+            _ => 0,
+        };
+        if expected > continuations {
+            // The lead declares more continuation bytes than are present —
+            // the sequence is incomplete; hold the whole partial char back.
+            return continuations + 1 + cr;
+        }
+    }
+    // No lead found (orphan continuation bytes — not part of any char) or a
+    // complete sequence: only the CR is held back.
+    cr
+}
+
 /// Flush `pending` forward as a partial chunk — called when an unterminated
 /// line exceeds [`MAX_PENDING_LINE_BYTES`] so a newline-less firehose cannot
-/// balloon daemon memory. Holds back a trailing `\r` so a `\n` arriving in a
-/// later chunk can still fold the CRLF. The flush point is either the buffer
-/// end or the held-back `\r` — both complete UTF-8 chars — so the client's
-/// per-chunk lossy decode never renders a replacement char mid-line.
+/// balloon daemon memory. Holds back a trailing `\r` (CRLF folding) and any
+/// partial UTF-8 char at the end ([`partial_tail_len`]), so the emitted
+/// chunk ends on a char boundary and the client's per-chunk lossy decode
+/// never renders a replacement char where the final record shows the real
+/// character.
 fn flush_partial_line(pending: &mut Vec<u8>, on_line: &mut dyn FnMut(Vec<u8>)) {
-    // Splitting at `len` (or `len - 1` for the held-back CR) never lands
-    // mid-char: the flushed prefix ends at a UTF-8 boundary by construction.
-    let split = pending.len() - usize::from(pending.last() == Some(&b'\r'));
+    // The partial tail is at most 5 bytes (3 continuation + lead + CR) and
+    // the flush is only called when `pending` is at least the 16 KiB
+    // threshold, so the split is always ≥ 1 — the flush always makes
+    // progress and never emits an empty chunk.
+    let split = pending.len() - partial_tail_len(pending);
     let line: Vec<u8> = pending.drain(..split).collect();
     on_line(line);
 }
@@ -461,7 +530,7 @@ pub(crate) fn spawn_with_watchdog(
 
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let (killed_tx, killed_rx) = mpsc::channel::<()>();
-    let watchdog = spawn_watchdog(timeout_ms, pid, pidfd, done_rx, killed_tx);
+    let watchdog = spawn_watchdog(timeout_ms, pid, pidfd, done_rx, killed_tx, None);
 
     // Drain stdout/stderr concurrently so the child can never block on a full
     // pipe buffer (the classic pipe deadlock). Each drain is bounded by a stop
@@ -476,7 +545,7 @@ pub(crate) fn spawn_with_watchdog(
                 out_stop_rx,
                 DRAIN_POLL_MS,
                 &mut |_| {},
-                Some(MAX_TOOL_OUTPUT_BYTES),
+                DrainAccumulate::Capped(MAX_TOOL_OUTPUT_BYTES),
             )
         })
     });
@@ -487,7 +556,7 @@ pub(crate) fn spawn_with_watchdog(
                 err_stop_rx,
                 DRAIN_POLL_MS,
                 &mut |_| {},
-                Some(MAX_TOOL_OUTPUT_BYTES),
+                DrainAccumulate::Capped(MAX_TOOL_OUTPUT_BYTES),
             )
         })
     });
@@ -526,21 +595,31 @@ pub(crate) fn spawn_with_watchdog(
 /// hit and dropping everything after. The bounded streaming *channel* only
 /// bounds in-flight chunks (backpressure); this caps the *total*, so a
 /// long-running command cannot push an unbounded live view to the client.
-/// The final recorded result is separately truncated by
-/// `format_shell_output`, but the streamed view must not diverge from it.
-/// The cap accounting itself is the shared [`ByteBudget`] (the same engine
-/// `drain_fd` and the VM's guest-WRITE path use), so all streaming paths
-/// agree on the "first N bytes + one marker" contract.
+/// The final recorded result is separately capped by `format_shell_output`,
+/// but the streamed view must not diverge from it — the stream budget
+/// reserves the record framing (see [`RecordFraming`]) so that final cap is
+/// a no-op. The cap accounting itself is the shared [`ByteBudget`] (the same
+/// engine `drain_fd` and the VM's guest-WRITE path use), so all streaming
+/// paths agree on the "first N bytes + one marker" contract.
 struct StreamByteCap {
     budget: ByteBudget,
     tx: crossbeam_channel::Sender<Vec<u8>>,
+    /// Signalled when the watchdog kills the child (timeout) — interrupts a
+    /// send that is blocked on a full channel so the tool cannot be wedged
+    /// past its timeout by a stalled subscriber.
+    abort_rx: crossbeam_channel::Receiver<()>,
 }
 
 impl StreamByteCap {
-    fn new(limit: usize, tx: crossbeam_channel::Sender<Vec<u8>>) -> Self {
+    fn new(
+        limit: usize,
+        tx: crossbeam_channel::Sender<Vec<u8>>,
+        abort_rx: crossbeam_channel::Receiver<()>,
+    ) -> Self {
         Self {
             budget: ByteBudget::new(limit),
             tx,
+            abort_rx,
         }
     }
 
@@ -555,17 +634,47 @@ impl StreamByteCap {
     /// accumulated copy stays byte-identical to the live view: the recorded
     /// result then contains precisely what the client saw streamed,
     /// truncation marker included.
-    fn push(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+    ///
+    /// Returns `false` when forwarding must stop — the watchdog aborted the
+    /// tool (timeout) or the client dropped the receiver — in which case the
+    /// caller should stop accumulating. The accumulated copy only grows with
+    /// bytes that were actually delivered (forward before accumulate), so the
+    /// record never contains a chunk the client did not see; order in `out`
+    /// still matches send order (prefix then marker).
+    fn push(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> bool {
         let n = self.budget.fit(chunk.len());
+        // Forward before accumulating: a chunk whose send is aborted must not
+        // land in the recorded body (the live view never showed it).
+        if n > 0 && !self.forward(&chunk[..n]) {
+            return false;
+        }
         if n > 0 {
             out.extend_from_slice(&chunk[..n]);
-            let _ = self.tx.send(chunk[..n].to_vec());
         }
         if let Some(marker) = self.budget.take_marker() {
             // Same byte-cap marker `truncate_tool_output` appends, so the
             // live view reads exactly like the final (capped) result.
+            if !self.forward(marker.as_bytes()) {
+                return false;
+            }
             out.extend_from_slice(marker.as_bytes());
-            let _ = self.tx.send(marker.as_bytes().to_vec());
+        }
+        true
+    }
+
+    /// Send `bytes` to the client. The fast path (`try_send`) never blocks
+    /// and is never interrupted by the abort signal; when the bounded channel
+    /// is full (backpressure from a stalled subscriber) the send blocks in a
+    /// `select!` against the abort signal, so a timeout kill still unwedges
+    /// the tool. A dropped receiver fails the send, which stops the stream
+    /// the same way an abort does.
+    fn forward(&self, bytes: &[u8]) -> bool {
+        match self.tx.try_send(bytes.to_vec()) {
+            Ok(()) => true,
+            Err(_) => crossbeam_channel::select! {
+                send(self.tx, bytes.to_vec()) -> res => res.is_ok(),
+                recv(self.abort_rx) -> _ => false,
+            },
         }
     }
 }
@@ -578,9 +687,9 @@ impl StreamByteCap {
 /// `spawn_with_streaming` so the stdout/stderr handling cannot drift.
 ///
 /// `reader` is fully drained (never blocking the child on a full pipe), but
-/// the per-stream byte cap is 0: the merger thread accumulates the body, so
-/// `drain_fd`'s own buffer is kept empty while `on_data` still observes
-/// every chunk.
+/// the per-stream accumulation is [`DrainAccumulate::None`]: the merger
+/// thread accumulates the body, so `drain_fd`'s own buffer is kept empty
+/// while `on_data` still observes every chunk.
 fn spawn_line_drain<R>(
     reader: R,
     stop_rx: mpsc::Receiver<()>,
@@ -600,7 +709,7 @@ where
                     let _ = merge_tx.send(line);
                 });
             },
-            Some(0),
+            DrainAccumulate::None,
         );
         // Flush any final unterminated line (matches `BufRead::lines()`
         // yielding a last line without a trailing newline).
@@ -608,6 +717,42 @@ where
             let _ = merge_tx.send(pending);
         }
     })
+}
+
+/// Reserved bytes of record framing that `format_shell_output` will add
+/// around a streamed body — the `$ {cmd}\n` header, the worst-case exit-code
+/// footer, and the truncation markers. `spawn_with_streaming` subtracts this
+/// from the stream budget so the cap `finish_tool_output_sanitized` applies
+/// at format time is a no-op: the recorded body then contains exactly the
+/// bytes that were streamed, truncation marker included.
+///
+/// A newtype (rather than a raw `usize`) so a caller cannot pass an
+/// arbitrary reservation: [`RecordFraming::shell`] derives the value from the
+/// *same* display command that `run_shell_streaming` passes to
+/// `format_shell_output`, so the reserved and the actual framing cannot
+/// drift. Direct callers that format the output themselves use
+/// [`RecordFraming::none`].
+#[derive(Debug, Clone, Copy)]
+pub struct RecordFraming(usize);
+
+impl RecordFraming {
+    /// No record framing: the stream caps at the full
+    /// [`MAX_TOOL_OUTPUT_BYTES`] budget (the caller formats the output
+    /// without a reserved frame).
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    /// Framing for `format_shell_output`'s `$ {display_cmd}\n` record,
+    /// computed from the same display command that will be formatted.
+    pub fn shell(display_cmd: &str) -> Self {
+        Self(shell_output_framing_reservation(display_cmd))
+    }
+
+    /// The number of framing bytes reserved inside the stream budget.
+    fn bytes(self) -> usize {
+        self.0
+    }
 }
 
 /// Spawn the command with piped stdout/stderr and stream their lines through
@@ -631,17 +776,23 @@ where
 /// its progress to stderr (cargo, nextest, make, …) therefore shows a live
 /// view instead of appearing all at once when it exits.
 ///
-/// `reservation` is the number of record-framing bytes `format_shell_output`
-/// will add around the body (the `$ {cmd}\n` prefix, the exit-code footer,
-/// and the truncation marker) — reserved *inside* the stream budget so the
-/// final cap is a no-op and the recorded body contains exactly the streamed
-/// bytes, even when the stream is truncated. Pass 0 to skip the reservation
-/// (direct callers that do not format the output); `run_shell_streaming`
-/// computes the right value via [`shell_output_framing_reservation`].
+/// `framing` reserves `format_shell_output`'s record framing (the
+/// `$ {cmd}\n` prefix, the exit-code footer, and the truncation marker)
+/// *inside* the stream budget so the final cap is a no-op and the recorded
+/// body contains exactly the streamed bytes, even when the stream is
+/// truncated. `run_shell_streaming` computes it via
+/// [`RecordFraming::shell`]; direct callers that format the output
+/// themselves pass [`RecordFraming::none`].
+///
+/// On a timeout the watchdog kills the child and signals an abort channel;
+/// the merger selects on it while blocked on a full output channel, so a
+/// stalled subscriber can never wedge the tool past its timeout (the abort
+/// drops the merge receiver, the drains' sends fail, and every thread joins
+/// promptly).
 pub fn spawn_with_streaming(
     cmd: &mut Command,
     timeout_ms: u64,
-    reservation: usize,
+    framing: RecordFraming,
     output_tx: crossbeam_channel::Sender<Vec<u8>>,
 ) -> Result<(Output, bool), ToolExecError> {
     setup_child(cmd);
@@ -677,9 +828,9 @@ pub fn spawn_with_streaming(
 
     // Both pipes are drained by the same `spawn_line_drain` helper: split
     // into complete lines (CRLF folded) and forwarded to the merge channel in
-    // arrival order. The per-stream accumulate cap is 0 because the merger
-    // accumulates the body — `drain_fd` still consumes every byte (no pipe
-    // deadlock) and calls `on_data` for each chunk.
+    // arrival order. `DrainAccumulate::None` keeps `drain_fd`'s own buffer
+    // empty — the merger accumulates the body — while `on_data` still
+    // consumes every byte (no pipe deadlock).
     let stdout_thread = spawn_line_drain(stdout, out_stop_rx, merge_tx.clone());
     let stderr_thread = spawn_line_drain(stderr, err_stop_rx, merge_tx.clone());
 
@@ -687,6 +838,13 @@ pub fn spawn_with_streaming(
     // moment BOTH drain threads finish — that disconnect is what terminates
     // the merger below. Without this drop, the merger would wait forever.
     drop(merge_tx);
+
+    // Abort signal: the watchdog sends on this when it kills the child for a
+    // timeout. The merger selects on it while blocked on a full output
+    // channel, so a stalled subscriber can never wedge the tool past its
+    // timeout — the abort drops the merge receiver, the drains' sends fail,
+    // and every thread joins promptly.
+    let (abort_tx, abort_rx) = crossbeam_channel::bounded::<()>(1);
 
     // Thread: consume merged lines in arrival order, forward each through the
     // shared byte cap (the live view), and accumulate the same capped bytes
@@ -696,30 +854,76 @@ pub fn spawn_with_streaming(
     // "first N bytes + one marker" contract as the client's live
     // accumulation, so the recorded result reads exactly like the stream.
     //
-    // The budget is reduced by `reservation` (the record framing
+    // The budget is reduced by `framing` (the record framing
     // `format_shell_output` adds — header, footer, marker) so the final cap
     // is a no-op: the recorded body then contains exactly the streamed
     // bytes, truncation marker included, and the exit-code footer always
     // survives (including the transcript re-cap in `record_tool_completion`).
     let merger_thread = std::thread::spawn(move || {
-        let mut stream_cap =
-            StreamByteCap::new(MAX_TOOL_OUTPUT_BYTES.saturating_sub(reservation), output_tx);
+        let mut stream_cap = StreamByteCap::new(
+            MAX_TOOL_OUTPUT_BYTES.saturating_sub(framing.bytes()),
+            output_tx,
+            abort_rx,
+        );
         let mut full: Vec<u8> = Vec::new();
         while let Ok(line) = merge_rx.recv() {
-            stream_cap.push(&line, &mut full);
+            // Escape Cf chars (the spoofing class) BEFORE the bytes enter
+            // the stream budget, so the budget accounts for the escaped form
+            // the client and the record both see. Sanitizing here — instead
+            // of only at format time — makes the recorded body byte-identical
+            // to the live view even for Cf-heavy output, which previously
+            // expanded past the cap at `finish_tool_output` and got re-cut
+            // (dropping streamed tail bytes and appending a second marker).
+            // `from_utf8_lossy` is lossless here: the drains only emit
+            // char-aligned chunks (see `flush_partial_line`), so no real
+            // char is ever split across chunks. The named binding keeps the
+            // lossy Cow alive for the duration of the escape.
+            let lossy = String::from_utf8_lossy(&line);
+            let escaped = sanitize_transcript(&lossy);
+            if !stream_cap.push(escaped.as_bytes(), &mut full) {
+                // Abort (timeout) or client gone: stop accumulating. The
+                // record is discarded on the timeout path anyway.
+                break;
+            }
         }
         full
     });
 
     // Watchdog thread: enforce timeout. Shared with the buffered path so the
-    // two timeout semantics stay identical (see `spawn_watchdog`).
+    // two timeout semantics stay identical (see `spawn_watchdog`); the abort
+    // sender lets the watchdog unwedge the merger when it kills the child.
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let (killed_tx, killed_rx) = mpsc::channel::<()>();
-    let watchdog = spawn_watchdog(timeout_ms, pid, pidfd, done_rx, killed_tx);
+    let watchdog = spawn_watchdog(timeout_ms, pid, pidfd, done_rx, killed_tx, Some(abort_tx));
 
     // Wait for the process to finish (both background threads drain the
     // pipes concurrently, preventing any blocking deadlock).
-    let status = child.wait()?;
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            // `wait` failing is nearly unreachable (std retries EINTR), but a
+            // silent thread leak here would be permanent: tear down every
+            // thread before propagating. The dropped `done_tx` makes the
+            // watchdog treat this as a timeout and kill the (possibly still
+            // running) child, which also sends the abort that unwedges the
+            // merger; the stop signals end the drainers at their next poll.
+            let _ = out_stop_tx.send(());
+            let _ = err_stop_tx.send(());
+            if let Err(e) = stdout_thread.join() {
+                warn!("stdout reader thread panicked: {:?}", e);
+            }
+            if let Err(e) = stderr_thread.join() {
+                warn!("stderr reader thread panicked: {:?}", e);
+            }
+            if let Err(e) = merger_thread.join() {
+                warn!("stream merger thread panicked: {:?}", e);
+            }
+            if let Err(e) = watchdog.join() {
+                warn!("watchdog thread panicked: {:?}", e);
+            }
+            return Err(e.into());
+        }
+    };
     let _ = done_tx.send(());
     // Stop the drainers once the direct child is reaped (see
     // `spawn_with_watchdog`).
@@ -763,7 +967,7 @@ pub fn spawn_with_streaming(
 
 /// Bytes of record framing that `format_shell_output` adds around the
 /// streamed body and that must therefore be reserved *inside* the stream
-/// budget: the `$ {display_cmd}\n` prefix, the worst-case `\n\nExit code: N`
+/// budget: the `$ {display_cmd}\n` header, the worst-case `\n\nExit code: N`
 /// footer (an i32 exit code is at most 11 chars), and the `...[truncated]`
 /// marker twice — once for the stream's own marker (which rides in the
 /// recorded body) and once for the room `finish_tool_output` holds back for
@@ -771,11 +975,17 @@ pub fn spawn_with_streaming(
 /// no-op, so the recorded result contains exactly the bytes that were
 /// streamed — truncation marker included — and the exit-code footer always
 /// survives (including the transcript re-cap in `record_tool_completion`).
+///
+/// The header length is measured *after* `sanitize_transcript`: the whole
+/// record is escaped before the cap, so Cf chars in the display command
+/// expand and must be reserved at their escaped size or the cap could still
+/// re-cut the body.
 fn shell_output_framing_reservation(display_cmd: &str) -> usize {
+    let escaped_header_len = sanitize_transcript(&format!("$ {display_cmd}\n")).len();
     // `format_shell_output` renders the footer as `\n` + `\nExit code: {code}`;
     // i32::MIN ("-2147483648") is the longest possible exit code.
     const WORST_CASE_FOOTER_LEN: usize = "\n\nExit code: -2147483648".len();
-    format!("$ {display_cmd}\n").len() + WORST_CASE_FOOTER_LEN + 2 * TRUNCATION_SUFFIX.len()
+    escaped_header_len + WORST_CASE_FOOTER_LEN + 2 * TRUNCATION_SUFFIX.len()
 }
 
 /// Convenience wrapper that combines `spawn_with_streaming` (which applies
@@ -795,8 +1005,15 @@ pub fn run_shell_streaming(
     timeout_ms: u64,
     output_tx: crossbeam_channel::Sender<Vec<u8>>,
 ) -> Result<String, ToolExecError> {
-    let reservation = shell_output_framing_reservation(display_cmd);
-    let (output, was_killed) = spawn_with_streaming(cmd, timeout_ms, reservation, output_tx)?;
+    // `RecordFraming::shell` derives the reservation from the SAME display
+    // command passed to `format_shell_output` below, so the reserved and the
+    // actual framing cannot drift.
+    let (output, was_killed) = spawn_with_streaming(
+        cmd,
+        timeout_ms,
+        RecordFraming::shell(display_cmd),
+        output_tx,
+    )?;
     Ok(format_shell_output(
         display_cmd,
         &output,
@@ -827,9 +1044,16 @@ pub(crate) fn format_shell_output(
             )),
         );
     }
-    let mut combined = output.stdout.clone();
-    combined.extend_from_slice(&output.stderr);
-    let combined_str = String::from_utf8_lossy(&combined);
+    // The streaming path folds stderr into `output.stdout` (see
+    // `spawn_with_streaming`), so no copy is needed there; the buffered path
+    // concatenates stdout then stderr into an owned buffer.
+    let combined_str = if output.stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout)
+    } else {
+        let mut combined = output.stdout.clone();
+        combined.extend_from_slice(&output.stderr);
+        std::borrow::Cow::Owned(String::from_utf8_lossy(&combined).into_owned())
+    };
     let exit_code = output.status.code().unwrap_or(-1);
     finish_tool_output_sanitized(
         &format!("$ {display_cmd}\n{combined_str}"),
@@ -959,7 +1183,7 @@ mod tests {
         drop(writer); // EOF
 
         let (_stop_tx, stop_rx) = mpsc::channel::<()>();
-        let got = drain_fd(reader, stop_rx, 0, &mut |_| {}, None);
+        let got = drain_fd(reader, stop_rx, 0, &mut |_| {}, DrainAccumulate::None);
         assert_eq!(got, b"line1\nline2\n");
     }
 
@@ -975,7 +1199,7 @@ mod tests {
         drop(writer); // EOF
 
         let (_stop_tx, stop_rx) = mpsc::channel::<()>();
-        let got = drain_fd(reader, stop_rx, 0, &mut |_| {}, None);
+        let got = drain_fd(reader, stop_rx, 0, &mut |_| {}, DrainAccumulate::None);
         assert_eq!(got, payload);
     }
 
@@ -991,7 +1215,7 @@ mod tests {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         stop_tx.send(()).expect("signal stop");
 
-        let got = drain_fd(reader, stop_rx, 0, &mut |_| {}, None);
+        let got = drain_fd(reader, stop_rx, 0, &mut |_| {}, DrainAccumulate::None);
         assert_eq!(
             got, b"hello",
             "buffered data must be drained before stopping"
@@ -1020,7 +1244,7 @@ mod tests {
             stop_rx,
             0,
             &mut |chunk: &[u8]| seen += chunk.len(),
-            Some(8 * 1024),
+            DrainAccumulate::Capped(8 * 1024),
         );
         assert_eq!(got.len(), 8 * 1024, "accumulation must stop at the cap");
         assert_eq!(
@@ -1090,6 +1314,50 @@ mod tests {
     }
 
     #[test]
+    fn forward_complete_lines_holds_back_partial_utf8_at_flush() {
+        // A multi-byte char split across the flush boundary must be held back
+        // whole: the emitted chunks stay valid UTF-8, so the client's
+        // per-chunk lossy decode never renders a replacement char where the
+        // final record (a whole-stream decode) shows the real character.
+        // Deterministic — pure byte-buffer manipulation, no I/O.
+        let mut pending: Vec<u8> = vec![b'x'; MAX_PENDING_LINE_BYTES - 2];
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        // Two of the three bytes of € (U+20AC: E2 82 AC) cross the threshold:
+        // the flush must hold the partial char back instead of splitting it.
+        forward_complete_lines(b"\xe2\x82", &mut pending, &mut |l| parts.push(l));
+        assert_eq!(
+            parts,
+            vec![vec![b'x'; MAX_PENDING_LINE_BYTES - 2]],
+            "the complete prefix is flushed; nothing past it"
+        );
+        assert_eq!(pending, b"\xe2\x82", "partial char held back whole");
+
+        // The final byte completes the char; the EOF flush emits it whole.
+        forward_complete_lines(b"\xac", &mut pending, &mut |l| parts.push(l));
+        assert!(
+            !pending.is_empty(),
+            "the char is still pending (no newline)"
+        );
+        let joined: Vec<u8> = parts.concat();
+        assert_eq!(
+            joined.len(),
+            MAX_PENDING_LINE_BYTES - 2,
+            "no bytes lost across the flush"
+        );
+        // The pending € completes the stream; a whole-stream decode sees the
+        // real char, never a replacement.
+        let stream: Vec<u8> = joined
+            .into_iter()
+            .chain(std::mem::take(&mut pending))
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&stream),
+            format!("{}€", "x".repeat(MAX_PENDING_LINE_BYTES - 2)),
+            "chunks must join back into the original valid UTF-8"
+        );
+    }
+
+    #[test]
     fn format_shell_output_was_killed_shows_timeout() {
         let output = Output {
             stdout: b"some output".to_vec(),
@@ -1136,12 +1404,13 @@ mod tests {
         // when it fires — to the accumulated body in send order, so the
         // recorded result is byte-identical to the live view.
         let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-        let mut cap = StreamByteCap::new(10, tx);
+        let (_abort_tx, abort_rx) = crossbeam_channel::bounded::<()>(1);
+        let mut cap = StreamByteCap::new(10, tx, abort_rx);
         let mut out = Vec::new();
 
-        cap.push(b"abcd", &mut out);
-        cap.push(b"0123456789", &mut out);
-        cap.push(b"xyz", &mut out);
+        assert!(cap.push(b"abcd", &mut out));
+        assert!(cap.push(b"0123456789", &mut out));
+        assert!(cap.push(b"xyz", &mut out));
 
         let streamed: Vec<u8> = rx.try_iter().flatten().collect();
         assert_eq!(
@@ -1149,6 +1418,33 @@ mod tests {
             "recorded body must equal the forwarded stream"
         );
         assert_eq!(out, b"abcd012345\n...[truncated]");
+    }
+
+    #[test]
+    fn stream_byte_cap_abort_interrupts_a_blocked_send() {
+        // A full output channel (stalled subscriber) must not wedge the tool:
+        // the abort signal — sent by the watchdog on a timeout kill — wakes
+        // the blocked send, and `push` reports false so the caller stops.
+        // Deterministic: the channel is filled before the abort is queued, so
+        // `push` blocks in `select!` and the queued abort wins (no time-based
+        // waits).
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
+        let (abort_tx, abort_rx) = crossbeam_channel::bounded::<()>(1);
+        let mut cap = StreamByteCap::new(100, tx.clone(), abort_rx);
+        let mut out = Vec::new();
+
+        // Fill the channel: the next send must block.
+        tx.try_send(b"full".to_vec()).expect("fill channel");
+        abort_tx.send(()).expect("queue abort");
+        assert!(
+            !cap.push(b"blocked", &mut out),
+            "abort must interrupt a blocked send"
+        );
+        // The client-side chunk stays queued; the aborted chunk was neither
+        // delivered nor accumulated.
+        assert_eq!(rx.try_recv().expect("queued chunk"), b"full");
+        assert!(rx.try_recv().is_err(), "aborted send must not deliver");
+        assert!(out.is_empty(), "aborted send must not be accumulated");
     }
 
     #[test]
@@ -1165,6 +1461,15 @@ mod tests {
         );
         // Sanity: the framing is small relative to the budget.
         assert!(shell_output_framing_reservation("echo") < MAX_TOOL_OUTPUT_BYTES / 100);
+
+        // A Cf char in the display command expands when escaped; the
+        // reservation must cover the escaped header or the final cap could
+        // still re-cut the body.
+        assert!(
+            shell_output_framing_reservation("echo\u{200b}")
+                > shell_output_framing_reservation("echo"),
+            "Cf chars in the display command must be reserved at escaped size"
+        );
     }
 
     #[test]
