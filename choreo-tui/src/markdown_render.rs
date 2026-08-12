@@ -292,12 +292,12 @@ fn sanitize_for_terminal(text: &str) -> String {
 /// **zero** columns, and ratatui (≥0.30) filters control characters out of
 /// `Span::styled_graphemes` entirely, so a literal tab is both mis-measured
 /// *and* silently dropped from the rendered Paragraph.  Expanding tabs to
-/// spaces at the traditional 8-column stops makes every downstream width
-/// computation (grapheme wrap, `Line::width`, height `div_ceil`, fill
-/// padding) measure exactly what ratatui draws, and keeps tab-aligned columns
-/// aligned — matching what the raw bytes would have shown on a stock
-/// terminal with default tab stops.
-const TAB_STOP: usize = 8;
+/// spaces at 4-column stops (a common editor convention) makes every
+/// downstream width computation (grapheme wrap, `Line::width`, height
+/// `div_ceil`, fill padding) measure exactly what ratatui draws, and keeps
+/// tab-aligned columns aligned — matching what the raw bytes would have
+/// shown on a terminal with 4-wide tab stops.
+const TAB_STOP: usize = 4;
 
 /// Replace each `\t` with the spaces needed to reach the next `TAB_STOP`
 /// column, tracking the column per logical line (`\n` resets it).  Runs on
@@ -846,7 +846,7 @@ pub(crate) fn render_turn_lines(
                 // regardless of which tool produced them. SGR survives, so
                 // ANSI coloring still works below.
                 let content = sanitize_for_terminal(&tr.content);
-                // Expand tabs to 8-column spaces (see [`expand_tabs`]):
+                // Expand tabs to 4-column spaces (see [`expand_tabs`]):
                 // unicode-width measures `\t` as 0 columns and ratatui
                 // drops control chars at draw time, so a literal tab would
                 // vanish *and* leave every width computation (wrap, height,
@@ -3588,7 +3588,7 @@ content ---"
         // A raw tab is invisible to unicode-width (0 columns) and dropped by
         // ratatui's control-char filter at draw time, so tab-indented tool
         // output (code, JSON, `find -printf` output) would lose its leading
-        // alignment.  Regression: tabs must render as 8-column-stop spaces,
+        // alignment.  Regression: tabs must render as 4-column-stop spaces,
         // with every character present and widths still inside the margins.
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
@@ -3621,9 +3621,9 @@ content ---"
             "no literal tab may reach the renderer: {text:?}"
         );
         // The three content lines keep their (expanded) leading indentation.
-        assert!(text.contains("        fn main() {"), "{text:?}");
-        assert!(text.contains("                println!"), "{text:?}");
-        assert!(text.contains("        }"), "{text:?}");
+        assert!(text.contains("    fn main() {"), "{text:?}");
+        assert!(text.contains("        println!"), "{text:?}");
+        assert!(text.contains("    }"), "{text:?}");
         // Expansion must not drop anything: the source chars all survive.
         for needle in ["fn main() {", "println!(\"hi\");", "}"] {
             assert!(text.contains(needle), "missing {needle:?} in {text:?}");
@@ -3845,22 +3845,22 @@ content ---"
     }
 
     #[test]
-    fn expand_tabs_leading_tab_becomes_eight_spaces() {
-        // A tab at column 0 advances to the next 8-column stop (column 8).
-        assert_eq!(expand_tabs("\tfoo"), "        foo");
+    fn expand_tabs_leading_tab_becomes_four_spaces() {
+        // A tab at column 0 advances to the next 4-column stop (column 4).
+        assert_eq!(expand_tabs("\tfoo"), "    foo");
     }
 
     #[test]
     fn expand_tabs_mid_line_is_column_aware() {
-        // "abc" sits at column 3; the next 8-column stop is 8 → 5 spaces,
-        // not a fixed 8.
-        assert_eq!(expand_tabs("abc\tdef"), "abc     def");
+        // "abc" sits at column 3; the next 4-column stop is 4 → 1 space,
+        // not a fixed 4.
+        assert_eq!(expand_tabs("abc\tdef"), "abc def");
     }
 
     #[test]
     fn expand_tabs_after_wide_char_tracks_display_columns() {
-        // "日" occupies 2 columns; the next stop is still 8 → 6 spaces.
-        assert_eq!(expand_tabs("日\tx"), "日      x");
+        // "日" occupies 2 columns; the next stop is 4 → 2 spaces.
+        assert_eq!(expand_tabs("日\tx"), "日  x");
     }
 
     #[test]
@@ -3872,36 +3872,36 @@ content ---"
     #[test]
     fn expand_tabs_resets_column_per_line() {
         // Column tracking restarts after every newline, like a terminal.
-        assert_eq!(expand_tabs("a\tb\n\tc"), "a       b\n        c");
+        assert_eq!(expand_tabs("a\tb\n\tc"), "a   b\n    c");
     }
 
     #[test]
     fn expand_tabs_consecutive_tabs_chain() {
-        // Two tabs at line start: col 0 → 8, then col 8 → 16.
-        assert_eq!(expand_tabs("\t\tfoo"), "                foo");
+        // Two tabs at line start: col 0 → 4, then col 4 → 8.
+        assert_eq!(expand_tabs("\t\tfoo"), "        foo");
     }
 
     #[test]
     fn expand_tabs_ignores_sgr_sequences_for_column_tracking() {
         // A complete SGR color sequence is invisible on screen: the column
         // must advance only past the visible chars, so a tab after a color
-        // code pads to the correct 8-column stop instead of treating the
+        // code pads to the correct 4-column stop instead of treating the
         // escape bytes as visible columns.  "abc" sits at column 3 (the
-        // ESC[31m adds nothing) → 5 spaces.
+        // ESC[31m adds nothing) → 1 space.
         assert_eq!(
             expand_tabs("\x1b[31mabc\tdef"),
-            "\x1b[31mabc     def",
+            "\x1b[31mabc def",
             "SGR bytes must not count toward the column"
         );
         // Multi-param SGR and the reset form are handled the same way.
         assert_eq!(
             expand_tabs("\x1b[1;32mab\tcd"),
-            "\x1b[1;32mab      cd",
+            "\x1b[1;32mab  cd",
             "multi-param SGR must not count toward the column"
         );
         assert_eq!(
             expand_tabs("\x1b[0m\tfoo"),
-            "\x1b[0m        foo",
+            "\x1b[0m    foo",
             "a tab right after a reset code pads from column 0"
         );
         // The sequence is preserved verbatim (the ANSI renderer needs it).
@@ -3914,7 +3914,7 @@ content ---"
         // each logical line starts its own tab-stop cycle.
         assert_eq!(
             expand_tabs("\x1b[31mred\t\nblue\t"),
-            "\x1b[31mred     \nblue    "
+            "\x1b[31mred \nblue    "
         );
     }
 
