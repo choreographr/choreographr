@@ -2180,8 +2180,14 @@ impl App {
         } else {
             return 0;
         };
-        let lines = plain_text_lines(text, width);
-        lines_height(&lines, width).max(1) as u16
+        // The status/error Paragraph is drawn inset by one column on each side
+        // (render.rs `notify_area`), so it wraps at `width - 2` columns.
+        // Measure at that same inner width, or a long message's reserved
+        // height can fall short of the rows ratatui actually draws and the
+        // tail gets clipped by the layout.
+        let inner = width.saturating_sub(2);
+        let lines = plain_text_lines(text, inner);
+        lines_height(&lines, inner).max(1) as u16
     }
 
     /// Number of visual content lines the input box currently occupies,
@@ -5311,9 +5317,11 @@ mod tests {
     #[test]
     fn status_error_height_wrapping() {
         let mut app = test_app();
-        // A 10-char line at width 5 wraps to 2 lines
+        // The status Paragraph wraps at width-2 (the inset `notify_area`), so
+        // at width 5 the inner width is 3: "12345 7890" hard-splits to
+        // ["123", "45 ", "789", "0"] → 4 rows (matches what ratatui draws).
         app.error = Some("12345 7890".into());
-        assert_eq!(app.status_error_height(5), 2);
+        assert_eq!(app.status_error_height(5), 4);
     }
 
     #[test]
@@ -5328,12 +5336,11 @@ mod tests {
     #[test]
     fn status_error_height_multi_line_with_wrapping() {
         let mut app = test_app();
-        // Two lines, second wraps
+        // Two lines; at width 5 the inner wrap width is 3: "hello" hard-splits
+        // to ["hel", "lo"] (2 rows) and "12345 7890" to 4 rows — 6 total,
+        // matching the rows the inset status Paragraph actually draws.
         app.error = Some("hello\n12345 7890".into());
-        // line 1: "hello" → 1 line
-        // line 2: "12345 7890" → wraps to 2 lines at width 5
-        // total = 3
-        assert_eq!(app.status_error_height(5), 3);
+        assert_eq!(app.status_error_height(5), 6);
     }
 
     #[test]

@@ -102,6 +102,16 @@ fn wrap_plain_line(line: &str, width: usize) -> Vec<String> {
     if display_width(line) <= width {
         return vec![line.to_string()];
     }
+    // A line with no whitespace at all can never break at a word boundary:
+    // every overflow is a hard grapheme split, which [`grapheme_chunks`]
+    // implements (the shared hard-splitter).  Sanitized content has no
+    // standalone mid-line zero-width graphemes, so the chunk boundaries
+    // coincide exactly (common for huge single tokens — base64, URLs,
+    // minified JSON).  This also keeps the main loop below free of a
+    // per-overflow whitespace scan.
+    if !line.contains(char::is_whitespace) {
+        return grapheme_chunks(line, width, 0);
+    }
 
     let mut out: Vec<String> = Vec::new();
     let mut buf = String::new();
@@ -115,7 +125,7 @@ fn wrap_plain_line(line: &str, width: usize) -> Vec<String> {
         let g_width = grapheme_width(g);
         buf.push_str(g);
         buf_width += g_width;
-        if g.chars().all(|c| c.is_whitespace()) {
+        if g.trim().is_empty() {
             last_space = Some((buf.len(), buf_width));
         }
         if buf_width > width {
@@ -129,8 +139,7 @@ fn wrap_plain_line(line: &str, width: usize) -> Vec<String> {
                 _ => (buf.len() - g.len(), buf_width - g_width),
             };
             if cut.0 == 0 {
-                out.push(buf.clone());
-                buf.clear();
+                out.push(std::mem::take(&mut buf));
                 buf_width = 0;
             } else {
                 out.push(buf[..cut.0].to_string());
@@ -144,6 +153,43 @@ fn wrap_plain_line(line: &str, width: usize) -> Vec<String> {
         out.push(buf);
     }
     out
+}
+
+/// Hard-split a whitespace-free run into chunks of at most `width` display
+/// columns, breaking only at grapheme boundaries.  `floor` is the minimum
+/// width credited to a single grapheme: 1 for [`split_word_to_width`] (a lone
+/// combining mark still occupies a column when a word renders in isolation),
+/// 0 for the plain-text wrapper (where zero-width graphemes are genuinely
+/// invisible).  One shared implementation so the two hard-split paths can
+/// never drift apart.
+fn grapheme_chunks(run: &str, width: usize, floor: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(run, true) {
+        let grapheme_width = grapheme_width(grapheme).max(floor);
+        if !current.is_empty() && current_width + grapheme_width > width {
+            // The next grapheme would push this chunk over the width — flush.
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push_str(grapheme);
+        current_width += grapheme_width;
+        if current_width >= width {
+            // A chunk that exactly fills the width is flushed immediately so
+            // the next grapheme starts a fresh chunk.
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
 }
 
 /// Terminal-safe filter for tool-result content: keeps complete SGR color
@@ -239,6 +285,51 @@ fn sanitize_for_terminal(text: &str) -> String {
     out
 }
 
+/// Standard terminal tab-stop interval.  `unicode-width` reports `\t` as
+/// **zero** columns, and ratatui (≥0.30) filters control characters out of
+/// `Span::styled_graphemes` entirely, so a literal tab is both mis-measured
+/// *and* silently dropped from the rendered Paragraph.  Expanding tabs to
+/// spaces at the traditional 8-column stops makes every downstream width
+/// computation (grapheme wrap, `Line::width`, height `div_ceil`, fill
+/// padding) measure exactly what ratatui draws, and keeps tab-aligned columns
+/// aligned — matching what the raw bytes would have shown on a stock
+/// terminal with default tab stops.
+const TAB_STOP: usize = 8;
+
+/// Replace each `\t` with the spaces needed to reach the next `TAB_STOP`
+/// column, tracking the column per logical line (`\n` resets it).  Runs on
+/// already-sanitized content (no other control chars can reach it), so only
+/// tabs need handling; every other char advances the column by its display
+/// width.  O(1) for content without tabs (the common case), O(n) with one
+/// output allocation otherwise.
+fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut col = 0usize;
+    for c in text.chars() {
+        match c {
+            '\t' => {
+                // Advance to the next multiple of TAB_STOP from the line
+                // start (the same rule a terminal's default tab stops use).
+                let pad = TAB_STOP - (col % TAB_STOP);
+                out.extend(std::iter::repeat_n(' ', pad));
+                col += pad;
+            }
+            '\n' => {
+                out.push('\n');
+                col = 0;
+            }
+            _ => {
+                out.push(c);
+                col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            }
+        }
+    }
+    out
+}
+
 /// Whether a single char passes through the terminal filter unchanged: tabs,
 /// newlines, printable ASCII, and safe non-ASCII. Everything else — every
 /// C0/C1 control (including lone CR; a CRLF pair is folded to `\n` by
@@ -260,13 +351,13 @@ fn terminal_keeps(c: char) -> bool {
 fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     use ansi_to_tui::IntoText as _;
 
-    let width = width as usize;
+    let width_usize = width as usize;
 
     match text.as_bytes().into_text() {
         Ok(t) => {
             let mut result: Vec<Line<'static>> = Vec::new();
             for line in &t.lines {
-                if width == 0 || line.width() <= width {
+                if width_usize == 0 || line.width() <= width_usize {
                     let spans: Vec<Span<'static>> = line
                         .spans
                         .iter()
@@ -275,7 +366,7 @@ fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                     result.push(Line::from(spans));
                 } else {
                     // Word-wrap this over-long line at width.
-                    wrap_styled_line(line, width, &mut result);
+                    wrap_styled_line(line, width_usize, &mut result);
                 }
             }
             if result.is_empty() {
@@ -290,7 +381,7 @@ fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 text_len = text.len(),
                 "failed to parse ANSI escape codes, falling back to plain text"
             );
-            plain_text_lines(text, width as u16)
+            plain_text_lines(text, width)
         }
     }
 }
@@ -724,6 +815,13 @@ pub(crate) fn render_turn_lines(
                 // regardless of which tool produced them. SGR survives, so
                 // ANSI coloring still works below.
                 let content = sanitize_for_terminal(&tr.content);
+                // Expand tabs to 8-column spaces (see [`expand_tabs`]):
+                // unicode-width measures `\t` as 0 columns and ratatui
+                // drops control chars at draw time, so a literal tab would
+                // vanish *and* leave every width computation (wrap, height,
+                // fill padding) mis-measured.  After expansion all four
+                // branches below (ansi/diff/markdown/plain) see exact widths.
+                let content = expand_tabs(&content);
                 // Content with ANSI escape codes gets colored rendering.
                 if content.contains("\x1b[") {
                     body.extend(ansi_lines(&content, tool_content_width));
@@ -1432,30 +1530,10 @@ fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
 }
 
 fn split_word_to_width(word: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0;
-    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(word, true) {
-        let grapheme_width = grapheme_width(grapheme).max(1);
-        if !current.is_empty() && current_width + grapheme_width > width {
-            chunks.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
-        current.push_str(grapheme);
-        current_width += grapheme_width;
-        if current_width >= width {
-            chunks.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-    chunks
+    // Hard-split a word with the shared chunker; the floor of 1 keeps a lone
+    // zero-width grapheme (e.g. a combining mark in an isolated word) from
+    // vanishing entirely from the chunks.
+    grapheme_chunks(word, width, 1)
 }
 
 fn pad_aligned(text: &str, width: usize, alignment: MarkdownAlignment) -> String {
@@ -2131,6 +2209,37 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].to_string(), "a");
         assert_eq!(result[1].to_string(), "");
+    }
+
+    // ── grapheme_chunks (shared hard-splitter) ───────────────────────────
+
+    #[test]
+    fn grapheme_chunks_exact_fit_flushes_immediately() {
+        // A chunk that exactly fills the width is flushed so the next grapheme
+        // starts a fresh chunk — same boundaries as wrap_plain_line's inline
+        // hard-split (which cuts when the *next* grapheme would overflow).
+        assert_eq!(grapheme_chunks("abcdefgh", 3, 0), ["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn grapheme_chunks_wide_grapheme_alone_on_line() {
+        // A grapheme wider than the width occupies its own over-wide chunk.
+        assert_eq!(grapheme_chunks("😀😀", 1, 0), ["😀", "😀"]);
+    }
+
+    #[test]
+    fn grapheme_chunks_floor_keeps_zero_width_graphemes() {
+        // A leading combining mark is a zero-width grapheme.  With floor 1
+        // (split_word_to_width) it still occupies a column of its own chunk;
+        // with floor 0 (plain text) it merges invisibly.
+        let run = "\u{301}ab";
+        assert_eq!(grapheme_chunks(run, 1, 1), ["\u{301}", "a", "b"]);
+        assert_eq!(grapheme_chunks(run, 1, 0), ["\u{301}a", "b"]);
+    }
+
+    #[test]
+    fn grapheme_chunks_empty_returns_one_empty_chunk() {
+        assert_eq!(grapheme_chunks("", 5, 0), [""]);
     }
 
     // ── lines_height ────────────────────────────────────────────────────
@@ -3444,6 +3553,60 @@ content ---"
     }
 
     #[test]
+    fn render_turn_lines_tab_indented_content_renders_as_spaces() {
+        // A raw tab is invisible to unicode-width (0 columns) and dropped by
+        // ratatui's control-char filter at draw time, so tab-indented tool
+        // output (code, JSON, `find -printf` output) would lose its leading
+        // alignment.  Regression: tabs must render as 8-column-stop spaces,
+        // with every character present and widths still inside the margins.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "grep".into(),
+                content: "\tfn main() {\n\t\tprintln!(\"hi\");\n\t}".into(),
+                is_error: false,
+                invocation_description: "Grepping for `main`.".into(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains('\t'),
+            "no literal tab may reach the renderer: {text:?}"
+        );
+        // The three content lines keep their (expanded) leading indentation.
+        assert!(text.contains("        fn main() {"), "{text:?}");
+        assert!(text.contains("                println!"), "{text:?}");
+        assert!(text.contains("        }"), "{text:?}");
+        // Expansion must not drop anything: the source chars all survive.
+        for needle in ["fn main() {", "println!(\"hi\");", "}"] {
+            assert!(text.contains(needle), "missing {needle:?} in {text:?}");
+        }
+        for line in &lines {
+            assert!(
+                line.width() <= 85 + 4,
+                "rendered line width {} exceeds tool content width + margins",
+                line.width()
+            );
+        }
+    }
+
+    #[test]
     fn render_turn_lines_pdf_to_markdown_keeps_markdown_rendering() {
         // The markdown allowlist: pdf_to_markdown emits markdown by design
         // and keeps the styled renderer (bold applied, syntax hidden).
@@ -3642,6 +3805,50 @@ content ---"
     }
 
     // ── sanitize_for_terminal ────────────────────────────────────────────
+
+    #[test]
+    fn expand_tabs_no_tabs_returns_input() {
+        // Common case (no tabs) must be a no-op, not a rewrite.
+        let s = "plain text\nwithout tabs";
+        assert_eq!(expand_tabs(s), s);
+    }
+
+    #[test]
+    fn expand_tabs_leading_tab_becomes_eight_spaces() {
+        // A tab at column 0 advances to the next 8-column stop (column 8).
+        assert_eq!(expand_tabs("\tfoo"), "        foo");
+    }
+
+    #[test]
+    fn expand_tabs_mid_line_is_column_aware() {
+        // "abc" sits at column 3; the next 8-column stop is 8 → 5 spaces,
+        // not a fixed 8.
+        assert_eq!(expand_tabs("abc\tdef"), "abc     def");
+    }
+
+    #[test]
+    fn expand_tabs_after_wide_char_tracks_display_columns() {
+        // "日" occupies 2 columns; the next stop is still 8 → 6 spaces.
+        assert_eq!(expand_tabs("日\tx"), "日      x");
+    }
+
+    #[test]
+    fn expand_tabs_at_tab_stop_adds_one_space() {
+        // "1234567" fills column 7; a tab there advances 1 column to 8.
+        assert_eq!(expand_tabs("1234567\tx"), "1234567 x");
+    }
+
+    #[test]
+    fn expand_tabs_resets_column_per_line() {
+        // Column tracking restarts after every newline, like a terminal.
+        assert_eq!(expand_tabs("a\tb\n\tc"), "a       b\n        c");
+    }
+
+    #[test]
+    fn expand_tabs_consecutive_tabs_chain() {
+        // Two tabs at line start: col 0 → 8, then col 8 → 16.
+        assert_eq!(expand_tabs("\t\tfoo"), "                foo");
+    }
 
     #[test]
     fn sanitize_for_terminal_keeps_sgr_sequences() {
