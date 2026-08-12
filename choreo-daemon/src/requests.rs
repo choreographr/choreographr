@@ -1369,6 +1369,17 @@ pub(crate) fn run_agent_loop(
                         arguments_json: tc.arguments_json.clone(),
                     })
                     .collect();
+                // Invocation descriptions for the same calls, in the same
+                // order: seeding them onto the placeholder results lets every
+                // client render the tool's context (e.g. "Running command:
+                // `…`.") from the moment the seeded turn is broadcast — before
+                // any output streams — instead of waiting for a streaming
+                // chunk that may be dropped or for the final record.
+                let invocation_descriptions: Vec<String> = tool_use
+                    .tool_calls
+                    .iter()
+                    .map(|tc| ctx.tool_registry.describe_invocation(tc))
+                    .collect();
                 // Record the producing provider+model once: it feeds both the
                 // turn's provenance and the persisted response-id provenance.
                 let producer = ReasoningProducer {
@@ -1389,8 +1400,14 @@ pub(crate) fn run_agent_loop(
                 // Seed one placeholder tool result per call, in the model's
                 // call order, so the transcript renders every tool result in
                 // that order at all times — each placeholder is filled in
-                // place as its tool streams or finalizes.
-                session.seed_tool_results(current_turn_id, &tool_call_records);
+                // place as its tool streams or finalizes.  The seeded
+                // placeholder already carries the invocation description so
+                // the live header matches the final record's exactly.
+                session.seed_tool_results(
+                    current_turn_id,
+                    &tool_call_records,
+                    &invocation_descriptions,
+                );
                 broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, current_turn_id);
                 // Store response_id for chaining tool results back to this
                 // turn, and persist it (+ its producing model) on the session
@@ -1446,6 +1463,15 @@ pub(crate) fn run_agent_loop(
                         break;
                     }
 
+                    // The invocation description is generated up front so the
+                    // ToolCallStarted broadcast carries it (clients render the
+                    // tool's context — e.g. "Running command: `…`." — from the
+                    // start event, not from a streaming chunk that may be
+                    // dropped) and the serial error/panic outputs carry it too
+                    // (a timed-out or cancelled tool renders with the same
+                    // invocation context the concurrent path shows).
+                    let invocation_description = ctx.tool_registry.describe_invocation(&tool_call);
+
                     if let Err(e) =
                         ctx.cmd_tx
                             .send(SessionCommand::Broadcast(DaemonMessage::ToolCallStarted {
@@ -1454,6 +1480,7 @@ pub(crate) fn run_agent_loop(
                                 call_id: tool_call.id.clone(),
                                 tool_name: tool_call.name.clone(),
                                 arguments_json: tool_call.arguments_json.clone(),
+                                invocation_description: invocation_description.clone(),
                             }))
                     {
                         warn!(%request_id, call_id = %tool_call.id, error = %e, "failed to broadcast ToolCallStarted");
@@ -1481,11 +1508,6 @@ pub(crate) fn run_agent_loop(
                         "executing tool (serial)",
                     );
 
-                    // The invocation description is generated up front (as in
-                    // the concurrent path) so the serial error/panic outputs
-                    // carry it too — a timed-out or cancelled tool renders with
-                    // the same invocation context the concurrent path shows.
-                    let invocation_description = ctx.tool_registry.describe_invocation(&tool_call);
                     let turn_working_dir = session.config.working_dir.clone();
                     let (mut output, tool_cancelled, image) = execute_tool_with_timeout(
                         &tool_call,
@@ -1544,6 +1566,12 @@ pub(crate) fn run_agent_loop(
                 // ── Phase 2: All remaining tools (concurrent) ───────
                 if !cancelled && !concurrent.is_empty() {
                     for tc in concurrent.iter() {
+                        // Carry the invocation description on the start event so
+                        // clients render the tool's context (e.g. "Running
+                        // command: `…`.") from the broadcast rather than from a
+                        // streaming chunk — chunks are droppable under load, and
+                        // this event is queued before the tool even starts.
+                        let invocation_description = ctx.tool_registry.describe_invocation(tc);
                         if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::ToolCallStarted {
                                 session_id: ctx.session_id,
@@ -1551,6 +1579,7 @@ pub(crate) fn run_agent_loop(
                                 call_id: tc.id.clone(),
                                 tool_name: tc.name.clone(),
                                 arguments_json: tc.arguments_json.clone(),
+                                invocation_description,
                             },
                         )) {
                             warn!(%request_id, call_id = %tc.id, error = %e, "failed to broadcast ToolCallStarted");
@@ -2375,7 +2404,7 @@ mod tests {
         );
         // Placeholder results are seeded in call order; the finished tool
         // updates its slot in place.
-        session.seed_tool_results(tid, &records);
+        session.seed_tool_results(tid, &records, &["".into()]);
         session.update_tool_result(
             tid,
             "call_1",
@@ -2824,7 +2853,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        session.seed_tool_results(tid, &records);
+        session.seed_tool_results(tid, &records, &["".into()]);
         // Tool-involving turn WITH an artifact: clean.
         add_turn(
             &mut session,
@@ -2972,7 +3001,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        session.seed_tool_results(tid, &records);
+        session.seed_tool_results(tid, &records, &["".into()]);
         // ResponseId policy: artifacts flow via previous_response_id, so the
         // guard must not flag the missing message artifact.
         assert_eq!(
@@ -3868,15 +3897,9 @@ mod tests {
         );
         assert!(!cancelled, "completion must not report a cancel");
 
-        // First chunk is the description string (from execute_streaming_json)
-        match cmd_rx.recv() {
-            Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
-                assert_eq!(data, b"test tool that sends streaming output.");
-            }
-            Ok(_other) => panic!("expected ToolResultChunk, got unexpected SessionCommand"),
-            Err(e) => panic!("channel disconnected while waiting for streaming output: {e}"),
-        }
-        // Second chunk is the actual payload from the tool's execute_streaming
+        // The invocation description is no longer streamed as a chunk (it
+        // rides on ToolCallStarted + the seeded placeholder); the only chunk
+        // is the tool's own payload from execute_streaming.
         match cmd_rx.recv() {
             Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
                 assert_eq!(data, b"streamed payload");

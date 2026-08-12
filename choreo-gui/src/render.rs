@@ -87,7 +87,14 @@ fn render_tool_result(tr: &ToolResultRecord) -> Element {
     } else {
         "tool result"
     };
-    let content = format!("{}: {}", tr.name, tr.content);
+    // The invocation description (e.g. "Running command: `cargo build`.") is
+    // the primary summary of what the tool did; the tool name + verbatim
+    // content follow it, mirroring how the TUI renders the header.
+    let content = if tr.invocation_description.is_empty() {
+        format!("{}: {}", tr.name, tr.content)
+    } else {
+        format!("{}\n{}: {}", tr.invocation_description, tr.name, tr.content)
+    };
     render_labeled_plain_message(label, &content, "session-item tool-result-item")
 }
 

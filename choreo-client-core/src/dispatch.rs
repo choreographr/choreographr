@@ -11,6 +11,10 @@ pub enum ToolCallEvent {
         call_id: String,
         tool_name: String,
         arguments_json: String,
+        /// Human-readable invocation description from `ToolCallStarted` (e.g.
+        /// "Running command: `cargo build`.") so clients can render the tool's
+        /// context immediately, before any streaming output arrives.
+        invocation_description: String,
     },
     Finished {
         call_id: String,
@@ -199,6 +203,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             call_id,
             tool_name,
             arguments_json,
+            invocation_description,
         } => handler.handle_tool_call_event(
             *session_id,
             *request_id,
@@ -206,6 +211,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
                 call_id: call_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
+                invocation_description: invocation_description.clone(),
             },
         ),
         DaemonMessage::ToolCallFinished {

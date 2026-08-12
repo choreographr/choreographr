@@ -671,16 +671,28 @@ impl SessionState {
     /// issued them — even while the tools are still running. Each placeholder
     /// is filled in place by [`Self::update_tool_result`] the moment its tool
     /// streams or finishes, so the rendered order never changes.
-    pub fn seed_tool_results(&mut self, turn_id: u32, tool_calls: &[AssistantToolCallRecord]) {
+    ///
+    /// `invocation_descriptions` runs parallel to `tool_calls` (same length,
+    /// same order — both are derived from the same model response): seeding
+    /// the description onto each placeholder means clients render the tool's
+    /// context (e.g. "Running command: `…`.") from the moment the turn is
+    /// broadcast, matching the final record's header exactly.
+    pub fn seed_tool_results(
+        &mut self,
+        turn_id: u32,
+        tool_calls: &[AssistantToolCallRecord],
+        invocation_descriptions: &[String],
+    ) {
         if let Some(turn) = self.turns.get_mut(&turn_id) {
             turn.tool_results = tool_calls
                 .iter()
-                .map(|tc| ToolResultRecord {
+                .zip(invocation_descriptions.iter())
+                .map(|(tc, desc)| ToolResultRecord {
                     call_id: tc.call_id.clone(),
                     name: tc.name.clone(),
                     content: String::new(),
                     is_error: false,
-                    invocation_description: String::new(),
+                    invocation_description: desc.clone(),
                 })
                 .collect();
         }
@@ -3432,7 +3444,15 @@ mod tests {
                 arguments_json: "{}".into(),
             },
         ];
-        state.seed_tool_results(tid, &calls);
+        state.seed_tool_results(
+            tid,
+            &calls,
+            &[
+                "Reading `a`.".into(),
+                "Grepping `b`.".into(),
+                "Running `c`.".into(),
+            ],
+        );
 
         let order_of = |state: &SessionState| {
             state
@@ -3447,6 +3467,20 @@ mod tests {
                 .unwrap_or_default()
         };
         assert_eq!(order_of(&state), vec!["a", "b", "c"]);
+        // Each placeholder carries its invocation description from the start
+        // (the live header matches the final record's).
+        assert_eq!(
+            state.turns[&tid].tool_results[0].invocation_description,
+            "Reading `a`."
+        );
+        assert_eq!(
+            state.turns[&tid].tool_results[1].invocation_description,
+            "Grepping `b`."
+        );
+        assert_eq!(
+            state.turns[&tid].tool_results[2].invocation_description,
+            "Running `c`."
+        );
 
         // c finishes first — its placeholder is filled in place.
         state.update_tool_result(tid, "c", "sh".into(), "c-out".into(), false, String::new());
@@ -3487,7 +3521,7 @@ mod tests {
         // the call-order invariant.
         let mut state = SessionState::empty();
         let (tid, _) = state.start_turn(None);
-        state.seed_tool_results(tid, &[]);
+        state.seed_tool_results(tid, &[], &[]);
         state.update_tool_result(
             tid,
             "ghost",
@@ -3525,7 +3559,7 @@ mod tests {
                 arguments_json: "{}".into(),
             },
         ];
-        state.seed_tool_results(tid, &calls);
+        state.seed_tool_results(tid, &calls, &["".into(), "".into(), "".into()]);
         // Only a's result was recorded before the cancel.
         state.update_tool_result(
             tid,
@@ -3559,7 +3593,7 @@ mod tests {
             name: "sh".into(),
             arguments_json: "{}".into(),
         }];
-        state.seed_tool_results(tid, &calls);
+        state.seed_tool_results(tid, &calls, &["".into(), "".into(), "".into()]);
         state.update_tool_result(
             tid,
             "a",

@@ -238,6 +238,7 @@ mod tests {
             call_id: call_id.into(),
             tool_name: tool_name.into(),
             arguments_json: args.into(),
+            invocation_description: String::new(),
         }
     }
 

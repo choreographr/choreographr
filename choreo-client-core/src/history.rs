@@ -56,6 +56,13 @@ pub struct SessionView {
     /// request_id → turn_id for streaming chunk routing.
     /// Inserted on `Started`, removed on `Done`/`Failed`/`Cancelled`.
     pub request_to_turn: HashMap<u32, u32>,
+    /// call_id → invocation description for tool calls whose start event
+    /// (`ToolCallStarted`) arrived before their first streaming chunk created
+    /// a stub result.  The description rides on the start event (never on a
+    /// chunk — chunks are droppable under load), so a stub created by a later
+    /// chunk must be able to recover it here.  Entries are removed when the
+    /// authoritative turn replaces the accumulated one (`insert_or_replace`).
+    tool_call_descriptions: HashMap<String, String>,
 }
 
 impl SessionView {
@@ -63,10 +70,17 @@ impl SessionView {
         Self {
             turns: BTreeMap::new(),
             request_to_turn: HashMap::new(),
+            tool_call_descriptions: HashMap::new(),
         }
     }
 
     pub fn insert_or_replace(&mut self, turn_id: u32, turn: Turn) {
+        // Once the authoritative turn (with the final records) replaces the
+        // accumulated one, no more chunks arrive for its calls — drop their
+        // description entries so the map stays bounded by in-flight calls.
+        for tc in &turn.tool_calls {
+            self.tool_call_descriptions.remove(&tc.call_id);
+        }
         self.turns.insert(turn_id, turn);
     }
 
@@ -129,6 +143,7 @@ impl SessionView {
         call_id: String,
         name: String,
         args: String,
+        invocation_description: String,
     ) {
         let Some(&turn_id) = self.request_to_turn.get(&request_id) else {
             tracing::warn!(%request_id, "tool_call_started: unknown request");
@@ -138,23 +153,40 @@ impl SessionView {
             tracing::warn!(%turn_id, "tool_call_started: unknown turn");
             return;
         };
-        // Backfill the tool name onto a stub tool result created out of
-        // order (a chunk that arrived before this event).  The stub's name
-        // is unresolvable at chunk time if the tool_call hasn't landed yet;
-        // filling it in here keeps the TUI's quiet/default-collapse
-        // decision correct without waiting for the full turn to replace
-        // the record.  Only fills empty names — a seeded placeholder or an
-        // earlier backfill already carries the right value.
-        if let Some(result) = turn.tool_results.iter_mut().find(|r| r.call_id == call_id)
-            && result.name.is_empty()
-        {
-            result.name = name.clone();
+        // Stash the description for a stub that the first chunk may create
+        // later.  ToolCallStarted is broadcast before any chunk, so the stub
+        // usually does not exist yet; without this, the description would be
+        // lost the moment the start event passed (the description never rides
+        // on a chunk).
+        if !invocation_description.is_empty() {
+            self.tool_call_descriptions
+                .insert(call_id.clone(), invocation_description.clone());
         }
-        turn.tool_calls.push(AssistantToolCallRecord {
-            call_id,
-            name,
-            arguments_json: args,
-        });
+        // Backfill the tool name AND description onto a stub tool result
+        // created out of order (a chunk that arrived before this event).  The
+        // stub's name is unresolvable at chunk time if the tool_call hasn't
+        // landed yet; filling both in here keeps the TUI's quiet/default-
+        // collapse decision and the header rendering correct without waiting
+        // for the full turn to replace the record.  Only fills empty fields —
+        // a seeded placeholder or an earlier backfill already carries values.
+        if let Some(result) = turn.tool_results.iter_mut().find(|r| r.call_id == call_id) {
+            if result.name.is_empty() {
+                result.name = name.clone();
+            }
+            if result.invocation_description.is_empty() {
+                result.invocation_description = invocation_description.clone();
+            }
+        }
+        // The seeded turn already carries this call in tool_calls (the daemon
+        // broadcasts the seeded turn before ToolCallStarted); don't duplicate
+        // the record when the start event lands after it.
+        if !turn.tool_calls.iter().any(|tc| tc.call_id == call_id) {
+            turn.tool_calls.push(AssistantToolCallRecord {
+                call_id,
+                name,
+                arguments_json: args,
+            });
+        }
     }
 
     /// Route a tool result chunk — appends to the matching ToolResultRecord.
@@ -168,8 +200,21 @@ impl SessionView {
             tracing::warn!(%turn_id, "tool_result_chunk: unknown turn");
             return;
         };
+        // The start event's description, if it arrived before this chunk
+        // (the normal FIFO order) — used to fill an empty placeholder/stub.
+        let pending_desc = self.tool_call_descriptions.get(call_id).cloned();
         match turn.tool_results.iter_mut().find(|r| r.call_id == call_id) {
-            Some(result) => push_capped(&mut result.content, data),
+            Some(result) => {
+                // A record that predates the start event (e.g. the seeded
+                // placeholder when the ToolCallStarted broadcast was dropped)
+                // still gets its header from the first chunk onward.
+                if result.invocation_description.is_empty()
+                    && let Some(desc) = pending_desc
+                {
+                    result.invocation_description = desc;
+                }
+                push_capped(&mut result.content, data);
+            }
             None => {
                 // Stub created out of order (chunk before ToolCallStarted).
                 // Resolve the tool name from the turn's tool_calls so the
@@ -190,7 +235,7 @@ impl SessionView {
                     name,
                     content,
                     is_error: false,
-                    invocation_description: String::new(),
+                    invocation_description: pending_desc.unwrap_or_default(),
                 });
             }
         }
@@ -419,10 +464,135 @@ mod tests {
         assert_eq!(view.get(1).unwrap().tool_results[0].name, "");
 
         // The start event arrives: the name is backfilled onto the stub.
-        view.tool_call_started(7, "call-2".into(), "read_file".into(), "{}".into());
+        view.tool_call_started(
+            7,
+            "call-2".into(),
+            "read_file".into(),
+            "{}".into(),
+            "".into(),
+        );
 
         let turn = view.get(1).unwrap();
         assert_eq!(turn.tool_results[0].name, "read_file");
         assert_eq!(turn.tool_calls.len(), 2, "the call is recorded as usual");
+    }
+
+    #[test]
+    fn tool_call_started_stashes_description_for_upcoming_stub() {
+        // ToolCallStarted is broadcast before the first chunk, so when the
+        // chunk arrives the stub does not exist yet — the description stashed
+        // by the start event must be recovered at stub-creation time.
+        let mut view = SessionView::new();
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
+        view.request_to_turn.insert(7, 1);
+
+        view.tool_call_started(
+            7,
+            "call-2".into(),
+            "sh".into(),
+            r#"{"command":"cargo build"}"#.into(),
+            "Running command: `cargo build`.".into(),
+        );
+        assert!(
+            view.get(1).unwrap().tool_results.is_empty(),
+            "the start event alone must not create a result record"
+        );
+
+        view.tool_result_chunk(7, "call-2", "Compiling…\n");
+
+        let turn = view.get(1).unwrap();
+        assert_eq!(turn.tool_results.len(), 1);
+        assert_eq!(
+            turn.tool_results[0].invocation_description, "Running command: `cargo build`.",
+            "stub must carry the description from the start event"
+        );
+        assert_eq!(turn.tool_results[0].name, "sh");
+        assert_eq!(turn.tool_results[0].content, "Compiling…\n");
+    }
+
+    #[test]
+    fn tool_call_started_backfills_description_onto_out_of_order_stub() {
+        // A chunk arriving before the start event creates a stub without a
+        // description; the start event must backfill it (mirroring the name
+        // backfill) so the live header renders once the event lands.
+        let mut view = SessionView::new();
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
+        view.request_to_turn.insert(7, 1);
+
+        view.tool_result_chunk(7, "call-2", "output\n");
+        assert_eq!(
+            view.get(1).unwrap().tool_results[0].invocation_description,
+            ""
+        );
+
+        view.tool_call_started(
+            7,
+            "call-2".into(),
+            "sh".into(),
+            "{}".into(),
+            "Running shell command: `ls`.".into(),
+        );
+
+        let turn = view.get(1).unwrap();
+        assert_eq!(
+            turn.tool_results[0].invocation_description, "Running shell command: `ls`.",
+            "start event must backfill the description onto the stub"
+        );
+        assert_eq!(turn.tool_results[0].name, "sh");
+    }
+
+    #[test]
+    fn tool_call_started_does_not_duplicate_seeded_tool_call() {
+        // The daemon broadcasts the seeded turn (with tool_calls) before
+        // ToolCallStarted, so the start event must not push a duplicate call
+        // record — duplicates would skew the tool_calls ordering used to
+        // resolve stub names.
+        let mut view = SessionView::new();
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
+        view.request_to_turn.insert(7, 1);
+
+        view.tool_call_started(7, "call-1".into(), "sh".into(), "{}".into(), "".into());
+
+        let turn = view.get(1).unwrap();
+        assert_eq!(
+            turn.tool_calls.len(),
+            1,
+            "a seeded tool_call must not be duplicated by its start event"
+        );
+    }
+
+    #[test]
+    fn insert_or_replace_drops_stale_description_entries() {
+        // Description entries are only needed while a call's streaming stub
+        // is being assembled; once the authoritative turn replaces the
+        // accumulated one, the entries must be cleaned so the map stays
+        // bounded by in-flight calls.
+        let mut view = SessionView::new();
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
+        view.request_to_turn.insert(7, 1);
+        view.tool_call_started(
+            7,
+            "call-1".into(),
+            "sh".into(),
+            "{}".into(),
+            "Running shell command: `ls`.".into(),
+        );
+        assert_eq!(view.tool_call_descriptions.len(), 1);
+
+        // The final turn (with the completed record) replaces the stub.
+        let mut turn = turn_with_tool_call("call-1", "sh");
+        turn.tool_results.push(ToolResultRecord {
+            call_id: "call-1".into(),
+            name: "sh".into(),
+            content: "done".into(),
+            is_error: false,
+            invocation_description: "Running shell command: `ls`.".into(),
+        });
+        view.insert_or_replace(1, turn);
+
+        assert!(
+            view.tool_call_descriptions.is_empty(),
+            "replaced turn's call descriptions must be dropped"
+        );
     }
 }

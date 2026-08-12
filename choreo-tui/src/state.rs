@@ -4110,10 +4110,15 @@ impl TurnEventHandler for App {
                 call_id,
                 tool_name,
                 arguments_json,
+                invocation_description,
             } => {
-                display
-                    .view
-                    .tool_call_started(request_id, call_id, tool_name, arguments_json);
+                display.view.tool_call_started(
+                    request_id,
+                    call_id,
+                    tool_name,
+                    arguments_json,
+                    invocation_description,
+                );
                 display.resolve_streaming_turn_index(request_id);
                 display.mark_streaming_changed();
             }

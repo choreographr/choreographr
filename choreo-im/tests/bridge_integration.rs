@@ -110,6 +110,7 @@ fn bridge_tool_call_events() {
             call_id: "call_1".into(),
             tool_name: "read_file".into(),
             arguments_json: r#"{"path":"/tmp"}"#.into(),
+            invocation_description: String::new(),
         },
     )
     .unwrap();

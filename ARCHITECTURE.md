@@ -1144,9 +1144,10 @@ pub struct ToolOutput {
 
 `Text` format is used for LLM-facing tool results (human-readable, uses `return_string`).
 `Json` format is used for Programmatic Tool Calling (PTC) — JSON-encodes the return via `serde_json::to_string`.
-`invocation_description` is stored in `ToolResultRecord` and streamed as the first chunk in
-`execute_streaming_json` for real-time TUI display. It is explicitly excluded from LLM message
-construction — the model never sees it.
+`invocation_description` is stored in `ToolResultRecord` and seeded onto every placeholder result when the
+model's tool calls are recorded, so clients render the tool's context (e.g. "Running command: `…`.")
+the moment the seeded turn is broadcast — before any output streams. It is explicitly excluded from LLM
+message construction — the model never sees it.
 
 Tools that need session context (`ToolContext` — used by `list_sessions`, `get_session`)
 receive it in the `ctx` parameter. Tools that return structured data override
@@ -1204,12 +1205,14 @@ failure) and all three dispatch paths:
 The JSON path deserializes arguments with `serde_json`, calls `Tool::execute()`, then
 returns a `ToolOutput`. Both `execute_json` and `execute_streaming_json` first call
 `T::describe_invocation(self, &args)` to produce the invocation description, then store
-it on the returned `ToolOutput`. In the streaming path, the description is also sent as
-the first chunk via `output_tx` so the TUI can display it in real time before the tool
-produces any output. When `format` is `Text`, the content is produced via
-`T::return_string()` (human-readable). When `format` is `Json`, the return value
-is JSON-encoded via `serde_json::to_string()` (for PTC responses).
-The binary path uses `postcard` for both deserialization and serialization,
+it on the returned `ToolOutput`. In the streaming path the description is deliberately
+NOT sent as a chunk (a chunk can be dropped under load, and a chunk without a trailing
+newline would be mashed against the first output line): it is delivered reliably via the
+`ToolCallStarted` broadcast (queued before the tool starts) and on the seeded placeholder
+result, so clients render the same header live and in the final record. When `format` is
+`Text`, the content is produced via `T::return_string()` (human-readable). When `format`
+is `Json`, the return value is JSON-encoded via `serde_json::to_string()` (for PTC
+responses). The binary path uses `postcard` for both deserialization and serialization,
 enabling compact cross-VM communication.
 
 ### `define_tool!` macro

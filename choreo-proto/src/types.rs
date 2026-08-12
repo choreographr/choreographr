@@ -535,6 +535,11 @@ pub enum DaemonMessage {
         call_id: String,
         tool_name: String,
         arguments_json: String,
+        /// Human-readable invocation description (e.g. "Running command:
+        /// `cargo build`.") so clients can render the tool's context as soon
+        /// as the call starts, without waiting for the first streaming chunk
+        /// or the final result.  Mirrors `ToolOutput.invocation_description`.
+        invocation_description: String,
     },
     ToolCallFinished {
         session_id: u64,

@@ -110,9 +110,15 @@ impl TurnEventHandler for AppState {
                 call_id,
                 tool_name,
                 arguments_json,
+                invocation_description,
             } => {
-                self.session_view
-                    .tool_call_started(request_id, call_id, tool_name, arguments_json);
+                self.session_view.tool_call_started(
+                    request_id,
+                    call_id,
+                    tool_name,
+                    arguments_json,
+                    invocation_description,
+                );
             }
             ToolCallEvent::Finished { .. } | ToolCallEvent::Failed { .. } => {}
         }

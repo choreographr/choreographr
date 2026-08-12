@@ -375,13 +375,14 @@ pub trait Tool: Send + Sync {
 
     /// Whether this tool produces streaming output via `execute_streaming`.
     ///
-    /// When `true`, `execute_streaming_json` sends the invocation description as
-    /// the first chunk so the client sees immediate context.  When `false` (the
-    /// default for non-streaming tools like `read_file`), sending the description
-    /// as a chunk would create a misleading stub `ToolResultRecord` on the client
-    /// side with the description in `content` and empty `invocation_description`.
-    /// The description arrives correctly through `ToolOutput.invocation_description`
-    /// in the subsequent `TurnAppended`.
+    /// Streaming tools forward their live output as `ToolResultChunk`s.  The
+    /// invocation description is *not* sent as a chunk: it rides on the
+    /// `ToolCallStarted` broadcast (queued before the tool even starts) and on
+    /// the seeded placeholder result, so clients render the same header live
+    /// and in the final record — a chunk can be dropped under load, and a
+    /// no-output tool emits no chunks at all.  Non-streaming tools (the
+    /// default, e.g. `read_file`) emit no chunks; their description arrives
+    /// via `ToolOutput.invocation_description` in the `TurnAppended`.
     fn supports_streaming_output() -> bool {
         false
     }
@@ -552,15 +553,13 @@ impl<T: Tool + 'static> ToolDyn for T {
     ) -> Result<ToolOutput, ToolError> {
         let args = serde_json::from_str::<T::Args>(args_json)?;
         let desc = T::describe_invocation(self, &args);
-        // Only send the invocation description as the first streaming chunk
-        // for tools that override `execute_streaming`.  For non-streaming tools
-        // the description arrives through `ToolOutput.invocation_description`
-        // in the `TurnAppended`; sending it as a chunk would create a stub
-        // `ToolResultRecord` on the client with the description in `content`
-        // and empty `invocation_description`, masking the real output.
-        if T::supports_streaming_output() {
-            let _ = output_tx.send(desc.as_bytes().to_vec());
-        }
+        // The invocation description is deliberately NOT sent as a streaming
+        // chunk: it would be mashed against the first output line (no trailing
+        // newline), and a chunk can be dropped under load, leaving the live
+        // view without the tool's context.  It is delivered reliably instead —
+        // on the `ToolCallStarted` broadcast and on the seeded placeholder
+        // result — so the client renders the header identically during
+        // streaming and in the final record.
         let ret = match self.execute_streaming(args, x_credentials, working_dir, output_tx, ctx) {
             Ok(r) => r,
             Err(e) => {

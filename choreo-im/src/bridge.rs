@@ -435,6 +435,7 @@ mod tests {
                 call_id: "call_1".into(),
                 tool_name: "read".into(),
                 arguments_json: r#"{"path":"/tmp"}"#.into(),
+                invocation_description: String::new(),
             },
             &mut buffers,
             &mut tool_buffers,
