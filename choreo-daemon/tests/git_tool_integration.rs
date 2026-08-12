@@ -1,7 +1,7 @@
 use choreo_daemon::{
-    GitAddArgs, GitCommitArgs, GitDiffArgs, GitLogArgs, GitPushArgs, GitRepoArgs,
+    GitAddArgs, GitCommitArgs, GitDiffArgs, GitLogArgs, GitPushArgs, GitRepoArgs, GitShowArgs,
     execute_git_add_tool, execute_git_commit_tool, execute_git_diff_tool, execute_git_log_tool,
-    execute_git_push_tool, execute_git_status_tool,
+    execute_git_push_tool, execute_git_show_tool, execute_git_status_tool,
 };
 use std::{
     path::Path,
@@ -326,4 +326,45 @@ fn push_rejected_when_ahead() {
     // Make another commit without pulling first (simulating non-ff rejection)
     // Actually in a bare test repo with no other pushes this won't fail.
     // Just test that push succeeds.
+}
+
+#[test]
+#[ignore]
+fn show_commit_diff_skips_directory_entries() {
+    // Regression test: gix's tree diff reports a change for every modified
+    // *directory* entry in addition to the files inside it. The old code
+    // read those tree objects as blobs, which surfaced raw tree bytes
+    // (NUL separators) as bogus `Binary file: <dir>` entries — making
+    // agents think the repo contained binaries or symlinks at crate paths.
+    let repo = init_repo();
+    std::fs::create_dir_all(repo.join("choreo-foo/src")).unwrap();
+    std::fs::write(repo.join("choreo-foo/Cargo.toml"), "[package]\n").unwrap();
+    std::fs::write(repo.join("choreo-foo/src/lib.rs"), "pub fn v1() {}\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+    std::fs::write(repo.join("choreo-foo/src/lib.rs"), "pub fn v2() {}\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "modify nested file"]);
+
+    let result = execute_git_show_tool(
+        &GitShowArgs {
+            repo_path: repo_path_arg(&repo),
+            revision: Some("HEAD".into()),
+            path: None,
+            diff: Some(true),
+        },
+        None,
+    )
+    .unwrap_or_default();
+
+    // The real file change must be present...
+    assert!(result.contains("choreo-foo/src/lib.rs"), "{}", result);
+    assert!(result.contains("+pub fn v2"), "{}", result);
+    // ...and no directory-level "Binary file:" noise may leak in.
+    assert!(!result.contains("Binary file:"), "{}", result);
+    assert!(
+        !result.contains("diff --git a/choreo-foo b/choreo-foo"),
+        "{}",
+        result
+    );
 }

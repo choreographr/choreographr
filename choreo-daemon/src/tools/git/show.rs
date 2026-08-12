@@ -233,6 +233,17 @@ fn generate_commit_diff(
     let mut out = String::new();
 
     for change in &changes {
+        // gix's tree diff reports a change for every modified *directory* (and
+        // gitlink) entry in addition to the files inside it. Directories have
+        // no diffable content — reading the tree object as a blob yields raw
+        // tree bytes (NUL separators), which we would otherwise report as a
+        // bogus `Binary file: <dir>` entry that makes agents think the repo
+        // contains binaries or symlinks at those paths. Skip structural
+        // entries; the leaf file changes are emitted separately.
+        if !is_blob_change(change) {
+            continue;
+        }
+
         let path = String::from_utf8_lossy(change.location().as_ref()).into_owned();
         let source_path = String::from_utf8_lossy(change.source_location().as_ref()).into_owned();
 
@@ -263,6 +274,41 @@ fn generate_commit_diff(
     }
 
     Ok(out)
+}
+
+/// Returns `true` when the change describes file content (blobs, executable
+/// blobs, or symlinks) worth diffing, and `false` for structural entries
+/// (directories and gitlinks/submodules).
+///
+/// gix's tree diff emits a change for every changed *tree* entry in addition
+/// to the files inside it — so a commit touching `crate-a/src/lib.rs` also
+/// yields changes at `crate-a` and `crate-a/src`. Only blob-like entries have
+/// diffable content; treating a tree object as a blob surfaces raw tree bytes
+/// (which contain NUL separators) as a misleading `Binary file: <dir>` entry.
+fn is_blob_change(change: &gix::object::tree::diff::ChangeDetached) -> bool {
+    use gix::object::tree::EntryKind;
+    use gix::object::tree::diff::ChangeDetached;
+
+    let is_file_mode = |mode: gix::object::tree::EntryMode| {
+        matches!(
+            mode.kind(),
+            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link
+        )
+    };
+    match change {
+        ChangeDetached::Addition { entry_mode, .. } => is_file_mode(*entry_mode),
+        ChangeDetached::Deletion { entry_mode, .. } => is_file_mode(*entry_mode),
+        ChangeDetached::Modification {
+            previous_entry_mode,
+            entry_mode,
+            ..
+        } => is_file_mode(*previous_entry_mode) && is_file_mode(*entry_mode),
+        ChangeDetached::Rewrite {
+            source_entry_mode,
+            entry_mode,
+            ..
+        } => is_file_mode(*source_entry_mode) && is_file_mode(*entry_mode),
+    }
 }
 
 /// Extract old/new OIDs from a tree change, returning `(old, new)` where
@@ -550,6 +596,72 @@ mod tests {
     fn test_is_binary_under_limit() {
         let small = "x".repeat(999_999);
         assert!(!is_binary_content(&small));
+    }
+
+    // ── is_blob_change ──
+
+    fn mode(octal: u32) -> gix::object::tree::EntryMode {
+        gix::object::tree::EntryMode::try_from(octal).expect("valid entry mode")
+    }
+
+    fn null_id() -> gix::hash::ObjectId {
+        gix::hash::ObjectId::null(gix::hash::Kind::Sha1)
+    }
+
+    fn addition(mode_octal: u32) -> gix::object::tree::diff::ChangeDetached {
+        gix::object::tree::diff::ChangeDetached::Addition {
+            location: gix::bstr::BString::from("f"),
+            relation: None,
+            entry_mode: mode(mode_octal),
+            id: null_id(),
+        }
+    }
+
+    fn deletion(mode_octal: u32) -> gix::object::tree::diff::ChangeDetached {
+        gix::object::tree::diff::ChangeDetached::Deletion {
+            location: gix::bstr::BString::from("f"),
+            relation: None,
+            entry_mode: mode(mode_octal),
+            id: null_id(),
+        }
+    }
+
+    fn modification(
+        old_mode_octal: u32,
+        new_mode_octal: u32,
+    ) -> gix::object::tree::diff::ChangeDetached {
+        gix::object::tree::diff::ChangeDetached::Modification {
+            location: gix::bstr::BString::from("f"),
+            previous_entry_mode: mode(old_mode_octal),
+            previous_id: null_id(),
+            entry_mode: mode(new_mode_octal),
+            id: null_id(),
+        }
+    }
+
+    #[test]
+    fn blob_changes_are_diffed() {
+        // Regular file, executable file, and symlink additions.
+        assert!(is_blob_change(&addition(0o100644)));
+        assert!(is_blob_change(&addition(0o100755)));
+        assert!(is_blob_change(&addition(0o120000)));
+        // Deletions and modifications of files.
+        assert!(is_blob_change(&deletion(0o100644)));
+        assert!(is_blob_change(&modification(0o100644, 0o100644)));
+        assert!(is_blob_change(&modification(0o100644, 0o100755)));
+    }
+
+    #[test]
+    fn directory_and_gitlink_changes_are_skipped() {
+        // Directory additions/deletions are structural, not content.
+        assert!(!is_blob_change(&addition(0o040000)));
+        assert!(!is_blob_change(&deletion(0o040000)));
+        // Submodule (gitlink) entries carry no diffable content either.
+        assert!(!is_blob_change(&addition(0o160000)));
+        // Directory → directory and file ↔ directory transitions.
+        assert!(!is_blob_change(&modification(0o040000, 0o040000)));
+        assert!(!is_blob_change(&modification(0o100644, 0o040000)));
+        assert!(!is_blob_change(&modification(0o040000, 0o100644)));
     }
 
     #[test]
