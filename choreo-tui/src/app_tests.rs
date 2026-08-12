@@ -3772,6 +3772,86 @@ fn session_state_snapshot_with_newer_larger_usage_updates_display() {
     );
 }
 
+#[test]
+fn session_state_snapshot_does_not_regress_fresher_last_prompt_tokens() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(7);
+
+    // The display already holds the fresher value (a mid-turn
+    // TokenUsageUpdate or the Done at turn end).  Unlike cumulative usage,
+    // last_prompt_tokens is not monotonic, so the snapshot must gap-fill
+    // rather than overwrite: a lagging attach snapshot (built from the
+    // session thread's config before the latest broadcast) must not regress
+    // the progress bar until the next update.
+    app.display_for(7).last_prompt_tokens = Some(5000);
+
+    handle_daemon_message(
+        DaemonMessage::SessionState {
+            session_id: 7,
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            working_dir: None,
+            turns: std::collections::BTreeMap::new(),
+            active_tool_groups: vec![],
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: Some(100),
+            reasoning_effort: None,
+            reasoning_capability: None,
+            status: SessionStatus::Inactive,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    assert_eq!(
+        app.display_for(7).last_prompt_tokens,
+        Some(5000),
+        "a lagging snapshot must not regress the fresher last_prompt_tokens"
+    );
+}
+
+#[test]
+fn session_state_snapshot_fills_missing_last_prompt_tokens() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(7);
+
+    // No value shown yet — the snapshot's value must still be applied
+    // (gap-fill only blocks regression, not forward progress).
+    assert!(app.display_for(7).last_prompt_tokens.is_none());
+
+    handle_daemon_message(
+        DaemonMessage::SessionState {
+            session_id: 7,
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            working_dir: None,
+            turns: std::collections::BTreeMap::new(),
+            active_tool_groups: vec![],
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: Some(300),
+            reasoning_effort: None,
+            reasoning_capability: None,
+            status: SessionStatus::Inactive,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    assert_eq!(
+        app.display_for(7).last_prompt_tokens,
+        Some(300),
+        "a snapshot must fill last_prompt_tokens when nothing is shown yet"
+    );
+}
+
 // ── multi-session streaming: switching keeps accumulated content ──
 
 /// A turn whose assistant text was streamed in via OutputChunk.

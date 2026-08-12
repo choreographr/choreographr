@@ -65,6 +65,14 @@ const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags = KeyboardEnhancementFlags:
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits(),
 );
 
+/// High-water mark for the daemon→UI event queue.  The queue is unbounded by
+/// design (see the reader-thread closure in `run_app`), so a stalled UI event
+/// loop could otherwise accumulate events silently; above this many pending
+/// events the reader thread warns once per episode so the backlog stays
+/// observable.  Chosen well above the normal steady-state backlog (a handful
+/// of events per frame).
+const UI_EVENT_QUEUE_HIGH_WATER_MARK: usize = 16_384;
+
 /// Commands sent from the terminal-event thread to the main loop for
 /// coordinating terminal state around suspend/resume cycles.
 #[derive(Debug)]
@@ -147,6 +155,10 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 
     let connection_ui_tx = ui_tx.clone();
     let connection_task = thread::spawn(move || {
+        // Warn once per backlog episode (reset when the queue drains below
+        // half the high-water mark) so a wedged UI loop is observable without
+        // spamming the log on every event while it is stalled.
+        let mut queue_over_high_water_warned = false;
         let result = run_daemon_connection_with_mode(
             mode,
             |message| {
@@ -162,10 +174,28 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
                 // fill the queue and DROP this session's streaming chunks —
                 // and a dropped chunk is *not* recoverable from the next one
                 // (chunks are deltas, appended by the client; only the final
-                // `TurnAppended` resyncs the complete content).  The
-                // daemon-side drop-on-full already bounds the flow into this
-                // thread, so the unbounded queue stays bounded in practice.
+                // `TurnAppended` resyncs the complete content).
+                //
+                // The cost is that a stalled UI event loop (slow render,
+                // heavy paste, resize storm) lets this queue grow without a
+                // hard cap: the daemon's drop-on-full bounds only the
+                // daemon-side channel, which the reader drains immediately,
+                // so it does NOT bound the queue here.  Correctness wins over
+                // a hard cap (dropping the newest chunk is the exact bug this
+                // replaced), so a high-water warning keeps a wedged loop
+                // observable instead of silently accumulating memory.
                 let _ = connection_ui_tx.send(UiEvent::Daemon(Box::new(message)));
+                if connection_ui_tx.len() > UI_EVENT_QUEUE_HIGH_WATER_MARK
+                    && !queue_over_high_water_warned
+                {
+                    queue_over_high_water_warned = true;
+                    tracing::warn!(
+                        queued = connection_ui_tx.len(),
+                        "ui event queue above high-water mark: a stalled render is accumulating events"
+                    );
+                } else if connection_ui_tx.len() < UI_EVENT_QUEUE_HIGH_WATER_MARK / 2 {
+                    queue_over_high_water_warned = false;
+                }
             },
             client_rx,
             Some(shutdown_rx),
@@ -2056,7 +2086,16 @@ pub(crate) fn handle_daemon_message(
                     if let Some(cw) = context_window {
                         display.context_window = Some(*cw);
                     }
-                    if let Some(tokens) = last_prompt_tokens {
+                    // Gap-fill, never overwrite: the snapshot's
+                    // last_prompt_tokens can lag the value already shown via
+                    // the all-activity subscription (the same cross-channel
+                    // race as token_usage above), and unlike cumulative usage
+                    // it is not monotonic, so a max-merge is wrong.  Never
+                    // regress a fresher value; the next TokenUsageUpdate /
+                    // Done refreshes it anyway.
+                    if display.last_prompt_tokens.is_none()
+                        && let Some(tokens) = last_prompt_tokens
+                    {
                         display.last_prompt_tokens = Some(*tokens);
                     }
                     display.working_dir = working_dir.clone();

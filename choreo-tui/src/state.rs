@@ -3389,24 +3389,24 @@ impl App {
 /// never regressing it.
 ///
 /// Cumulative token usage only ever increases (the daemon accumulates per-turn
-/// usage monotonically), so the merge is a per-field max.  This matters when
-/// switching into a session that is mid-turn: the attach `SessionState`
-/// snapshot is built from the session thread's config, which can lag the
-/// request worker's live accumulation (and, in the worker→main sync window,
-/// the value already broadcast to this client).  A blind overwrite would
-/// regress the status bar's `↑in ↓out` readout until the next
-/// `TokenUsageUpdate` — i.e. until the turn ends — while a `None` snapshot
-/// must never wipe an accumulated total.
+/// usage monotonically), so the merge is a per-field max via
+/// [`TokenUsage::merge_max`].  This matters when switching into a session that
+/// is mid-turn: the attach `SessionState` snapshot is built from the session
+/// thread's config, which can lag the request worker's live accumulation (and,
+/// in the worker→main sync window, the value already broadcast to this client).
+/// A blind overwrite would regress the status bar's `↑in ↓out` readout until
+/// the next `TokenUsageUpdate` — i.e. until the turn ends — while a `None`
+/// snapshot must never wipe an accumulated total.
 pub(crate) fn merge_token_usage(
     current: &Option<TokenUsage>,
     incoming: &Option<TokenUsage>,
 ) -> Option<TokenUsage> {
     match (current, incoming) {
-        (Some(cur), Some(inc)) => Some(TokenUsage {
-            input_tokens: cur.input_tokens.max(inc.input_tokens),
-            output_tokens: cur.output_tokens.max(inc.output_tokens),
-            total_tokens: cur.total_tokens.max(inc.total_tokens),
-        }),
+        (Some(cur), Some(inc)) => {
+            let mut merged = *cur;
+            merged.merge_max(*inc);
+            Some(merged)
+        }
         (Some(cur), None) => Some(*cur),
         (None, Some(inc)) => Some(*inc),
         (None, None) => None,
@@ -4082,9 +4082,15 @@ impl TurnEventHandler for App {
         let display = self.display_for(session_id);
         for tid in turn_ids {
             invalidate_turn_cache(display, *tid);
-            // Bump so the version never collides with a previously cached
-            // rendering if the turn is later redone with identical content.
-            display.bump_turn_version(*tid);
+            // Drop the content-version entry rather than bumping it: the
+            // cache slot was invalidated above and undone turns are skipped
+            // by rebuilds, so no cached rendering can survive for this turn;
+            // `handle_turns_redone` re-invalidates the slot before
+            // re-inserting, so a redone turn (even with byte-identical
+            // content) always recomputes fresh.  Pruning keeps the version
+            // map bounded by the live (non-undone) turn set instead of the
+            // session's whole history.
+            display.turn_versions.remove(tid);
             // Drop the user's reasoning-expansion preference for undone turns
             // so the map can't accumulate stale entries; a redo restores the
             // turn fresh with the derived default.
@@ -4368,6 +4374,15 @@ impl TurnEventHandler for App {
         }
         let display = self.display_for(session_id);
         display.view.turns = merged;
+        // Content versions must never outlive the turns they fingerprint:
+        // drop entries whose turn left the view.  The snapshot merge is a
+        // union today (accumulated turns are re-inserted below), so this is
+        // defensive — it pins the invariant against any future path that
+        // removes turns (undo keeps turns, only marking them undone).
+        let live_turn_ids: Vec<u32> = display.view.turns.keys().copied().collect();
+        display
+            .turn_versions
+            .retain(|turn_id, _| live_turn_ids.contains(turn_id));
         // The merge can silently replace a turn's content (the snapshot wins
         // when it is at least as complete, or the accumulated version wins
         // for the in-flight turn) — either way the cached rendering, built
@@ -4387,7 +4402,15 @@ impl TurnEventHandler for App {
         if let Some(cw) = context_window {
             display.context_window = Some(cw);
         }
-        if let Some(tokens) = last_prompt_tokens {
+        // Gap-fill, never overwrite: the snapshot's last_prompt_tokens can
+        // lag the value already broadcast to this client via the
+        // all-activity subscription (the same cross-channel race as
+        // token_usage), and unlike cumulative usage it is not monotonic, so
+        // a max-merge is wrong.  Never regress a fresher value; the next
+        // TokenUsageUpdate / Done refreshes it anyway.
+        if display.last_prompt_tokens.is_none()
+            && let Some(tokens) = last_prompt_tokens
+        {
             display.last_prompt_tokens = Some(tokens);
         }
         if let Some(effort) = reasoning_effort {
@@ -5978,6 +6001,49 @@ mod tests {
         assert!(
             display.view.turns[&1].undone,
             "the turn should be marked undone"
+        );
+    }
+
+    #[test]
+    fn turns_undone_prunes_content_version() {
+        // The content-version map must stay bounded by the live (non-undone)
+        // turn set, mirroring the reasoning/collapse override pruning: a
+        // redone turn re-invalidates its cache slot, so dropping the version
+        // here can never serve a stale rendering.
+        let mut app = test_app();
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("response".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        {
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(1, turn);
+            // A chunk-like mutation records a version for the turn.
+            display.bump_turn_version(1);
+            assert_eq!(display.turn_content_version(1), 1);
+        }
+
+        app.handle_turns_undone(0, &[1]);
+
+        let display = app.active_display_ref().unwrap();
+        assert!(
+            !display.turn_versions.contains_key(&1),
+            "undo should prune the turn's content version"
+        );
+        assert_eq!(
+            display.turn_content_version(1),
+            0,
+            "an undone turn reports version 0 (no recorded mutations)"
         );
     }
 

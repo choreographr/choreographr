@@ -1762,7 +1762,13 @@ fn handle_sync_accumulated_usage(
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
-    state.config.accumulated_usage = token_usage;
+    // Merge, never overwrite: today a single FIFO worker per session makes a
+    // blind assignment safe (the accumulated total only grows), but a
+    // per-field max keeps the counter monotonic without resting on that
+    // invariant — an out-of-order or overlapping sync can never regress a
+    // total a client already saw.  [`TokenUsage::merge_max`] implements the
+    // same policy the TUI applies to attach snapshots.
+    state.config.accumulated_usage.merge_max(token_usage);
     if let Some(tokens) = last_prompt_tokens {
         state.config.last_prompt_tokens = Some(tokens);
     }
@@ -3497,6 +3503,61 @@ mod tests {
             }
             other => panic!("expected SessionState, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_accumulated_usage_never_regresses_config() {
+        // The config must be monotonic even if a sync arrives out of order or
+        // from an overlapping worker: a per-field max, never a blind assign.
+        let dir = tempdir().unwrap();
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let tool_registry = ToolRegistry::new().build();
+        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db,
+            tool_registry,
+            daemon_tx,
+            max_turns: 0,
+        };
+        let mut state = test_state();
+        let mut shutdown = false;
+
+        // A fresher (larger) total lands first…
+        process_command(
+            SessionCommand::SyncAccumulatedUsage {
+                token_usage: TokenUsage {
+                    input_tokens: 30,
+                    output_tokens: 15,
+                    total_tokens: 45,
+                },
+                last_prompt_tokens: Some(30),
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+        // …then a stale (smaller) sync that a blind assignment would regress.
+        process_command(
+            SessionCommand::SyncAccumulatedUsage {
+                token_usage: TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 3,
+                    total_tokens: 8,
+                },
+                last_prompt_tokens: None,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        assert_eq!(state.config.accumulated_usage.total_tokens, 45);
+        assert_eq!(state.config.accumulated_usage.input_tokens, 30);
+        assert_eq!(state.config.accumulated_usage.output_tokens, 15);
+        assert_eq!(state.config.last_prompt_tokens, Some(30));
     }
 
     #[test]

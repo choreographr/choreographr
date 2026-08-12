@@ -76,6 +76,20 @@ pub struct TokenUsage {
     pub total_tokens: u32,
 }
 
+impl TokenUsage {
+    /// Merge `other` into `self`, keeping the per-field maximum.
+    ///
+    /// Cumulative usage only ever increases, so the per-field max is the
+    /// "most advanced" state without ever regressing a counter.  Shared by
+    /// the daemon's mid-turn `SyncAccumulatedUsage` handler and the TUI's
+    /// attach-snapshot merge so both sides apply the identical policy.
+    pub fn merge_max(&mut self, other: TokenUsage) {
+        self.input_tokens = self.input_tokens.max(other.input_tokens);
+        self.output_tokens = self.output_tokens.max(other.output_tokens);
+        self.total_tokens = self.total_tokens.max(other.total_tokens);
+    }
+}
+
 /// Unix-epoch-milliseconds timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimestampMs(i64);
@@ -946,5 +960,41 @@ mod tests {
         assert_eq!(decoded, turn);
         assert!(decoded.reasoning_artifact.is_none());
         assert!(decoded.reasoning_producer.is_none());
+    }
+
+    #[test]
+    fn token_usage_merge_max_keeps_most_advanced_field_per_field() {
+        // Cumulative usage only ever increases, so the merge is a per-field
+        // max — never regressing any counter even when one side trails the
+        // other on a subset of fields (an attach snapshot built before the
+        // mid-turn sync landed).
+        let mut usage = TokenUsage {
+            input_tokens: 30,
+            output_tokens: 5,
+            total_tokens: 35,
+        };
+        usage.merge_max(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 15,
+            total_tokens: 25,
+        });
+        assert_eq!(usage.input_tokens, 30);
+        assert_eq!(usage.output_tokens, 15);
+        assert_eq!(usage.total_tokens, 35);
+
+        // An identical or trailing value is a no-op.
+        usage.merge_max(TokenUsage {
+            input_tokens: 30,
+            output_tokens: 15,
+            total_tokens: 35,
+        });
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input_tokens: 30,
+                output_tokens: 15,
+                total_tokens: 35,
+            }
+        );
     }
 }

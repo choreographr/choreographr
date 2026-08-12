@@ -775,6 +775,8 @@ LLM provider (API response)
         ├─ embeds per-turn TokenUsage into SessionMessageKind::AssistantText / SessionMessageKind::AssistantToolUse
         ├─ tracks last_prompt_tokens = Some(usage.input_tokens) for context-window display
         └─ accumulates into SessionState.config.accumulated_usage (TokenUsage)
+        │    └─ on the worker's PRIVATE session clone; the main thread's config
+        │       is synced mid-turn via SessionCommand::SyncAccumulatedUsage (see below)
         │
         ▼
       SessionState (choreo-daemon/src/sessions.rs)
@@ -803,6 +805,23 @@ LLM provider (API response)
        └─ choreo-tui: terminal progress bar uses last_prompt_tokens vs context_window
           for the OSC 9;4 percentage sequence
 ```
+
+The request worker accumulates usage on a **private clone** of the session
+state and only merges it back at `RequestFinished`.  To keep every consumer
+fresh *mid-turn* (attach `SessionState` snapshots, session summaries, and
+`TokenUsageUpdate` broadcasts), `broadcast_token_usage` (requests.rs) routes the
+worker's cumulative total through `SessionCommand::SyncAccumulatedUsage` to the
+session's main thread, which (1) applies it to the authoritative
+`config.accumulated_usage` — as a per-field **max** (`TokenUsage::merge_max`,
+shared with the TUI's attach-snapshot merge), so an out-of-order or overlapping
+sync can never regress a total a client already saw — (2) re-broadcasts
+`TokenUsageUpdate` from the updated state so a client can never be ahead of the
+snapshot it receives on attach, and (3) refreshes the daemon's session-metadata
+index without a `last_modified` bump.  `apply_worker_snapshot` at
+`RequestFinished` applies the final (≥) value, so the two paths are idempotent.
+On the client side, `last_prompt_tokens` is not cumulative, so the TUI
+gap-fills it from snapshots (never overwriting a fresher value) instead of
+max-merging it.
 
 **Key type** — `TokenUsage` (choreo-proto/src/types.rs):
 ```rust
