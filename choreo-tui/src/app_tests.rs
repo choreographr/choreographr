@@ -3669,6 +3669,109 @@ fn live_output_token_count_updates_own_session_after_switch() {
     );
 }
 
+#[test]
+fn session_state_snapshot_does_not_regress_fresher_token_usage() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(7);
+
+    // While the session streamed in the background, the all-activity
+    // subscription accumulated the worker's fresh cumulative usage.
+    app.display_for(7).token_usage = Some(TokenUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        total_tokens: 15,
+    });
+
+    // The attach snapshot is built from the session thread's config, which
+    // can lag the worker's live total for a mid-turn session — it must not
+    // regress the status bar's token readout.
+    handle_daemon_message(
+        DaemonMessage::SessionState {
+            session_id: 7,
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            working_dir: None,
+            turns: std::collections::BTreeMap::new(),
+            active_tool_groups: vec![],
+            token_usage: Some(TokenUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                total_tokens: 3,
+            }),
+            context_window: None,
+            last_prompt_tokens: None,
+            reasoning_effort: None,
+            reasoning_capability: None,
+            status: SessionStatus::Inactive,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    // The fresher accumulated value survives — no regression to pre-turn totals.
+    assert_eq!(
+        app.display_token_usage(),
+        Some(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+        })
+    );
+}
+
+#[test]
+fn session_state_snapshot_with_newer_larger_usage_updates_display() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(7);
+
+    // The display holds an older total; the snapshot is authoritative and
+    // must still win when it carries a larger (newer) cumulative value.
+    app.display_for(7).token_usage = Some(TokenUsage {
+        input_tokens: 1,
+        output_tokens: 2,
+        total_tokens: 3,
+    });
+
+    handle_daemon_message(
+        DaemonMessage::SessionState {
+            session_id: 7,
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            working_dir: None,
+            turns: std::collections::BTreeMap::new(),
+            active_tool_groups: vec![],
+            token_usage: Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            }),
+            context_window: None,
+            last_prompt_tokens: None,
+            reasoning_effort: None,
+            reasoning_capability: None,
+            status: SessionStatus::Inactive,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    // The newer snapshot total wins.
+    assert_eq!(
+        app.display_token_usage(),
+        Some(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+        })
+    );
+}
+
 // ── multi-session streaming: switching keeps accumulated content ──
 
 /// A turn whose assistant text was streamed in via OutputChunk.

@@ -693,8 +693,20 @@ pub(crate) struct TurnLayout {
 }
 
 /// Everything that identifies a render-cache entry.  Two keys are equal iff
-/// the cached lines can be reused: same turn, same widths, and the same
-/// effective reasoning/tool-result collapse state.
+/// the cached lines can be reused: same turn, same widths, the same
+/// effective reasoning/tool-result collapse state, and — critically — the
+/// same *content version* of the turn (see
+/// [`SessionDisplayState::turn_versions`]).
+///
+/// The content version is what makes the key content-correct: streaming
+/// growth (tool-result chunks, answer chunks), turn replacement
+/// (`TurnAppended`), and snapshot merges (`SessionState`) all bump it, so a
+/// full rebuild can never serve a stale cached rendering of a turn whose
+/// text changed behind the key's other fields.  Without it, a rebuild
+/// between a chunk and its fast-path refresh would reuse the pre-chunk
+/// lines — the visible results froze while the scrollbar total kept
+/// reflecting fresh content, and everything snapped back only when the
+/// final `TurnAppended` invalidated the slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenderCacheKey {
     /// Turn ID this entry belongs to, used to detect stale entries after
@@ -712,6 +724,10 @@ pub(crate) struct RenderCacheKey {
     /// Collapse state of each tool result (aligned with `turn.tool_results`)
     /// the cached lines were rendered with.
     pub tool_results_collapsed: Vec<bool>,
+    /// Monotonic per-turn content version the lines were rendered with.
+    /// Bumped by every event handler that mutates a turn's rendered content;
+    /// a mismatch forces a recompute even when every other field matches.
+    pub content_version: u64,
 }
 
 /// Cached render output for a turn: the lines plus the precomputed height,
@@ -807,6 +823,16 @@ pub(crate) struct SessionDisplayState {
     /// call_id (not position) because a result's position is stable while
     /// its content streams in.
     pub(crate) tool_collapse_override: HashMap<u32, HashMap<String, bool>>,
+    /// Monotonic per-turn content version, bumped by every event handler
+    /// that mutates a turn's rendered content (streaming chunks, turn
+    /// replacement, snapshot merges, undo/redo).  Included in the
+    /// [`RenderCacheKey`] so a full rebuild can never reuse a cached
+    /// rendering whose turn content changed behind the key's other fields.
+    /// This is what makes the cache content-correct even when the streaming
+    /// fast path was disarmed by an interleaved `mark_content_changed` (a
+    /// `Done`/`TurnAppended`/`SessionState` from this or another session
+    /// landing between chunks).
+    pub(crate) turn_versions: HashMap<u32, u64>,
     pub(crate) render_cache: Vec<Option<RenderedCache>>,
     pub(crate) active: HashSet<u32>,
     pub(crate) live_input_estimate: u32,
@@ -848,6 +874,7 @@ impl Default for SessionDisplayState {
             turn_layouts: Vec::new(),
             reasoning_override: HashMap::new(),
             tool_collapse_override: HashMap::new(),
+            turn_versions: HashMap::new(),
             render_cache: Vec::new(),
             active: HashSet::new(),
             live_input_estimate: 0,
@@ -3358,11 +3385,62 @@ impl App {
     }
 }
 
+/// Merge a daemon-provided token usage into the display's accumulated value,
+/// never regressing it.
+///
+/// Cumulative token usage only ever increases (the daemon accumulates per-turn
+/// usage monotonically), so the merge is a per-field max.  This matters when
+/// switching into a session that is mid-turn: the attach `SessionState`
+/// snapshot is built from the session thread's config, which can lag the
+/// request worker's live accumulation (and, in the worker→main sync window,
+/// the value already broadcast to this client).  A blind overwrite would
+/// regress the status bar's `↑in ↓out` readout until the next
+/// `TokenUsageUpdate` — i.e. until the turn ends — while a `None` snapshot
+/// must never wipe an accumulated total.
+pub(crate) fn merge_token_usage(
+    current: &Option<TokenUsage>,
+    incoming: &Option<TokenUsage>,
+) -> Option<TokenUsage> {
+    match (current, incoming) {
+        (Some(cur), Some(inc)) => Some(TokenUsage {
+            input_tokens: cur.input_tokens.max(inc.input_tokens),
+            output_tokens: cur.output_tokens.max(inc.output_tokens),
+            total_tokens: cur.total_tokens.max(inc.total_tokens),
+        }),
+        (Some(cur), None) => Some(*cur),
+        (None, Some(inc)) => Some(*inc),
+        (None, None) => None,
+    }
+}
+
 // ── SessionDisplayState methods ─────────────────────────────────────
 
 impl SessionDisplayState {
     pub(crate) fn total_history_height(&self) -> usize {
         self.height_prefix.last().copied().unwrap_or(0)
+    }
+
+    /// Current content version for `turn_id` (0 when no mutation has ever
+    /// been recorded for it).  Part of the render-cache key so a rebuild
+    /// recomputes a turn whose content changed since it was cached.
+    pub(crate) fn turn_content_version(&self, turn_id: u32) -> u64 {
+        self.turn_versions.get(&turn_id).copied().unwrap_or(0)
+    }
+
+    /// Bump the content version for `turn_id` and return the new value.
+    ///
+    /// Must be called by every event handler that mutates a turn's rendered
+    /// content — after `stream_chunk`/`tool_result_chunk`/`tool_call_started`
+    /// on the streaming turn, and after `insert_or_replace`/snapshot merges.
+    /// Wrapping is deliberate: a version collision after 2^64 mutations is
+    /// astronomically improbable and only risks one stale cache hit.
+    fn bump_turn_version(&mut self, turn_id: u32) -> u64 {
+        // `entry().or_insert(0)` yields `&mut u64`; increment through the
+        // reference (auto-deref for the RHS, write-back on the LHS) so the
+        // new version is persisted in the map, then return it.
+        let version = self.turn_versions.entry(turn_id).or_insert(0);
+        *version = version.wrapping_add(1);
+        *version
     }
 
     /// Rebuild height_prefix, markers, visible_turn_ids, and populate render_cache.
@@ -3413,6 +3491,7 @@ impl SessionDisplayState {
                 viewport_width: viewport.width,
                 reasoning_expanded,
                 tool_results_collapsed,
+                content_version: self.turn_content_version(turn_id),
             };
             let rendered_turn =
                 cached_or_compute_lines(&mut self.render_cache, visible_idx, &key, || {
@@ -3586,9 +3665,20 @@ impl SessionDisplayState {
     }
 
     pub(crate) fn compute_total_height_and_markers(&mut self, viewport: &HistoryViewport) -> usize {
-        if self.streaming_dirty && !self.markers_dirty {
+        // Streaming content updates run FIRST — even when a separate event
+        // also marked markers_dirty — so a mid-stream `Done`/`TurnAppended`/
+        // `SessionState` (from this session or, via the all-activity
+        // subscription, a busy background session) can never force the per-
+        // chunk cost onto the O(n) full rebuild.  The fast path re-renders
+        // only the streaming turn and applies its height delta incrementally;
+        // the rebuild below (if markers_dirty is still set) then reuses the
+        // fresh cache entry, so it only recomputes turns whose content
+        // actually changed (content-version key) instead of re-rendering
+        // everything.
+        if self.streaming_dirty {
             self.apply_streaming_update(viewport);
-        } else if self.markers_dirty {
+        }
+        if self.markers_dirty {
             let at_bottom = self.effective_scroll(viewport) == 0;
             let preserve_scroll = self.content_dirty && !at_bottom;
             let old_total = if preserve_scroll {
@@ -3659,6 +3749,11 @@ impl SessionDisplayState {
             .map(|r| self.effective_tool_result_collapsed(turn_id, r))
             .collect();
 
+        // Snapshot the turn's current content version before the mutable
+        // `render_cache` borrow below — the lookup borrows all of `self`,
+        // which would conflict with the `get_mut` held across the cache write.
+        let content_version = self.turn_content_version(turn_id);
+
         if let Some(Some(cached)) = self.render_cache.get_mut(turn_idx)
             && cached.key.turn_id == turn_id
             && cached.key.width == content_width
@@ -3701,7 +3796,11 @@ impl SessionDisplayState {
             }
 
             // Replace the cache entry wholesale with the freshly rendered
-            // state so the next frame's lookup is a valid hit.
+            // state so the next frame's lookup is a valid hit.  The key
+            // records the turn's current content version, so a later rebuild
+            // (which may run while this turn's chunks are still streaming)
+            // recomputes instead of reusing these lines once more content
+            // arrives.
             *cached = RenderedCache {
                 key: RenderCacheKey {
                     turn_id,
@@ -3709,6 +3808,7 @@ impl SessionDisplayState {
                     viewport_width: viewport.width,
                     reasoning_expanded,
                     tool_results_collapsed,
+                    content_version,
                 },
                 rendered: RenderedTurn {
                     lines: Arc::from(text_lines),
@@ -3744,7 +3844,15 @@ impl SessionDisplayState {
         }
 
         self.streaming_dirty = false;
-        self.content_dirty = false;
+        // A structural rebuild may follow (markers_dirty was already set when
+        // this streaming update ran): leave content_dirty set so that
+        // rebuild's preserve-scroll logic can still anchor the viewport
+        // against any *structural* height change layered on top of the
+        // streaming delta (e.g. a turn appended mid-stream).  When no rebuild
+        // follows, the fast path is the only consumer and clears it here.
+        if !self.markers_dirty {
+            self.content_dirty = false;
+        }
     }
 
     fn rebuild_height_prefix_preserving_scroll(&mut self, viewport: &HistoryViewport) {
@@ -3952,6 +4060,10 @@ impl TurnEventHandler for App {
         let display = self.display_for(session_id);
         invalidate_turn_cache(display, turn_id);
         display.view.insert_or_replace(turn_id, turn);
+        // Replacement can change the rendered content even when the cache key's
+        // other fields (widths, reasoning/collapse state) stay identical, so
+        // bump the version to force a recompute on the next rebuild.
+        display.bump_turn_version(turn_id);
         display.mark_content_changed();
     }
 
@@ -3961,6 +4073,7 @@ impl TurnEventHandler for App {
         let display = self.display_for(session_id);
         invalidate_turn_cache(display, turn_id);
         display.view.insert_or_replace(turn_id, turn);
+        display.bump_turn_version(turn_id);
         display.mark_content_changed();
     }
 
@@ -3969,6 +4082,9 @@ impl TurnEventHandler for App {
         let display = self.display_for(session_id);
         for tid in turn_ids {
             invalidate_turn_cache(display, *tid);
+            // Bump so the version never collides with a previously cached
+            // rendering if the turn is later redone with identical content.
+            display.bump_turn_version(*tid);
             // Drop the user's reasoning-expansion preference for undone turns
             // so the map can't accumulate stale entries; a redo restores the
             // turn fresh with the derived default.
@@ -3996,6 +4112,7 @@ impl TurnEventHandler for App {
         let display = self.display_for(session_id);
         for (tid, turn) in turns {
             invalidate_turn_cache(display, tid);
+            display.bump_turn_version(tid);
             display.view.insert_or_replace(tid, turn);
         }
         display.mark_content_changed();
@@ -4018,6 +4135,14 @@ impl TurnEventHandler for App {
                 .is_some_and(|t| t.assistant_text.is_none());
 
         display.view.stream_chunk(request_id, stream, &data);
+
+        // The appended chunk changed the turn's rendered content: bump its
+        // version so any rebuild (e.g. one triggered by an interleaved
+        // `Done`/`TurnAppended` from another request or session) recomputes
+        // this turn instead of serving the pre-chunk cached lines.
+        if let Some(turn_id) = turn_id {
+            display.bump_turn_version(turn_id);
+        }
 
         // Auto-collapse reasoning when the response starts — drop any
         // explicit expansion override so the derived default (collapsed once
@@ -4127,6 +4252,11 @@ impl TurnEventHandler for App {
                 arguments_json,
                 invocation_description,
             } => {
+                // Look up the turn before mutating so the version bump below
+                // can target the right turn (the start event may backfill the
+                // stub's name/description — both visible in the rendered
+                // header).
+                let turn_id = display.view.request_to_turn.get(&request_id).copied();
                 display.view.tool_call_started(
                     request_id,
                     call_id,
@@ -4134,6 +4264,9 @@ impl TurnEventHandler for App {
                     arguments_json,
                     invocation_description,
                 );
+                if let Some(turn_id) = turn_id {
+                    display.bump_turn_version(turn_id);
+                }
                 display.resolve_streaming_turn_index(request_id);
                 display.mark_streaming_changed();
             }
@@ -4151,7 +4284,15 @@ impl TurnEventHandler for App {
     ) {
         let text = String::from_utf8_lossy(&data).into_owned();
         let display = self.display_for(session_id);
+        // The chunk appends to `turn.tool_results[i].content` (rendered
+        // live); bump the turn's content version so a rebuild between chunks
+        // recomputes instead of reusing the pre-chunk cached lines — the
+        // core fix for "scrollbar moves but results stay stuck".
+        let turn_id = display.view.request_to_turn.get(&request_id).copied();
         display.view.tool_result_chunk(request_id, &call_id, &text);
+        if let Some(turn_id) = turn_id {
+            display.bump_turn_version(turn_id);
+        }
         display.resolve_streaming_turn_index(request_id);
         display.mark_streaming_changed();
     }
@@ -4227,10 +4368,22 @@ impl TurnEventHandler for App {
         }
         let display = self.display_for(session_id);
         display.view.turns = merged;
-        display.selected_model = selected_model;
-        if let Some(usage) = token_usage {
-            display.token_usage = Some(usage);
+        // The merge can silently replace a turn's content (the snapshot wins
+        // when it is at least as complete, or the accumulated version wins
+        // for the in-flight turn) — either way the cached rendering, built
+        // from the pre-merge content, may now be stale.  Bump every turn the
+        // client already knew about so the next rebuild recomputes rather
+        // than reusing those lines.  Turns only present in the snapshot have
+        // no cache entry, so they need no bump.
+        for turn_id in accumulated.keys() {
+            display.bump_turn_version(*turn_id);
         }
+        display.selected_model = selected_model;
+        // Merge, never overwrite: the attach snapshot can lag the fresher
+        // total accumulated via the all-activity subscription for a mid-turn
+        // session (see [`merge_token_usage`]), so a blind assignment would
+        // regress the status bar's token readout until the next update.
+        display.token_usage = merge_token_usage(&display.token_usage, &token_usage);
         if let Some(cw) = context_window {
             display.context_window = Some(cw);
         }
@@ -5696,6 +5849,7 @@ mod tests {
                 viewport_width: 80,
                 reasoning_expanded: false, // response present → collapsed default
                 tool_results_collapsed: vec![],
+                content_version: 0,
             },
             rendered: RenderedTurn {
                 lines: Arc::from(vec![Line::from("stale")]),
@@ -5901,6 +6055,7 @@ mod tests {
                 viewport_width: 80,
                 reasoning_expanded: false,
                 tool_results_collapsed: vec![true], // quiet default → collapsed
+                content_version: 0,
             },
             rendered: RenderedTurn {
                 lines: Arc::from(vec![Line::from("stale")]),
@@ -6627,6 +6782,7 @@ mod tests {
                     viewport_width: 0,
                     reasoning_expanded: false,
                     tool_results_collapsed: vec![],
+                    content_version: 0,
                 },
                 rendered: RenderedTurn {
                     lines: Arc::from(Vec::<Line<'static>>::new()),
@@ -6674,6 +6830,7 @@ mod tests {
                     viewport_width: 0,
                     reasoning_expanded: false,
                     tool_results_collapsed: vec![],
+                    content_version: 0,
                 },
                 rendered: RenderedTurn {
                     lines: Arc::from(Vec::<Line<'static>>::new()),
@@ -7094,6 +7251,232 @@ mod tests {
             height_after_collapsed, height_before_collapsed,
             "collapsed result stays flat while its content streams"
         );
+    }
+
+    #[test]
+    fn streaming_chunk_after_mark_content_changed_stays_fresh_and_incremental() {
+        // Regression for "scrollbar moves but the results stay stuck": a
+        // mid-stream `mark_content_changed` (here simulated with a `Done` for
+        // an unrelated request — the same shape as a `TurnAppended` or
+        // `SessionState` interleaving between chunks, which happens more
+        // often when another session is active) disarms the streaming fast
+        // path (`streaming_dirty=false`, `streaming_turn_index=None`).
+        //
+        // Before the fix the next chunk was processed by the O(n) full
+        // rebuild, whose content-blind cache key served the *pre-chunk* lines
+        // — the visible results froze until the final `TurnAppended`
+        // invalidated the slot.  The content-version key forces the rebuild
+        // to recompute, and running the fast path first keeps chunk
+        // processing incremental.
+        let mut app = test_app();
+        app.attached_session_id = Some(0);
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 200;
+
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![ToolResultRecord {
+                call_id: "call-1".into(),
+                name: "sh".into(), // not quiet → expanded by default
+                content: String::new(),
+                is_error: false,
+                invocation_description: "Running `b`.".into(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        {
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(1, turn);
+            display.view.request_to_turn.insert(7, 1);
+        }
+        app.rebuild_height_prefix();
+
+        let version_before = app.active_display_ref().unwrap().turn_content_version(1);
+        let height_before = app.active_display_ref().unwrap().turn_heights[0];
+
+        // First chunk: fast path renders it live.
+        app.handle_tool_result_chunk(0, 7, "call-1".into(), b"line one\n".to_vec());
+        app.compute_total_height_and_markers();
+        let version_after_chunk1 = app.active_display_ref().unwrap().turn_content_version(1);
+        assert!(
+            version_after_chunk1 > version_before,
+            "chunk must bump the turn's content version"
+        );
+
+        // Mid-stream disarming event (unrelated Done): clears the streaming
+        // flags and forces markers_dirty.
+        app.handle_done(0, 99, None, None);
+        assert!(
+            app.active_display_ref().unwrap().markers_dirty,
+            "Done must mark the display for a rebuild"
+        );
+
+        // Second chunk arrives while markers_dirty is still set.
+        app.handle_tool_result_chunk(0, 7, "call-1".into(), b"line two\n".to_vec());
+        app.compute_total_height_and_markers();
+
+        let display = app.active_display_ref().unwrap();
+        // The rebuild (or the fast path) must serve the *latest* content, not
+        // the pre-second-chunk lines the content-blind key would have reused.
+        let cached = display.render_cache[0].as_ref().expect("cache slot filled");
+        let text: String = cached
+            .rendered
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("line two"),
+            "rebuild must not serve stale pre-chunk lines:\n{text}"
+        );
+        assert!(
+            text.contains("line one"),
+            "earlier chunk must still be present"
+        );
+        assert!(
+            display.turn_heights[0] > height_before,
+            "turn height must reflect the streamed content"
+        );
+        assert!(!display.streaming_dirty, "streaming flag consumed");
+        assert!(!display.markers_dirty, "markers flag consumed");
+        assert!(!display.content_dirty, "content flag consumed");
+    }
+
+    #[test]
+    fn rebuild_after_disarmed_chunk_serves_fresh_content() {
+        // Regression for the content-version cache key: a chunk arrives, then
+        // a `mark_content_changed` event (a `Done`/`TurnAppended`/`SessionState`
+        // interleaving between the chunk and its render) disarms the fast
+        // path *before* it can re-render — so the rebuild runs against a cache
+        // entry rendered from pre-chunk content.  Without the content version
+        // in the key the rebuild would reuse those stale lines; with it, the
+        // mismatch forces a recompute.
+        let mut app = test_app();
+        app.attached_session_id = Some(0);
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 200;
+
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![ToolResultRecord {
+                call_id: "call-1".into(),
+                name: "sh".into(), // not quiet → expanded by default
+                content: String::new(),
+                is_error: false,
+                invocation_description: "Running `b`.".into(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        {
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(1, turn);
+            display.view.request_to_turn.insert(7, 1);
+        }
+        app.rebuild_height_prefix();
+
+        // The cache now holds the pre-chunk rendering (empty result body).
+        // A chunk appends content and bumps the version, but the fast path
+        // has NOT run yet.
+        app.handle_tool_result_chunk(0, 7, "call-1".into(), b"line one\n".to_vec());
+
+        // The disarming event lands before the next render: streaming flags
+        // are cleared, markers_dirty set — the rebuild path will run.
+        app.handle_done(0, 99, None, None);
+
+        app.compute_total_height_and_markers();
+
+        let display = app.active_display_ref().unwrap();
+        let cached = display.render_cache[0].as_ref().expect("cache slot filled");
+        let text: String = cached
+            .rendered
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("line one"),
+            "rebuild must recompute the chunk's content (content-version key):\n{text}"
+        );
+        assert!(
+            cached.key.content_version > 0,
+            "cache entry must record the post-chunk version"
+        );
+    }
+
+    #[test]
+    fn content_version_bumps_on_every_mutating_handler() {
+        // The version is the cache key's content fingerprint: every handler
+        // that changes a turn's rendered text must bump it, so a rebuild can
+        // tell stale entries apart from current ones.
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 200;
+
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![ToolResultRecord {
+                call_id: "call-1".into(),
+                name: "sh".into(),
+                content: String::new(),
+                is_error: false,
+                invocation_description: String::new(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        {
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(1, turn);
+            display.view.request_to_turn.insert(7, 1);
+        }
+        app.rebuild_height_prefix();
+
+        let v0 = app.active_display_ref().unwrap().turn_content_version(1);
+        assert_eq!(v0, 0, "fresh turn starts at version 0");
+
+        app.handle_tool_result_chunk(0, 7, "call-1".into(), b"one\n".to_vec());
+        let v1 = app.active_display_ref().unwrap().turn_content_version(1);
+        assert_eq!(v1, v0 + 1, "chunk bumps by one");
+
+        app.handle_tool_result_chunk(0, 7, "call-1".into(), b"two\n".to_vec());
+        let v2 = app.active_display_ref().unwrap().turn_content_version(1);
+        assert_eq!(v2, v1 + 1, "every chunk bumps the version");
+
+        // A replacement turn (the daemon's final TurnAppended) bumps too, so
+        // a cached rendering of the accumulated version is never reused.
+        let mut replacement = app.active_display_ref().unwrap().view.turns[&1].clone();
+        replacement.tool_results[0].content.push_str("final\n");
+        app.handle_turn_appended(0, 1, replacement);
+        let v3 = app.active_display_ref().unwrap().turn_content_version(1);
+        assert_eq!(v3, v2 + 1, "TurnAppended bumps the version");
     }
 
     #[test]

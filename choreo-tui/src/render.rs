@@ -487,6 +487,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 viewport_width: area.width,
                 reasoning_expanded,
                 tool_results_collapsed,
+                content_version: display.turn_content_version(turn_id),
             };
             let rendered = cached_or_compute_lines(&mut display.render_cache, i, &key, || {
                 render_turn_lines(
@@ -1603,7 +1604,8 @@ mod tests {
     }
 
     /// A key for a one-line entry rendered at content width 80 in a
-    /// viewport of width 100, reasoning collapsed, no tool results.
+    /// viewport of width 100, reasoning collapsed, no tool results, at
+    /// content version 0 (no mutations recorded).
     fn base_key() -> RenderCacheKey {
         RenderCacheKey {
             turn_id: 0,
@@ -1611,6 +1613,7 @@ mod tests {
             viewport_width: 100,
             reasoning_expanded: false,
             tool_results_collapsed: Vec::new(),
+            content_version: 0,
         }
     }
 
@@ -2115,6 +2118,48 @@ mod tests {
             cached.key.tool_results_collapsed,
             vec![false],
             "cache entry should record the new collapse state"
+        );
+    }
+
+    #[test]
+    fn cached_or_compute_lines_content_version_mismatch_recomputes() {
+        // The cache key carries a per-turn content version so a rebuild can
+        // never reuse a rendering of a turn whose content grew behind the
+        // key's other fields (a tool-result chunk appended between a rebuild
+        // and the streaming fast path).  Same turn/widths/collapse state, but
+        // a newer content version — must be a miss.
+        let mut cache = vec![Some(cache_entry(
+            RenderCacheKey {
+                content_version: 1, // cached from an earlier chunk
+                ..base_key()
+            },
+            Arc::from(vec![Line::from("stale")]),
+            99,
+            Arc::from([1]),
+        ))];
+        // Request with a bumped content version — should be a miss.
+        let compute_called = std::cell::Cell::new(false);
+        let rendered = cached_or_compute_lines(
+            &mut cache,
+            0,
+            &RenderCacheKey {
+                content_version: 2,
+                ..base_key()
+            },
+            || {
+                compute_called.set(true);
+                rendered(vec![Line::from("fresh")])
+            },
+        );
+        assert!(
+            compute_called.get(),
+            "should recompute when content_version differs"
+        );
+        assert_eq!(rendered.lines[0], Line::from("fresh"));
+        let cached = cache[0].as_ref().unwrap();
+        assert_eq!(
+            cached.key.content_version, 2,
+            "cache entry should record the new content version"
         );
     }
 

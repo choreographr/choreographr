@@ -3,7 +3,7 @@ use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
     AIProvidersView, App, INPUT_PAD, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView,
-    UiEvent, find_turn_at_row, input_inner_width,
+    UiEvent, find_turn_at_row, input_inner_width, merge_token_usage,
 };
 use crate::terminal_progress;
 use crate::{ShellCommand, build_picker, parse_input_line};
@@ -31,8 +31,6 @@ use std::io::{self, Read};
 use std::os::unix::io::AsRawFd;
 use std::{thread, time::Duration};
 use tui_prompts::State;
-
-const UI_EVENT_CHANNEL_SIZE: usize = 4096;
 
 /// Keyboard enhancements requested from the terminal via the kitty keyboard
 /// protocol (`CSI > flags u`), pushed at startup and re-pushed after resume.
@@ -101,7 +99,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 
     let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
-    let (ui_tx, ui_rx) = channel::bounded::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
+    let (ui_tx, ui_rx) = channel::unbounded::<UiEvent>();
 
     let picker = build_picker();
 
@@ -152,27 +150,22 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         let result = run_daemon_connection_with_mode(
             mode,
             |message| {
-                // Use try_send so the daemon reader thread never blocks when
-                // the UI event loop is temporarily backed up (e.g. during a
-                // slow render).  Dropping a streaming chunk is acceptable
-                // because the next chunk carries cumulative content and the
-                // final Done/SessionMessageAppended delivers the complete
-                // text; a blocking send would stall the reader thread, fill
-                // the socket buffer, and cascade back to the daemon's
-                // session thread — effectively killing all streaming.
+                // The UI-event channel is unbounded, so this send can never
+                // block the reader thread and can never fail on capacity: the
+                // only failure is a Disconnected receiver, which means the UI
+                // thread has already begun tearing down and there is no
+                // consumer left to process this event.
                 //
-                // A Disconnected error (receiver dropped) is silently
-                // ignored — the terminal thread has already begun tearing
-                // down the UI, so there is no consumer left to process this
-                // event and no point in propagating the error.
-                if let Err(e) = connection_ui_tx.try_send(UiEvent::Daemon(Box::new(message)))
-                    && e.is_full()
-                {
-                    tracing::warn!(
-                        "[choreo-tui] daemon reader channel full, dropping event ({} queued)",
-                        connection_ui_tx.len(),
-                    );
-                }
+                // An unbounded channel is deliberate: with a bounded one, a
+                // burst from another session (all activity is subscribed, and
+                // a background session streams its own chunks/updates) could
+                // fill the queue and DROP this session's streaming chunks —
+                // and a dropped chunk is *not* recoverable from the next one
+                // (chunks are deltas, appended by the client; only the final
+                // `TurnAppended` resyncs the complete content).  The
+                // daemon-side drop-on-full already bounds the flow into this
+                // thread, so the unbounded queue stays bounded in practice.
+                let _ = connection_ui_tx.send(UiEvent::Daemon(Box::new(message)));
             },
             client_rx,
             Some(shutdown_rx),
@@ -2053,9 +2046,13 @@ pub(crate) fn handle_daemon_message(
             if app.attached_session_id == Some(*session_id) {
                 {
                     let display = app.display_for(*session_id);
-                    if let Some(usage) = token_usage {
-                        display.token_usage = Some(*usage);
-                    }
+                    // Merge, never overwrite: the snapshot's token_usage can
+                    // lag the fresher total accumulated via the all-activity
+                    // subscription for a mid-turn session (see
+                    // [`merge_token_usage`]), so a blind assignment would
+                    // regress the status bar's token readout until the next
+                    // TokenUsageUpdate.
+                    display.token_usage = merge_token_usage(&display.token_usage, token_usage);
                     if let Some(cw) = context_window {
                         display.context_window = Some(*cw);
                     }
