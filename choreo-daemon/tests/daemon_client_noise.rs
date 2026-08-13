@@ -519,12 +519,12 @@ fn noise_shutdown_notifies_client() {
 
 /// Test that a >64 KiB message survives the FULL daemon round trip. The
 /// client's 1 MiB AddCredential payload must fragment on the wire (snow's
-/// single-message cap is 65519 plaintext bytes); the daemon's
+/// single-fragment cap is 65518 plaintext bytes); the daemon's
 /// `tcp_client_thread` reassembles it via `recv_client_message`, the command
 /// loop stores the blob (`handle_add_credential_sync`), and the CredentialAdded
 /// reply travels back through the same encrypted channel. This proves the
 /// framing change is invisible above the transport: typed proto messages can
-/// now be as large as the codec's 32 MiB `MAX_FRAME_SIZE`, not just 65519
+/// now be as large as the codec's 32 MiB `MAX_FRAME_SIZE`, not just 65518
 /// bytes.
 #[test]
 #[ignore]
@@ -538,7 +538,7 @@ fn noise_large_message_through_daemon() {
     );
 
     // 1 MiB encrypted credential blob — 17 wire fragments — far beyond the
-    // 65519-byte single Noise message cap, so the sender must split it and
+    // 65518-byte single-fragment cap, so the sender must split it and
     // the daemon's reader must glue the fragments back before the command
     // loop ever sees the message.
     client.send(ClientMessage::AddCredential {
@@ -575,7 +575,7 @@ fn noise_large_message_daemon_to_client() {
     );
 
     // Titles large enough that the aggregate Sessions reply exceeds the
-    // 65519-byte single Noise message cap: 12 × 8 KiB of title bytes
+    // 65518-byte single-fragment cap: 12 × 8 KiB of title bytes
     // (~96 KiB) fragments into at least two wire fragments.
     const SESSIONS: usize = 12;
     let big_title = "x".repeat(8 * 1024);
@@ -613,7 +613,7 @@ fn noise_large_message_daemon_to_client() {
                 .map(|s| s.title.as_deref().map_or(0, |t| t.len()))
                 .sum();
             assert!(
-                total > 65519,
+                total > 65518,
                 "test premise broken: aggregated reply is not >64 KiB ({total} bytes)"
             );
         }

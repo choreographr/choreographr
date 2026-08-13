@@ -3,7 +3,7 @@ use crate::sessions::SessionCommand;
 use choreo_transport::key::TransportSecretKey;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::io;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -193,6 +193,13 @@ pub fn run_server(
     // Unix path; the TCP accept thread just spawns a per-connection
     // `tcp_client_thread`, whose writer thread owns and closes its own socket.
     let tcp_shutdown = Arc::clone(&shutdown);
+    // The accept thread itself is tracked (and later woken + bounded-joined)
+    // so shutdown can close the spawn/drain race: once the thread has exited,
+    // every connection handle it ever spawned has been sent over
+    // `tcp_client_tx` (handles are ferried from the accept thread immediately
+    // after each spawn), so the final drain below captures all of them.
+    let mut tcp_accept_handle: Option<thread::JoinHandle<()>> = None;
+    let mut tcp_accept_addr: Option<SocketAddr> = None;
     if let Some(ref tcp_addr_str) = tcp_addr {
         let addr: SocketAddr = tcp_addr_str.parse().map_err(|e| {
             io::Error::new(
@@ -200,6 +207,7 @@ pub fn run_server(
                 format!("invalid --tcp-addr: {e}"),
             )
         })?;
+        tcp_accept_addr = Some(addr);
         let listener = TcpListener::bind(addr)
             .map_err(|e| io::Error::other(format!("failed to bind TCP listener on {addr}: {e}")))?;
         info!("TCP (Noise IK) listening on {addr}");
@@ -207,13 +215,21 @@ pub fn run_server(
         let daemon_tx = daemon_tx.clone();
         let acl = Arc::clone(&acl);
         let tcp_client_tx = tcp_client_tx.clone();
-        thread::spawn(move || {
+        tcp_accept_handle = Some(thread::spawn(move || {
             loop {
                 if tcp_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
                 match listener.accept() {
                     Ok((tcp, _)) => {
+                        if tcp_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                            // Shutdown wake-up probe (see the shutdown path
+                            // below): the main thread connected to unblock this
+                            // accept; drop the probe WITHOUT spawning a client
+                            // thread for it.
+                            drop(tcp);
+                            break;
+                        }
                         let tx = daemon_tx.clone();
                         let sk_bytes = *transport_sk.as_bytes();
                         let acl = Arc::clone(&acl);
@@ -257,7 +273,7 @@ pub fn run_server(
                     }
                 }
             }
-        });
+        }));
     }
 
     // Main thread accept loop — blocking accept() is event-driven
@@ -307,6 +323,29 @@ pub fn run_server(
     }
 
     info!("shutting down");
+
+    // Wake and bounded-join the TCP accept thread BEFORE the broadcast and
+    // the connection drain: a spurious probe connect below makes its blocked
+    // accept() return, the shutdown-flag check drops the probe, and the thread
+    // exits. Because handles are ferried from the accept thread itself (right
+    // after each spawn), every connection thread it ever started is already on
+    // `tcp_client_rx` once it has exited — so joining it here closes the race
+    // where the accept thread could spawn a connection after the drain, whose
+    // handle would never be joined.
+    if let Some(addr) = tcp_accept_addr {
+        // Probe with loopback addresses only: connecting back to an
+        // unspecified bind address (0.0.0.0 / ::) is not a valid destination,
+        // and either probe lands on a v4- or v6-bound listener.
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let _ = TcpStream::connect(SocketAddr::new(ip, addr.port()));
+        }
+    }
+    if let Some(handle) = tcp_accept_handle.take() {
+        join_connection_thread(handle, Instant::now() + CONNECTION_DRAIN_GRACE);
+    }
 
     // Collect TCP connection threads spawned concurrently with shutdown so
     // they are not missed by the bounded join below.

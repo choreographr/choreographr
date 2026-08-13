@@ -1,6 +1,7 @@
 use choreo_proto::{ClientMessage, DaemonMessage};
-use choreo_transport::noise::{handshake_initiator, handshake_responder};
-use std::io::Write;
+use choreo_transport::noise::{NoiseStream, handshake_initiator, handshake_responder};
+use snow::Builder;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
@@ -213,14 +214,14 @@ fn noise_encrypted_message_round_trip() {
 /// the handshake path can never carry and proves the length prefix +
 /// ciphertext are reassembled exactly by the peer's `read_exact`.
 ///
-/// The payload is 65519 bytes (65535 − 16-byte GCM tag), which is the
-/// *largest single message the Noise layer permits*: the Noise spec caps
-/// messages at 65535 bytes ciphertext, and snow 0.10 enforces this via a
-/// hard `MAXMSGLEN` constant with no builder knob to raise it. proto's
-/// 32 MiB `MAX_FRAME_SIZE` governs only the typed codec layer above the
-/// cipher; this test pins the single-fragment wire format, while
-/// `noise_fragmented_message_round_trip` covers payloads past this cap
-/// (which the transport now splits and reassembles transparently).
+/// The payload is 65518 bytes (65535 − 16-byte GCM tag − 1-byte authenticated
+/// continuation header), which is the *largest payload a single Noise fragment
+/// can carry*: the Noise spec caps messages at 65535 bytes ciphertext, and
+/// snow 0.10 enforces this via a hard `MAXMSGLEN` constant with no builder
+/// knob to raise it. proto's 32 MiB `MAX_FRAME_SIZE` governs only the typed
+/// codec layer above the cipher; this test pins the single-fragment wire
+/// format, while `noise_fragmented_message_round_trip` covers payloads past
+/// this cap (which the transport now splits and reassembles transparently).
 #[test]
 #[ignore]
 fn noise_large_message_round_trip() {
@@ -250,7 +251,7 @@ fn noise_large_message_round_trip() {
             // The client sends raw bytes (not a typed message) — the point
             // is byte-exact framing, so compare against the expected 0xAB
             // pattern rather than decoding a proto frame.
-            let expected = vec![0xABu8; 65535 - 16];
+            let expected = vec![0xABu8; 65535 - 16 - 1];
             let payload = server
                 .recv_message()
                 .map_err(|e| format!("recv large message failed: {e:?}"))?;
@@ -270,11 +271,11 @@ fn noise_large_message_round_trip() {
     let mut client =
         handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes).expect("client handshake");
 
-    // 65519 bytes of a single byte pattern — the largest payload snow will
-    // accept in one `write_message` (65535 MAXMSGLEN minus the 16-byte GCM
-    // tag), well beyond the 2-byte handshake framing's u16 range, so the
-    // u32 data-plane framing is what gets exercised.
-    let payload = vec![0xABu8; 65535 - 16];
+    // 65518 bytes of a single byte pattern — the largest payload a single
+    // fragment can carry (65535 MAXMSGLEN minus the 16-byte GCM tag and the
+    // 1-byte continuation header), well beyond the 2-byte handshake framing's
+    // u16 range, so the u32 data-plane framing is what gets exercised.
+    let payload = vec![0xABu8; 65535 - 16 - 1];
     client
         .send_message(&payload)
         .expect("client send large payload");
@@ -287,11 +288,11 @@ fn noise_large_message_round_trip() {
     );
 }
 
-/// Test that payloads larger than snow's single-message cap fragment on the
-/// wire and reassemble transparently. 65520 bytes is exactly one past the
-/// 65519-byte single-message maximum, so it must split into two fragments;
-/// 1024 * 1024 bytes spans 17 fragments (16 full 65519-byte chunks plus a
-/// 272-byte remainder). The final small echo round trip proves the shared
+/// Test that payloads larger than a single fragment's capacity fragment on
+/// the wire and reassemble transparently. 65519 bytes is exactly one past the
+/// 65518-byte single-fragment maximum, so it must split into two fragments;
+/// 1024 * 1024 bytes spans 17 fragments (16 full 65518-byte chunks plus a
+/// 288-byte remainder). The final small echo round trip proves the shared
 /// TransportState keeps working across fragment boundaries — send and recv
 /// nonces stay in sync after a multi-fragment exchange, and the transport
 /// still carries ordinary single-frame messages afterwards.
@@ -325,8 +326,8 @@ fn noise_fragmented_message_round_trip() {
             let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk_ref)
                 .map_err(|e| format!("server handshake failed: {e:?}"))?;
 
-            // 65520 bytes = 65519 + 1: exactly two fragments.
-            let expected_two = vec![0x11u8; 65519 + 1];
+            // 65519 bytes = 65518 + 1: exactly two fragments.
+            let expected_two = vec![0x11u8; 65518 + 1];
             let payload_two = server
                 .recv_message()
                 .map_err(|e| format!("recv 2-fragment message failed: {e:?}"))?;
@@ -338,7 +339,7 @@ fn noise_fragmented_message_round_trip() {
                 ));
             }
 
-            // 1024 * 1024 bytes = 16 full chunks + a 272-byte remainder:
+            // 1024 * 1024 bytes = 16 full chunks + a 288-byte remainder:
             // 17 fragments in total, exercising sustained reassembly.
             let expected_mib = vec![0x22u8; 1024 * 1024];
             let payload_mib = server
@@ -372,9 +373,9 @@ fn noise_fragmented_message_round_trip() {
     let mut client =
         handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes).expect("client handshake");
 
-    // One byte past the single-message cap: the sender must split this into
-    // two fragments (65519 + 1), and the receiver must glue them back.
-    let payload_two = vec![0x11u8; 65519 + 1];
+    // One byte past the single-fragment capacity: the sender must split this
+    // into two fragments (65518 + 1), and the receiver must glue them back.
+    let payload_two = vec![0x11u8; 65518 + 1];
     client
         .send_message(&payload_two)
         .expect("client send 2-fragment payload");
@@ -618,6 +619,9 @@ fn noise_concurrent_bidirectional_large_messages() {
 /// ciphertext cap BEFORE allocating or reading that many bytes — without the
 /// validation the old code would `vec![0u8; ct_len]` for a 0x7FFF_FFFF
 /// prefix (~2 GiB) and block in read_exact waiting for the bytes.
+///
+/// (The prefix no longer carries a continuation flag — that decision moved
+/// into the authenticated plaintext — so the raw value is just a huge length.)
 #[test]
 #[ignore]
 fn noise_rejects_oversized_fragment_prefix() {
@@ -656,8 +660,8 @@ fn noise_rejects_oversized_fragment_prefix() {
         handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes).expect("client handshake");
 
     // Raw write of a length prefix claiming 0x7FFF_FFFF ciphertext bytes
-    // (flag clear, far above the 65535-byte Noise cap), bypassing
-    // send_message so the wire carries a genuinely invalid frame.
+    // (far above the 65535-byte Noise cap), bypassing send_message so the
+    // wire carries a genuinely invalid frame.
     client
         .get_ref()
         .write_all(&0x7FFF_FFFFu32.to_be_bytes())
@@ -667,6 +671,191 @@ fn noise_rejects_oversized_fragment_prefix() {
     assert!(
         server_result.is_ok(),
         "oversized fragment prefix must be rejected: {:?}",
+        server_result.err()
+    );
+}
+
+/// Test that a wire-level tamper with a fragment's length prefix is rejected
+/// loudly and can never silently truncate a reassembled message. The 4-byte
+/// prefix precedes the GCM ciphertext and is NOT authenticated, so the
+/// reassembly decision must come from the authenticated continuation byte
+/// INSIDE the plaintext: a flipped prefix bit changes ct_len, which either
+/// trips the size cap or fails the GCM authentication on the wrong byte
+/// count — in no case may the receiver return a truncated prefix as a
+/// complete message.
+///
+/// The test drives a manually-derived TransportState (mirroring the
+/// production handshake byte-for-byte) on both sides so it can encrypt raw
+/// fragments and then write a tampered prefix — something the public API
+/// cannot express, since `send_message` always writes an intact prefix.
+#[test]
+#[ignore]
+fn noise_rejects_tampered_length_prefix() {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_pk = PublicKey::from(&server_sk);
+    let server_sk_bytes = server_sk.to_bytes();
+    let server_pk_bytes = server_pk.to_bytes();
+
+    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let client_pk = PublicKey::from(&client_sk);
+    let client_sk_bytes = client_sk.to_bytes();
+    let client_pk_bytes = client_pk.to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    let server_sk = server_sk_bytes;
+    let client_pk_ref = client_pk_bytes;
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let result = (|| -> Result<(), String> {
+            // Responder half of the IK handshake, byte-for-byte what
+            // handshake_responder does (same pattern, same 2-byte framing),
+            // but keeping the TransportState so recv_message runs against a
+            // stream whose peer writes raw (possibly tampered) frames.
+            let mut handshake = Builder::new(
+                "Noise_IK_25519_AESGCM_SHA256"
+                    .parse()
+                    .map_err(|e| format!("pattern parse failed: {e:?}"))?,
+            )
+            .local_private_key(&server_sk)
+            .map_err(|e| format!("server key failed: {e:?}"))?
+            .build_responder()
+            .map_err(|e| format!("build responder failed: {e:?}"))?;
+
+            let mut len_buf = [0u8; 2];
+            stream
+                .read_exact(&mut len_buf)
+                .map_err(|e| format!("read msg1 len failed: {e}"))?;
+            let msg_len = u16::from_be_bytes(len_buf) as usize;
+            let mut rbuf = vec![0u8; msg_len];
+            stream
+                .read_exact(&mut rbuf)
+                .map_err(|e| format!("read msg1 failed: {e}"))?;
+            let mut out_buf = vec![0u8; 1024];
+            handshake
+                .read_message(&rbuf, &mut out_buf)
+                .map_err(|e| format!("server read msg1 failed: {e:?}"))?;
+
+            let pk = handshake
+                .get_remote_static()
+                .ok_or_else(|| "no client static key".to_string())?;
+            if *pk != client_pk_ref {
+                return Err("unexpected client public key".into());
+            }
+
+            let n = handshake
+                .write_message(&[], &mut out_buf)
+                .map_err(|e| format!("server write msg2 failed: {e:?}"))?;
+            stream
+                .write_all(&(n as u16).to_be_bytes())
+                .map_err(|e| format!("write msg2 len failed: {e}"))?;
+            stream
+                .write_all(&out_buf[..n])
+                .map_err(|e| format!("write msg2 failed: {e}"))?;
+
+            let ts = handshake
+                .into_transport_mode()
+                .map_err(|e| format!("server transport failed: {e:?}"))?;
+            let mut server = NoiseStream::new(stream, ts);
+
+            // Control: a valid two-fragment message reassembles intact.
+            let payload = server
+                .recv_message()
+                .map_err(|e| format!("control recv failed: {e:?}"))?;
+            let expected = vec![0xABu8; 65518 + 100];
+            if payload != expected {
+                return Err(format!(
+                    "control payload mismatch: got {} bytes, want {} bytes of 0xAB",
+                    payload.len(),
+                    expected.len()
+                ));
+            }
+
+            // Attack: the client writes a second message whose second-fragment
+            // length prefix is decremented by one. The receiver must reject it
+            // (the wrong byte count never decrypts), NOT return the first
+            // fragment as a complete message.
+            match server.recv_message() {
+                Err(_) => Ok(()), // rejected — the desired outcome
+                Ok(p) => Err(format!(
+                    "tampered length prefix was NOT rejected ({} bytes returned)",
+                    p.len()
+                )),
+            }
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    // Client side: initiator half of the handshake, byte-for-byte what
+    // handshake_initiator does, but keeping the TransportState so the test can
+    // encrypt fragments and tamper with the wire itself.
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    let mut handshake = Builder::new("Noise_IK_25519_AESGCM_SHA256".parse().expect("parse"))
+        .local_private_key(&client_sk_bytes)
+        .expect("client key")
+        .remote_public_key(&server_pk_bytes)
+        .expect("server pk")
+        .build_initiator()
+        .expect("build initiator");
+
+    let mut buf = vec![0u8; 1024];
+    let n = handshake
+        .write_message(&[], &mut buf)
+        .expect("client write msg1");
+    stream
+        .write_all(&(n as u16).to_be_bytes())
+        .expect("write msg1 len");
+    stream.write_all(&buf[..n]).expect("write msg1");
+
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).expect("read msg2 len");
+    let msg_len = u16::from_be_bytes(len_buf) as usize;
+    let mut rbuf = vec![0u8; msg_len];
+    stream.read_exact(&mut rbuf).expect("read msg2");
+    handshake
+        .read_message(&rbuf, &mut buf)
+        .expect("client read msg2");
+
+    let mut ts = handshake.into_transport_mode().expect("client transport");
+
+    // Helper to write a full message as raw frames with the production framing
+    // (4-byte BE ciphertext length, then the ciphertext), optionally tampering
+    // with the second fragment's length prefix.
+    let mut write_message_raw = |payload: &[u8], tamper_second: bool| {
+        let mut ct = vec![0u8; 65535];
+        let mut frag = vec![0u8; 65519]; // 1 continuation byte + max payload
+        let chunks: Vec<&[u8]> = payload.chunks(65518).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let more = i + 1 < chunks.len();
+            frag[0] = if more { 0x01 } else { 0x00 };
+            frag[1..1 + chunk.len()].copy_from_slice(chunk);
+            let n = ts
+                .write_message(&frag[..1 + chunk.len()], &mut ct)
+                .expect("encrypt");
+            let mut len = n as u32;
+            if tamper_second && i == 1 {
+                // Decrement (never increment): a larger prefix would make the
+                // receiver block waiting for bytes we never send, hanging the
+                // test. A smaller one trips the GCM authentication instead.
+                len -= 1;
+            }
+            stream.write_all(&len.to_be_bytes()).expect("write len");
+            stream.write_all(&ct[..n]).expect("write ct");
+        }
+    };
+
+    // Control message: intact prefixes, two fragments.
+    write_message_raw(&vec![0xABu8; 65518 + 100], false);
+    // Attack message: second fragment's length prefix decremented by one.
+    write_message_raw(&vec![0xABu8; 65518 + 100], true);
+
+    let server_result = rx.recv().expect("recv server result");
+    assert!(
+        server_result.is_ok(),
+        "tampered length prefix must be rejected: {:?}",
         server_result.err()
     );
 }

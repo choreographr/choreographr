@@ -50,7 +50,10 @@ In the `choreo-tui` crate specifically, do not use `eprintln!` for diagnostics �
 
 Do not share mutable state between threads. Use message passing (`mpsc` channels) for all cross-thread communication. Shared-state patterns (`Arc<RwLock<…>>`, `Arc<Mutex<…>>`) should be avoided in favor of channel-based designs.
 
-One sanctioned exception: **cooperative cancellation flags** (`Arc<AtomicBool>`, e.g. `ToolContext.cancelled`). A blocking tool call cannot be interrupted by a channel message, so a tiny lock-free flag is used as a best-effort stop hint for work that consults it. Keep such flags single-bit (carry no data), document each use in code, and route all control flow — results, cancellation events, kills, streaming — over channels.
+Two sanctioned exceptions, both single-purpose, lock-free or minimally scoped, and documented in code and in ARCHITECTURE.md:
+
+1. **Cooperative cancellation flags** (`Arc<AtomicBool>`, e.g. `ToolContext.cancelled`). A blocking tool call cannot be interrupted by a channel message, so a tiny lock-free flag is used as a best-effort stop hint for work that consults it. Keep such flags single-bit (carry no data), document each use in code, and route all control flow — results, cancellation events, kills, streaming — over channels.
+2. **The Noise transport state** (`choreo-transport`'s `Arc<Mutex<TransportState>>` on `NoiseStream`, plus its `Arc<AtomicBool>` single-writer guard). An encrypted duplex stream is cloned via `try_clone` across the reader and writer threads of one connection, which must interleave encrypt/decrypt against the same snow `TransportState` — so the state has to be shared, not channeled. The lock is held only per chunk, never across blocking socket I/O (that scope is what prevents the bidirectional large-message deadlock), and the guard is a single-bit flag in the spirit of exception 1. The full rationale lives in ARCHITECTURE.md's `noise.rs` module row.
 
 ## Inline Comments
 

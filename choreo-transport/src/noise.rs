@@ -8,15 +8,24 @@ use tracing::{debug, info};
 
 use crate::error::TransportError;
 
-/// Maximum plaintext bytes in a single Noise message. snow caps one message's
-/// ciphertext at 65535 bytes (MAXMSGLEN); AES-256-GCM appends a 16-byte tag,
-/// leaving 65519 bytes of plaintext per encrypted message.
-const MAX_PLAINTEXT_CHUNK: usize = 65535 - 16;
-/// High bit of the 4-byte data-plane length prefix: when set, more fragments
-/// of the same logical message follow. Real per-fragment ciphertext lengths
-/// are <= 65535 (snow's cap), far below 2^31, so the bit is unambiguous; the
-/// proto codec's own 32 MiB frame cap (MAX_FRAME_SIZE) never collides with it.
-const MORE_FRAGMENTS: u32 = 0x8000_0000;
+/// AES-256-GCM authentication tag length, appended to every encrypted
+/// message (snow's `MAXMSGLEN` counts the tag).
+const GCM_TAG_LEN: usize = 16;
+/// Length of the authenticated per-fragment continuation header: one byte at
+/// the START of each fragment's plaintext, so the AES-GCM tag covers it (see
+/// [`FRAGMENT_CONTINUATION`]).
+const FRAGMENT_HEADER_LEN: usize = 1;
+/// Maximum payload bytes in a single Noise fragment. snow caps one message's
+/// ciphertext at 65535 bytes (MAXMSGLEN); the 16-byte GCM tag and the 1-byte
+/// authenticated continuation header leave 65518 bytes of payload per
+/// fragment.
+const MAX_PLAINTEXT_CHUNK: usize = 65535 - GCM_TAG_LEN - FRAGMENT_HEADER_LEN;
+/// Bit 0 of a fragment's first plaintext byte: 1 = more fragments of the same
+/// logical message follow, 0 = this fragment terminates it. Because the byte
+/// lives INSIDE the plaintext, the AES-GCM tag authenticates it — the wire
+/// length prefix that precedes the ciphertext is NOT authenticated, so the
+/// reassembly decision must not be trusted from there.
+const FRAGMENT_CONTINUATION: u8 = 0x01;
 
 /// Resets the single-writer flag when a `send_message` finishes — on every
 /// exit path, including early `?` returns. Without the guard a concurrent
@@ -25,7 +34,13 @@ struct SendGuard<'a>(&'a AtomicBool);
 
 impl Drop for SendGuard<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        // Relaxed is sufficient: the flag publishes no data (the TransportState
+        // mutex provides its own ordering for the cipher state, and socket bytes
+        // are kernel-buffered), so exclusion needs only the atomic coherence of
+        // the flag itself — a concurrent `swap(true)` sees either `false` (the
+        // previous holder's drop already happened) or `true` (still in flight),
+        // never both, so exactly one sender proceeds at a time.
+        self.0.store(false, Ordering::Relaxed);
     }
 }
 
@@ -72,10 +87,11 @@ impl NoiseStream {
     ///
     /// Encrypts the plaintext into one or more ciphertext fragments (leaving
     /// the input untouched), then writes each fragment's 4-byte big-endian
-    /// length prefix followed by the ciphertext. Payloads larger than
-    /// [`MAX_PLAINTEXT_CHUNK`] are split into multiple fragments; the
-    /// `MORE_FRAGMENTS` flag bit set on every non-final fragment's length
-    /// prefix tells the receiver to keep reading.
+    /// ciphertext length prefix followed by the ciphertext. Payloads larger
+    /// than [`MAX_PLAINTEXT_CHUNK`] are split into multiple fragments; each
+    /// fragment's plaintext starts with an AUTHENTICATED continuation byte
+    /// ([`FRAGMENT_CONTINUATION`]) that tells the receiver whether to keep
+    /// reading.
     ///
     /// The shared `TransportState` lock is held only per-chunk, during the
     /// encrypt call, and is NEVER held across the blocking `write_all`s —
@@ -91,17 +107,31 @@ impl NoiseStream {
         // thread calls send_message per stream. Enforce it at runtime: a
         // second concurrent sender gets a loud protocol error instead of
         // silently corrupting the stream.
-        if self.sender_active.swap(true, Ordering::SeqCst) {
+        if self.sender_active.swap(true, Ordering::Relaxed) {
             return Err(TransportError::InvalidFragment(
                 "concurrent send_message on one NoiseStream".to_string(),
             ));
         }
         let _guard = SendGuard(&self.sender_active);
 
+        // Mirror the receiver's reassembly cap so an over-limit message is
+        // rejected at the source instead of by the peer's recv_message.
+        if plaintext.len() > MAX_FRAME_SIZE {
+            return Err(TransportError::InvalidFragment(format!(
+                "outgoing message exceeds the {MAX_FRAME_SIZE}-byte limit"
+            )));
+        }
+
         // Reusable ciphertext buffer: one Noise message's worst case is
-        // MAX_PLAINTEXT_CHUNK plaintext bytes plus the 16-byte AES-GCM tag.
-        // Reusing it across chunks avoids reallocating per fragment.
-        let mut buf = vec![0u8; MAX_PLAINTEXT_CHUNK + 16];
+        // MAX_PLAINTEXT_CHUNK payload bytes plus the 1-byte continuation header
+        // and the 16-byte AES-GCM tag. Reusing it across chunks avoids
+        // reallocating per fragment.
+        let mut buf = vec![0u8; MAX_PLAINTEXT_CHUNK + FRAGMENT_HEADER_LEN + GCM_TAG_LEN];
+        // Reusable per-fragment plaintext: 1 continuation byte + payload. The
+        // header goes INSIDE the plaintext (not the length prefix) so the
+        // AES-GCM tag authenticates it — the wire prefix is not authenticated,
+        // so the continuation flag must not be trusted from there.
+        let mut frag = vec![0u8; FRAGMENT_HEADER_LEN + MAX_PLAINTEXT_CHUNK];
 
         // Serializing sends is the writer thread's job (each NoiseStream has a
         // single writer), so the TransportState lock is only needed to make the
@@ -113,21 +143,19 @@ impl NoiseStream {
         // it, so the reader can always acquire the lock and drain.
         let mut remaining = plaintext.len();
         for chunk in plaintext.chunks(MAX_PLAINTEXT_CHUNK) {
-            let n = {
-                let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
-                transport.write_message(chunk, &mut buf)?
-            };
             // This chunk is non-final iff it did not consume all remaining
             // plaintext; a full-size chunk in the middle leaves a remainder,
             // while the final chunk (even one exactly MAX_PLAINTEXT_CHUNK
             // bytes) leaves none.
             let more = remaining > chunk.len();
             remaining -= chunk.len();
-            let mut len = n as u32;
-            if more {
-                len |= MORE_FRAGMENTS;
-            }
-            self.tcp.write_all(&len.to_be_bytes())?;
+            frag[0] = if more { FRAGMENT_CONTINUATION } else { 0 };
+            frag[FRAGMENT_HEADER_LEN..FRAGMENT_HEADER_LEN + chunk.len()].copy_from_slice(chunk);
+            let n = {
+                let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
+                transport.write_message(&frag[..FRAGMENT_HEADER_LEN + chunk.len()], &mut buf)?
+            };
+            self.tcp.write_all(&(n as u32).to_be_bytes())?;
             self.tcp.write_all(&buf[..n])?;
         }
         Ok(())
@@ -136,16 +164,16 @@ impl NoiseStream {
     /// Receive a decrypted message.
     ///
     /// Reads one or more length-prefixed ciphertext fragments, decrypting
-    /// each into a shared plaintext buffer, until a fragment with the
-    /// `MORE_FRAGMENTS` flag clear arrives — that fragment terminates the
-    /// logical message.
+    /// each into a shared plaintext buffer, until a fragment whose
+    /// AUTHENTICATED continuation header is clear arrives — that fragment
+    /// terminates the logical message.
     pub fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
         let mut plaintext = Vec::new();
         // Reusable per-fragment buffers, sized to the largest legitimate
         // fragment (65535 bytes of ciphertext). `resize` below only sets the
         // length after the first fragment — no per-fragment allocations.
-        let mut ct_buf = vec![0u8; MAX_PLAINTEXT_CHUNK + 16];
-        let mut pt_buf = vec![0u8; MAX_PLAINTEXT_CHUNK + 16];
+        let mut ct_buf = vec![0u8; MAX_PLAINTEXT_CHUNK + FRAGMENT_HEADER_LEN + GCM_TAG_LEN];
+        let mut pt_buf = vec![0u8; MAX_PLAINTEXT_CHUNK + FRAGMENT_HEADER_LEN + GCM_TAG_LEN];
         loop {
             // Read the raw frame bytes WITHOUT holding the TransportState
             // lock: snow tracks separate send and recv nonce counters, so an
@@ -157,32 +185,32 @@ impl NoiseStream {
             // waiting for data that may never come — a shutdown deadlock.
             let mut len_buf = [0u8; 4];
             self.tcp.read_exact(&mut len_buf)?;
-            let raw = u32::from_be_bytes(len_buf);
-            let more = raw & MORE_FRAGMENTS != 0;
-            // Mask the flag bit off: the real per-fragment ciphertext length
-            // is <= 65535 (snow's cap), so the flag occupies a bit no real
-            // length ever sets (see MORE_FRAGMENTS).
-            let ct_len = (raw & !MORE_FRAGMENTS) as usize;
+            let ct_len = u32::from_be_bytes(len_buf) as usize;
             // The length prefix is NOT authenticated — it precedes the GCM
             // ciphertext and is trusted before decryption — so it must be
             // validated before any allocation or read. snow caps one
             // message's ciphertext at 65535 bytes; a larger prefix is
             // protocol garbage, and rejecting it here stops a hostile or
             // corrupted peer from making us allocate (and block in
-            // read_exact for) an arbitrarily large buffer.
-            if ct_len > MAX_PLAINTEXT_CHUNK + 16 {
+            // read_exact for) an arbitrarily large buffer. Any smaller
+            // tamper with the prefix changes ct_len and is caught by the GCM
+            // authentication below (a wrong byte count never decrypts), so a
+            // wire flip can never silently truncate or extend a message.
+            if ct_len > MAX_PLAINTEXT_CHUNK + FRAGMENT_HEADER_LEN + GCM_TAG_LEN {
                 return Err(TransportError::InvalidFragment(format!(
                     "fragment ciphertext length {ct_len} exceeds the {}-byte Noise cap",
-                    MAX_PLAINTEXT_CHUNK + 16
+                    MAX_PLAINTEXT_CHUNK + FRAGMENT_HEADER_LEN + GCM_TAG_LEN
                 )));
             }
             // Cumulative cap during reassembly: the codec's MAX_FRAME_SIZE is
             // the effective per-message limit, and enforcing it HERE rather
             // than after reassembly in decode_frame bounds memory for an
-            // endless stream of MORE_FRAGMENTS fragments. Each fragment
-            // contributes at most ct_len - 16 plaintext bytes (the trailing
-            // 16 are the AES-GCM tag).
-            if plaintext.len() + ct_len.saturating_sub(16) > MAX_FRAME_SIZE {
+            // endless stream of continuation-marked fragments. Each fragment
+            // contributes at most ct_len - (tag + continuation header)
+            // plaintext bytes.
+            if plaintext.len() + ct_len.saturating_sub(GCM_TAG_LEN + FRAGMENT_HEADER_LEN)
+                > MAX_FRAME_SIZE
+            {
                 return Err(TransportError::InvalidFragment(format!(
                     "reassembled message exceeds the {MAX_FRAME_SIZE}-byte limit"
                 )));
@@ -198,7 +226,21 @@ impl NoiseStream {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .read_message(&ct_buf, &mut pt_buf)?;
-            plaintext.extend_from_slice(&pt_buf[..n]);
+            // Every fragment from this implementation carries the 1-byte
+            // continuation header, so a zero-length plaintext is impossible
+            // from a legitimate peer; guard the index below rather than panic
+            // on a hostile or corrupted 16-byte ciphertext (a bare GCM tag).
+            if n == 0 {
+                return Err(TransportError::InvalidFragment(
+                    "fragment carries no authenticated continuation header".to_string(),
+                ));
+            }
+            // The continuation flag is read from the AUTHENTICATED plaintext
+            // (the GCM tag covers it), so a wire-level tamper with the length
+            // prefix cannot change the reassembly decision — see the prefix
+            // validation above.
+            let more = pt_buf[0] & FRAGMENT_CONTINUATION != 0;
+            plaintext.extend_from_slice(&pt_buf[FRAGMENT_HEADER_LEN..n]);
 
             if !more {
                 return Ok(plaintext);
