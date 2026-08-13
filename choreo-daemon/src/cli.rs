@@ -224,7 +224,6 @@ pub fn main() -> anyhow::Result<()> {
         x_credentials: None,
         db,
         tool_registry,
-        client_streams: Vec::new(),
         summary_subscribers: std::collections::HashMap::new(),
         client_writers: HashMap::new(),
         activity_subscribers: std::collections::HashMap::new(),

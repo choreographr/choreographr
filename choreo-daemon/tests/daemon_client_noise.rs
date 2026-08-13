@@ -554,3 +554,72 @@ fn noise_large_message_through_daemon() {
     daemon.shutdown();
     client.finish().expect("clean close after shutdown");
 }
+
+/// Test that a >64 KiB message travels daemon → client through the FULL
+/// daemon stack — the reverse direction of `noise_large_message_through_daemon`
+/// (which is client → daemon). The client creates sessions with multi-KiB
+/// titles, so the aggregate ListSessions reply exceeds snow's single-message
+/// cap and must fragment on the wire: the daemon's writer thread splits it
+/// (send_daemon_message → send_message) and the client's reader thread
+/// reassembles it (recv_daemon_message → recv_message). The reply must
+/// arrive intact.
+#[test]
+#[ignore]
+fn noise_large_message_daemon_to_client() {
+    let (key_dir, client_pk) = test_keypair();
+    let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
+    let client = NoiseClient::connect(
+        &daemon.tcp_addr.to_string(),
+        &daemon.server_pk,
+        key_dir.path().to_path_buf(),
+    );
+
+    // Titles large enough that the aggregate Sessions reply exceeds the
+    // 65519-byte single Noise message cap: 12 × 8 KiB of title bytes
+    // (~96 KiB) fragments into at least two wire fragments.
+    const SESSIONS: usize = 12;
+    let big_title = "x".repeat(8 * 1024);
+    for i in 0..SESSIONS {
+        client.send(ClientMessage::CreateSession {
+            title: Some(big_title.clone()),
+            parent_session_id: None,
+            working_dir: None,
+            context_config: None,
+            account_name: None,
+            selected_model: None,
+            reasoning_effort: None,
+        });
+        match client.recv() {
+            DaemonMessage::SessionCreated { session_id, .. } => {
+                assert_eq!(session_id, (i + 1) as u64)
+            }
+            other => panic!("expected SessionCreated, got {other:?}"),
+        }
+    }
+
+    // This client never subscribed to the session summary, so the next
+    // message is exactly the Sessions reply — and it must be intact after
+    // reassembly.
+    client.send(ClientMessage::ListSessions);
+    match client.recv() {
+        DaemonMessage::Sessions { sessions } => {
+            assert_eq!(sessions.len(), SESSIONS);
+            for s in &sessions {
+                assert_eq!(s.title.as_deref(), Some(big_title.as_str()));
+            }
+            // Sanity: the reply really was large enough to fragment.
+            let total: usize = sessions
+                .iter()
+                .map(|s| s.title.as_deref().map_or(0, |t| t.len()))
+                .sum();
+            assert!(
+                total > 65519,
+                "test premise broken: aggregated reply is not >64 KiB ({total} bytes)"
+            );
+        }
+        other => panic!("expected Sessions, got {other:?}"),
+    }
+
+    daemon.shutdown();
+    client.finish().expect("clean close after shutdown");
+}

@@ -17,6 +17,63 @@ use tracing::{debug, error, info, warn};
 /// the previous thread::sleep() pacing for tool result chunks.
 pub(crate) const SUBSCRIBER_CHANNEL_CAPACITY: usize = 128;
 
+/// A per-connection message sink implementing the single-writer contract.
+///
+/// Both transports (Unix socket and TCP/Noise) implement this so the writer
+/// thread loop in [`writer_thread`] lives in exactly one place. The
+/// `ShuttingDown` special case — flush the notification, close the socket,
+/// stop draining — is what makes notify-before-EOF deterministic: the thread
+/// that writes the message is the same thread that closes the socket.
+trait ConnectionWriter {
+    /// Serialize and send one message. Errors are fatal for the connection
+    /// (the socket is broken) — the caller stops draining.
+    fn send_message(&mut self, msg: &DaemonMessage) -> Result<(), String>;
+    /// Close the underlying socket (both directions).
+    fn shutdown(&self);
+}
+
+impl ConnectionWriter for BufWriter<UnixStream> {
+    fn send_message(&mut self, msg: &DaemonMessage) -> Result<(), String> {
+        write_message(self, msg).map_err(|e| e.to_string())?;
+        self.flush().map_err(|e| e.to_string())
+    }
+    fn shutdown(&self) {
+        let _ = self.get_ref().shutdown(Shutdown::Both);
+    }
+}
+
+impl ConnectionWriter for choreo_transport::noise::NoiseStream {
+    fn send_message(&mut self, msg: &DaemonMessage) -> Result<(), String> {
+        self.send_daemon_message(msg).map_err(|e| e.to_string())
+    }
+    fn shutdown(&self) {
+        let _ = self.get_ref().shutdown(Shutdown::Both);
+    }
+}
+
+/// Drain a connection's writer channel — the connection's SOLE writer.
+///
+/// Each connection has exactly one writer thread, so messages on `rx` are
+/// serialized and fragments of one logical message can never interleave.
+/// `ShuttingDown` is special-cased: it is flushed, then the socket is closed
+/// HERE (by the writer thread itself), so the client observes the
+/// notification before the EOF with no other thread ever writing to or
+/// closing the socket. (ShuttingDown is only ever enqueued by the daemon's
+/// shutdown broadcast.) An error at any point stops the loop — the socket is
+/// broken, so continuing would just fail again.
+fn writer_thread<W: ConnectionWriter>(mut writer: W, rx: mpsc::Receiver<DaemonMessage>) {
+    for msg in rx {
+        if let Err(e) = writer.send_message(&msg) {
+            warn!("writer thread error: {e}");
+            break;
+        }
+        if matches!(msg, DaemonMessage::ShuttingDown) {
+            writer.shutdown();
+            break;
+        }
+    }
+}
+
 /// Shared per-client context passed through the dispatch and handler functions.
 /// Bundles the channels and mutable per-connection state into one struct so
 /// the call sites don't pass 5–6 individual arguments to every function.
@@ -353,26 +410,10 @@ pub(crate) fn client_thread(
     daemon_tx: mpsc::Sender<DaemonCommand>,
 ) -> io::Result<()> {
     let reader = BufReader::new(stream.try_clone()?);
-    let mut writer = BufWriter::new(stream);
+    let writer = BufWriter::new(stream);
 
     let (writer_tx, writer_rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
-    let writer_handle = std::thread::spawn(move || {
-        for msg in writer_rx {
-            if write_message(&mut writer, &msg).is_err() {
-                break;
-            }
-            let _ = writer.flush();
-            // This thread is the connection's SOLE writer. Closing the socket
-            // here — right after flushing ShuttingDown — guarantees the client
-            // observes the notification before the EOF, with no other thread
-            // ever writing to the socket. (DaemonMessage::ShuttingDown is only
-            // ever enqueued by the shutdown broadcast.)
-            if matches!(msg, DaemonMessage::ShuttingDown) {
-                let _ = writer.get_ref().shutdown(Shutdown::Both);
-                break;
-            }
-        }
-    });
+    let writer_handle = std::thread::spawn(move || writer_thread(writer, writer_rx));
 
     let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
     let mut attached_session_id: Option<u64> = None;
@@ -436,22 +477,8 @@ pub(crate) fn tcp_client_thread(
     let (writer_tx, writer_rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
 
     // Writer thread: blocks on writer_rx, sends via NoiseStream encryption.
-    let mut writer = noise.try_clone()?;
-    let writer_handle = std::thread::spawn(move || {
-        for msg in writer_rx {
-            if let Err(e) = writer.send_daemon_message(&msg) {
-                warn!("tcp writer thread error: {e}");
-                break;
-            }
-            // Sole-writer discipline: closing the socket here, right after the
-            // ShuttingDown flush, makes notify-before-EOF deterministic and
-            // keeps the accept-loop thread from ever writing to the socket.
-            if matches!(msg, DaemonMessage::ShuttingDown) {
-                let _ = writer.get_ref().shutdown(Shutdown::Both);
-                break;
-            }
-        }
-    });
+    let writer = noise.try_clone()?;
+    let writer_handle = std::thread::spawn(move || writer_thread(writer, writer_rx));
 
     let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
     let mut attached_session_id: Option<u64> = None;

@@ -28,6 +28,8 @@
 
 use choreo_proto::DaemonMessage;
 use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use tracing::warn;
 
 /// Try to deliver `message` to one subscriber, returning whether the
@@ -63,6 +65,45 @@ pub(crate) fn try_send_keep_on_full(
         // Receiver gone — the client is dead, stop sending to it.
         Err(mpsc::TrySendError::Disconnected(_)) => {
             warn!("removing disconnected subscriber {client_id}");
+            false
+        }
+    }
+}
+
+/// Deliver `ShuttingDown` to one client, blocking up to `grace` for the
+/// writer thread to drain a momentarily-full channel.
+///
+/// Only reached when the writer channel is full (the fast path in
+/// `handle_broadcast_shutting_down` handles the normal case with a
+/// non-blocking try_send). A bounded blocking send keeps the notify-before-EOF
+/// guarantee alive through transient backpressure: a thread performs the
+/// blocking `send` while we wait on its completion with a timeout. The daemon
+/// exits right after shutdown, so a thread left blocked in `send` (writer
+/// stuck in a blocking socket write) is killed by process exit — the timeout
+/// is what keeps the shutdown path itself from hanging.
+pub(crate) fn send_shutting_down_bounded(
+    tx: &mpsc::SyncSender<DaemonMessage>,
+    client_id: u64,
+    grace: Duration,
+) -> bool {
+    let tx = tx.clone();
+    let (done_tx, done_rx) = mpsc::channel::<Result<(), mpsc::SendError<DaemonMessage>>>();
+    thread::spawn(move || {
+        let _ = done_tx.send(tx.send(DaemonMessage::ShuttingDown));
+    });
+    match done_rx.recv_timeout(grace) {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => {
+            warn!("removing disconnected client {client_id} during shutdown");
+            false
+        }
+        Err(_) => {
+            // The writer did not drain in time. Drop the notification (the
+            // process exits momentarily and the OS closes the socket, so the
+            // client sees a bare EOF) and count it like any other dropped
+            // broadcast so a wedged client stays observable via /metrics.
+            crate::metrics::record_broadcast_dropped("client");
+            warn!("shutdown notification timed out for slow client {client_id}");
             false
         }
     }

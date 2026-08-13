@@ -60,7 +60,6 @@ pub fn test_daemon_state() -> DaemonState {
         db,
         tool_registry,
         daemon_tx,
-        client_streams: Vec::new(),
         summary_subscribers: HashMap::new(),
         client_writers: HashMap::new(),
         activity_subscribers: HashMap::new(),

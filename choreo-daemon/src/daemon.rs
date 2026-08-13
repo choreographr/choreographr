@@ -13,14 +13,20 @@ use choreo_proto::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
+
+/// Grace period for delivering `ShuttingDown` to a client whose writer
+/// channel is momentarily full during daemon shutdown. Bounded so a writer
+/// thread stuck in a blocking socket write cannot hang shutdown; the daemon
+/// process exits right after `run_server` returns, killing any sender thread
+/// left blocked past the grace period.
+const SHUTDOWN_NOTIFY_GRACE: Duration = Duration::from_secs(2);
 
 /// Reply type for the ListModels command.
 pub(super) type ListModelsReply =
@@ -51,7 +57,6 @@ pub struct DaemonState {
     pub db: Arc<redb::Database>,
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
-    pub client_streams: Vec<UnixStream>,
     pub summary_subscribers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
     /// Writer channel of EVERY connected client (both transports), registered
     /// on connect and removed on disconnect. The shutdown path uses it to
@@ -1087,26 +1092,43 @@ impl DaemonState {
         client_id: u64,
         writer: std::sync::mpsc::SyncSender<DaemonMessage>,
     ) {
+        debug!("registering client writer: client_id={}", client_id);
         // A fresh connection owns its client_id, so any prior entry is stale.
         self.client_writers.insert(client_id, writer);
     }
 
     /// Deliver `DaemonMessage::ShuttingDown` to every connected client via its
     /// writer channel; each connection's writer thread then closes its own
-    /// socket, so clients observe the notification before EOF.
+    /// socket, so clients observe the notification before EOF. A
+    /// momentarily-full writer channel is escalated to a bounded blocking send
+    /// (see `broadcast::send_shutting_down_bounded`) so backpressure cannot
+    /// silently drop the notification; the bound keeps shutdown from hanging
+    /// on a writer stuck in a blocking write.
     fn handle_broadcast_shutting_down(&mut self) {
-        // Best-effort, non-blocking: a slow client (full buffer) has its
-        // ShuttingDown dropped — documented best-effort, since the daemon
-        // process exits right after `run_server` returns and closes its
-        // sockets — and a dead client is evicted.
+        let clients = self.client_writers.len();
+        info!("broadcasting ShuttingDown to {clients} client(s)");
+        // Fast path: non-blocking try_send per client. A FULL channel is NOT
+        // dropped here (that would lose the notification); it is escalated to
+        // a bounded blocking send below so the notify-before-EOF guarantee
+        // survives transient backpressure. A disconnected client is evicted.
+        let mut slow_clients: Vec<(u64, mpsc::SyncSender<DaemonMessage>)> = Vec::new();
         self.client_writers.retain(|client_id, tx| {
-            crate::broadcast::try_send_keep_on_full(
-                tx,
-                *client_id,
-                "client",
-                &DaemonMessage::ShuttingDown,
-            )
+            match tx.try_send(DaemonMessage::ShuttingDown) {
+                Ok(()) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+                Err(mpsc::TrySendError::Full(_)) => {
+                    slow_clients.push((*client_id, tx.clone()));
+                    true
+                }
+            }
         });
+        // Slow path: bounded blocking delivery for full channels (see
+        // broadcast::send_shutting_down_bounded). Each connection's writer
+        // thread then flushes the notification and closes its own socket, so
+        // clients observe it before EOF.
+        for (client_id, tx) in slow_clients {
+            crate::broadcast::send_shutting_down_bounded(&tx, client_id, SHUTDOWN_NOTIFY_GRACE);
+        }
     }
 
     /// Clean up all per-client tracking when a client disconnects.
@@ -1801,7 +1823,6 @@ mod tests {
             db,
             tool_registry,
             daemon_tx,
-            client_streams: Vec::new(),
             summary_subscribers: HashMap::new(),
             client_writers: HashMap::new(),
             activity_subscribers: HashMap::new(),
