@@ -610,3 +610,63 @@ fn noise_concurrent_bidirectional_large_messages() {
         client_result.err()
     );
 }
+
+/// Test that a hostile or corrupted length prefix cannot make the receiver
+/// allocate a huge buffer or hang: the 4-byte data-plane prefix is NOT
+/// authenticated (it precedes the GCM ciphertext), so a peer can send any
+/// value. recv_message must reject a fragment longer than snow's 65535-byte
+/// ciphertext cap BEFORE allocating or reading that many bytes — without the
+/// validation the old code would `vec![0u8; ct_len]` for a 0x7FFF_FFFF
+/// prefix (~2 GiB) and block in read_exact waiting for the bytes.
+#[test]
+#[ignore]
+fn noise_rejects_oversized_fragment_prefix() {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_pk = PublicKey::from(&server_sk);
+    let server_sk_bytes = server_sk.to_bytes();
+    let server_pk_bytes = server_pk.to_bytes();
+
+    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let client_pk = PublicKey::from(&client_sk);
+    let client_sk_bytes = client_sk.to_bytes();
+    let client_pk_bytes = client_pk.to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    let server_sk = server_sk_bytes;
+    let client_pk_ref = client_pk_bytes;
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = (|| -> Result<(), String> {
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk_ref)
+                .map_err(|e| format!("server handshake failed: {e:?}"))?;
+            match server.recv_message() {
+                Err(_) => Ok(()), // rejected — the desired outcome
+                Ok(_) => Err("oversized fragment prefix was NOT rejected".into()),
+            }
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let client =
+        handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes).expect("client handshake");
+
+    // Raw write of a length prefix claiming 0x7FFF_FFFF ciphertext bytes
+    // (flag clear, far above the 65535-byte Noise cap), bypassing
+    // send_message so the wire carries a genuinely invalid frame.
+    client
+        .get_ref()
+        .write_all(&0x7FFF_FFFFu32.to_be_bytes())
+        .expect("write bogus prefix");
+
+    let server_result = rx.recv().expect("recv server result");
+    assert!(
+        server_result.is_ok(),
+        "oversized fragment prefix must be rejected: {:?}",
+        server_result.err()
+    );
+}

@@ -1,7 +1,8 @@
-use choreo_proto::{ClientMessage, DaemonMessage, decode_frame, encode_payload};
+use choreo_proto::{ClientMessage, DaemonMessage, MAX_FRAME_SIZE, decode_frame, encode_payload};
 use snow::TransportState;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
@@ -17,6 +18,17 @@ const MAX_PLAINTEXT_CHUNK: usize = 65535 - 16;
 /// proto codec's own 32 MiB frame cap (MAX_FRAME_SIZE) never collides with it.
 const MORE_FRAGMENTS: u32 = 0x8000_0000;
 
+/// Resets the single-writer flag when a `send_message` finishes — on every
+/// exit path, including early `?` returns. Without the guard a concurrent
+/// sender that errored would leave the flag set and wedge the stream.
+struct SendGuard<'a>(&'a AtomicBool);
+
+impl Drop for SendGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// An encrypted Noise IK transport stream.
 ///
 /// Wraps a TcpStream with a snow TransportState. Every message is
@@ -27,6 +39,12 @@ const MORE_FRAGMENTS: u32 = 0x8000_0000;
 pub struct NoiseStream {
     tcp: TcpStream,
     transport: Arc<Mutex<TransportState>>,
+    /// Single-writer guard: a concurrent second `send_message` on one stream
+    /// would interleave fragments of different logical messages on the wire
+    /// (silent corruption). The flag is shared across clones; `send_message`
+    /// swaps it and fails loudly with a protocol error if it was already set,
+    /// so a future violation is caught instead of corrupting the stream.
+    sender_active: Arc<AtomicBool>,
 }
 
 impl NoiseStream {
@@ -35,6 +53,7 @@ impl NoiseStream {
         NoiseStream {
             tcp,
             transport: Arc::new(Mutex::new(transport)),
+            sender_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -45,6 +64,7 @@ impl NoiseStream {
         Ok(NoiseStream {
             tcp: self.tcp.try_clone()?,
             transport: Arc::clone(&self.transport),
+            sender_active: Arc::clone(&self.sender_active),
         })
     }
 
@@ -61,8 +81,23 @@ impl NoiseStream {
     /// encrypt call, and is NEVER held across the blocking `write_all`s —
     /// the reader must always be able to acquire it (briefly) and drain the
     /// socket, or two peers sending large messages concurrently would
-    /// deadlock once the socket buffers filled.
+    /// deadlock once the socket buffers filled. A runtime single-writer guard
+    /// (see `sender_active`) rejects a concurrent second `send_message` with a
+    /// protocol error rather than interleaving fragments.
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
+        // The single-writer-per-connection invariant is load-bearing:
+        // fragments of one logical message must never interleave with
+        // another message's on the wire, which holds only while exactly one
+        // thread calls send_message per stream. Enforce it at runtime: a
+        // second concurrent sender gets a loud protocol error instead of
+        // silently corrupting the stream.
+        if self.sender_active.swap(true, Ordering::SeqCst) {
+            return Err(TransportError::InvalidFragment(
+                "concurrent send_message on one NoiseStream".to_string(),
+            ));
+        }
+        let _guard = SendGuard(&self.sender_active);
+
         // Reusable ciphertext buffer: one Noise message's worst case is
         // MAX_PLAINTEXT_CHUNK plaintext bytes plus the 16-byte AES-GCM tag.
         // Reusing it across chunks avoids reallocating per fragment.
@@ -106,6 +141,11 @@ impl NoiseStream {
     /// logical message.
     pub fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
         let mut plaintext = Vec::new();
+        // Reusable per-fragment buffers, sized to the largest legitimate
+        // fragment (65535 bytes of ciphertext). `resize` below only sets the
+        // length after the first fragment — no per-fragment allocations.
+        let mut ct_buf = vec![0u8; MAX_PLAINTEXT_CHUNK + 16];
+        let mut pt_buf = vec![0u8; MAX_PLAINTEXT_CHUNK + 16];
         loop {
             // Read the raw frame bytes WITHOUT holding the TransportState
             // lock: snow tracks separate send and recv nonce counters, so an
@@ -123,12 +163,36 @@ impl NoiseStream {
             // is <= 65535 (snow's cap), so the flag occupies a bit no real
             // length ever sets (see MORE_FRAGMENTS).
             let ct_len = (raw & !MORE_FRAGMENTS) as usize;
-            let mut ct_buf = vec![0u8; ct_len];
+            // The length prefix is NOT authenticated — it precedes the GCM
+            // ciphertext and is trusted before decryption — so it must be
+            // validated before any allocation or read. snow caps one
+            // message's ciphertext at 65535 bytes; a larger prefix is
+            // protocol garbage, and rejecting it here stops a hostile or
+            // corrupted peer from making us allocate (and block in
+            // read_exact for) an arbitrarily large buffer.
+            if ct_len > MAX_PLAINTEXT_CHUNK + 16 {
+                return Err(TransportError::InvalidFragment(format!(
+                    "fragment ciphertext length {ct_len} exceeds the {}-byte Noise cap",
+                    MAX_PLAINTEXT_CHUNK + 16
+                )));
+            }
+            // Cumulative cap during reassembly: the codec's MAX_FRAME_SIZE is
+            // the effective per-message limit, and enforcing it HERE rather
+            // than after reassembly in decode_frame bounds memory for an
+            // endless stream of MORE_FRAGMENTS fragments. Each fragment
+            // contributes at most ct_len - 16 plaintext bytes (the trailing
+            // 16 are the AES-GCM tag).
+            if plaintext.len() + ct_len.saturating_sub(16) > MAX_FRAME_SIZE {
+                return Err(TransportError::InvalidFragment(format!(
+                    "reassembled message exceeds the {MAX_FRAME_SIZE}-byte limit"
+                )));
+            }
+            ct_buf.resize(ct_len, 0);
             self.tcp.read_exact(&mut ct_buf)?;
 
             // Take the lock briefly to decrypt this one fragment, then
             // release it before the next blocking read (see above).
-            let mut pt_buf = vec![0u8; ct_len];
+            pt_buf.resize(ct_len, 0);
             let n = self
                 .transport
                 .lock()

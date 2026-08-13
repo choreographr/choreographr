@@ -392,7 +392,7 @@ TCP.  Used by both `choreo-client-core` (client side) and `choreo-daemon` (serve
 
 | Module | Purpose |
 |---|---|
-| `noise.rs` | `NoiseStream` — wraps `TcpStream` + `snow::TransportState` with length-prefixed AES-256-GCM framing. Payloads above snow's 65535-byte single-message ciphertext cap are split into flag-marked fragments and reassembled transparently, so the effective per-message cap is now the proto codec's 32 MiB `MAX_FRAME_SIZE`. The shared `TransportState` lock is held only per-chunk during encryption, never during the blocking socket writes — together with the single-writer-per-connection discipline on the daemon, this prevents a bidirectional large-message deadlock (see `noise_concurrent_bidirectional_large_messages`). `handshake_initiator()` (client) and `handshake_responder()` (server) implement the Noise IK handshake with X25519 key agreement. |
+| `noise.rs` | `NoiseStream` — wraps `TcpStream` + `snow::TransportState` with length-prefixed AES-256-GCM framing. Payloads above snow's 65535-byte single-message ciphertext cap are split into flag-marked fragments and reassembled transparently, so the effective per-message cap is now the proto codec's 32 MiB `MAX_FRAME_SIZE`. The shared `TransportState` lock is held only per-chunk during encryption, never during the blocking socket writes — together with the single-writer-per-connection discipline on the daemon, this prevents a bidirectional large-message deadlock (see `noise_concurrent_bidirectional_large_messages`). The unauthenticated 4-byte fragment-length prefix is validated before any allocation (snow's 65535-byte ciphertext cap) and reassembly is capped at the codec's 32 MiB `MAX_FRAME_SIZE`, so a hostile or corrupted peer cannot force a huge buffer allocation; a runtime single-writer guard on `send_message` rejects a concurrent second sender instead of interleaving fragments. `handshake_initiator()` (client) and `handshake_responder()` (server) implement the Noise IK handshake with X25519 key agreement. |
 | `error.rs` | `TransportError` enum — `Io`, `Noise`, `Protocol`, `AuthFailed`, `ConnectionClosed`. |
 | `key.rs` | Transport keypair handling — `TransportSecretKey` (type-safe X25519 secret), `ensure_transport_keypair()` (generate-or-load with advisory file locking), `read_server_pk()`. `set_test_config_root()` is the keypair-directory test override, now `pub` so integration tests can redirect keypair generation to a temp dir — matching the `choreo_keystore::paths` / `choreo_daemon::mcp::config` precedent. |
 
@@ -2760,7 +2760,9 @@ cap — the 65519-byte single-fragment boundary plus multi-fragment reassembly
 (65520 bytes = 2 fragments, 1 MiB = 17 fragments, and a post-fragment echo
 proving nonces stay in sync) — malformed-handshake rejection, and a new
 unit test (`transport_state_rejects_tampered_ciphertext`) proving GCM
-authentication rejects a single flipped ciphertext byte. A regression test
+authentication rejects a single flipped ciphertext byte, and an
+oversized-fragment-prefix rejection test (`noise_rejects_oversized_fragment_prefix`)
+pins the length-prefix validation. A regression test
 (`noise_concurrent_bidirectional_large_messages`) pins the transport lock
 scope: both endpoints send 1 MiB concurrently under tiny socket buffers, and
 the sends must complete because `send_message` holds the `TransportState`
