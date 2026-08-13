@@ -354,6 +354,9 @@ pub fn run_server(
                             );
                             continue;
                         };
+                        // Count the accept toward connections_total — mirrors
+                        // the Unix accept path below.
+                        crate::metrics::record_connection_accepted();
                         let tx = daemon_tx.clone();
                         let sk_bytes = *transport_sk.as_bytes();
                         let acl = Arc::clone(&acl);

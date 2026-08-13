@@ -1,11 +1,12 @@
 use choreo_proto::{ClientMessage, DaemonMessage, MAX_FRAME_SIZE, decode_frame, encode_payload};
 use snow::TransportState;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::TransportError;
+use tracing::{debug, trace};
 
 /// AES-256-GCM authentication tag length, appended to every encrypted
 /// message (snow's `MAXMSGLEN` counts the tag).
@@ -52,6 +53,35 @@ impl Drop for SendGuard<'_> {
     }
 }
 
+/// Classify a raw stream error: the EOF-class kinds that mean "the peer
+/// closed the connection" become [`TransportError::ConnectionClosed`] instead
+/// of a raw `Io(UnexpectedEof)`. `read_exact` surfaces a graceful close as
+/// `UnexpectedEof` (EOF before the buffer filled) and a reset/abort as
+/// `ConnectionReset`/`BrokenPipe`; all mean the peer is gone, which the
+/// daemon and client read loops want to distinguish from a protocol failure
+/// (they log a graceful disconnect and run cleanup). The match arms that
+/// branch on [`TransportError::ConnectionClosed`] depend on this
+/// classification.
+fn classify_stream_error(e: io::Error) -> TransportError {
+    match e.kind() {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe => {
+            debug!("Noise stream closed by peer");
+            TransportError::ConnectionClosed
+        }
+        _ => e.into(),
+    }
+}
+
+/// `read_exact` that classifies peer-close error kinds via
+/// [`classify_stream_error`], so `recv_message` can surface a graceful
+/// disconnect as [`TransportError::ConnectionClosed`].
+fn read_exact_or_closed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), TransportError> {
+    stream.read_exact(buf).map_err(classify_stream_error)
+}
+
 /// An encrypted Noise IK transport stream.
 ///
 /// Wraps a TcpStream with a snow TransportState. Every message is
@@ -91,6 +121,7 @@ pub struct NoiseStream {
 impl NoiseStream {
     /// Create a new NoiseStream wrapping a TcpStream and TransportState.
     pub fn new(tcp: TcpStream, transport: TransportState) -> Self {
+        trace!("NoiseStream created");
         NoiseStream {
             tcp,
             transport: Arc::new(Mutex::new(transport)),
@@ -167,6 +198,7 @@ impl NoiseStream {
                 "outgoing message exceeds the {MAX_FRAME_SIZE}-byte limit"
             )));
         }
+        trace!(plaintext_len = plaintext.len(), "sending Noise message");
 
         // Guarantee the reused per-stream buffers are big enough for the
         // largest single fragment. They are lazy: `new`/`try_clone` start
@@ -240,7 +272,10 @@ impl NoiseStream {
     /// Reads one or more length-prefixed ciphertext fragments, decrypting
     /// each into a shared plaintext buffer, until a fragment whose
     /// AUTHENTICATED continuation header is clear arrives — that fragment
-    /// terminates the logical message.
+    /// terminates the logical message. If the peer closes the connection
+    /// (EOF before a full frame, or a reset) `Err(TransportError::ConnectionClosed)`
+    /// is returned — the read-loop callers treat that as a graceful
+    /// disconnect, distinct from a protocol failure.
     pub fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
         let mut plaintext = Vec::new();
         loop {
@@ -253,7 +288,7 @@ impl NoiseStream {
             // thread sending ShuttingDown) would block forever on a reader
             // waiting for data that may never come — a shutdown deadlock.
             let mut len_buf = [0u8; 4];
-            self.tcp.read_exact(&mut len_buf)?;
+            read_exact_or_closed(&mut self.tcp, &mut len_buf)?;
             let ct_len = u32::from_be_bytes(len_buf) as usize;
             // The length prefix is NOT authenticated — it precedes the GCM
             // ciphertext and is trusted before decryption — so it must be
@@ -288,7 +323,7 @@ impl NoiseStream {
             // the length (growing if this fragment is the largest seen), so
             // capacity carries across messages — no per-fragment allocation.
             self.recv_ct_buf.resize(ct_len, 0);
-            self.tcp.read_exact(&mut self.recv_ct_buf)?;
+            read_exact_or_closed(&mut self.tcp, &mut self.recv_ct_buf)?;
 
             // Take the lock briefly to decrypt this one fragment, then
             // release it before the next blocking read (see above).
@@ -315,6 +350,7 @@ impl NoiseStream {
             plaintext.extend_from_slice(&self.recv_pt_buf[FRAGMENT_HEADER_LEN..n]);
 
             if !more {
+                trace!(message_len = plaintext.len(), "received Noise message");
                 return Ok(plaintext);
             }
         }
@@ -352,6 +388,7 @@ impl NoiseStream {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use snow::Builder;
     use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -426,5 +463,32 @@ mod tests {
             result.is_err(),
             "tampered ciphertext must be rejected by GCM authentication"
         );
+    }
+
+    /// EOF-class read errors are classified as `TransportError::ConnectionClosed`
+    /// (a graceful peer disconnect) rather than a raw `Io` error — the daemon's
+    /// and client's read loops branch on that variant to log a graceful
+    /// disconnect and run cleanup. Pure mapping test: no sockets, no sleeps.
+    #[test]
+    fn eof_class_read_errors_map_to_connection_closed() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+        ] {
+            let err = io::Error::new(kind, "peer gone");
+            assert!(
+                matches!(classify_stream_error(err), TransportError::ConnectionClosed),
+                "{kind:?} must classify as ConnectionClosed"
+            );
+        }
+        // A non-EOF error stays a raw Io error, not a graceful disconnect.
+        let other = io::Error::new(io::ErrorKind::PermissionDenied, "nope");
+        assert!(matches!(
+            classify_stream_error(other),
+            TransportError::Io(_)
+        ));
     }
 }

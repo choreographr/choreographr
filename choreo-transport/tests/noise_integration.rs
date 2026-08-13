@@ -431,6 +431,50 @@ fn noise_empty_message_round_trip() {
     );
 }
 
+/// The peer closing its end of the socket after the handshake surfaces as
+/// `TransportError::ConnectionClosed` (not a raw `Io(UnexpectedEof)`): the
+/// daemon's read loop branches on that variant to log a graceful disconnect
+/// and run cleanup instead of reporting an error. Pins the EOF classification
+/// in `noise::recv_message`.
+#[test]
+#[ignore]
+fn noise_peer_close_surfaces_as_connection_closed() {
+    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = (|| -> Result<(), String> {
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
+                .map_err(|e| format!("server handshake failed: {e:?}"))?;
+            // The client closes its end without sending a frame; the next
+            // recv must report ConnectionClosed, not hang or surface a raw
+            // I/O error.
+            match server.recv_message() {
+                Err(TransportError::ConnectionClosed) => Ok(()),
+                other => Err(format!("expected ConnectionClosed, got {other:?}")),
+            }
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
+    // Close our end: the server's next read hits EOF.
+    drop(client);
+
+    let server_result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server must return instead of hanging");
+    assert!(
+        server_result.is_ok(),
+        "server side should report ConnectionClosed: {:?}",
+        server_result.err()
+    );
+}
+
 /// Test that a peer sending garbage instead of a Noise handshake message 1
 /// cannot wedge the responder: handshake_responder must error out (not
 /// hang), and that failure is relayed over mpsc. The client writes a

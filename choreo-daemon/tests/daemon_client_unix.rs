@@ -308,7 +308,7 @@ fn unix_connection_cap_rejects_over_limit_with_eof() {
 
     let mut streams = Vec::with_capacity(CAP);
     for _ in 0..CAP {
-        let stream = UnixStream::connect(&daemon.socket_str()).expect("connect under the cap");
+        let stream = UnixStream::connect(daemon.socket_str()).expect("connect under the cap");
         streams.push(stream);
         // Pace the connects so the daemon's single-threaded accept loop keeps
         // up: its Unix listener backlog is 128 (smaller than the cap), so
@@ -319,7 +319,7 @@ fn unix_connection_cap_rejects_over_limit_with_eof() {
 
     // The cap is 256: the 257th connection is accepted and dropped
     // immediately (the client sees a bare EOF, never a protocol message).
-    let mut over_limit = UnixStream::connect(&daemon.socket_str()).expect("connect over the cap");
+    let mut over_limit = UnixStream::connect(daemon.socket_str()).expect("connect over the cap");
     over_limit
         .set_read_timeout(Some(TIMEOUT))
         .expect("set read timeout");
