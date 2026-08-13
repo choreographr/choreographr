@@ -17,6 +17,8 @@
 use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_connection;
 use choreo_proto::{ClientMessage, DaemonMessage};
+use std::io::{self, Read};
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -284,4 +286,65 @@ fn unix_two_clients_isolated_and_shared_state() {
 
     daemon.shutdown();
     client_b.assert_closed_ok();
+}
+
+/// The concurrent-connection cap (`MAX_CONCURRENT_CONNECTIONS = 256` in
+/// `server/lifecycle.rs`) bounds how many wedged-but-open clients the daemon
+/// keeps alive. This pins it end-to-end over the Unix socket: 256 silent
+/// clients (socket open, nothing sent) each hold a live-connection slot; the
+/// 257th is accepted and immediately dropped, so its reader sees a bare EOF
+/// while the first 256 stay connected.
+///
+/// Direct `UnixStream` usage (rather than the `Client` helper) keeps the
+/// test minimal: the point is the accept-side cap, not the client protocol.
+#[test]
+#[ignore]
+fn unix_connection_cap_rejects_over_limit_with_eof() {
+    // Must match MAX_CONCURRENT_CONNECTIONS in server/lifecycle.rs (the
+    // constant is private to the crate, so the integration test hardcodes it
+    // and this comment is the coupling point).
+    const CAP: usize = 256;
+    let daemon = common::SpawnedDaemon::start(&[]);
+
+    let mut streams = Vec::with_capacity(CAP);
+    for _ in 0..CAP {
+        let stream = UnixStream::connect(&daemon.socket_str()).expect("connect under the cap");
+        streams.push(stream);
+        // Pace the connects so the daemon's single-threaded accept loop keeps
+        // up: its Unix listener backlog is 128 (smaller than the cap), so
+        // connecting 256 sockets faster than it accepts would block on a full
+        // backlog instead of exercising the cap.
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    // The cap is 256: the 257th connection is accepted and dropped
+    // immediately (the client sees a bare EOF, never a protocol message).
+    let mut over_limit = UnixStream::connect(&daemon.socket_str()).expect("connect over the cap");
+    over_limit
+        .set_read_timeout(Some(TIMEOUT))
+        .expect("set read timeout");
+    let mut buf = [0u8; 1];
+    match over_limit.read(&mut buf) {
+        Ok(0) => {} // EOF — the expected rejection
+        other => panic!("expected EOF from over-cap connection, got {other:?}"),
+    }
+
+    // FIFO accept order guarantees the daemon accepted the first 256 before
+    // the 257th (each connect was issued strictly after the previous one), so
+    // once the 257th saw EOF every slot is held. Verify none of the 256 was
+    // dropped: a still-connected silent socket reads WouldBlock (no data),
+    // never EOF.
+    for (i, mut stream) in streams.iter().enumerate() {
+        stream.set_nonblocking(true).expect("set nonblocking");
+        let mut buf = [0u8; 1];
+        match stream.read(&mut buf) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            other => panic!("connection {i} under the cap was dropped: {other:?}"),
+        }
+    }
+
+    // Dropping the streams before the daemon's Drop runs shutdown lets the
+    // daemon's readers see EOF and exit cleanly, so shutdown does not wait
+    // out the bounded drain grace for 256 wedged connections.
+    drop(streams);
 }

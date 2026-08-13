@@ -1116,10 +1116,13 @@ impl DaemonState {
         // survives transient backpressure. A disconnected client is evicted.
         let mut slow_clients: Vec<(u64, mpsc::SyncSender<DaemonMessage>)> = Vec::new();
         self.client_writers.retain(|client_id, tx| {
-            match tx.try_send(DaemonMessage::ShuttingDown) {
-                Ok(()) => true,
-                Err(mpsc::TrySendError::Disconnected(_)) => false,
-                Err(mpsc::TrySendError::Full(_)) => {
+            // One shared classification (broadcast::try_send_classify) feeds
+            // both this fast path and the per-subscriber broadcast policy, so
+            // the Ok/Disconnected/Full arms live in exactly one place.
+            match crate::broadcast::try_send_classify(tx, &DaemonMessage::ShuttingDown) {
+                crate::broadcast::SendOutcome::Delivered => true,
+                crate::broadcast::SendOutcome::Disconnected => false,
+                crate::broadcast::SendOutcome::Full => {
                     slow_clients.push((*client_id, tx.clone()));
                     true
                 }

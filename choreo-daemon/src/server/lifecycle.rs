@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,27 +34,35 @@ const CONNECTION_DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// drain grace below.
 const ACCEPT_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Join a connection thread, giving up once `deadline` passes. Returns
+/// Join a thread with a deadline, giving up once `deadline` passes. Returns
 /// whether the thread exited before the deadline.
 ///
-/// A connection thread is the owner of its writer: `cleanup_client` joins
-/// the writer thread after the socket EOF, so joining the connection thread
-/// transitively waits for the writer to flush `ShuttingDown` and close its
-/// own socket — this is what makes notify-before-EOF observable even when
-/// `run_server` is embedded in-process (no process exit to reap threads).
-/// All connection threads share one deadline (see the shutdown path below) so
-/// N wedged clients cost ~one grace period instead of N × grace.
-fn join_connection_thread(handle: thread::JoinHandle<()>, deadline: Instant) -> bool {
+/// The bounded join is the shared primitive behind every "wait for a thread
+/// but do not hang on it" site in the daemon:
+///
+/// * the shutdown drain joins each connection thread against one shared
+///   deadline, so N wedged clients cost ~one grace period instead of N ×
+///   grace. A connection thread owns its writer: `cleanup_client` joins the
+///   writer thread after the socket EOF, so joining the connection thread
+///   transitively waits for the writer to flush `ShuttingDown` and close its
+///   own socket — this is what makes notify-before-EOF observable even when
+///   `run_server` is embedded in-process (no process exit to reap threads).
+/// * `run_server` joins the TCP accept thread before the broadcast so no
+///   connection handle can be spawned after the drain.
+/// * `cleanup_client` joins a connection's writer thread with a short grace
+///   so a writer wedged in a blocking socket write cannot wedge its
+///   connection thread's cleanup.
+pub(crate) fn join_thread_bounded(handle: thread::JoinHandle<()>, deadline: Instant) -> bool {
     while !handle.is_finished() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            warn!("connection thread did not exit before shutdown deadline; abandoning join");
+            warn!("thread did not exit before shutdown deadline; abandoning join");
             return false;
         }
         thread::sleep(remaining.min(Duration::from_millis(10)));
     }
     if let Err(e) = handle.join() {
-        error!("connection thread panicked during shutdown: {e:?}");
+        error!("thread panicked during shutdown: {e:?}");
     }
     true
 }
@@ -64,6 +72,42 @@ fn join_connection_thread(handle: thread::JoinHandle<()>, deadline: Instant) -> 
 /// pruning finished ones eagerly stops a long-running daemon from
 /// accumulating one handle per connection ever accepted.
 const CLIENT_THREAD_PRUNE_THRESHOLD: usize = 64;
+
+/// Maximum concurrently-connected clients (both transports combined). Each
+/// connection holds two threads (connection + writer) and a socket FD, so an
+/// unbounded number of wedged-but-open clients (connected, not reading) could
+/// exhaust thread/FD resources even though each is individually harmless
+/// (per-connection backpressure never blocks the command loop). The cap turns
+/// that unbounded accumulation into a bounded one: once it is hit, a new
+/// connection is accepted and immediately dropped (the client sees a bare
+/// EOF rather than hanging in the accept backlog) and the event is logged.
+/// Generous for a personal daemon (TUI + GUI + IM bridge + a handful of
+/// mobile clients).
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
+/// RAII live-connection slot: decrements the daemon-wide connection counter
+/// when a connection thread exits — including on panic — so a connection can
+/// never leak its slot and slowly eat into the cap. Owns an `Arc` clone so it
+/// can be moved into the spawned connection thread.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Try to take a connection slot under [`MAX_CONCURRENT_CONNECTIONS`].
+/// Atomic `fetch_add` makes the check-and-take race-free across the two
+/// accept paths (Unix main thread + TCP accept thread); on rejection the
+/// increment is undone and `None` is returned.
+fn try_take_connection_slot(count: &Arc<AtomicUsize>) -> Option<ConnectionSlot> {
+    if count.fetch_add(1, Ordering::Relaxed) >= MAX_CONCURRENT_CONNECTIONS {
+        count.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(ConnectionSlot(Arc::clone(count)))
+}
 
 /// Track a connection thread's JoinHandle for the shutdown drain, pruning
 /// handles of already-finished threads once the Vec grows past
@@ -124,6 +168,22 @@ fn start_metrics_server(addr_str: &str, _shutdown: &Arc<AtomicBool>) -> io::Resu
         "--metrics-addr {addr_str}: this build was compiled without the \
          `metrics` feature; rebuild with `--features metrics` to serve /metrics"
     )))
+}
+
+/// Handle an accept() error the way both accept loops do: a transient error
+/// (interrupted syscall — `signal_hook` does not use SA_RESTART — or a
+/// connection aborted before accept completed, which consumed no FD) is
+/// retried immediately; a resource-exhaustion error (EMFILE/ENFILE/…) is
+/// logged and backed off so other threads can close FDs. Both loops continue
+/// after this, so it returns nothing.
+fn handle_accept_error(e: io::Error) {
+    match e.kind() {
+        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => {}
+        _ => {
+            error!(error = %e, "accept error, retrying");
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 pub fn run_server(
@@ -231,6 +291,11 @@ pub fn run_server(
     let mut client_threads: Vec<thread::JoinHandle<()>> = Vec::new();
     let (tcp_client_tx, tcp_client_rx) = mpsc::channel::<thread::JoinHandle<()>>();
 
+    // Daemon-wide live-connection counter backing MAX_CONCURRENT_CONNECTIONS.
+    // Both accept paths take a slot per accepted connection, so the cap is
+    // enforced across the Unix main thread and the TCP accept thread.
+    let conn_count = Arc::new(AtomicUsize::new(0));
+
     // TCP listener for Noise IK clients. The `ShuttingDown` notification is
     // routed through the daemon's client_writers registry, exactly as on the
     // Unix path; the TCP accept thread just spawns a per-connection
@@ -258,6 +323,11 @@ pub fn run_server(
         let daemon_tx = daemon_tx.clone();
         let acl = Arc::clone(&acl);
         let tcp_client_tx = tcp_client_tx.clone();
+        // Clone the connection counter into this accept thread (same pattern
+        // as the daemon_tx/acl clones above): the main thread keeps its own
+        // Arc for the Unix accept path, so the shared cap is enforced across
+        // both transports.
+        let conn_count = Arc::clone(&conn_count);
         tcp_accept_handle = Some(thread::spawn(move || {
             loop {
                 if tcp_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -273,6 +343,17 @@ pub fn run_server(
                             drop(tcp);
                             break;
                         }
+                        // Enforce the concurrent-connection cap: at the cap,
+                        // a new connection is accepted and immediately dropped
+                        // (the client sees a bare EOF) instead of letting
+                        // wedged-but-open clients accumulate threads and FDs
+                        // without bound.
+                        let Some(slot) = try_take_connection_slot(&conn_count) else {
+                            warn!(
+                                "connection rejected: at the {MAX_CONCURRENT_CONNECTIONS} concurrent-connection cap"
+                            );
+                            continue;
+                        };
                         let tx = daemon_tx.clone();
                         let sk_bytes = *transport_sk.as_bytes();
                         let acl = Arc::clone(&acl);
@@ -285,7 +366,12 @@ pub fn run_server(
                         let (client_id, writer_tx, writer_rx) =
                             crate::server::connection::register_client_writer(&tx);
                         let handle = thread::spawn(move || {
-                            let noise = match choreo_transport::noise::handshake_responder(
+                            // Held through the handshake AND the connection
+                            // thread: released when this thread exits
+                            // (handshake failure or connection end), even on
+                            // panic.
+                            let _slot = slot;
+                            let noise = match choreo_transport::handshake::handshake_responder(
                                 tcp,
                                 &sk_bytes,
                                 |pk| acl.contains(pk),
@@ -312,22 +398,8 @@ pub fn run_server(
                         // can wait for this connection thread too.
                         let _ = tcp_client_tx.send(handle);
                     }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                        // Blocking accept was interrupted by a signal.
-                        // Retry immediately.
-                        continue;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                        // The connection was aborted before accept completed.
-                        // No FD was consumed, retry immediately.
-                        continue;
-                    }
                     Err(e) => {
-                        // Transient or resource-exhaustion errors
-                        // (EMFILE, ENFILE, etc.) — log and retry with
-                        // backoff so other threads can close FDs.
-                        error!(error = %e, "TCP accept error, retrying");
-                        thread::sleep(Duration::from_millis(100));
+                        handle_accept_error(e);
                     }
                 }
             }
@@ -349,6 +421,16 @@ pub fn run_server(
                     // Wakeup from the signal handler — shut down.
                     break;
                 }
+                // Enforce the concurrent-connection cap: at the cap, the
+                // accepted stream is dropped right here (the client sees a
+                // bare EOF) rather than letting wedged-but-open clients
+                // accumulate threads and FDs without bound.
+                let Some(slot) = try_take_connection_slot(&conn_count) else {
+                    warn!(
+                        "connection rejected: at the {MAX_CONCURRENT_CONNECTIONS} concurrent-connection cap"
+                    );
+                    continue; // the accepted stream is dropped here; the client sees EOF
+                };
                 crate::metrics::record_connection_accepted();
                 let tx = daemon_tx.clone();
                 // Register the writer channel with the daemon BEFORE spawning
@@ -360,6 +442,10 @@ pub fn run_server(
                 push_client_thread(
                     &mut client_threads,
                     thread::spawn(move || {
+                        // Held for this thread's whole lifetime: released
+                        // (decrementing the counter) when the connection
+                        // thread exits, even on panic.
+                        let _slot = slot;
                         if let Err(e) = crate::server::connection::client_thread(
                             stream, tx, client_id, writer_tx, writer_rx,
                         ) {
@@ -368,23 +454,8 @@ pub fn run_server(
                     }),
                 );
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                // Blocking accept was interrupted by a signal
-                // (signal_hook does not use SA_RESTART).  Retry.
-                continue;
-            }
-            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                // The connection was aborted before accept completed.
-                // No FD was consumed, retry immediately.
-                continue;
-            }
             Err(e) => {
-                // Transient or resource-exhaustion errors
-                // (ECONNABORTED, EMFILE, ENFILE, etc.) — log
-                // and retry with backoff so other threads can
-                // close file descriptors.
-                error!(error = %e, "accept error, retrying");
-                thread::sleep(Duration::from_millis(100));
+                handle_accept_error(e);
             }
         }
     }
@@ -417,7 +488,7 @@ pub fn run_server(
         let _ = TcpStream::connect_timeout(&probe, ACCEPT_PROBE_CONNECT_TIMEOUT);
     }
     if let Some(handle) = tcp_accept_handle.take() {
-        join_connection_thread(handle, Instant::now() + CONNECTION_DRAIN_GRACE);
+        join_thread_bounded(handle, Instant::now() + CONNECTION_DRAIN_GRACE);
     }
 
     // Collect TCP connection threads spawned concurrently with shutdown so
@@ -448,7 +519,7 @@ pub fn run_server(
     drain_tcp_handles(&tcp_client_rx, &mut client_threads);
     let drain_deadline = Instant::now() + CONNECTION_DRAIN_GRACE;
     for handle in client_threads {
-        join_connection_thread(handle, drain_deadline);
+        join_thread_bounded(handle, drain_deadline);
     }
 
     if Path::new(socket_path).exists() {
@@ -488,6 +559,45 @@ mod tests {
         assert!(
             msg.contains("--features metrics"),
             "error must point at the opt-in feature: {msg}"
+        );
+    }
+
+    /// A connection slot decrements the daemon-wide counter when dropped, so
+    /// a connection thread can never leak its slot and slowly eat into the
+    /// cap — the decrement also runs on panic, via `Drop`. The slot is taken
+    /// through [`try_take_connection_slot`] because that is where the counter
+    /// is incremented (atomically, to make check-and-take race-free); the
+    /// `ConnectionSlot` constructor itself never touches the counter.
+    #[test]
+    fn connection_slot_decrements_counter_on_drop() {
+        let count = Arc::new(AtomicUsize::new(0));
+        {
+            let _slot = try_take_connection_slot(&count).expect("under the cap");
+            assert_eq!(count.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    /// At the cap, further connections are rejected (None) and every taken
+    /// slot is released when its connection exits, so the counter returns to
+    /// zero rather than leaking slots into the cap.
+    #[test]
+    fn connection_cap_rejects_over_limit_and_releases_on_drop() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut slots = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            let slot = try_take_connection_slot(&count).expect("under the cap");
+            slots.push(slot);
+        }
+        assert!(
+            try_take_connection_slot(&count).is_none(),
+            "at-cap connection must be rejected"
+        );
+        drop(slots);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "every slot must be released when its connection exits"
         );
     }
 

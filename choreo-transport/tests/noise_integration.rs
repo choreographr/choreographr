@@ -1,7 +1,9 @@
 use choreo_proto::{ClientMessage, DaemonMessage};
-use choreo_transport::noise::{
-    NoiseStream, handshake_initiator, handshake_responder, handshake_responder_with_timeout,
+use choreo_transport::error::TransportError;
+use choreo_transport::handshake::{
+    handshake_initiator, handshake_responder, handshake_responder_with_timeout,
 };
+use choreo_transport::noise::NoiseStream;
 use snow::Builder;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -41,35 +43,40 @@ fn shrink_socket_buffers(stream: &TcpStream) {
 #[cfg(not(unix))]
 fn shrink_socket_buffers(_stream: &TcpStream) {}
 
+/// Fresh X25519 keypairs for both handshake sides plus an ephemeral
+/// listener, shared by every test (cuts the per-test keygen boilerplate).
+fn noise_test_pair() -> (TcpListener, [u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_pk = PublicKey::from(&server_sk);
+    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let client_pk = PublicKey::from(&client_sk);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    (
+        listener,
+        server_sk.to_bytes(),
+        server_pk.to_bytes(),
+        client_sk.to_bytes(),
+        client_pk.to_bytes(),
+    )
+}
+
 /// Test full Noise IK handshake between client and server.
 #[test]
 #[ignore]
 fn noise_ik_handshake_round_trip() {
-    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let server_pk = PublicKey::from(&server_sk);
-    let server_sk_bytes = server_sk.to_bytes();
-    let server_pk_bytes = server_pk.to_bytes();
-
-    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let client_pk = PublicKey::from(&client_sk);
-    let client_sk_bytes = client_sk.to_bytes();
-    let client_pk_bytes = client_pk.to_bytes();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
 
-    let server_sk = server_sk_bytes;
-    let client_pk_ref = client_pk_bytes;
     thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
-        let result = handshake_responder(stream, &server_sk, |pk| *pk == client_pk_ref);
+        let result = handshake_responder(stream, &server_sk, |pk| *pk == client_pk);
         tx.send(result.map(|_| ())).expect("send server result");
     });
 
     let stream = TcpStream::connect(addr).expect("connect");
-    let result = handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes);
+    let result = handshake_initiator(stream, &client_sk, &server_pk);
     assert!(
         result.is_ok(),
         "client handshake should succeed: {:?}",
@@ -88,29 +95,20 @@ fn noise_ik_handshake_round_trip() {
 #[test]
 #[ignore]
 fn noise_ik_handshake_rejects_unknown_client() {
-    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let server_pk = PublicKey::from(&server_sk);
-    let server_sk_bytes = server_sk.to_bytes();
-    let server_pk_bytes = server_pk.to_bytes();
-
-    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let client_sk_bytes = client_sk.to_bytes();
-
-    let wrong_pk = PublicKey::from(&StaticSecret::random_from_rng(&mut rand::rng()));
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let (listener, server_sk, server_pk, client_sk, _client_pk) = noise_test_pair();
     let addr = listener.local_addr().expect("local addr");
+    let wrong_pk = PublicKey::from(&StaticSecret::random_from_rng(&mut rand::rng()));
 
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
-        let result = handshake_responder(stream, &server_sk_bytes, |pk| *pk == wrong_pk.to_bytes());
+        let result = handshake_responder(stream, &server_sk, |pk| *pk == wrong_pk.to_bytes());
         tx.send(result.map(|_| ())).expect("send");
     });
 
     let stream = TcpStream::connect(addr).expect("connect");
-    let client_result = handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes);
+    let client_result = handshake_initiator(stream, &client_sk, &server_pk);
     assert!(
         client_result.is_err(),
         "client handshake should fail when server rejects"
@@ -131,23 +129,11 @@ fn noise_ik_handshake_rejects_unknown_client() {
 #[test]
 #[ignore]
 fn noise_encrypted_message_round_trip() {
-    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let server_pk = PublicKey::from(&server_sk);
-    let server_sk_bytes = server_sk.to_bytes();
-    let server_pk_bytes = server_pk.to_bytes();
-
-    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let client_pk = PublicKey::from(&client_sk);
-    let client_sk_bytes = client_sk.to_bytes();
-    let client_pk_bytes = client_pk.to_bytes();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
 
-    let server_sk = server_sk_bytes;
-    let client_pk_ref = client_pk_bytes;
     thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
         // Run all server-side work through a closure returning a Result so
@@ -155,7 +141,7 @@ fn noise_encrypted_message_round_trip() {
         // instead of panicking — a panic would drop the stream mid-protocol
         // and could leave the client blocked on recv().
         let result = (|| -> Result<(), String> {
-            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk_ref)
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
                 .map_err(|e| format!("server handshake failed: {e:?}"))?;
 
             let msg = server
@@ -183,8 +169,7 @@ fn noise_encrypted_message_round_trip() {
     });
 
     let stream = TcpStream::connect(addr).expect("connect");
-    let mut client =
-        handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes).expect("client handshake");
+    let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
     // First round trip: Ping -> Pong.
     client
@@ -228,27 +213,15 @@ fn noise_encrypted_message_round_trip() {
 #[test]
 #[ignore]
 fn noise_large_message_round_trip() {
-    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let server_pk = PublicKey::from(&server_sk);
-    let server_sk_bytes = server_sk.to_bytes();
-    let server_pk_bytes = server_pk.to_bytes();
-
-    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let client_pk = PublicKey::from(&client_sk);
-    let client_sk_bytes = client_sk.to_bytes();
-    let client_pk_bytes = client_pk.to_bytes();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
 
-    let server_sk = server_sk_bytes;
-    let client_pk_ref = client_pk_bytes;
     thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
         let result = (|| -> Result<(), String> {
-            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk_ref)
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
                 .map_err(|e| format!("server handshake failed: {e:?}"))?;
 
             // The client sends raw bytes (not a typed message) — the point
@@ -271,8 +244,7 @@ fn noise_large_message_round_trip() {
     });
 
     let stream = TcpStream::connect(addr).expect("connect");
-    let mut client =
-        handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes).expect("client handshake");
+    let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
     // 65518 bytes of a single byte pattern — the largest payload a single
     // fragment can carry (65535 MAXMSGLEN minus the 16-byte GCM tag and the
@@ -302,23 +274,11 @@ fn noise_large_message_round_trip() {
 #[test]
 #[ignore]
 fn noise_fragmented_message_round_trip() {
-    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let server_pk = PublicKey::from(&server_sk);
-    let server_sk_bytes = server_sk.to_bytes();
-    let server_pk_bytes = server_pk.to_bytes();
-
-    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let client_pk = PublicKey::from(&client_sk);
-    let client_sk_bytes = client_sk.to_bytes();
-    let client_pk_bytes = client_pk.to_bytes();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
 
-    let server_sk = server_sk_bytes;
-    let client_pk_ref = client_pk_bytes;
     thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
         // Same Result-relay pattern as the other tests: all server-side
@@ -326,7 +286,7 @@ fn noise_fragmented_message_round_trip() {
         // mismatch surfaces in the client thread instead of panicking and
         // dropping the stream mid-protocol.
         let result = (|| -> Result<(), String> {
-            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk_ref)
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
                 .map_err(|e| format!("server handshake failed: {e:?}"))?;
 
             // 65519 bytes = 65518 + 1: exactly two fragments.
@@ -373,8 +333,7 @@ fn noise_fragmented_message_round_trip() {
     });
 
     let stream = TcpStream::connect(addr).expect("connect");
-    let mut client =
-        handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes).expect("client handshake");
+    let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
     // One byte past the single-fragment capacity: the sender must split this
     // into two fragments (65518 + 1), and the receiver must glue them back.
@@ -401,6 +360,73 @@ fn noise_fragmented_message_round_trip() {
     assert!(
         server_result.is_ok(),
         "server should verify all fragmented payloads: {:?}",
+        server_result.err()
+    );
+}
+
+/// Test that an empty payload still produces a real wire frame: before the
+/// fix, `send_message(&[])` wrote ZERO bytes (the fragment loop emitted
+/// nothing) and the peer's `recv_message` blocked forever on the length
+/// prefix. Now the empty message round-trips as `Ok(vec![])` — proving a real
+/// frame was emitted — and a follow-up non-empty round trip proves the shared
+/// TransportState keeps working (send/recv nonces stay in sync across the
+/// empty message).
+#[test]
+#[ignore]
+fn noise_empty_message_round_trip() {
+    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        // Same Result-relay pattern as the other tests: a mismatch surfaces in
+        // the client thread instead of panicking mid-protocol.
+        let result = (|| -> Result<(), String> {
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
+                .map_err(|e| format!("server handshake failed: {e:?}"))?;
+
+            let empty = server
+                .recv_message()
+                .map_err(|e| format!("recv empty message failed: {e:?}"))?;
+            if !empty.is_empty() {
+                return Err(format!(
+                    "expected an empty message, got {} bytes",
+                    empty.len()
+                ));
+            }
+
+            // Follow-up after the empty frame: if the empty message had not
+            // consumed its nonce (or had consumed two), the counters would be
+            // out of sync and this decrypt would fail.
+            let after = server
+                .recv_message()
+                .map_err(|e| format!("recv follow-up failed: {e:?}"))?;
+            if after != b"after" {
+                return Err(format!("expected b\"after\", got {after:?}"));
+            }
+            Ok(())
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
+
+    // Empty message first: with the old code this wrote nothing and the
+    // server's recv_message blocked on the length prefix until the follow-up
+    // frame arrived — which it would have misparsed as the empty message,
+    // failing the is_empty check below.
+    client.send_message(&[]).expect("client send empty");
+    client
+        .send_message(b"after")
+        .expect("client send follow-up");
+
+    let server_result = rx.recv().expect("recv server result");
+    assert!(
+        server_result.is_ok(),
+        "server side should succeed: {:?}",
         server_result.err()
     );
 }
@@ -464,17 +490,7 @@ fn noise_garbage_handshake_message_rejected() {
 #[test]
 #[ignore]
 fn noise_concurrent_bidirectional_large_messages() {
-    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let server_pk = PublicKey::from(&server_sk);
-    let server_sk_bytes = server_sk.to_bytes();
-    let server_pk_bytes = server_pk.to_bytes();
-
-    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let client_pk = PublicKey::from(&client_sk);
-    let client_sk_bytes = client_sk.to_bytes();
-    let client_pk_bytes = client_pk.to_bytes();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
     let addr = listener.local_addr().expect("local addr");
 
     // Both sides send 1 MiB before either's receive completes; distinct byte
@@ -488,8 +504,6 @@ fn noise_concurrent_bidirectional_large_messages() {
     let (server_tx, server_rx) = mpsc::channel();
     let (client_tx, client_rx) = mpsc::channel();
 
-    let server_sk = server_sk_bytes;
-    let client_pk_ref = client_pk_bytes;
     thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
         // Shrink the kernel buffers BEFORE the handshake so the socket's
@@ -498,7 +512,7 @@ fn noise_concurrent_bidirectional_large_messages() {
         // shrink_socket_buffers for why failures are ignored).
         shrink_socket_buffers(&stream);
         let result = (|| -> Result<(), String> {
-            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk_ref)
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
                 .map_err(|e| format!("server handshake failed: {e:?}"))?;
 
             // Spawn the READER on its own thread via try_clone — the same
@@ -554,7 +568,7 @@ fn noise_concurrent_bidirectional_large_messages() {
     shrink_socket_buffers(&stream);
     thread::spawn(move || {
         let result = (|| -> Result<(), String> {
-            let mut client = handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes)
+            let mut client = handshake_initiator(stream, &client_sk, &server_pk)
                 .map_err(|e| format!("client handshake failed: {e:?}"))?;
 
             // Same reader-thread shape as the server side (see above).
@@ -628,27 +642,15 @@ fn noise_concurrent_bidirectional_large_messages() {
 #[test]
 #[ignore]
 fn noise_rejects_oversized_fragment_prefix() {
-    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let server_pk = PublicKey::from(&server_sk);
-    let server_sk_bytes = server_sk.to_bytes();
-    let server_pk_bytes = server_pk.to_bytes();
-
-    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let client_pk = PublicKey::from(&client_sk);
-    let client_sk_bytes = client_sk.to_bytes();
-    let client_pk_bytes = client_pk.to_bytes();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
 
-    let server_sk = server_sk_bytes;
-    let client_pk_ref = client_pk_bytes;
     thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
         let result = (|| -> Result<(), String> {
-            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk_ref)
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
                 .map_err(|e| format!("server handshake failed: {e:?}"))?;
             match server.recv_message() {
                 Err(_) => Ok(()), // rejected — the desired outcome
@@ -659,8 +661,7 @@ fn noise_rejects_oversized_fragment_prefix() {
     });
 
     let stream = TcpStream::connect(addr).expect("connect");
-    let client =
-        handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes).expect("client handshake");
+    let client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
     // Raw write of a length prefix claiming 0x7FFF_FFFF ciphertext bytes
     // (far above the 65535-byte Noise cap), bypassing send_message so the
@@ -801,27 +802,15 @@ fn raw_handshake_initiator(
 #[test]
 #[ignore]
 fn noise_rejects_tampered_length_prefix() {
-    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let server_pk = PublicKey::from(&server_sk);
-    let server_sk_bytes = server_sk.to_bytes();
-    let server_pk_bytes = server_pk.to_bytes();
-
-    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let client_pk = PublicKey::from(&client_sk);
-    let client_sk_bytes = client_sk.to_bytes();
-    let client_pk_bytes = client_pk.to_bytes();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
 
-    let server_sk = server_sk_bytes;
-    let client_pk_ref = client_pk_bytes;
     thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
         let result = (|| -> Result<(), String> {
-            let (stream, ts) = raw_handshake_responder(stream, &server_sk, &client_pk_ref)?;
+            let (stream, ts) = raw_handshake_responder(stream, &server_sk, &client_pk)?;
             let mut server = NoiseStream::new(stream, ts);
 
             // Control: a valid two-fragment message reassembles intact.
@@ -855,8 +844,8 @@ fn noise_rejects_tampered_length_prefix() {
     // Client side: raw initiator handshake so the test can encrypt fragments
     // and tamper with the wire itself.
     let stream = TcpStream::connect(addr).expect("connect");
-    let (mut stream, mut ts) = raw_handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes)
-        .expect("client handshake");
+    let (mut stream, mut ts) =
+        raw_handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
     // Helper to write a full message as raw frames with the production framing
     // (4-byte BE ciphertext length, then the ciphertext), optionally tampering
@@ -937,10 +926,10 @@ fn noise_handshake_times_out_when_peer_silent() {
     let server_result = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("responder must return instead of hanging");
-    assert!(
-        server_result.is_err(),
-        "a silent peer must be timed out, not served"
-    );
+    match server_result {
+        Err(TransportError::HandshakeTimeout) => {}
+        other => panic!("a silent peer must be cut off with HandshakeTimeout, got {other:?}"),
+    }
 }
 
 /// Test that a peer which keeps the handshake alive by DRIBBLING bytes — each
@@ -993,8 +982,8 @@ fn noise_handshake_times_out_against_dribbling_peer() {
     let server_result = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("responder must return instead of accepting dribbles forever");
-    assert!(
-        server_result.is_err(),
-        "a dribbling peer must be cut off by the absolute handshake deadline"
-    );
+    match server_result {
+        Err(TransportError::HandshakeTimeout) => {}
+        other => panic!("a dribbling peer must be cut off with HandshakeTimeout, got {other:?}"),
+    }
 }

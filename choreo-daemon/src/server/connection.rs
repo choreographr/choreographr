@@ -8,6 +8,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::sync::mpsc::SyncSender;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Per-subscriber channel capacity for session message broadcast.
@@ -16,6 +17,14 @@ use tracing::{debug, error, info, warn};
 /// from the TUI event loop back to the daemon session thread, replacing
 /// the previous thread::sleep() pacing for tool result chunks.
 pub(crate) const SUBSCRIBER_CHANNEL_CAPACITY: usize = 128;
+
+/// Bound for joining a connection's writer thread during cleanup. A healthy
+/// writer exits immediately on channel disconnect (dropping `writer_tx` in
+/// `cleanup_client` disconnects `writer_rx`); the grace covers a writer
+/// wedged in a blocking socket write — a client that is open but not reading
+/// — which cannot exit on the channel disconnect alone (see the comment at
+/// the call site in `cleanup_client`).
+const WRITER_JOIN_GRACE: Duration = Duration::from_secs(5);
 
 /// A per-connection message sink implementing the single-writer contract.
 ///
@@ -155,7 +164,17 @@ fn cleanup_client(
     }
     let _ = daemon_tx.send(DaemonCommand::ClientDisconnected { client_id });
     drop(writer_tx);
-    let _ = writer_handle.join();
+    // Join the writer with a bound: a wedged writer (client open but not
+    // reading) is stuck in a blocking socket write and cannot exit on the
+    // channel disconnect alone. Cleanup must not hang the connection thread on
+    // that forever; the daemon shutdown drain is the backstop, and the
+    // concurrent-connection cap bounds how many wedged writers can accumulate.
+    // A writer that times out is detached — it keeps its socket until the
+    // client goes away, then exits on its own.
+    crate::server::lifecycle::join_thread_bounded(
+        writer_handle,
+        Instant::now() + WRITER_JOIN_GRACE,
+    );
     crate::metrics::record_client_disconnected();
 }
 

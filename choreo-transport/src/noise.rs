@@ -1,11 +1,9 @@
 use choreo_proto::{ClientMessage, DaemonMessage, MAX_FRAME_SIZE, decode_frame, encode_payload};
 use snow::TransportState;
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tracing::{debug, info};
 
 use crate::error::TransportError;
 
@@ -27,26 +25,15 @@ const MAX_PLAINTEXT_CHUNK: usize = 65535 - GCM_TAG_LEN - FRAGMENT_HEADER_LEN;
 /// length prefix that precedes the ciphertext is NOT authenticated, so the
 /// reassembly decision must not be trusted from there.
 const FRAGMENT_CONTINUATION: u8 = 0x01;
-
-/// Default total-duration budget for the Noise IK handshake. The
-/// `handshake_*_with_timeout` variants take their own budget; the plain
-/// functions delegate to them with this constant.
-///
-/// The budget is an ABSOLUTE deadline, not a per-read socket timeout: every
-/// handshake read is bounded by the time remaining until it (see
-/// [`read_handshake_exact`]), so a peer that dribbles bytes to keep resetting
-/// a per-recv timeout is still cut off at the deadline. It is cleared before
-/// the TransportState is handed over; the data plane has no timeout by design
-/// — readers block until a message or EOF, and the daemon's shutdown path
-/// closes sockets to unblock them.
-///
-/// The handshake runs BEFORE any authentication (the responder's ACL check
-/// happens mid-handshake), so without a bound an unauthenticated peer could
-/// hold a connection thread + socket FD open forever by connecting and
-/// sending nothing — a resource-exhaustion vector on the daemon's TCP
-/// listener. 10 s is far beyond the single round trip a healthy handshake
-/// needs (sub-millisecond on loopback, a few ms on a real network).
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Size of the reused outbound ciphertext frame buffer: 4-byte BE length
+/// prefix headroom + the largest single Noise message's ciphertext (65535
+/// bytes = max payload + continuation header + GCM tag). The ciphertext is
+/// encrypted into `send_buf[4..]`, the prefix is written into `send_buf[..4]`,
+/// and one `write_all` sends the whole frame.
+const FRAME_BUF_LEN: usize = 4 + MAX_PLAINTEXT_CHUNK + FRAGMENT_HEADER_LEN + GCM_TAG_LEN;
+/// Size of the reused per-fragment plaintext buffer: 1 authenticated
+/// continuation header byte + the largest payload chunk.
+const FRAG_BUF_LEN: usize = FRAGMENT_HEADER_LEN + MAX_PLAINTEXT_CHUNK;
 
 /// Resets the single-writer flag when a `send_message` finishes — on every
 /// exit path, including early `?` returns. Without the guard a concurrent
@@ -81,6 +68,24 @@ pub struct NoiseStream {
     /// swaps it and fails loudly with a protocol error if it was already set,
     /// so a future violation is caught instead of corrupting the stream.
     sender_active: Arc<AtomicBool>,
+    /// Reused outbound ciphertext frame buffer: 4 bytes of length-prefix
+    /// headroom + the largest possible single Noise message's ciphertext
+    /// (65535 bytes). Lazy — `new`/`try_clone` start it empty and
+    /// `send_message` grows it once — so a clone used only for reading never
+    /// pays for it. One `write_all` sends the prefix + ciphertext together.
+    send_buf: Vec<u8>,
+    /// Reused per-fragment plaintext: 1 authenticated continuation byte +
+    /// the largest possible payload chunk. Lazy like `send_buf`; the reader
+    /// clone's copy stays empty.
+    send_frag: Vec<u8>,
+    /// Reused inbound per-fragment ciphertext, resized to the actual `ct_len`
+    /// of each frame. Capacity carries across messages, so there is no
+    /// per-fragment allocation; the buffer only grows to the largest fragment
+    /// actually seen.
+    recv_ct_buf: Vec<u8>,
+    /// Reused inbound per-fragment plaintext, sized like `recv_ct_buf` (the
+    /// writer clone's copy stays empty).
+    recv_pt_buf: Vec<u8>,
 }
 
 impl NoiseStream {
@@ -90,6 +95,13 @@ impl NoiseStream {
             tcp,
             transport: Arc::new(Mutex::new(transport)),
             sender_active: Arc::new(AtomicBool::new(false)),
+            // All four reusable buffers start empty; send_message/recv_message
+            // grow the ones they actually use to their worst-case size on
+            // first use (see FRAME_BUF_LEN/FRAG_BUF_LEN).
+            send_buf: Vec::new(),
+            send_frag: Vec::new(),
+            recv_ct_buf: Vec::new(),
+            recv_pt_buf: Vec::new(),
         }
     }
 
@@ -101,6 +113,14 @@ impl NoiseStream {
             tcp: self.tcp.try_clone()?,
             transport: Arc::clone(&self.transport),
             sender_active: Arc::clone(&self.sender_active),
+            // Buffer reuse is per-direction: a reader clone never sends and a
+            // writer clone never receives, so each clone starts the other
+            // side's buffers empty and never grows them — no wasted memory on
+            // unused sides.
+            send_buf: Vec::new(),
+            send_frag: Vec::new(),
+            recv_ct_buf: Vec::new(),
+            recv_pt_buf: Vec::new(),
         })
     }
 
@@ -121,6 +141,11 @@ impl NoiseStream {
     /// deadlock once the socket buffers filled. A runtime single-writer guard
     /// (see `sender_active`) rejects a concurrent second `send_message` with a
     /// protocol error rather than interleaving fragments.
+    ///
+    /// The ciphertext is encrypted into the stream's reused `send_buf` field
+    /// — never allocated per call — and each frame is written as ONE
+    /// coalesced `write_all` (4-byte prefix + ciphertext, one syscall per
+    /// fragment).
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
         // The single-writer-per-connection invariant is load-bearing:
         // fragments of one logical message must never interleave with
@@ -143,16 +168,36 @@ impl NoiseStream {
             )));
         }
 
-        // Reusable ciphertext buffer: one Noise message's worst case is
-        // MAX_PLAINTEXT_CHUNK payload bytes plus the 1-byte continuation header
-        // and the 16-byte AES-GCM tag. Reusing it across chunks avoids
-        // reallocating per fragment.
-        let mut buf = vec![0u8; MAX_PLAINTEXT_CHUNK + FRAGMENT_HEADER_LEN + GCM_TAG_LEN];
-        // Reusable per-fragment plaintext: 1 continuation byte + payload. The
-        // header goes INSIDE the plaintext (not the length prefix) so the
-        // AES-GCM tag authenticates it — the wire prefix is not authenticated,
-        // so the continuation flag must not be trusted from there.
-        let mut frag = vec![0u8; FRAGMENT_HEADER_LEN + MAX_PLAINTEXT_CHUNK];
+        // Guarantee the reused per-stream buffers are big enough for the
+        // largest single fragment. They are lazy: `new`/`try_clone` start
+        // them empty, and this grows them once to their worst-case size, so
+        // nothing is allocated per message or per fragment afterwards.
+        if self.send_buf.len() < FRAME_BUF_LEN {
+            self.send_buf.resize(FRAME_BUF_LEN, 0);
+        }
+        if self.send_frag.len() < FRAG_BUF_LEN {
+            self.send_frag.resize(FRAG_BUF_LEN, 0);
+        }
+
+        if plaintext.is_empty() {
+            // An empty payload still needs one wire frame: the chunk loop
+            // below would emit nothing, and the peer's recv_message would
+            // block forever on the length prefix. Emit a single fragment
+            // carrying only the cleared continuation header; the peer's
+            // recv_message returns Ok(vec![]) for it (the n == 0 guard never
+            // triggers — the header byte itself is the plaintext).
+            self.send_frag[0] = 0;
+            let n = {
+                let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
+                transport.write_message(
+                    &self.send_frag[..FRAGMENT_HEADER_LEN],
+                    &mut self.send_buf[4..],
+                )?
+            };
+            self.send_buf[..4].copy_from_slice(&(n as u32).to_be_bytes());
+            self.tcp.write_all(&self.send_buf[..4 + n])?;
+            return Ok(());
+        }
 
         // Serializing sends is the writer thread's job (each NoiseStream has a
         // single writer), so the TransportState lock is only needed to make the
@@ -170,14 +215,22 @@ impl NoiseStream {
             // bytes) leaves none.
             let more = remaining > chunk.len();
             remaining -= chunk.len();
-            frag[0] = if more { FRAGMENT_CONTINUATION } else { 0 };
-            frag[FRAGMENT_HEADER_LEN..FRAGMENT_HEADER_LEN + chunk.len()].copy_from_slice(chunk);
+            self.send_frag[0] = if more { FRAGMENT_CONTINUATION } else { 0 };
+            self.send_frag[FRAGMENT_HEADER_LEN..FRAGMENT_HEADER_LEN + chunk.len()]
+                .copy_from_slice(chunk);
             let n = {
                 let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
-                transport.write_message(&frag[..FRAGMENT_HEADER_LEN + chunk.len()], &mut buf)?
+                transport.write_message(
+                    &self.send_frag[..FRAGMENT_HEADER_LEN + chunk.len()],
+                    &mut self.send_buf[4..],
+                )?
             };
-            self.tcp.write_all(&(n as u32).to_be_bytes())?;
-            self.tcp.write_all(&buf[..n])?;
+            // One coalesced write per frame: the 4-byte BE length prefix is
+            // written into the headroom ahead of the ciphertext, so a single
+            // write_all sends prefix + ciphertext together (one syscall per
+            // fragment instead of two).
+            self.send_buf[..4].copy_from_slice(&(n as u32).to_be_bytes());
+            self.tcp.write_all(&self.send_buf[..4 + n])?;
         }
         Ok(())
     }
@@ -190,11 +243,6 @@ impl NoiseStream {
     /// terminates the logical message.
     pub fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
         let mut plaintext = Vec::new();
-        // Reusable per-fragment buffers, sized to the largest legitimate
-        // fragment (65535 bytes of ciphertext). `resize` below only sets the
-        // length after the first fragment — no per-fragment allocations.
-        let mut ct_buf = vec![0u8; MAX_PLAINTEXT_CHUNK + FRAGMENT_HEADER_LEN + GCM_TAG_LEN];
-        let mut pt_buf = vec![0u8; MAX_PLAINTEXT_CHUNK + FRAGMENT_HEADER_LEN + GCM_TAG_LEN];
         loop {
             // Read the raw frame bytes WITHOUT holding the TransportState
             // lock: snow tracks separate send and recv nonce counters, so an
@@ -236,17 +284,20 @@ impl NoiseStream {
                     "reassembled message exceeds the {MAX_FRAME_SIZE}-byte limit"
                 )));
             }
-            ct_buf.resize(ct_len, 0);
-            self.tcp.read_exact(&mut ct_buf)?;
+            // Reuse the per-stream ciphertext buffer: `resize` only adjusts
+            // the length (growing if this fragment is the largest seen), so
+            // capacity carries across messages — no per-fragment allocation.
+            self.recv_ct_buf.resize(ct_len, 0);
+            self.tcp.read_exact(&mut self.recv_ct_buf)?;
 
             // Take the lock briefly to decrypt this one fragment, then
             // release it before the next blocking read (see above).
-            pt_buf.resize(ct_len, 0);
+            self.recv_pt_buf.resize(ct_len, 0);
             let n = self
                 .transport
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .read_message(&ct_buf, &mut pt_buf)?;
+                .read_message(&self.recv_ct_buf, &mut self.recv_pt_buf)?;
             // Every fragment from this implementation carries the 1-byte
             // continuation header, so a zero-length plaintext is impossible
             // from a legitimate peer; guard the index below rather than panic
@@ -260,8 +311,8 @@ impl NoiseStream {
             // (the GCM tag covers it), so a wire-level tamper with the length
             // prefix cannot change the reassembly decision — see the prefix
             // validation above.
-            let more = pt_buf[0] & FRAGMENT_CONTINUATION != 0;
-            plaintext.extend_from_slice(&pt_buf[FRAGMENT_HEADER_LEN..n]);
+            let more = self.recv_pt_buf[0] & FRAGMENT_CONTINUATION != 0;
+            plaintext.extend_from_slice(&self.recv_pt_buf[FRAGMENT_HEADER_LEN..n]);
 
             if !more {
                 return Ok(plaintext);
@@ -297,184 +348,6 @@ impl NoiseStream {
     pub fn get_ref(&self) -> &TcpStream {
         &self.tcp
     }
-}
-
-/// Read exactly `len` bytes from `stream`, never taking longer than
-/// `deadline` in total.
-///
-/// A bare `read_exact` under `SO_RCVTIMEO` only bounds each individual `recv`:
-/// a peer that dribbles one byte per read window could stretch the handshake
-/// out indefinitely. Here every read is limited to the time *remaining* until
-/// `deadline` (the socket timeout is re-armed before each call), so the total
-/// duration is bounded by `deadline` plus scheduler slop no matter how the
-/// peer paces its bytes. EOF before `len` bytes is `UnexpectedEof`, matching
-/// `read_exact`'s semantics.
-fn read_handshake_exact(
-    stream: &mut TcpStream,
-    deadline: Instant,
-    len: usize,
-) -> Result<Vec<u8>, TransportError> {
-    let mut buf = Vec::with_capacity(len);
-    // Stack scratch buffer reused across reads — no per-read allocation. A
-    // handshake message is at most a few hundred bytes, so 1 KiB is ample.
-    let mut scratch = [0u8; 1024];
-    while buf.len() < len {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(TransportError::HandshakeTimeout);
-        }
-        // Bound THIS read by the remaining budget so a slow peer cannot
-        // stretch the total past `deadline` by dribbling bytes.
-        stream.set_read_timeout(Some(remaining))?;
-        let want = (len - buf.len()).min(scratch.len());
-        let n = stream.read(&mut scratch[..want])?;
-        if n == 0 {
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
-        }
-        buf.extend_from_slice(&scratch[..n]);
-    }
-    Ok(buf)
-}
-
-/// Perform the Noise IK handshake as the **initiator** (client side), using
-/// the default [`HANDSHAKE_TIMEOUT`] budget.
-///
-/// * `stream` — the already-connected TCP stream.
-/// * `static_sk` — the client's transport.sec (32-byte X25519 secret key).
-/// * `server_pk` — the server's transport.pub (32-byte X25519 public key).
-///
-/// On success returns a `NoiseStream` ready for encrypted message I/O.
-pub fn handshake_initiator(
-    stream: TcpStream,
-    static_sk: &[u8; 32],
-    server_pk: &[u8; 32],
-) -> Result<NoiseStream, TransportError> {
-    handshake_initiator_with_timeout(stream, static_sk, server_pk, HANDSHAKE_TIMEOUT)
-}
-
-/// [`handshake_initiator`] with an explicit total-duration budget for the
-/// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`] for why the budget is absolute,
-/// not per-read). Exposed so integration tests can exercise the timeout path
-/// in milliseconds instead of waiting out the 10 s default.
-pub fn handshake_initiator_with_timeout(
-    mut stream: TcpStream,
-    static_sk: &[u8; 32],
-    server_pk: &[u8; 32],
-    timeout: Duration,
-) -> Result<NoiseStream, TransportError> {
-    use snow::Builder;
-
-    let deadline = Instant::now() + timeout;
-
-    let mut handshake = Builder::new("Noise_IK_25519_AESGCM_SHA256".parse()?)
-        .local_private_key(static_sk)?
-        .remote_public_key(server_pk)?
-        .build_initiator()?;
-
-    // Write first handshake message (e, encrypted s)
-    let mut buf = vec![0u8; 1024];
-    let n = handshake.write_message(&[], &mut buf)?;
-    // Use 2-byte length prefix for handshake messages (max size < 65535)
-    let len_bytes = (n as u16).to_be_bytes();
-    stream.write_all(&len_bytes)?;
-    stream.write_all(&buf[..n])?;
-
-    // Read second handshake message (e, encrypted empty) — every read is
-    // bounded by the time remaining until `deadline`, so a stalled server
-    // cannot hold the client forever (see read_handshake_exact).
-    let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
-    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
-    let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
-    handshake.read_message(&rbuf, &mut buf)?;
-
-    // Handshake complete — restore the unbounded data-plane reads.
-    stream.set_read_timeout(None)?;
-
-    let transport = handshake.into_transport_mode()?;
-    debug!("Noise IK handshake complete (initiator)");
-    Ok(NoiseStream::new(stream, transport))
-}
-
-/// Perform the Noise IK handshake as the **responder** (server side), using
-/// the default [`HANDSHAKE_TIMEOUT`] budget.
-///
-/// * `stream` — the accepted TCP stream from the listener.
-/// * `static_sk` — the server's transport.sec (32-byte X25519 secret key).
-/// * `check_client` — a closure that receives the client's 32-byte static
-///   public key (extracted from the handshake) and returns `true` if the
-///   client is authorized.
-///
-/// On success returns a `NoiseStream` ready for encrypted message I/O.
-/// On authentication failure the connection is closed and `Err(AuthFailed)` is returned.
-pub fn handshake_responder<F>(
-    stream: TcpStream,
-    static_sk: &[u8; 32],
-    check_client: F,
-) -> Result<NoiseStream, TransportError>
-where
-    F: FnOnce(&[u8; 32]) -> bool,
-{
-    handshake_responder_with_timeout(stream, static_sk, check_client, HANDSHAKE_TIMEOUT)
-}
-
-/// [`handshake_responder`] with an explicit total-duration budget for the
-/// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`]). Exposed so integration tests
-/// can exercise the timeout path in milliseconds instead of waiting out the
-/// 10 s default.
-pub fn handshake_responder_with_timeout<F>(
-    mut stream: TcpStream,
-    static_sk: &[u8; 32],
-    check_client: F,
-    timeout: Duration,
-) -> Result<NoiseStream, TransportError>
-where
-    F: FnOnce(&[u8; 32]) -> bool,
-{
-    use snow::Builder;
-
-    let deadline = Instant::now() + timeout;
-
-    let mut handshake = Builder::new("Noise_IK_25519_AESGCM_SHA256".parse()?)
-        .local_private_key(static_sk)?
-        .build_responder()?;
-
-    // Read first handshake message from client (e, encrypted s) — every read
-    // is bounded by the time remaining until `deadline`: the ACL check has
-    // not happened yet, so a peer that connects and stalls (or dribbles) must
-    // not be able to hold this thread and FD forever. Cleared once the
-    // handshake completes and the client is authenticated.
-    let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
-    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
-    let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
-    let mut out_buf = vec![0u8; 1024];
-    handshake.read_message(&rbuf, &mut out_buf)?;
-
-    // Extract client's static public key for ACL check.
-    if let Some(client_pk) = handshake.get_remote_static() {
-        let mut pk = [0u8; 32];
-        pk.copy_from_slice(client_pk);
-        if !check_client(&pk) {
-            info!("Noise IK handshake rejected: client not in ACL");
-            return Err(TransportError::AuthFailed);
-        }
-    } else {
-        info!("Noise IK handshake rejected: client did not send static key");
-        return Err(TransportError::AuthFailed);
-    }
-
-    // Write second handshake message (e, encrypted empty)
-    let mut buf = vec![0u8; 1024];
-    let n = handshake.write_message(&[], &mut buf)?;
-    let len_bytes = (n as u16).to_be_bytes();
-    stream.write_all(&len_bytes)?;
-    stream.write_all(&buf[..n])?;
-
-    // Handshake complete — restore the unbounded data-plane reads.
-    stream.set_read_timeout(None)?;
-
-    let transport = handshake.into_transport_mode()?;
-    debug!("Noise IK handshake complete (responder)");
-    Ok(NoiseStream::new(stream, transport))
 }
 
 #[cfg(test)]

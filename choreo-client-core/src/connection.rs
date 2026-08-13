@@ -1,8 +1,8 @@
 use crate::error::ClientError;
 use choreo_proto::{ClientMessage, DaemonMessage, ProtoError, read_message, write_message};
 use choreo_transport::error::TransportError;
+use choreo_transport::handshake::handshake_initiator;
 use choreo_transport::key::ensure_transport_keypair;
-use choreo_transport::noise::handshake_initiator;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;

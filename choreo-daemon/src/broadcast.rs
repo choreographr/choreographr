@@ -38,6 +38,32 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
+/// Outcome of one non-blocking try_send to a subscriber channel. Shared by
+/// the broadcast retain-predicate (`try_send_keep_on_full`) and the shutdown
+/// fast path (`handle_broadcast_shutting_down`) so the Ok/Disconnected/Full
+/// arms live in exactly one place.
+pub(crate) enum SendOutcome {
+    Delivered,
+    Disconnected,
+    Full,
+}
+
+/// Classify one `try_send` attempt. [`try_send_keep_on_full`] and the
+/// shutdown fast path apply different policies to [`SendOutcome::Full`]
+/// (drop-and-keep vs. escalate to the bounded fan-out), but both treat
+/// [`SendOutcome::Disconnected`] as eviction and [`SendOutcome::Delivered`]
+/// as keep.
+pub(crate) fn try_send_classify(
+    tx: &mpsc::SyncSender<DaemonMessage>,
+    message: &DaemonMessage,
+) -> SendOutcome {
+    match tx.try_send(message.clone()) {
+        Ok(()) => SendOutcome::Delivered,
+        Err(mpsc::TrySendError::Disconnected(_)) => SendOutcome::Disconnected,
+        Err(mpsc::TrySendError::Full(_)) => SendOutcome::Full,
+    }
+}
+
 /// Try to deliver `message` to one subscriber, returning whether the
 /// subscriber should remain registered.
 ///
@@ -56,20 +82,20 @@ pub(crate) fn try_send_keep_on_full(
     path: &str,
     message: &DaemonMessage,
 ) -> bool {
-    match tx.try_send(message.clone()) {
+    match try_send_classify(tx, message) {
         // Delivered — keep the subscriber.
-        Ok(()) => true,
+        SendOutcome::Delivered => true,
         // Buffer full: drop the message but KEEP the subscriber.  Logging
         // every dropped chunk here would be pure noise under a fast burst
         // (one line per message per subscriber), so we stay silent in the
         // logs and instead count the drop so a wedged subscriber remains
         // observable via /metrics.
-        Err(mpsc::TrySendError::Full(_)) => {
+        SendOutcome::Full => {
             crate::metrics::record_broadcast_dropped(path);
             true
         }
         // Receiver gone — the client is dead, stop sending to it.
-        Err(mpsc::TrySendError::Disconnected(_)) => {
+        SendOutcome::Disconnected => {
             warn!("removing disconnected subscriber {client_id}");
             false
         }
