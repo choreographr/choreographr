@@ -25,11 +25,17 @@
 //! Crucially the policy NEVER blocks: `try_send` returns immediately, so a
 //! slow subscriber can never stall the daemon's single-threaded command loop
 //! or a session thread.
+//!
+//! The shutdown fan-out (`send_shutting_down_bounded`) is the one deliberate
+//! exception to drop-on-full: `ShuttingDown` is the notify-before-EOF
+//! guarantee, so a momentarily-full writer channel is polled (round-robin,
+//! bounded) until the writer drains instead of being silently dropped.  It
+//! still never *blocks* on the writer — only the poll interval is slept.
 
 use choreo_proto::DaemonMessage;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Try to deliver `message` to one subscriber, returning whether the
@@ -70,43 +76,75 @@ pub(crate) fn try_send_keep_on_full(
     }
 }
 
-/// Deliver `ShuttingDown` to one client, blocking up to `grace` for the
-/// writer thread to drain a momentarily-full channel.
+/// Poll interval between delivery attempts to a full writer channel during
+/// the shutdown fan-out.  A healthy writer drains a slot in well under this;
+/// the poll only paces retries to a slow-but-alive writer.
+pub(crate) const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Deliver `ShuttingDown` to every client whose writer channel was full on
+/// the fast path of `handle_broadcast_shutting_down`, polling each channel
+/// round-robin so all clients share one `grace` window — a wedged client can
+/// no longer delay the others, and total shutdown latency is bounded by
+/// `grace`, not `grace × N`.
 ///
-/// Only reached when the writer channel is full (the fast path in
-/// `handle_broadcast_shutting_down` handles the normal case with a
-/// non-blocking try_send). A bounded blocking send keeps the notify-before-EOF
-/// guarantee alive through transient backpressure: a thread performs the
-/// blocking `send` while we wait on its completion with a timeout. The daemon
-/// exits right after shutdown, so a thread left blocked in `send` (writer
-/// stuck in a blocking socket write) is killed by process exit — the timeout
-/// is what keeps the shutdown path itself from hanging.
+/// Delivery never blocks on a writer thread: `try_send` returns immediately
+/// and only `poll` is slept, so a slow-but-alive writer gets a fresh chance
+/// each pass while a wedged one (writer stuck in a blocking socket write,
+/// client not reading) is abandoned after `grace`.  Abandonment is safe: the
+/// daemon exits right after shutdown and the OS closes the socket, so the
+/// client sees a bare EOF; each abandoned client is counted via
+/// `metrics::record_broadcast_dropped` so it stays observable on `/metrics`.
+///
+/// Returns the ids of clients that were NOT delivered (disconnected or
+/// timed-out) so the caller can drop them from its registry.  `poll` is
+/// injectable so unit tests can use `Duration::ZERO` (a deterministic busy
+/// retry with no time-based waits); production passes
+/// [`SHUTDOWN_POLL_INTERVAL`].
 pub(crate) fn send_shutting_down_bounded(
-    tx: &mpsc::SyncSender<DaemonMessage>,
-    client_id: u64,
+    clients: Vec<(u64, mpsc::SyncSender<DaemonMessage>)>,
     grace: Duration,
-) -> bool {
-    let tx = tx.clone();
-    let (done_tx, done_rx) = mpsc::channel::<Result<(), mpsc::SendError<DaemonMessage>>>();
-    thread::spawn(move || {
-        let _ = done_tx.send(tx.send(DaemonMessage::ShuttingDown));
-    });
-    match done_rx.recv_timeout(grace) {
-        Ok(Ok(())) => true,
-        Ok(Err(_)) => {
-            warn!("removing disconnected client {client_id} during shutdown");
-            false
-        }
-        Err(_) => {
-            // The writer did not drain in time. Drop the notification (the
-            // process exits momentarily and the OS closes the socket, so the
-            // client sees a bare EOF) and count it like any other dropped
-            // broadcast so a wedged client stays observable via /metrics.
-            crate::metrics::record_broadcast_dropped("client");
-            warn!("shutdown notification timed out for slow client {client_id}");
-            false
-        }
+    poll: Duration,
+) -> Vec<u64> {
+    let mut pending = clients;
+    if pending.is_empty() {
+        return Vec::new();
     }
+    let deadline = Instant::now() + grace;
+    let mut failed = Vec::new();
+    while !pending.is_empty() {
+        pending.retain(|(client_id, tx)| {
+            match tx.try_send(DaemonMessage::ShuttingDown) {
+                // Delivered — the writer thread will flush it and close its
+                // own socket; drop this client from the pending set.
+                Ok(()) => false,
+                // Receiver gone — the client is dead mid-shutdown.
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    warn!("removing disconnected client {client_id} during shutdown");
+                    failed.push(*client_id);
+                    false
+                }
+                // Still full — keep polling this client on the next pass.
+                Err(mpsc::TrySendError::Full(_)) => true,
+            }
+        });
+        if pending.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            // The remaining writers did not drain in time. Abandon them (the
+            // process exits momentarily and the OS closes their sockets, so
+            // each client sees a bare EOF) and count every drop so a wedged
+            // client stays observable via /metrics.
+            for (client_id, _) in &pending {
+                crate::metrics::record_broadcast_dropped("client");
+                warn!("shutdown notification timed out for slow client {client_id}");
+            }
+            failed.extend(pending.into_iter().map(|(client_id, _)| client_id));
+            break;
+        }
+        thread::sleep(poll);
+    }
+    failed
 }
 
 #[cfg(test)]
@@ -155,5 +193,89 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
         drop(rx); // Disconnect the receiver
         assert!(!try_send_keep_on_full(&tx, 7, "summary", &status_msg(1)));
+    }
+
+    /// A bounded send to an empty channel delivers immediately — `grace = 0`
+    /// proves no waiting was needed and no client is reported failed.
+    #[test]
+    fn bounded_shutdown_delivers_when_channel_has_room() {
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
+        let failed = send_shutting_down_bounded(vec![(7, tx)], Duration::ZERO, Duration::ZERO);
+        assert!(
+            failed.is_empty(),
+            "a channel with room must accept ShuttingDown: {failed:?}"
+        );
+        assert_eq!(rx.try_recv().unwrap(), DaemonMessage::ShuttingDown);
+    }
+
+    /// A channel that stays full past the grace period is abandoned and its
+    /// client reported failed. `grace = 0` makes the first full attempt the
+    /// deadline, so the test is fully deterministic (no sleeps).
+    #[test]
+    fn bounded_shutdown_gives_up_on_still_full_channel() {
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
+        // Fill the single slot so every try_send sees Full.
+        tx.send(DaemonMessage::Pong).unwrap();
+        let failed = send_shutting_down_bounded(vec![(7, tx)], Duration::ZERO, Duration::ZERO);
+        assert_eq!(failed, vec![7], "stuck client must be reported failed");
+        // The filler is still there; ShuttingDown was never delivered.
+        assert_eq!(rx.try_recv().unwrap(), DaemonMessage::Pong);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A disconnected writer is reported failed and removed from the pending
+    /// set instead of being polled forever.
+    #[test]
+    fn bounded_shutdown_evicts_disconnected_client() {
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
+        drop(rx);
+        let failed = send_shutting_down_bounded(vec![(7, tx)], Duration::ZERO, Duration::ZERO);
+        assert_eq!(failed, vec![7]);
+    }
+
+    /// A momentarily-full channel is NOT dropped: the fan-out polls
+    /// round-robin until the writer drains a slot. A capacity-0 rendezvous
+    /// channel makes the wait load-bearing — `try_send` only succeeds while
+    /// a receiver is blocked in `recv`, so delivery provably waits for the
+    /// drainer rather than giving up. `poll = ZERO` (a busy retry) plus the
+    /// ready-handshake keep the test deterministic: the drainer is
+    /// guaranteed to block, so the retry loop always completes.
+    #[test]
+    fn bounded_shutdown_waits_for_writer_that_drains() {
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(0);
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let drainer = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            rx.recv().expect("rendezvous must deliver ShuttingDown")
+        });
+        ready_rx.recv().expect("drainer must become ready");
+        let failed =
+            send_shutting_down_bounded(vec![(7, tx)], Duration::from_secs(5), Duration::ZERO);
+        assert!(
+            failed.is_empty(),
+            "delivery must wait for the writer to drain, got failures: {failed:?}"
+        );
+        assert_eq!(
+            drainer.join().expect("drainer panicked"),
+            DaemonMessage::ShuttingDown
+        );
+    }
+
+    /// Mixed clients: a connected one is delivered, a stuck one is reported
+    /// failed — the two outcomes coexist in a single fan-out.
+    #[test]
+    fn bounded_shutdown_delivers_healthy_and_reports_stuck() {
+        let (healthy_tx, healthy_rx) = mpsc::sync_channel::<DaemonMessage>(1);
+        let (stuck_tx, stuck_rx) = mpsc::sync_channel::<DaemonMessage>(1);
+        stuck_tx.send(DaemonMessage::Pong).unwrap(); // fill the only slot
+
+        let failed = send_shutting_down_bounded(
+            vec![(1, healthy_tx), (2, stuck_tx)],
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert_eq!(failed, vec![2]);
+        assert_eq!(healthy_rx.try_recv().unwrap(), DaemonMessage::ShuttingDown);
+        assert_eq!(stuck_rx.try_recv().unwrap(), DaemonMessage::Pong);
     }
 }

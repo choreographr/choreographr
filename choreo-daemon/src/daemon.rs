@@ -23,9 +23,11 @@ use zeroize::Zeroize;
 
 /// Grace period for delivering `ShuttingDown` to a client whose writer
 /// channel is momentarily full during daemon shutdown. Bounded so a writer
-/// thread stuck in a blocking socket write cannot hang shutdown; the daemon
-/// process exits right after `run_server` returns, killing any sender thread
-/// left blocked past the grace period.
+/// thread stuck in a blocking socket write cannot hang shutdown: after the
+/// grace period the notification is dropped and the process exits (closing
+/// the socket, so the client sees a bare EOF). Shared by all slow clients
+/// via the round-robin fan-out, so total shutdown latency is bounded by this
+/// constant rather than `grace × clients`.
 const SHUTDOWN_NOTIFY_GRACE: Duration = Duration::from_secs(2);
 
 /// Reply type for the ListModels command.
@@ -1100,16 +1102,17 @@ impl DaemonState {
     /// Deliver `DaemonMessage::ShuttingDown` to every connected client via its
     /// writer channel; each connection's writer thread then closes its own
     /// socket, so clients observe the notification before EOF. A
-    /// momentarily-full writer channel is escalated to a bounded blocking send
-    /// (see `broadcast::send_shutting_down_bounded`) so backpressure cannot
-    /// silently drop the notification; the bound keeps shutdown from hanging
-    /// on a writer stuck in a blocking write.
+    /// momentarily-full writer channel is escalated to a bounded round-robin
+    /// poll (see `broadcast::send_shutting_down_bounded`) so backpressure
+    /// cannot silently drop the notification; the bound keeps shutdown from
+    /// hanging on a writer stuck in a blocking write, and a wedged client can
+    /// no longer delay the others.
     fn handle_broadcast_shutting_down(&mut self) {
         let clients = self.client_writers.len();
         info!("broadcasting ShuttingDown to {clients} client(s)");
         // Fast path: non-blocking try_send per client. A FULL channel is NOT
         // dropped here (that would lose the notification); it is escalated to
-        // a bounded blocking send below so the notify-before-EOF guarantee
+        // the bounded fan-out below so the notify-before-EOF guarantee
         // survives transient backpressure. A disconnected client is evicted.
         let mut slow_clients: Vec<(u64, mpsc::SyncSender<DaemonMessage>)> = Vec::new();
         self.client_writers.retain(|client_id, tx| {
@@ -1122,12 +1125,20 @@ impl DaemonState {
                 }
             }
         });
-        // Slow path: bounded blocking delivery for full channels (see
+        // Slow path: bounded round-robin delivery for full channels (see
         // broadcast::send_shutting_down_bounded). Each connection's writer
         // thread then flushes the notification and closes its own socket, so
-        // clients observe it before EOF.
-        for (client_id, tx) in slow_clients {
-            crate::broadcast::send_shutting_down_bounded(&tx, client_id, SHUTDOWN_NOTIFY_GRACE);
+        // clients observe it before EOF. A client that could not be notified
+        // (disconnected, or a writer still wedged after the grace period) is
+        // dropped from the registry to keep its invariant — connected clients
+        // only — honest.
+        let failed = crate::broadcast::send_shutting_down_bounded(
+            slow_clients,
+            SHUTDOWN_NOTIFY_GRACE,
+            crate::broadcast::SHUTDOWN_POLL_INTERVAL,
+        );
+        for client_id in failed {
+            self.client_writers.remove(&client_id);
         }
     }
 

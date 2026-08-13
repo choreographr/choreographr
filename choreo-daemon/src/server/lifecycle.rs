@@ -10,8 +10,45 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
-use tracing::{error, info};
+use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
+
+/// Grace period for joining connection threads during shutdown. After
+/// `BroadcastShuttingDown`, every healthy writer flushes the notification and
+/// closes its own socket, the reader sees EOF, and the connection thread's
+/// cleanup joins the writer — so the join completes in microseconds. The
+/// bound exists for a client that stopped reading: its writer stays stuck in
+/// a blocking socket write, the writer never processes `ShuttingDown`, and
+/// the connection thread blocks joining the writer. Shutdown must not hang
+/// on that, so the join is abandoned after the grace period (the daemon
+/// process exits and the OS closes the socket anyway). Mirrors
+/// `sessions::SESSION_SHUTDOWN_GRACE`.
+const CONNECTION_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Join a connection thread, giving up once `deadline` passes. Returns
+/// whether the thread exited before the deadline.
+///
+/// A connection thread is the owner of its writer: `cleanup_client` joins
+/// the writer thread after the socket EOF, so joining the connection thread
+/// transitively waits for the writer to flush `ShuttingDown` and close its
+/// own socket — this is what makes notify-before-EOF observable even when
+/// `run_server` is embedded in-process (no process exit to reap threads).
+/// All connection threads share one deadline (see the shutdown path below) so
+/// N wedged clients cost ~one grace period instead of N × grace.
+fn join_connection_thread(handle: thread::JoinHandle<()>, deadline: Instant) -> bool {
+    while !handle.is_finished() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            warn!("connection thread did not exit before shutdown deadline; abandoning join");
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    if let Err(e) = handle.join() {
+        error!("connection thread panicked during shutdown: {e:?}");
+    }
+    true
+}
 
 /// Resolve and spawn the `/metrics` HTTP server thread.
 ///
@@ -142,6 +179,15 @@ pub fn run_server(
         start_metrics_server(addr_str, &shutdown)?;
     }
 
+    // Connection threads are tracked so shutdown can wait for them — and,
+    // through them, their writer threads — to flush `ShuttingDown` and close
+    // their own sockets before `run_server` returns. Unix connection threads
+    // are spawned directly below and pushed here; TCP connection threads are
+    // spawned inside the accept thread, so their JoinHandles are ferried back
+    // over a channel.
+    let mut client_threads: Vec<thread::JoinHandle<()>> = Vec::new();
+    let (tcp_client_tx, tcp_client_rx) = mpsc::channel::<thread::JoinHandle<()>>();
+
     // TCP listener for Noise IK clients. The `ShuttingDown` notification is
     // routed through the daemon's client_writers registry, exactly as on the
     // Unix path; the TCP accept thread just spawns a per-connection
@@ -160,6 +206,7 @@ pub fn run_server(
 
         let daemon_tx = daemon_tx.clone();
         let acl = Arc::clone(&acl);
+        let tcp_client_tx = tcp_client_tx.clone();
         thread::spawn(move || {
             loop {
                 if tcp_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -170,7 +217,7 @@ pub fn run_server(
                         let tx = daemon_tx.clone();
                         let sk_bytes = *transport_sk.as_bytes();
                         let acl = Arc::clone(&acl);
-                        thread::spawn(move || {
+                        let handle = thread::spawn(move || {
                             let noise = match choreo_transport::noise::handshake_responder(
                                 tcp,
                                 &sk_bytes,
@@ -187,6 +234,9 @@ pub fn run_server(
                                 error!(error = %e, "TCP client error");
                             }
                         });
+                        // Ferry the handle back to the main thread so shutdown
+                        // can wait for this connection thread too.
+                        let _ = tcp_client_tx.send(handle);
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                         // Blocking accept was interrupted by a signal.
@@ -216,6 +266,11 @@ pub fn run_server(
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
+        // Collect TCP connection threads whose handshakes completed since the
+        // last iteration so shutdown can wait for them too.
+        while let Ok(handle) = tcp_client_rx.try_recv() {
+            client_threads.push(handle);
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 if shutdown.load(Ordering::SeqCst) {
@@ -224,11 +279,11 @@ pub fn run_server(
                 }
                 crate::metrics::record_connection_accepted();
                 let tx = daemon_tx.clone();
-                thread::spawn(move || {
+                client_threads.push(thread::spawn(move || {
                     if let Err(e) = crate::server::connection::client_thread(stream, tx) {
                         error!(error = %e, "client error");
                     }
-                });
+                }));
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                 // Blocking accept was interrupted by a signal
@@ -253,6 +308,12 @@ pub fn run_server(
 
     info!("shutting down");
 
+    // Collect TCP connection threads spawned concurrently with shutdown so
+    // they are not missed by the bounded join below.
+    while let Ok(handle) = tcp_client_rx.try_recv() {
+        client_threads.push(handle);
+    }
+
     // Route the shutdown notification through each connection's single writer
     // thread (via the command loop's client_writers registry), then stop the
     // command loop. Each writer thread flushes ShuttingDown and closes its own
@@ -265,6 +326,22 @@ pub fn run_server(
     cmd_handle.join().unwrap_or_else(|e| {
         error!("command thread panicked: {e:?}");
     });
+
+    // Collect any stragglers, then wait (bounded) for each connection thread
+    // — and, through it, its writer thread — to finish. Every healthy writer
+    // flushes ShuttingDown and closes its own socket after the broadcast
+    // above, the reader then sees EOF and cleanup joins the writer, so the
+    // join completes promptly. The deadline (CONNECTION_DRAIN_GRACE) covers a
+    // client that stopped reading, which would otherwise wedge its writer in
+    // a blocking socket write and hang shutdown; all connections share one
+    // deadline so N wedged clients cost ~one grace period, not N × grace.
+    while let Ok(handle) = tcp_client_rx.try_recv() {
+        client_threads.push(handle);
+    }
+    let drain_deadline = Instant::now() + CONNECTION_DRAIN_GRACE;
+    for handle in client_threads {
+        join_connection_thread(handle, drain_deadline);
+    }
 
     if Path::new(socket_path).exists() {
         std::fs::remove_file(socket_path)?;

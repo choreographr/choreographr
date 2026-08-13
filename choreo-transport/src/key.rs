@@ -14,6 +14,12 @@ thread_local! {
 ///
 /// Public so integration tests (which compile the crate without #[cfg(test)])
 /// can redirect keypair generation away from the user's real config directory.
+///
+/// Hidden from the public API docs on purpose: this is a test seam, not part
+/// of the transport's contract. It is thread-local and resets on drop, so a
+/// production caller could only ever redirect key generation in its own
+/// thread — but it should not be treated as a supported API.
+#[doc(hidden)]
 pub fn set_test_config_root(root: Option<PathBuf>) {
     TEST_CONFIG_ROOT.with(|cell| cell.replace(root));
 }

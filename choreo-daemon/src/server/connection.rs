@@ -29,7 +29,7 @@ trait ConnectionWriter {
     /// (the socket is broken) — the caller stops draining.
     fn send_message(&mut self, msg: &DaemonMessage) -> Result<(), String>;
     /// Close the underlying socket (both directions).
-    fn shutdown(&self);
+    fn shutdown(&mut self);
 }
 
 impl ConnectionWriter for BufWriter<UnixStream> {
@@ -37,7 +37,7 @@ impl ConnectionWriter for BufWriter<UnixStream> {
         write_message(self, msg).map_err(|e| e.to_string())?;
         self.flush().map_err(|e| e.to_string())
     }
-    fn shutdown(&self) {
+    fn shutdown(&mut self) {
         let _ = self.get_ref().shutdown(Shutdown::Both);
     }
 }
@@ -46,7 +46,7 @@ impl ConnectionWriter for choreo_transport::noise::NoiseStream {
     fn send_message(&mut self, msg: &DaemonMessage) -> Result<(), String> {
         self.send_daemon_message(msg).map_err(|e| e.to_string())
     }
-    fn shutdown(&self) {
+    fn shutdown(&mut self) {
         let _ = self.get_ref().shutdown(Shutdown::Both);
     }
 }
@@ -824,6 +824,122 @@ fn handle_remove_credential_sync(ctx: &mut ClientCtx, service: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `ConnectionWriter` test double that forwards every written message
+    /// to a channel and records shutdown calls on another. Message-passing
+    /// only (no shared state across threads): the test reads the record
+    /// after joining the writer thread.
+    struct MockConnectionWriter {
+        sent: mpsc::Sender<DaemonMessage>,
+        shutdown_tx: mpsc::Sender<()>,
+        /// Fail `send_message` on the Nth call (1-based) to exercise the
+        /// error path of `writer_thread`.
+        fail_on: Option<usize>,
+        calls: usize,
+    }
+
+    impl ConnectionWriter for MockConnectionWriter {
+        fn send_message(&mut self, msg: &DaemonMessage) -> Result<(), String> {
+            self.calls += 1;
+            if self.fail_on == Some(self.calls) {
+                return Err("mock write failure".to_string());
+            }
+            let _ = self.sent.send(msg.clone());
+            Ok(())
+        }
+        fn shutdown(&mut self) {
+            let _ = self.shutdown_tx.send(());
+        }
+    }
+
+    fn mock_writer(
+        fail_on: Option<usize>,
+    ) -> (
+        MockConnectionWriter,
+        mpsc::Receiver<DaemonMessage>,
+        mpsc::Receiver<()>,
+    ) {
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        (
+            MockConnectionWriter {
+                sent: sent_tx,
+                shutdown_tx,
+                fail_on,
+                calls: 0,
+            },
+            sent_rx,
+            shutdown_rx,
+        )
+    }
+
+    /// The core `writer_thread` contract: `ShuttingDown` is flushed, the
+    /// socket is shut down HERE (by the writer thread itself), and draining
+    /// stops — a message enqueued after the notification is never written,
+    /// so the client observes the notification before the EOF.
+    #[test]
+    fn writer_thread_flushes_shutting_down_then_shuts_down_and_stops() {
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(8);
+        let (writer, sent_rx, shutdown_rx) = mock_writer(None);
+        let handle = std::thread::spawn(move || writer_thread(writer, rx));
+
+        tx.send(DaemonMessage::Pong).unwrap();
+        tx.send(DaemonMessage::ShuttingDown).unwrap();
+        // Queued after the notification: must never be written.
+        tx.send(DaemonMessage::Pong).unwrap();
+
+        handle.join().expect("writer thread panicked");
+        let written: Vec<_> = sent_rx.try_iter().collect();
+        assert_eq!(
+            written,
+            vec![DaemonMessage::Pong, DaemonMessage::ShuttingDown],
+            "ShuttingDown must be flushed in order, then draining must stop"
+        );
+        assert!(
+            shutdown_rx.try_recv().is_ok(),
+            "the writer thread must close the socket itself after ShuttingDown"
+        );
+    }
+
+    /// A send error is fatal for the connection: the loop stops (and does
+    /// NOT call shutdown — the socket is broken anyway).
+    #[test]
+    fn writer_thread_stops_on_send_error_without_shutdown() {
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(8);
+        // Fail on the second write: the first Pong goes out, the loop breaks.
+        let (writer, sent_rx, shutdown_rx) = mock_writer(Some(2));
+        let handle = std::thread::spawn(move || writer_thread(writer, rx));
+
+        tx.send(DaemonMessage::Pong).unwrap();
+        tx.send(DaemonMessage::Pong).unwrap();
+        tx.send(DaemonMessage::ShuttingDown).unwrap();
+        drop(tx); // disconnect so the thread cannot linger
+
+        handle.join().expect("writer thread panicked");
+        let written: Vec<_> = sent_rx.try_iter().collect();
+        assert_eq!(written.len(), 1, "writer must stop at the failing message");
+        assert!(
+            shutdown_rx.try_recv().is_err(),
+            "shutdown must not be called on a send error"
+        );
+    }
+
+    /// A disconnected channel ends the loop cleanly without shutdown — the
+    /// normal drain-to-exit path for a disconnected client.
+    #[test]
+    fn writer_thread_exits_cleanly_on_disconnect() {
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(8);
+        let (writer, sent_rx, shutdown_rx) = mock_writer(None);
+        let handle = std::thread::spawn(move || writer_thread(writer, rx));
+
+        tx.send(DaemonMessage::Pong).unwrap();
+        drop(tx); // all senders gone: the for-loop drains and ends
+
+        handle.join().expect("writer thread panicked");
+        let written: Vec<_> = sent_rx.try_iter().collect();
+        assert_eq!(written, vec![DaemonMessage::Pong]);
+        assert!(shutdown_rx.try_recv().is_err());
+    }
 
     #[test]
     fn handle_unlock_sync_ok() {
