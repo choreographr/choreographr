@@ -25,6 +25,15 @@ use tracing::{error, info, warn};
 /// `sessions::SESSION_SHUTDOWN_GRACE`.
 const CONNECTION_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// Bound for the shutdown wake-probe's connect to the TCP accept thread. The
+/// probe only needs to land in the accept queue; a healthy listener accepts it
+/// in microseconds. Without a bound, a full accept backlog (a connection burst
+/// coinciding with shutdown) would make the blocking connect wait out the
+/// kernel's SYN-retry period (~130 s), stalling shutdown — so the probe itself
+/// is bounded, and a listener the probe cannot reach is simply left to the
+/// drain grace below.
+const ACCEPT_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Join a connection thread, giving up once `deadline` passes. Returns
 /// whether the thread exited before the deadline.
 ///
@@ -405,7 +414,7 @@ pub fn run_server(
             }
             _ => addr,
         };
-        let _ = TcpStream::connect(probe);
+        let _ = TcpStream::connect_timeout(&probe, ACCEPT_PROBE_CONNECT_TIMEOUT);
     }
     if let Some(handle) = tcp_accept_handle.take() {
         join_connection_thread(handle, Instant::now() + CONNECTION_DRAIN_GRACE);

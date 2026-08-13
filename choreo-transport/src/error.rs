@@ -14,6 +14,12 @@ pub enum TransportError {
     /// The stream is unusable after this error.
     #[error("invalid transport fragment: {0}")]
     InvalidFragment(String),
+    /// The Noise IK handshake did not complete within its total budget. The
+    /// budget bounds the WHOLE handshake, not just a single read: a peer that
+    /// dribbles bytes to keep resetting the per-read socket timeout is still
+    /// cut off (see `noise::read_handshake_exact`).
+    #[error("Noise handshake timed out")]
+    HandshakeTimeout,
     #[error("Authentication failed")]
     AuthFailed,
     #[error("Connection closed")]

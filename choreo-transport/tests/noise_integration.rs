@@ -1,5 +1,7 @@
 use choreo_proto::{ClientMessage, DaemonMessage};
-use choreo_transport::noise::{NoiseStream, handshake_initiator, handshake_responder};
+use choreo_transport::noise::{
+    NoiseStream, handshake_initiator, handshake_responder, handshake_responder_with_timeout,
+};
 use snow::Builder;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -896,11 +898,14 @@ fn noise_rejects_tampered_length_prefix() {
 }
 
 /// Test that a peer connecting but sending nothing cannot hold the
-/// responder's handshake open forever: `handshake_responder` applies a read
-/// timeout to the handshake socket, so a silent peer gets an error instead of
-/// a thread + FD held indefinitely. The handshake runs before the ACL check,
-/// so this is what stops unauthenticated peers from exhausting daemon
-/// resources.
+/// responder's handshake open forever: the handshake runs under an ABSOLUTE
+/// deadline, so a silent peer gets an error instead of a thread + FD held
+/// indefinitely. The handshake runs before the ACL check, so this is what
+/// stops unauthenticated peers from exhausting daemon resources.
+///
+/// Uses `handshake_responder_with_timeout` with a short budget so the
+/// timeout path runs in milliseconds instead of waiting out the 10 s
+/// production default.
 #[test]
 #[ignore]
 fn noise_handshake_times_out_when_peer_silent() {
@@ -914,21 +919,82 @@ fn noise_handshake_times_out_when_peer_silent() {
 
     thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
-        let result = handshake_responder(stream, &server_sk_bytes, |_| true);
+        let result = handshake_responder_with_timeout(
+            stream,
+            &server_sk_bytes,
+            |_| true,
+            Duration::from_millis(100),
+        );
         tx.send(result.map(|_| ())).expect("send server result");
     });
 
     // Connect and then send NOTHING. The responder blocks reading the 2-byte
-    // handshake length prefix; the read timeout must fire and return an error
+    // handshake length prefix; the deadline must fire and return an error
     // — NOT hang (bounded by recv_timeout below), and NOT a clean EOF (the
     // socket is still open, so the timeout is what ends the handshake).
     let _silent = TcpStream::connect(addr).expect("connect");
 
     let server_result = rx
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(Duration::from_secs(5))
         .expect("responder must return instead of hanging");
     assert!(
         server_result.is_err(),
         "a silent peer must be timed out, not served"
+    );
+}
+
+/// Test that a peer which keeps the handshake alive by DRIBBLING bytes — each
+/// byte arriving well within any single read's window, so a per-recv socket
+/// timeout never fires — is still cut off by the ABSOLUTE handshake deadline.
+/// Every handshake read is bounded by the time remaining until the deadline,
+/// so the total duration cannot exceed it no matter how the peer paces its
+/// bytes: the slow-loris case a per-read timeout alone does not cover. (This
+/// test fails against the old per-recv-timeout-only code, which accepted the
+/// dribbles past the test's wait window.)
+#[test]
+#[ignore]
+fn noise_handshake_times_out_against_dribbling_peer() {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_sk_bytes = server_sk.to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        // 500 ms total budget: the dribbler sends one byte every 150 ms, so
+        // each byte lands well within any single read's window while the
+        // TOTAL stretches far past the deadline.
+        let result = handshake_responder_with_timeout(
+            stream,
+            &server_sk_bytes,
+            |_| true,
+            Duration::from_millis(500),
+        );
+        tx.send(result.map(|_| ())).expect("send server result");
+    });
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    // A real IK msg1 is ~80-96 bytes; claim 96 with the 2-byte prefix...
+    stream
+        .write_all(&(96u16).to_be_bytes())
+        .expect("write prefix");
+    // ...then dribble: one byte every 150 ms. The responder must give up at
+    // the 500 ms deadline instead of accepting each slow byte forever. Later
+    // writes may fail once the responder has errored and closed the socket,
+    // which is the desired outcome — tolerate the error.
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(150));
+        let _ = stream.write_all(&[0xAB]);
+    }
+
+    let server_result = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("responder must return instead of accepting dribbles forever");
+    assert!(
+        server_result.is_err(),
+        "a dribbling peer must be cut off by the absolute handshake deadline"
     );
 }

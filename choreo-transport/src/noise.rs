@@ -1,10 +1,10 @@
 use choreo_proto::{ClientMessage, DaemonMessage, MAX_FRAME_SIZE, decode_frame, encode_payload};
 use snow::TransportState;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
 use crate::error::TransportError;
@@ -28,10 +28,17 @@ const MAX_PLAINTEXT_CHUNK: usize = 65535 - GCM_TAG_LEN - FRAGMENT_HEADER_LEN;
 /// reassembly decision must not be trusted from there.
 const FRAGMENT_CONTINUATION: u8 = 0x01;
 
-/// Read timeout applied to the socket for the duration of the Noise IK
-/// handshake only (cleared before the TransportState is handed over; the data
-/// plane has no timeout by design — readers block until a message or EOF, and
-/// the daemon's shutdown path closes sockets to unblock them).
+/// Default total-duration budget for the Noise IK handshake. The
+/// `handshake_*_with_timeout` variants take their own budget; the plain
+/// functions delegate to them with this constant.
+///
+/// The budget is an ABSOLUTE deadline, not a per-read socket timeout: every
+/// handshake read is bounded by the time remaining until it (see
+/// [`read_handshake_exact`]), so a peer that dribbles bytes to keep resetting
+/// a per-recv timeout is still cut off at the deadline. It is cleared before
+/// the TransportState is handed over; the data plane has no timeout by design
+/// — readers block until a message or EOF, and the daemon's shutdown path
+/// closes sockets to unblock them.
 ///
 /// The handshake runs BEFORE any authentication (the responder's ACL check
 /// happens mid-handshake), so without a bound an unauthenticated peer could
@@ -292,7 +299,45 @@ impl NoiseStream {
     }
 }
 
-/// Perform the Noise IK handshake as the **initiator** (client side).
+/// Read exactly `len` bytes from `stream`, never taking longer than
+/// `deadline` in total.
+///
+/// A bare `read_exact` under `SO_RCVTIMEO` only bounds each individual `recv`:
+/// a peer that dribbles one byte per read window could stretch the handshake
+/// out indefinitely. Here every read is limited to the time *remaining* until
+/// `deadline` (the socket timeout is re-armed before each call), so the total
+/// duration is bounded by `deadline` plus scheduler slop no matter how the
+/// peer paces its bytes. EOF before `len` bytes is `UnexpectedEof`, matching
+/// `read_exact`'s semantics.
+fn read_handshake_exact(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    len: usize,
+) -> Result<Vec<u8>, TransportError> {
+    let mut buf = Vec::with_capacity(len);
+    // Stack scratch buffer reused across reads — no per-read allocation. A
+    // handshake message is at most a few hundred bytes, so 1 KiB is ample.
+    let mut scratch = [0u8; 1024];
+    while buf.len() < len {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TransportError::HandshakeTimeout);
+        }
+        // Bound THIS read by the remaining budget so a slow peer cannot
+        // stretch the total past `deadline` by dribbling bytes.
+        stream.set_read_timeout(Some(remaining))?;
+        let want = (len - buf.len()).min(scratch.len());
+        let n = stream.read(&mut scratch[..want])?;
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+        }
+        buf.extend_from_slice(&scratch[..n]);
+    }
+    Ok(buf)
+}
+
+/// Perform the Noise IK handshake as the **initiator** (client side), using
+/// the default [`HANDSHAKE_TIMEOUT`] budget.
 ///
 /// * `stream` — the already-connected TCP stream.
 /// * `static_sk` — the client's transport.sec (32-byte X25519 secret key).
@@ -300,16 +345,26 @@ impl NoiseStream {
 ///
 /// On success returns a `NoiseStream` ready for encrypted message I/O.
 pub fn handshake_initiator(
-    mut stream: TcpStream,
+    stream: TcpStream,
     static_sk: &[u8; 32],
     server_pk: &[u8; 32],
 ) -> Result<NoiseStream, TransportError> {
+    handshake_initiator_with_timeout(stream, static_sk, server_pk, HANDSHAKE_TIMEOUT)
+}
+
+/// [`handshake_initiator`] with an explicit total-duration budget for the
+/// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`] for why the budget is absolute,
+/// not per-read). Exposed so integration tests can exercise the timeout path
+/// in milliseconds instead of waiting out the 10 s default.
+pub fn handshake_initiator_with_timeout(
+    mut stream: TcpStream,
+    static_sk: &[u8; 32],
+    server_pk: &[u8; 32],
+    timeout: Duration,
+) -> Result<NoiseStream, TransportError> {
     use snow::Builder;
 
-    // Bound the handshake reads (see HANDSHAKE_TIMEOUT): a stalled or dead
-    // server must not hang the client's connect forever. Cleared below once
-    // the TransportState is derived.
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let deadline = Instant::now() + timeout;
 
     let mut handshake = Builder::new("Noise_IK_25519_AESGCM_SHA256".parse()?)
         .local_private_key(static_sk)?
@@ -324,12 +379,12 @@ pub fn handshake_initiator(
     stream.write_all(&len_bytes)?;
     stream.write_all(&buf[..n])?;
 
-    // Read second handshake message (e, encrypted empty)
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf)?;
-    let msg_len = u16::from_be_bytes(len_buf) as usize;
-    let mut rbuf = vec![0u8; msg_len];
-    stream.read_exact(&mut rbuf)?;
+    // Read second handshake message (e, encrypted empty) — every read is
+    // bounded by the time remaining until `deadline`, so a stalled server
+    // cannot hold the client forever (see read_handshake_exact).
+    let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
+    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
     handshake.read_message(&rbuf, &mut buf)?;
 
     // Handshake complete — restore the unbounded data-plane reads.
@@ -340,7 +395,8 @@ pub fn handshake_initiator(
     Ok(NoiseStream::new(stream, transport))
 }
 
-/// Perform the Noise IK handshake as the **responder** (server side).
+/// Perform the Noise IK handshake as the **responder** (server side), using
+/// the default [`HANDSHAKE_TIMEOUT`] budget.
 ///
 /// * `stream` — the accepted TCP stream from the listener.
 /// * `static_sk` — the server's transport.sec (32-byte X25519 secret key).
@@ -351,31 +407,45 @@ pub fn handshake_initiator(
 /// On success returns a `NoiseStream` ready for encrypted message I/O.
 /// On authentication failure the connection is closed and `Err(AuthFailed)` is returned.
 pub fn handshake_responder<F>(
-    mut stream: TcpStream,
+    stream: TcpStream,
     static_sk: &[u8; 32],
     check_client: F,
 ) -> Result<NoiseStream, TransportError>
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
+    handshake_responder_with_timeout(stream, static_sk, check_client, HANDSHAKE_TIMEOUT)
+}
+
+/// [`handshake_responder`] with an explicit total-duration budget for the
+/// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`]). Exposed so integration tests
+/// can exercise the timeout path in milliseconds instead of waiting out the
+/// 10 s default.
+pub fn handshake_responder_with_timeout<F>(
+    mut stream: TcpStream,
+    static_sk: &[u8; 32],
+    check_client: F,
+    timeout: Duration,
+) -> Result<NoiseStream, TransportError>
+where
+    F: FnOnce(&[u8; 32]) -> bool,
+{
     use snow::Builder;
 
-    // Bound the handshake reads (see HANDSHAKE_TIMEOUT): the ACL check has
-    // not happened yet, so a peer that connects and stalls must not be able
-    // to hold this thread and FD forever. Cleared once the handshake
-    // completes and the client is authenticated.
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let deadline = Instant::now() + timeout;
 
     let mut handshake = Builder::new("Noise_IK_25519_AESGCM_SHA256".parse()?)
         .local_private_key(static_sk)?
         .build_responder()?;
 
-    // Read first handshake message from client (e, encrypted s)
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf)?;
-    let msg_len = u16::from_be_bytes(len_buf) as usize;
-    let mut rbuf = vec![0u8; msg_len];
-    stream.read_exact(&mut rbuf)?;
+    // Read first handshake message from client (e, encrypted s) — every read
+    // is bounded by the time remaining until `deadline`: the ACL check has
+    // not happened yet, so a peer that connects and stalls (or dribbles) must
+    // not be able to hold this thread and FD forever. Cleared once the
+    // handshake completes and the client is authenticated.
+    let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
+    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
     let mut out_buf = vec![0u8; 1024];
     handshake.read_message(&rbuf, &mut out_buf)?;
 

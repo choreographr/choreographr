@@ -410,9 +410,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                     send_to_writer(ctx.writer_tx, DaemonMessage::AccountAdded { name });
                 }
                 Ok(Err(e)) => {
-                    let _ = ctx
-                        .writer_tx
-                        .send(DaemonMessage::AccountAddFailed { name, error: e });
+                    send_to_writer(
+                        ctx.writer_tx,
+                        DaemonMessage::AccountAddFailed { name, error: e },
+                    );
                 }
                 Err(_) => warn!("daemon disconnected while handling add account"),
             }
@@ -427,9 +428,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                     send_to_writer(ctx.writer_tx, DaemonMessage::AccountRemoved { name });
                 }
                 Ok(Err(e)) => {
-                    let _ = ctx
-                        .writer_tx
-                        .send(DaemonMessage::AccountRemoveFailed { name, error: e });
+                    send_to_writer(
+                        ctx.writer_tx,
+                        DaemonMessage::AccountRemoveFailed { name, error: e },
+                    );
                 }
                 Err(_) => warn!("daemon disconnected while handling remove account"),
             }
@@ -443,9 +445,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                     send_to_writer(ctx.writer_tx, DaemonMessage::Accounts { accounts });
                 }
                 Ok(Err(e)) => {
-                    let _ = ctx
-                        .writer_tx
-                        .send(DaemonMessage::AccountListFailed { error: e });
+                    send_to_writer(ctx.writer_tx, DaemonMessage::AccountListFailed { error: e });
                 }
                 Err(_) => warn!("daemon disconnected while handling list accounts"),
             }
@@ -710,9 +710,7 @@ fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
             // Send SessionAttached before SessionCommand::Attach so that
             // the TUI's attached_session_id is set before SessionState
             // arrives — otherwise SessionState is silently dropped.
-            let _ = ctx
-                .writer_tx
-                .send(DaemonMessage::SessionAttached { session_id });
+            send_to_writer(ctx.writer_tx, DaemonMessage::SessionAttached { session_id });
             switch_attached_session(session_id, session_tx, ctx);
         }
         Ok(Err(e)) => {
@@ -834,9 +832,10 @@ fn handle_get_credential_sync(ctx: &mut ClientCtx, service: String) {
             );
         }
         Ok(None) => {
-            let _ = ctx
-                .writer_tx
-                .send(DaemonMessage::Credential { service, key: None });
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::Credential { service, key: None },
+            );
         }
         Err(_) => warn!("daemon disconnected while handling get credential"),
     }
@@ -880,14 +879,13 @@ fn handle_add_credential_sync(
     });
     match result {
         Ok(Ok(())) => {
-            let _ = ctx
-                .writer_tx
-                .send(DaemonMessage::CredentialAdded { service });
+            send_to_writer(ctx.writer_tx, DaemonMessage::CredentialAdded { service });
         }
         Ok(Err(e)) => {
-            let _ = ctx
-                .writer_tx
-                .send(DaemonMessage::CredentialAddFailed { service, error: e });
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::CredentialAddFailed { service, error: e },
+            );
         }
         Err(_) => warn!("daemon disconnected while handling add credential"),
     }
@@ -900,14 +898,13 @@ fn handle_remove_credential_sync(ctx: &mut ClientCtx, service: String) {
     });
     match result {
         Ok(Ok(())) => {
-            let _ = ctx
-                .writer_tx
-                .send(DaemonMessage::CredentialRemoved { service });
+            send_to_writer(ctx.writer_tx, DaemonMessage::CredentialRemoved { service });
         }
         Ok(Err(e)) => {
-            let _ = ctx
-                .writer_tx
-                .send(DaemonMessage::CredentialRemoveFailed { service, error: e });
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::CredentialRemoveFailed { service, error: e },
+            );
         }
         Err(_) => warn!("daemon disconnected while handling remove credential"),
     }
