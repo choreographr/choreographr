@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Shrink a raw TcpStream's kernel send/recv buffers (SO_SNDBUF/SO_RCVBUF)
@@ -675,6 +676,113 @@ fn noise_rejects_oversized_fragment_prefix() {
     );
 }
 
+/// Responder half of the Noise IK handshake with the production wire format
+/// (2-byte BE length-prefixed handshake messages), returning the raw
+/// `TcpStream` and the derived `TransportState`. Byte-for-byte what
+/// [`handshake_responder`] does, but keeps the raw pieces so a test can write
+/// frames the public API cannot express (e.g. a tampered length prefix).
+fn raw_handshake_responder(
+    mut stream: TcpStream,
+    server_sk: &[u8; 32],
+    expected_client_pk: &[u8; 32],
+) -> Result<(TcpStream, snow::TransportState), String> {
+    let mut handshake = Builder::new(
+        "Noise_IK_25519_AESGCM_SHA256"
+            .parse()
+            .map_err(|e| format!("pattern parse failed: {e:?}"))?,
+    )
+    .local_private_key(server_sk)
+    .map_err(|e| format!("server key failed: {e:?}"))?
+    .build_responder()
+    .map_err(|e| format!("build responder failed: {e:?}"))?;
+
+    let mut len_buf = [0u8; 2];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| format!("read msg1 len failed: {e}"))?;
+    let msg_len = u16::from_be_bytes(len_buf) as usize;
+    let mut rbuf = vec![0u8; msg_len];
+    stream
+        .read_exact(&mut rbuf)
+        .map_err(|e| format!("read msg1 failed: {e}"))?;
+    let mut out_buf = vec![0u8; 1024];
+    handshake
+        .read_message(&rbuf, &mut out_buf)
+        .map_err(|e| format!("server read msg1 failed: {e:?}"))?;
+
+    let pk = handshake
+        .get_remote_static()
+        .ok_or_else(|| "no client static key".to_string())?;
+    if *pk != *expected_client_pk {
+        return Err("unexpected client public key".into());
+    }
+
+    let n = handshake
+        .write_message(&[], &mut out_buf)
+        .map_err(|e| format!("server write msg2 failed: {e:?}"))?;
+    stream
+        .write_all(&(n as u16).to_be_bytes())
+        .map_err(|e| format!("write msg2 len failed: {e}"))?;
+    stream
+        .write_all(&out_buf[..n])
+        .map_err(|e| format!("write msg2 failed: {e}"))?;
+
+    let ts = handshake
+        .into_transport_mode()
+        .map_err(|e| format!("server transport failed: {e:?}"))?;
+    Ok((stream, ts))
+}
+
+/// Initiator half of the Noise IK handshake with the production wire format,
+/// returning the raw `TcpStream` and the derived `TransportState` (see
+/// [`raw_handshake_responder`]).
+fn raw_handshake_initiator(
+    mut stream: TcpStream,
+    client_sk: &[u8; 32],
+    server_pk: &[u8; 32],
+) -> Result<(TcpStream, snow::TransportState), String> {
+    let mut handshake = Builder::new(
+        "Noise_IK_25519_AESGCM_SHA256"
+            .parse()
+            .map_err(|e| format!("pattern parse failed: {e:?}"))?,
+    )
+    .local_private_key(client_sk)
+    .map_err(|e| format!("client key failed: {e:?}"))?
+    .remote_public_key(server_pk)
+    .map_err(|e| format!("server pk failed: {e:?}"))?
+    .build_initiator()
+    .map_err(|e| format!("build initiator failed: {e:?}"))?;
+
+    let mut buf = vec![0u8; 1024];
+    let n = handshake
+        .write_message(&[], &mut buf)
+        .map_err(|e| format!("client write msg1 failed: {e:?}"))?;
+    stream
+        .write_all(&(n as u16).to_be_bytes())
+        .map_err(|e| format!("write msg1 len failed: {e}"))?;
+    stream
+        .write_all(&buf[..n])
+        .map_err(|e| format!("write msg1 failed: {e}"))?;
+
+    let mut len_buf = [0u8; 2];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| format!("read msg2 len failed: {e}"))?;
+    let msg_len = u16::from_be_bytes(len_buf) as usize;
+    let mut rbuf = vec![0u8; msg_len];
+    stream
+        .read_exact(&mut rbuf)
+        .map_err(|e| format!("read msg2 failed: {e}"))?;
+    handshake
+        .read_message(&rbuf, &mut buf)
+        .map_err(|e| format!("client read msg2 failed: {e:?}"))?;
+
+    let ts = handshake
+        .into_transport_mode()
+        .map_err(|e| format!("client transport failed: {e:?}"))?;
+    Ok((stream, ts))
+}
+
 /// Test that a wire-level tamper with a fragment's length prefix is rejected
 /// loudly and can never silently truncate a reassembled message. The 4-byte
 /// prefix precedes the GCM ciphertext and is NOT authenticated, so the
@@ -709,56 +817,9 @@ fn noise_rejects_tampered_length_prefix() {
     let server_sk = server_sk_bytes;
     let client_pk_ref = client_pk_bytes;
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
+        let (stream, _) = listener.accept().expect("accept");
         let result = (|| -> Result<(), String> {
-            // Responder half of the IK handshake, byte-for-byte what
-            // handshake_responder does (same pattern, same 2-byte framing),
-            // but keeping the TransportState so recv_message runs against a
-            // stream whose peer writes raw (possibly tampered) frames.
-            let mut handshake = Builder::new(
-                "Noise_IK_25519_AESGCM_SHA256"
-                    .parse()
-                    .map_err(|e| format!("pattern parse failed: {e:?}"))?,
-            )
-            .local_private_key(&server_sk)
-            .map_err(|e| format!("server key failed: {e:?}"))?
-            .build_responder()
-            .map_err(|e| format!("build responder failed: {e:?}"))?;
-
-            let mut len_buf = [0u8; 2];
-            stream
-                .read_exact(&mut len_buf)
-                .map_err(|e| format!("read msg1 len failed: {e}"))?;
-            let msg_len = u16::from_be_bytes(len_buf) as usize;
-            let mut rbuf = vec![0u8; msg_len];
-            stream
-                .read_exact(&mut rbuf)
-                .map_err(|e| format!("read msg1 failed: {e}"))?;
-            let mut out_buf = vec![0u8; 1024];
-            handshake
-                .read_message(&rbuf, &mut out_buf)
-                .map_err(|e| format!("server read msg1 failed: {e:?}"))?;
-
-            let pk = handshake
-                .get_remote_static()
-                .ok_or_else(|| "no client static key".to_string())?;
-            if *pk != client_pk_ref {
-                return Err("unexpected client public key".into());
-            }
-
-            let n = handshake
-                .write_message(&[], &mut out_buf)
-                .map_err(|e| format!("server write msg2 failed: {e:?}"))?;
-            stream
-                .write_all(&(n as u16).to_be_bytes())
-                .map_err(|e| format!("write msg2 len failed: {e}"))?;
-            stream
-                .write_all(&out_buf[..n])
-                .map_err(|e| format!("write msg2 failed: {e}"))?;
-
-            let ts = handshake
-                .into_transport_mode()
-                .map_err(|e| format!("server transport failed: {e:?}"))?;
+            let (stream, ts) = raw_handshake_responder(stream, &server_sk, &client_pk_ref)?;
             let mut server = NoiseStream::new(stream, ts);
 
             // Control: a valid two-fragment message reassembles intact.
@@ -789,37 +850,11 @@ fn noise_rejects_tampered_length_prefix() {
         tx.send(result).expect("send server result");
     });
 
-    // Client side: initiator half of the handshake, byte-for-byte what
-    // handshake_initiator does, but keeping the TransportState so the test can
-    // encrypt fragments and tamper with the wire itself.
-    let mut stream = TcpStream::connect(addr).expect("connect");
-    let mut handshake = Builder::new("Noise_IK_25519_AESGCM_SHA256".parse().expect("parse"))
-        .local_private_key(&client_sk_bytes)
-        .expect("client key")
-        .remote_public_key(&server_pk_bytes)
-        .expect("server pk")
-        .build_initiator()
-        .expect("build initiator");
-
-    let mut buf = vec![0u8; 1024];
-    let n = handshake
-        .write_message(&[], &mut buf)
-        .expect("client write msg1");
-    stream
-        .write_all(&(n as u16).to_be_bytes())
-        .expect("write msg1 len");
-    stream.write_all(&buf[..n]).expect("write msg1");
-
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).expect("read msg2 len");
-    let msg_len = u16::from_be_bytes(len_buf) as usize;
-    let mut rbuf = vec![0u8; msg_len];
-    stream.read_exact(&mut rbuf).expect("read msg2");
-    handshake
-        .read_message(&rbuf, &mut buf)
-        .expect("client read msg2");
-
-    let mut ts = handshake.into_transport_mode().expect("client transport");
+    // Client side: raw initiator handshake so the test can encrypt fragments
+    // and tamper with the wire itself.
+    let stream = TcpStream::connect(addr).expect("connect");
+    let (mut stream, mut ts) = raw_handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes)
+        .expect("client handshake");
 
     // Helper to write a full message as raw frames with the production framing
     // (4-byte BE ciphertext length, then the ciphertext), optionally tampering
@@ -857,5 +892,43 @@ fn noise_rejects_tampered_length_prefix() {
         server_result.is_ok(),
         "tampered length prefix must be rejected: {:?}",
         server_result.err()
+    );
+}
+
+/// Test that a peer connecting but sending nothing cannot hold the
+/// responder's handshake open forever: `handshake_responder` applies a read
+/// timeout to the handshake socket, so a silent peer gets an error instead of
+/// a thread + FD held indefinitely. The handshake runs before the ACL check,
+/// so this is what stops unauthenticated peers from exhausting daemon
+/// resources.
+#[test]
+#[ignore]
+fn noise_handshake_times_out_when_peer_silent() {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_sk_bytes = server_sk.to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = handshake_responder(stream, &server_sk_bytes, |_| true);
+        tx.send(result.map(|_| ())).expect("send server result");
+    });
+
+    // Connect and then send NOTHING. The responder blocks reading the 2-byte
+    // handshake length prefix; the read timeout must fire and return an error
+    // — NOT hang (bounded by recv_timeout below), and NOT a clean EOF (the
+    // socket is still open, so the timeout is what ends the handshake).
+    let _silent = TcpStream::connect(addr).expect("connect");
+
+    let server_result = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("responder must return instead of hanging");
+    assert!(
+        server_result.is_err(),
+        "a silent peer must be timed out, not served"
     );
 }

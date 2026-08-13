@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::{debug, info};
 
 use crate::error::TransportError;
@@ -26,6 +27,19 @@ const MAX_PLAINTEXT_CHUNK: usize = 65535 - GCM_TAG_LEN - FRAGMENT_HEADER_LEN;
 /// length prefix that precedes the ciphertext is NOT authenticated, so the
 /// reassembly decision must not be trusted from there.
 const FRAGMENT_CONTINUATION: u8 = 0x01;
+
+/// Read timeout applied to the socket for the duration of the Noise IK
+/// handshake only (cleared before the TransportState is handed over; the data
+/// plane has no timeout by design — readers block until a message or EOF, and
+/// the daemon's shutdown path closes sockets to unblock them).
+///
+/// The handshake runs BEFORE any authentication (the responder's ACL check
+/// happens mid-handshake), so without a bound an unauthenticated peer could
+/// hold a connection thread + socket FD open forever by connecting and
+/// sending nothing — a resource-exhaustion vector on the daemon's TCP
+/// listener. 10 s is far beyond the single round trip a healthy handshake
+/// needs (sub-millisecond on loopback, a few ms on a real network).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resets the single-writer flag when a `send_message` finishes — on every
 /// exit path, including early `?` returns. Without the guard a concurrent
@@ -292,6 +306,11 @@ pub fn handshake_initiator(
 ) -> Result<NoiseStream, TransportError> {
     use snow::Builder;
 
+    // Bound the handshake reads (see HANDSHAKE_TIMEOUT): a stalled or dead
+    // server must not hang the client's connect forever. Cleared below once
+    // the TransportState is derived.
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+
     let mut handshake = Builder::new("Noise_IK_25519_AESGCM_SHA256".parse()?)
         .local_private_key(static_sk)?
         .remote_public_key(server_pk)?
@@ -312,6 +331,9 @@ pub fn handshake_initiator(
     let mut rbuf = vec![0u8; msg_len];
     stream.read_exact(&mut rbuf)?;
     handshake.read_message(&rbuf, &mut buf)?;
+
+    // Handshake complete — restore the unbounded data-plane reads.
+    stream.set_read_timeout(None)?;
 
     let transport = handshake.into_transport_mode()?;
     debug!("Noise IK handshake complete (initiator)");
@@ -337,6 +359,12 @@ where
     F: FnOnce(&[u8; 32]) -> bool,
 {
     use snow::Builder;
+
+    // Bound the handshake reads (see HANDSHAKE_TIMEOUT): the ACL check has
+    // not happened yet, so a peer that connects and stalls must not be able
+    // to hold this thread and FD forever. Cleared once the handshake
+    // completes and the client is authenticated.
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
 
     let mut handshake = Builder::new("Noise_IK_25519_AESGCM_SHA256".parse()?)
         .local_private_key(static_sk)?
@@ -370,6 +398,9 @@ where
     let len_bytes = (n as u16).to_be_bytes();
     stream.write_all(&len_bytes)?;
     stream.write_all(&buf[..n])?;
+
+    // Handshake complete — restore the unbounded data-plane reads.
+    stream.set_read_timeout(None)?;
 
     let transport = handshake.into_transport_mode()?;
     debug!("Noise IK handshake complete (responder)");

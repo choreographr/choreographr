@@ -74,6 +74,61 @@ fn writer_thread<W: ConnectionWriter>(mut writer: W, rx: mpsc::Receiver<DaemonMe
     }
 }
 
+/// Create a connection's writer channel and register it with the daemon,
+/// returning the client id and both channel ends for the connection thread.
+///
+/// Registration happens HERE — in the acceptor, BEFORE the connection thread
+/// is spawned — so a connection accepted concurrently with shutdown is
+/// guaranteed to receive `ShuttingDown`:
+///
+/// * Unix: the accept loop registers (then spawns) before it can observe the
+///   shutdown flag and break out to broadcast, so the register command is
+///   enqueued before the broadcast on the same FIFO command channel.
+/// * TCP: the accept thread registers before spawning the handshake thread,
+///   and `run_server` joins the accept thread BEFORE broadcasting, so the
+///   register (sent strictly before the accept thread exited) is ordered
+///   before the broadcast in the command channel.
+///
+/// If registration were deferred to inside the connection thread, a handshake
+/// still in flight when shutdown began could land its register after the
+/// broadcast was processed — and that client would miss the notification.
+pub(crate) fn register_client_writer(
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
+) -> (
+    u64,
+    SyncSender<DaemonMessage>,
+    mpsc::Receiver<DaemonMessage>,
+) {
+    let (writer_tx, writer_rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+    let client_id = rand::random::<u64>();
+    let _ = daemon_tx.send(DaemonCommand::RegisterClientWriter {
+        client_id,
+        writer: writer_tx.clone(),
+    });
+    (client_id, writer_tx, writer_rx)
+}
+
+/// Send a reply to a client's writer channel.
+///
+/// Deliberately a BLOCKING send, unlike the drop-on-full policy used for
+/// broadcasts ([`crate::broadcast::try_send_keep_on_full`]): a reply is a
+/// request/response contract, and silently dropping it would leave the client
+/// waiting forever for a reply that never arrives. The 128-slot bounded
+/// channel plus blocking send IS the connection's backpressure mechanism — a
+/// client that stops reading stalls only its own connection thread, never the
+/// daemon command loop or other connections.
+///
+/// The one interaction to keep in mind is shutdown: if the channel is full
+/// when `ShuttingDown` is broadcast, the notification queues behind the
+/// backlog, and the shutdown fan-out
+/// ([`crate::broadcast::send_shutting_down_bounded`]) polls for up to
+/// `SHUTDOWN_NOTIFY_GRACE` before giving up; the bounded connection drain in
+/// `run_server` caps the rest. A pathological client can therefore delay
+/// (never hang) shutdown by bounded amounts.
+fn send_to_writer(writer_tx: &SyncSender<DaemonMessage>, msg: DaemonMessage) {
+    let _ = writer_tx.send(msg);
+}
+
 /// Shared per-client context passed through the dispatch and handler functions.
 /// Bundles the channels and mutable per-connection state into one struct so
 /// the call sites don't pass 5–6 individual arguments to every function.
@@ -147,7 +202,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             let (reply, rx) = mpsc::channel();
             let _ = ctx.daemon_tx.send(DaemonCommand::ListSessions { reply });
             if let Ok(sessions) = rx.recv() {
-                let _ = ctx.writer_tx.send(DaemonMessage::Sessions { sessions });
+                send_to_writer(ctx.writer_tx, DaemonMessage::Sessions { sessions });
             }
         }
         ClientMessage::SubscribeSessionsSummary => {
@@ -175,11 +230,14 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 // session" to the client: it lets a connection-level failure
                 // be routed to whatever session the user is viewing.  The
                 // TUI resolves it via `App::resolve_daemon_session`.
-                let _ = ctx.writer_tx.send(DaemonMessage::Failed {
-                    session_id: 0,
-                    request_id,
-                    error: "no session attached".to_string(),
-                });
+                send_to_writer(
+                    ctx.writer_tx,
+                    DaemonMessage::Failed {
+                        session_id: 0,
+                        request_id,
+                        error: "no session attached".to_string(),
+                    },
+                );
             }
         }
         ClientMessage::Cancel { request_id } => {
@@ -216,16 +274,19 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                     input: b"Continue.".to_vec(),
                 });
             } else {
-                let _ = ctx.writer_tx.send(DaemonMessage::Failed {
-                    session_id: 0,
-                    request_id,
-                    error: "no session attached".to_string(),
-                });
+                send_to_writer(
+                    ctx.writer_tx,
+                    DaemonMessage::Failed {
+                        session_id: 0,
+                        request_id,
+                        error: "no session attached".to_string(),
+                    },
+                );
             }
         }
         ClientMessage::Ping => {
             debug!("client {}: Ping", ctx.client_id);
-            let _ = ctx.writer_tx.send(DaemonMessage::Pong);
+            send_to_writer(ctx.writer_tx, DaemonMessage::Pong);
         }
         ClientMessage::SetModel { model } => {
             info!(
@@ -237,11 +298,14 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             if let Some(tx) = ctx.attached_session_tx {
                 let _ = tx.send(SessionCommand::SetModel { model });
             } else {
-                let _ = ctx.writer_tx.send(DaemonMessage::ModelSelectionFailed {
-                    session_id: 0,
-                    model,
-                    error: "no session attached".to_string(),
-                });
+                send_to_writer(
+                    ctx.writer_tx,
+                    DaemonMessage::ModelSelectionFailed {
+                        session_id: 0,
+                        model,
+                        error: "no session attached".to_string(),
+                    },
+                );
             }
         }
         ClientMessage::SetReasoningEffort { effort } => {
@@ -254,11 +318,14 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             if let Some(tx) = ctx.attached_session_tx {
                 let _ = tx.send(SessionCommand::SetReasoningEffort { effort });
             } else {
-                let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSetFailed {
-                    session_id: 0,
-                    effort,
-                    error: "no session attached".to_string(),
-                });
+                send_to_writer(
+                    ctx.writer_tx,
+                    DaemonMessage::ReasoningEffortSetFailed {
+                        session_id: 0,
+                        effort,
+                        error: "no session attached".to_string(),
+                    },
+                );
             }
         }
         ClientMessage::GetReasoningEffort => {
@@ -266,16 +333,22 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let (reply, rx) = mpsc::channel();
                 let _ = tx.send(SessionCommand::GetReasoningEffort { reply });
                 if let Ok(effort) = rx.recv() {
-                    let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSet {
-                        session_id: 0,
-                        effort,
-                    });
+                    send_to_writer(
+                        ctx.writer_tx,
+                        DaemonMessage::ReasoningEffortSet {
+                            session_id: 0,
+                            effort,
+                        },
+                    );
                 }
             } else {
-                let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSet {
-                    session_id: 0,
-                    effort: "off".to_string(),
-                });
+                send_to_writer(
+                    ctx.writer_tx,
+                    DaemonMessage::ReasoningEffortSet {
+                        session_id: 0,
+                        effort: "off".to_string(),
+                    },
+                );
             }
         }
         ClientMessage::Unlock { private_key } => {
@@ -334,7 +407,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             });
             match result {
                 Ok(Ok(())) => {
-                    let _ = ctx.writer_tx.send(DaemonMessage::AccountAdded { name });
+                    send_to_writer(ctx.writer_tx, DaemonMessage::AccountAdded { name });
                 }
                 Ok(Err(e)) => {
                     let _ = ctx
@@ -351,7 +424,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             });
             match result {
                 Ok(Ok(())) => {
-                    let _ = ctx.writer_tx.send(DaemonMessage::AccountRemoved { name });
+                    send_to_writer(ctx.writer_tx, DaemonMessage::AccountRemoved { name });
                 }
                 Ok(Err(e)) => {
                     let _ = ctx
@@ -367,7 +440,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             });
             match result {
                 Ok(Ok(accounts)) => {
-                    let _ = ctx.writer_tx.send(DaemonMessage::Accounts { accounts });
+                    send_to_writer(ctx.writer_tx, DaemonMessage::Accounts { accounts });
                 }
                 Ok(Err(e)) => {
                     let _ = ctx
@@ -408,23 +481,21 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
 pub(crate) fn client_thread(
     stream: UnixStream,
     daemon_tx: mpsc::Sender<DaemonCommand>,
+    client_id: u64,
+    writer_tx: SyncSender<DaemonMessage>,
+    writer_rx: mpsc::Receiver<DaemonMessage>,
 ) -> io::Result<()> {
     let reader = BufReader::new(stream.try_clone()?);
     let writer = BufWriter::new(stream);
 
-    let (writer_tx, writer_rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
     let writer_handle = std::thread::spawn(move || writer_thread(writer, writer_rx));
 
     let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
     let mut attached_session_id: Option<u64> = None;
-    let client_id = rand::random::<u64>();
-    // Register this connection's writer channel with the daemon so the
-    // shutdown path can route `ShuttingDown` through this single writer
-    // thread instead of writing to the socket from another thread.
-    let _ = daemon_tx.send(DaemonCommand::RegisterClientWriter {
-        client_id,
-        writer: writer_tx.clone(),
-    });
+    // The writer channel was registered with the daemon by the acceptor
+    // (register_client_writer) before this thread was spawned, so the shutdown
+    // path can route `ShuttingDown` through this single writer thread instead
+    // of writing to the socket from another thread.
     info!("client connected: id={}", client_id);
     crate::metrics::record_client_connected();
 
@@ -473,24 +544,21 @@ pub(crate) fn client_thread(
 pub(crate) fn tcp_client_thread(
     noise: choreo_transport::noise::NoiseStream,
     daemon_tx: mpsc::Sender<DaemonCommand>,
+    client_id: u64,
+    writer_tx: SyncSender<DaemonMessage>,
+    writer_rx: mpsc::Receiver<DaemonMessage>,
 ) -> io::Result<()> {
-    let (writer_tx, writer_rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
-
     // Writer thread: blocks on writer_rx, sends via NoiseStream encryption.
     let writer = noise.try_clone()?;
     let writer_handle = std::thread::spawn(move || writer_thread(writer, writer_rx));
 
     let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
     let mut attached_session_id: Option<u64> = None;
-    let client_id = rand::random::<u64>();
-    // Register this connection's writer channel with the daemon so the
-    // shutdown path can route `ShuttingDown` through this single writer
-    // thread (see client_thread). The NoiseStream's TransportState lock is
-    // only safe to take per-message because this is the sole sender.
-    let _ = daemon_tx.send(DaemonCommand::RegisterClientWriter {
-        client_id,
-        writer: writer_tx.clone(),
-    });
+    // The writer channel was registered with the daemon by the acceptor
+    // (register_client_writer) before this thread was spawned, so the shutdown
+    // path can route `ShuttingDown` through this single writer thread (see
+    // client_thread). The NoiseStream's TransportState lock is only safe to
+    // take per-message because this is the sole sender.
     let mut reader = noise;
     info!("TCP client connected: id={}", client_id);
     crate::metrics::record_client_connected();
@@ -601,22 +669,28 @@ fn handle_client_create_session(
             // the user presses Enter on a session.
             // This keeps the old session alive when
             // creating from the session manager page.
-            let _ = ctx.writer_tx.send(DaemonMessage::SessionCreated {
-                session_id: sid,
-                title,
-                parent_session_id,
-                working_dir: cwd_str,
-                account_name,
-                selected_model,
-                reasoning_effort,
-            });
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::SessionCreated {
+                    session_id: sid,
+                    title,
+                    parent_session_id,
+                    working_dir: cwd_str,
+                    account_name,
+                    selected_model,
+                    reasoning_effort,
+                },
+            );
         }
         Ok(Err(e)) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
-                session_id: 0,
-                operation: "create_session".into(),
-                error: e.to_string(),
-            });
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::SessionFailed {
+                    session_id: 0,
+                    operation: "create_session".into(),
+                    error: e.to_string(),
+                },
+            );
         }
         Err(_) => return false,
     }
@@ -642,11 +716,14 @@ fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
             switch_attached_session(session_id, session_tx, ctx);
         }
         Ok(Err(e)) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
-                session_id: 0,
-                operation: "attach_session".into(),
-                error: e.to_string(),
-            });
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::SessionFailed {
+                    session_id: 0,
+                    operation: "attach_session".into(),
+                    error: e.to_string(),
+                },
+            );
         }
         Err(_) => return false,
     }
@@ -668,19 +745,25 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
                 let _ = tx.send(SessionCommand::SetAccount { name });
             }
             _ => {
-                let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
-                    session_id: 0,
-                    operation: "set_account".into(),
-                    error: format!("account '{name}' not found"),
-                });
+                send_to_writer(
+                    ctx.writer_tx,
+                    DaemonMessage::SessionFailed {
+                        session_id: 0,
+                        operation: "set_account".into(),
+                        error: format!("account '{name}' not found"),
+                    },
+                );
             }
         }
     } else {
-        let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
-            session_id: 0,
-            operation: "set_account".into(),
-            error: "no session attached".to_string(),
-        });
+        send_to_writer(
+            ctx.writer_tx,
+            DaemonMessage::SessionFailed {
+                session_id: 0,
+                operation: "set_account".into(),
+                error: "no session attached".to_string(),
+            },
+        );
     }
 }
 
@@ -704,10 +787,10 @@ fn handle_unlock_sync(ctx: &mut ClientCtx, private_key: Vec<u8>) {
     });
     match result {
         Ok(Ok(())) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::Unlocked);
+            send_to_writer(ctx.writer_tx, DaemonMessage::Unlocked);
         }
         Ok(Err(e)) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::LockedError { error: e });
+            send_to_writer(ctx.writer_tx, DaemonMessage::LockedError { error: e });
         }
         Err(_) => warn!("daemon disconnected while handling unlock"),
     }
@@ -720,13 +803,16 @@ fn handle_list_models_sync(ctx: &mut ClientCtx, attached_session_id: Option<u64>
     });
     match result {
         Ok(Ok((models, selected_model))) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::Models {
-                models,
-                selected_model,
-            });
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::Models {
+                    models,
+                    selected_model,
+                },
+            );
         }
         Ok(Err(e)) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::ModelsFailed { error: e });
+            send_to_writer(ctx.writer_tx, DaemonMessage::ModelsFailed { error: e });
         }
         Err(_) => warn!("daemon disconnected while handling list models"),
     }
@@ -739,10 +825,13 @@ fn handle_get_credential_sync(ctx: &mut ClientCtx, service: String) {
     });
     match result {
         Ok(Some(key)) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::Credential {
-                service,
-                key: Some(key),
-            });
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::Credential {
+                    service,
+                    key: Some(key),
+                },
+            );
         }
         Ok(None) => {
             let _ = ctx
@@ -765,10 +854,13 @@ fn handle_delete_session_sync(ctx: &mut ClientCtx, session_id: u64) {
             // the session list), so we don't duplicate it here.
         }
         Ok(Err(e)) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::SessionDeleteFailed {
-                session_id,
-                error: e.to_string(),
-            });
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::SessionDeleteFailed {
+                    session_id,
+                    error: e.to_string(),
+                },
+            );
         }
         Err(_) => warn!("daemon disconnected while handling delete session"),
     }

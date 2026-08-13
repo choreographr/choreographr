@@ -50,6 +50,40 @@ fn join_connection_thread(handle: thread::JoinHandle<()>, deadline: Instant) -> 
     true
 }
 
+/// Prune `client_threads` once it grows past this many retained handles.
+/// Handles are kept so shutdown can bound-join every live connection thread;
+/// pruning finished ones eagerly stops a long-running daemon from
+/// accumulating one handle per connection ever accepted.
+const CLIENT_THREAD_PRUNE_THRESHOLD: usize = 64;
+
+/// Track a connection thread's JoinHandle for the shutdown drain, pruning
+/// handles of already-finished threads once the Vec grows past
+/// [`CLIENT_THREAD_PRUNE_THRESHOLD`]. A finished thread's handle can be
+/// dropped without joining (the OS thread is already reaped); a still-running
+/// handle must be retained — dropping it would detach the thread and lose the
+/// shutdown join — so only finished ones are pruned.
+fn push_client_thread(
+    client_threads: &mut Vec<thread::JoinHandle<()>>,
+    handle: thread::JoinHandle<()>,
+) {
+    if client_threads.len() >= CLIENT_THREAD_PRUNE_THRESHOLD {
+        client_threads.retain(|h| !h.is_finished());
+    }
+    client_threads.push(handle);
+}
+
+/// Collect every connection-thread handle the TCP accept thread has ferried
+/// over the channel since the last drain, routing them through
+/// [`push_client_thread`].
+fn drain_tcp_handles(
+    rx: &mpsc::Receiver<thread::JoinHandle<()>>,
+    client_threads: &mut Vec<thread::JoinHandle<()>>,
+) {
+    while let Ok(handle) = rx.try_recv() {
+        push_client_thread(client_threads, handle);
+    }
+}
+
 /// Resolve and spawn the `/metrics` HTTP server thread.
 ///
 /// Feature-on build: parse the socket address (rejecting garbage with an
@@ -233,6 +267,14 @@ pub fn run_server(
                         let tx = daemon_tx.clone();
                         let sk_bytes = *transport_sk.as_bytes();
                         let acl = Arc::clone(&acl);
+                        // Register the writer channel BEFORE the handshake (see
+                        // register_client_writer): the main thread joins this
+                        // accept thread before sending the shutdown broadcast,
+                        // so a register issued here is always ordered before
+                        // the broadcast — a connection accepted concurrently
+                        // with shutdown cannot miss ShuttingDown.
+                        let (client_id, writer_tx, writer_rx) =
+                            crate::server::connection::register_client_writer(&tx);
                         let handle = thread::spawn(move || {
                             let noise = match choreo_transport::noise::handshake_responder(
                                 tcp,
@@ -242,11 +284,18 @@ pub fn run_server(
                                 Ok(ns) => ns,
                                 Err(e) => {
                                     error!(error = %e, "Noise IK handshake rejected");
+                                    // The writer channel was registered at accept
+                                    // time; unregister so a failed handshake does
+                                    // not leave a stale writer entry in the
+                                    // daemon's client_writers registry.
+                                    let _ =
+                                        tx.send(DaemonCommand::ClientDisconnected { client_id });
                                     return;
                                 }
                             };
-                            if let Err(e) = crate::server::connection::tcp_client_thread(noise, tx)
-                            {
+                            if let Err(e) = crate::server::connection::tcp_client_thread(
+                                noise, tx, client_id, writer_tx, writer_rx,
+                            ) {
                                 error!(error = %e, "TCP client error");
                             }
                         });
@@ -284,9 +333,7 @@ pub fn run_server(
         }
         // Collect TCP connection threads whose handshakes completed since the
         // last iteration so shutdown can wait for them too.
-        while let Ok(handle) = tcp_client_rx.try_recv() {
-            client_threads.push(handle);
-        }
+        drain_tcp_handles(&tcp_client_rx, &mut client_threads);
         match listener.accept() {
             Ok((stream, _)) => {
                 if shutdown.load(Ordering::SeqCst) {
@@ -295,11 +342,22 @@ pub fn run_server(
                 }
                 crate::metrics::record_connection_accepted();
                 let tx = daemon_tx.clone();
-                client_threads.push(thread::spawn(move || {
-                    if let Err(e) = crate::server::connection::client_thread(stream, tx) {
-                        error!(error = %e, "client error");
-                    }
-                }));
+                // Register the writer channel with the daemon BEFORE spawning
+                // the connection thread — see register_client_writer for why
+                // this closes the "connection accepted concurrently with
+                // shutdown misses ShuttingDown" race.
+                let (client_id, writer_tx, writer_rx) =
+                    crate::server::connection::register_client_writer(&daemon_tx);
+                push_client_thread(
+                    &mut client_threads,
+                    thread::spawn(move || {
+                        if let Err(e) = crate::server::connection::client_thread(
+                            stream, tx, client_id, writer_tx, writer_rx,
+                        ) {
+                            error!(error = %e, "client error");
+                        }
+                    }),
+                );
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                 // Blocking accept was interrupted by a signal
@@ -333,15 +391,21 @@ pub fn run_server(
     // where the accept thread could spawn a connection after the drain, whose
     // handle would never be joined.
     if let Some(addr) = tcp_accept_addr {
-        // Probe with loopback addresses only: connecting back to an
-        // unspecified bind address (0.0.0.0 / ::) is not a valid destination,
-        // and either probe lands on a v4- or v6-bound listener.
-        for ip in [
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ] {
-            let _ = TcpStream::connect(SocketAddr::new(ip, addr.port()));
-        }
+        // Wake the accept thread: probe the address the listener is actually
+        // bound to when it is concrete — a specific non-loopback bind (e.g.
+        // 192.168.1.10:9000) is unreachable via loopback probes. An
+        // unspecified bind (0.0.0.0 / ::) cannot be connected back to, so
+        // probe the matching loopback address instead.
+        let probe = match addr.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+            }
+            IpAddr::V6(ip) if ip.is_unspecified() => {
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), addr.port())
+            }
+            _ => addr,
+        };
+        let _ = TcpStream::connect(probe);
     }
     if let Some(handle) = tcp_accept_handle.take() {
         join_connection_thread(handle, Instant::now() + CONNECTION_DRAIN_GRACE);
@@ -349,9 +413,7 @@ pub fn run_server(
 
     // Collect TCP connection threads spawned concurrently with shutdown so
     // they are not missed by the bounded join below.
-    while let Ok(handle) = tcp_client_rx.try_recv() {
-        client_threads.push(handle);
-    }
+    drain_tcp_handles(&tcp_client_rx, &mut client_threads);
 
     // Route the shutdown notification through each connection's single writer
     // thread (via the command loop's client_writers registry), then stop the
@@ -374,9 +436,7 @@ pub fn run_server(
     // client that stopped reading, which would otherwise wedge its writer in
     // a blocking socket write and hang shutdown; all connections share one
     // deadline so N wedged clients cost ~one grace period, not N × grace.
-    while let Ok(handle) = tcp_client_rx.try_recv() {
-        client_threads.push(handle);
-    }
+    drain_tcp_handles(&tcp_client_rx, &mut client_threads);
     let drain_deadline = Instant::now() + CONNECTION_DRAIN_GRACE;
     for handle in client_threads {
         join_connection_thread(handle, drain_deadline);
@@ -420,5 +480,40 @@ mod tests {
             msg.contains("--features metrics"),
             "error must point at the opt-in feature: {msg}"
         );
+    }
+
+    /// Finished connection threads are pruned once the retained Vec grows past
+    /// the threshold, so a long-running daemon does not accumulate one
+    /// JoinHandle per connection ever accepted; a still-running handle is
+    /// retained for the shutdown join.
+    #[test]
+    fn push_client_thread_prunes_finished_handles() {
+        let mut handles = Vec::new();
+        // Fill past the prune threshold with threads that have already exited.
+        // Spinning on `is_finished` is deterministic — the closure is empty,
+        // so the thread cannot fail to finish — and avoids any sleep.
+        for _ in 0..=CLIENT_THREAD_PRUNE_THRESHOLD {
+            let h = thread::spawn(|| {});
+            while !h.is_finished() {
+                std::hint::spin_loop();
+            }
+            handles.push(h);
+        }
+
+        // A live thread: blocked on a channel until released, so it is
+        // guaranteed to be running when pushed and must survive the prune.
+        let (tx, rx) = mpsc::channel::<()>();
+        let live = thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        push_client_thread(&mut handles, live);
+
+        assert_eq!(
+            handles.len(),
+            1,
+            "only the still-running handle must survive the prune"
+        );
+        tx.send(()).unwrap();
+        handles.pop().unwrap().join().unwrap();
     }
 }
