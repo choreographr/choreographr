@@ -62,6 +62,7 @@ pub fn test_daemon_state() -> DaemonState {
         daemon_tx,
         client_streams: Vec::new(),
         summary_subscribers: HashMap::new(),
+        client_writers: HashMap::new(),
         activity_subscribers: HashMap::new(),
         client_subscribed_sessions: HashMap::new(),
         model_cache: HashMap::new(),
@@ -99,74 +100,120 @@ pub struct SpawnedDaemon {
 impl SpawnedDaemon {
     /// Start a daemon whose Noise ACL authorizes exactly `authorized_pks`
     /// (an empty slice => empty ACL => every Noise connection rejected).
+    ///
+    /// Retries up to `START_ATTEMPTS` times: the ephemeral TCP port is chosen
+    /// by binding `127.0.0.1:0`, reading the port, and *dropping* the probe so
+    /// `run_server` can bind it. Under parallel load another process can grab
+    /// that port in the window; `run_server` then fails fast on the bind error
+    /// and the daemon dies before serving — which we detect as an early
+    /// `handle` exit while waiting for readiness and recover from with a fresh
+    /// tempdir/port/socket/state.
     pub fn start(authorized_pks: &[[u8; 32]]) -> Self {
-        // Fresh Noise keypair for the server. `rand::rng()` is the
-        // thread-local CSPRNG; `random_from_rng` fills the 32-byte secret
-        // from it. The public half is what tests hand to the client side;
-        // the secret half goes into `run_server` via `TransportSecretKey`.
-        let server_sk = x25519_dalek::StaticSecret::random_from_rng(&mut rand::rng());
-        let server_pk = x25519_dalek::PublicKey::from(&server_sk).to_bytes();
-        let transport_sk = choreo_transport::key::TransportSecretKey::new(server_sk.to_bytes());
+        const START_ATTEMPTS: usize = 5;
 
-        // One temp dir holds the socket and the ACL file — keeping them
-        // alive for the daemon's whole lifetime (the DB lives in its own
-        // tempdir inside `test_daemon_state`).
-        let tmp = tempfile::tempdir().expect("tempdir for daemon test");
-        let socket_path = tmp.path().join("daemon.sock");
-        let socket_str = socket_path
-            .to_str()
-            .expect("socket path must be valid UTF-8")
-            .to_string();
+        for attempt in 1..=START_ATTEMPTS {
+            // Fresh Noise keypair for the server. `rand::rng()` is the
+            // thread-local CSPRNG; `random_from_rng` fills the 32-byte secret
+            // from it. The public half is what tests hand to the client side;
+            // the secret half goes into `run_server` via `TransportSecretKey`.
+            let server_sk = x25519_dalek::StaticSecret::random_from_rng(&mut rand::rng());
+            let server_pk = x25519_dalek::PublicKey::from(&server_sk).to_bytes();
+            let transport_sk = choreo_transport::key::TransportSecretKey::new(server_sk.to_bytes());
 
-        // Always write the ACL file — even when there are no authorized keys
-        // — so `Acl::load` exercises its real TOML parsing path instead of
-        // the file-not-found early return.
-        let acl_path = tmp.path().join("authorized_clients.toml");
-        let mut acl_toml = String::new();
-        for pk in authorized_pks {
-            acl_toml.push_str(&format!("[[client]]\npubkey = \"{}\"\n", BASE64.encode(pk)));
+            // One temp dir holds the socket and the ACL file — keeping them
+            // alive for the daemon's whole lifetime (the DB lives in its own
+            // tempdir inside `test_daemon_state`).
+            let tmp = tempfile::tempdir().expect("tempdir for daemon test");
+            let socket_path = tmp.path().join("daemon.sock");
+            let socket_str = socket_path
+                .to_str()
+                .expect("socket path must be valid UTF-8")
+                .to_string();
+
+            // Always write the ACL file — even when there are no authorized keys
+            // — so `Acl::load` exercises its real TOML parsing path instead of
+            // the file-not-found early return.
+            let acl_path = tmp.path().join("authorized_clients.toml");
+            let mut acl_toml = String::new();
+            for pk in authorized_pks {
+                acl_toml.push_str(&format!("[[client]]\npubkey = \"{}\"\n", BASE64.encode(pk)));
+            }
+            std::fs::write(&acl_path, acl_toml).expect("write ACL file");
+            let acl = Arc::new(Acl::load(&acl_path));
+
+            // Reserve a free TCP port: bind :0, read the kernel-assigned port,
+            // then drop the probe listener so `run_server` can bind it. There
+            // is an inherent race where another process grabs the port in
+            // between — exactly what the retry loop recovers from, because
+            // `run_server` fails fast on the bind error and exits early.
+            let tcp_addr: SocketAddr = {
+                let probe = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+                let port = probe.local_addr().expect("local_addr").port();
+                SocketAddr::from(([127, 0, 0, 1], port))
+            };
+            let tcp_addr_str = tcp_addr.to_string();
+
+            let state = test_daemon_state();
+            let mut handle: Option<thread::JoinHandle<std::io::Result<()>>> =
+                Some(thread::spawn(move || {
+                    run_server(
+                        &socket_str,
+                        state,
+                        None,
+                        Some(tcp_addr_str),
+                        transport_sk,
+                        acl,
+                    )
+                }));
+
+            // Readiness, bounded: first the Unix socket file (created by the
+            // bind inside `run_server`), then a TCP connect probe. A stuck
+            // daemon panics the test with a clear message instead of hanging.
+            wait_until("daemon Unix socket", || socket_path.exists());
+
+            // TCP readiness loop that ALSO watches for early server exit: if
+            // the socket file appeared but the server thread has already
+            // finished, `run_server` died before serving — the port-steal
+            // bind failure — so reclaim the JoinHandle result and retry the
+            // whole attempt with a fresh tempdir/port/socket. `handle` is an
+            // Option so the finished branch can `take()` it (join consumes)
+            // while the success branch still owns it for the daemon struct.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let ready = loop {
+                if handle.as_ref().is_some_and(|h| h.is_finished()) {
+                    let result = handle
+                        .take()
+                        .expect("server thread panicked")
+                        .join()
+                        .expect("server thread panicked");
+                    tracing::warn!(
+                        attempt,
+                        ?result,
+                        "daemon exited early while waiting for readiness — retrying start"
+                    );
+                    break false;
+                }
+                if TcpStream::connect(tcp_addr).is_ok() {
+                    break true;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out after 5s waiting for daemon TCP listener"
+                );
+                thread::sleep(Duration::from_millis(10));
+            };
+            if ready {
+                return SpawnedDaemon {
+                    socket_path,
+                    tcp_addr,
+                    server_pk,
+                    handle,
+                    _tmp: tmp,
+                };
+            }
         }
-        std::fs::write(&acl_path, acl_toml).expect("write ACL file");
-        let acl = Arc::new(Acl::load(&acl_path));
 
-        // Reserve a free TCP port: bind :0, read the kernel-assigned port,
-        // then drop the probe listener so `run_server` can bind it. There is
-        // an inherent (tiny) race where another process grabs the port in
-        // between — acceptable for tests, and run_server fails loudly if so.
-        let tcp_addr: SocketAddr = {
-            let probe = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-            let port = probe.local_addr().expect("local_addr").port();
-            SocketAddr::from(([127, 0, 0, 1], port))
-        };
-        let tcp_addr_str = tcp_addr.to_string();
-
-        let state = test_daemon_state();
-        let handle = thread::spawn(move || {
-            run_server(
-                &socket_str,
-                state,
-                None,
-                Some(tcp_addr_str),
-                transport_sk,
-                acl,
-            )
-        });
-
-        // Readiness: first the Unix socket file (created by the bind inside
-        // `run_server`), then a TCP connect probe. Both bounded — a stuck
-        // daemon panics the test with a clear message instead of hanging.
-        wait_until("daemon Unix socket", || socket_path.exists());
-        wait_until("daemon TCP listener", || {
-            TcpStream::connect(tcp_addr).is_ok()
-        });
-
-        SpawnedDaemon {
-            socket_path,
-            tcp_addr,
-            server_pk,
-            handle: Some(handle),
-            _tmp: tmp,
-        }
+        panic!("failed to start test daemon after {START_ATTEMPTS} attempts");
     }
 
     /// Gracefully shut the daemon down (SIGINT) and join the server thread.

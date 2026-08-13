@@ -2346,6 +2346,7 @@ version = "0.1.0"
 dependencies = [
  "choreo-proto",
  "dirs",
+ "nix 0.31.3",
  "rand 0.10.2",
  "serial_test",
  "snow",
@@ -7838,6 +7839,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

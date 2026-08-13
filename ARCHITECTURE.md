@@ -392,7 +392,7 @@ TCP.  Used by both `choreo-client-core` (client side) and `choreo-daemon` (serve
 
 | Module | Purpose |
 |---|---|
-| `noise.rs` | `NoiseStream` — wraps `TcpStream` + `snow::TransportState` with length-prefixed AES-256-GCM framing. Payloads above snow's 65535-byte single-message ciphertext cap are split into flag-marked fragments and reassembled transparently, so the effective per-message cap is now the proto codec's 32 MiB `MAX_FRAME_SIZE`. `handshake_initiator()` (client) and `handshake_responder()` (server) implement the Noise IK handshake with X25519 key agreement. |
+| `noise.rs` | `NoiseStream` — wraps `TcpStream` + `snow::TransportState` with length-prefixed AES-256-GCM framing. Payloads above snow's 65535-byte single-message ciphertext cap are split into flag-marked fragments and reassembled transparently, so the effective per-message cap is now the proto codec's 32 MiB `MAX_FRAME_SIZE`. The shared `TransportState` lock is held only per-chunk during encryption, never during the blocking socket writes — together with the single-writer-per-connection discipline on the daemon, this prevents a bidirectional large-message deadlock (see `noise_concurrent_bidirectional_large_messages`). `handshake_initiator()` (client) and `handshake_responder()` (server) implement the Noise IK handshake with X25519 key agreement. |
 | `error.rs` | `TransportError` enum — `Io`, `Noise`, `Protocol`, `AuthFailed`, `ConnectionClosed`. |
 | `key.rs` | Transport keypair handling — `TransportSecretKey` (type-safe X25519 secret), `ensure_transport_keypair()` (generate-or-load with advisory file locking), `read_server_pk()`. `set_test_config_root()` is the keypair-directory test override, now `pub` so integration tests can redirect keypair generation to a temp dir — matching the `choreo_keystore::paths` / `choreo_daemon::mcp::config` precedent. |
 
@@ -530,8 +530,8 @@ synchronous `execute_*` entry points (which `block_on` internally).
 
 | Module | Purpose |
 |---|---|---|
-| `server/lifecycle.rs` | Accept loop (non-blocking `UnixListener` + 50ms poll), signal handling (`signal_hook::flag`), shutdown orchestration. On graceful shutdown, `DaemonMessage::ShuttingDown` is written to every connected client before the socket closes — Unix-socket streams directly, and TCP/Noise clients too: completed-handshake `NoiseStream` clones are ferried from the TCP accept thread to the main thread via an mpsc channel so the notification goes through the encrypted channel (previously Unix-only). |
-| `server/connection.rs` | Per-client `client_thread` (Unix) and `tcp_client_thread` (TCP/Noise) — read `ClientMessages` from the socket, dispatch via `daemon_tx` mpsc channel. Session-summary subscription is an explicit client decision on both transports: a client opts into `SessionCreated`/`SessionStatusChanged`/`SessionDeleted` push broadcasts with `SubscribeSessionsSummary` (previously `tcp_client_thread` auto-registered every Noise client on connect; the GUI now sends the subscribe message at connect to keep its session list live). |
+| `server/lifecycle.rs` | Accept loop (blocking `UnixListener` + signal-wakeup), signal handling, shutdown orchestration. On graceful shutdown, `DaemonMessage::ShuttingDown` is routed through each connection's single writer thread (via a `client_writers` registry in the daemon command loop); the writer thread flushes it and closes its own socket, so a client observes the notification before the EOF. The accept-loop thread never writes to or closes client sockets — there are no retained stream clones and no backstop close pass, so the notification cannot be lost to a race with a socket close. |
+| `server/connection.rs` | Per-client `client_thread` (Unix) and `tcp_client_thread` (TCP/Noise) — read `ClientMessages` from the socket, dispatch via `daemon_tx` mpsc channel. Single-writer discipline: each connection has exactly one writer thread draining its `writer_rx`; `ShuttingDown` is a special-cased message that makes the writer close the socket after flushing (notify-before-EOF), and no other thread ever writes to the socket. Session-summary subscription is an explicit client decision on both transports: a client opts into `SessionCreated`/`SessionStatusChanged`/`SessionDeleted` push broadcasts with `SubscribeSessionsSummary` (previously `tcp_client_thread` auto-registered every Noise client on connect; the GUI now sends the subscribe message at connect to keep its session list live). |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` (including `total_timeout_secs`) and converts the shared fields into `ProviderOverrides` for the other protocols. |
 | `config.rs` | Daemon-level configuration: `DaemonConfig` (`max_turns`, `[context]`), `config_path()`, `load_daemon_config()`, and the deprecated `load_service_config()`. (Previously lived in `openai/config.rs`; it is daemon config, not provider config.) |
@@ -2760,7 +2760,13 @@ cap — the 65519-byte single-fragment boundary plus multi-fragment reassembly
 (65520 bytes = 2 fragments, 1 MiB = 17 fragments, and a post-fragment echo
 proving nonces stay in sync) — malformed-handshake rejection, and a new
 unit test (`transport_state_rejects_tampered_ciphertext`) proving GCM
-authentication rejects a single flipped ciphertext byte.
+authentication rejects a single flipped ciphertext byte. A regression test
+(`noise_concurrent_bidirectional_large_messages`) pins the transport lock
+scope: both endpoints send 1 MiB concurrently under tiny socket buffers, and
+the sends must complete because `send_message` holds the `TransportState`
+lock only per-chunk during encryption and never across the blocking socket
+writes — the old lock-across-`write_all` code deadlocked this scenario
+(neither side's reader could acquire the lock to drain the socket).
 
 **Test infrastructure:** Most tests use `UnixStream::pair()` for socket-less daemon↔client
 communication, and mock HTTP servers for API simulation; the end-to-end transport

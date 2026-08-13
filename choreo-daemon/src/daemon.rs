@@ -53,6 +53,11 @@ pub struct DaemonState {
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
     pub client_streams: Vec<UnixStream>,
     pub summary_subscribers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
+    /// Writer channel of EVERY connected client (both transports), registered
+    /// on connect and removed on disconnect. The shutdown path uses it to
+    /// route `ShuttingDown` through each connection's single writer thread —
+    /// distinct from the opt-in summary/activity subscriber maps.
+    pub client_writers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
     pub activity_subscribers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
     /// Tracks which clients are direct session subscribers of which sessions.
     /// Used by `handle_broadcast_activity` to skip duplicate delivery to
@@ -155,6 +160,16 @@ pub enum DaemonCommand {
     ClientDisconnected {
         client_id: u64,
     },
+    /// Register a connection's writer channel so the shutdown path can route
+    /// `ShuttingDown` through that connection's single writer thread.
+    RegisterClientWriter {
+        client_id: u64,
+        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
+    },
+    /// Deliver `DaemonMessage::ShuttingDown` to every connected client via its
+    /// writer channel; each connection's writer thread then closes its own
+    /// socket, so clients observe the notification before EOF.
+    BroadcastShuttingDown,
     BroadcastActivity(DaemonMessage),
     BroadcastSessionStatus {
         session_id: u64,
@@ -349,6 +364,10 @@ impl DaemonState {
             DaemonCommand::ClientDisconnected { client_id } => {
                 self.handle_client_disconnected(client_id)
             }
+            DaemonCommand::RegisterClientWriter { client_id, writer } => {
+                self.handle_register_client_writer(client_id, writer)
+            }
+            DaemonCommand::BroadcastShuttingDown => self.handle_broadcast_shutting_down(),
             DaemonCommand::BroadcastActivity(msg) => self.handle_broadcast_activity(msg),
             DaemonCommand::BroadcastSessionStatus { session_id, status } => {
                 self.handle_broadcast_session_status(session_id, status)
@@ -1061,6 +1080,35 @@ impl DaemonState {
         self.activity_subscribers.remove(&client_id);
     }
 
+    /// Register a connection's writer channel so the shutdown path can route
+    /// `ShuttingDown` through that connection's single writer thread.
+    fn handle_register_client_writer(
+        &mut self,
+        client_id: u64,
+        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
+    ) {
+        // A fresh connection owns its client_id, so any prior entry is stale.
+        self.client_writers.insert(client_id, writer);
+    }
+
+    /// Deliver `DaemonMessage::ShuttingDown` to every connected client via its
+    /// writer channel; each connection's writer thread then closes its own
+    /// socket, so clients observe the notification before EOF.
+    fn handle_broadcast_shutting_down(&mut self) {
+        // Best-effort, non-blocking: a slow client (full buffer) has its
+        // ShuttingDown dropped — documented best-effort, since the daemon
+        // process exits right after `run_server` returns and closes its
+        // sockets — and a dead client is evicted.
+        self.client_writers.retain(|client_id, tx| {
+            crate::broadcast::try_send_keep_on_full(
+                tx,
+                *client_id,
+                "client",
+                &DaemonMessage::ShuttingDown,
+            )
+        });
+    }
+
     /// Clean up all per-client tracking when a client disconnects.
     /// Removes from summary subscribers, activity subscribers, and session
     /// subscription tracking in a single atomic operation so stale entries
@@ -1070,6 +1118,11 @@ impl DaemonState {
         self.summary_subscribers.remove(&client_id);
         self.activity_subscribers.remove(&client_id);
         self.client_subscribed_sessions.remove(&client_id);
+        // Drop the registered writer channel so this connection's writer
+        // thread can exit: with the connection-local sender (dropped by
+        // cleanup_client) gone too, writer_rx disconnects and the thread's
+        // for-loop terminates.
+        self.client_writers.remove(&client_id);
     }
 
     /// Track that `client_id` is a direct subscriber of `session_id`.
@@ -1750,6 +1803,7 @@ mod tests {
             daemon_tx,
             client_streams: Vec::new(),
             summary_subscribers: HashMap::new(),
+            client_writers: HashMap::new(),
             activity_subscribers: HashMap::new(),
             client_subscribed_sessions: HashMap::new(),
             model_cache: HashMap::new(),

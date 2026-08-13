@@ -21,3 +21,9 @@ rand.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 serial_test.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+# Used only to shrink the test sockets' kernel send/recv buffers (SO_SNDBUF /
+# SO_RCVBUF) in noise_integration.rs — TcpStream has no stable API for these.
+# nix's default features are empty, so opt into the socket feature explicitly.
+nix = { workspace = true, features = ["socket"] }

@@ -6,6 +6,37 @@ use std::sync::mpsc;
 use std::thread;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+/// Shrink a raw TcpStream's kernel send/recv buffers (SO_SNDBUF/SO_RCVBUF)
+/// before the handshake, so the socket's in-flight capacity stays far below
+/// the 1 MiB payloads and the writers are forced to block on a full peer
+/// receive buffer. `TcpStream` has no stable API for these options, so use
+/// `nix`'s setsockopt (Unix only; the dependency is target-gated in
+/// Cargo.toml). Errors are ignored on purpose: on platforms where the sets
+/// fail the kernel keeps default-sized buffers, and even defaults (~64-256
+/// KiB) are far below 1 MiB, so the test still reproduces the deadlock.
+///
+/// 64 KiB, not smaller: the kernel doubles SO_SNDBUF/SO_RCVBUF, and on the
+/// loopback interface the TCP MSS is 32768 bytes. A 4096-byte request (8 KiB
+/// effective) leaves the receive window smaller than one full segment, which
+/// on loopback stalls the transfer with window/retransmit collapses even with
+/// the per-chunk lock fix — a test-environment artifact unrelated to the
+/// lock scope. 64 KiB (128 KiB effective) is well below the 1 MiB payloads,
+/// so the writers still block and the lock-scope deadlock still reproduces,
+/// while TCP can make normal progress.
+#[cfg(unix)]
+fn shrink_socket_buffers(stream: &TcpStream) {
+    use nix::sys::socket::setsockopt;
+    use nix::sys::socket::sockopt::{RcvBuf, SndBuf};
+    let _ = setsockopt(stream, SndBuf, &65536usize);
+    let _ = setsockopt(stream, RcvBuf, &65536usize);
+}
+
+/// Non-Unix fallback: no portable way to shrink the kernel buffers, but the
+/// defaults (~64-256 KiB) are still far below the 1 MiB payloads, so the test
+/// reproduces the deadlock against the old code regardless.
+#[cfg(not(unix))]
+fn shrink_socket_buffers(_stream: &TcpStream) {}
+
 /// Test full Noise IK handshake between client and server.
 #[test]
 #[ignore]
@@ -406,5 +437,176 @@ fn noise_garbage_handshake_message_rejected() {
     assert!(
         server_result.is_err(),
         "responder must reject a malformed handshake message"
+    );
+}
+
+/// Regression test for the bidirectional large-message deadlock.
+///
+/// Both endpoints send 1 MiB CONCURRENTLY (each side's writer thread sends
+/// before its receive completes) under tiny socket buffers, so both
+/// directions' in-flight data far exceeds the kernel buffers. Each side runs
+/// a reader thread via `try_clone` (the same writer-thread + reader-thread
+/// shape the daemon uses per connection), so the writer's `write_all` can
+/// only complete if the reader keeps draining the socket. With the old code,
+/// `send_message` held the shared `TransportState` lock across the blocking
+/// `write_all`s: each side's reader drained one fragment (65 KiB, lock-free)
+/// and then blocked at `lock()` while its own writer held the lock and was
+/// blocked in `write_all` (the peer's receive buffer full) — neither side
+/// drained, so both writers blocked forever. With the fix the lock is held
+/// only per-chunk during encryption and never across socket I/O, so the
+/// readers always acquire the lock (briefly) and drain, and every
+/// `write_all` completes. This test pins that fix: it deadlocks (and times
+/// out) against the old code, passes against the new one.
+#[test]
+#[ignore]
+fn noise_concurrent_bidirectional_large_messages() {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_pk = PublicKey::from(&server_sk);
+    let server_sk_bytes = server_sk.to_bytes();
+    let server_pk_bytes = server_pk.to_bytes();
+
+    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let client_pk = PublicKey::from(&client_sk);
+    let client_sk_bytes = client_sk.to_bytes();
+    let client_pk_bytes = client_pk.to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    // Both sides send 1 MiB before either's receive completes; distinct byte
+    // patterns let each side verify it got the peer's message, not its own.
+    let client_payload = vec![0xABu8; 1024 * 1024];
+    let server_payload = vec![0xCDu8; 1024 * 1024];
+
+    // Relay each side's result (Ok or a String error) over its own channel;
+    // a panic in either thread would drop its stream mid-protocol and could
+    // wedge the peer, so all failures are returned as Err instead.
+    let (server_tx, server_rx) = mpsc::channel();
+    let (client_tx, client_rx) = mpsc::channel();
+
+    let server_sk = server_sk_bytes;
+    let client_pk_ref = client_pk_bytes;
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        // Shrink the kernel buffers BEFORE the handshake so the socket's
+        // in-flight capacity stays far below the 1 MiB payloads, forcing the
+        // writers to block on a full peer receive buffer (see
+        // shrink_socket_buffers for why failures are ignored).
+        shrink_socket_buffers(&stream);
+        let result = (|| -> Result<(), String> {
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk_ref)
+                .map_err(|e| format!("server handshake failed: {e:?}"))?;
+
+            // Spawn the READER on its own thread via try_clone — the same
+            // shape as the daemon (one writer thread + one reader thread per
+            // connection, sharing the TransportState through the Arc<Mutex>).
+            // The writer thread below sends 1 MiB FIRST; the reader drains
+            // the socket concurrently, and that concurrent drain is exactly
+            // what the old lock-across-write_all code prevented (the reader
+            // blocked at lock() while the writer held the lock and blocked in
+            // write_all).
+            let mut reader = server
+                .try_clone()
+                .map_err(|e| format!("server try_clone failed: {e:?}"))?;
+            let (recv_tx, recv_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let recv_result = (|| -> Result<(), String> {
+                    let received = reader
+                        .recv_message()
+                        .map_err(|e| format!("server recv 1 MiB failed: {e:?}"))?;
+                    let expected = vec![0xABu8; 1024 * 1024];
+                    if received != expected {
+                        return Err(format!(
+                            "server payload mismatch: got {} bytes, want 1 MiB of 0xAB",
+                            received.len()
+                        ));
+                    }
+                    Ok(())
+                })();
+                recv_tx.send(recv_result).expect("send server recv result");
+            });
+
+            // SEND BEFORE RECEIVING: the send starts while the reader thread
+            // above drains the other direction. Under the old code this
+            // deadlocked once both sides' receive buffers filled — the reader
+            // could not acquire the TransportState lock to decrypt, so the
+            // writer's write_all never completed. With the fix the send
+            // completes because the reader always drains.
+            server
+                .send_message(&server_payload)
+                .map_err(|e| format!("server send 1 MiB failed: {e:?}"))?;
+
+            // The send completed, so the reader must have drained everything;
+            // join it to surface any receive-side failure.
+            recv_rx
+                .recv()
+                .map_err(|e| format!("server recv join failed: {e}"))?
+        })();
+        server_tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    // Same tiny-buffer treatment on the client side, before the handshake.
+    shrink_socket_buffers(&stream);
+    thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let mut client = handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes)
+                .map_err(|e| format!("client handshake failed: {e:?}"))?;
+
+            // Same reader-thread shape as the server side (see above).
+            let mut reader = client
+                .try_clone()
+                .map_err(|e| format!("client try_clone failed: {e:?}"))?;
+            let (recv_tx, recv_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let recv_result = (|| -> Result<(), String> {
+                    let received = reader
+                        .recv_message()
+                        .map_err(|e| format!("client recv 1 MiB failed: {e:?}"))?;
+                    let expected = vec![0xCDu8; 1024 * 1024];
+                    if received != expected {
+                        return Err(format!(
+                            "client payload mismatch: got {} bytes, want 1 MiB of 0xCD",
+                            received.len()
+                        ));
+                    }
+                    Ok(())
+                })();
+                recv_tx.send(recv_result).expect("send client recv result");
+            });
+
+            // SEND BEFORE RECEIVING (see server side above).
+            client
+                .send_message(&client_payload)
+                .map_err(|e| format!("client send 1 MiB failed: {e:?}"))?;
+
+            recv_rx
+                .recv()
+                .map_err(|e| format!("client recv join failed: {e}"))?
+        })();
+        client_tx.send(result).expect("send client result");
+    });
+
+    // Wait on BOTH sides with a bounded timeout: a deadlock fails the test
+    // with a clear message instead of hanging the suite. Nextest runs each
+    // test in its own process and tears it down when the test function
+    // returns, so the deadlocked threads do not leak into other tests.
+    let server_result = match server_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(result) => result.map_err(|e| format!("server side failed: {e}")),
+        Err(_) => panic!("timed out waiting for server side (deadlock?)"),
+    };
+    let client_result = match client_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(result) => result.map_err(|e| format!("client side failed: {e}")),
+        Err(_) => panic!("timed out waiting for client side (deadlock?)"),
+    };
+    assert!(
+        server_result.is_ok(),
+        "server side should succeed: {:?}",
+        server_result.err()
+    );
+    assert!(
+        client_result.is_ok(),
+        "client side should succeed: {:?}",
+        client_result.err()
     );
 }

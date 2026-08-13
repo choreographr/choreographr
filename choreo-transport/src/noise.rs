@@ -56,29 +56,32 @@ impl NoiseStream {
     /// [`MAX_PLAINTEXT_CHUNK`] are split into multiple fragments; the
     /// `MORE_FRAGMENTS` flag bit set on every non-final fragment's length
     /// prefix tells the receiver to keep reading.
+    ///
+    /// The shared `TransportState` lock is held only per-chunk, during the
+    /// encrypt call, and is NEVER held across the blocking `write_all`s —
+    /// the reader must always be able to acquire it (briefly) and drain the
+    /// socket, or two peers sending large messages concurrently would
+    /// deadlock once the socket buffers filled.
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
         // Reusable ciphertext buffer: one Noise message's worst case is
         // MAX_PLAINTEXT_CHUNK plaintext bytes plus the 16-byte AES-GCM tag.
         // Reusing it across chunks avoids reallocating per fragment.
         let mut buf = vec![0u8; MAX_PLAINTEXT_CHUNK + 16];
 
-        // Hold the shared TransportState lock for the WHOLE message, across
-        // every chunk. Two senders share this NoiseStream via try_clone (the
-        // connection's writer thread and, on the daemon, the
-        // shutdown-notification thread); releasing the lock between chunks
-        // would let them interleave fragments of different messages on the
-        // wire, which the receiver's reassembly would corrupt. Holding the
-        // lock keeps both the send nonce counter and the frame bytes of one
-        // logical message atomic. (The current code already holds the lock
-        // during the blocking write_all, so this does not add new blocking.)
-        let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
-
-        // chunks(MAX_PLAINTEXT_CHUNK) yields exactly one empty chunk for an
-        // empty payload — a single frame with the flag clear, byte-identical
-        // to the pre-fragmentation wire format.
+        // Serializing sends is the writer thread's job (each NoiseStream has a
+        // single writer), so the TransportState lock is only needed to make the
+        // encrypt call atomic against the reader's decrypts. It must NEVER be
+        // held across the blocking write_all below: a reader waiting on the
+        // lock would stop draining the socket, and a peer doing the same in the
+        // other direction would deadlock once the socket buffers filled. Each
+        // chunk is therefore encrypted under a brief lock and written outside
+        // it, so the reader can always acquire the lock and drain.
         let mut remaining = plaintext.len();
         for chunk in plaintext.chunks(MAX_PLAINTEXT_CHUNK) {
-            let n = transport.write_message(chunk, &mut buf)?;
+            let n = {
+                let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
+                transport.write_message(chunk, &mut buf)?
+            };
             // This chunk is non-final iff it did not consume all remaining
             // plaintext; a full-size chunk in the middle leaves a remainder,
             // while the final chunk (even one exactly MAX_PLAINTEXT_CHUNK

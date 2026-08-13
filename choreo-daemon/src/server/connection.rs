@@ -4,6 +4,7 @@ use choreo_proto::{
     ClientMessage, ContextConfig, DaemonMessage, ProtoError, read_message, write_message,
 };
 use std::io::{self, BufReader, BufWriter, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::sync::mpsc::SyncSender;
@@ -361,12 +362,28 @@ pub(crate) fn client_thread(
                 break;
             }
             let _ = writer.flush();
+            // This thread is the connection's SOLE writer. Closing the socket
+            // here — right after flushing ShuttingDown — guarantees the client
+            // observes the notification before the EOF, with no other thread
+            // ever writing to the socket. (DaemonMessage::ShuttingDown is only
+            // ever enqueued by the shutdown broadcast.)
+            if matches!(msg, DaemonMessage::ShuttingDown) {
+                let _ = writer.get_ref().shutdown(Shutdown::Both);
+                break;
+            }
         }
     });
 
     let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
     let mut attached_session_id: Option<u64> = None;
     let client_id = rand::random::<u64>();
+    // Register this connection's writer channel with the daemon so the
+    // shutdown path can route `ShuttingDown` through this single writer
+    // thread instead of writing to the socket from another thread.
+    let _ = daemon_tx.send(DaemonCommand::RegisterClientWriter {
+        client_id,
+        writer: writer_tx.clone(),
+    });
     info!("client connected: id={}", client_id);
     crate::metrics::record_client_connected();
 
@@ -426,12 +443,27 @@ pub(crate) fn tcp_client_thread(
                 warn!("tcp writer thread error: {e}");
                 break;
             }
+            // Sole-writer discipline: closing the socket here, right after the
+            // ShuttingDown flush, makes notify-before-EOF deterministic and
+            // keeps the accept-loop thread from ever writing to the socket.
+            if matches!(msg, DaemonMessage::ShuttingDown) {
+                let _ = writer.get_ref().shutdown(Shutdown::Both);
+                break;
+            }
         }
     });
 
     let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
     let mut attached_session_id: Option<u64> = None;
     let client_id = rand::random::<u64>();
+    // Register this connection's writer channel with the daemon so the
+    // shutdown path can route `ShuttingDown` through this single writer
+    // thread (see client_thread). The NoiseStream's TransportState lock is
+    // only safe to take per-message because this is the sole sender.
+    let _ = daemon_tx.send(DaemonCommand::RegisterClientWriter {
+        client_id,
+        writer: writer_tx.clone(),
+    });
     let mut reader = noise;
     info!("TCP client connected: id={}", client_id);
     crate::metrics::record_client_connected();

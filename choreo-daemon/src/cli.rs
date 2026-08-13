@@ -226,6 +226,7 @@ pub fn main() -> anyhow::Result<()> {
         tool_registry,
         client_streams: Vec::new(),
         summary_subscribers: std::collections::HashMap::new(),
+        client_writers: HashMap::new(),
         activity_subscribers: std::collections::HashMap::new(),
         client_subscribed_sessions: std::collections::HashMap::new(),
         model_cache: HashMap::new(),
