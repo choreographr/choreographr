@@ -218,26 +218,19 @@ fn noise_list_sessions_round_trip() {
     // carrying the id the daemon assigned at creation, proving the create
     // path updated the same daemon-side store the list reads from.
     //
-    // Unlike the Unix client_thread, tcp_client_thread auto-registers every
-    // Noise client as a SUMMARY SUBSCRIBER, so session creation also pushes
-    // a SessionCreated broadcast (duplicating the direct reply) and a
-    // SessionStatusChanged broadcast onto the writer channel — the interleave
-    // of the connection thread's reply with the daemon loop's broadcasts is
-    // racy, so drain both until the ListSessions reply arrives (the drain is
-    // bounded by `recv`'s recv_timeout, so a wedged daemon fails loudly).
+    // This client never sent SubscribeSessionsSummary, and summary
+    // broadcasts are an explicit opt-in on BOTH transports (tcp_client_thread
+    // no longer auto-registers), so no SessionCreated/SessionStatusChanged
+    // broadcast arrives between the create reply and the list reply — the
+    // next message is exactly the Sessions reply. This is the regression pin
+    // for the removed TCP auto-registration.
     client.send(ClientMessage::ListSessions);
-    loop {
-        match client.recv() {
-            DaemonMessage::SessionCreated { .. } | DaemonMessage::SessionStatusChanged { .. } => {
-                continue;
-            }
-            DaemonMessage::Sessions { sessions } => {
-                assert_eq!(sessions.len(), 1);
-                assert_eq!(sessions[0].session_id, 1);
-                break;
-            }
-            other => panic!("expected Sessions, got {other:?}"),
+    match client.recv() {
+        DaemonMessage::Sessions { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].session_id, 1);
         }
+        other => panic!("expected Sessions, got {other:?}"),
     }
 
     daemon.shutdown();
@@ -297,6 +290,11 @@ fn noise_and_unix_share_daemon_state() {
     // ...and the Unix client sees it: both listeners serve the same
     // DaemonState, so a session created through one transport is visible
     // through the other.
+    //
+    // Neither client has subscribed to the session summary (the Unix client
+    // never sends SubscribeSessionsSummary and the Noise client was not
+    // auto-registered), so no broadcast lands on the Unix channel before its
+    // reply — the next message must be exactly the Sessions reply.
     from_ui
         .send(ClientMessage::ListSessions)
         .expect("send to daemon");
@@ -321,6 +319,119 @@ fn noise_and_unix_share_daemon_state() {
         .join()
         .expect("unix client thread panicked")
         .expect("clean close after shutdown");
+}
+
+#[test]
+#[ignore]
+fn noise_subscribe_receives_session_broadcasts() {
+    // Two authorized Noise clients with independent keypairs: A opts into
+    // session-summary broadcasts, B stays unsubscribed. This is the
+    // regression pin for the removed TCP auto-registration — summary
+    // broadcasts must now be earned with an explicit
+    // SubscribeSessionsSummary on the Noise transport, exactly as on the
+    // Unix path.
+    let (key_dir_a, client_pk_a) = test_keypair();
+    let (key_dir_b, client_pk_b) = test_keypair();
+    let mut daemon = common::SpawnedDaemon::start(&[client_pk_a, client_pk_b]);
+
+    let client_a = NoiseClient::connect(
+        &daemon.tcp_addr.to_string(),
+        &daemon.server_pk,
+        key_dir_a.path().to_path_buf(),
+    );
+    let client_b = NoiseClient::connect(
+        &daemon.tcp_addr.to_string(),
+        &daemon.server_pk,
+        key_dir_b.path().to_path_buf(),
+    );
+
+    // A opts in to summary broadcasts; B never sends the message.
+    client_a.send(ClientMessage::SubscribeSessionsSummary);
+
+    // Synchronize: A's connection thread forwards SubscribeSessionsSummary
+    // and ListSessions to the daemon command loop in order, so when A
+    // receives the Sessions reply the RegisterSummarySubscriber has been
+    // processed. Without this barrier, B's CreateSession below could win the
+    // race to the daemon loop and session 1's broadcast would miss A
+    // (zero subscribers at broadcast time) — flaking the test.
+    client_a.send(ClientMessage::ListSessions);
+    match client_a.recv() {
+        DaemonMessage::Sessions { sessions } => assert!(sessions.is_empty()),
+        other => panic!("expected empty Sessions, got {other:?}"),
+    }
+
+    // B creates a session. An unsubscribed client must receive only the
+    // DIRECT SessionCreated reply — not the duplicate SessionCreated and
+    // SessionStatusChanged broadcasts that the old auto-registration pushed
+    // onto every TCP client's writer channel. (Under auto-registration this
+    // single recv could have returned either broadcast first, which is why
+    // the old tests drained; the exact-one-message assert below is the pin.)
+    client_b.send(create_session());
+    match client_b.recv() {
+        DaemonMessage::SessionCreated { session_id, .. } => assert_eq!(session_id, 1),
+        other => panic!("expected SessionCreated, got {other:?}"),
+    }
+
+    // A, subscribed, sees B's creation as two summary broadcasts: a
+    // SessionCreated and a SessionStatusChanged. The daemon loop emits them
+    // back-to-back onto A's writer channel, but the direct-reply thread and
+    // the daemon loop both write to that channel, so their relative order is
+    // not load-bearing — accept either order; both must arrive.
+    let mut saw_created = false;
+    let mut saw_status = false;
+    for _ in 0..2 {
+        match client_a.recv() {
+            DaemonMessage::SessionCreated { session_id, .. } => {
+                assert_eq!(session_id, 1);
+                saw_created = true;
+            }
+            DaemonMessage::SessionStatusChanged { session_id, .. } => {
+                assert_eq!(session_id, 1);
+                saw_status = true;
+            }
+            other => panic!("expected summary broadcast, got {other:?}"),
+        }
+    }
+    assert!(
+        saw_created,
+        "subscribed client must receive the SessionCreated broadcast"
+    );
+    assert!(
+        saw_status,
+        "subscribed client must receive the SessionStatusChanged broadcast"
+    );
+
+    // A creates a session too. A receives three messages for it — the
+    // direct SessionCreated reply plus its own broadcast SessionCreated and
+    // SessionStatusChanged — in racy order, so count rather than sequence
+    // them. B (unsubscribed) must stay quiet: a Ping's Pong has to be B's
+    // very next message, which it could not be if any broadcast about A's
+    // session had leaked onto B's writer channel.
+    client_a.send(create_session());
+    let mut created_2 = 0;
+    let mut status_2 = 0;
+    for _ in 0..3 {
+        match client_a.recv() {
+            DaemonMessage::SessionCreated { session_id, .. } => {
+                assert_eq!(session_id, 2);
+                created_2 += 1;
+            }
+            DaemonMessage::SessionStatusChanged { session_id, .. } => {
+                assert_eq!(session_id, 2);
+                status_2 += 1;
+            }
+            other => panic!("expected session 2 traffic, got {other:?}"),
+        }
+    }
+    assert_eq!(created_2, 2, "direct reply + broadcast SessionCreated");
+    assert_eq!(status_2, 1, "broadcast SessionStatusChanged");
+
+    client_b.send(ClientMessage::Ping);
+    assert_eq!(client_b.recv(), DaemonMessage::Pong);
+
+    daemon.shutdown();
+    client_a.finish().expect("clean close after shutdown");
+    client_b.finish().expect("clean close after shutdown");
 }
 
 #[test]
@@ -403,5 +514,43 @@ fn noise_shutdown_notifies_client() {
 
     // The EOF that follows the notification must be a clean close — Ok(()),
     // not an I/O error.
+    client.finish().expect("clean close after shutdown");
+}
+
+/// Test that a >64 KiB message survives the FULL daemon round trip. The
+/// client's 1 MiB AddCredential payload must fragment on the wire (snow's
+/// single-message cap is 65519 plaintext bytes); the daemon's
+/// `tcp_client_thread` reassembles it via `recv_client_message`, the command
+/// loop stores the blob (`handle_add_credential_sync`), and the CredentialAdded
+/// reply travels back through the same encrypted channel. This proves the
+/// framing change is invisible above the transport: typed proto messages can
+/// now be as large as the codec's 32 MiB `MAX_FRAME_SIZE`, not just 65519
+/// bytes.
+#[test]
+#[ignore]
+fn noise_large_message_through_daemon() {
+    let (key_dir, client_pk) = test_keypair();
+    let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
+    let client = NoiseClient::connect(
+        &daemon.tcp_addr.to_string(),
+        &daemon.server_pk,
+        key_dir.path().to_path_buf(),
+    );
+
+    // 1 MiB encrypted credential blob — 17 wire fragments — far beyond the
+    // 65519-byte single Noise message cap, so the sender must split it and
+    // the daemon's reader must glue the fragments back before the command
+    // loop ever sees the message.
+    client.send(ClientMessage::AddCredential {
+        service: "big-blob".into(),
+        encrypted_payload: vec![0x42u8; 1024 * 1024],
+        unlock_key: None,
+    });
+    match client.recv() {
+        DaemonMessage::CredentialAdded { service } => assert_eq!(service, "big-blob"),
+        other => panic!("expected CredentialAdded, got {other:?}"),
+    }
+
+    daemon.shutdown();
     client.finish().expect("clean close after shutdown");
 }

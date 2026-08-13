@@ -24,6 +24,14 @@ pub(crate) fn use_daemon_connection() -> DaemonConnection {
         if let Err(e) = client_tx.send(ClientMessage::ListSessions) {
             tracing::error!("failed to send ListSessions: {e}");
         }
+        // The GUI keeps its session list live via daemon push broadcasts
+        // (SessionCreated / SessionStatusChanged / SessionDeleted). The daemon
+        // no longer auto-registers TCP clients as summary subscribers, so the
+        // GUI must opt in explicitly at connect — same as the TUI does on the
+        // Unix path.
+        if let Err(e) = client_tx.send(ClientMessage::SubscribeSessionsSummary) {
+            tracing::error!("failed to send SubscribeSessionsSummary: {e}");
+        }
         daemon_tx.set(Some(client_tx));
         events_rx.set(Some(ui_rx));
         let tx = ui_tx.clone();

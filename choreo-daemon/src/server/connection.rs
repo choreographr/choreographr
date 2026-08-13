@@ -436,13 +436,12 @@ pub(crate) fn tcp_client_thread(
     info!("TCP client connected: id={}", client_id);
     crate::metrics::record_client_connected();
 
-    // Register the summary subscriber so daemon push notifications
-    // go through the writer thread (writer_tx channel).
-    let _ = daemon_tx.send(DaemonCommand::RegisterSummarySubscriber {
-        client_id,
-        writer: writer_tx.clone(),
-    });
-
+    // Summary subscription is an explicit client decision on this transport,
+    // exactly as on the Unix path: a Noise client opts in via
+    // ClientMessage::SubscribeSessionsSummary (dispatched in
+    // dispatch_client_message). Previously every TCP connection was
+    // auto-registered here, which pushed broadcasts about other clients'
+    // sessions to clients that never asked.
     loop {
         match reader.recv_client_message() {
             Ok(msg) => {

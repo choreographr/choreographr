@@ -187,8 +187,9 @@ fn noise_encrypted_message_round_trip() {
 /// messages at 65535 bytes ciphertext, and snow 0.10 enforces this via a
 /// hard `MAXMSGLEN` constant with no builder knob to raise it. proto's
 /// 32 MiB `MAX_FRAME_SIZE` governs only the typed codec layer above the
-/// cipher; carrying a message larger than the Noise cap would require
-/// fragmentation at a higher layer, which is out of scope here.
+/// cipher; this test pins the single-fragment wire format, while
+/// `noise_fragmented_message_round_trip` covers payloads past this cap
+/// (which the transport now splits and reassembles transparently).
 #[test]
 #[ignore]
 fn noise_large_message_round_trip() {
@@ -251,6 +252,120 @@ fn noise_large_message_round_trip() {
     assert!(
         server_result.is_ok(),
         "server should verify the payload byte-for-byte: {:?}",
+        server_result.err()
+    );
+}
+
+/// Test that payloads larger than snow's single-message cap fragment on the
+/// wire and reassemble transparently. 65520 bytes is exactly one past the
+/// 65519-byte single-message maximum, so it must split into two fragments;
+/// 1024 * 1024 bytes spans 17 fragments (16 full 65519-byte chunks plus a
+/// 272-byte remainder). The final small echo round trip proves the shared
+/// TransportState keeps working across fragment boundaries — send and recv
+/// nonces stay in sync after a multi-fragment exchange, and the transport
+/// still carries ordinary single-frame messages afterwards.
+#[test]
+#[ignore]
+fn noise_fragmented_message_round_trip() {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_pk = PublicKey::from(&server_sk);
+    let server_sk_bytes = server_sk.to_bytes();
+    let server_pk_bytes = server_pk.to_bytes();
+
+    let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let client_pk = PublicKey::from(&client_sk);
+    let client_sk_bytes = client_sk.to_bytes();
+    let client_pk_bytes = client_pk.to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    let server_sk = server_sk_bytes;
+    let client_pk_ref = client_pk_bytes;
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        // Same Result-relay pattern as the other tests: all server-side
+        // assertions run in a closure whose error is sent over mpsc, so a
+        // mismatch surfaces in the client thread instead of panicking and
+        // dropping the stream mid-protocol.
+        let result = (|| -> Result<(), String> {
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk_ref)
+                .map_err(|e| format!("server handshake failed: {e:?}"))?;
+
+            // 65520 bytes = 65519 + 1: exactly two fragments.
+            let expected_two = vec![0x11u8; 65519 + 1];
+            let payload_two = server
+                .recv_message()
+                .map_err(|e| format!("recv 2-fragment message failed: {e:?}"))?;
+            if payload_two != expected_two {
+                return Err(format!(
+                    "2-fragment payload mismatch: got {} bytes, want {} bytes of 0x11",
+                    payload_two.len(),
+                    expected_two.len()
+                ));
+            }
+
+            // 1024 * 1024 bytes = 16 full chunks + a 272-byte remainder:
+            // 17 fragments in total, exercising sustained reassembly.
+            let expected_mib = vec![0x22u8; 1024 * 1024];
+            let payload_mib = server
+                .recv_message()
+                .map_err(|e| format!("recv 17-fragment message failed: {e:?}"))?;
+            if payload_mib != expected_mib {
+                return Err(format!(
+                    "17-fragment payload mismatch: got {} bytes, want {} bytes of 0x22",
+                    payload_mib.len(),
+                    expected_mib.len()
+                ));
+            }
+
+            // Echo the small tail message back verbatim. This is a *send*
+            // after two multi-fragment *receives*: if the shared
+            // TransportState's send nonce had drifted out of sync with the
+            // client's recv nonce across the fragment boundaries, the client
+            // would fail to decrypt this reply.
+            let tail = server
+                .recv_message()
+                .map_err(|e| format!("recv tail failed: {e:?}"))?;
+            server
+                .send_message(&tail)
+                .map_err(|e| format!("echo tail failed: {e:?}"))?;
+            Ok(())
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let mut client =
+        handshake_initiator(stream, &client_sk_bytes, &server_pk_bytes).expect("client handshake");
+
+    // One byte past the single-message cap: the sender must split this into
+    // two fragments (65519 + 1), and the receiver must glue them back.
+    let payload_two = vec![0x11u8; 65519 + 1];
+    client
+        .send_message(&payload_two)
+        .expect("client send 2-fragment payload");
+
+    // 1 MiB — 17 fragments — proves the reassembly loop sustains many
+    // fragments, not just a single split.
+    let payload_mib = vec![0x22u8; 1024 * 1024];
+    client
+        .send_message(&payload_mib)
+        .expect("client send 1 MiB payload");
+
+    // A small message after the fragments: the transport must still carry
+    // ordinary single-frame messages once the multi-fragment traffic is done.
+    let tail = b"tail".to_vec();
+    client.send_message(&tail).expect("client send tail");
+    let echo = client.recv_message().expect("client recv tail echo");
+    assert_eq!(echo, tail, "server must echo the tail verbatim");
+
+    let server_result = rx.recv().expect("recv server result");
+    assert!(
+        server_result.is_ok(),
+        "server should verify all fragmented payloads: {:?}",
         server_result.err()
     );
 }

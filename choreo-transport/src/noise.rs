@@ -7,6 +7,16 @@ use tracing::{debug, info};
 
 use crate::error::TransportError;
 
+/// Maximum plaintext bytes in a single Noise message. snow caps one message's
+/// ciphertext at 65535 bytes (MAXMSGLEN); AES-256-GCM appends a 16-byte tag,
+/// leaving 65519 bytes of plaintext per encrypted message.
+const MAX_PLAINTEXT_CHUNK: usize = 65535 - 16;
+/// High bit of the 4-byte data-plane length prefix: when set, more fragments
+/// of the same logical message follow. Real per-fragment ciphertext lengths
+/// are <= 65535 (snow's cap), far below 2^31, so the bit is unambiguous; the
+/// proto codec's own 32 MiB frame cap (MAX_FRAME_SIZE) never collides with it.
+const MORE_FRAGMENTS: u32 = 0x8000_0000;
+
 /// An encrypted Noise IK transport stream.
 ///
 /// Wraps a TcpStream with a snow TransportState. Every message is
@@ -40,41 +50,93 @@ impl NoiseStream {
 
     /// Send an encrypted message.
     ///
-    /// Encrypts the plaintext into a separate ciphertext buffer (leaving
-    /// the input untouched), then writes a 4-byte big-endian length prefix
-    /// followed by the ciphertext.
+    /// Encrypts the plaintext into one or more ciphertext fragments (leaving
+    /// the input untouched), then writes each fragment's 4-byte big-endian
+    /// length prefix followed by the ciphertext. Payloads larger than
+    /// [`MAX_PLAINTEXT_CHUNK`] are split into multiple fragments; the
+    /// `MORE_FRAGMENTS` flag bit set on every non-final fragment's length
+    /// prefix tells the receiver to keep reading.
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
-        let mut buf = vec![0u8; plaintext.len() + 16];
-        let n = self
-            .transport
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .write_message(plaintext, &mut buf)?;
-        let len = (n as u32).to_be_bytes();
-        self.tcp.write_all(&len)?;
-        self.tcp.write_all(&buf[..n])?;
+        // Reusable ciphertext buffer: one Noise message's worst case is
+        // MAX_PLAINTEXT_CHUNK plaintext bytes plus the 16-byte AES-GCM tag.
+        // Reusing it across chunks avoids reallocating per fragment.
+        let mut buf = vec![0u8; MAX_PLAINTEXT_CHUNK + 16];
+
+        // Hold the shared TransportState lock for the WHOLE message, across
+        // every chunk. Two senders share this NoiseStream via try_clone (the
+        // connection's writer thread and, on the daemon, the
+        // shutdown-notification thread); releasing the lock between chunks
+        // would let them interleave fragments of different messages on the
+        // wire, which the receiver's reassembly would corrupt. Holding the
+        // lock keeps both the send nonce counter and the frame bytes of one
+        // logical message atomic. (The current code already holds the lock
+        // during the blocking write_all, so this does not add new blocking.)
+        let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
+
+        // chunks(MAX_PLAINTEXT_CHUNK) yields exactly one empty chunk for an
+        // empty payload — a single frame with the flag clear, byte-identical
+        // to the pre-fragmentation wire format.
+        let mut remaining = plaintext.len();
+        for chunk in plaintext.chunks(MAX_PLAINTEXT_CHUNK) {
+            let n = transport.write_message(chunk, &mut buf)?;
+            // This chunk is non-final iff it did not consume all remaining
+            // plaintext; a full-size chunk in the middle leaves a remainder,
+            // while the final chunk (even one exactly MAX_PLAINTEXT_CHUNK
+            // bytes) leaves none.
+            let more = remaining > chunk.len();
+            remaining -= chunk.len();
+            let mut len = n as u32;
+            if more {
+                len |= MORE_FRAGMENTS;
+            }
+            self.tcp.write_all(&len.to_be_bytes())?;
+            self.tcp.write_all(&buf[..n])?;
+        }
         Ok(())
     }
 
     /// Receive a decrypted message.
     ///
-    /// Reads the 4-byte length prefix, then reads exactly that many
-    /// bytes of ciphertext, decrypts into a plaintext buffer, and returns
-    /// the plaintext.
+    /// Reads one or more length-prefixed ciphertext fragments, decrypting
+    /// each into a shared plaintext buffer, until a fragment with the
+    /// `MORE_FRAGMENTS` flag clear arrives — that fragment terminates the
+    /// logical message.
     pub fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
-        let mut len_buf = [0u8; 4];
-        self.tcp.read_exact(&mut len_buf)?;
-        let ct_len = u32::from_be_bytes(len_buf) as usize;
-        let mut ct_buf = vec![0u8; ct_len];
-        self.tcp.read_exact(&mut ct_buf)?;
-        let mut pt_buf = vec![0u8; ct_len];
-        let n = self
-            .transport
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .read_message(&ct_buf, &mut pt_buf)?;
-        pt_buf.truncate(n);
-        Ok(pt_buf)
+        let mut plaintext = Vec::new();
+        loop {
+            // Read the raw frame bytes WITHOUT holding the TransportState
+            // lock: snow tracks separate send and recv nonce counters, so an
+            // interleaved send_message from another thread is safe, and a
+            // sender can never be blocked by this reader. If recv_message
+            // instead held the mutex while blocked on read_exact, a
+            // concurrent sender (e.g. the daemon's shutdown-notification
+            // thread sending ShuttingDown) would block forever on a reader
+            // waiting for data that may never come — a shutdown deadlock.
+            let mut len_buf = [0u8; 4];
+            self.tcp.read_exact(&mut len_buf)?;
+            let raw = u32::from_be_bytes(len_buf);
+            let more = raw & MORE_FRAGMENTS != 0;
+            // Mask the flag bit off: the real per-fragment ciphertext length
+            // is <= 65535 (snow's cap), so the flag occupies a bit no real
+            // length ever sets (see MORE_FRAGMENTS).
+            let ct_len = (raw & !MORE_FRAGMENTS) as usize;
+            let mut ct_buf = vec![0u8; ct_len];
+            self.tcp.read_exact(&mut ct_buf)?;
+
+            // Take the lock briefly to decrypt this one fragment, then
+            // release it before the next blocking read (see above).
+            let mut pt_buf = vec![0u8; ct_len];
+            let n = self
+                .transport
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .read_message(&ct_buf, &mut pt_buf)?;
+            plaintext.extend_from_slice(&pt_buf[..n]);
+
+            if !more {
+                return Ok(plaintext);
+            }
+        }
     }
 
     /// Send a typed ClientMessage (convenience for clients).
