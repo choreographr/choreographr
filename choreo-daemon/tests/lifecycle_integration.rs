@@ -1,47 +1,12 @@
-use choreo_daemon::accounts::AccountManager;
-use choreo_daemon::{DaemonState, run_server};
+use choreo_daemon::run_server;
 use choreo_proto::{ClientMessage, DaemonMessage, read_message, write_message};
-use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-/// Build a minimal [`DaemonState`] suitable for testing the server lifecycle.
-fn test_daemon_state() -> DaemonState {
-    let (daemon_tx, _daemon_rx) = mpsc::channel();
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db =
-        Arc::new(redb::Database::create(dir.path().join("state.redb")).expect("test database"));
-    let tool_registry = choreo_daemon::tools::ToolRegistry::new().build();
-    let config_dir = tempfile::tempdir().expect("tempdir for config");
-    let accounts_path = config_dir.path().join("accounts.toml");
-
-    DaemonState {
-        next_session_id: 1,
-        max_turns: 10,
-        active_sessions: HashMap::new(),
-        session_metadata: HashMap::new(),
-        deleted_sessions: std::collections::HashSet::new(),
-        children: HashMap::new(),
-        accounts: AccountManager::load(&accounts_path).unwrap(),
-        providers: HashMap::new(),
-        credentials: HashMap::new(),
-        x_credentials: None,
-        db,
-        tool_registry,
-        daemon_tx,
-        client_streams: Vec::new(),
-        summary_subscribers: HashMap::new(),
-        activity_subscribers: HashMap::new(),
-        client_subscribed_sessions: HashMap::new(),
-        model_cache: HashMap::new(),
-        mcp_manager: choreo_daemon::mcp::McpManager::empty(),
-    }
-}
+mod common;
 
 #[test]
 #[ignore]
@@ -50,7 +15,7 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
     let socket_path = dir.path().join("test.sock");
     let socket_str = socket_path.to_str().expect("valid socket path").to_string();
 
-    let state = test_daemon_state();
+    let state = common::test_daemon_state();
 
     // Dummy transport key and empty ACL (no TCP listener needed for this test).
     let transport_sk = choreo_transport::key::TransportSecretKey::new([0u8; 32]);

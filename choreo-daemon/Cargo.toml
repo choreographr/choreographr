@@ -134,3 +134,6 @@ choreo-daemon = { path = ".", features = ["test-utils"] }
 # The shared scripted HTTP mock provider for the reasoning round-trip wire
 # tests lives in choreo-ai-protocols behind its `test-utils` feature.
 choreo-ai-protocols = { workspace = true, features = ["test-utils"] }
+# The real client-side connection library used by the daemon<->client
+# integration tests (tests/daemon_client_unix.rs, tests/daemon_client_noise.rs).
+choreo-client-core.workspace = true

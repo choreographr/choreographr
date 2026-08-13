@@ -144,6 +144,12 @@ pub fn run_server(
     }
 
     // TCP listener for Noise IK clients.
+    //
+    // Completed-handshake NoiseStream clones are ferried from the TCP accept
+    // thread back to the main thread so the shutdown path can send
+    // `ShuttingDown` through the encrypted channel, just like the Unix
+    // client streams tracked below.
+    let (tcp_notify_tx, tcp_notify_rx) = mpsc::channel::<choreo_transport::noise::NoiseStream>();
     let tcp_shutdown = Arc::clone(&shutdown);
     if let Some(ref tcp_addr_str) = tcp_addr {
         let addr: SocketAddr = tcp_addr_str.parse().map_err(|e| {
@@ -166,6 +172,7 @@ pub fn run_server(
                 match listener.accept() {
                     Ok((tcp, _)) => {
                         let tx = daemon_tx.clone();
+                        let tcp_notify_tx = tcp_notify_tx.clone();
                         let sk_bytes = *transport_sk.as_bytes();
                         let acl = Arc::clone(&acl);
                         thread::spawn(move || {
@@ -180,6 +187,16 @@ pub fn run_server(
                                     return;
                                 }
                             };
+                            // Share a clone of the encrypted stream with the main
+                            // thread so the shutdown path can send `ShuttingDown`
+                            // through the Noise channel. Cloning rather than
+                            // moving preserves the shared TransportState
+                            // (Arc<Mutex<...>>) that the reader/writer/shim
+                            // threads inside `tcp_client_thread` use — try_clone
+                            // clones the TcpStream and keeps that Arc shared.
+                            if let Ok(notify_clone) = noise.try_clone() {
+                                let _ = tcp_notify_tx.send(notify_clone);
+                            }
                             if let Err(e) = crate::server::connection::tcp_client_thread(noise, tx)
                             {
                                 error!(error = %e, "TCP client error");
@@ -211,9 +228,15 @@ pub fn run_server(
     // Main thread accept loop — blocking accept() is event-driven
     // (the kernel deschedules us until a connection arrives).
     let mut client_streams: Vec<UnixStream> = Vec::new();
+    let mut tcp_streams: Vec<choreo_transport::noise::NoiseStream> = Vec::new();
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
+        }
+        // Collect Noise streams whose handshakes completed since the last
+        // iteration so the shutdown path can notify them too.
+        while let Ok(ns) = tcp_notify_rx.try_recv() {
+            tcp_streams.push(ns);
         }
         match listener.accept() {
             Ok((stream, _)) => {
@@ -255,6 +278,12 @@ pub fn run_server(
 
     info!("shutting down");
 
+    // Drain once more: streams whose handshake completed concurrently with
+    // shutdown are captured here rather than missed.
+    while let Ok(ns) = tcp_notify_rx.try_recv() {
+        tcp_streams.push(ns);
+    }
+
     // Notify connected clients.
     for stream in client_streams.iter() {
         if let Ok(writer) = stream.try_clone() {
@@ -262,6 +291,12 @@ pub fn run_server(
             let _ = choreo_proto::write_message(&mut writer, &DaemonMessage::ShuttingDown);
         }
         let _ = stream.shutdown(Shutdown::Both);
+    }
+
+    // Notify Noise IK clients through the encrypted channel, then close.
+    for mut ns in tcp_streams {
+        let _ = ns.send_daemon_message(&DaemonMessage::ShuttingDown);
+        let _ = ns.get_ref().shutdown(Shutdown::Both);
     }
 
     // Signal the daemon command handler to stop and wait for it.

@@ -394,6 +394,7 @@ TCP.  Used by both `choreo-client-core` (client side) and `choreo-daemon` (serve
 |---|---|
 | `noise.rs` | `NoiseStream` — wraps `TcpStream` + `snow::TransportState` with length-prefixed AES-256-GCM framing. `handshake_initiator()` (client) and `handshake_responder()` (server) implement the Noise IK handshake with X25519 key agreement. |
 | `error.rs` | `TransportError` enum — `Io`, `Noise`, `Protocol`, `AuthFailed`, `ConnectionClosed`. |
+| `key.rs` | Transport keypair handling — `TransportSecretKey` (type-safe X25519 secret), `ensure_transport_keypair()` (generate-or-load with advisory file locking), `read_server_pk()`. `set_test_config_root()` is the keypair-directory test override, now `pub` so integration tests can redirect keypair generation to a temp dir — matching the `choreo_keystore::paths` / `choreo_daemon::mcp::config` precedent. |
 
 The server-side TCP/Noise handler lives in `choreo-daemon/src/server/connection.rs`
 (`tcp_client_thread`), where the Noise IK handshake is performed and the
@@ -529,7 +530,7 @@ synchronous `execute_*` entry points (which `block_on` internally).
 
 | Module | Purpose |
 |---|---|---|
-| `server/lifecycle.rs` | Accept loop (non-blocking `UnixListener` + 50ms poll), signal handling (`signal_hook::flag`), shutdown orchestration. |
+| `server/lifecycle.rs` | Accept loop (non-blocking `UnixListener` + 50ms poll), signal handling (`signal_hook::flag`), shutdown orchestration. On graceful shutdown, `DaemonMessage::ShuttingDown` is written to every connected client before the socket closes — Unix-socket streams directly, and TCP/Noise clients too: completed-handshake `NoiseStream` clones are ferried from the TCP accept thread to the main thread via an mpsc channel so the notification goes through the encrypted channel (previously Unix-only). |
 | `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` (including `total_timeout_secs`) and converts the shared fields into `ProviderOverrides` for the other protocols. |
@@ -2715,14 +2716,46 @@ tears every thread down before propagating.
 | Providers (`choreo-ai-protocols`) | SSE parsing, HTTP request construction, chat completions + responses serialization, content-block deserialisation, config overrides, catalog lookups | `choreo-ai-protocols/src/openai/tests.rs`, `choreo-ai-protocols/src/openai/chat_completions.rs`, `choreo-ai-protocols/src/openai/config.rs`, `choreo-ai-protocols/src/anthropic/tests.rs`, `choreo-ai-protocols/src/google/tests.rs`, `choreo-ai-protocols/src/catalog/mod.rs` |
 | choreo-tui | SVG rasterization, Unicode width, app state | `choreo-tui/src/app_tests.rs`, `choreo-tui/src/lib_tests.rs` |
 | choreo-gui | App state, render helpers | `choreo-gui/src/app_tests.rs` |
+| Transport (`choreo-transport`) | Noise data plane — typed message round trips, max-size payload, malformed-handshake rejection, tampered-ciphertext rejection | `choreo-transport/tests/noise_integration.rs`, `choreo-transport/src/noise.rs` |
+| Daemon↔client (Unix socket) | Ping/Pong, session CRUD round trips, attach ordering, `ShuttingDown`, concurrent clients + disconnect cleanup | `choreo-daemon/tests/daemon_client_unix.rs` |
+| Daemon↔client (TCP/Noise) | Ping/Pong, session CRUD, cross-transport shared state, ACL rejection, wrong server key, encrypted `ShuttingDown` | `choreo-daemon/tests/daemon_client_noise.rs` |
 
 > **Binary-spawning integration tests.** Integration tests live in their
 > crates and test the libs. Any future binary-spawning integration test (via
 > `env!("CARGO_BIN_EXE_...")`) must live in the ROOT package's `tests/`,
 > because the root package owns the binaries.
+>
+> **Shared daemon-test harness.** `choreo-daemon/tests/common/mod.rs` provides
+> the scaffolding for end-to-end daemon tests that run the real
+> `run_server` (Unix socket + TCP/Noise) and drive it with the real client
+> library: `test_db()`, `test_daemon_state()`, and `SpawnedDaemon` (spawns
+> the server on a temp socket/ACL/free port, waits for both listeners, and
+> SIGINT-shuts it down on drop). Test files opt in with `mod common;`.
+> The daemon<->client tests (`tests/daemon_client_unix.rs`,
+> `tests/daemon_client_noise.rs`) build on it.
 
-**Test infrastructure:** Tests use `UnixStream::pair()` for socket-less daemon↔client
-communication, and mock HTTP servers for API simulation.
+These end-to-end tests close the previous coverage gap: the daemon's TCP/Noise
+listener (`handshake_responder` + ACL + `tcp_client_thread`) and the real client
+connection paths (`run_daemon_connection` / `run_daemon_tcp_connection`) had no
+integration coverage before — only the transport primitives were exercised in
+isolation. `daemon_client_unix.rs` covers Ping/Pong and ListSessions/CreateSession
+round trips, CreateSession+Attach ordering (`SessionAttached` before
+`SessionState`), the SIGINT `ShuttingDown` notification, and two concurrent
+clients with client-disconnect cleanup; `daemon_client_noise.rs` covers the same
+round trips over the encrypted channel plus cross-transport shared state (Noise +
+Unix clients on one daemon), ACL rejection of an unknown client key,
+wrong-server-public-key failure, and `ShuttingDown` through the encrypted channel
+(previously Unix-only). The extended `noise_integration.rs` data-plane tests push
+the transport itself: typed `ClientMessage`/`DaemonMessage` round trips through
+the Noise transport state, a 65519-byte payload (the largest single Noise message
+— snow caps ciphertext at 65535 bytes), malformed-handshake rejection, and a new
+unit test (`transport_state_rejects_tampered_ciphertext`) proving GCM
+authentication rejects a single flipped ciphertext byte.
+
+**Test infrastructure:** Most tests use `UnixStream::pair()` for socket-less daemon↔client
+communication, and mock HTTP servers for API simulation; the end-to-end transport
+tests above instead bind real sockets (a temp Unix-socket path and an ephemeral
+TCP port via `SpawnedDaemon`).
 
 **Test runner:** The recommended runner is cargo-nextest, configured in
 `.config/nextest.toml` (`fail-fast = false`; 120s `slow-timeout` that kills hung

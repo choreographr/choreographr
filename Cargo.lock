@@ -2193,6 +2193,7 @@ dependencies = [
  "base64 0.23.1",
  "choreo-ai-protocols",
  "choreo-blockchain",
+ "choreo-client-core",
  "choreo-daemon",
  "choreo-keystore",
  "choreo-mcp",

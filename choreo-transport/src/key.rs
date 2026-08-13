@@ -3,7 +3,6 @@ use tracing::{debug, info};
 
 use crate::error::TransportError;
 
-#[cfg(test)]
 thread_local! {
     /// Test-only override for the keypair directory. When set, `keypair_dir()`
     /// returns `<root>/choreographr` instead of the user's real config dir.
@@ -12,8 +11,10 @@ thread_local! {
 }
 
 /// Test-only override for the keypair directory (see `TEST_CONFIG_ROOT`).
-#[cfg(test)]
-pub(crate) fn set_test_config_root(root: Option<PathBuf>) {
+///
+/// Public so integration tests (which compile the crate without #[cfg(test)])
+/// can redirect keypair generation away from the user's real config directory.
+pub fn set_test_config_root(root: Option<PathBuf>) {
     TEST_CONFIG_ROOT.with(|cell| cell.replace(root));
 }
 
@@ -69,7 +70,6 @@ fn generate_keypair() -> ([u8; 32], [u8; 32]) {
 /// so a test relying on it would write the keypair into the user's real
 /// config directory.
 fn keypair_dir() -> Result<PathBuf, TransportError> {
-    #[cfg(test)]
     if let Some(root) = TEST_CONFIG_ROOT.with(|cell| cell.borrow().clone()) {
         return Ok(root.join("choreographr"));
     }
