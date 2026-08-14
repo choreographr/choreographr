@@ -36,7 +36,7 @@
 //! Unknown keys at any level are **warned and skipped**, never fatal — a
 //! user overlay typo must not brick the daemon.
 
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use super::{ModelEntry, ProviderEntry, ProviderProtocol, ReasoningPassback};
 use crate::shared::MaxTokensField;
@@ -61,6 +61,13 @@ pub fn merge_overlay(base: &[ProviderEntry], overlay_src: &str) -> Vec<ProviderE
     };
 
     let mut merged: Vec<ProviderEntry> = base.to_vec();
+    // Aggregate counters for a single per-merge debug line: the per-provider
+    // / per-model detail moved to `trace!` because a merge runs at startup, on
+    // every overlay reload, and on every `/refresh-models` — per-entry debug
+    // lines flooded the log with hundreds of one-line entries per merge.
+    let mut overridden = 0usize;
+    let mut added = 0usize;
+    let mut models_touched = 0usize;
     for (slug, value) in providers {
         let Some(table) = value.as_table() else {
             warn!(slug, "overlay provider is not a table; skipping");
@@ -68,11 +75,12 @@ pub fn merge_overlay(base: &[ProviderEntry], overlay_src: &str) -> Vec<ProviderE
         };
         match merged.iter_mut().find(|e| e.slug == *slug) {
             Some(entry) => {
-                debug!(slug, "overlay: applying provider overrides");
-                apply_provider_overlay(entry, table);
+                trace!(slug, "overlay: applying provider overrides");
+                apply_provider_overlay(entry, table, &mut models_touched);
+                overridden += 1;
             }
             None => {
-                debug!(slug, "overlay: adding new provider");
+                trace!(slug, "overlay: adding new provider");
                 let mut entry = ProviderEntry {
                     slug: slug.clone(),
                     display_name: slug.clone(),
@@ -83,18 +91,24 @@ pub fn merge_overlay(base: &[ProviderEntry], overlay_src: &str) -> Vec<ProviderE
                     default_model: String::new(),
                     models: Vec::new(),
                 };
-                apply_provider_overlay(&mut entry, table);
+                apply_provider_overlay(&mut entry, table, &mut models_touched);
                 merged.push(entry);
+                added += 1;
             }
         }
     }
+    debug!(overridden, added, models_touched, "overlay merge complete",);
     merged
 }
 
 /// Apply a `[provider.<slug>]` overlay table onto an existing entry.
 /// Recognized scalar keys are field-wise replaced; the `models` sub-table is
 /// applied per model; anything else is warned and skipped.
-fn apply_provider_overlay(entry: &mut ProviderEntry, table: &toml::Table) {
+fn apply_provider_overlay(
+    entry: &mut ProviderEntry,
+    table: &toml::Table,
+    models_touched: &mut usize,
+) {
     for (key, value) in table {
         match key.as_str() {
             "protocol" => match parse_protocol(value) {
@@ -121,7 +135,7 @@ fn apply_provider_overlay(entry: &mut ProviderEntry, table: &toml::Table) {
                     warn!(slug = %entry.slug, "overlay: display_name is not a string; skipping")
                 }
             },
-            "models" => apply_models_overlay(entry, value),
+            "models" => apply_models_overlay(entry, value, models_touched),
             other => warn!(
                 slug = %entry.slug,
                 key = other,
@@ -133,7 +147,11 @@ fn apply_provider_overlay(entry: &mut ProviderEntry, table: &toml::Table) {
 
 /// Apply the `[provider.<slug>.models]` sub-table. Each model id names an
 /// entry that is replaced field-wise (or created when new).
-fn apply_models_overlay(entry: &mut ProviderEntry, value: &toml::Value) {
+fn apply_models_overlay(
+    entry: &mut ProviderEntry,
+    value: &toml::Value,
+    models_touched: &mut usize,
+) {
     let Some(models) = value.as_table() else {
         warn!(slug = %entry.slug, "overlay: models is not a table; skipping");
         return;
@@ -148,7 +166,10 @@ fn apply_models_overlay(entry: &mut ProviderEntry, value: &toml::Value) {
             continue;
         };
         match entry.models.iter_mut().find(|m| m.model == *model_id) {
-            Some(model) => apply_model_overlay(&mut *model, table),
+            Some(model) => {
+                apply_model_overlay(&mut *model, table);
+                *models_touched += 1;
+            }
             None => {
                 let mut model = ModelEntry {
                     model: model_id.clone(),
@@ -160,6 +181,7 @@ fn apply_models_overlay(entry: &mut ProviderEntry, value: &toml::Value) {
                 };
                 apply_model_overlay(&mut model, table);
                 entry.models.push(model);
+                *models_touched += 1;
             }
         }
     }

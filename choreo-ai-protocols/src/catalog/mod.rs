@@ -24,7 +24,7 @@
 
 use std::fmt;
 use std::sync::{Arc, LazyLock};
-use tracing::debug;
+use tracing::{debug, trace};
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -254,7 +254,7 @@ pub fn model_reasoning_capability(provider_slug: &str, model: &str) -> Reasoning
         None => vec![],
     };
 
-    debug!(
+    trace!(
         provider = %provider_slug,
         model = %model,
         ?levels,
@@ -322,7 +322,7 @@ pub fn model_reasoning_passback(provider_slug: &str, model: &str) -> ReasoningPa
         None => ReasoningPassback::None,
     };
 
-    debug!(
+    trace!(
         provider = %provider_slug,
         model = %model,
         ?passback,
