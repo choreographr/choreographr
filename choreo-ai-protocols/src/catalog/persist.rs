@@ -18,7 +18,13 @@ use std::path::Path;
 /// file must live in the same directory as the target so the rename never
 /// crosses a filesystem boundary.
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // Bind the parent once: it is both the temp file's home (same dir, so
+    // the rename never crosses a filesystem boundary) and the directory that
+    // must be fsynced for rename durability. A parentless path (a bare file
+    // name) falls back to "." for the temp file but skips the dir fsync —
+    // there is no identifiable parent to sync.
+    let parent = path.parent();
+    let dir = parent.unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(bytes)?;
@@ -29,7 +35,7 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // file. Some platforms/filesystems refuse to fsync a directory handle
     // (EINVAL) — a failure here only weakens crash durability, never
     // correctness, so it is logged rather than propagated.
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = parent {
         match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
             Ok(()) => {}
             Err(e) => {

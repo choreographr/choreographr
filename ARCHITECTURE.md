@@ -484,11 +484,16 @@ the revalidation cadence (24 h, configurable constant): after every refresh
 outcome — a successful fetch, a 304, or a failure — the next conditional GET
 is armed, so the cache keeps a steady freshness cycle and a failure never
 spins. A burst of `/refresh-models` requests is **coalesced** into one fetch
-(fold the force flags, fan the single result out to every requester), and the
+(fold the force flags — the shared fetch is forced if ANY requester asked —
+but each requester's reply status reflects its OWN flag, so a plain request
+folded into a forced burst is reported `Updated`, not `Forced`), and the
 `/refresh-models` path also **re-reads the user overlay** (fingerprint-gated,
 shared with the watcher) so it is the documented reload fallback when the
-watch could not start. A failed initial `notify` watch is **retried** in the
-loop until the config dir exists. The notify
+watch could not start. At startup the thread first **creates the runtime
+dirs** (config dir for the overlay watch, data dir for the cache) so the
+`notify` watch installs on the first attempt even on a fresh system — the
+loop's watch **retry** is then only a last-resort fallback for a dir deleted
+at runtime. The notify
 callback is deliberately trivial — it only forwards events; all policy
 (basename filter, re-read, fingerprint compare) lives on the maintenance
 thread. On startup the thread loads the base (cache file → embedded
@@ -572,7 +577,7 @@ synchronous `execute_*` entry points (which `block_on` internally).
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management, and the runtime catalog swap (`CatalogBaseChanged` → `replace_catalog`, the single writer of the `PROVIDER_CATALOG` ArcSwap), `CatalogUpdated` broadcasts, and `/refresh-models` plumbing (the fetch is delegated to the maintenance thread, never run here). `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` (including `total_timeout_secs`) and converts the shared fields into `ProviderOverrides` for the other protocols. |
 | `config.rs` | Daemon-level configuration: `DaemonConfig` (`max_turns`, `[context]`), `config_path()`, `load_daemon_config()`, and the deprecated `load_service_config()`. (Previously lived in `openai/config.rs`; it is daemon config, not provider config.) |
-| `catalog.rs` | Runtime catalog maintenance (S4): `CatalogPaths` (XDG data/config locations for the cache, etag sidecar, and user overlay), atomic cache persistence (temp → fsync → rename, `catalog.bin` postcard + one-line `models.dev.etag`), the ONE background **maintenance thread** (loads the cache → embedded `catalog.bin`, reads the user overlay, runs the startup conditional GET, watches the config dir with `notify` — **retrying a failed watch** so a later-created dir is picked up — serves `/refresh-models` requests with **coalescing** of bursts into one fetch, all channel-driven, never mutating the catalog itself), and the **fingerprint-gated overlay reload** (pure compare collapses editor save-event storms; shared by the watcher and the `/refresh-models` path). Every change is delivered to the daemon command loop as `DaemonCommand::CatalogBaseChanged`. |
+| `catalog.rs` | Runtime catalog maintenance (S4): `CatalogPaths` (XDG data/config locations for the cache, etag sidecar, and user overlay), atomic cache persistence (temp → fsync → rename, `catalog.bin` postcard + one-line `models.dev.etag`), the ONE background **maintenance thread** (creates the runtime dirs up front so the `notify` watch installs first-time, loads the cache → embedded `catalog.bin`, reads the user overlay, runs the startup conditional GET, watches the config dir with `notify` — a failed watch is **retried** as a last-resort fallback — serves `/refresh-models` requests with **coalescing** of bursts into one fetch (per-requester status), all channel-driven, never mutating the catalog itself), and the **fingerprint-gated overlay reload** (pure compare collapses editor save-event storms; shared by the watcher and the `/refresh-models` path). Every change is delivered to the daemon command loop as `DaemonCommand::CatalogBaseChanged` (a swap) or `DaemonCommand::CatalogNotModified` (a 304 — a pure reply routed through the loop so a queued overlay reload is applied before the `UpToDate` counts are computed). |
 | `providers/mod.rs` | `InferenceProvider` — protocol-erased facade wrapping `Arc<dyn ProviderClient>` plus the catalog slug. `from_account_config()` dispatches by `ProviderProtocol` and constructs the right client from `choreo-ai-protocols`. Records API metrics (`record_api_call`/`record_api_error`) around each turn — timing lives here, not in the provider crate. |
 | `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional working directory. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
@@ -705,7 +710,9 @@ catalog/models.dev.json  (local, gitignored)  ──catalog-gen──►  catalo
   Normalization is deterministic (JSON order preserved), so re-running the
   generator over the same snapshot yields a byte-identical blob (guarded by the
   `embedded_blob_matches_local_snapshot` unit test when the snapshot is present
-  locally, and by `catalog-gen --check` for CI).
+  locally, and by `catalog-gen --check` for CI). `--check` is strictly
+  read-only; `--snapshot <path>` lets CI point at a cached snapshot artifact so
+  the check never needs the network.
 - **Overlay — everything not derivable.** `catalog/models-overlay.toml` is
   `include_str!` and merged at load time by `merge_overlay` — never baked into
   the blob, so S4 can re-merge the same base with a user overlay at runtime.
@@ -754,10 +761,11 @@ models.dev:
   (rename-safe; basename-filtered) and reloads on change via a
   **fingerprint gate** — the file is re-read and compared against the
   last-applied contents, so editor save-event storms collapse naturally after
-  the first reload. Deleting the file falls back to bundled-only (warn). A
-  failed initial watch (e.g. the config dir did not exist at startup) is
-  **retried** in the maintenance loop, so a later-created overlay is picked up
-  without a daemon restart.
+  the first reload. Deleting the file falls back to bundled-only (warn). The
+  maintenance thread **creates the config dir at startup** (before the watch is
+  installed and the models.dev fetch runs) so the first watch install succeeds
+  even on a fresh system — a failed watch is **retried** in the loop only as a
+  last-resort fallback.
 - **`/refresh-models`.** TUI slash command → `ClientMessage::RefreshModels`
   → the daemon hands the request to the maintenance thread over its channel
   (never blocking the command loop on the download) → reply routed back as
@@ -766,8 +774,12 @@ models.dev:
   `Cache-Control: no-cache` and skips the etag. The request also **re-reads
   the user overlay** (fingerprint-gated, shared with the watcher) so it is the
   documented reload fallback when the watch could not start, and a burst of
-  queued requests is **coalesced** into a single fetch (force flags OR-ed,
-  every requester receives the same result).
+  queued requests is **coalesced** into a single fetch (force flags OR-ed;
+  each requester's reply status reflects its own flag). A 304 reply is
+  **routed through the daemon command loop** (as `CatalogNotModified`, not
+  sent directly by the maintenance thread) so an overlay reload queued just
+  before the request is applied first and the `UpToDate` counts reflect the
+  current catalog.
 - **`CatalogUpdated` broadcast.** Every catalog swap (startup refresh,
   overlay reload, `/refresh-models`) broadcasts the full provider list
   (slug + display name) to all activity subscribers — and a freshly

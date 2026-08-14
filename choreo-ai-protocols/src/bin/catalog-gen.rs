@@ -13,12 +13,17 @@
 //! as-is (offline-friendly); when it is missing the tool fetches a fresh
 //! snapshot from models.dev and persists it **atomically** to that gitignored
 //! path (temp file + rename, never a torn write) so later runs work offline.
+//! `--snapshot <path>` overrides the source entirely (no fetch, no write) —
+//! CI can point at a cached snapshot artifact so `--check` never needs the
+//! network.
 //!
 //! `--check` mode (`cargo run --bin catalog-gen -- --check`) serializes the
 //! normalized base and compares it to the on-disk `catalog.bin` without
 //! writing anything — the guard that the committed blob has not drifted from
-//! the snapshot, and the CI-appropriate check (the snapshot is absent in CI,
-//! so a missing local snapshot falls through to a fresh fetch there).
+//! the snapshot. With a local (or `--snapshot`-provided) snapshot the check is
+//! fully offline; with no snapshot at all it falls through to a fresh fetch
+//! (network required), which is the CI-appropriate default when the snapshot
+//! is absent.
 //!
 //! Re-runnable: `cargo run --bin catalog-gen`. Normalization is deterministic
 //! (providers and models keep the snapshot's JSON order), so re-running over
@@ -52,7 +57,15 @@ fn main() -> Result<()> {
 
     // `--check` is detected before any write so check mode is strictly
     // read-only: even a snapshot fetch-and-cache must not mutate the tree.
-    let check_only = std::env::args().any(|a| a == "--check");
+    // `--snapshot <path>` overrides the snapshot source (CI can point at a
+    // cached artifact so the check stays offline).
+    let args: Vec<String> = std::env::args().collect();
+    let check_only = args.iter().any(|a| a == "--check");
+    let explicit_snapshot = args
+        .iter()
+        .position(|a| a == "--snapshot")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
 
     // `CARGO_MANIFEST_DIR` is set by cargo for every build (including the
     // generator run), so the paths below always resolve to the crate root.
@@ -68,43 +81,49 @@ fn main() -> Result<()> {
     let overlay_path = catalog_dir.join("models-overlay.toml");
     let out_path = catalog_dir.join("catalog.bin");
 
-    // Snapshot source: the local gitignored snapshot when present (the offline
-    // path), otherwise a fresh models.dev fetch persisted atomically to that
-    // same path so the next run is offline.
-    let snapshot = match std::fs::read_to_string(&snapshot_path) {
-        Ok(src) => src,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            info!(
-                path = %snapshot_path.display(),
-                "local models.dev snapshot is missing; fetching a fresh snapshot",
-            );
-            let outcome =
-                fetch_modelsdev(None, true).context("failed to fetch the models.dev snapshot")?;
-            let json = match outcome {
-                RefreshOutcome::Fetched { json, .. } => json,
-                // A forced fetch (no etag, no-cache) cannot legitimately 304.
-                other => bail!(
-                    "expected a fresh models.dev snapshot, got {other:?} \
-                     (a forced no-cache fetch cannot 304)",
-                ),
-            };
-            // Cache the fetch to the gitignored path so later runs are
-            // offline. Check mode skips even this write: a torn snapshot file
-            // would silently normalize to an empty base later, and check mode
-            // must not mutate the tree.
-            if !check_only {
-                write_file_atomic(&snapshot_path, json.as_bytes()).with_context(|| {
-                    format!(
-                        "failed to persist the fetched snapshot to {}",
-                        snapshot_path.display(),
-                    )
-                })?;
+    // Snapshot source precedence: an explicit `--snapshot <path>` (CI/offline
+    // — read, never fetched, never written) → the local gitignored snapshot
+    // (the offline path) → a fresh models.dev fetch persisted atomically to
+    // that same path so the next run is offline.
+    let snapshot = match &explicit_snapshot {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read snapshot {}", path.display()))?,
+        None => match std::fs::read_to_string(&snapshot_path) {
+            Ok(src) => src,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(
+                    path = %snapshot_path.display(),
+                    "local models.dev snapshot is missing; fetching a fresh snapshot",
+                );
+                let outcome = fetch_modelsdev(None, true)
+                    .context("failed to fetch the models.dev snapshot")?;
+                let json = match outcome {
+                    RefreshOutcome::Fetched { json, .. } => json,
+                    // A forced fetch (no etag, no-cache) cannot legitimately 304.
+                    other => bail!(
+                        "expected a fresh models.dev snapshot, got {other:?} \
+                         (a forced no-cache fetch cannot 304)",
+                    ),
+                };
+                // Cache the fetch to the gitignored path so later runs are
+                // offline. Check mode skips even this write: a torn snapshot file
+                // would silently normalize to an empty base later, and check mode
+                // must not mutate the tree.
+                if !check_only {
+                    write_file_atomic(&snapshot_path, json.as_bytes()).with_context(|| {
+                        format!(
+                            "failed to persist the fetched snapshot to {}",
+                            snapshot_path.display(),
+                        )
+                    })?;
+                }
+                json
             }
-            json
-        }
-        Err(e) => {
-            return Err(e).with_context(|| format!("failed to read {}", snapshot_path.display()));
-        }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to read {}", snapshot_path.display()));
+            }
+        },
     };
 
     let overlay = std::fs::read_to_string(&overlay_path)

@@ -557,9 +557,11 @@ entries (`[provider.<slug>.models."<model>"]` with `context_window`,
 `reasoning_supported`, `reasoning_levels`, `responses`, `reasoning_passback`),
 plus wholesale provider definitions for anything models.dev doesn't list. The
 file is watched and reloads automatically on change (deleting it falls back to
-the bundled overlay; a failed watch is retried until the config dir exists);
+the bundled overlay; the daemon creates the config dir at startup so the watch
+installs even on a fresh system);
 `/refresh-models [--force]` re-fetches the upstream catalog on demand and also
-re-reads the user overlay (a burst of requests is coalesced into one fetch).
+re-reads the user overlay (a burst of requests is coalesced into one fetch;
+each requester's status reflects its own `--force` flag).
 
 | Field | Description |
 |---|---|
@@ -604,7 +606,7 @@ In `choreo-tui`:
 - `/ping` — health check
 - `/models` — list and select models
 - `/model` — alias for `/models`
-- `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts; a burst of `/refresh-models` requests is coalesced into a single fetch.
+- `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts; a burst of `/refresh-models` requests is coalesced into a single fetch (each requester's status reflects its own `--force` flag, and a 304 reply is ordered after any queued overlay reload so the counts are current).
 - `/session` — show current session info
 - `/session list` — list all sessions
 - `/session new [title]` — create a new session

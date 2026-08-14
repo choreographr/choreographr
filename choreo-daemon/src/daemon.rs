@@ -1,5 +1,5 @@
 use crate::accounts::{AccountConfig, AccountManager, accounts_config_path};
-use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport};
+use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshRequester};
 use crate::db::{self, SessionRecord};
 use crate::mcp::McpManager;
 use crate::providers::InferenceProvider;
@@ -145,8 +145,9 @@ pub enum DaemonCommand {
     /// A client requested `/refresh-models`. The daemon does NOT do the HTTP
     /// fetch here — it hands the request to the maintenance thread over its
     /// channel (the fetch can block for the whole 30s timeout), and the reply
-    /// is routed back through [`DaemonCommand::CatalogBaseChanged`] once the
-    /// maintenance thread has a result.
+    /// is routed back through [`DaemonCommand::CatalogBaseChanged`] (fetched)
+    /// or [`DaemonCommand::CatalogNotModified`] (304) once the maintenance
+    /// thread has a result.
     RefreshModels {
         force: bool,
         reply: mpsc::Sender<Result<RefreshReport, String>>,
@@ -155,7 +156,7 @@ pub enum DaemonCommand {
     /// base + the current user overlay. The daemon command loop — the single
     /// writer of the catalog `ArcSwap` — merges overlays, swaps the catalog,
     /// optionally persists the cache, broadcasts `CatalogUpdated`, and
-    /// replies to a `/refresh-models` requester.
+    /// replies to the `/refresh-models` requester(s).
     CatalogBaseChanged {
         base: Vec<choreo_ai_protocols::ProviderEntry>,
         etag: Option<String>,
@@ -166,13 +167,18 @@ pub enum DaemonCommand {
         /// Persist the cache bin + etag sidecar after swapping (live fetches
         /// only — a startup cache load is already on disk).
         persist: bool,
-        /// Reported status when this change came from a `/refresh-models`
-        /// request (`None` for background events: startup load, overlay
-        /// change).
-        report_status: Option<RefreshStatus>,
         /// Reply channel(s) for a `/refresh-models` request (empty for
-        /// background events; one sender per coalesced requester).
-        reply: Vec<mpsc::Sender<Result<RefreshReport, String>>>,
+        /// background events; one entry per coalesced requester, each
+        /// carrying its own force flag so the reply status is individualized).
+        reply: Vec<RefreshRequester>,
+    },
+    /// A models.dev conditional GET returned 304 — nothing changed. Routed
+    /// through the command loop (rather than replied to directly by the
+    /// maintenance thread) so any user-overlay reload queued just before it
+    /// is applied first and the `UpToDate` counts reflect the current
+    /// catalog. Carries no base: no swap happens.
+    CatalogNotModified {
+        reply: Vec<RefreshRequester>,
     },
     GetCredential {
         service: String,
@@ -396,16 +402,9 @@ impl DaemonState {
                 etag,
                 user_overlay,
                 persist,
-                report_status,
                 reply,
-            } => self.handle_catalog_base_changed(
-                base,
-                etag,
-                user_overlay,
-                persist,
-                report_status,
-                reply,
-            ),
+            } => self.handle_catalog_base_changed(base, etag, user_overlay, persist, reply),
+            DaemonCommand::CatalogNotModified { reply } => self.handle_catalog_not_modified(reply),
             DaemonCommand::GetCredential { service, reply } => {
                 self.handle_get_credential(service, reply)
             }
@@ -994,8 +993,9 @@ impl DaemonState {
                     "RefreshModels: handing fetch to the maintenance thread"
                 );
                 // Clone the reply: on a dead thread the request must still
-                // get a structured error (a dropped channel would leave the
-                // client's connection thread blocked forever with no reply).
+                // get a structured error instead of silently vanishing (the
+                // clone rides the maintenance channel; the original replies
+                // on send failure).
                 if tx
                     .send(MaintenanceEvent::RefreshNow {
                         force,
@@ -1035,8 +1035,7 @@ impl DaemonState {
         etag: Option<String>,
         user_overlay: Option<String>,
         persist: bool,
-        report_status: Option<RefreshStatus>,
-        reply: Vec<mpsc::Sender<Result<RefreshReport, String>>>,
+        reply: Vec<RefreshRequester>,
     ) {
         debug!(
             base_providers = base.len(),
@@ -1053,8 +1052,8 @@ impl DaemonState {
             // the requester(s) (merge_overlay is infallible, so an empty
             // result means the base itself was empty — a broken fetch).
             error!("refusing to swap in an empty catalog; keeping the current one");
-            for tx in reply {
-                let _ = tx.send(Err(
+            for r in reply {
+                let _ = r.tx.send(Err(
                     "merged catalog is empty; keeping the current catalog".to_string()
                 ));
             }
@@ -1072,7 +1071,33 @@ impl DaemonState {
 
         let models: usize = effective.iter().map(|e| e.models.len()).sum();
         info!(providers = effective.len(), models, "catalog updated",);
-        send_catalog_reply(reply, report_status, effective.len(), models);
+        send_catalog_reply(reply, effective.len(), models);
+    }
+
+    /// A models.dev conditional GET returned 304 — the cached base is
+    /// current. The reply is routed through the command loop (not sent
+    /// directly by the maintenance thread) so any user-overlay reload queued
+    /// just before the request is applied first: FIFO on the command channel
+    /// orders the swap ahead of this reply, so the `UpToDate` counts reflect
+    /// the post-reload catalog rather than stale pre-reload numbers. Carries
+    /// no base — nothing is swapped, nothing persisted, nothing broadcast.
+    fn handle_catalog_not_modified(&mut self, reply: Vec<RefreshRequester>) {
+        if reply.is_empty() {
+            return;
+        }
+        let snapshot = catalog_snapshot();
+        let providers = snapshot.len();
+        let models: usize = snapshot.iter().map(|e| e.models.len()).sum();
+        info!(providers, models, "models.dev catalog unchanged (304)");
+        for r in reply {
+            let _ = r.tx.send(Ok(RefreshReport {
+                providers,
+                models,
+                // A 304 means nothing changed, even for a requester that
+                // asked for --force (the server said the cache is current).
+                status: RefreshStatus::UpToDate,
+            }));
+        }
     }
 
     /// Persist the cache bin + etag sidecar after a live fetch. Startup
@@ -1980,22 +2005,20 @@ fn merge_catalog_layers(
     effective
 }
 
-/// Route `/refresh-models` replies once the swap has happened. The status
-/// defaults to `Updated` for background events that carry no explicit one.
-/// An empty `reply` Vec (background events) is a no-op; a coalesced burst
-/// fans the same report out to every requester.
-fn send_catalog_reply(
-    reply: Vec<mpsc::Sender<Result<RefreshReport, String>>>,
-    report_status: Option<RefreshStatus>,
-    providers: usize,
-    models: usize,
-) {
-    if reply.is_empty() {
-        return;
-    }
-    let status = report_status.unwrap_or(RefreshStatus::Updated);
-    for tx in reply {
-        let _ = tx.send(Ok(RefreshReport {
+/// Fan a `/refresh-models` reply out to every requester in a coalesced batch
+/// once the swap has happened. Each requester's status reflects its OWN force
+/// flag: the batch's shared fetch is forced if ANY requester asked
+/// (`fold_refresh_nows` ORs the flags), but a plain request folded into a
+/// forced burst is reported `Updated`, not `Forced` — matching what it
+/// actually asked for. An empty `reply` (background events) is a no-op.
+fn send_catalog_reply(reply: Vec<RefreshRequester>, providers: usize, models: usize) {
+    for r in reply {
+        let status = if r.force {
+            RefreshStatus::Forced
+        } else {
+            RefreshStatus::Updated
+        };
+        let _ = r.tx.send(Ok(RefreshReport {
             providers,
             models,
             status,
@@ -4061,8 +4084,10 @@ mod tests {
             etag: Some("\"v42\"".into()),
             user_overlay: None,
             persist: false,
-            report_status: Some(RefreshStatus::Updated),
-            reply: vec![reply],
+            reply: vec![RefreshRequester {
+                force: false,
+                tx: reply,
+            }],
         });
 
         // The catalog was swapped: the tiny provider is now visible.
@@ -4113,7 +4138,6 @@ context_window = 1024
             etag: None,
             user_overlay: Some(overlay.to_string()),
             persist: false,
-            report_status: None,
             reply: Vec::new(),
         });
 
@@ -4142,14 +4166,71 @@ context_window = 1024
             etag: None,
             user_overlay: None,
             persist: false,
-            report_status: Some(RefreshStatus::Updated),
-            reply: vec![reply],
+            reply: vec![RefreshRequester {
+                force: false,
+                tx: reply,
+            }],
         });
         let report = reply_rx.recv().unwrap().expect("refresh succeeds");
         assert!(report.providers > 1, "overlay-only providers must survive");
         assert_eq!(report.status, RefreshStatus::Updated);
         // The overlay-only providers are actually queryable now.
         assert!(choreo_ai_protocols::lookup_provider("ollama").is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(catalog)]
+    fn catalog_not_modified_replies_up_to_date_with_current_counts() {
+        // A 304 routes through the command loop (the maintenance thread never
+        // replies directly) and reports UpToDate with the CURRENT catalog's
+        // counts — even for a requester that asked for --force, because the
+        // server said nothing changed.
+        let (mut state, _rx) = make_daemon_state();
+        let (reply, reply_rx) = mpsc::channel();
+
+        state.handle_command(DaemonCommand::CatalogNotModified {
+            reply: vec![RefreshRequester {
+                force: true,
+                tx: reply,
+            }],
+        });
+
+        let report = reply_rx.recv().unwrap().expect("304 reply is Ok");
+        assert_eq!(report.status, RefreshStatus::UpToDate);
+        assert!(
+            report.providers > 0,
+            "counts come from the currently swapped catalog"
+        );
+    }
+
+    #[test]
+    fn send_catalog_reply_individualizes_status_per_requester() {
+        // A mixed coalesced burst: the shared fetch is forced, but only the
+        // requester that asked for --force gets Forced; the plain requester
+        // folded into the burst is reported Updated.
+        let (forced_tx, forced_rx) = mpsc::channel();
+        let (plain_tx, plain_rx) = mpsc::channel();
+
+        send_catalog_reply(
+            vec![
+                RefreshRequester {
+                    force: true,
+                    tx: forced_tx,
+                },
+                RefreshRequester {
+                    force: false,
+                    tx: plain_tx,
+                },
+            ],
+            208,
+            1234,
+        );
+
+        let forced = forced_rx.recv().unwrap().expect("forced reply is Ok");
+        assert_eq!(forced.status, RefreshStatus::Forced);
+        assert_eq!((forced.providers, forced.models), (208, 1234));
+        let plain = plain_rx.recv().unwrap().expect("plain reply is Ok");
+        assert_eq!(plain.status, RefreshStatus::Updated);
     }
 
     #[test]

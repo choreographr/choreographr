@@ -135,12 +135,23 @@ pub fn fetch_modelsdev(
 }
 
 /// Whether to attach an `If-None-Match` header for the given cached etag.
-/// An empty etag (e.g. a truncated sidecar) must NOT be sent — an empty
-/// entity tag is never valid and would break the conditional GET. Extracted
-/// as a pure function so the header logic is unit-testable without a network
-/// round trip.
+/// The value must be a **well-formed HTTP entity-tag** — an empty or
+/// malformed value (e.g. a truncated sidecar) must NOT be sent: an invalid
+/// header would break the conditional GET. Extracted as a pure function so
+/// the header logic is unit-testable without a network round trip.
 fn should_send_if_none_match(etag: Option<&str>) -> bool {
-    matches!(etag, Some(e) if !e.is_empty())
+    matches!(etag, Some(e) if is_well_formed_etag(e))
+}
+
+/// A valid HTTP entity-tag: a quoted opaque string of at least one character,
+/// optionally weak-prefixed (`W/"…"`). Everything else — empty, unquoted
+/// garbage from a truncated sidecar, an unterminated quote, an empty `""`
+/// (RFC 7232 requires a non-empty opaque-tag) — fails and is never sent on
+/// the wire.
+fn is_well_formed_etag(etag: &str) -> bool {
+    let body = etag.strip_prefix("W/").unwrap_or(etag);
+    // Two quotes plus at least one opaque-tag character between them.
+    body.len() >= 3 && body.starts_with('"') && body.ends_with('"')
 }
 
 /// Read the full response body into a `String`, bounded by [`MAX_BODY_BYTES`].
@@ -176,12 +187,17 @@ mod tests {
     }
 
     #[test]
-    fn etag_guard_skips_empty_etags() {
+    fn etag_guard_skips_empty_and_malformed_etags() {
         // The maintenance thread may hold an empty etag (e.g. a sidecar that
-        // was truncated). Sending `If-None-Match: ""` would be invalid — the
-        // guard must fall back to a plain GET for empty/absent etags.
+        // was truncated) or unquoted garbage. Sending those as If-None-Match
+        // would be invalid — the guard must fall back to a plain GET. Only a
+        // well-formed entity-tag (`"…"` or weak `W/"…"`) is sent.
         assert!(!should_send_if_none_match(None));
         assert!(!should_send_if_none_match(Some("")));
+        assert!(!should_send_if_none_match(Some("garbage")));
+        assert!(!should_send_if_none_match(Some("\"unterminated")));
+        assert!(!should_send_if_none_match(Some("\"\""))); // empty quoted tag
         assert!(should_send_if_none_match(Some("\"abc123\"")));
+        assert!(should_send_if_none_match(Some("W/\"abc123\"")));
     }
 }
