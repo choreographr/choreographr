@@ -1,7 +1,0 @@
-slug = "atlascloud"
-display_name = "Atlas Cloud"
-protocol = "openai"
-max_tokens_field = "max_completion_tokens"
-base_url = "https://api.atlascloud.ai/v1"
-default_model = "qwen/qwen3.5-flash"
-

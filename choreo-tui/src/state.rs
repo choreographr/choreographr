@@ -77,329 +77,239 @@ pub(crate) enum AIProvidersView {
     SetSlug,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderInfo {
-    pub(crate) slug: &'static str,
-    pub(crate) display_name: &'static str,
+    pub(crate) slug: String,
+    pub(crate) display_name: String,
 }
 
-pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
-    ProviderInfo {
-        slug: "aimlapi",
-        display_name: "aimlapi.com",
-    },
-    ProviderInfo {
-        slug: "alibaba",
-        display_name: "Alibaba (Qwen)",
-    },
-    ProviderInfo {
-        slug: "ant-ling",
-        display_name: "Ant Ling",
-    },
-    ProviderInfo {
-        slug: "anthropic",
-        display_name: "Anthropic",
-    },
-    ProviderInfo {
-        slug: "arcee",
-        display_name: "Arcee AI",
-    },
-    ProviderInfo {
-        slug: "atlascloud",
-        display_name: "Atlas Cloud",
-    },
-    ProviderInfo {
-        slug: "atomic-chat",
-        display_name: "Atomic Chat",
-    },
-    ProviderInfo {
-        slug: "bankr",
-        display_name: "Bankr",
-    },
-    ProviderInfo {
-        slug: "cerebras",
-        display_name: "Cerebras",
-    },
-    ProviderInfo {
-        slug: "cloudflare-ai-gateway",
-        display_name: "Cloudflare AI Gateway",
-    },
-    ProviderInfo {
-        slug: "cloudflare-workers-ai",
-        display_name: "Cloudflare Workers AI",
-    },
-    ProviderInfo {
-        slug: "custom-anthropic",
-        display_name: "Custom Anthropic-Compatible",
-    },
-    ProviderInfo {
-        slug: "custom-openai",
-        display_name: "Custom OpenAI-Compatible",
-    },
-    ProviderInfo {
-        slug: "deepinfra",
-        display_name: "DeepInfra",
-    },
-    ProviderInfo {
-        slug: "deepseek",
-        display_name: "DeepSeek",
-    },
-    ProviderInfo {
-        slug: "empiriolabs",
-        display_name: "EmpirioLabs AI",
-    },
-    ProviderInfo {
-        slug: "fireworks",
-        display_name: "Fireworks",
-    },
-    ProviderInfo {
-        slug: "friendli",
-        display_name: "Friendli AI",
-    },
-    ProviderInfo {
-        slug: "futurmix",
-        display_name: "FuturMix",
-    },
-    ProviderInfo {
-        slug: "github",
-        display_name: "GitHub Models",
-    },
-    ProviderInfo {
-        slug: "github-copilot",
-        display_name: "GitHub Copilot",
-    },
-    ProviderInfo {
-        slug: "gitlawb-opengateway",
-        display_name: "GitLawb OpenGateway",
-    },
-    ProviderInfo {
-        slug: "gmi",
-        display_name: "GMI Cloud",
-    },
-    ProviderInfo {
-        slug: "google",
-        display_name: "Google Gemini",
-    },
-    ProviderInfo {
-        slug: "groq",
-        display_name: "Groq",
-    },
-    ProviderInfo {
-        slug: "huggingface",
-        display_name: "Hugging Face",
-    },
-    ProviderInfo {
-        slug: "iflytek",
-        display_name: "iFlytek Spark",
-    },
-    ProviderInfo {
-        slug: "iflytek-astron",
-        display_name: "iFlytek Astron MaaS",
-    },
-    ProviderInfo {
-        slug: "inception",
-        display_name: "Inception",
-    },
-    ProviderInfo {
-        slug: "kilocode",
-        display_name: "KiloCode",
-    },
-    ProviderInfo {
-        slug: "kimi-code",
-        display_name: "Kimi Code subscription",
-    },
-    ProviderInfo {
-        slug: "llama-swap",
-        display_name: "Llama Swap",
-    },
-    ProviderInfo {
-        slug: "lmstudio",
-        display_name: "LM Studio",
-    },
-    ProviderInfo {
-        slug: "longcat",
-        display_name: "LongCat",
-    },
-    ProviderInfo {
-        slug: "meta",
-        display_name: "Meta",
-    },
-    ProviderInfo {
-        slug: "minimax",
-        display_name: "MiniMax",
-    },
-    ProviderInfo {
-        slug: "minimax-cn",
-        display_name: "MiniMax (China)",
-    },
-    ProviderInfo {
-        slug: "mistral",
-        display_name: "Mistral",
-    },
-    ProviderInfo {
-        slug: "moonshotai",
-        display_name: "Moonshot AI (Kimi)",
-    },
-    ProviderInfo {
-        slug: "moonshotai-cn",
-        display_name: "Moonshot AI (China)",
-    },
-    ProviderInfo {
-        slug: "nearai",
-        display_name: "NEAR AI Cloud",
-    },
-    ProviderInfo {
-        slug: "nous",
-        display_name: "Nous Research",
-    },
-    ProviderInfo {
-        slug: "novita",
-        display_name: "Novita AI",
-    },
-    ProviderInfo {
-        slug: "nvidia",
-        display_name: "NVIDIA NIM",
-    },
-    ProviderInfo {
-        slug: "ollama",
-        display_name: "Ollama (Local)",
-    },
-    ProviderInfo {
-        slug: "ollama-cloud",
-        display_name: "Ollama Cloud",
-    },
-    ProviderInfo {
-        slug: "omlx",
-        display_name: "oMLX",
-    },
-    ProviderInfo {
-        slug: "openai",
-        display_name: "OpenAI",
-    },
-    ProviderInfo {
-        slug: "openai-codex",
-        display_name: "OpenAI Codex subscription",
-    },
-    ProviderInfo {
-        slug: "openai_compatible",
-        display_name: "OpenAI Compatible",
-    },
-    ProviderInfo {
-        slug: "opencode",
-        display_name: "OpenCode Zen",
-    },
-    ProviderInfo {
-        slug: "opencode-go",
-        display_name: "OpenCode Go",
-    },
-    ProviderInfo {
-        slug: "opencode-go-anthropic-compatible",
-        display_name: "OpenCode Go Anthropic-compatible",
-    },
-    ProviderInfo {
-        slug: "openrouter",
-        display_name: "OpenRouter",
-    },
-    ProviderInfo {
-        slug: "orcarouter",
-        display_name: "OrcaRouter",
-    },
-    ProviderInfo {
-        slug: "ovhcloud",
-        display_name: "OVHcloud",
-    },
-    ProviderInfo {
-        slug: "perplexity",
-        display_name: "Perplexity",
-    },
-    ProviderInfo {
-        slug: "qwen-token-plan",
-        display_name: "Qwen Token Plan",
-    },
-    ProviderInfo {
-        slug: "qwen-token-plan-cn",
-        display_name: "Qwen Token Plan CN",
-    },
-    ProviderInfo {
-        slug: "routstr",
-        display_name: "Routstr",
-    },
-    ProviderInfo {
-        slug: "sakana",
-        display_name: "Sakana AI",
-    },
-    ProviderInfo {
-        slug: "saladcloud",
-        display_name: "SaladCloud AI Gateway",
-    },
-    ProviderInfo {
-        slug: "scaleway",
-        display_name: "Scaleway",
-    },
-    ProviderInfo {
-        slug: "stepfun",
-        display_name: "StepFun",
-    },
-    ProviderInfo {
-        slug: "tanzu",
-        display_name: "VMware Tanzu Platform",
-    },
-    ProviderInfo {
-        slug: "tensorix",
-        display_name: "Tensorix",
-    },
-    ProviderInfo {
-        slug: "together",
-        display_name: "Together AI",
-    },
-    ProviderInfo {
-        slug: "upstage",
-        display_name: "Upstage Solar",
-    },
-    ProviderInfo {
-        slug: "venice",
-        display_name: "Venice AI",
-    },
-    ProviderInfo {
-        slug: "vercel-ai-gateway",
-        display_name: "Vercel AI Gateway",
-    },
-    ProviderInfo {
-        slug: "xai",
-        display_name: "xAI",
-    },
-    ProviderInfo {
-        slug: "xiaomi",
-        display_name: "Xiaomi MiMo",
-    },
-    ProviderInfo {
-        slug: "xiaomi-token-plan-ams",
-        display_name: "Xiaomi MiMo Token Plan (Amsterdam)",
-    },
-    ProviderInfo {
-        slug: "xiaomi-token-plan-cn",
-        display_name: "Xiaomi MiMo Token Plan (China)",
-    },
-    ProviderInfo {
-        slug: "xiaomi-token-plan-sgp",
-        display_name: "Xiaomi MiMo Token Plan (Singapore)",
-    },
-    ProviderInfo {
-        slug: "zai",
-        display_name: "ZAI",
-    },
-    ProviderInfo {
-        slug: "zai-cn",
-        display_name: "Z.AI CN",
-    },
-    ProviderInfo {
-        slug: "zai-coding-cn",
-        display_name: "Z.AI Coding CN",
-    },
-    ProviderInfo {
-        slug: "zhipu",
-        display_name: "Zhipu AI",
-    },
+/// The static default provider picker list for the new-account wizard
+/// (phase 1) — 208 entries.
+///
+/// Generated from the merged catalog (models.dev base + bundled overlay) by
+/// `cargo run --bin catalog-gen` — regenerate and paste the printed list when
+/// the catalog changes. Order matches the catalog (models.dev snapshot order
+/// for covered providers, then overlay-only providers).
+///
+/// This is the DEFAULT/fallback: `App.providers` starts from it and is
+/// replaced wholesale whenever the daemon broadcasts `CatalogUpdated` (S4),
+/// so the picker tracks the daemon's live catalog (cache + user overlay)
+/// rather than this compile-time snapshot.
+pub(crate) const PROVIDER_OPTIONS: &[(&str, &str)] = &[
+    ("zhipuai", "Zhipu AI"),
+    ("lucidquery", "LucidQuery"),
+    ("anyapi", "AnyAPI"),
+    ("impossibl", "Impossibl"),
+    ("blueclaw", "Blue Claw"),
+    ("tencent-tokenhub", "Tencent TokenHub"),
+    ("fireworks-ai", "Fireworks AI"),
+    ("greenpt", "GreenPT"),
+    ("wandb", "Weights & Biases"),
+    ("crossmodel", "CrossModel"),
+    ("llmtr", "LLMTR"),
+    ("claudinio", "Claudinio"),
+    ("coralbricks", "CoralBricks"),
+    ("snowflake-cortex", "Snowflake Cortex"),
+    ("cohere", "Cohere"),
+    ("opencode-go", "OpenCode Go"),
+    ("poe", "Poe"),
+    ("baseten", "Baseten"),
+    ("nvidia", "Nvidia"),
+    ("nebius", "Nebius Token Factory"),
+    ("vivgrid", "Vivgrid"),
+    ("google", "Google"),
+    ("thinkingmachines", "Thinking Machines"),
+    ("lilac", "Lilac"),
+    ("stepfun-ai-step-plan", "StepFun Step Plan (Global)"),
+    ("zhipuai-coding-plan", "Zhipu AI Coding Plan"),
+    ("nano-gpt", "NanoGPT"),
+    ("fastrouter", "FastRouter"),
+    ("nearai", "NEAR AI Cloud"),
+    ("daoxe", "DaoXE"),
+    ("crof", "CrofAI"),
+    ("qvac", "QVAC"),
+    ("abliteration-ai", "abliteration.ai"),
+    ("alibaba-coding-plan-cn", "Alibaba Coding Plan (China)"),
+    ("llmgateway", "LLM Gateway"),
+    ("kenari", "Kenari"),
+    ("friendli", "Friendli"),
+    ("opencode", "OpenCode Zen"),
+    ("sakana", "Sakana AI"),
+    ("trustedrouter", "TrustedRouter"),
+    ("salad-cloud", "SaladCloud AI Gateway"),
+    ("atomic-chat", "Atomic Chat"),
+    ("inception", "Inception"),
+    ("stepfun-step-plan", "StepFun Step Plan (China)"),
+    ("cloudflare-workers-ai", "Cloudflare Workers AI"),
+    ("modelscope", "ModelScope"),
+    ("github-copilot", "GitHub Copilot"),
+    ("302ai", "302.AI"),
+    ("helicone", "Helicone"),
+    ("alibaba-coding-plan", "Alibaba Coding Plan"),
+    ("watsonx", "watsonx.ai"),
+    ("submodel", "submodel"),
+    ("neon", "Neon"),
+    ("infomaniak", "Infomaniak"),
+    ("ambient", "Ambient"),
+    ("dinference", "DInference"),
+    ("privatemode-ai", "Privatemode AI"),
+    ("unorouter", "UnoRouter"),
+    ("frogbot", "FrogBot"),
+    ("the-grid-ai", "The Grid AI"),
+    ("sap-ai-core", "SAP AI Core"),
+    ("upstage", "Upstage"),
+    ("cline-pass", "ClinePass"),
+    ("regolo-ai", "Regolo AI"),
+    ("aiand", "ai&"),
+    ("pioneer", "Pioneer"),
+    ("siliconflow", "SiliconFlow"),
+    ("ai-router", "AI-ROUTER"),
+    ("zenmux", "ZenMux"),
+    ("inference", "Inference"),
+    ("evroc", "evroc"),
+    ("abacus", "Abacus"),
+    ("edenai", "Eden AI"),
+    ("inceptron", "Inceptron"),
+    ("empiriolabs", "EmpirioLabs AI"),
+    ("alibaba-token-plan", "Alibaba Token Plan"),
+    ("meta", "Meta"),
+    ("azure-cognitive-services", "Azure Cognitive Services"),
+    ("wafer.ai", "Wafer"),
+    ("clarifai", "Clarifai"),
+    ("iflowcn", "iFlow"),
+    ("gitlab", "GitLab Duo"),
+    ("bailing", "Bailing"),
+    ("venice", "Venice AI"),
+    ("mixlayer", "Mixlayer"),
+    ("scaleway", "Scaleway"),
+    ("togetherai", "Together AI"),
+    ("digitalocean", "DigitalOcean"),
+    ("moonshotai-cn", "Moonshot AI (China)"),
+    ("model-oracle-ai", "Model Oracle AI"),
+    ("drun", "D.Run (China)"),
+    ("lmstudio", "LMStudio"),
+    ("ovhcloud", "OVHcloud AI Endpoints"),
+    ("zeldoc", "Zeldoc"),
+    ("auriko", "Auriko"),
+    ("azure", "Azure"),
+    ("kuae-cloud-coding-plan", "KUAE Cloud Coding Plan"),
+    ("modal", "Modal"),
+    ("qihang-ai", "QiHang"),
+    ("berget", "Berget.AI"),
+    ("google-vertex-anthropic", "Vertex (Anthropic)"),
+    ("moark", "Moark"),
+    ("nova", "Nova"),
+    ("vultr", "Vultr"),
+    ("io-net", "IO.NET"),
+    ("neuralwatt", "Neuralwatt"),
+    ("aki-io", "AKI.IO"),
+    ("xai", "xAI"),
+    ("hetzner", "Hetzner"),
+    ("zenifra", "Zenifra"),
+    ("aihubmix", "AIHubMix"),
+    ("morph", "Morph"),
+    ("umans-ai-coding-plan", "Umans AI Coding Plan"),
+    ("mistral", "Mistral"),
+    ("umans-ai", "Umans AI"),
+    ("ofox", "Ofox"),
+    ("orcarouter", "OrcaRouter"),
+    ("xiaomi-token-plan-cn", "Xiaomi Token Plan (China)"),
+    ("v0", "v0"),
+    ("poolside", "Poolside"),
+    ("routing-run", "routing.run"),
+    ("google-vertex", "Vertex"),
+    ("tencent-token-plan", "Tencent Token Plan"),
+    ("synthetic", "Synthetic"),
+    ("zai-coding-plan", "Z.AI Coding Plan"),
+    ("gmicloud", "GMI Cloud"),
+    ("freemodel", "FreeModel"),
+    ("amazon-bedrock", "Amazon Bedrock"),
+    ("xiaomi-token-plan-ams", "Xiaomi Token Plan (Europe)"),
+    ("minimax", "MiniMax (minimax.io)"),
+    ("groq", "Groq"),
+    ("deepseek", "DeepSeek"),
+    ("kimi-for-coding", "Kimi For Coding"),
+    ("requesty", "Requesty"),
+    ("tensorx", "TensorX"),
+    ("llama", "Llama"),
+    ("kilo", "Kilo Gateway"),
+    ("merge-gateway", "Merge Gateway"),
+    ("scx", "SCX.ai"),
+    ("cloudferro-sherlock", "CloudFerro Sherlock"),
+    ("modelis", "Modelis"),
+    ("subconscious", "Subconscious"),
+    ("tencent-coding-plan", "Tencent Coding Plan (China)"),
+    ("hyper", "Charm Hyper"),
+    ("alibaba", "Alibaba"),
+    ("vercel", "Vercel AI Gateway"),
+    ("alibaba-cn", "Alibaba (China)"),
+    ("novita-ai", "NovitaAI"),
+    ("openrouter", "OpenRouter"),
+    ("huggingface", "Hugging Face"),
+    ("minimax-coding-plan", "MiniMax Token Plan (minimax.io)"),
+    ("siliconflow-cn", "SiliconFlow (China)"),
+    ("tinfoil", "Tinfoil"),
+    ("xiaomi", "Xiaomi"),
+    ("stackit", "STACKIT"),
+    ("deepinfra", "Deep Infra"),
+    ("anthropic", "Anthropic"),
+    ("cloudflare-ai-gateway", "Cloudflare AI Gateway"),
+    ("lynkr", "Lynkr"),
+    ("alibaba-token-plan-cn", "Alibaba Token Plan (China)"),
+    ("stepfun-ai", "StepFun (Global)"),
+    ("chutes", "Chutes"),
+    ("cerebras", "Cerebras"),
+    ("qiniu-ai", "Qiniu"),
+    ("longcat", "LongCat"),
+    ("ollama-cloud", "Ollama Cloud"),
+    ("jiekou", "Jiekou.AI"),
+    ("perplexity", "Perplexity"),
+    ("perplexity-agent", "Perplexity Agent"),
+    ("moonshotai", "Moonshot AI"),
+    ("openai", "OpenAI"),
+    ("xpersona", "Xpersona"),
+    ("sarvam", "Sarvam AI"),
+    ("zai", "Z.AI"),
+    ("inferx", "InferX"),
+    ("meganova", "Meganova"),
+    ("stepfun", "StepFun (China)"),
+    ("cortecs", "Cortecs"),
+    ("xiaomi-token-plan-sgp", "Xiaomi Token Plan (Singapore)"),
+    ("hpc-ai", "HPC-AI"),
+    ("minimax-cn", "MiniMax (minimaxi.com)"),
+    ("ebcloud", "EBCloud"),
+    ("databricks", "Databricks"),
+    (
+        "minimax-cn-coding-plan",
+        "MiniMax Token Plan (minimaxi.com)",
+    ),
+    ("aimlapi", "aimlapi.com"),
+    ("ant-ling", "Ant Ling"),
+    ("arcee", "Arcee AI"),
+    ("atlascloud", "Atlas Cloud"),
+    ("bankr", "Bankr"),
+    ("custom-anthropic", "Custom Anthropic-Compatible"),
+    ("custom-openai", "Custom OpenAI-Compatible"),
+    ("futurmix", "FuturMix"),
+    ("gitlawb-opengateway", "GitLawb OpenGateway"),
+    ("iflytek", "iFlytek Spark"),
+    ("iflytek-astron", "iFlytek Astron MaaS"),
+    ("kimi-code", "Kimi Code subscription"),
+    ("llama-swap", "Llama Swap"),
+    ("nous", "Nous Research"),
+    ("ollama", "Ollama (Local)"),
+    ("omlx", "oMLX"),
+    ("openai-codex", "OpenAI Codex subscription"),
+    ("openai_compatible", "OpenAI Compatible"),
+    (
+        "opencode-go-anthropic-compatible",
+        "OpenCode Go Anthropic-compatible",
+    ),
+    ("qwen-token-plan", "Qwen Token Plan"),
+    ("qwen-token-plan-cn", "Qwen Token Plan CN"),
+    ("routstr", "Routstr"),
+    ("tanzu", "VMware Tanzu Platform"),
+    ("tensorix", "Tensorix"),
 ];
 
 pub(crate) struct AIProvidersState {
@@ -519,8 +429,8 @@ impl AIProvidersState {
         self.provider_selection = self.provider_selection.saturating_sub(1);
     }
 
-    pub(crate) fn provider_down(&mut self) {
-        let max = PROVIDER_OPTIONS.len().saturating_sub(1);
+    pub(crate) fn provider_down(&mut self, providers: &[ProviderInfo]) {
+        let max = providers.len().saturating_sub(1);
         if self.provider_selection < max {
             self.provider_selection += 1;
         }
@@ -535,20 +445,24 @@ impl AIProvidersState {
 
     /// Move the selection down by a page (PgDn), clamped to the last
     /// provider.
-    pub(crate) fn provider_page_down(&mut self) {
-        let max = PROVIDER_OPTIONS.len().saturating_sub(1);
+    pub(crate) fn provider_page_down(&mut self, providers: &[ProviderInfo]) {
+        let max = providers.len().saturating_sub(1);
         self.provider_selection = (self.provider_selection + PROVIDER_PAGE_LINES).min(max);
     }
 
-    /// Compute the `(start, count)` slice of `PROVIDER_OPTIONS` to render
+    /// Compute the `(start, count)` slice of the provider list to render
     /// for a window of `height` provider rows, keeping the highlighted row
     /// visible.  Pure (`&self`): the renderer must not mutate focus state
     /// during `draw()`, so repeated calls with the same inputs return
     /// identical results.  The selection is the only scroll input — the
     /// window anchors the highlighted row at the bottom once it passes the
     /// fold, and at the top otherwise.
-    pub(crate) fn provider_window(&self, height: usize) -> (usize, usize) {
-        let len = PROVIDER_OPTIONS.len();
+    pub(crate) fn provider_window(
+        &self,
+        providers: &[ProviderInfo],
+        height: usize,
+    ) -> (usize, usize) {
+        let len = providers.len();
         if len == 0 || height == 0 {
             return (0, 0);
         }
@@ -568,10 +482,13 @@ impl AIProvidersState {
 
     /// The currently selected provider's canonical slug, or None when no
     /// provider has been picked yet (should not happen while in the wizard).
-    pub(crate) fn selected_provider_slug(&self) -> Option<&'static str> {
-        PROVIDER_OPTIONS
+    pub(crate) fn selected_provider_slug<'a>(
+        &self,
+        providers: &'a [ProviderInfo],
+    ) -> Option<&'a str> {
+        providers
             .get(self.provider_selection)
-            .map(|p| p.slug)
+            .map(|p| p.slug.as_str())
     }
 
     pub(crate) fn enter_credential(&mut self, account_name: String) {
@@ -1105,6 +1022,11 @@ pub(crate) struct App {
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
     pub(crate) model_selector: ModelSelectorState,
+    /// The live provider list for the new-account wizard's provider picker
+    /// (S4). Initialized from the static `PROVIDER_OPTIONS` default and
+    /// replaced wholesale whenever the daemon broadcasts `CatalogUpdated`, so
+    /// the picker tracks the daemon's live catalog (cache + user overlay).
+    pub(crate) providers: Vec<ProviderInfo>,
     pub(crate) scroll_accumulator: isize,
     pub(crate) scrollbar_dragging: bool,
     pub(crate) last_terminal_size: Option<(u16, u16)>,
@@ -2144,6 +2066,15 @@ impl App {
             session_mgr: SessionManagerState::new(),
             ai_providers: AIProvidersState::new(),
             model_selector: ModelSelectorState::new(),
+            // Start from the static default; the daemon's CatalogUpdated
+            // broadcast replaces it with the live list.
+            providers: PROVIDER_OPTIONS
+                .iter()
+                .map(|(slug, display_name)| ProviderInfo {
+                    slug: (*slug).to_string(),
+                    display_name: (*display_name).to_string(),
+                })
+                .collect(),
             scroll_accumulator: 0,
             scrollbar_dragging: false,
             history_index: None,
@@ -2162,6 +2093,22 @@ impl App {
 
     pub(crate) fn display_for(&mut self, session_id: u64) -> &mut SessionDisplayState {
         self.session_displays.entry(session_id).or_default()
+    }
+
+    /// Replace the live provider list from a daemon `CatalogUpdated`
+    /// broadcast. Clamps the wizard's provider selection when the list
+    /// shrank, so a catalog refresh that drops providers can never leave the
+    /// selection pointing past the end of the list. Returns whether the list
+    /// actually changed (identical payloads — e.g. the send-on-subscribe
+    /// welcome — do not churn the status line).
+    pub(crate) fn set_providers(&mut self, providers: Vec<ProviderInfo>) -> bool {
+        if self.providers == providers {
+            return false;
+        }
+        self.providers = providers;
+        let max = self.providers.len().saturating_sub(1);
+        self.ai_providers.provider_selection = self.ai_providers.provider_selection.min(max);
+        true
     }
     pub(crate) fn active_display(&mut self) -> Option<&mut SessionDisplayState> {
         self.session_displays.get_mut(&self.active_session_id?)

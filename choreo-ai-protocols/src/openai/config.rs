@@ -31,7 +31,10 @@ pub struct ServiceConfig {
     pub responses_path: String,
     pub chat_completions_path: String,
     pub default_request_format: RequestFormat,
-    pub provider_slug: &'static str,
+    /// Catalog slug for this service (e.g. `"opencode"` for an OpenAI-format
+    /// gateway). Owned: the catalog lookup that supplies it returns a clone,
+    /// so the slug cannot be a `'static` reference anymore.
+    pub provider_slug: String,
     pub chat_completions_max_tokens: Option<u32>,
     pub model_max_tokens: HashMap<String, u32>,
     pub context_window_config: crate::ContextWindowConfig,
@@ -66,7 +69,7 @@ impl Default for ServiceConfig {
             responses_path: DEFAULT_RESPONSES_PATH.to_string(),
             chat_completions_path: DEFAULT_CHAT_COMPLETIONS_PATH.to_string(),
             default_request_format: RequestFormat::ChatCompletions,
-            provider_slug: "openai",
+            provider_slug: "openai".to_string(),
             chat_completions_max_tokens: None,
             model_max_tokens: HashMap::new(),
             context_window_config: crate::ContextWindowConfig::default(),
@@ -103,7 +106,7 @@ impl ServiceConfig {
     /// Resolve the request format for a model: catalog lookup first,
     /// falling back to the configured default for unknown models.
     pub fn request_format_for_model(&self, model: &str) -> RequestFormat {
-        crate::catalog::model_request_format(self.provider_slug, model)
+        crate::catalog::model_request_format(&self.provider_slug, model)
             .unwrap_or(self.default_request_format)
     }
 
@@ -168,7 +171,7 @@ impl ServiceConfig {
     /// behavior it wasn't configured for. Every other provider slug gets an
     /// empty list.
     pub(crate) fn opencode_request_headers(&self) -> &'static [(&'static str, &'static str)] {
-        match self.provider_slug {
+        match self.provider_slug.as_str() {
             "opencode" | "opencode-go" => &[("x-opencode-session", OPENCODE_SESSION_ID)],
             _ => &[],
         }
@@ -206,6 +209,10 @@ pub fn completion(
 }
 
 #[cfg(test)]
+// These tests read the process-wide provider catalog via
+// `ServiceConfig::request_format_for_model`, so serialize them under the same
+// key as the catalog swap tests (see `catalog/mod.rs`) for libtest determinism.
+#[serial_test::serial(catalog)]
 mod tests {
     use super::*;
 
@@ -213,7 +220,7 @@ mod tests {
     fn opencode_request_headers_present_for_opencode_slug() {
         for slug in ["opencode", "opencode-go"] {
             let config = ServiceConfig {
-                provider_slug: slug,
+                provider_slug: slug.into(),
                 ..Default::default()
             };
             let headers = config.opencode_request_headers();
@@ -229,7 +236,7 @@ mod tests {
     fn opencode_request_headers_empty_for_other_providers() {
         for slug in ["openai", "deepseek", "anthropic", "custom"] {
             let config = ServiceConfig {
-                provider_slug: slug,
+                provider_slug: slug.into(),
                 ..Default::default()
             };
             assert!(
@@ -251,7 +258,7 @@ mod tests {
             "my-opencode-proxy",
         ] {
             let config = ServiceConfig {
-                provider_slug: slug,
+                provider_slug: slug.into(),
                 ..Default::default()
             };
             assert!(
@@ -318,7 +325,7 @@ mod tests {
     fn request_format_for_model_uses_catalog_lookup() {
         let config = ServiceConfig {
             default_request_format: RequestFormat::Responses,
-            provider_slug: "openai",
+            provider_slug: "openai".to_string(),
             ..Default::default()
         };
         assert_eq!(

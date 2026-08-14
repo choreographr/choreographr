@@ -1,7 +1,0 @@
-slug = "kilocode"
-display_name = "KiloCode"
-protocol = "openai"
-max_tokens_field = "max_completion_tokens"
-base_url = "https://api.kilo.ai/api/gateway"
-default_model = "anthropic/claude-sonnet-4.6"
-

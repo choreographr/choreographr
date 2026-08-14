@@ -617,7 +617,7 @@ use crate::{ChatTurnRequest, ProviderClient};
 use choreo_proto::InferenceError;
 
 impl ProviderClient for OpenAiClient {
-    fn provider_slug(&self) -> &'static str {
+    fn provider_slug(&self) -> &str {
         "openai"
     }
 

@@ -165,6 +165,13 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: crate::tg_api::Message)
         ShellCommand::Continue | ShellCommand::Stop => {
             debug!("telegram does not support Continue/Stop commands");
         }
+        ShellCommand::RefreshModels { force } => {
+            // The daemon refresh is client-agnostic: forward the request over
+            // the bridge like any other Send command.
+            if let Err(e) = state.bridge_tx.send(ClientMessage::RefreshModels { force }) {
+                warn!("failed to send refresh-models to bridge: {e}");
+            }
+        }
     }
 }
 

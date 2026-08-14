@@ -396,6 +396,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             debug!("client {}: ListModels", ctx.client_id);
             handle_list_models_sync(ctx, *ctx.attached_session_id);
         }
+        ClientMessage::RefreshModels { force } => {
+            debug!("client {}: RefreshModels force={}", ctx.client_id, force);
+            handle_refresh_models_sync(ctx, force);
+        }
         ClientMessage::DeleteSession { session_id } => {
             info!("client {}: DeleteSession id={}", ctx.client_id, session_id);
             handle_delete_session_sync(ctx, session_id);
@@ -835,6 +839,37 @@ fn handle_list_models_sync(ctx: &mut ClientCtx, attached_session_id: Option<u64>
     }
 }
 
+/// Handle a RefreshModels client message: forward the request to the daemon
+/// (which hands it to the maintenance thread — the fetch never blocks this
+/// connection), then route the reply back to the client. The request blocks
+/// here until the maintenance thread has a result, which is the request/
+/// response contract `/refresh-models` implies.
+fn handle_refresh_models_sync(ctx: &mut ClientCtx, force: bool) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::RefreshModels {
+        force,
+        reply,
+    });
+    match result {
+        Ok(Ok(report)) => {
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::ModelsRefreshed {
+                    providers: report.providers,
+                    models: report.models,
+                    status: report.status,
+                },
+            );
+        }
+        Ok(Err(e)) => {
+            send_to_writer(
+                ctx.writer_tx,
+                DaemonMessage::ModelsRefreshFailed { error: e },
+            );
+        }
+        Err(_) => warn!("daemon disconnected while handling refresh models"),
+    }
+}
+
 fn handle_get_credential_sync(ctx: &mut ClientCtx, service: String) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::GetCredential {
         service: service.clone(),
@@ -1140,6 +1175,69 @@ mod tests {
         handle_list_models_sync(&mut ctx, None);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg, DaemonMessage::Models { .. }));
+    }
+
+    #[test]
+    fn handle_refresh_models_sync_ok() {
+        // The connection thread asks the daemon for a refresh; the daemon
+        // (via the maintenance thread) replies with a report, which the
+        // connection routes to the client as ModelsRefreshed.
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::RefreshModels { force, reply }) = daemon_rx.recv() {
+                assert!(force);
+                let _ = reply.send(Ok(crate::catalog::RefreshReport {
+                    providers: 208,
+                    models: 1234,
+                    status: choreo_proto::RefreshStatus::Updated,
+                }));
+            }
+        });
+        handle_refresh_models_sync(&mut ctx, true);
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(
+            &msg,
+            DaemonMessage::ModelsRefreshed {
+                providers: 208,
+                models: 1234,
+                status: choreo_proto::RefreshStatus::Updated,
+            }
+        ));
+    }
+
+    #[test]
+    fn handle_refresh_models_sync_err() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::RefreshModels { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(Err("daemon is locked".into()));
+            }
+        });
+        handle_refresh_models_sync(&mut ctx, false);
+        let msg = writer_rx.recv().unwrap();
+        assert!(
+            matches!(&msg, DaemonMessage::ModelsRefreshFailed { error } if error == "daemon is locked")
+        );
     }
 
     #[test]

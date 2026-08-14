@@ -164,7 +164,7 @@ fn model_switch_sends_no_reasoning_on_the_wire() {
     let client = OpenAiClient::new(
         ServiceConfig {
             base_url: mock.base_url("v1"),
-            provider_slug: "deepseek",
+            provider_slug: "deepseek".to_string(),
             streaming: false,
             retry_max_attempts: 1,
             connect_timeout_secs: 5,

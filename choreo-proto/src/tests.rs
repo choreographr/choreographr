@@ -38,6 +38,87 @@ fn continue_generation_serde_round_trip() {
 }
 
 #[test]
+fn refresh_models_serde_round_trip() {
+    for force in [false, true] {
+        let message = ClientMessage::RefreshModels { force };
+        let frame = encode_frame(&message).expect("encode");
+        let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+        assert_eq!(decoded, message);
+    }
+}
+
+#[test]
+fn refresh_messages_serde_round_trip() {
+    // DaemonMessage replies: every RefreshStatus variant + the failure arm.
+    for status in [
+        RefreshStatus::UpToDate,
+        RefreshStatus::Updated,
+        RefreshStatus::Forced,
+    ] {
+        let message = DaemonMessage::ModelsRefreshed {
+            providers: 208,
+            models: 1234,
+            status,
+        };
+        let frame = encode_frame(&message).expect("encode");
+        let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+        assert_eq!(decoded, message);
+    }
+    let failed = DaemonMessage::ModelsRefreshFailed {
+        error: "network error".to_string(),
+    };
+    let frame = encode_frame(&failed).expect("encode");
+    let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, failed);
+
+    // CatalogUpdated carries the provider list (slugs + display names).
+    let updated = DaemonMessage::CatalogUpdated {
+        providers: vec![
+            CatalogProvider {
+                slug: "openai".to_string(),
+                display_name: "OpenAI".to_string(),
+            },
+            CatalogProvider {
+                slug: "ollama".to_string(),
+                display_name: "Ollama (Local)".to_string(),
+            },
+        ],
+    };
+    let frame = encode_frame(&updated).expect("encode");
+    let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, updated);
+}
+
+#[test]
+fn refresh_messages_have_no_session_id() {
+    // These variants are connection/catalog-level, not session-scoped: the
+    // activity-broadcast dedup logic must treat them as origin-less.
+    assert_eq!(
+        DaemonMessage::ModelsRefreshed {
+            providers: 0,
+            models: 0,
+            status: RefreshStatus::Updated,
+        }
+        .session_id(),
+        None
+    );
+    assert_eq!(
+        DaemonMessage::ModelsRefreshFailed {
+            error: "x".to_string(),
+        }
+        .session_id(),
+        None
+    );
+    assert_eq!(
+        DaemonMessage::CatalogUpdated {
+            providers: Vec::new(),
+        }
+        .session_id(),
+        None
+    );
+}
+
+#[test]
 fn decode_rejects_trailing_bytes() {
     let message = ClientMessage::Ping;
     let mut frame = encode_frame(&message).expect("encode");

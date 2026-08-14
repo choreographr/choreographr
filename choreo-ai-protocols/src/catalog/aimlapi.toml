@@ -1,7 +1,0 @@
-slug = "aimlapi"
-display_name = "aimlapi.com"
-protocol = "openai"
-max_tokens_field = "max_completion_tokens"
-base_url = "https://api.aimlapi.com/v1"
-default_model = "anthropic/claude-sonnet-5"
-

@@ -1,7 +1,0 @@
-slug = "longcat"
-display_name = "LongCat"
-protocol = "openai"
-max_tokens_field = "max_completion_tokens"
-base_url = "https://api.longcat.chat/openai"
-default_model = "LongCat-2.0"
-

@@ -1,6 +1,0 @@
-slug = "cloudflare-workers-ai"
-display_name = "Cloudflare Workers AI"
-protocol = "openai"
-max_tokens_field = "max_completion_tokens"
-base_url = "https://api.cloudflare.com/client/v4/accounts"
-default_model = "@cf/meta/llama-3.1-8b-instruct"

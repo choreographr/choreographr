@@ -4,8 +4,8 @@ use crate::state::*;
 use crate::test_util::test_app;
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{
-    AccountInfo, ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata,
-    ReasoningCapability, SessionStatus, TokenUsage, Turn,
+    AccountInfo, CatalogProvider, ClientMessage, DaemonMessage, DisplayedImageRecord,
+    ImageMetadata, ReasoningCapability, RefreshStatus, SessionStatus, TokenUsage, Turn,
 };
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2966,7 +2966,8 @@ fn advance_to_slug_phase(
     provider: &str,
 ) {
     setup_providers_new_account(app);
-    let idx = PROVIDER_OPTIONS
+    let idx = app
+        .providers
         .iter()
         .position(|p| p.slug == provider)
         .expect("provider in options");
@@ -3056,17 +3057,14 @@ fn ai_providers_new_account_provider_selection_clamps_at_edges() {
     assert_eq!(app.ai_providers.provider_selection, 0);
 
     // Jump to the last provider and try to go past it.
-    app.ai_providers.provider_selection = PROVIDER_OPTIONS.len() - 1;
+    app.ai_providers.provider_selection = app.providers.len() - 1;
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
     .expect("down at bottom");
-    assert_eq!(
-        app.ai_providers.provider_selection,
-        PROVIDER_OPTIONS.len() - 1
-    );
+    assert_eq!(app.ai_providers.provider_selection, app.providers.len() - 1);
 }
 
 #[test]
@@ -3103,17 +3101,14 @@ fn ai_providers_new_account_provider_page_keys_move_selection_by_page() {
     assert_eq!(app.ai_providers.provider_selection, 0);
 
     // PgDn past the last provider clamps to it.
-    app.ai_providers.provider_selection = PROVIDER_OPTIONS.len() - 1;
+    app.ai_providers.provider_selection = app.providers.len() - 1;
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
     .expect("page down at bottom");
-    assert_eq!(
-        app.ai_providers.provider_selection,
-        PROVIDER_OPTIONS.len() - 1
-    );
+    assert_eq!(app.ai_providers.provider_selection, app.providers.len() - 1);
 
     // Paging must not leak into the slug buffer.
     assert_eq!(app.ai_providers.slug_state.value(), "");
@@ -3126,7 +3121,7 @@ fn ai_providers_new_account_provider_window_keeps_selection_visible() {
 
     // The render window (pure) always contains the selection, anchoring it
     // at the bottom row once it passes the fold.
-    let window = |app: &App| app.ai_providers.provider_window(10);
+    let window = |app: &App| app.ai_providers.provider_window(&app.providers, 10);
     app.ai_providers.provider_selection = 50;
     let (start, count) = window(&app);
     assert!(
@@ -3141,11 +3136,11 @@ fn ai_providers_new_account_provider_window_keeps_selection_visible() {
     assert_eq!(start, 0, "window should start at the top for row 1");
 
     // The window never exceeds the list bounds at the bottom edge.
-    app.ai_providers.provider_selection = PROVIDER_OPTIONS.len() - 1;
+    app.ai_providers.provider_selection = app.providers.len() - 1;
     let (start, count) = window(&app);
     assert_eq!(
         start + count,
-        PROVIDER_OPTIONS.len(),
+        app.providers.len(),
         "window must end at the last provider"
     );
 }
@@ -3231,7 +3226,8 @@ fn ai_providers_new_account_esc_backs_to_provider_from_slug() {
     let (tx, _rx) = std::sync::mpsc::channel();
     advance_to_slug_phase(&mut app, &tx, "anthropic");
 
-    let anthro_idx = PROVIDER_OPTIONS
+    let anthro_idx = app
+        .providers
         .iter()
         .position(|p| p.slug == "anthropic")
         .expect("anthropic in options");
@@ -4617,6 +4613,28 @@ fn ctrl_r_no_session_shows_message() {
 }
 
 #[test]
+fn ctrl_r_no_active_display_shows_message() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // No session attached at all: there is no display whose capability
+    // could be consulted, so fall back to the established no-session
+    // wording used by the other session-bound shortcuts.
+    app.active_session_id = None;
+    app.attached_session_id = None;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r");
+
+    assert_eq!(app.status.as_deref(), Some("no session attached"));
+    assert!(rx.try_iter().next().is_none(), "no client message expected");
+}
+
+#[test]
 fn ctrl_r_cycles_through_valid_slugs() {
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -4700,12 +4718,15 @@ fn ctrl_r_cycles_through_valid_slugs() {
 }
 
 #[test]
-fn ctrl_r_non_reasoning_model_shows_message() {
+fn ctrl_r_no_model_selected_shows_message() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
 
-    // No reasoning capability set (model does not support reasoning).
+    // No model selected yet and no capability reported.  `None` here must
+    // NOT be reported as "model does not support reasoning" — the user
+    // simply has nothing to cycle yet.
     app.display_for(0).reasoning_capability = None;
+    app.display_for(0).selected_model = None;
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
@@ -4716,10 +4737,39 @@ fn ctrl_r_non_reasoning_model_shows_message() {
 
     assert_eq!(
         app.status.as_deref(),
-        Some("model does not support reasoning")
+        Some("no model selected — pick one with Ctrl+M")
     );
-    // Effort should remain unchanged (still None).
+    // Effort should remain unchanged (still None) and nothing is sent to
+    // the daemon (no cycling, so no SetReasoningEffort).
     assert!(app.display_for(0).reasoning_effort.is_none());
+    assert!(rx.try_iter().next().is_none(), "no client message expected");
+}
+
+#[test]
+fn ctrl_r_model_selected_capability_pending_shows_message() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // A model is selected but the daemon has not reported its reasoning
+    // capability yet — must not be reported as "does not support reasoning".
+    app.display_for(0).reasoning_capability = None;
+    app.display_for(0).selected_model = Some("gpt-4o".to_string());
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r");
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("reasoning capability not yet available")
+    );
+    // Effort should remain unchanged (still None) and nothing is sent to
+    // the daemon (no cycling, so no SetReasoningEffort).
+    assert!(app.display_for(0).reasoning_effort.is_none());
+    assert!(rx.try_iter().next().is_none(), "no client message expected");
 }
 
 #[test]
@@ -6599,5 +6649,191 @@ mod unsent_draft_tests {
         app.attach_to_session(1, &tx)
             .expect("attach back to session 1");
         assert_eq!(app.input.text, "past promptX");
+    }
+
+    // ── S4: /refresh-models + dynamic provider list ─────────────────────
+
+    #[test]
+    fn refresh_models_sets_status_and_sends_message() {
+        // The slash command shows immediate feedback and sends RefreshModels;
+        // the reply arrives asynchronously.
+        let mut app = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("enter on empty input is a no-op");
+
+        // Type the command and submit it.
+        app.input.text = "/refresh-models --force".to_string();
+        app.input.cursor = app.input.text.len();
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("submit refresh-models");
+
+        let msg = rx.recv().expect("RefreshModels sent");
+        assert_eq!(msg, ClientMessage::RefreshModels { force: true });
+        assert_eq!(
+            app.status.as_deref(),
+            Some("refreshing models… (forced)"),
+            "status set before the reply arrives"
+        );
+    }
+
+    #[test]
+    fn models_refreshed_updates_status() {
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        handle_daemon_message(
+            DaemonMessage::ModelsRefreshed {
+                providers: 208,
+                models: 1234,
+                status: RefreshStatus::Updated,
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle ModelsRefreshed");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("models updated (208 providers, 1234 models)")
+        );
+
+        handle_daemon_message(
+            DaemonMessage::ModelsRefreshed {
+                providers: 208,
+                models: 1234,
+                status: RefreshStatus::UpToDate,
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle ModelsRefreshed 304");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("models up to date (208 providers, 1234 models)")
+        );
+
+        handle_daemon_message(
+            DaemonMessage::ModelsRefreshed {
+                providers: 208,
+                models: 1234,
+                status: RefreshStatus::Forced,
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle ModelsRefreshed forced");
+        assert!(app.status.as_deref().unwrap().contains("forced"));
+    }
+
+    #[test]
+    fn models_refresh_failed_sets_error() {
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        handle_daemon_message(
+            DaemonMessage::ModelsRefreshFailed {
+                error: "network error".to_string(),
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle ModelsRefreshFailed");
+        assert_eq!(
+            app.error.as_deref(),
+            Some("[daemon] refresh-models failed: network error")
+        );
+    }
+
+    #[test]
+    fn catalog_updated_replaces_provider_list_and_clamps_selection() {
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        // The default list starts from PROVIDER_OPTIONS (208 entries); park
+        // the wizard selection deep in the list.
+        let default_len = app.providers.len();
+        assert!(default_len > 10, "default provider list is large");
+        app.ai_providers.provider_selection = default_len - 1;
+
+        // A catalog update with a small list replaces it and clamps.
+        handle_daemon_message(
+            DaemonMessage::CatalogUpdated {
+                providers: vec![
+                    CatalogProvider {
+                        slug: "openai".into(),
+                        display_name: "OpenAI".into(),
+                    },
+                    CatalogProvider {
+                        slug: "anthropic".into(),
+                        display_name: "Anthropic".into(),
+                    },
+                ],
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle CatalogUpdated");
+
+        assert_eq!(app.providers.len(), 2);
+        assert_eq!(app.providers[0].slug, "openai");
+        assert_eq!(app.providers[0].display_name, "OpenAI");
+        // Selection was beyond the new list's end → clamped to the last row.
+        assert_eq!(app.ai_providers.provider_selection, 1);
+        assert_eq!(app.status.as_deref(), Some("catalog updated (2 providers)"));
+    }
+
+    #[test]
+    fn catalog_updated_identical_list_does_not_churn_status() {
+        // The daemon sends CatalogUpdated on every activity-subscribe; an
+        // identical payload must not overwrite an unrelated status message.
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.status = Some("busy".to_string());
+
+        let providers = app
+            .providers
+            .iter()
+            .map(|p| CatalogProvider {
+                slug: p.slug.clone(),
+                display_name: p.display_name.clone(),
+            })
+            .collect();
+        handle_daemon_message(DaemonMessage::CatalogUpdated { providers }, &mut app, &tx)
+            .expect("handle CatalogUpdated");
+
+        assert_eq!(app.status.as_deref(), Some("busy"), "status preserved");
+        assert_eq!(app.providers.len(), 208);
+    }
+
+    #[test]
+    fn set_providers_returns_whether_list_changed() {
+        let mut app = test_app();
+        let unchanged = app
+            .providers
+            .iter()
+            .map(|p| ProviderInfo {
+                slug: p.slug.clone(),
+                display_name: p.display_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert!(!app.set_providers(unchanged), "identical list → no change");
+
+        assert!(
+            app.set_providers(vec![ProviderInfo {
+                slug: "openai".into(),
+                display_name: "OpenAI".into(),
+            }]),
+            "different list → change"
+        );
+        assert_eq!(app.ai_providers.provider_selection, 0);
     }
 }

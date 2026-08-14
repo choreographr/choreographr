@@ -1,6 +1,0 @@
-slug = "opencode-go-anthropic-compatible"
-display_name = "OpenCode Go Anthropic-compatible"
-protocol = "anthropic"
-base_url = "https://opencode.ai/zen/go"
-default_model = "minimax-m3"
-

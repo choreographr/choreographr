@@ -1,15 +1,18 @@
 use crate::accounts::{AccountConfig, AccountManager, accounts_config_path};
+use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport};
 use crate::db::{self, SessionRecord};
 use crate::mcp::McpManager;
 use crate::providers::InferenceProvider;
 use crate::sessions::{
     ActiveSessionEntry, CANCEL_ALL, RequestContext, SessionCommand, SessionMetadata, session_main,
 };
-use choreo_ai_protocols::lookup_context_window;
+use choreo_ai_protocols::{
+    bundled_overlay_src, catalog_snapshot, lookup_context_window, merge_overlay, replace_catalog,
+};
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
-    AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary, TimestampMs,
-    TokenUsage,
+    AccountInfo, CatalogProvider, ContextConfig, DaemonMessage, RefreshStatus, SessionStatus,
+    SessionSummary, TimestampMs, TokenUsage,
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -73,6 +76,14 @@ pub struct DaemonState {
     pub client_subscribed_sessions: HashMap<u64, HashSet<u64>>,
     pub model_cache: HashMap<String, (Vec<String>, Instant)>,
     pub mcp_manager: McpManager,
+    /// Sender to the ONE background catalog-maintenance thread (see
+    /// `crate::catalog`). `None` until `run_server` spawns the thread — a
+    /// unit-test DaemonState has no maintenance thread, and `/refresh-models`
+    /// then replies with an error instead of hanging.
+    pub maintenance_tx: Option<crossbeam_channel::Sender<MaintenanceEvent>>,
+    /// Filesystem locations of the runtime catalog cache + user overlay
+    /// (resolved from the standard XDG dirs; see `crate::catalog`).
+    pub catalog_paths: CatalogPaths,
 }
 
 pub enum DaemonCommand {
@@ -130,6 +141,38 @@ pub enum DaemonCommand {
     ListModels {
         session_id: Option<u64>,
         reply: ListModelsReply,
+    },
+    /// A client requested `/refresh-models`. The daemon does NOT do the HTTP
+    /// fetch here — it hands the request to the maintenance thread over its
+    /// channel (the fetch can block for the whole 30s timeout), and the reply
+    /// is routed back through [`DaemonCommand::CatalogBaseChanged`] once the
+    /// maintenance thread has a result.
+    RefreshModels {
+        force: bool,
+        reply: mpsc::Sender<Result<RefreshReport, String>>,
+    },
+    /// The maintenance thread delivered a (possibly refreshed) models.dev
+    /// base + the current user overlay. The daemon command loop — the single
+    /// writer of the catalog `ArcSwap` — merges overlays, swaps the catalog,
+    /// optionally persists the cache, broadcasts `CatalogUpdated`, and
+    /// replies to a `/refresh-models` requester.
+    CatalogBaseChanged {
+        base: Vec<choreo_ai_protocols::ProviderEntry>,
+        etag: Option<String>,
+        /// The user overlay contents, or `None` for bundled-only. `Some`
+        /// with a fresh value means the file was edited; `None` after `Some`
+        /// means it was deleted.
+        user_overlay: Option<String>,
+        /// Persist the cache bin + etag sidecar after swapping (live fetches
+        /// only — a startup cache load is already on disk).
+        persist: bool,
+        /// Reported status when this change came from a `/refresh-models`
+        /// request (`None` for background events: startup load, overlay
+        /// change).
+        report_status: Option<RefreshStatus>,
+        /// Reply channel for a `/refresh-models` request (`None` for
+        /// background events).
+        reply: Option<mpsc::Sender<Result<RefreshReport, String>>>,
     },
     GetCredential {
         service: String,
@@ -345,6 +388,24 @@ impl DaemonState {
             DaemonCommand::ListModels { session_id, reply } => {
                 self.handle_list_models(session_id, reply)
             }
+            DaemonCommand::RefreshModels { force, reply } => {
+                self.handle_refresh_models(force, reply)
+            }
+            DaemonCommand::CatalogBaseChanged {
+                base,
+                etag,
+                user_overlay,
+                persist,
+                report_status,
+                reply,
+            } => self.handle_catalog_base_changed(
+                base,
+                etag,
+                user_overlay,
+                persist,
+                report_status,
+                reply,
+            ),
             DaemonCommand::GetCredential { service, reply } => {
                 self.handle_get_credential(service, reply)
             }
@@ -552,7 +613,7 @@ impl DaemonState {
             active_tool_groups.clone()
         };
 
-        // Resolve context window from the static catalog at creation time
+        // Resolve context window from the provider catalog at creation time
         // when both account and model are known — no provider instance needed.
         let context_window = account_name.as_ref().and_then(|name| {
             self.accounts.get(name).and_then(|config| {
@@ -916,6 +977,119 @@ impl DaemonState {
         let _ = reply.send(result);
     }
 
+    /// Handle a `/refresh-models` request. The fetch must NEVER run here (it
+    /// can block for the whole 30s timeout, stalling the command loop), so the
+    /// request is handed to the maintenance thread over its channel; the reply
+    /// comes back through [`DaemonCommand::CatalogBaseChanged`] after the
+    /// thread has a result (or is sent directly by the thread on 304/error).
+    fn handle_refresh_models(
+        &mut self,
+        force: bool,
+        reply: mpsc::Sender<Result<RefreshReport, String>>,
+    ) {
+        match &self.maintenance_tx {
+            Some(tx) => {
+                info!(
+                    force,
+                    "RefreshModels: handing fetch to the maintenance thread"
+                );
+                if tx
+                    .send(MaintenanceEvent::RefreshNow { force, reply })
+                    .is_err()
+                {
+                    warn!("RefreshModels: maintenance thread is gone");
+                }
+            }
+            None => {
+                warn!(
+                    "RefreshModels: no maintenance thread (unit-test state); replying with an error"
+                );
+                let _ = reply.send(Err("catalog maintenance thread is not running".to_string()));
+            }
+        }
+    }
+
+    /// Apply a new catalog base + user overlay delivered by the maintenance
+    /// thread. This is the ONLY place the daemon calls `replace_catalog` for
+    /// runtime refreshes (single-writer invariant: the daemon command loop).
+    ///
+    /// Merge order, lowest → highest wins: normalized models.dev base →
+    /// bundled overlay → user overlay. The merged catalog is validated
+    /// non-empty before the swap (a hostile/typo'd overlay must never leave
+    /// the daemon with an empty catalog). On a live fetch the cache bin +
+    /// etag sidecar are persisted atomically. Every swap broadcasts
+    /// `CatalogUpdated` so clients can refresh their provider pickers.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_catalog_base_changed(
+        &mut self,
+        base: Vec<choreo_ai_protocols::ProviderEntry>,
+        etag: Option<String>,
+        user_overlay: Option<String>,
+        persist: bool,
+        report_status: Option<RefreshStatus>,
+        reply: Option<mpsc::Sender<Result<RefreshReport, String>>>,
+    ) {
+        debug!(
+            base_providers = base.len(),
+            user_overlay_present = user_overlay.is_some(),
+            persist,
+            "CatalogBaseChanged: merging overlays",
+        );
+
+        // Lowest → highest: base → bundled overlay → user overlay.
+        let mut effective = merge_overlay(&base, bundled_overlay_src());
+        if let Some(overlay) = &user_overlay {
+            effective = merge_overlay(&effective, overlay);
+        }
+
+        if effective.is_empty() {
+            // Never swap in an empty catalog: keep the current one and tell
+            // the requester (merge_overlay is infallible, so an empty result
+            // means the base itself was empty — a broken fetch).
+            error!("refusing to swap in an empty catalog; keeping the current one");
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(
+                    "merged catalog is empty; keeping the current catalog".to_string()
+                ));
+            }
+            return;
+        }
+
+        // Single-writer point: the atomic swap. Readers are lock-free.
+        replace_catalog(effective.clone());
+
+        if persist
+            && let Err(e) = crate::catalog::write_catalog_cache(
+                &base,
+                etag.as_deref(),
+                &self.catalog_paths.bin,
+                &self.catalog_paths.etag,
+            )
+        {
+            warn!(
+                error = %e,
+                "failed to persist the catalog cache; the next refresh will re-fetch",
+            );
+        }
+
+        // Broadcast the new provider list to all activity subscribers so the
+        // TUI's provider picker tracks the live catalog.
+        let providers = catalog_provider_pairs();
+        self.handle_broadcast_activity(DaemonMessage::CatalogUpdated { providers });
+
+        let models: usize = effective.iter().map(|e| e.models.len()).sum();
+        info!(providers = effective.len(), models, "catalog updated",);
+
+        if let Some(reply) = reply {
+            let status = report_status.unwrap_or(RefreshStatus::Updated);
+            let _ = reply.send(Ok(RefreshReport {
+                providers: effective.len(),
+                models,
+                status,
+            }));
+        }
+    }
+
     /// Validate that a model exists in the provider's model list for this
     /// session's account.  The model list is pre-populated by
     /// `fetch_and_cache_models` at provider-resolution time (unlock, credential
@@ -1067,7 +1241,15 @@ impl DaemonState {
         writer: std::sync::mpsc::SyncSender<DaemonMessage>,
     ) {
         info!("registering activity subscriber: client_id={}", client_id);
-        self.activity_subscribers.insert(client_id, writer);
+        self.activity_subscribers.insert(client_id, writer.clone());
+        // Send the CURRENT provider list to the freshly-subscribed client so
+        // its provider picker reflects the live catalog immediately (not just
+        // the static default) — a client that connects after the daemon's
+        // startup refresh has already broadcast would otherwise wait for the
+        // next catalog change. Drop-on-full is fine here: the TUI re-requests
+        // on every catalog swap anyway, and the channel has 128 slots.
+        let providers = catalog_provider_pairs();
+        let _ = writer.try_send(DaemonMessage::CatalogUpdated { providers });
     }
 
     /// Unregister a client from all session activity broadcasts.
@@ -1758,6 +1940,19 @@ fn fetch_and_cache_models(
     }
 }
 
+/// Build the slug + display-name pair list for a `CatalogUpdated` broadcast
+/// from the currently swapped catalog. Shared by the broadcast and the
+/// send-on-subscribe path so both carry the identical payload shape.
+fn catalog_provider_pairs() -> Vec<CatalogProvider> {
+    catalog_snapshot()
+        .iter()
+        .map(|e| CatalogProvider {
+            slug: e.slug.clone(),
+            display_name: e.display_name.clone(),
+        })
+        .collect()
+}
+
 fn handle_list_models_inner(
     state: &mut DaemonState,
     session_id: Option<u64>,
@@ -1843,6 +2038,8 @@ mod tests {
             client_subscribed_sessions: HashMap::new(),
             model_cache: HashMap::new(),
             mcp_manager: crate::mcp::McpManager::empty(),
+            maintenance_tx: None,
+            catalog_paths: CatalogPaths::default(),
         };
         (state, daemon_rx)
     }
@@ -3000,6 +3197,17 @@ mod tests {
 
     // ── Activity subscriber tests ───────────────────────────────────────
 
+    /// Drain the send-on-subscribe `CatalogUpdated` that registering an
+    /// activity subscriber delivers to the fresh client, so tests can assert
+    /// on the messages that follow registration.
+    fn drain_send_on_subscribe(rx: &mpsc::Receiver<DaemonMessage>) {
+        let msg = rx.recv().unwrap();
+        assert!(
+            matches!(&msg, DaemonMessage::CatalogUpdated { providers } if !providers.is_empty()),
+            "expected the send-on-subscribe CatalogUpdated, got {msg:?}",
+        );
+    }
+
     #[test]
     fn handle_register_activity_subscriber_adds_to_map() {
         let (mut state, _rx) = make_daemon_state();
@@ -3241,6 +3449,7 @@ mod tests {
             client_id: 10,
             writer: tx,
         });
+        drain_send_on_subscribe(&rx);
 
         let msg = DaemonMessage::OutputChunk {
             session_id: 1,
@@ -3268,6 +3477,7 @@ mod tests {
             client_id: 10,
             writer: tx,
         });
+        drain_send_on_subscribe(&rx);
         state.handle_command(DaemonCommand::TrackSessionSubscription {
             client_id: 10,
             session_id: 1,
@@ -3303,6 +3513,7 @@ mod tests {
             client_id: 10,
             writer: tx,
         });
+        drain_send_on_subscribe(&rx);
         state.handle_command(DaemonCommand::TrackSessionSubscription {
             client_id: 10,
             session_id: 1,
@@ -3333,6 +3544,7 @@ mod tests {
             client_id: 10,
             writer: tx,
         });
+        drain_send_on_subscribe(&rx);
 
         let msg = DaemonMessage::Models {
             models: vec!["gpt-4".into()],
@@ -3388,6 +3600,9 @@ mod tests {
             client_id: 10,
             writer: tx,
         });
+        // Drain the send-on-subscribe CatalogUpdated so the single slot is
+        // free for the filler below (the register already used it).
+        drain_send_on_subscribe(&rx);
 
         // Fill the subscriber's buffer so the broadcast below cannot enqueue.
         let filler = DaemonMessage::SessionStatusChanged {
@@ -3452,6 +3667,8 @@ mod tests {
             client_id: 20,
             writer: tx2,
         });
+        drain_send_on_subscribe(&rx1);
+        drain_send_on_subscribe(&rx2);
         state.handle_command(DaemonCommand::TrackSessionSubscription {
             client_id: 10,
             session_id: 1,
@@ -3668,5 +3885,217 @@ mod tests {
             data: vec![],
         };
         assert_eq!(msg.session_id(), Some(12345));
+    }
+
+    // ── S4: /refresh-models + catalog swaps ────────────────────────────
+
+    /// The bundled catalog (embedded base + bundled overlay) — what
+    /// `PROVIDER_CATALOG` is lazily initialized from, and what the swap tests
+    /// restore.
+    fn bundled_catalog() -> Vec<choreo_ai_protocols::ProviderEntry> {
+        merge_overlay(
+            &choreo_ai_protocols::load_bundled_base(),
+            bundled_overlay_src(),
+        )
+    }
+
+    /// Restores the bundled catalog when dropped, so a failing swap test can
+    /// never leave the process-global catalog swapped for later tests (the
+    /// libtest fallback shares one process; nextest gives per-test processes
+    /// but the guard keeps the invariant anyway).
+    struct RestoreBundledCatalogOnDrop;
+
+    impl Drop for RestoreBundledCatalogOnDrop {
+        fn drop(&mut self) {
+            replace_catalog(bundled_catalog());
+        }
+    }
+
+    /// A minimal one-provider base for the catalog-swap tests.
+    fn tiny_base() -> Vec<choreo_ai_protocols::ProviderEntry> {
+        vec![choreo_ai_protocols::ProviderEntry {
+            slug: "tiny-test".into(),
+            display_name: "Tiny Test".into(),
+            protocol: choreo_ai_protocols::ProviderProtocol::OpenAi {
+                max_tokens_field: choreo_ai_protocols::MaxTokensField::MaxCompletionTokens,
+            },
+            base_url: "https://tiny.example/v1".into(),
+            default_model: "tiny-1".into(),
+            models: vec![choreo_ai_protocols::ModelEntry {
+                model: "tiny-1".into(),
+                context_window: 4096,
+                reasoning_supported: true,
+                openai_reasoning_levels: vec![],
+                openai_responses: false,
+                reasoning_passback: None,
+            }],
+        }]
+    }
+
+    #[test]
+    #[serial_test::serial(catalog)]
+    fn refresh_models_without_maintenance_thread_replies_error() {
+        // A unit-test DaemonState has no maintenance thread; the handler must
+        // reply with a structured error instead of hanging or panicking.
+        let (mut state, _rx) = make_daemon_state();
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::RefreshModels {
+            force: false,
+            reply,
+        });
+        let result = rx.recv().unwrap();
+        assert!(result.is_err(), "no maintenance thread → error reply");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("maintenance thread"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(catalog)]
+    fn refresh_models_forwards_to_maintenance_thread() {
+        // With a maintenance channel present, the handler hands the request
+        // (force + reply) to the thread and does NOT fetch itself.
+        let (mut state, _rx) = make_daemon_state();
+        let (maintenance_tx, maintenance_rx) = crossbeam_channel::unbounded();
+        state.maintenance_tx = Some(maintenance_tx);
+        let (reply, _reply_rx) = mpsc::channel();
+
+        state.handle_command(DaemonCommand::RefreshModels { force: true, reply });
+
+        let msg = maintenance_rx.recv().unwrap();
+        match msg {
+            MaintenanceEvent::RefreshNow { force, .. } => assert!(force),
+            other => panic!("expected RefreshNow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(catalog)]
+    fn catalog_base_changed_swaps_broadcasts_and_replies() {
+        let _restore = RestoreBundledCatalogOnDrop;
+        let (mut state, _rx) = make_daemon_state();
+        let (writer_tx, writer_rx) =
+            std::sync::mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        state.activity_subscribers.insert(1, writer_tx);
+        let (reply, reply_rx) = mpsc::channel();
+
+        state.handle_command(DaemonCommand::CatalogBaseChanged {
+            base: tiny_base(),
+            etag: Some("\"v42\"".into()),
+            user_overlay: None,
+            persist: false,
+            report_status: Some(RefreshStatus::Updated),
+            reply: Some(reply),
+        });
+
+        // The catalog was swapped: the tiny provider is now visible.
+        assert_eq!(
+            choreo_ai_protocols::lookup_provider("tiny-test")
+                .expect("swapped catalog")
+                .slug,
+            "tiny-test"
+        );
+        // Activity subscribers got the CatalogUpdated broadcast.
+        let broadcast = writer_rx.recv().unwrap();
+        assert!(matches!(
+            &broadcast,
+            DaemonMessage::CatalogUpdated { providers } if providers.iter().any(|p| p.slug == "tiny-test")
+        ));
+        // The requester got a RefreshReport with the merged counts. The
+        // merged catalog is tiny-test + the bundled overlay's wholesale
+        // providers (ollama, kimi-code, custom-*, …), so it is strictly
+        // larger than the 1-provider base.
+        let report = reply_rx.recv().unwrap().expect("refresh succeeds");
+        assert!(report.providers > 1, "overlay-only providers must survive");
+        assert!(report.models >= 1);
+        assert_eq!(report.status, RefreshStatus::Updated);
+    }
+
+    #[test]
+    #[serial_test::serial(catalog)]
+    fn catalog_base_changed_user_overlay_merges_on_top() {
+        let _restore = RestoreBundledCatalogOnDrop;
+        let (mut state, _rx) = make_daemon_state();
+        // A user overlay that renames the tiny provider's display name and
+        // adds a brand-new provider must win over the base.
+        let overlay = r#"
+[provider.tiny-test]
+display_name = "Renamed By User"
+
+[provider.user-only]
+display_name = "User Only"
+protocol = "openai"
+base_url = "https://user.example/v1"
+default_model = "u-1"
+
+[provider.user-only.models."u-1"]
+context_window = 1024
+"#;
+        state.handle_command(DaemonCommand::CatalogBaseChanged {
+            base: tiny_base(),
+            etag: None,
+            user_overlay: Some(overlay.to_string()),
+            persist: false,
+            report_status: None,
+            reply: None,
+        });
+
+        let renamed = choreo_ai_protocols::lookup_provider("tiny-test").expect("tiny-test present");
+        assert_eq!(renamed.display_name, "Renamed By User");
+        let user_only =
+            choreo_ai_protocols::lookup_provider("user-only").expect("user overlay provider");
+        assert_eq!(user_only.display_name, "User Only");
+        assert_eq!(user_only.models.len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial(catalog)]
+    fn catalog_base_changed_empty_base_still_yields_overlay_only_providers() {
+        let _restore = RestoreBundledCatalogOnDrop;
+        let (mut state, _rx) = make_daemon_state();
+        // An empty base (a broken fetch that slipped past the maintenance
+        // thread's validation) still merges to a NON-empty catalog: the
+        // bundled overlay defines the wholesale overlay-only providers, so
+        // the daemon swaps in those and replies Ok with their counts. The
+        // `effective.is_empty()` guard is belt-and-suspenders on top of that
+        // (defensive; unreachable while the bundled overlay is non-empty).
+        let (reply, reply_rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::CatalogBaseChanged {
+            base: Vec::new(),
+            etag: None,
+            user_overlay: None,
+            persist: false,
+            report_status: Some(RefreshStatus::Updated),
+            reply: Some(reply),
+        });
+        let report = reply_rx.recv().unwrap().expect("refresh succeeds");
+        assert!(report.providers > 1, "overlay-only providers must survive");
+        assert_eq!(report.status, RefreshStatus::Updated);
+        // The overlay-only providers are actually queryable now.
+        assert!(choreo_ai_protocols::lookup_provider("ollama").is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(catalog)]
+    fn activity_subscriber_gets_current_provider_list_on_register() {
+        // A freshly-subscribed client must receive the CURRENT provider list
+        // immediately (send-on-subscribe), so the TUI's picker tracks the live
+        // catalog even when it connects after the startup swap broadcast.
+        let (mut state, _rx) = make_daemon_state();
+        let (writer_tx, writer_rx) =
+            std::sync::mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        state.handle_register_activity_subscriber(1, writer_tx);
+
+        let msg = writer_rx.recv().unwrap();
+        match &msg {
+            DaemonMessage::CatalogUpdated { providers } => {
+                assert!(!providers.is_empty());
+                assert!(providers.iter().any(|p| p.slug == "openai"));
+            }
+            other => panic!("expected CatalogUpdated, got {other:?}"),
+        }
     }
 }

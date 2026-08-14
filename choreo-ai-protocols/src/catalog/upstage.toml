@@ -1,7 +1,0 @@
-slug = "upstage"
-display_name = "Upstage Solar"
-protocol = "openai"
-max_tokens_field = "max_completion_tokens"
-base_url = "https://api.upstage.ai/v1"
-default_model = "solar-pro"
-

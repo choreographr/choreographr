@@ -37,7 +37,7 @@ pub struct ChatTurnRequest<'a> {
 /// Uses `&mut dyn FnMut` for the streaming callback to keep the trait object-safe.
 pub trait ProviderClient: Debug + Send + Sync {
     /// Return the provider slug for catalog lookups.
-    fn provider_slug(&self) -> &'static str;
+    fn provider_slug(&self) -> &str;
 
     fn chat_completion_turn(
         &self,

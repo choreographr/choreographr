@@ -66,6 +66,11 @@ pub fn test_daemon_state() -> DaemonState {
         client_subscribed_sessions: HashMap::new(),
         model_cache: HashMap::new(),
         mcp_manager: choreo_daemon::mcp::McpManager::empty(),
+        // The integration harness runs the real `run_server`, which spawns the
+        // catalog-maintenance thread and fills this in; a dummy value here is
+        // overwritten before any client connects.
+        maintenance_tx: None,
+        catalog_paths: choreo_daemon::catalog::CatalogPaths::default(),
     }
 }
 

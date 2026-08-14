@@ -1,7 +1,0 @@
-slug = "gitlawb-opengateway"
-display_name = "GitLawb OpenGateway"
-protocol = "openai"
-max_tokens_field = "max_completion_tokens"
-base_url = "https://opengateway.gitlawb.com/v1"
-default_model = "mimo-v2.5-pro"
-

@@ -404,6 +404,14 @@ pub enum ClientMessage {
         service: String,
     },
     ListModels,
+    /// Ask the daemon to refresh the models.dev catalog from upstream: a
+    /// conditional GET against the cached etag, then a catalog swap when the
+    /// remote changed. `force` bypasses the etag (`Cache-Control: no-cache`).
+    /// The daemon replies with `DaemonMessage::ModelsRefreshed` (or
+    /// `ModelsRefreshFailed`).
+    RefreshModels {
+        force: bool,
+    },
     SetModel {
         model: String,
     },
@@ -468,6 +476,28 @@ pub struct ImageMetadata {
     pub height: u32,
     pub byte_len: u64,
     pub alt: Option<String>,
+}
+
+/// Outcome of a `ClientMessage::RefreshModels` request, reported in
+/// `DaemonMessage::ModelsRefreshed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshStatus {
+    /// The conditional GET returned 304 — the cached catalog is current.
+    UpToDate,
+    /// The remote changed and the catalog was swapped in.
+    Updated,
+    /// A `--force` refresh fetched and swapped in a new catalog.
+    Forced,
+}
+
+/// One provider in a `DaemonMessage::CatalogUpdated` broadcast: the slug the
+/// daemon's catalog is keyed by, plus the human-readable display name. A
+/// plain wire pair — the TUI maps it into its own `ProviderInfo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogProvider {
+    pub slug: String,
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -618,6 +648,23 @@ pub enum DaemonMessage {
     },
     ModelsFailed {
         error: String,
+    },
+    /// Reply to `ClientMessage::RefreshModels`. `status` distinguishes
+    /// "nothing changed" (304) from a real swap (200), and a forced swap.
+    ModelsRefreshed {
+        providers: usize,
+        models: usize,
+        status: RefreshStatus,
+    },
+    /// Reply to `ClientMessage::RefreshModels` when the fetch/merge failed.
+    ModelsRefreshFailed {
+        error: String,
+    },
+    /// Broadcast whenever the daemon swaps the provider catalog (startup
+    /// refresh, user-overlay reload, `/refresh-models`). Carries the full
+    /// provider list so clients can replace their static default picker.
+    CatalogUpdated {
+        providers: Vec<CatalogProvider>,
     },
     ModelSelected {
         session_id: u64,
@@ -772,6 +819,9 @@ impl DaemonMessage {
             | Self::AccountRemoveFailed { .. }
             | Self::Accounts { .. }
             | Self::AccountListFailed { .. }
+            | Self::ModelsRefreshed { .. }
+            | Self::ModelsRefreshFailed { .. }
+            | Self::CatalogUpdated { .. }
             | Self::ShuttingDown => None,
         }
     }

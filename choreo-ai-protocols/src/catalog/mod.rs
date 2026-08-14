@@ -1,15 +1,30 @@
 //! Provider catalog — types, aggregation, and lookups.
 //!
-//! The catalog data (one TOML file per provider) is bundled at compile time
-//! and parsed lazily into [`PROVIDER_CATALOG`]. Keeping the data in TOML
-//! instead of Rust lets a provider or model be added/refreshed by editing a
-//! single data file — no recompile of catalog logic, and the data is
-//! machine-generatable (see `plans/provider-data/` for the generators).
+//! The catalog is a **two-layer pipeline**: a normalized snapshot of the
+//! models.dev API (`catalog/models.dev.json`, preprocessed by the `catalog-gen`
+//! binary into an embedded postcard blob `catalog/catalog.bin`) supplies the
+//! *facts* — provider slugs/names, base URLs, and per-model reasoning/context
+//! data — and the bundled `catalog/models-overlay.toml` policy layer
+//! (`include_str!`, merged at load time) supplies everything models.dev cannot
+//! express: wire-protocol selection, endpoint policy, per-model passback
+//! exceptions, and the providers models.dev does not cover. The merge
+//! entry points ([`normalize_modelsdev`], [`merge_overlay`], and
+//! [`load_bundled_base`]) are the public seam S4 reuses for the runtime user
+//! overlay + cache.
+//!
+//! The catalog lives behind a process-wide [`ArcSwap`] (see
+//! [`PROVIDER_CATALOG`]): readers are lock-free, and a runtime refresh can
+//! atomically replace the whole catalog with [`replace_catalog`]. Single-writer
+//! invariant: only the daemon command loop calls [`replace_catalog`] (after a
+//! refresh, overlay change, or `/refresh-models`); every change *request*
+//! travels over a channel, and only the atomic store mutates (documented as a
+//! thread-communication exception in ARCHITECTURE.md).
 
 use std::fmt;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tracing::debug;
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 use choreo_proto::ReasoningCapability;
@@ -18,6 +33,14 @@ use crate::openai::RequestFormat;
 use crate::shared::MaxTokensField;
 
 mod loader;
+mod modelsdev;
+mod overlay;
+pub mod refresh;
+
+pub use loader::{bundled_overlay_src, load_bundled_base};
+pub use modelsdev::normalize_modelsdev;
+pub use overlay::merge_overlay;
+pub use refresh::{RefreshError, RefreshOutcome, fetch_modelsdev};
 
 /// How reasoning is replayed back to the provider on subsequent turns.
 /// The "unset" meaning lives in the outer `Option` on [`ModelEntry`]
@@ -45,7 +68,7 @@ pub enum ReasoningPassback {
 /// Per-model metadata in the provider catalog.
 /// A single source of truth for context window, reasoning support,
 /// explicit effort levels, and reasoning round-trip format.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub model: String,
     pub context_window: u32,
@@ -76,7 +99,12 @@ pub struct ModelEntry {
 }
 
 /// Protocol variant — selects wire format and carries protocol-specific fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The serde representation is the default externally-tagged enum encoding
+/// (e.g. `{"OpenAi": {"max_tokens_field": "max_completion_tokens"}}`); it only
+/// needs to round-trip for the embedded-artifact pipeline, so the simplest
+/// correct repr is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ProviderProtocol {
     OpenAi { max_tokens_field: MaxTokensField },
@@ -85,7 +113,7 @@ pub enum ProviderProtocol {
 }
 
 /// A provider and its curated model list, loaded from `<slug>.toml`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderEntry {
     pub slug: String,
     pub display_name: String,
@@ -95,11 +123,37 @@ pub struct ProviderEntry {
     pub models: Vec<ModelEntry>,
 }
 
-/// Static catalog of all known providers, loaded lazily from the bundled
-/// TOML data files. `LazyLock` gives every returned reference `'static`
-/// lifetime (static storage is never mutated after first access), so the
-/// `&'static`-based API used throughout the crate is preserved.
-pub static PROVIDER_CATALOG: LazyLock<Vec<ProviderEntry>> = LazyLock::new(loader::load_catalog);
+/// Process-wide catalog of all known providers, backed by an [`ArcSwap`] so a
+/// runtime refresh can atomically swap it while readers stay lock-free.
+///
+/// `ArcSwap::from_pointee` is not a const fn and the TOML load is a runtime
+/// parse, so the `ArcSwap` itself is lazily initialized behind a [`LazyLock`]:
+/// the first access parses the bundled data once, and every later access goes
+/// straight to the `ArcSwap` (an atomic load, then lock-free reads / atomic
+/// `store` on swap). This preserves the old lazy-init behavior exactly while
+/// making the catalog runtime-swappable.
+pub static PROVIDER_CATALOG: LazyLock<ArcSwap<Vec<ProviderEntry>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(loader::load_catalog()));
+
+/// Atomically replace the process-wide catalog. Single-writer invariant:
+/// only the daemon command loop calls this (after a refresh, overlay
+/// change, or `/refresh-models`). Readers are lock-free.
+pub fn replace_catalog(entries: Vec<ProviderEntry>) {
+    debug!(
+        providers = entries.len(),
+        "replacing process-wide provider catalog",
+    );
+    PROVIDER_CATALOG.store(Arc::new(entries));
+}
+
+/// Return an immutable snapshot of the current catalog.
+///
+/// The returned `Arc` pins one version of the catalog independently of any
+/// later swap, so a caller can iterate it (or clone entries out of it)
+/// without holding an `ArcSwap` guard open.
+pub fn catalog_snapshot() -> Arc<Vec<ProviderEntry>> {
+    PROVIDER_CATALOG.load_full()
+}
 
 impl fmt::Display for ProviderProtocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -112,8 +166,18 @@ impl fmt::Display for ProviderProtocol {
 }
 
 /// Look up a provider entry by slug. Returns `None` if not found.
-pub fn lookup_provider(slug: &str) -> Option<&'static ProviderEntry> {
-    PROVIDER_CATALOG.iter().find(|e| e.slug == slug)
+///
+/// Returns an *owned* clone taken out of the `ArcSwap` guard, so the entry
+/// stays valid (and cheap to keep) even if the catalog is swapped underneath
+/// the caller. Callers only read the fields transiently (`slug`, `base_url`,
+/// `protocol`, `models`) and call this rarely (provider construction, not the
+/// hot path), so the clone is fine.
+pub fn lookup_provider(slug: &str) -> Option<ProviderEntry> {
+    PROVIDER_CATALOG
+        .load()
+        .iter()
+        .find(|e| e.slug == slug)
+        .cloned()
 }
 
 /// Look up the context window for a model on a given provider.
@@ -122,7 +186,10 @@ pub fn lookup_provider(slug: &str) -> Option<&'static ProviderEntry> {
 /// entry has no known window (`context_window == 0`, e.g. a model whose
 /// window was never recorded — callers then fall back to the client config).
 pub fn lookup_context_window(provider_slug: &str, model: &str) -> Option<u32> {
-    let entry = lookup_provider(provider_slug)?;
+    // Hold the ArcSwap guard for the duration of the lookup so we never clone
+    // a whole provider entry just to read one model's window.
+    let catalog = PROVIDER_CATALOG.load();
+    let entry = catalog.iter().find(|e| e.slug == provider_slug)?;
     for m in &entry.models {
         if model == m.model {
             return if m.context_window == 0 {
@@ -135,21 +202,30 @@ pub fn lookup_context_window(provider_slug: &str, model: &str) -> Option<u32> {
     None
 }
 
-/// Return all provider slugs.
-pub fn all_slugs() -> impl Iterator<Item = &'static str> {
-    PROVIDER_CATALOG.iter().map(|e| e.slug.as_str())
+/// Return all provider slugs as owned strings.
+pub fn all_slugs() -> Vec<String> {
+    PROVIDER_CATALOG
+        .load()
+        .iter()
+        .map(|e| e.slug.clone())
+        .collect()
 }
 
-/// Return all display names.
-pub fn all_display_names() -> impl Iterator<Item = &'static str> {
-    PROVIDER_CATALOG.iter().map(|e| e.display_name.as_str())
+/// Return all display names as owned strings.
+pub fn all_display_names() -> Vec<String> {
+    PROVIDER_CATALOG
+        .load()
+        .iter()
+        .map(|e| e.display_name.clone())
+        .collect()
 }
 
 /// Compute the reasoning capability for a given model on a given provider.
 /// Falls back to protocol defaults for unknown models (best-effort
 /// compatibility with new/untracked models).
 pub fn model_reasoning_capability(provider_slug: &str, model: &str) -> ReasoningCapability {
-    let entry = lookup_provider(provider_slug);
+    let catalog = PROVIDER_CATALOG.load();
+    let entry = catalog.iter().find(|e| e.slug == provider_slug);
 
     let levels: Vec<String> = match entry {
         Some(e) => {
@@ -201,7 +277,8 @@ fn protocol_default_levels(protocol: ProviderProtocol) -> Vec<String> {
 /// Look up whether a model should use OpenAI's Responses API.
 /// Returns None for unknown models — caller falls back to default_request_format.
 pub fn model_request_format(provider_slug: &str, model: &str) -> Option<RequestFormat> {
-    let entry = lookup_provider(provider_slug)?;
+    let catalog = PROVIDER_CATALOG.load();
+    let entry = catalog.iter().find(|e| e.slug == provider_slug)?;
     for m in &entry.models {
         if model == m.model {
             return if m.openai_responses {
@@ -222,7 +299,8 @@ pub fn model_request_format(provider_slug: &str, model: &str) -> Option<RequestF
 /// to protocol defaults for unknown/new models, and `None` for unknown
 /// providers).
 pub fn model_reasoning_passback(provider_slug: &str, model: &str) -> ReasoningPassback {
-    let entry = lookup_provider(provider_slug);
+    let catalog = PROVIDER_CATALOG.load();
+    let entry = catalog.iter().find(|e| e.slug == provider_slug);
 
     let passback = match entry {
         Some(e) => match e.models.iter().find(|m| m.model == model) {
@@ -279,19 +357,148 @@ fn protocol_default_passback(
 }
 
 #[cfg(test)]
+// All tests in this module read (and the `replace_catalog` tests mutate) the
+// process-wide `PROVIDER_CATALOG`, so serialize them under one key: nextest
+// gives per-process isolation anyway, but the libtest fallback shares one
+// process across parallel threads and a mid-flight swap would race the readers.
+#[serial_test::serial(catalog)]
 mod tests {
     use super::*;
 
+    /// Restores the bundled catalog when dropped, so a failing swap test can
+    /// never leave the process-global catalog swapped for later tests (the
+    /// libtest fallback shares one process).
+    struct RestoreBundledOnDrop;
+
+    impl Drop for RestoreBundledOnDrop {
+        fn drop(&mut self) {
+            replace_catalog(loader::load_catalog());
+        }
+    }
+
     #[test]
-    fn bundled_toml_parses() {
-        // Every bundled data file must parse; a broken file here means the
-        // production `unwrap_or_default`-style handling silently drops a
-        // provider, so this must fail loudly at test time.
+    fn embedded_catalog_loads() {
+        // The merged catalog (embedded `catalog.bin` base + bundled overlay)
+        // must parse and be sane: a broken artifact or overlay here means the
+        // daemon silently loads an empty catalog, so this must fail loudly at
+        // test time.
         let catalog = loader::load_catalog();
         assert!(
-            catalog.len() >= 70,
-            "expected >=70 providers from bundled TOML, got {}",
+            catalog.len() >= 150,
+            "expected >=150 providers from the embedded catalog, got {}",
             catalog.len()
+        );
+        // No duplicate slugs (the zai/github-copilot merges collapse three
+        // old TOML providers each into one models.dev key).
+        let mut seen = std::collections::HashSet::new();
+        for entry in &catalog {
+            assert!(
+                seen.insert(entry.slug.as_str()),
+                "duplicate slug in merged catalog: {}",
+                entry.slug
+            );
+        }
+        // Every provider has a name and a default model. base_url is NOT
+        // required to be non-empty: models.dev carries several providers we
+        // never hand-curated (cohere, azure, amazon-bedrock, …) with no API
+        // endpoint — they are catalogued for their model lists, and only the
+        // overlay-only providers and the api-less providers we pin carry an
+        // explicit endpoint.
+        for entry in &catalog {
+            assert!(!entry.slug.is_empty(), "empty slug");
+            assert!(
+                !entry.display_name.is_empty(),
+                "empty display_name for {}",
+                entry.slug
+            );
+            assert!(
+                !entry.default_model.is_empty(),
+                "empty default model for {}",
+                entry.slug
+            );
+        }
+        // The one-time slug migration: renamed slugs present, old slugs gone.
+        for slug in [
+            "fireworks-ai",
+            "togetherai",
+            "github-copilot",
+            "novita-ai",
+            "salad-cloud",
+            "kilo",
+            "gmicloud",
+            "vercel",
+            "zhipuai",
+            "zai",
+        ] {
+            assert!(
+                seen.contains(slug),
+                "renamed slug {slug} must be present in the merged catalog"
+            );
+        }
+        for slug in [
+            "fireworks",
+            "together",
+            "github",
+            "novita",
+            "saladcloud",
+            "kilocode",
+            "gmi",
+            "vercel-ai-gateway",
+            "zhipu",
+            "zai-cn",
+            "zai-coding-cn",
+        ] {
+            assert!(
+                !seen.contains(slug),
+                "old slug {slug} must be absent after the one-time migration"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_only_providers_survive_the_merge() {
+        // Providers models.dev does not cover are defined wholesale in the
+        // bundled overlay; each keeps its slug and carries its policy.
+        for (slug, expected_name) in [
+            ("aimlapi", "aimlapi.com"),
+            ("ant-ling", "Ant Ling"),
+            ("arcee", "Arcee AI"),
+            ("atlascloud", "Atlas Cloud"),
+            ("bankr", "Bankr"),
+            ("futurmix", "FuturMix"),
+            ("gitlawb-opengateway", "GitLawb OpenGateway"),
+            ("iflytek", "iFlytek Spark"),
+            ("iflytek-astron", "iFlytek Astron MaaS"),
+            ("kimi-code", "Kimi Code subscription"),
+            ("nous", "Nous Research"),
+            ("omlx", "oMLX"),
+            ("qwen-token-plan", "Qwen Token Plan"),
+            ("qwen-token-plan-cn", "Qwen Token Plan CN"),
+            ("routstr", "Routstr"),
+            ("tanzu", "VMware Tanzu Platform"),
+            ("tensorix", "Tensorix"),
+            ("custom-openai", "Custom OpenAI-Compatible"),
+            ("custom-anthropic", "Custom Anthropic-Compatible"),
+            ("openai_compatible", "OpenAI Compatible"),
+            ("ollama", "Ollama (Local)"),
+        ] {
+            let entry =
+                lookup_provider(slug).unwrap_or_else(|| panic!("overlay-only {slug} missing"));
+            assert_eq!(entry.display_name, expected_name);
+            assert!(!entry.base_url.is_empty(), "{slug} needs a base_url");
+            assert!(
+                !entry.default_model.is_empty(),
+                "{slug} needs a default_model"
+            );
+        }
+        // kimi-code carries its full model list.
+        let kimi = lookup_provider("kimi-code").expect("kimi-code");
+        assert_eq!(
+            kimi.models
+                .iter()
+                .map(|m| m.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k3", "kimi-for-coding"]
         );
     }
 
@@ -317,14 +524,14 @@ mod tests {
 
     #[test]
     fn all_slugs_returns_expected_count() {
-        let slugs: Vec<&str> = all_slugs().collect();
-        assert_eq!(slugs.len(), PROVIDER_CATALOG.len());
+        let slugs = all_slugs();
+        assert_eq!(slugs.len(), catalog_snapshot().len());
     }
 
     #[test]
     fn catalog_has_no_duplicate_slugs() {
         let mut seen = std::collections::HashSet::new();
-        for entry in PROVIDER_CATALOG.iter() {
+        for entry in catalog_snapshot().iter() {
             assert!(
                 seen.insert(entry.slug.as_str()),
                 "duplicate slug: {}",
@@ -335,16 +542,11 @@ mod tests {
 
     #[test]
     fn catalog_entries_have_no_empty_fields() {
-        for entry in PROVIDER_CATALOG.iter() {
+        for entry in catalog_snapshot().iter() {
             assert!(!entry.slug.is_empty(), "empty slug");
             assert!(
                 !entry.display_name.is_empty(),
                 "empty display_name for {}",
-                entry.slug
-            );
-            assert!(
-                !entry.base_url.is_empty(),
-                "empty base_url for {}",
                 entry.slug
             );
             assert!(
@@ -354,7 +556,9 @@ mod tests {
             );
             // `context_window` is a `u32` where 0 means "unknown"; the previous
             // `== 0 || > 0` check was vacuously true for every model, so it is
-            // dropped (clippy::double_comparisons).
+            // dropped (clippy::double_comparisons). `base_url` may be empty for
+            // models.dev-only providers without an endpoint (cohere, azure,
+            // bedrock, …) — only the overlay-pinned providers carry one.
             for m in &entry.models {
                 assert!(!m.model.is_empty(), "empty model slug in {}", entry.slug);
             }
@@ -369,7 +573,9 @@ mod tests {
             Some(1_047_576)
         );
         assert_eq!(lookup_context_window("openai", "gpt-5"), Some(400_000));
-        assert_eq!(lookup_context_window("openai", "gpt-5.4"), Some(272_000));
+        // models.dev is authoritative for context windows: gpt-5.4 is a
+        // 1.05M-token model there (the old TOML's 272k was stale).
+        assert_eq!(lookup_context_window("openai", "gpt-5.4"), Some(1_050_000));
         assert_eq!(
             lookup_context_window("openai", "gpt-5.5-pro"),
             Some(1_050_000)
@@ -528,21 +734,22 @@ mod tests {
 
     #[test]
     fn model_reasoning_passback_openai_chat_completions_model() {
-        // openai.toml has no chat-completions models, so exercise the
-        // protocol default on another OpenAI-protocol provider with a known
-        // chat-completions model: Cerebras' gpt-oss-120b (responses = false)
-        // → echo reasoning on tool-call turns.
+        // A chat-completions OpenAI-protocol model would derive ToolLoop from
+        // the protocol — but Cerebras' gpt-oss-120b is pinned to `none` by the
+        // bundled overlay: the gateway rejects replayed `reasoning_content`,
+        // so this model must never replay.
         assert_eq!(
             model_reasoning_passback("cerebras", "gpt-oss-120b"),
-            ReasoningPassback::ToolLoop
+            ReasoningPassback::None
         );
     }
 
     #[test]
-    fn model_reasoning_passback_deepseek_toml_override() {
-        // DeepSeek overrides the protocol default explicitly (tool_loop) on
-        // both models; matches the responses = false default, so the override
-        // is documentation-grade here.
+    fn model_reasoning_passback_deepseek_derives_tool_loop() {
+        // DeepSeek is a chat-completions OpenAI-protocol provider, so both
+        // models derive the ToolLoop default (echo reasoning on tool-call
+        // turns) — the old TOML's explicit tool_loop override was redundant
+        // with the derived default and is not carried into the overlay.
         assert_eq!(
             model_reasoning_passback("deepseek", "deepseek-v4-flash"),
             ReasoningPassback::ToolLoop
@@ -635,13 +842,13 @@ mod tests {
 
     #[test]
     fn model_reasoning_passback_explicit_override_beats_protocol_default() {
-        // deepseek-v4-flash carries an explicit tool_loop override; even if
-        // the responses flag flipped to true, the override would still win.
-        let entry = lookup_provider("deepseek").unwrap();
+        // claude-haiku-4-5 carries an explicit tool_loop override that beats
+        // the Anthropic keep-all-turns protocol default.
+        let entry = lookup_provider("anthropic").unwrap();
         let model = entry
             .models
             .iter()
-            .find(|m| m.model == "deepseek-v4-flash")
+            .find(|m| m.model == "claude-haiku-4-5")
             .unwrap();
         assert_eq!(model.reasoning_passback, Some(ReasoningPassback::ToolLoop));
     }
@@ -705,5 +912,73 @@ mod tests {
             model_reasoning_passback("groq", "groq/compound"),
             ReasoningPassback::ToolLoop
         );
+    }
+
+    /// Build a minimal one-provider/one-model catalog for the swap tests.
+    fn tiny_catalog() -> Vec<ProviderEntry> {
+        vec![ProviderEntry {
+            slug: "tiny-test".into(),
+            display_name: "Tiny Test".into(),
+            protocol: ProviderProtocol::OpenAi {
+                max_tokens_field: MaxTokensField::MaxTokens,
+            },
+            base_url: "https://tiny-test.example/v1".into(),
+            default_model: "tiny-model".into(),
+            models: vec![ModelEntry {
+                model: "tiny-model".into(),
+                context_window: 4096,
+                reasoning_supported: true,
+                openai_reasoning_levels: vec!["off".into(), "high".into()],
+                openai_responses: false,
+                reasoning_passback: None,
+            }],
+        }]
+    }
+
+    #[test]
+    fn replace_catalog_swaps_what_lookup_sees() {
+        // Swapping the process-wide catalog must be visible to readers
+        // immediately (the ArcSwap store is atomic). Restore the bundled
+        // catalog on drop so a failure here cannot poison later tests.
+        let _restore = RestoreBundledOnDrop;
+        let bundled = catalog_snapshot();
+        assert!(lookup_provider("openai").is_some());
+
+        replace_catalog(tiny_catalog());
+
+        let entry = lookup_provider("tiny-test").expect("swapped catalog has tiny-test");
+        assert_eq!(entry.slug, "tiny-test");
+        assert_eq!(entry.base_url, "https://tiny-test.example/v1");
+        // The bundled catalog is gone while the tiny one is installed.
+        assert!(lookup_provider("openai").is_none());
+        assert_eq!(all_slugs(), vec!["tiny-test".to_string()]);
+
+        // Sanity-check the lookup functions read through the same global.
+        assert_eq!(lookup_context_window("tiny-test", "tiny-model"), Some(4096));
+        assert_eq!(
+            model_reasoning_capability("tiny-test", "tiny-model").available_effort_levels,
+            vec!["off", "high"]
+        );
+
+        // Explicit restore (the guard also restores on panic) so the test is
+        // self-documenting about returning the global to its initial state.
+        replace_catalog(bundled.to_vec());
+        assert!(lookup_provider("openai").is_some());
+    }
+
+    #[test]
+    fn lookup_provider_returns_owned_clone_outliving_guard() {
+        // The returned entry is owned (cloned out of the ArcSwap guard), so it
+        // remains valid even after the catalog is swapped underneath it.
+        let _restore = RestoreBundledOnDrop;
+        let entry = lookup_provider("openai").expect("openai is in the bundled catalog");
+
+        replace_catalog(tiny_catalog());
+
+        // The clone outlives the swap: its data is intact and independent.
+        assert_eq!(entry.slug, "openai");
+        assert_eq!(entry.base_url, "https://api.openai.com/v1");
+        assert_eq!(entry.default_model, "gpt-5.4");
+        assert!(!entry.models.is_empty());
     }
 }

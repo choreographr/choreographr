@@ -4,8 +4,8 @@ use crate::markdown_render::{display_width, reasoning_expanded_default, render_t
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, CTRL_HELP_LINE1, CTRL_HELP_LINE2, INPUT_PAD,
-    PROVIDER_OPTIONS, Page, RenderCacheKey, SessionManagerView, cached_or_compute_lines,
-    cached_visual_lines, input_inner_width,
+    Page, RenderCacheKey, SessionManagerView, cached_or_compute_lines, cached_visual_lines,
+    input_inner_width,
 };
 use choreo_proto::{SessionStatus, TokenUsage};
 use ratatui::{
@@ -1228,17 +1228,20 @@ fn render_ai_providers_select_provider(frame: &mut Frame<'_>, app: &mut App) {
         .split(inner);
 
     let max_rows = list_chunks[0].height as usize;
-    let total = PROVIDER_OPTIONS.len();
+    let total = app.providers.len();
     let mut lines: Vec<Line> = Vec::new();
 
     // One line per provider, so the visible window holds max_rows entries.
     // `provider_window` keeps the highlighted row on screen regardless of
     // how far the user scrolled.
     let items_per_page = max_rows.max(1);
-    let (win_start, win_count) = app.ai_providers.provider_window(items_per_page);
+    let (win_start, win_count) = app
+        .ai_providers
+        .provider_window(&app.providers, items_per_page);
     let win_end = (win_start + win_count).min(total);
 
-    for (i, provider) in PROVIDER_OPTIONS
+    for (i, provider) in app
+        .providers
         .iter()
         .enumerate()
         .take(win_end)
@@ -1312,9 +1315,9 @@ fn render_ai_providers_set_slug(frame: &mut Frame<'_>, app: &mut App) {
     // Provider picked in phase 1, shown for context.
     let provider_name = app
         .ai_providers
-        .selected_provider_slug()
-        .and_then(|slug| PROVIDER_OPTIONS.iter().find(|p| p.slug == slug))
-        .map(|p| p.display_name)
+        .selected_provider_slug(&app.providers)
+        .and_then(|slug| app.providers.iter().find(|p| p.slug == slug))
+        .map(|p| p.display_name.as_str())
         .unwrap_or("(none)");
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(String::new(), Style::default()))];
     lines.push(Line::from(Span::styled(

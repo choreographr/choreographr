@@ -1,5 +1,6 @@
 pub mod accounts;
 mod broadcast;
+pub mod catalog;
 pub mod cli;
 pub use cli::main;
 pub mod config;

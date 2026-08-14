@@ -127,7 +127,7 @@ use crate::ProviderClient;
 use choreo_proto::InferenceError;
 
 impl ProviderClient for AnthropicClient {
-    fn provider_slug(&self) -> &'static str {
+    fn provider_slug(&self) -> &str {
         "anthropic"
     }
 

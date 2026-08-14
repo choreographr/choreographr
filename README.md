@@ -3,7 +3,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="Apache 2.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2024_edition-orange" alt="Rust 2024"></a>
-  <img src="https://img.shields.io/badge/providers-79+-brightgreen" alt="79+ providers">
+  <img src="https://img.shields.io/badge/providers-208+-brightgreen" alt="208+ providers">
   <img src="https://img.shields.io/badge/wire_protocols-3-lightgrey" alt="3 wire protocols">
   <a href="https://t.me/choreographr"><img src="https://img.shields.io/badge/Telegram-Choreographr_Community-2CA5E0?logo=telegram&logoColor=white" alt="Telegram community"></a>
 </p>
@@ -159,7 +159,7 @@ after Choreographr.
 | Language | Rust | TypeScript | Python | TypeScript | Rust | TypeScript | Rust | Python | Rust | TypeScript | TypeScript | Swift/Kotlin | TypeScript | Python | TypeScript | Go | Python |
 | Daemon + multi-client | ✅ | ✅ | — | server | — | — | server | — | ✅ | ✅ | ✅ | — | ✅ daemon | — | ✅ | — | server |
 | Concurrent sessions | ✅ daemon | ✅ gateway | ✅ capped | ✅ server | ✅ threads | — | ✅ server | ✅ framework | ✅ | — | ✅ | — | ✅ | — | ✅ | ✅ pool | ✅ |
-| Providers | 79/3 proto | 40+ | 34 | 15 | 1 (OpenAI) | 42/9 proto | 39 | agnostic | agnostic | agnostic | 5 (drives) | 8 | 6 | 28 | multi | 36 | 5 |
+| Providers | 208/3 proto | 40+ | 34 | 15 | 1 (OpenAI) | 42/9 proto | 39 | agnostic | agnostic | agnostic | 5 (drives) | 8 | 6 | 28 | multi | 36 | 5 |
 | OAuth | coming | ✅ | ✅ 6× | ✅ | ✅ ChatGPT | ✅ | — | — | — | ✅ | — | ✅ | ✅ device | ✅ | ✅ subs | ✅ | ✅ MCP |
 | Credential rotation/fallback | retry only | ✅ failover | ✅ pool | — | — | — | — | — | — | — | — | ✅ fallback | ✅ | — | — | — | ✅ |
 | Tool permission gating | coming | ✅ | env-only | ✅ | ✅ | — | ✅ | — | — | — | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ judge |
@@ -388,7 +388,7 @@ data model.
 |---|---|
 | `choreographr` | Workspace root — the suite installer. Declares the four binaries (`choreographr choreo-tui choreo-im choreo-acp`); `cargo run -p choreographr` / `cargo install choreographr` default to the daemon binary via `default-run` |
 | `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
-| `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (79+ providers) |
+| `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (208 providers) |
 | `choreo-blockchain` | Blockchain tools — EVM (alloy) and Substrate/Polkadot (subxt) read-only queries plus the tokio sidecar runtime they run on; pulled in by the daemon's `blockchain` feature (off by default) |
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
 | `choreo-sanitize` | Internal leaf crate — the single source of truth for the Unicode "spoofing" predicates (bidi/ZWSP escaping) and the shared tool-output byte budget + `...[truncated]` marker, used by the daemon, TUI, blockchain tools, and client |
@@ -524,19 +524,38 @@ streaming = false
 retry_max_attempts = 3
 ```
 
-Supported providers: all entries in the provider catalog — 79+ across three
+Supported providers: all entries in the provider catalog — 208 across three
 wire protocols (OpenAI-compatible, Anthropic Messages, Google Generative AI).
-Each provider has its own data file under
-`choreo-ai-protocols/src/catalog/<slug>.toml` (one file per provider,
-TOML data, not code) with a curated model list, context windows, reasoning
-levels, and the API format each model uses. Highlights: OpenAI, Anthropic,
-Google Gemini, Mistral, DeepSeek, xAI Grok, Groq, Together AI, OpenRouter,
-Hugging Face, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, Alibaba
-(Qwen), Moonshot AI (Kimi), Perplexity, Z.ai, Xiaomi MiMo, Qwen Token Plan, Vercel AI
-Gateway, OpenCode Zen/Go, GitHub Copilot, Kimi Code, Ollama (local/cloud), LM
+The catalog is a two-layer pipeline in `choreo-ai-protocols/catalog/`: a
+pinned **models.dev snapshot** (`models.dev.json`, normalized by the
+`catalog-gen` binary into an embedded postcard blob `catalog.bin`) supplies
+provider/model *facts* (context windows, reasoning support and levels, the
+Responses-API flag), and a bundled **`models-overlay.toml`** policy layer
+supplies everything models.dev can't express — wire-protocol selection,
+endpoint policy, per-model passback exceptions, and the local/niche providers
+models.dev doesn't cover (ollama, kimi-code, custom-*, …). Highlights: OpenAI,
+Anthropic, Google Gemini, Mistral, DeepSeek, xAI Grok, Groq, Together AI,
+OpenRouter, Hugging Face, GitHub Copilot, NVIDIA NIM, Cerebras, Fireworks AI,
+Alibaba (Qwen), Moonshot AI (Kimi), Perplexity, Z.AI, Xiaomi MiMo, Qwen Token
+Plan, Vercel AI Gateway, OpenCode Zen/Go, Kimi Code, Ollama (local/cloud), LM
 Studio, and many regional/niche gateways. See the `catalog/` directory for the
 full list. Each provider ships sensible defaults (base URL, default model) —
 override any field per-account:
+
+**Runtime refresh & user overlay.** At startup the daemon loads the base from
+the cache at `$XDG_DATA_HOME/choreographr/catalog.bin` (falling back to the
+embedded blob) and revalidates it against models.dev with an etag conditional
+GET on a background thread (304 → keep, 200 → normalize, swap, and persist the
+cache). A **user overlay** at
+`$XDG_CONFIG_HOME/choreographr/models-overlay.toml` is merged on top of the
+bundled overlay with the same schema — provider scalars (`protocol`,
+`base_url`, `max_tokens_field`, `default_model`, `display_name`) and per-model
+entries (`[provider.<slug>.models."<model>"]` with `context_window`,
+`reasoning_supported`, `reasoning_levels`, `responses`, `reasoning_passback`),
+plus wholesale provider definitions for anything models.dev doesn't list. The
+file is watched and reloads automatically on change (deleting it falls back to
+the bundled overlay); `/refresh-models [--force]` re-fetches the upstream
+catalog on demand.
 
 | Field | Description |
 |---|---|
@@ -581,6 +600,7 @@ In `choreo-tui`:
 - `/ping` — health check
 - `/models` — list and select models
 - `/model` — alias for `/models`
+- `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts.
 - `/session` — show current session info
 - `/session list` — list all sessions
 - `/session new [title]` — create a new session
@@ -599,7 +619,7 @@ In `choreo-tui`:
 - New-account wizard (`n` on the accounts page) — a two-phase flow: pick a provider (`j`/`k` navigate, `PgUp`/`PgDn` page), then enter a slug (the account's unique name, e.g. `/account <slug>`); Enter creates the account and jumps straight to the API-key page
 - `/reasoning` — show current reasoning effort slug
 - `/reasoning <slug>` — set reasoning effort (e.g. `off`, `low`, `medium`, `high`, `on`, `xhigh`, `max`; available values depend on the model)
-- `Ctrl+R` — cycle reasoning effort through available slugs for the attached session's model
+- `Ctrl+R` — cycle reasoning effort through available slugs for the attached session's model (status message states: model reports no effort levels → "model does not support reasoning"; no model selected → "no model selected — pick one with Ctrl+M"; model selected but capability not yet reported → "reasoning capability not yet available")
 - `Ctrl+M` — open the model selector: list models available on the attached session's account, type to filter, Enter to select, Esc to dismiss (requires a terminal that implements the kitty keyboard protocol — e.g. kitty, foot, wezterm, ghostty, alacritty; on other terminals Ctrl+M arrives as Enter)
 - `/continue` — continue a stopped/idle session by sending a "Please continue." prompt
 - `/stop` — cancel whatever request is currently active on the attached session (same as `/cancel 0`)

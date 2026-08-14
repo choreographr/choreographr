@@ -207,6 +207,9 @@ humfmt = "0.6.0"
 hex = "0.4"
 nix = "0.31.3"
 unicode-segmentation = "1.13"
+# Filesystem notification for the user-overlay watcher (S4). 8.2.0 is the
+# latest stable; 9.0.0-rc.x is a pre-release and is deliberately NOT used.
+notify = "8.2.0"
 # Unicode general-category property (consumed by choreo-sanitize, the leaf
 # crate that owns the shared spoofing predicates and output byte budget):
 # generated from the Unicode data tables, so the Cf set used to escape

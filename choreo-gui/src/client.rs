@@ -109,6 +109,14 @@ pub(crate) fn handle_shell_command(
                 state.status_texts.push("no session attached".to_string());
             }
         }
+        ShellCommand::RefreshModels { force } => {
+            state.status_texts.push(if force {
+                "refreshing models… (forced)".to_string()
+            } else {
+                "refreshing models…".to_string()
+            });
+            send_client_message(state, daemon_tx, ClientMessage::RefreshModels { force });
+        }
     }
 }
 

@@ -18,7 +18,7 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 │   choreo-im     │◄──────────────────►│              │◄──────────────►│  Mistral API          │
 │ (IM bridge)  │    Unix socket     │              │                ├──────────────────────┤
 └──────────────┘                    └──────────────┘                └──────────────────────┘
-                                                                    │  70+ OpenAI-compat    │
+                                                                    │  200+ OpenAI-compat   │
                                                                     │  providers via catalog│
                                                                     └──────────────────────┘
 ```
@@ -46,7 +46,7 @@ Choreographr (workspace)
 │                       discovers tools, and dispatches tool calls over JSON-RPC stdio
 ├── choreo-ai-protocols    Provider protocols — OpenAI-compatible, Anthropic Messages, and
 │                       Google Gemini clients, the ProviderClient trait, and the provider
-│                       catalog (bundled TOML data)
+│                       catalog (models.dev base + bundled overlay, embedded postcard)
 ├── choreo-daemon          Unix socket server — the core engine (library; the daemon
 │                       binary `choreographr` lives in the root package)
 ├── choreo-acp             ACP bridge — translates the Agent Communication Protocol
@@ -454,13 +454,41 @@ account configuration, no sessions — so it can be consumed independently of
 | `overrides.rs` | `ProviderOverrides` — protocol-agnostic account overrides carrier (the daemon converts its `AccountConfig` into this) |
 | `retry.rs` | Shared HTTP retry logic. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, cancellation support, and a per-attempt wall-clock deadline (`AttemptDeadline`, re-armed at the start of every attempt). `AttemptContext` bundles the per-call retry inputs (`on_retry` callback, `cancel_rx`, `attempt_deadline`) so the retry entry points do not grow a parameter per knob. |
 | `stream.rs` | Cancellable SSE reader plumbing: `spawn_sse_reader()` runs the blocking socket read on a dedicated thread and forwards parsed events through a bounded crossbeam channel (backpressure — the reader blocks on `send` instead of buffering unboundedly); an abort signal stops the thread at its next loop boundary on cancel/drop; `recv_sse_event()` waits event-driven with `select_biased!` on the event channel, the cancellation channel, and an exact timer for the remaining budget — no polling, so Escape and deadline expiry interrupt a stalled/trickling stream the moment they happen instead of blocking forever inside `read()`. The per-attempt wall-clock deadline is supplied by the caller (`retry::AttemptDeadline` — armed *before* the request is sent and re-armed on each retry, so it spans DNS → connect → headers → body; the real backstop — ureq's `timeout_global` is floored at ~1 s per socket read, so sub-second keep-alive trickles could otherwise evade it). Deadline expiry surfaces as a dedicated `ProviderError::DeadlineExceeded` (non-retryable, distinct from a socket `Io` error). |
-| `catalog/` | `ProviderProtocol` enum + `ProviderEntry`/`ModelEntry`, `PROVIDER_CATALOG` (bundled TOML, one `catalog/<slug>.toml` per provider), and lookups (`lookup_provider`, `lookup_context_window`, `model_reasoning_capability`, `model_reasoning_passback`, `model_request_format`, `all_slugs`, `all_display_names`). `ModelEntry` carries a `reasoning_passback` field (per-model override; `None` derives from the protocol) |
+| `catalog/` | Two-layer provider catalog pipeline — a **models.dev base** (`catalog/models.dev.json`, normalized by the `catalog-gen` binary into an embedded postcard blob `catalog/catalog.bin`; deserialized by `load_bundled_base`) and a **bundled overlay** (`catalog/models-overlay.toml`, `include_str!` + merged at load time via `merge_overlay`; `normalize_modelsdev` runs the snapshot→base normalization; `bundled_overlay_src` exposes the overlay source so the daemon can re-merge it at runtime). `refresh.rs` owns the models.dev **conditional GET** (`fetch_modelsdev`, `If-None-Match` / `Cache-Control: no-cache` for `--force`, structured `RefreshError`, `RefreshOutcome::{NotModified, Fetched}`). `PROVIDER_CATALOG` is an `ArcSwap`-backed runtime-swappable global lazily initialized from `loader::load_catalog()`. Lookups: `lookup_provider` → owned `ProviderEntry` clone, `lookup_context_window`, `model_reasoning_capability`, `model_reasoning_passback`, `model_request_format`, `all_slugs` → `Vec<String>`, `all_display_names` → `Vec<String>`. `ModelEntry` carries a `reasoning_passback` field (per-model override; `None` derives from the protocol). `replace_catalog` atomically swaps the whole catalog (single writer: the daemon command loop) and `catalog_snapshot` returns an `Arc<Vec<ProviderEntry>>` pinning one version. |
 
 **Root re-exports** give consumers a stable front door: the client types
 (`OpenAiClient`, `AnthropicClient`, `GoogleClient`, …), the trait and shared
 types (`ProviderClient`, `ChatTurnRequest`, `ChatTurnResult`, `StreamEvent`,
 `ProviderError`, `ContextWindowConfig`, `ProviderOverrides`, …), and the
 catalog (`ProviderProtocol`, `PROVIDER_CATALOG`, `lookup_*`, …).
+
+**Threading — the catalog `ArcSwap` exception.** The `PROVIDER_CATALOG`
+`ArcSwap` is a documented exception to the repo's channel-only
+thread-communication rule (see AGENTS.md): readers are lock-free and the swap
+is an atomic `store()`, but there is a strict **single-writer invariant** —
+only the daemon command loop calls `replace_catalog` (after a catalog refresh,
+overlay change, or `/refresh-models`). Every *change request* still travels by
+channel (maintenance thread → daemon loop → store); no other thread mutates the
+catalog. All other cross-thread communication in this crate (and the daemon)
+uses mpsc channels.
+
+**Threading — the catalog maintenance thread (S4).** One background thread
+(`choreo-daemon/src/catalog.rs`, spawned by `run_server` before the accept
+loop) owns the whole runtime pipeline but never mutates the catalog. It is
+**channel-driven**: it waits on a single crossbeam channel whose two producers
+are (a) the daemon command loop (`/refresh-models` requests, sent as
+`MaintenanceEvent::RefreshNow`) and (b) the `notify` filesystem watcher's
+callback (raw config-directory events, forwarded as
+`MaintenanceEvent::OverlayFsEvent`). The thread's `recv_timeout` doubles as the
+retry timer for failed / 304 refreshes (6 h, configurable constant). The notify
+callback is deliberately trivial — it only forwards events; all policy
+(basename filter, re-read, fingerprint compare) lives on the maintenance
+thread. On startup the thread loads the base (cache file → embedded
+`catalog.bin`), reads the user overlay, sends `CatalogBaseChanged` to the
+command loop (which merges + swaps + broadcasts), then runs the conditional
+GET against models.dev. The thread is detached: the process exits after
+`run_server` returns, and its sends to the daemon channel fail harmlessly once
+the command loop is gone.
 
 
 ### `choreo-acp` — ACP bridge (Agent Communication Protocol)
@@ -533,9 +561,10 @@ synchronous `execute_*` entry points (which `block_on` internally).
 |---|---|---|
 | `server/lifecycle.rs` | Accept loop (blocking `UnixListener` + signal-wakeup), signal handling, shutdown orchestration. On graceful shutdown, `DaemonMessage::ShuttingDown` is routed through each connection's single writer thread (via a `client_writers` registry in the daemon command loop); the writer thread flushes it and closes its own socket, so a client observes the notification before the EOF. The accept-loop thread never writes to or closes client sockets — there are no retained stream clones and no backstop close pass, so the notification cannot be lost to a race with a socket close. A momentarily-full writer channel is escalated to a bounded round-robin fan-out (shared 2 s grace, 10 ms poll, thread-free) so backpressure cannot silently drop the notification and one wedged client cannot delay the others. The writer channel is created and REGISTERED with the daemon before the connection thread is spawned (see the `server/connection.rs` row's `register_client_writer`), so a connection accepted concurrently with shutdown is guaranteed to be in the registry when the broadcast is processed — the register is ordered before the broadcast on the FIFO command channel (Unix: same thread; TCP: the accept thread is joined before the broadcast). Before returning, `run_server` also waits — bounded, 5 s — for the TCP accept thread (woken by a probe connect to the listener's actual bound address, falling back to loopback for unspecified `0.0.0.0`/`::` binds, so a concrete non-loopback bind is woken too; the probe's own connect is bounded by a 1 s `connect_timeout` so a full accept backlog cannot stall shutdown on the kernel's SYN-retry timeout) and then for each connection thread (Unix handles tracked directly, TCP handles ferried back over a channel) and, through it, its writer thread, to flush the notification and close its own socket, so notify-before-EOF holds even when `run_server` is embedded in-process rather than exiting the process. Connection handles are pruned eagerly once the retained Vec grows past 64, so a long-running daemon does not accumulate one `JoinHandle` per connection ever accepted (pinned by a unit test). Live connections are also capped at 256 (`MAX_CONCURRENT_CONNECTIONS`, both transports combined, pinned by unit tests + an integration test): at the cap a newly-accepted connection is dropped immediately (bare EOF) so wedged-but-open clients cannot exhaust thread/FD resources. `cleanup_client`'s writer join is bounded (5 s `WRITER_JOIN_GRACE`) so a writer wedged in a blocking socket write cannot hang its connection thread's cleanup; a timed-out writer is detached and the shutdown drain remains the backstop. The cap is enforced with a daemon-wide `Arc<AtomicUsize>` live-connection counter (RAII `ConnectionSlot`) shared across both accept paths and every connection thread's exit — a single-purpose, lock-free resource-accounting exception to the workspace's message-passing rule (documented in AGENTS.md). |
 | `server/connection.rs` | Per-client `client_thread` (Unix) and `tcp_client_thread` (TCP/Noise) — read `ClientMessages` from the socket, dispatch via `daemon_tx` mpsc channel. Single-writer discipline: each connection has exactly one writer thread draining its `writer_rx`; `ShuttingDown` is a special-cased message that makes the writer close the socket after flushing (notify-before-EOF), and no other thread ever writes to the socket. The writer loops of both transports share one implementation (a `ConnectionWriter` trait + `writer_thread`), so the sole-writer contract and the `ShuttingDown` close live in exactly one place — pinned by unit tests with a mock `ConnectionWriter` (flush `ShuttingDown`, close, stop draining; stop on send error; end cleanly on disconnect). The writer channel is created and registered with the daemon by `register_client_writer`, called by the acceptor BEFORE the connection thread spawns (see the `server/lifecycle.rs` row) — a failed TCP handshake unregisters via `ClientDisconnected` so the registry stays honest. Replies are written through `send_to_writer`, a deliberately BLOCKING send: the 128-slot channel is the connection's backpressure mechanism, and dropping replies would break the request/response contract; the shutdown fan-out + bounded connection drain bound the worst-case delay. Session-summary subscription is an explicit client decision on both transports: a client opts into `SessionCreated`/`SessionStatusChanged`/`SessionDeleted` push broadcasts with `SubscribeSessionsSummary` (previously `tcp_client_thread` auto-registered every Noise client on connect; the GUI now sends the subscribe message at connect to keep its session list live). `cleanup_client` joins the connection's writer thread with a 5 s bound (`WRITER_JOIN_GRACE`) so a writer wedged in a blocking socket write cannot hang the connection thread's cleanup — a timed-out writer is detached and exits on its own once the client goes away. |
-| `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
+| `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management, and the runtime catalog swap (`CatalogBaseChanged` → `replace_catalog`, the single writer of the `PROVIDER_CATALOG` ArcSwap), `CatalogUpdated` broadcasts, and `/refresh-models` plumbing (the fetch is delegated to the maintenance thread, never run here). `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` (including `total_timeout_secs`) and converts the shared fields into `ProviderOverrides` for the other protocols. |
 | `config.rs` | Daemon-level configuration: `DaemonConfig` (`max_turns`, `[context]`), `config_path()`, `load_daemon_config()`, and the deprecated `load_service_config()`. (Previously lived in `openai/config.rs`; it is daemon config, not provider config.) |
+| `catalog.rs` | Runtime catalog maintenance (S4): `CatalogPaths` (XDG data/config locations for the cache, etag sidecar, and user overlay), atomic cache persistence (temp → fsync → rename, `catalog.bin` postcard + one-line `models.dev.etag`), the ONE background **maintenance thread** (loads the cache → embedded `catalog.bin`, reads the user overlay, runs the startup conditional GET, watches the config dir with `notify`, serves `/refresh-models` requests — all channel-driven, never mutating the catalog itself), and the **fingerprint-gated overlay reload** (pure compare collapses editor save-event storms). Every change is delivered to the daemon command loop as `DaemonCommand::CatalogBaseChanged`. |
 | `providers/mod.rs` | `InferenceProvider` — protocol-erased facade wrapping `Arc<dyn ProviderClient>` plus the catalog slug. `from_account_config()` dispatches by `ProviderProtocol` and constructs the right client from `choreo-ai-protocols`. Records API metrics (`record_api_call`/`record_api_error`) around each turn — timing lives here, not in the provider crate. |
 | `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional working directory. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
@@ -573,7 +602,7 @@ pub struct ChatTurnRequest<'a> {
 }
 
 pub trait ProviderClient: Debug + Send + Sync {
-    fn provider_slug(&self) -> &'static str;
+    fn provider_slug(&self) -> &str;
     fn chat_completion_turn(&self, params: ChatTurnRequest<'_>) -> Result<ChatTurnResult, InferenceError>;
     fn chat_completion_turn_streaming(&self, params: ChatTurnRequest<'_>, on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>) -> Result<ChatTurnResult, InferenceError>;
     fn list_models(&self) -> Result<Vec<String>, InferenceError>;
@@ -586,7 +615,7 @@ pub trait ProviderClient: Debug + Send + Sync {
 to eliminate repetitive argument passing across all provider implementations.
 Uses `&mut dyn FnMut` for the streaming callback to keep the trait object-safe.
 `context_window_for_model()` returns the model's context window size, using a
-resolution chain: per-model config → global fallback → static catalog.
+resolution chain: per-model config → global fallback → catalog fallback.
 Each client implementation maps the `&str` effort slug to its wire format:
 - **OpenAI**: `reasoning_effort` field (`None` for `"off"`, `"low"`/`"medium"`/`"high"` slug → API string)
 - **Anthropic**: `thinking` block with `budget_tokens` (slug ≠ `"off"` enables thinking, clamping to `max_tokens - 1024`)
@@ -597,9 +626,10 @@ Each client implementation maps the `&str` effort slug to its wire format:
 ```rust
 pub struct InferenceProvider {
     client: Arc<dyn ProviderClient>,
+    slug: String, // catalog slug, owned (e.g. "opencode" even for an OpenAiClient)
 }
 ```
-Created via `from_account_config()` which looks up the provider slug in the catalog and dispatches to the appropriate client constructor by protocol type. All wire-protocol knowledge lives in `choreo-ai-protocols`; the daemon's `InferenceProvider` is the only daemon type that dispatches by protocol. It also records API metrics (`record_api_call` / `record_api_error`) around every turn — timing moved here from the provider crates so `choreo-ai-protocols` stays free of daemon concerns.
+Created via `from_account_config()` which looks up the provider slug in the catalog (returning an owned clone) and dispatches to the appropriate client constructor by protocol type. `provider_slug()` borrows `&str` from the owned slug. All wire-protocol knowledge lives in `choreo-ai-protocols`; the daemon's `InferenceProvider` is the only daemon type that dispatches by protocol. It also records API metrics (`record_api_call` / `record_api_error`) around every turn — timing moved here from the provider crates so `choreo-ai-protocols` stays free of daemon concerns.
 
 The metrics `endpoint` label is the **catalog slug** (e.g. `"opencode"` rather than the protocol name `"openai"`) — more precise than the protocol, but part of the public metrics contract: renaming it changes the Prometheus series for that provider. Error labels come from `InferenceError::metric_label()` in `choreo-proto`, the single canonical mapping shared by all providers.
 
@@ -636,13 +666,115 @@ pub enum ProviderProtocol {
 (Note: Mistral speaks the OpenAI wire format — `POST /v1/chat/completions` —
 so it is catalogued under `OpenAi`, not a protocol of its own.)
 
-Provider data is stored as TOML — one `catalog/<slug>.toml` file per provider —
-and parsed lazily into a `static PROVIDER_CATALOG: LazyLock<Vec<ProviderEntry>>`
-(`catalog/mod.rs` + `catalog/loader.rs`). Keeping the data in TOML means adding
-or refreshing a provider is a data-file edit (machine-generatable), and the
-`&'static`-reference API is preserved because static storage is never mutated.
+### models.dev + overlay
 
-A `ProviderEntry` (loaded from its TOML file) maps each provider slug to:
+The catalog is a two-layer pipeline (`choreo-ai-protocols/src/catalog/`):
+
+```text
+catalog/models.dev.json  ──catalog-gen──►  catalog/catalog.bin   (embedded postcard base)
+                                                      │
+                                             include_bytes!  ▼
+                                    load_bundled_base() → ProviderEntry base
+                                                      │
+                  catalog/models-overlay.toml (include_str!)  ▼
+                                              merge_overlay() → load_catalog()
+```
+
+- **Base — normalized models.dev facts.** `catalog/models.dev.json` is a pinned
+  snapshot of the models.dev API (fetched 2026-08-13, 184 providers).
+  `normalize_modelsdev` turns it into base `ProviderEntry` values: slug/name
+  from the provider key/`name`, `base_url` from `api` (empty when absent),
+  `default_model` = the FIRST model id in the snapshot's JSON order, protocol
+  derived from the `npm` package (`@ai-sdk/anthropic` → Anthropic,
+  `@ai-sdk/google` → Google, everything else OpenAI-compatible), and per-model
+  `context_window` / `reasoning_supported` / effort levels derived from
+  `limit.context` / `reasoning` / `reasoning_options`. The `catalog-gen` binary
+  (`cargo run --bin catalog-gen`) normalizes the snapshot, postcard-serializes
+  the **normalized base only**, and writes `catalog/catalog.bin`, which the
+  library embeds via `include_bytes!`. Normalization is deterministic (JSON
+  order preserved), so re-running the generator yields a byte-identical blob.
+- **Overlay — everything not derivable.** `catalog/models-overlay.toml` is
+  `include_str!` and merged at load time by `merge_overlay` — never baked into
+  the blob, so S4 can re-merge the same base with a user overlay at runtime.
+  It carries: provider-level endpoint/protocol/default-model policy for
+  models.dev-covered providers (base_url where models.dev has none or differs,
+  `max_tokens_field` for `max_tokens` gateways, protocol overrides such as
+  Fireworks/Vercel's Anthropic-mode endpoints), per-model exceptions
+  (Anthropic `tool_loop` passback pins, the `responses = true` flags on
+  opencode/github-copilot GPT-5.x entries, Cerebras' `gpt-oss-120b`
+  `none` pin, and the two `claude-opus-4-1` models the snapshot dropped), and
+  the **wholesale overlay-only providers** models.dev does not cover (ollama,
+  kimi-code, custom-*, … — they keep their pre-models.dev slugs and carry
+  their full model lists verbatim).
+- **Merge semantics** (`merge_overlay`): provider scalars field-wise replace
+  with omitted fields falling through; naming a model replaces that entry's
+  fields onto the base (new keys add); unknown keys warn + skip, never fatal.
+
+### Runtime catalog refresh (S4)
+
+The compiled-in catalog is the *fallback*; at runtime the daemon layers a
+**local cache + a user overlay** on top and keeps the base fresh from
+models.dev:
+
+- **Cache.** The normalized base is cached at
+  `$XDG_DATA_HOME/choreographr/catalog.bin` (postcard, same format as the
+  embedded blob — one load path) with a one-line `models.dev.etag` sidecar.
+  Both are written **atomically** (temp file → fsync → rename). Load order at
+  startup: valid cache file → embedded `catalog.bin` (a corrupt cache logs a
+  warning and falls back). The effective catalog is
+  `merge_overlay(base, [bundled_overlay, user_overlay])`.
+- **Background refresh.** A dedicated maintenance thread
+  (`choreo-daemon/src/catalog.rs`) does a conditional GET against
+  `https://models.dev/api.json` at startup (`If-None-Match` with the cached
+  etag; models.dev serves `ETag` + `must-revalidate`). 200 → normalize →
+  validate non-empty → hand the new base to the daemon command loop, which
+  merges overlays, atomically swaps the catalog (`replace_catalog`), persists
+  the cache, and broadcasts `CatalogUpdated`. 304 / error → log and retry
+  later (the thread's channel `recv_timeout` is the retry timer). The fetch
+  helper (`choreo-ai-protocols` `catalog::refresh::fetch_modelsdev`) owns ureq
+  + normalization; the daemon command loop never does HTTP.
+- **User overlay.** `$XDG_CONFIG_HOME/choreographr/models-overlay.toml`, the
+  same schema as the bundled layer, merged last (highest precedence). The
+  maintenance thread watches the config *directory* with the `notify` crate
+  (rename-safe; basename-filtered) and reloads on change via a
+  **fingerprint gate** — the file is re-read and compared against the
+  last-applied contents, so editor save-event storms collapse naturally after
+  the first reload. Deleting the file falls back to bundled-only (warn).
+- **`/refresh-models`.** TUI slash command → `ClientMessage::RefreshModels`
+  → the daemon hands the request to the maintenance thread over its channel
+  (never blocking the command loop on the download) → reply routed back as
+  `DaemonMessage::ModelsRefreshed` (with `RefreshStatus`:
+  `UpToDate`/`Updated`/`Forced`) or `ModelsRefreshFailed`. `--force` sends
+  `Cache-Control: no-cache` and skips the etag.
+- **`CatalogUpdated` broadcast.** Every catalog swap (startup refresh,
+  overlay reload, `/refresh-models`) broadcasts the full provider list
+  (slug + display name) to all activity subscribers — and a freshly
+  subscribed client is sent the current list immediately, so the TUI's
+  provider picker tracks the live catalog instead of the static default.
+
+### Slug renames (one-time migration)
+
+models.dev keys are canonical, so the old hand-curated slugs were renamed to
+match — `fireworks→fireworks-ai`, `together→togetherai`, `github→
+github-copilot`, `novita→novita-ai`, `saladcloud→salad-cloud`, `kilocode→
+kilo`, `gmi→gmicloud`, `vercel-ai-gateway→vercel`, `zhipu→zhipuai`, and the
+three Z.AI entry points `zai`/`zai-cn`/`zai-coding-cn` merged into `zai`. This
+is a one-time data migration (accounts.toml / keystore service names / TUI
+`PROVIDER_OPTIONS` updated to the new slugs); there is deliberately **no
+runtime alias resolution**. The metrics `endpoint` label changes with the slug
+(Prometheus series change accepted, pre-1.0).
+
+The merged catalog is parsed lazily into `PROVIDER_CATALOG`, a process-global
+`LazyLock<ArcSwap<Vec<ProviderEntry>>>` (`catalog/mod.rs` +
+`catalog/loader.rs`): the first access deserializes the embedded base and
+merges the bundled overlay once; every later access goes straight to the
+`ArcSwap` (an atomic load, then lock-free reads / atomic `store` on swap). The
+`ArcSwap` makes the catalog runtime-swappable: readers are lock-free and
+`replace_catalog()` atomically swaps the whole catalog (single writer: the
+daemon command loop), so lookups return *owned* values cloned out of the
+atomic guard rather than `&'static` references.
+
+A `ProviderEntry` maps each provider slug to:
 - `display_name` — human-readable name for UIs
 - `protocol` — which wire protocol to use
 - `base_url` — well-known API endpoint
@@ -673,7 +805,7 @@ Reasoning text is not only *displayed* — for several providers it must also be
 | `Signature` | send back encrypted thought signatures (Gemini) | attach artifact on every assistant message; the adapter attaches the final signature to the last part |
 | `ResponseId` | chain via `previous_response_id` / opaque reasoning items (OpenAI/xAI Responses) | never via the message; continuity flows through the response id (see below) |
 
-`model_reasoning_passback(slug, model)` mirrors `model_reasoning_capability`: an explicit per-model TOML override wins (including an explicit `none` — a model that must never replay can be pinned without inventing a provider), otherwise the protocol default applies — OpenAI-protocol with `responses = true` → `ResponseId`; OpenAI-protocol chat-completions → `ToolLoop`; Anthropic → `AllTurns` (last-turn-only models like `claude-haiku-4-5` carry an explicit `tool_loop` override); Google → `Signature`; unknown providers → `None`. TOMLs set the field only where nuance matters (DeepSeek/Kimi explicitly `tool_loop`).
+`model_reasoning_passback(slug, model)` mirrors `model_reasoning_capability`: an explicit per-model override from the overlay wins (including an explicit `none` — a model that must never replay can be pinned without inventing a provider), otherwise the protocol default applies — OpenAI-protocol with `responses = true` → `ResponseId`; OpenAI-protocol chat-completions → `ToolLoop`; Anthropic → `AllTurns` (last-turn-only models like `claude-haiku-4-5` carry an explicit `tool_loop` override in the overlay); Google → `Signature`; unknown providers → `None`. The overlay sets the field only where nuance matters (the Anthropic last-turn-only pins, Cerebras' `gpt-oss-120b` `none`; DeepSeek's `tool_loop` was already the derived default and is not carried).
 
 **Re-emit** is per-adapter, verbatim: OpenAI chat writes the `ChatReasoning` bytes back as the wire field recorded at capture (`reasoning_content` / `reasoning` / `reasoning_text` — DeepSeek/Kimi being `reasoning_content`), so a provider that streamed `reasoning_text` gets `reasoning_text` back, not `reasoning_content` (the artifact field itself never appears on the wire); Anthropic deserializes the block array and pushes the blocks verbatim (in order, ahead of text/tool_use — never rebuilt or reordered, and only when thinking is enabled for the request, `!thinking_disabled`); Google attaches the captured signatures to the assistant parts; Responses re-emits the opaque items into `input` ahead of the message and chains continuity through `previous_response_id`. A foreign artifact variant (e.g. a `ChatReasoning` payload on an Anthropic request) is dropped by the adapter — payloads stay opaque until their producer decodes them.
 
@@ -685,18 +817,19 @@ A precondition guard (`warn_on_missing_reasoning_artifacts`) runs before any ech
 
 Replayed reasoning is billed as input on keep-all models, so `estimate_prompt_tokens` counts the artifact bytes (UTF-8 text when decodable, else a bytes/4 heuristic). The estimate counts the full conversation in `messages` as-is, which already covers the server-side chained context for `previous_response_id` requests: the adapter trims only the *wire* payload to the chain tail, but the provider bills the whole chain, and the full conversation in `messages` is that chain plus the new tail. There is deliberately no chained-context addend — adding the last request's `prompt_tokens` would count the conversation twice.
 
-Currently supports 79+ providers. Adding a new OpenAI-compatible provider requires only a catalog TOML file (and a line in `loader.rs`'s `include_str!` list) — zero client code.
+Currently supports 208 providers (184 from the models.dev base + 24 overlay-only). Adding or refreshing a provider is a data change in `catalog/`: update the snapshot (or add an overlay entry) and re-run `cargo run --bin catalog-gen` — zero client code.
 
 **Supported providers by protocol:**
 
-| Protocol | Providers |
+| Protocol | Providers (overlay-only providers in *italics*) |
 |---|---|
-| OpenAI-compatible | OpenAI, DeepSeek, Mistral, xAI, Groq, Together AI, OpenRouter, Hugging Face, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, Alibaba (Qwen), Moonshot AI, Perplexity, Z.ai, Qwen Token Plan, Venice AI, Novita AI, LM Studio, Ollama (local/cloud), OpenCode Zen/Go, DeepInfra, Upstage, Nous, Arcee, GMI, StepFun, Zhipu, iFlytek, Inception, Meta, NEAR AI, OrcaRouter, Routstr, Sakana, SaladCloud, Scaleway, OVHcloud, Tensorix, FuturMix, EmpirioLabs, Friendli, aimlapi, GitLawb OpenGateway, KiloCode, Atomic Chat, OpenCode Codex, and custom OpenAI-compatible |
+| OpenAI-compatible | OpenAI, DeepSeek, Mistral, xAI, Groq, Together AI, OpenRouter, Hugging Face, GitHub Copilot, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, Alibaba (Qwen), Moonshot AI, Perplexity, Z.AI, Qwen Token Plan, Venice AI, Novita AI, LM Studio, Ollama Cloud, OpenCode Zen/Go, DeepInfra, Upstage, StepFun, Inception, Meta, NEAR AI, OrcaRouter, Routstr, Sakana, SaladCloud, Scaleway, OVHcloud, FuturMix, EmpirioLabs, Friendli, Atomic Chat, custom OpenAI-compatible — plus the overlay-only providers that keep their pre-models.dev slugs: *aimlapi, GitLawb OpenGateway, Kilo Gateway, OpenAI Codex, iFlytek, Nous, Arcee, GMI, Zhipu, Bankr, Atlas Cloud, Ant Ling, oMLX, Qwen Token Plan (CN), Tensorix, Tanzu, Llama Swap, kimi-code, ollama, openai-compatible, …* |
 | Anthropic Messages | Anthropic Claude, MiniMax, Vercel AI Gateway, Kimi Code, Fireworks (Anthropic mode), OpenCode Go (Anthropic-compatible), custom Anthropic-compatible |
 | Google Generative AI | Google Gemini |
 
 > **Note — providers present in agent catalogs but deferred from the daemon catalog**
-> (present in ~/agents; not yet given a `<slug>.toml` here):
+> (present in models.dev, catalogued for their model lists but with no API
+> endpoint / no API-key path in the current catalog):
 >
 > | Provider(s) | Reason deferred |
 > |---|---|
@@ -704,7 +837,7 @@ Currently supports 79+ providers. Adding a new OpenAI-compatible provider requir
 > | `chatgpt` (Codex), `openai-codex` OAuth, `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The slugs above that do have an API-key path (`openai-codex`, `kimi-code`, `github-copilot`) are catalogued; the pure-OAuth ones are not. |
 > | `cursor` | t3code subprocess driver (spawns the Cursor CLI), not a direct HTTP provider. |
 >
-> Adding them requires daemon-side OAuth support and/or multi-field credentials, both out of scope for the current TOML catalog.
+> Adding them requires daemon-side OAuth support and/or multi-field credentials, both out of scope for the current catalog model.
 
 **Per-client architecture (OS threads):**
 

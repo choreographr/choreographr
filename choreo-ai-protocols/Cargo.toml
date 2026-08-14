@@ -17,8 +17,22 @@ rust-version.workspace = true
 name = "choreo_ai_protocols"
 
 [dependencies]
+# Atomic runtime swap of the process-wide provider catalog (see
+# `catalog/mod.rs`); previously a transitive dependency, promoted so the
+# ArcSwap global is a declared direct dependency.
+arc-swap = "1.9.2"
 choreo-proto.workspace = true
 crossbeam-channel.workspace = true
+# Ordered maps for the models.dev normalization: the snapshot's JSON object
+# order is load-bearing (the `default_model` is the FIRST model in a
+# provider's models map), so providers and models must be deserialized in
+# insertion order, not BTreeMap order. Already in the dependency tree
+# (2.14.0 via ratatui/serde_json transitive deps); the `serde` feature lets
+# serde deserialize straight into `IndexMap`.
+indexmap = { version = "2.14", features = ["serde"] }
+# Serialize the normalized models.dev base into the embedded `catalog.bin`
+# (postcard, the same format the S4 runtime cache will use — one load path).
+postcard.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,6 +41,13 @@ toml.workspace = true
 tracing.workspace = true
 ureq.workspace = true
 zeroize.workspace = true
+
+# Generator binary: regenerates `catalog/catalog.bin` from the checked-in
+# `catalog/models.dev.json` snapshot + `catalog/models-overlay.toml`.
+# Re-runnable via `cargo run --bin catalog-gen` (see the bin's module docs).
+[[bin]]
+name = "catalog-gen"
+path = "src/bin/catalog-gen.rs"
 
 [features]
 # Test-only: exposes the shared scripted HTTP mock provider (`test_utils::
@@ -39,3 +60,7 @@ test-utils = []
 # Enable the `test-utils` feature when building tests/examples/benchmarks for
 # this package (a package may depend on itself in dev-dependencies).
 choreo-ai-protocols = { path = ".", features = ["test-utils"] }
+# Serialize the catalog unit tests that read/mutate the `PROVIDER_CATALOG`
+# process global (the `replace_catalog` swap tests + direct catalog readers),
+# so they stay deterministic when the libtest runner shares one process.
+serial_test.workspace = true

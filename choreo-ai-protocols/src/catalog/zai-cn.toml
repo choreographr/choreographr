@@ -1,7 +1,0 @@
-slug = "zai-cn"
-display_name = "Z.AI CN"
-protocol = "openai"
-max_tokens_field = "max_completion_tokens"
-base_url = "https://open.bigmodel.cn/api/paas/v4"
-default_model = "glm-4.5"
-

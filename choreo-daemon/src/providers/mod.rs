@@ -23,29 +23,31 @@ pub struct InferenceProvider {
     client: Arc<dyn ProviderClient>,
     /// The provider slug from the catalog (e.g. "openai", "anthropic", "opencode").
     /// Used for catalog lookups instead of delegating to the client, which may
-    /// return a generic value (e.g. OpenAiClient always says "openai").
-    slug: &'static str,
+    /// return a generic value (e.g. OpenAiClient always says "openai"). Owned
+    /// because the catalog lookup that supplies it returns a clone, not a
+    /// `'static` reference.
+    slug: String,
 }
 
 impl InferenceProvider {
     pub fn from_openai(client: OpenAiClient) -> Self {
         Self {
             client: Arc::new(client),
-            slug: "openai",
+            slug: "openai".to_string(),
         }
     }
 
     pub fn from_anthropic(client: AnthropicClient) -> Self {
         Self {
             client: Arc::new(client),
-            slug: "anthropic",
+            slug: "anthropic".to_string(),
         }
     }
 
     pub fn from_google(client: GoogleClient) -> Self {
         Self {
             client: Arc::new(client),
-            slug: "google",
+            slug: "google".to_string(),
         }
     }
 
@@ -64,7 +66,7 @@ impl InferenceProvider {
                 let mut svc_config = ServiceConfig {
                     base_url: entry.base_url.to_string(),
                     chat_completions_max_tokens_field: max_tokens_field,
-                    provider_slug: entry.slug.as_str(),
+                    provider_slug: entry.slug.clone(),
                     ..Default::default()
                 };
                 config.apply_overrides(&mut svc_config);
@@ -74,7 +76,7 @@ impl InferenceProvider {
                     .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
-                    slug: entry.slug.as_str(),
+                    slug: entry.slug,
                 })
             }
             ProviderProtocol::AnthropicMessages => {
@@ -91,7 +93,7 @@ impl InferenceProvider {
                     .map_err(|e| format!("failed to create Anthropic client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
-                    slug: entry.slug.as_str(),
+                    slug: entry.slug,
                 })
             }
             ProviderProtocol::GoogleGenerativeAi => {
@@ -108,7 +110,7 @@ impl InferenceProvider {
                     .map_err(|e| format!("failed to create Google client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
-                    slug: entry.slug.as_str(),
+                    slug: entry.slug,
                 })
             }
             // `ProviderProtocol` is #[non_exhaustive] — a new protocol added
@@ -161,7 +163,7 @@ impl InferenceProvider {
         result: &Result<T, InferenceError>,
     ) {
         let elapsed = start.elapsed().as_secs_f64();
-        crate::metrics::record_api_call(model, self.slug, elapsed);
+        crate::metrics::record_api_call(model, self.slug.as_str(), elapsed);
         if let Err(e) = result {
             // The error→label mapping lives with the error type in
             // choreo-proto (InferenceError::metric_label) so it can't drift
@@ -171,8 +173,8 @@ impl InferenceProvider {
     }
 
     /// Return the provider slug (e.g. "openai", "anthropic").
-    pub fn provider_slug(&self) -> &'static str {
-        self.slug
+    pub fn provider_slug(&self) -> &str {
+        self.slug.as_str()
     }
 
     /// Resolve the context window for a model, using the client config first
@@ -180,7 +182,7 @@ impl InferenceProvider {
     pub fn resolve_context_window(&self, model: &str) -> Option<u32> {
         self.client
             .context_window_for_model(model)
-            .or_else(|| choreo_ai_protocols::lookup_context_window(self.slug, model))
+            .or_else(|| choreo_ai_protocols::lookup_context_window(&self.slug, model))
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, InferenceError> {
@@ -326,7 +328,7 @@ pub(crate) mod test_util {
     pub(crate) struct StubProviderClient;
 
     impl ProviderClient for StubProviderClient {
-        fn provider_slug(&self) -> &'static str {
+        fn provider_slug(&self) -> &str {
             "test-stub"
         }
 
@@ -353,7 +355,7 @@ pub(crate) mod test_util {
     pub(crate) fn make_test_provider() -> InferenceProvider {
         InferenceProvider {
             client: Arc::new(StubProviderClient),
-            slug: "test-stub",
+            slug: "test-stub".to_string(),
         }
     }
 }

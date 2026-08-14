@@ -35,6 +35,11 @@ pub enum ShellCommand {
     /// Stop a running session — cancels whatever request is currently active
     /// on the attached session, equivalent to `Cancel` with `CANCEL_ALL`.
     Stop,
+    /// Refresh the models.dev catalog from upstream (conditional GET against
+    /// the cached etag). `--force` bypasses the etag.
+    RefreshModels {
+        force: bool,
+    },
     InvalidCancel(String),
     UnknownCommand(String),
     Empty,
@@ -325,6 +330,21 @@ fn parse_command(
         return ShellCommand::Send(ClientMessage::Lock);
     }
 
+    // /refresh-models [--force]: refresh the models.dev catalog. Kept as a
+    // non-Send variant so the TUI can set a "refreshing models…" status
+    // BEFORE the request goes out (and the reply is asynchronous).
+    if rest == "refresh-models" {
+        return ShellCommand::RefreshModels { force: false };
+    }
+    if let Some(arg) = rest.strip_prefix("refresh-models ") {
+        return match arg.trim() {
+            "--force" | "force" => ShellCommand::RefreshModels { force: true },
+            other => ShellCommand::UnknownCommand(format!(
+                "usage: /refresh-models [--force] (got '{other}')"
+            )),
+        };
+    }
+
     if rest == "undo" {
         return ShellCommand::Undo;
     }
@@ -387,6 +407,58 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
         ShellCommand::Redo => Some("> redo".to_string()),
         ShellCommand::Continue => Some("> continue".to_string()),
         ShellCommand::Stop => Some("> stop".to_string()),
+        ShellCommand::RefreshModels { force } => {
+            let suffix = if *force { " --force" } else { "" };
+            Some(format!("> /refresh-models{suffix}"))
+        }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_models_parses_plain() {
+        let mut id = 0;
+        assert_eq!(
+            parse_input_line("/refresh-models", &mut id, None),
+            ShellCommand::RefreshModels { force: false },
+        );
+    }
+
+    #[test]
+    fn refresh_models_parses_force() {
+        let mut id = 0;
+        assert_eq!(
+            parse_input_line("/refresh-models --force", &mut id, None),
+            ShellCommand::RefreshModels { force: true },
+        );
+        assert_eq!(
+            parse_input_line("/refresh-models force", &mut id, None),
+            ShellCommand::RefreshModels { force: true },
+        );
+    }
+
+    #[test]
+    fn refresh_models_rejects_unknown_args() {
+        let mut id = 0;
+        assert!(matches!(
+            parse_input_line("/refresh-models --bogus", &mut id, None),
+            ShellCommand::UnknownCommand(_),
+        ));
+    }
+
+    #[test]
+    fn refresh_models_echo_mentions_force() {
+        assert_eq!(
+            shell_command_echo(&ShellCommand::RefreshModels { force: false }).as_deref(),
+            Some("> /refresh-models"),
+        );
+        assert_eq!(
+            shell_command_echo(&ShellCommand::RefreshModels { force: true }).as_deref(),
+            Some("> /refresh-models --force"),
+        );
     }
 }

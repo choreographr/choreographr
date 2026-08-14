@@ -1,7 +1,0 @@
-slug = "github"
-display_name = "GitHub Models"
-protocol = "openai"
-max_tokens_field = "max_completion_tokens"
-base_url = "https://models.inference.ai.azure.com"
-default_model = "openai/gpt-4.1"
-

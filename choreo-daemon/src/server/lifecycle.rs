@@ -203,6 +203,18 @@ pub fn run_server(
     let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
     state.daemon_tx = daemon_tx.clone();
 
+    // Spawn the ONE background catalog-maintenance thread (S4) before the
+    // command loop is moved into its own thread: it loads the cache, does the
+    // startup models.dev conditional GET, watches the user overlay, and serves
+    // `/refresh-models` requests — all over channels, and never mutating the
+    // catalog itself (every change goes through
+    // `DaemonCommand::CatalogBaseChanged` back to the command loop, the single
+    // writer of the catalog ArcSwap). Spawned before the accept loop so the
+    // startup swap lands promptly.
+    let maintenance_tx =
+        crate::catalog::spawn_catalog_maintenance(daemon_tx.clone(), state.catalog_paths.clone());
+    state.maintenance_tx = Some(maintenance_tx);
+
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Signal handler thread: sets the shutdown flag and connects to our own

@@ -230,6 +230,10 @@ pub fn main() -> anyhow::Result<()> {
         client_subscribed_sessions: std::collections::HashMap::new(),
         model_cache: HashMap::new(),
         mcp_manager,
+        // Populated by `run_server`, which spawns the maintenance thread
+        // (it needs the real command-loop channel, created there).
+        maintenance_tx: None,
+        catalog_paths: crate::catalog::CatalogPaths::from_dirs(),
     };
 
     // Load or generate the transport keypair for Noise IK.

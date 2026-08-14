@@ -1,0 +1,664 @@
+# models-overlay.toml — bundled policy layer over the models.dev base catalog.
+#
+# The catalog is a two-layer pipeline (see src/catalog/loader.rs):
+#
+#   catalog/models.dev.json ──catalog-gen──► catalog/catalog.bin   (base, embedded)
+#   catalog/models-overlay.toml ──include_str!──► merged at load time
+#
+# This file carries EVERYTHING that is not derivable from the models.dev
+# snapshot:
+#
+#   1. Provider-level policy for models.dev-covered providers — protocol /
+#      max_tokens_field / base_url / default_model where the hand-curated
+#      TOML catalog set a value that differs from the derived default (the
+#      models.dev `api`, the first models.dev model, or the npm-derived
+#      protocol). The overlay is authoritative for endpoint policy; models.dev
+#      is authoritative for facts.
+#   2. Per-model exceptions — passback pins (Anthropic last-turn-only
+#      models), Responses-API flags models.dev cannot express, and the two
+#      claude-opus-4-1 models the snapshot dropped (carried wholesale from the
+#      old anthropic.toml so they stay selectable).
+#   3. Providers models.dev does not cover — defined WHOLESALE with their
+#      full model lists, verbatim from their old TOMLs.
+#
+# Merge semantics (merge_overlay in src/catalog/overlay.rs):
+#   - provider scalars: field-wise replace, omitted fields fall through
+#   - per-model entries: field-wise replace onto the base entry (new keys add)
+#   - unknown keys: warn + skip, never fatal
+#
+# Schema (bundled layer; S4's user overlay uses the identical schema):
+#
+#   [provider.<slug>]
+#   protocol = "openai" | "anthropic" | "google"
+#   max_tokens_field = "max_completion_tokens" | "max_tokens"
+#   base_url = "https://…"
+#   default_model = "…"
+#   display_name = "…"          # only needed for providers not in the base
+#
+#   [provider.<slug>.models."<model>"]
+#   context_window = 123456
+#   reasoning_supported = true
+#   reasoning_levels = ["off", "high", "max"]
+#   responses = true
+#   reasoning_passback = "tool_loop" | "all_turns" | "none" | "signature" | "response_id"
+
+# alibaba -> alibaba (policy from the pre-models.dev TOML)
+[provider.alibaba]
+  default_model = "qwen3.6-plus"
+
+# anthropic -> anthropic (policy from the pre-models.dev TOML)
+[provider.anthropic]
+  base_url = "https://api.anthropic.com"
+
+# atomic-chat -> atomic-chat (policy from the pre-models.dev TOML)
+[provider.atomic-chat]
+  base_url = "https://api.atomic.chat/v1"
+
+# cerebras -> cerebras (policy from the pre-models.dev TOML)
+[provider.cerebras]
+  base_url = "https://api.cerebras.ai/v1"
+  default_model = "zai-glm-4.7"
+
+# cloudflare-ai-gateway -> cloudflare-ai-gateway (policy from the pre-models.dev TOML)
+[provider.cloudflare-ai-gateway]
+  base_url = "https://gateway.ai.cloudflare.com/v1"
+
+# cloudflare-workers-ai -> cloudflare-workers-ai (policy from the pre-models.dev TOML)
+[provider.cloudflare-workers-ai]
+  base_url = "https://api.cloudflare.com/client/v4/accounts"
+
+# deepinfra -> deepinfra (policy from the pre-models.dev TOML)
+[provider.deepinfra]
+  base_url = "https://api.deepinfra.com/v1/openai"
+
+# deepseek -> deepseek (policy from the pre-models.dev TOML)
+[provider.deepseek]
+  default_model = "deepseek-v4-pro"
+
+# empiriolabs -> empiriolabs (policy from the pre-models.dev TOML)
+[provider.empiriolabs]
+  default_model = "deepseek-v4-pro"
+
+# fireworks -> fireworks-ai (policy from the pre-models.dev TOML)
+[provider.fireworks-ai]
+  protocol = "anthropic"
+  base_url = "https://api.fireworks.ai/inference"
+  default_model = "accounts/fireworks/models/kimi-k2p6"
+
+# friendli -> friendli (policy from the pre-models.dev TOML)
+[provider.friendli]
+  default_model = "zai-org/GLM-5.1"
+
+# github-copilot -> github-copilot (policy from the pre-models.dev TOML)
+[provider.github-copilot]
+  base_url = "https://api.individual.githubcopilot.com"
+  default_model = "gpt-5.4"
+
+# google -> google (policy from the pre-models.dev TOML)
+[provider.google]
+  base_url = "https://generativelanguage.googleapis.com/v1beta"
+  default_model = "gemini-flash-latest"
+
+# groq -> groq (policy from the pre-models.dev TOML)
+[provider.groq]
+  base_url = "https://api.groq.com/openai/v1"
+  default_model = "openai/gpt-oss-120b"
+
+# huggingface -> huggingface (policy from the pre-models.dev TOML)
+[provider.huggingface]
+  default_model = "moonshotai/Kimi-K2.6"
+
+# inception -> inception (policy from the pre-models.dev TOML)
+[provider.inception]
+  base_url = "https://api.inceptionlabs.ai"
+
+# kilocode -> kilo (policy from the pre-models.dev TOML)
+[provider.kilo]
+  default_model = "anthropic/claude-sonnet-4.6"
+
+# lmstudio -> lmstudio (policy from the pre-models.dev TOML)
+[provider.lmstudio]
+  base_url = "http://localhost:1234/v1"
+
+# minimax-cn -> minimax-cn (policy from the pre-models.dev TOML)
+[provider.minimax-cn]
+  base_url = "https://api.minimaxi.com/anthropic"
+  default_model = "MiniMax-M3"
+
+# minimax -> minimax (policy from the pre-models.dev TOML)
+[provider.minimax]
+  base_url = "https://api.minimax.io/anthropic"
+  default_model = "MiniMax-M3"
+
+# mistral -> mistral (policy from the pre-models.dev TOML)
+[provider.mistral]
+  max_tokens_field = "max_tokens"
+  base_url = "https://api.mistral.ai"
+  default_model = "devstral-medium-latest"
+
+# moonshotai-cn -> moonshotai-cn (policy from the pre-models.dev TOML)
+[provider.moonshotai-cn]
+  default_model = "kimi-k2.7-code"
+
+# moonshotai -> moonshotai (policy from the pre-models.dev TOML)
+[provider.moonshotai]
+  default_model = "kimi-k2.7-code"
+
+# novita -> novita-ai (policy from the pre-models.dev TOML)
+[provider.novita-ai]
+  base_url = "https://api.novita.ai/v3/openai"
+
+# nvidia -> nvidia (policy from the pre-models.dev TOML)
+[provider.nvidia]
+  default_model = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+
+# openai -> openai (policy from the pre-models.dev TOML)
+[provider.openai]
+  base_url = "https://api.openai.com/v1"
+  default_model = "gpt-5.4"
+
+# opencode-go -> opencode-go (policy from the pre-models.dev TOML)
+[provider.opencode-go]
+  max_tokens_field = "max_tokens"
+  default_model = "kimi-k2.7-code"
+
+# opencode -> opencode (policy from the pre-models.dev TOML)
+[provider.opencode]
+  max_tokens_field = "max_tokens"
+  default_model = "kimi-k2.7-code"
+
+# openrouter -> openrouter (policy from the pre-models.dev TOML)
+[provider.openrouter]
+  default_model = "qwen/qwen3.7-max"
+
+# orcarouter -> orcarouter (policy from the pre-models.dev TOML)
+[provider.orcarouter]
+  default_model = "orcarouter/auto"
+
+# perplexity -> perplexity (policy from the pre-models.dev TOML)
+[provider.perplexity]
+  base_url = "https://api.perplexity.ai"
+  default_model = "sonar-pro"
+
+# sakana -> sakana (policy from the pre-models.dev TOML)
+[provider.sakana]
+  default_model = "fugu"
+
+# saladcloud -> salad-cloud (policy from the pre-models.dev TOML)
+[provider.salad-cloud]
+  base_url = "https://ai.salad.cloud/v1"
+
+# stepfun -> stepfun (policy from the pre-models.dev TOML)
+[provider.stepfun]
+  base_url = "https://api.stepfun.ai/step_plan/v1"
+
+# together -> togetherai (policy from the pre-models.dev TOML)
+[provider.togetherai]
+  base_url = "https://api.together.ai/v1"
+  default_model = "moonshotai/Kimi-K2.6"
+
+# upstage -> upstage (policy from the pre-models.dev TOML)
+[provider.upstage]
+  base_url = "https://api.upstage.ai/v1"
+
+# venice -> venice (policy from the pre-models.dev TOML)
+[provider.venice]
+  base_url = "https://api.venice.ai/api/v1"
+
+# vercel-ai-gateway -> vercel (policy from the pre-models.dev TOML)
+[provider.vercel]
+  protocol = "anthropic"
+  base_url = "https://ai-gateway.vercel.sh"
+  default_model = "zai/glm-5.1"
+
+# xai -> xai (policy from the pre-models.dev TOML)
+[provider.xai]
+  base_url = "https://api.x.ai/v1"
+  default_model = "grok-4.20-0309-reasoning"
+
+# xiaomi-token-plan-cn -> xiaomi-token-plan-cn (policy from the pre-models.dev TOML)
+[provider.xiaomi-token-plan-cn]
+  default_model = "mimo-v2.5-pro"
+
+# xiaomi -> xiaomi (policy from the pre-models.dev TOML)
+[provider.xiaomi]
+  default_model = "mimo-v2.5-pro"
+
+# zai.toml / zai-cn.toml / zai-coding-cn.toml -> zai (the three old Z.AI
+# entry points merged into the models.dev `zai` key; policy taken from
+# zai.toml, the international Z.AI coding endpoint).
+[provider.zai]
+  base_url = "https://api.z.ai/api/coding/paas/v4"
+  default_model = "glm-5.1"
+
+# Anthropic last-turn-only models: echo reasoning only on tool-call turns
+[provider.anthropic.models."claude-sonnet-4-5"]
+  reasoning_passback = "tool_loop"
+
+[provider.anthropic.models."claude-sonnet-4-5-20250929"]
+  reasoning_passback = "tool_loop"
+
+[provider.anthropic.models."claude-haiku-4-5"]
+  reasoning_passback = "tool_loop"
+
+[provider.anthropic.models."claude-haiku-4-5-20251001"]
+  reasoning_passback = "tool_loop"
+
+# claude-opus-4-1 / claude-opus-4-1-20250805 are absent from the models.dev snapshot;
+# carried wholesale from the old anthropic.toml so they stay selectable.
+[provider.anthropic.models."claude-opus-4-1"]
+  context_window = 200000
+  reasoning_supported = true
+  reasoning_levels = ["off", "minimal", "low", "medium", "high", "xhigh"]
+  responses = false
+  reasoning_passback = "tool_loop"
+
+[provider.anthropic.models."claude-opus-4-1-20250805"]
+  context_window = 200000
+  reasoning_supported = true
+  reasoning_levels = ["off", "minimal", "low", "medium", "high", "xhigh"]
+  responses = false
+  reasoning_passback = "tool_loop"
+
+# Cerebras gpt-oss-120b: gateway rejects replayed reasoning_content
+[provider.cerebras.models."gpt-oss-120b"]
+  reasoning_passback = "none"
+
+# OpenCode Zen: the GPT-5.x family runs the Responses API on the Zen gateway
+[provider.opencode.models."gpt-5.4"]
+  responses = true
+[provider.opencode.models."gpt-5.4-mini"]
+  responses = true
+[provider.opencode.models."gpt-5.5"]
+  responses = true
+[provider.opencode.models."gpt-5.5-pro"]
+  responses = true
+[provider.opencode.models."gpt-5.6-luna"]
+  responses = true
+[provider.opencode.models."gpt-5.6-sol"]
+  responses = true
+[provider.opencode.models."gpt-5.6-terra"]
+  responses = true
+
+# GitHub Copilot: the GPT-5.x family + mai-code run the Responses API
+[provider.github-copilot.models."gpt-5-mini"]
+  responses = true
+[provider.github-copilot.models."gpt-5.2"]
+  responses = true
+[provider.github-copilot.models."gpt-5.2-codex"]
+  responses = true
+[provider.github-copilot.models."gpt-5.3-codex"]
+  responses = true
+[provider.github-copilot.models."gpt-5.4"]
+  responses = true
+[provider.github-copilot.models."gpt-5.4-mini"]
+  responses = true
+[provider.github-copilot.models."gpt-5.4-nano"]
+  responses = true
+[provider.github-copilot.models."gpt-5.5"]
+  responses = true
+[provider.github-copilot.models."gpt-5.6-luna"]
+  responses = true
+[provider.github-copilot.models."gpt-5.6-sol"]
+  responses = true
+[provider.github-copilot.models."gpt-5.6-terra"]
+  responses = true
+[provider.github-copilot.models."mai-code-1-flash-picker"]
+  responses = true
+
+# aimlapi.com (not covered by models.dev; defined wholesale)
+[provider.aimlapi]
+  display_name = "aimlapi.com"
+  base_url = "https://api.aimlapi.com/v1"
+  default_model = "anthropic/claude-sonnet-5"
+
+# Ant Ling (not covered by models.dev; defined wholesale)
+[provider.ant-ling]
+  display_name = "Ant Ling"
+  base_url = "https://api.ant-ling.com/v1"
+  default_model = "ling"
+
+# Arcee AI (not covered by models.dev; defined wholesale)
+[provider.arcee]
+  display_name = "Arcee AI"
+  base_url = "https://api.arcee.ai/api/v1"
+  default_model = "trinity-large"
+
+# Atlas Cloud (not covered by models.dev; defined wholesale)
+[provider.atlascloud]
+  display_name = "Atlas Cloud"
+  base_url = "https://api.atlascloud.ai/v1"
+  default_model = "qwen/qwen3.5-flash"
+
+# Bankr (not covered by models.dev; defined wholesale)
+[provider.bankr]
+  display_name = "Bankr"
+  base_url = "https://api.bankr.bot/v1"
+  default_model = "bankr-large"
+
+# Custom Anthropic-Compatible (not covered by models.dev; defined wholesale)
+[provider.custom-anthropic]
+  display_name = "Custom Anthropic-Compatible"
+  protocol = "anthropic"
+  base_url = "https://api.anthropic.com"
+  default_model = "custom-model"
+
+# Custom OpenAI-Compatible (not covered by models.dev; defined wholesale)
+[provider.custom-openai]
+  display_name = "Custom OpenAI-Compatible"
+  base_url = "https://api.openai.com/v1"
+  default_model = "custom-model"
+
+# FuturMix (not covered by models.dev; defined wholesale)
+[provider.futurmix]
+  display_name = "FuturMix"
+  base_url = "https://futurmix.ai/v1"
+  default_model = "claude-sonnet-4-20250514"
+[provider.futurmix.models."claude-sonnet-4-20250514"]
+  context_window = 200000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.futurmix.models."gpt-4o"]
+  context_window = 128000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.futurmix.models."gemini-2.5-pro"]
+  context_window = 1048576
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.futurmix.models."deepseek-chat"]
+  context_window = 131072
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.futurmix.models."claude-haiku-4-20250514"]
+  context_window = 200000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+
+# GitLawb OpenGateway (not covered by models.dev; defined wholesale)
+[provider.gitlawb-opengateway]
+  display_name = "GitLawb OpenGateway"
+  base_url = "https://opengateway.gitlawb.com/v1"
+  default_model = "mimo-v2.5-pro"
+
+# iFlytek Spark (not covered by models.dev; defined wholesale)
+[provider.iflytek]
+  display_name = "iFlytek Spark"
+  base_url = "https://spark-api-open.xf-yun.com/v1"
+  default_model = "4.0Ultra"
+[provider.iflytek.models."4.0Ultra"]
+  context_window = 8192
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek.models."generalv3.5"]
+  context_window = 8192
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek.models."max-32k"]
+  context_window = 32768
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+
+# iFlytek Astron MaaS (not covered by models.dev; defined wholesale)
+[provider.iflytek-astron]
+  display_name = "iFlytek Astron MaaS"
+  base_url = "https://maas-token-api.cn-huabei-1.xf-yun.com/v2"
+  default_model = "xopglm51"
+[provider.iflytek-astron.models."xsparkx2"]
+  context_window = 131072
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek-astron.models."xsparkx2flash"]
+  context_window = 131072
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek-astron.models."xopglm51"]
+  context_window = 204800
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek-astron.models."xopglm5"]
+  context_window = 204800
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek-astron.models."xopdeepseekv4pro"]
+  context_window = 131072
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek-astron.models."xopdeepseekv4flash"]
+  context_window = 131072
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek-astron.models."xopdeepseekv32"]
+  context_window = 131072
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek-astron.models."xopkimik26"]
+  context_window = 262144
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek-astron.models."xminimaxm25"]
+  context_window = 131072
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek-astron.models."xopqwen35397b"]
+  context_window = 262144
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.iflytek-astron.models."astron-code-latest"]
+  context_window = 131072
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+
+# Kimi Code subscription (not covered by models.dev; defined wholesale)
+[provider.kimi-code]
+  display_name = "Kimi Code subscription"
+  base_url = "https://api.kimi.com/coding/v1"
+  default_model = "kimi-for-coding"
+[provider.kimi-code.models."k3"]
+  context_window = 1048576
+  reasoning_supported = true
+  reasoning_levels = ["xhigh"]
+  responses = false
+[provider.kimi-code.models."kimi-for-coding"]
+  context_window = 262144
+  reasoning_supported = true
+  reasoning_levels = ["medium", "xhigh"]
+  responses = false
+
+# Llama Swap (not covered by models.dev; defined wholesale)
+[provider.llama-swap]
+  display_name = "Llama Swap"
+  base_url = "http://localhost:8080/v1"
+  default_model = "local-model"
+
+# Nous Research (not covered by models.dev; defined wholesale)
+[provider.nous]
+  display_name = "Nous Research"
+  base_url = "https://inference-api.nousresearch.com/v1"
+  default_model = "hermes-4"
+
+# Ollama (Local) (not covered by models.dev; defined wholesale)
+[provider.ollama]
+  display_name = "Ollama (Local)"
+  base_url = "http://localhost:11434/v1"
+  default_model = "llama3.1"
+
+# oMLX (not covered by models.dev; defined wholesale)
+[provider.omlx]
+  display_name = "oMLX"
+  base_url = "http://localhost:8000/v1"
+  default_model = "local-model"
+
+# OpenAI Codex subscription (not covered by models.dev; defined wholesale)
+[provider.openai-codex]
+  display_name = "OpenAI Codex subscription"
+  base_url = "https://chatgpt.com/backend-api"
+  default_model = "gpt-5.5"
+[provider.openai-codex.models."gpt-5.6-sol"]
+  context_window = 272000
+  reasoning_supported = true
+  reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
+  responses = false
+[provider.openai-codex.models."gpt-5.6-terra"]
+  context_window = 272000
+  reasoning_supported = true
+  reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
+  responses = false
+[provider.openai-codex.models."gpt-5.6-luna"]
+  context_window = 272000
+  reasoning_supported = true
+  reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
+  responses = false
+[provider.openai-codex.models."gpt-5.5"]
+  context_window = 272000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.openai-codex.models."gpt-5.4"]
+  context_window = 272000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.openai-codex.models."gpt-5.4-mini"]
+  context_window = 400000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.openai-codex.models."gpt-5.3-codex"]
+  context_window = 400000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.openai-codex.models."gpt-5.3-codex-spark"]
+  context_window = 400000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.openai-codex.models."gpt-5.2"]
+  context_window = 400000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+
+# OpenAI Compatible (not covered by models.dev; defined wholesale)
+[provider.openai_compatible]
+  display_name = "OpenAI Compatible"
+  base_url = "https://api.openai.com/v1"
+  default_model = "custom-model"
+
+# OpenCode Go Anthropic-compatible (not covered by models.dev; defined wholesale)
+[provider.opencode-go-anthropic-compatible]
+  display_name = "OpenCode Go Anthropic-compatible"
+  protocol = "anthropic"
+  base_url = "https://opencode.ai/zen/go"
+  default_model = "minimax-m3"
+
+# Qwen Token Plan (not covered by models.dev; defined wholesale)
+[provider.qwen-token-plan]
+  display_name = "Qwen Token Plan"
+  base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+  default_model = "qwen3-coder-plus"
+
+# Qwen Token Plan CN (not covered by models.dev; defined wholesale)
+[provider.qwen-token-plan-cn]
+  display_name = "Qwen Token Plan CN"
+  base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+  default_model = "qwen3-coder-plus"
+
+# Routstr (not covered by models.dev; defined wholesale)
+[provider.routstr]
+  display_name = "Routstr"
+  base_url = "https://api.routstr.com/v1"
+  default_model = "deepseek-v4-pro"
+[provider.routstr.models."claude-opus-4.7"]
+  context_window = 1000000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.routstr.models."gemini-3.1-pro-preview"]
+  context_window = 1048576
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.routstr.models."gemini-3-flash-preview"]
+  context_window = 1048576
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.routstr.models."deepseek-v4-pro"]
+  context_window = 1048576
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.routstr.models."glm-5.1"]
+  context_window = 202752
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.routstr.models."minimax-m2.7"]
+  context_window = 196608
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+
+# VMware Tanzu Platform (not covered by models.dev; defined wholesale)
+[provider.tanzu]
+  display_name = "VMware Tanzu Platform"
+  base_url = "https://ai-services.example/openai/v1"
+  default_model = "openai/gpt-oss-120b"
+[provider.tanzu.models."openai/gpt-oss-120b"]
+  context_window = 131072
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+
+# Tensorix (not covered by models.dev; defined wholesale)
+[provider.tensorix]
+  display_name = "Tensorix"
+  base_url = "https://api.tensorix.ai/v1"
+  default_model = "z-ai/glm-5"
+[provider.tensorix.models."z-ai/glm-5"]
+  context_window = 203000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.tensorix.models."deepseek/deepseek-chat-v3.1"]
+  context_window = 164000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.tensorix.models."deepseek/deepseek-r1-0528"]
+  context_window = 164000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.tensorix.models."minimax/minimax-m2.5"]
+  context_window = 197000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+[provider.tensorix.models."moonshotai/kimi-k2.5"]
+  context_window = 262000
+  reasoning_supported = false
+  reasoning_levels = []
+  responses = false
+

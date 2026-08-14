@@ -1,9 +1,8 @@
 use crate::image_worker::{ImageResult, ImageWorker};
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column, render};
-use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    AIProvidersView, App, INPUT_PAD, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView,
-    UiEvent, find_turn_at_row, input_inner_width, merge_token_usage,
+    AIProvidersView, App, INPUT_PAD, InputBuffer, PAGE_SCROLL_LINES, Page, ProviderInfo,
+    SessionManagerView, UiEvent, find_turn_at_row, input_inner_width, merge_token_usage,
 };
 use crate::terminal_progress;
 use crate::{ShellCommand, build_picker, parse_input_line};
@@ -13,7 +12,7 @@ use choreo_client_core::{
     run_daemon_connection_with_mode, shell_command_echo,
 };
 use choreo_keystore::ensure_keypair;
-use choreo_proto::{ClientMessage, DaemonMessage};
+use choreo_proto::{ClientMessage, DaemonMessage, RefreshStatus};
 use crossbeam::channel;
 use crossbeam::select;
 use crossterm::event::{
@@ -1114,6 +1113,16 @@ fn handle_chat_event(
                                 app.status = Some("no session attached".to_string());
                             }
                         }
+                        ShellCommand::RefreshModels { force } => {
+                            // Show immediate feedback; the daemon replies
+                            // asynchronously via ModelsRefreshed /
+                            // ModelsRefreshFailed.
+                            let suffix = if force { " (forced)" } else { "" };
+                            app.status = Some(format!("refreshing models…{suffix}"));
+                            client_tx
+                                .send(ClientMessage::RefreshModels { force })
+                                .map_err(broken_pipe)?;
+                        }
                     }
                 }
                 KeyCode::Backspace
@@ -1362,31 +1371,70 @@ fn handle_chat_ctrl_key(
 ) -> Result<(), ClientError> {
     match key.code {
         KeyCode::Char('r') => {
-            let (capability, current_effort) = app
-                .active_display_ref()
-                .map(|d| (d.reasoning_capability.clone(), d.reasoning_effort.clone()))
-                .unwrap_or_default();
-            match capability.as_ref().and_then(|c| {
-                let current = current_effort.unwrap_or_else(|| "off".to_string());
-                c.cycle_from(&current).map(|next| (current, next))
-            }) {
-                Some((current, next)) => {
-                    if let Some(d) = app.active_display() {
-                        d.reasoning_effort = Some(next.clone());
+            let Some(display) = app.active_display_ref() else {
+                // No session attached — there is no display whose capability
+                // could be consulted.  Mirror the wording the other
+                // session-bound shortcuts use (Alt+Enter, Esc, /stop).
+                app.status = Some("no session attached".to_string());
+                tracing::warn!(
+                    session_id = ?app.attached_session_id,
+                    "Ctrl+R ignored — no active display (no session attached)",
+                );
+                return Ok(());
+            };
+            // Snapshot the display fields before mutating `app` below so the
+            // immutable borrow of the display ends before the status writes.
+            let capability = display.reasoning_capability.clone();
+            let current_effort = display.reasoning_effort.clone();
+            let selected_model = display.selected_model.clone();
+            match capability.as_ref() {
+                // A present-but-empty capability is the daemon's explicit
+                // "reasoning not supported" signal.  This must stay distinct
+                // from `None`, which only means "capability not yet known".
+                Some(c) if c.available_effort_levels.is_empty() => {
+                    app.status = Some("model does not support reasoning".to_string());
+                }
+                Some(c) => {
+                    let current = current_effort.unwrap_or_else(|| "off".to_string());
+                    if let Some(next) = c.cycle_from(&current) {
+                        if let Some(d) = app.active_display() {
+                            d.reasoning_effort = Some(next.clone());
+                        }
+                        app.status = Some(format!("reasoning: {next}"));
+                        tracing::info!(
+                            session_id = ?app.attached_session_id,
+                            current = %current,
+                            next = %next,
+                            "Ctrl+R cycling reasoning effort",
+                        );
+                        client_tx
+                            .send(ClientMessage::SetReasoningEffort { effort: next })
+                            .map_err(broken_pipe)?;
+                    } else {
+                        // `cycle_from` only returns None for an empty level
+                        // set, which the guard above already handled — this
+                        // is a defensive fallback.
+                        app.status = Some("model does not support reasoning".to_string());
                     }
-                    app.status = Some(format!("reasoning: {next}"));
+                }
+                // A model is selected but the daemon has not reported its
+                // effort levels yet.  `None` here must NOT be conflated with
+                // "reasoning unsupported" — the user may simply not have
+                // selected a model yet (the original bug this fixes).
+                None if selected_model.is_some() => {
+                    app.status = Some("reasoning capability not yet available".to_string());
                     tracing::info!(
                         session_id = ?app.attached_session_id,
-                        current = %current,
-                        next = %next,
-                        "Ctrl+R cycling reasoning effort",
+                        model = ?selected_model,
+                        "Ctrl+R pressed before reasoning capability was reported",
                     );
-                    client_tx
-                        .send(ClientMessage::SetReasoningEffort { effort: next })
-                        .map_err(broken_pipe)?;
                 }
                 None => {
-                    app.status = Some("model does not support reasoning".to_string());
+                    app.status = Some("no model selected — pick one with Ctrl+M".to_string());
+                    tracing::warn!(
+                        session_id = ?app.attached_session_id,
+                        "Ctrl+R pressed with no model selected",
+                    );
                 }
             }
         }
@@ -1767,12 +1815,12 @@ fn handle_ai_providers_select_provider_key(
 
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => app.ai_providers.provider_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.ai_providers.provider_down(),
+        KeyCode::Down | KeyCode::Char('j') => app.ai_providers.provider_down(&app.providers),
         // PgUp/PgDn page the selection (the render window follows it), so
         // browsing the ~90 providers takes a few keypresses, not a
         // row-by-row walk.
         KeyCode::PageUp => app.ai_providers.provider_page_up(),
-        KeyCode::PageDown => app.ai_providers.provider_page_down(),
+        KeyCode::PageDown => app.ai_providers.provider_page_down(&app.providers),
         // Enter confirms the highlighted provider and advances to the slug
         // entry page (phase 2).
         KeyCode::Enter => app.ai_providers.confirm_provider(),
@@ -1834,12 +1882,12 @@ fn submit_new_account(
     let slug = app.ai_providers.slug_state.value().trim().to_string();
     let provider_str = app
         .ai_providers
-        .selected_provider_slug()
+        .selected_provider_slug(&app.providers)
         // The provider is always chosen before this page is reachable; if it
         // somehow is not, fall back to the first option rather than indexing
-        // (the terminal `unwrap_or_default` is unreachable: PROVIDER_OPTIONS
-        // is a non-empty compile-time table).
-        .or_else(|| PROVIDER_OPTIONS.first().map(|p| p.slug))
+        // (the terminal `unwrap_or_default` is unreachable: `app.providers`
+        // is initialized from the non-empty compile-time table).
+        .or_else(|| app.providers.first().map(|p| p.slug.as_str()))
         .unwrap_or_default()
         .to_string();
 
@@ -2386,6 +2434,54 @@ pub(crate) fn handle_daemon_message(
             return Ok(());
         }
         // Selector closed: fall through to the generic error handling.
+
+        // ── S4: /refresh-models replies + catalog updates ────────────────
+        DaemonMessage::ModelsRefreshed {
+            providers,
+            models,
+            status,
+        } => {
+            let message = match status {
+                RefreshStatus::UpToDate => {
+                    format!("models up to date ({providers} providers, {models} models)")
+                }
+                RefreshStatus::Updated => {
+                    format!("models updated ({providers} providers, {models} models)")
+                }
+                RefreshStatus::Forced => {
+                    format!("models refreshed (forced) — {providers} providers, {models} models")
+                }
+            };
+            tracing::info!(%message, "refresh-models reply");
+            app.status = Some(message);
+            return Ok(());
+        }
+        DaemonMessage::ModelsRefreshFailed { error } => {
+            tracing::warn!(%error, "refresh-models failed");
+            app.error = Some(format!("[daemon] refresh-models failed: {error}"));
+            return Ok(());
+        }
+        DaemonMessage::CatalogUpdated { providers } => {
+            // Replace the live provider list (the picker's source of truth)
+            // and clamp the wizard selection if the list shrank. Only churn
+            // the status line when the list actually changed — the daemon
+            // also sends one on every activity-subscribe, which would
+            // otherwise overwrite unrelated status messages at connect.
+            let mapped = providers
+                .iter()
+                .map(|p| ProviderInfo {
+                    slug: p.slug.clone(),
+                    display_name: p.display_name.clone(),
+                })
+                .collect();
+            if app.set_providers(mapped) {
+                app.status = Some(format!(
+                    "catalog updated ({} providers)",
+                    app.providers.len()
+                ));
+            }
+            return Ok(());
+        }
         _ => {}
     }
 

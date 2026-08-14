@@ -145,7 +145,7 @@ fn deepseek_tool_loop_echoes_reasoning_content_verbatim() {
     let client = OpenAiClient::new(
         ServiceConfig {
             base_url: mock.base_url("v1"),
-            provider_slug: "deepseek",
+            provider_slug: "deepseek".to_string(),
             streaming: false,
             retry_max_attempts: 1,
             connect_timeout_secs: 5,
@@ -578,7 +578,7 @@ fn responses_chains_reasoning_continuity_via_response_id() {
     let client = OpenAiClient::new(
         ServiceConfig {
             base_url: mock.base_url("v1"),
-            provider_slug: "openai",
+            provider_slug: "openai".to_string(),
             streaming: false,
             retry_max_attempts: 1,
             connect_timeout_secs: 5,
@@ -728,7 +728,7 @@ fn opencode_provider_sends_x_opencode_session_header() {
     // header so the gateway routes to a stable, working upstream provider.
     for slug in ["opencode-go", "opencode"] {
         let req = chat_turn_request(ServiceConfig {
-            provider_slug: slug,
+            provider_slug: slug.to_string(),
             streaming: false,
             ..Default::default()
         });
@@ -747,7 +747,7 @@ fn non_opencode_provider_omits_x_opencode_session_header() {
     // header is only meaningful to opencode.ai's routing.
     for slug in ["openai", "deepseek"] {
         let req = chat_turn_request(ServiceConfig {
-            provider_slug: slug,
+            provider_slug: slug.to_string(),
             streaming: false,
             ..Default::default()
         });
