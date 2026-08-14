@@ -78,6 +78,35 @@ build-debug: _require-zig
 check: _require-zig
     cargo check {{ CARGO_FLAGS }} --workspace --all-targets
 
+# macOS cross-compile gate (works from Linux or macOS): type-check every library
+# crate for aarch64-apple-darwin using zig's clang+lld via cargo-zigbuild's
+# `check` subcommand. Note the direct `cargo-zigbuild` invocation — `cargo
+# zigbuild check` would misroute to the build subcommand, because cargo passes
+# the subcommand name through (cargo-zigbuild 0.23+).
+#
+# Libs only, deliberately: the final Mach-O binary link needs the Apple SDK,
+# which cannot be redistributed (it fails with "unable to find framework
+# 'CoreFoundation'"), so real macOS binaries are built on a macOS host in CI.
+# `cargo check` skips linking, so this gate passes — but C build scripts (ring,
+# zlob, ckb-vm, onig) DO run, so target-specific C breakage is caught too.
+#
+# Do NOT add `--all-features`: the `blockchain` feature pulls subxt →
+# native-tls → security-framework-sys, whose bindgen step reads Apple's
+# Security.framework headers (SDK territory — fails from Linux).
+check-macos: _require-zig
+    rustup target add aarch64-apple-darwin
+    cargo-zigbuild check {{ CARGO_FLAGS }} --target aarch64-apple-darwin --workspace --lib
+
+# Windows cross-compile gate: type-check every library crate for
+# x86_64-pc-windows-gnu via zig (MinGW bundled — no mingw install needed).
+# Same libs-only rationale as check-macos; this is the recipe to iterate the
+# Windows port against. Until the workspace [patch.crates-io] fix lands, a
+# clean build also surfaces the zlob archive-naming quirk (zig emits
+# `zlob.lib`, the windows-gnu target wants `libzlob.a`).
+check-windows: _require-zig
+    rustup target add x86_64-pc-windows-gnu
+    cargo-zigbuild check {{ CARGO_FLAGS }} --target x86_64-pc-windows-gnu --workspace --lib
+
 # ── testing ───────────────────────────────────────────────────────────────────
 
 # Full suite — unit + integration — via nextest in one pass (alias of `test-all`)

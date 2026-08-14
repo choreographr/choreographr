@@ -760,6 +760,8 @@ nextest only where noted:
 just preflight            # verify cargo + zig (+ optional nextest) are present
 just build                # cargo build --workspace (release by default)
 just check                # cargo check --workspace --all-targets (fastest CI signal)
+just check-macos          # macOS cross-compile gate: type-check every lib for aarch64-apple-darwin
+just check-windows        # Windows cross-compile gate: type-check every lib for x86_64-pc-windows-gnu
 
 just test                 # full suite via nextest (alias of just test-all)
 just test-fast            # unit tests via nextest
