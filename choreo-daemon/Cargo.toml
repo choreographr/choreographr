@@ -56,7 +56,6 @@ choreo-sanitize.workspace = true
 choreo-transport.workspace = true
 choreo-ai-protocols.workspace = true
 signal-hook.workspace = true
-uds_windows.workspace = true
 notify.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -140,9 +139,11 @@ choreo-ai-protocols = { workspace = true, features = ["test-utils"] }
 # integration tests (tests/daemon_client_unix.rs, tests/daemon_client_noise.rs).
 choreo-client-core.workspace = true
 
-# Windows process-tree isolation for shell tools: the Job Object FFI (the
-# Windows analogue of Unix process-group killpg(2), used by `ChildJob` in
-# src/tools/shell_util.rs). Target-specific — never built on Unix. The
-# `uds_windows` entry above stays as-is.
+# Windows-only deps: process-tree isolation for shell tools (the Job Object
+# FFI — the Windows analogue of Unix process-group killpg(2), used by
+# `ChildJob`/`ProcessIsAlive` in src/tools/shell_util.rs) and the Unix-socket
+# stand-in (named pipes) for the daemon's server layer. Target-specific —
+# never built on Unix.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+uds_windows.workspace = true

@@ -18,6 +18,10 @@ choreo-keystore.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# Windows Unix domain sockets (std::os::windows::net::UnixStream is still
+# unstable); see the workspace-level comment. Unix-only builds never compile it.
+[target.'cfg(windows)'.dependencies]
 uds_windows.workspace = true
 
 [dev-dependencies]

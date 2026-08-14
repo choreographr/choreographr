@@ -108,6 +108,24 @@ fn signal_to_resume_command(signo: i32) -> Option<ResumeCommand> {
     }
 }
 
+/// Whether a shutdown-notify channel has been disconnected.
+///
+/// The Windows terminal thread's notify is a sender that is *dropped* (never
+/// sent on) to signal shutdown — `try_recv` then reports `Disconnected`. A
+/// plain `try_recv().is_ok()` check would never fire, because no message is
+/// ever sent; this helper pins the Disconnected-detection contract.
+///
+/// Only the Windows terminal thread uses it in the lib build (the unit test
+/// below exercises it on every platform); `allow(dead_code)` keeps the Unix
+/// lib build warning-free.
+#[cfg_attr(unix, allow(dead_code))]
+fn notify_disconnected(rx: &channel::Receiver<()>) -> bool {
+    matches!(
+        rx.try_recv(),
+        Err(crossbeam::channel::TryRecvError::Disconnected)
+    )
+}
+
 pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     tracing::info!("[choreo-tui] run_app starting");
     // Ensure the keystore keypair exists before we try to connect to the
@@ -404,7 +422,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
                 // there is no job-control suspend. Poll with a short timeout so the
                 // shutdown notify (a dropped sender) is observed promptly.
                 loop {
-                    if notify_rx.try_recv().is_ok() {
+                    if notify_disconnected(&notify_rx) {
                         return;
                     }
                     match event::poll(Duration::from_millis(100)) {
@@ -2638,6 +2656,29 @@ mod tests {
     }
 
     // ── Kitty keyboard protocol ──
+
+    #[test]
+    fn notify_disconnected_detects_dropped_sender() {
+        // The Windows terminal thread's shutdown notify is a sender that is
+        // dropped (never sent on); `try_recv` then reports Disconnected — the
+        // `try_recv().is_ok()` check the old code used would never fire
+        // because no message is ever sent, hanging the thread (and the join
+        // at shutdown) forever. Pin the exact detection contract.
+        let (tx, rx) = channel::unbounded::<()>();
+        assert!(
+            !notify_disconnected(&rx),
+            "a live channel must not read as shut down"
+        );
+        drop(tx);
+        assert!(
+            notify_disconnected(&rx),
+            "a dropped sender must read as shut down"
+        );
+        assert!(
+            notify_disconnected(&rx),
+            "detection must stay latched after disconnect"
+        );
+    }
 
     #[test]
     fn kitty_flags_disambiguate_without_report_all_keys() {

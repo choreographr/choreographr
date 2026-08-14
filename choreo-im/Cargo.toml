@@ -23,4 +23,8 @@ ureq.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ammonia.workspace = true
+
+# Windows Unix domain sockets (std::os::windows::net::UnixStream is still
+# unstable); see the workspace-level comment. Unix-only builds never compile it.
+[target.'cfg(windows)'.dependencies]
 uds_windows.workspace = true

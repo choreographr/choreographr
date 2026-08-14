@@ -251,31 +251,47 @@ pub fn run_server(
         });
     }
 
-    // Windows: no sigwait and no iterator module — poll signal-hook flags set
-    // by the CRT console handler (SIGINT/SIGTERM), then wake the accept loop
-    // the same way (a connect to our own socket unblocks accept()).
+    // Windows: no sigwait and no iterator module — `low_level::register`
+    // installs the CRT console handler (the same primitive `flag::register`
+    // is built on), forwarding each signal as a channel message; the thread
+    // then blocks in `recv()` with zero CPU instead of polling a flag, then
+    // wakes the accept loop the same way as Unix (a connect to our own socket
+    // unblocks accept()).
     #[cfg(windows)]
     {
         let sig_shutdown = Arc::clone(&shutdown);
         let sig_path = socket_path.to_string();
         thread::spawn(move || {
             use signal_hook::consts::{SIGINT, SIGTERM};
-            let int_flag = Arc::new(AtomicBool::new(false));
-            let term_flag = Arc::new(AtomicBool::new(false));
-            if let Err(e) = signal_hook::flag::register(SIGINT, Arc::clone(&int_flag))
-                .and_then(|_| signal_hook::flag::register(SIGTERM, Arc::clone(&term_flag)))
-            {
+            let (sig_tx, sig_rx) = mpsc::channel::<()>();
+            let int_tx = sig_tx.clone();
+            let term_tx = sig_tx;
+            // SAFETY: on Windows the registered action runs on the CRT's
+            // console-handler thread, where an mpsc send is safe (no POSIX
+            // async-signal restrictions apply); the senders are moved into
+            // the registrations and outlive them.
+            if let Err(e) = unsafe {
+                signal_hook::low_level::register(SIGINT, move || {
+                    let _ = int_tx.send(());
+                })
+            }
+            .and_then(|_| unsafe {
+                signal_hook::low_level::register(SIGTERM, move || {
+                    let _ = term_tx.send(());
+                })
+            }) {
                 error!("failed to register signal handlers: {e}");
                 return;
             }
-            loop {
-                std::thread::sleep(Duration::from_millis(100));
-                if int_flag.swap(false, Ordering::SeqCst) || term_flag.swap(false, Ordering::SeqCst)
-                {
-                    sig_shutdown.store(true, Ordering::SeqCst);
-                    if let Ok(stream) = UnixStream::connect(&sig_path) {
-                        drop(stream);
-                    }
+            // Block until a signal arrives (channel recv — no polling), then
+            // wake the accept loop: the pending connection causes the next
+            // blocking accept() to return immediately so the shutdown flag is
+            // checked. The senders are held by the registrations, so recv
+            // never returns Err and the loop runs until the process exits.
+            while sig_rx.recv().is_ok() {
+                sig_shutdown.store(true, Ordering::SeqCst);
+                if let Ok(stream) = UnixStream::connect(&sig_path) {
+                    drop(stream);
                 }
             }
         });
