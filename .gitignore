@@ -1,2 +1,6 @@
 /target
 /dist
+# Local models.dev snapshot cache for the catalog generator: `catalog-gen`
+# fetches it from models.dev when missing and persists it here (gitignored), so
+# only `catalog.bin` is a committed catalog data file.
+/choreo-ai-protocols/catalog/models.dev.json

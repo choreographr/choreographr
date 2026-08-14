@@ -2141,6 +2141,7 @@ dependencies = [
 name = "choreo-ai-protocols"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "choreo-ai-protocols",
  "choreo-proto",
@@ -2151,9 +2152,11 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "tempfile",
  "thiserror 2.0.19",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "zeroize",
 ]

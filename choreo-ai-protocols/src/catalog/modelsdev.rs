@@ -1,9 +1,12 @@
 //! Normalization of the models.dev snapshot into base `ProviderEntry` values.
 //!
-//! The checked-in models.dev snapshot (`catalog/models.dev.json`, fetched
+//! The local models.dev snapshot (`catalog/models.dev.json`, fetched
 //! 2026-08-13) is the source of *facts*: provider slugs/names/base URLs and
-//! per-model reasoning/context facts. Policy (protocol selection, per-model
-//! passback exceptions, and the providers models.dev does not cover) lives in
+//! per-model reasoning/context facts. The snapshot is a **gitignored local
+//! artifact** — `catalog-gen` fetches a fresh copy from models.dev when it is
+//! missing and caches it at that path — so `catalog.bin` is the only
+//! committed catalog data file. Policy (protocol selection, per-model passback
+//! exceptions, and the providers models.dev does not cover) lives in
 //! `models-overlay.toml` and is merged at load time by [`merge_overlay`].
 //!
 //! The generator binary (`src/bin/catalog-gen.rs`) runs [`normalize_modelsdev`]

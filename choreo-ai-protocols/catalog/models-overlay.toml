@@ -2,7 +2,7 @@
 #
 # The catalog is a two-layer pipeline (see src/catalog/loader.rs):
 #
-#   catalog/models.dev.json ──catalog-gen──► catalog/catalog.bin   (base, embedded)
+#   catalog/models.dev.json (local, gitignored) ──catalog-gen──► catalog/catalog.bin   (base, embedded; the only committed catalog data file)
 #   catalog/models-overlay.toml ──include_str!──► merged at load time
 #
 # This file carries EVERYTHING that is not derivable from the models.dev

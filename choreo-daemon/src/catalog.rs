@@ -17,14 +17,14 @@
 //! failure) fires when the timeout elapses — so the cache stays fresh with
 //! no busy loops.
 
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use choreo_ai_protocols::{
     ProviderEntry, RefreshError, RefreshOutcome, fetch_modelsdev, load_bundled_base,
-    normalize_modelsdev,
+    normalize_modelsdev, write_file_atomic,
 };
 use choreo_proto::RefreshStatus;
 use crossbeam_channel::{Receiver, Sender};
@@ -38,9 +38,9 @@ use crate::daemon::DaemonCommand;
 /// so the catalog never goes stale and a failure never spins — it just waits
 /// for the next trigger (a `/refresh-models` request, an overlay event, or
 /// this interval). models.dev changes infrequently; the conditional GET is
-/// cheap (a 304 round trip), so a 6-hour revalidation is plenty to keep the
+/// cheap (a 304 round trip), so a 24-hour revalidation is plenty to keep the
 /// cache fresh, and `/refresh-models` bypasses it anytime.
-const RETRY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const RETRY_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Postcard cache filename under the data dir.
 const CATALOG_BIN_NAME: &str = "catalog.bin";
@@ -212,37 +212,6 @@ pub(crate) fn write_catalog_cache(
     Ok(())
 }
 
-/// Write `bytes` to `path` atomically: a temp file in the same directory,
-/// write + fsync, then rename over the target (atomic on POSIX). The temp
-/// file must live in the same directory as the target so the rename never
-/// crosses a filesystem boundary.
-fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    // Best-effort directory fsync so the rename itself is durable: POSIX
-    // rename durability requires syncing the parent directory, not just the
-    // file. Some platforms/filesystems refuse to fsync a directory handle
-    // (EINVAL) — a failure here only weakens crash durability, never
-    // correctness, so it is logged rather than propagated.
-    if let Some(dir) = path.parent() {
-        match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
-            Ok(()) => {}
-            Err(e) => {
-                tracing::debug!(
-                    path = %dir.display(),
-                    error = %e,
-                    "failed to fsync the catalog directory after rename",
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Spawn the ONE background catalog-maintenance thread. Returns the channel
 /// sender the daemon command loop uses to hand `/refresh-models` requests to
 /// it. The thread is detached (the process exits after `run_server` returns;
@@ -330,7 +299,7 @@ fn maintenance_loop(
         user_overlay,
         persist: false,
         report_status: None,
-        reply: None,
+        reply: Vec::new(),
     });
 
     // ── 4. Register the notify watcher on the config DIRECTORY (rename-safe:
@@ -352,37 +321,80 @@ fn maintenance_loop(
                 None
             }
         };
-    if let Some(w) = watcher.as_mut()
-        && let Some(dir) = paths.overlay.parent()
-        && let Err(e) = w.watch(dir, RecursiveMode::NonRecursive)
-    {
-        warn!(
-            dir = %dir.display(),
-            error = %e,
-            "failed to watch the config directory; user overlay changes will \
-             not reload automatically",
-        );
-        // The watcher is kept alive (a failed watch simply never fires); the
-        // daemon falls back to manual `/refresh-models` for overlay reloads.
+    // The watch targets the config DIRECTORY, not the file itself. A failed
+    // initial watch (e.g. the config dir did not exist yet at startup) is
+    // retried in the loop below once the dir appears, so a later-created
+    // overlay is picked up without a daemon restart. The watcher is kept
+    // alive either way — a failed watch simply never fires until re-armed.
+    let watch_dir = paths.overlay.parent().map(Path::to_path_buf);
+    let mut watch_armed = false;
+    if let (Some(w), Some(dir)) = (watcher.as_mut(), watch_dir.as_deref()) {
+        match w.watch(dir, RecursiveMode::NonRecursive) {
+            Ok(()) => watch_armed = true,
+            Err(e) => {
+                warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "failed to watch the config directory; retrying in the \
+                     maintenance loop (overlay changes also reload on `/refresh-models`)",
+                );
+            }
+        }
     }
 
     // ── 5. Initial conditional GET (best-effort; failures log + retry).
-    run_refresh(&daemon_tx, &mut state, false, None);
+    run_refresh(&daemon_tx, &mut state, false, Vec::new());
 
     // ── 6. Event loop: wait on the channel (requests + overlay events) with
     // the retry timer as the recv timeout.
     loop {
+        // Re-arm the config-dir watch if the initial attempt failed (e.g. the
+        // dir was created after startup): once the overlay file is watchable,
+        // edits reload automatically. Cheap while unarmed (a failed watch is
+        // a quick syscall); a no-op once armed.
+        if !watch_armed && let (Some(w), Some(dir)) = (watcher.as_mut(), watch_dir.as_deref()) {
+            match w.watch(dir, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    info!(
+                        dir = %dir.display(),
+                        "config directory is now watchable; overlay auto-reload armed",
+                    );
+                    watch_armed = true;
+                }
+                Err(e) => {
+                    // Debug, not warn: this retries on every loop iteration
+                    // until the dir exists, so a warn would spam the log.
+                    tracing::debug!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "config directory still not watchable; will retry",
+                    );
+                }
+            }
+        }
         let timeout = state
             .next_retry_at
             .map(|at| at.saturating_duration_since(Instant::now()))
             .unwrap_or(RETRY_INTERVAL);
         match rx.recv_timeout(timeout) {
             Ok(MaintenanceEvent::RefreshNow { force, reply }) => {
-                run_refresh(&daemon_tx, &mut state, force, Some(reply));
+                // /refresh-models is the documented fallback for overlay
+                // reloads (e.g. when the notify watch could not start). Re-read
+                // the file so the command re-syncs the user layer too, not
+                // just the models.dev base — and so an overlay edit is applied
+                // even when the conditional GET below returns 304 (a 304 sends
+                // no CatalogBaseChanged, so without this the reload is lost).
+                reload_user_overlay(&daemon_tx, &mut state, &paths.overlay);
+                // Coalesce: drain any RefreshNows queued while we were idle so
+                // a burst of /refresh-models becomes ONE fetch. Fold the force
+                // flag (a --force anywhere in the burst forces) and keep every
+                // reply sender so no requester is left hanging.
+                let (any_force, replies) = fold_refresh_nows(&rx, force, reply);
+                run_refresh(&daemon_tx, &mut state, any_force, replies);
             }
             Ok(MaintenanceEvent::OverlayFsEvent(Ok(event))) => {
                 if is_overlay_event(&event, &paths.overlay) {
-                    handle_overlay_event(&daemon_tx, &mut state, &paths.overlay);
+                    reload_user_overlay(&daemon_tx, &mut state, &paths.overlay);
                 }
             }
             Ok(MaintenanceEvent::OverlayFsEvent(Err(e))) => {
@@ -395,7 +407,7 @@ fn maintenance_loop(
                     && Instant::now() >= at
                 {
                     state.next_retry_at = None;
-                    run_refresh(&daemon_tx, &mut state, false, None);
+                    run_refresh(&daemon_tx, &mut state, false, Vec::new());
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -416,13 +428,15 @@ fn maintenance_loop(
 ///   `CatalogUpdated`, and replies to the requester.
 /// * `Err` → log + reply the error + schedule a retry.
 ///
-/// Every outcome arms `next_retry_at` (the recv-timeout cadence), so the
-/// catalog revalidates on a fixed schedule no matter what the last fetch did.
+/// `reply` holds one sender per `/refresh-models` requester (empty for
+/// background refreshes). Every outcome arms `next_retry_at` (the
+/// recv-timeout cadence), so the catalog revalidates on a fixed schedule no
+/// matter what the last fetch did.
 fn run_refresh(
     daemon_tx: &mpsc::Sender<DaemonCommand>,
     state: &mut MaintenanceState,
     force: bool,
-    reply: Option<mpsc::Sender<Result<RefreshReport, String>>>,
+    reply: Vec<mpsc::Sender<Result<RefreshReport, String>>>,
 ) {
     // The fetch is injected so the outcome→state machine is unit-testable
     // without a network round trip; production always uses the real ureq GET.
@@ -435,12 +449,13 @@ fn run_refresh(
 /// abstracted out. Every branch arms `next_retry_at` so the catalog keeps a
 /// steady revalidation cadence; the daemon command loop receives a
 /// `CatalogBaseChanged` (the single-writer swap) only when a new base was
-/// actually fetched.
+/// actually fetched. `reply` holds one sender per `/refresh-models` requester
+/// (empty for background refreshes); every sender receives the same outcome.
 fn run_refresh_impl<F>(
     daemon_tx: &mpsc::Sender<DaemonCommand>,
     state: &mut MaintenanceState,
     force: bool,
-    reply: Option<mpsc::Sender<Result<RefreshReport, String>>>,
+    reply: Vec<mpsc::Sender<Result<RefreshReport, String>>>,
     fetch: F,
 ) where
     F: FnOnce(Option<&str>, bool) -> Result<RefreshOutcome, RefreshError>,
@@ -451,13 +466,15 @@ fn run_refresh_impl<F>(
                 force,
                 "models.dev catalog unchanged (304); keeping the current catalog",
             );
-            if let Some(reply) = reply {
+            if !reply.is_empty() {
                 let (providers, models) = current_catalog_counts();
-                let _ = reply.send(Ok(RefreshReport {
-                    providers,
-                    models,
-                    status: RefreshStatus::UpToDate,
-                }));
+                for tx in reply {
+                    let _ = tx.send(Ok(RefreshReport {
+                        providers,
+                        models,
+                        status: RefreshStatus::UpToDate,
+                    }));
+                }
             }
             // The cache is still valid; revalidate later to keep it fresh
             // without hammering models.dev.
@@ -473,8 +490,8 @@ fn run_refresh_impl<F>(
                     "models.dev response did not normalize into a non-empty catalog; \
                      keeping the current catalog",
                 );
-                if let Some(reply) = reply {
-                    let _ = reply.send(Err(
+                for tx in reply {
+                    let _ = tx.send(Err(
                         "models.dev response did not parse into a non-empty catalog".to_string(),
                     ));
                 }
@@ -510,19 +527,42 @@ fn run_refresh_impl<F>(
         }
         Err(e) => {
             warn!(error = %e, "models.dev refresh failed; will retry later");
-            if let Some(reply) = reply {
-                let _ = reply.send(Err(e.to_string()));
+            for tx in reply {
+                let _ = tx.send(Err(e.to_string()));
             }
             state.next_retry_at = Some(Instant::now() + RETRY_INTERVAL);
         }
     }
 }
 
-/// An event for the user overlay file arrived. Re-read the file and, if the
-/// contents differ from the last-applied value (the fingerprint gate),
-/// hand the new contents to the daemon loop. A deleted file sends an explicit
-/// `None` so the daemon falls back to bundled-only and warns.
-fn handle_overlay_event(
+/// Fold a burst of queued [`MaintenanceEvent::RefreshNow`] events into the
+/// one being processed: OR the force flags and collect every reply sender, so
+/// a burst of `/refresh-models` requests performs a single fetch while every
+/// requester still gets a reply. `try_recv` never blocks — this only drains
+/// what has already been queued. Returns the effective force flag and all
+/// reply senders (the first event's plus any queued behind it).
+fn fold_refresh_nows(
+    rx: &Receiver<MaintenanceEvent>,
+    force: bool,
+    first_reply: mpsc::Sender<Result<RefreshReport, String>>,
+) -> (bool, Vec<mpsc::Sender<Result<RefreshReport, String>>>) {
+    let mut any_force = force;
+    let mut replies = vec![first_reply];
+    while let Ok(MaintenanceEvent::RefreshNow { force, reply }) = rx.try_recv() {
+        any_force |= force;
+        replies.push(reply);
+    }
+    (any_force, replies)
+}
+
+/// Re-read the user overlay and, if its contents changed since the
+/// last-applied value (the fingerprint gate), hand the new value to the
+/// daemon command loop so it re-merges and swaps. Shared by the notify
+/// watcher and the `/refresh-models` path, so the overlay reload policy lives
+/// in exactly one place. A deleted file sends an explicit `None` so the daemon
+/// falls back to bundled-only; an unreadable-but-present file warns and keeps
+/// the last-applied value rather than churn on a transient read error.
+fn reload_user_overlay(
     daemon_tx: &mpsc::Sender<DaemonCommand>,
     state: &mut MaintenanceState,
     overlay_path: &Path,
@@ -545,7 +585,7 @@ fn handle_overlay_event(
                     user_overlay: contents,
                     persist: false,
                     report_status: None,
-                    reply: None,
+                    reply: Vec::new(),
                 });
             }
         }
@@ -776,7 +816,7 @@ mod tests {
             user_overlay: Some("[provider.acme]\nbase_url = \"x\"\n".into()),
             persist: true,
             report_status: Some(RefreshStatus::Forced),
-            reply: None,
+            reply: Vec::new(),
         };
     }
 
@@ -815,7 +855,7 @@ mod tests {
             &daemon_tx,
             &mut state,
             false,
-            Some(reply_tx),
+            vec![reply_tx],
             |_etag, _force| {
                 Ok(RefreshOutcome::Fetched {
                     json: SNAPSHOT_JSON.into(),
@@ -844,8 +884,9 @@ mod tests {
             } => {
                 assert!(persist, "a live fetch must persist the cache");
                 assert_eq!(report_status, Some(RefreshStatus::Updated));
-                assert!(
-                    reply.is_some(),
+                assert_eq!(
+                    reply.len(),
+                    1,
                     "the /refresh-models reply must be routed through the command"
                 );
             }
@@ -861,7 +902,7 @@ mod tests {
         let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
         let mut state = maintenance_state();
 
-        run_refresh_impl(&daemon_tx, &mut state, true, None, |_etag, _force| {
+        run_refresh_impl(&daemon_tx, &mut state, true, Vec::new(), |_etag, _force| {
             Ok(RefreshOutcome::Fetched {
                 json: SNAPSHOT_JSON.into(),
                 etag: Some("\"v3\"".into()),
@@ -889,7 +930,7 @@ mod tests {
             &daemon_tx,
             &mut state,
             false,
-            Some(reply_tx),
+            vec![reply_tx],
             |etag, force| {
                 // The injected fetcher must see the cached etag and no force.
                 assert_eq!(etag, Some("\"v1\""));
@@ -916,7 +957,7 @@ mod tests {
             &daemon_tx,
             &mut state,
             false,
-            Some(reply_tx),
+            vec![reply_tx],
             |_etag, _force| Err(choreo_ai_protocols::RefreshError::Network("boom".into())),
         );
 
@@ -938,7 +979,7 @@ mod tests {
             &daemon_tx,
             &mut state,
             false,
-            Some(reply_tx),
+            vec![reply_tx],
             |_etag, _force| {
                 Ok(RefreshOutcome::Fetched {
                     json: "not json at all".into(),
@@ -968,5 +1009,126 @@ mod tests {
         };
         assert_eq!(p.slug, "openai");
         assert_eq!(p.display_name, "OpenAI");
+    }
+
+    #[test]
+    fn fold_refresh_nows_folds_queued_bursts() {
+        // A burst of /refresh-models must fold into ONE refresh: the force
+        // flags are OR-ed and every reply sender is kept, so no requester is
+        // left hanging and the maintenance thread fetches at most once.
+        let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceEvent>();
+        let (reply_a, _ra) = mpsc::channel();
+        let (reply_b, _rb) = mpsc::channel();
+        let (reply_c, _rc) = mpsc::channel();
+
+        // Queue two more refresh requests behind the first (force only on the
+        // last one — the fold must OR it in).
+        tx.send(MaintenanceEvent::RefreshNow {
+            force: false,
+            reply: reply_b,
+        })
+        .unwrap();
+        tx.send(MaintenanceEvent::RefreshNow {
+            force: true,
+            reply: reply_c,
+        })
+        .unwrap();
+
+        let (force, replies) = fold_refresh_nows(&rx, false, reply_a);
+        assert!(
+            force,
+            "a --force anywhere in the burst must force the fetch"
+        );
+        assert_eq!(replies.len(), 3, "every requester's reply sender is kept");
+        // The channel is drained by the fold.
+        assert!(rx.try_recv().is_err(), "the burst is fully drained");
+    }
+
+    #[test]
+    fn fold_refresh_nows_keeps_first_reply_when_queue_empty() {
+        let (_tx, rx) = crossbeam_channel::unbounded::<MaintenanceEvent>();
+        let (reply, _r) = mpsc::channel();
+        let (force, replies) = fold_refresh_nows(&rx, true, reply);
+        assert!(force);
+        assert_eq!(replies.len(), 1);
+    }
+
+    #[test]
+    fn reload_user_overlay_fingerprint_gates_the_daemon_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("models-overlay.toml");
+        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let mut state = maintenance_state();
+
+        // No file yet → nothing applied, nothing sent.
+        reload_user_overlay(&daemon_tx, &mut state, &overlay);
+        assert!(daemon_rx.try_recv().is_err(), "absent file sends nothing");
+        assert!(state.last_applied_user_overlay.is_none());
+
+        // Creating the file changes the fingerprint → CatalogBaseChanged with
+        // the fresh contents.
+        std::fs::write(&overlay, "[provider.acme]\nbase_url = \"x\"\n").unwrap();
+        reload_user_overlay(&daemon_tx, &mut state, &overlay);
+        match daemon_rx.try_recv().unwrap() {
+            DaemonCommand::CatalogBaseChanged {
+                user_overlay,
+                persist,
+                report_status,
+                reply,
+                ..
+            } => {
+                assert_eq!(
+                    user_overlay.as_deref(),
+                    Some("[provider.acme]\nbase_url = \"x\"\n")
+                );
+                assert!(!persist, "an overlay reload must not persist the cache");
+                assert_eq!(report_status, None);
+                assert!(reply.is_empty());
+            }
+            other => panic!(
+                "expected CatalogBaseChanged, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // An unchanged file (editor save storm) → fingerprint gate: nothing.
+        reload_user_overlay(&daemon_tx, &mut state, &overlay);
+        assert!(
+            daemon_rx.try_recv().is_err(),
+            "unchanged contents must not trigger a reload"
+        );
+
+        // Editing the file again → a new command with the new contents.
+        std::fs::write(&overlay, "[provider.acme]\nbase_url = \"y\"\n").unwrap();
+        reload_user_overlay(&daemon_tx, &mut state, &overlay);
+        match daemon_rx.try_recv().unwrap() {
+            DaemonCommand::CatalogBaseChanged { user_overlay, .. } => {
+                assert_eq!(
+                    user_overlay.as_deref(),
+                    Some("[provider.acme]\nbase_url = \"y\"\n")
+                );
+            }
+            other => panic!(
+                "expected CatalogBaseChanged, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // Deleting the file → explicit None so the daemon falls back to
+        // bundled-only.
+        std::fs::remove_file(&overlay).unwrap();
+        reload_user_overlay(&daemon_tx, &mut state, &overlay);
+        match daemon_rx.try_recv().unwrap() {
+            DaemonCommand::CatalogBaseChanged { user_overlay, .. } => {
+                assert_eq!(
+                    user_overlay, None,
+                    "a deleted overlay falls back to bundled-only"
+                );
+            }
+            other => panic!(
+                "expected CatalogBaseChanged, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
     }
 }

@@ -170,9 +170,9 @@ pub enum DaemonCommand {
         /// request (`None` for background events: startup load, overlay
         /// change).
         report_status: Option<RefreshStatus>,
-        /// Reply channel for a `/refresh-models` request (`None` for
-        /// background events).
-        reply: Option<mpsc::Sender<Result<RefreshReport, String>>>,
+        /// Reply channel(s) for a `/refresh-models` request (empty for
+        /// background events; one sender per coalesced requester).
+        reply: Vec<mpsc::Sender<Result<RefreshReport, String>>>,
     },
     GetCredential {
         service: String,
@@ -1036,7 +1036,7 @@ impl DaemonState {
         user_overlay: Option<String>,
         persist: bool,
         report_status: Option<RefreshStatus>,
-        reply: Option<mpsc::Sender<Result<RefreshReport, String>>>,
+        reply: Vec<mpsc::Sender<Result<RefreshReport, String>>>,
     ) {
         debug!(
             base_providers = base.len(),
@@ -1050,11 +1050,11 @@ impl DaemonState {
 
         if effective.is_empty() {
             // Never swap in an empty catalog: keep the current one and tell
-            // the requester (merge_overlay is infallible, so an empty result
-            // means the base itself was empty — a broken fetch).
+            // the requester(s) (merge_overlay is infallible, so an empty
+            // result means the base itself was empty — a broken fetch).
             error!("refusing to swap in an empty catalog; keeping the current one");
-            if let Some(reply) = reply {
-                let _ = reply.send(Err(
+            for tx in reply {
+                let _ = tx.send(Err(
                     "merged catalog is empty; keeping the current catalog".to_string()
                 ));
             }
@@ -1980,17 +1980,22 @@ fn merge_catalog_layers(
     effective
 }
 
-/// Route a `/refresh-models` reply once the swap has happened. The status
+/// Route `/refresh-models` replies once the swap has happened. The status
 /// defaults to `Updated` for background events that carry no explicit one.
+/// An empty `reply` Vec (background events) is a no-op; a coalesced burst
+/// fans the same report out to every requester.
 fn send_catalog_reply(
-    reply: Option<mpsc::Sender<Result<RefreshReport, String>>>,
+    reply: Vec<mpsc::Sender<Result<RefreshReport, String>>>,
     report_status: Option<RefreshStatus>,
     providers: usize,
     models: usize,
 ) {
-    if let Some(reply) = reply {
-        let status = report_status.unwrap_or(RefreshStatus::Updated);
-        let _ = reply.send(Ok(RefreshReport {
+    if reply.is_empty() {
+        return;
+    }
+    let status = report_status.unwrap_or(RefreshStatus::Updated);
+    for tx in reply {
+        let _ = tx.send(Ok(RefreshReport {
             providers,
             models,
             status,
@@ -4057,7 +4062,7 @@ mod tests {
             user_overlay: None,
             persist: false,
             report_status: Some(RefreshStatus::Updated),
-            reply: Some(reply),
+            reply: vec![reply],
         });
 
         // The catalog was swapped: the tiny provider is now visible.
@@ -4109,7 +4114,7 @@ context_window = 1024
             user_overlay: Some(overlay.to_string()),
             persist: false,
             report_status: None,
-            reply: None,
+            reply: Vec::new(),
         });
 
         let renamed = choreo_ai_protocols::lookup_provider("tiny-test").expect("tiny-test present");
@@ -4138,7 +4143,7 @@ context_window = 1024
             user_overlay: None,
             persist: false,
             report_status: Some(RefreshStatus::Updated),
-            reply: Some(reply),
+            reply: vec![reply],
         });
         let report = reply_rx.recv().unwrap().expect("refresh succeeds");
         assert!(report.providers > 1, "overlay-only providers must survive");

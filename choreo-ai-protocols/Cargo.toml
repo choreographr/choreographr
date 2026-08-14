@@ -20,6 +20,7 @@ name = "choreo_ai_protocols"
 # Atomic runtime swap of the process-wide provider catalog (see
 # `catalog/mod.rs`); previously a transitive dependency, promoted so the
 # ArcSwap global is a declared direct dependency.
+anyhow.workspace = true
 arc-swap = "1.9.2"
 choreo-proto.workspace = true
 crossbeam-channel.workspace = true
@@ -36,15 +37,26 @@ postcard.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Atomic artifact writes: temp file in the same dir → fsync → rename (see
+# `catalog/persist.rs`), used by `catalog-gen` for `catalog.bin` and the
+# gitignored snapshot cache.
+tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
+# Fmt-subscriber init for the `catalog-gen` binary (stdout stays a clean,
+# paste-able data contract; diagnostics go through tracing). Bins cannot use
+# dev-dependencies, so this lives in [dependencies].
+tracing-subscriber.workspace = true
 ureq.workspace = true
 zeroize.workspace = true
 
-# Generator binary: regenerates `catalog/catalog.bin` from the checked-in
-# `catalog/models.dev.json` snapshot + `catalog/models-overlay.toml`.
-# Re-runnable via `cargo run --bin catalog-gen` (see the bin's module docs).
+# Generator binary: regenerates `catalog/catalog.bin` from the local
+# `catalog/models.dev.json` snapshot (a gitignored, offline-cached fetch of
+# the models.dev API — `catalog-gen` fetches it when missing) + the bundled
+# `catalog/models-overlay.toml`. `catalog.bin` is the only committed catalog
+# data file. Re-runnable via `cargo run --bin catalog-gen` (see the bin's
+# module docs).
 [[bin]]
 name = "catalog-gen"
 path = "src/bin/catalog-gen.rs"

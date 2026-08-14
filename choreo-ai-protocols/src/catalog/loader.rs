@@ -5,7 +5,7 @@
 //! The artifact pipeline mirrors the data flow:
 //!
 //! ```text
-//! catalog/models.dev.json ──(catalog-gen: normalize_modelsdev)──► catalog/catalog.bin
+//! catalog/models.dev.json (local, gitignored) ──(catalog-gen: normalize_modelsdev)──► catalog/catalog.bin (committed)
 //!                                                                      │
 //!                                             include_bytes! (this file)▼
 //!                                    load_bundled_base() ──► ProviderEntry base
@@ -14,6 +14,10 @@
 //!                                             ▼
 //!                              merge_overlay() ──► load_catalog()
 //! ```
+//!
+//! `catalog/models.dev.json` is a **local artifact**: `catalog-gen` fetches a
+//! fresh snapshot from models.dev when it is missing and caches it there
+//! (gitignored), so `catalog.bin` is the only committed catalog data file.
 //!
 //! The overlay is merged at load time and never baked into `catalog.bin`, so
 //! S4 can re-merge the same base with a user overlay at runtime without
@@ -84,5 +88,30 @@ mod tests {
                 entry.slug
             );
         }
+    }
+
+    #[test]
+    fn embedded_blob_matches_local_snapshot() {
+        use crate::catalog::normalize_modelsdev;
+
+        // The committed `catalog.bin` must equal postcard(normalize(snapshot)).
+        // The snapshot (`catalog/models.dev.json`) is gitignored and absent in
+        // CI, so this test early-returns when it is missing — it guards
+        // developers who have the snapshot locally. The CI-appropriate guard
+        // is `cargo run --bin catalog-gen -- --check`, which rebuilds the
+        // comparison from a fresh fetch (or the local snapshot) without
+        // writing anything. This test deliberately does NOT touch the
+        // `PROVIDER_CATALOG` global, so it must not be serialized.
+        let snapshot_path = concat!(env!("CARGO_MANIFEST_DIR"), "/catalog/models.dev.json");
+        let Ok(snapshot) = std::fs::read_to_string(snapshot_path) else {
+            return;
+        };
+        let expected = postcard::to_allocvec(&normalize_modelsdev(&snapshot))
+            .expect("postcard serialization of the normalized snapshot succeeds");
+        assert_eq!(
+            expected,
+            include_bytes!("../../catalog/catalog.bin"),
+            "catalog.bin is stale: run `cargo run --bin catalog-gen`",
+        );
     }
 }

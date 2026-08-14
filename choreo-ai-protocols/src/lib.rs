@@ -51,7 +51,7 @@ pub use catalog::{
     RefreshOutcome, all_display_names, all_slugs, bundled_overlay_src, catalog_snapshot,
     fetch_modelsdev, load_bundled_base, lookup_context_window, lookup_provider, merge_overlay,
     model_reasoning_capability, model_reasoning_passback, model_request_format,
-    normalize_modelsdev, replace_catalog,
+    normalize_modelsdev, replace_catalog, write_file_atomic,
 };
 pub use context_window::ContextWindowConfig;
 pub use google::{GoogleClient, GoogleConfig};

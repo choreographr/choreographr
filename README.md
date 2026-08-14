@@ -527,10 +527,12 @@ retry_max_attempts = 3
 Supported providers: all entries in the provider catalog — 208 across three
 wire protocols (OpenAI-compatible, Anthropic Messages, Google Generative AI).
 The catalog is a two-layer pipeline in `choreo-ai-protocols/catalog/`: a
-pinned **models.dev snapshot** (`models.dev.json`, normalized by the
-`catalog-gen` binary into an embedded postcard blob `catalog.bin`) supplies
-provider/model *facts* (context windows, reasoning support and levels, the
-Responses-API flag), and a bundled **`models-overlay.toml`** policy layer
+**models.dev snapshot** (`models.dev.json`, a *local, gitignored* file that
+`catalog-gen` fetches from models.dev when absent, normalized into the
+embedded postcard blob `catalog.bin` — the only committed catalog data file)
+supplies provider/model *facts* (context windows, reasoning support and
+levels, the Responses-API flag), and a bundled **`models-overlay.toml`**
+policy layer
 supplies everything models.dev can't express — wire-protocol selection,
 endpoint policy, per-model passback exceptions, and the local/niche providers
 models.dev doesn't cover (ollama, kimi-code, custom-*, …). Highlights: OpenAI,
@@ -546,7 +548,7 @@ override any field per-account:
 the cache at `$XDG_DATA_HOME/choreographr/catalog.bin` (falling back to the
 embedded blob) and revalidates it against models.dev with an etag conditional
 GET on a background thread (304 → keep, 200 → normalize, swap, and persist the
-cache; every outcome arms the next revalidation 6 h out, so the cache stays
+cache; every outcome arms the next revalidation 24 h out, so the cache stays
 fresh). A **user overlay** at
 `$XDG_CONFIG_HOME/choreographr/models-overlay.toml` is merged on top of the
 bundled overlay with the same schema — provider scalars (`protocol`,
@@ -555,8 +557,9 @@ entries (`[provider.<slug>.models."<model>"]` with `context_window`,
 `reasoning_supported`, `reasoning_levels`, `responses`, `reasoning_passback`),
 plus wholesale provider definitions for anything models.dev doesn't list. The
 file is watched and reloads automatically on change (deleting it falls back to
-the bundled overlay); `/refresh-models [--force]` re-fetches the upstream
-catalog on demand.
+the bundled overlay; a failed watch is retried until the config dir exists);
+`/refresh-models [--force]` re-fetches the upstream catalog on demand and also
+re-reads the user overlay (a burst of requests is coalesced into one fetch).
 
 | Field | Description |
 |---|---|
@@ -601,7 +604,7 @@ In `choreo-tui`:
 - `/ping` — health check
 - `/models` — list and select models
 - `/model` — alias for `/models`
-- `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts.
+- `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts; a burst of `/refresh-models` requests is coalesced into a single fetch.
 - `/session` — show current session info
 - `/session list` — list all sessions
 - `/session new [title]` — create a new session

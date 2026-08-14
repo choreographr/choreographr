@@ -1,14 +1,16 @@
 //! Provider catalog — types, aggregation, and lookups.
 //!
 //! The catalog is a **two-layer pipeline**: a normalized snapshot of the
-//! models.dev API (`catalog/models.dev.json`, preprocessed by the `catalog-gen`
-//! binary into an embedded postcard blob `catalog/catalog.bin`) supplies the
-//! *facts* — provider slugs/names, base URLs, and per-model reasoning/context
-//! data — and the bundled `catalog/models-overlay.toml` policy layer
-//! (`include_str!`, merged at load time) supplies everything models.dev cannot
-//! express: wire-protocol selection, endpoint policy, per-model passback
-//! exceptions, and the providers models.dev does not cover. The merge
-//! entry points ([`normalize_modelsdev`], [`merge_overlay`], and
+//! models.dev API (a *local, gitignored* `catalog/models.dev.json` artifact —
+//! `catalog-gen` fetches a fresh copy from models.dev when it is missing and
+//! caches it there — preprocessed by the `catalog-gen` binary into an embedded
+//! postcard blob `catalog/catalog.bin`, the only committed catalog data file)
+//! supplies the *facts* — provider slugs/names, base URLs, and per-model
+//! reasoning/context data — and the bundled `catalog/models-overlay.toml`
+//! policy layer (`include_str!`, merged at load time) supplies everything
+//! models.dev cannot express: wire-protocol selection, endpoint policy,
+//! per-model passback exceptions, and the providers models.dev does not cover.
+//! The merge entry points ([`normalize_modelsdev`], [`merge_overlay`], and
 //! [`load_bundled_base`]) are the public seam S4 reuses for the runtime user
 //! overlay + cache.
 //!
@@ -35,11 +37,13 @@ use crate::shared::MaxTokensField;
 mod loader;
 mod modelsdev;
 mod overlay;
+mod persist;
 pub mod refresh;
 
 pub use loader::{bundled_overlay_src, load_bundled_base};
 pub use modelsdev::normalize_modelsdev;
 pub use overlay::merge_overlay;
+pub use persist::write_file_atomic;
 pub use refresh::{RefreshError, RefreshOutcome, fetch_modelsdev};
 
 /// How reasoning is replayed back to the provider on subsequent turns.
