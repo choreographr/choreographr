@@ -29,20 +29,36 @@ use tracing::{debug, warn};
 #[cfg(target_os = "linux")]
 use tracing::trace;
 
-/// Bounded wait used by the pipe-drain helpers: `poll(2)` in 100ms slices so a
-/// stop signal (sent once the direct child is reaped) is observed quickly.
-/// See `poll_readable` for why the drain must be bounded. Also the initial
-/// bound the Windows drains wait before the Job Object is terminated to force
-/// EOF on a wedged pipe (see `collect_capped_drain`).
+/// Bounded wait used by the Unix pipe-drain helpers: `poll(2)` in 100ms
+/// slices so a stop signal (sent once the direct child is reaped) is observed
+/// quickly. See `poll_readable` for why the drain must be bounded.
+#[cfg(unix)]
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Bound for joining a Windows drain thread AFTER the Job Object has been
-/// terminated to force EOF: terminating the job closes every descendant's
-/// pipe write-end, so a blocked read unblocks in microseconds. The grace
-/// exists for the essentially-unreachable case where termination fails — a
-/// wedged drain must not hang the tool indefinitely, so past this bound the
-/// handle is dropped and the thread detaches (see `collect_capped_drain`).
-const DRAIN_TERMINATE_JOIN_GRACE: Duration = Duration::from_secs(5);
+/// How long a drain is given to deliver its completion message after the
+/// direct child is reaped before the caller gives up on it. A healthy drain
+/// delivers in microseconds-to-milliseconds (EOF follows the child's exit);
+/// the bound exists only for the wedged case — a surviving grandchild that
+/// inherited a pipe write-end. Deliberately generous (1s, not the 100ms poll
+/// slice) so a drain that is merely slow to be scheduled — or still consuming
+/// a large buffered output — is never mistaken for wedged.
+///
+/// What happens past the bound is platform-specific (see `collect_capped_drain`
+/// / `collect_line_drains`): on Unix the handle is dropped to detach the
+/// thread; on Windows the Job Object is terminated to force EOF (killing the
+/// survivor — the only way to close the write-end a blocking read waits on),
+/// then [`DRAIN_DETACH_GRACE`] is given for delivery.
+const DRAIN_COMPLETION_GRACE: Duration = Duration::from_secs(1);
+
+/// Bound for joining a thread after it has been given every chance to finish:
+/// a Windows drain AFTER the Job Object was terminated to force EOF
+/// (terminating the job closes every descendant's pipe write-end, so a
+/// blocked read unblocks in microseconds; the grace covers the
+/// essentially-unreachable case where termination fails), or the stream
+/// merger after both drains have disconnected its merge channel (a stalled
+/// subscriber can keep it blocked in a send). Past the bound the handle is
+/// dropped to detach the thread rather than hang the tool.
+const DRAIN_DETACH_GRACE: Duration = Duration::from_secs(5);
 
 /// Check whether a binary with the given name exists somewhere in PATH.
 pub(crate) fn binary_exists(name: &str) -> bool {
@@ -384,26 +400,26 @@ impl ProcessIsAlive {
 }
 
 /// Collect a capped drain's buffer (Windows): bounded, channel-based wait.
-/// A drain still silent at [`DRAIN_POLL_INTERVAL`] is wedged on a pipe a
+/// A drain still silent at [`DRAIN_COMPLETION_GRACE`] is wedged on a pipe a
 /// surviving grandchild holds open — the Job Object is terminated to force
 /// EOF (killing the survivor: on Windows that is the only way to close the
 /// write-end a blocking read is waiting on; the direct child is always
 /// already reaped at this point, so only descendants are affected), then the
-/// drain is given [`DRAIN_TERMINATE_JOIN_GRACE`] to deliver. If it still
-/// does not (termination failed), the handle is dropped to detach the thread
-/// rather than hang the tool. `None` (never piped) returns `None`.
+/// drain is given [`DRAIN_DETACH_GRACE`] to deliver. If it still does not
+/// (termination failed), the handle is dropped to detach the thread rather
+/// than hang the tool. `None` (never piped) returns `None`.
 #[cfg(windows)]
 fn collect_capped_drain(
     thread: Option<(std::thread::JoinHandle<()>, mpsc::Receiver<Vec<u8>>)>,
     job: &ChildJob,
 ) -> Option<Vec<u8>> {
     let (handle, rx) = thread?;
-    let buf = match rx.recv_timeout(DRAIN_POLL_INTERVAL) {
+    let buf = match rx.recv_timeout(DRAIN_COMPLETION_GRACE) {
         Ok(buf) => buf,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             warn!("shell tool drain wedged past the child's exit; terminating job to force EOF");
             job.terminate();
-            match rx.recv_timeout(DRAIN_TERMINATE_JOIN_GRACE) {
+            match rx.recv_timeout(DRAIN_DETACH_GRACE) {
                 Ok(buf) => buf,
                 Err(_) => {
                     warn!("shell tool drain still blocked after job termination; detaching it");
@@ -422,13 +438,29 @@ fn collect_capped_drain(
 
 /// Collect a capped drain's buffer (Unix): the stop signal ends the drain at
 /// its next poll slice, so the completion message arrives promptly; the
-/// blocking `recv` (not a poll) waits for it and the handle is reaped.
+/// bounded `recv_timeout` waits for it and the handle is reaped. A drain
+/// still silent at `grace` is wedged on a pipe a surviving grandchild keeps
+/// producing — the stop signal is only checked when `poll` returns with no
+/// data, so a producer never lets the drain see it. There is no way to force
+/// EOF on Unix short of killing the survivor (which we have no handle to),
+/// so the handle is dropped to detach the thread — it exits on its own once
+/// the survivor does — rather than hang the tool.
 #[cfg(unix)]
 fn collect_capped_drain(
     thread: Option<(std::thread::JoinHandle<()>, mpsc::Receiver<Vec<u8>>)>,
+    grace: Duration,
 ) -> Option<Vec<u8>> {
     let (handle, rx) = thread?;
-    let buf = rx.recv().unwrap_or_default(); // Disconnected: drain panicked
+    let buf = match rx.recv_timeout(grace) {
+        Ok(buf) => buf,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            warn!("shell tool drain did not deliver within {grace:?}; detaching it");
+            drop(handle); // detach: the thread keeps draining until the survivor exits
+            return None;
+        }
+        // Disconnected: the drain panicked before delivering.
+        Err(_) => Vec::new(),
+    };
     let _ = handle.join();
     Some(buf)
 }
@@ -447,7 +479,7 @@ fn collect_line_drains(
         (stdout.0, stdout.1, "stdout"),
         (stderr.0, stderr.1, "stderr"),
     ] {
-        match rx.recv_timeout(DRAIN_POLL_INTERVAL) {
+        match rx.recv_timeout(DRAIN_COMPLETION_GRACE) {
             Ok(()) => {
                 let _ = handle.join();
             }
@@ -456,7 +488,7 @@ fn collect_line_drains(
                     "shell tool {name} line drain wedged past the child's exit; terminating job to force EOF"
                 );
                 job.terminate();
-                match rx.recv_timeout(DRAIN_TERMINATE_JOIN_GRACE) {
+                match rx.recv_timeout(DRAIN_DETACH_GRACE) {
                     Ok(()) => {
                         let _ = handle.join();
                     }
@@ -477,17 +509,36 @@ fn collect_line_drains(
 }
 
 /// Wait for both streaming line drains (Unix): the stop signal ends each
-/// drain at its next poll slice; the completion messages arrive promptly and
-/// the handles are reaped (blocking recv — no polling).
+/// drain at its next poll slice, so the completion messages arrive promptly;
+/// the bounded `recv_timeout` waits for them and the handles are reaped. A
+/// drain still silent at `grace` is wedged (see [`collect_capped_drain`]):
+/// its handle is dropped to detach it rather than hang the tool.
 #[cfg(unix)]
 fn collect_line_drains(
     stdout: (std::thread::JoinHandle<()>, mpsc::Receiver<()>),
     stderr: (std::thread::JoinHandle<()>, mpsc::Receiver<()>),
+    grace: Duration,
 ) {
-    let _ = stdout.1.recv();
-    let _ = stderr.1.recv();
-    let _ = stdout.0.join();
-    let _ = stderr.0.join();
+    for (handle, rx, name) in [
+        (stdout.0, stdout.1, "stdout"),
+        (stderr.0, stderr.1, "stderr"),
+    ] {
+        match rx.recv_timeout(grace) {
+            Ok(()) => {
+                let _ = handle.join();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                warn!(
+                    "shell tool {name} line drain did not deliver within {grace:?}; detaching it"
+                );
+                drop(handle);
+            }
+            // Disconnected: the drain panicked before delivering.
+            Err(_) => {
+                let _ = handle.join();
+            }
+        }
+    }
 }
 
 /// Collect the stream merger's accumulated body: a bounded, channel-based
@@ -500,15 +551,13 @@ fn collect_merger_body(
     handle: std::thread::JoinHandle<()>,
     rx: mpsc::Receiver<Vec<u8>>,
 ) -> Vec<u8> {
-    match rx.recv_timeout(DRAIN_TERMINATE_JOIN_GRACE) {
+    match rx.recv_timeout(DRAIN_DETACH_GRACE) {
         Ok(body) => {
             let _ = handle.join();
             body
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            warn!(
-                "stream merger did not finish within {DRAIN_TERMINATE_JOIN_GRACE:?}; detaching it"
-            );
+            warn!("stream merger did not finish within {DRAIN_DETACH_GRACE:?}; detaching it");
             drop(handle);
             Vec::new()
         }
@@ -530,9 +579,11 @@ fn collect_merger_body(
 /// the caller can report `was_killed`. Shared by the buffered and streaming
 /// spawn paths so their timeout semantics stay identical.
 ///
-/// `pid` is used only for the timeout log line; `pidfd` pins the child's
-/// identity for the kill (see `open_pidfd`) and is closed when the watchdog
-/// thread exits.
+/// `pid` is used only for the timeout log line; the kill itself is delegated
+/// to the `kill_tree` closure (killpg + pidfd on Unix, Job Object termination
+/// on Windows — see `kill_child_tree` / `ChildJob`), which reports whether a
+/// kill actually landed. On Unix the closure owns the pidfd, so it is closed
+/// when the watchdog thread exits.
 fn spawn_watchdog(
     timeout_ms: u64,
     pid: u32,
@@ -1046,9 +1097,9 @@ pub(crate) fn spawn_with_watchdog(
     // kills the survivor, because only the job termination can close its
     // write-end — see `collect_capped_drain`).
     #[cfg(unix)]
-    let stdout = collect_capped_drain(stdout_thread).unwrap_or_default();
+    let stdout = collect_capped_drain(stdout_thread, DRAIN_COMPLETION_GRACE).unwrap_or_default();
     #[cfg(unix)]
-    let stderr = collect_capped_drain(stderr_thread).unwrap_or_default();
+    let stderr = collect_capped_drain(stderr_thread, DRAIN_COMPLETION_GRACE).unwrap_or_default();
     #[cfg(windows)]
     let stdout = collect_capped_drain(stdout_thread, &job).unwrap_or_default();
     #[cfg(windows)]
@@ -1479,7 +1530,7 @@ pub fn spawn_with_streaming(
             {
                 let _ = out_stop_tx.send(());
                 let _ = err_stop_tx.send(());
-                collect_line_drains(stdout_thread, stderr_thread);
+                collect_line_drains(stdout_thread, stderr_thread, DRAIN_COMPLETION_GRACE);
             }
             #[cfg(windows)]
             {
@@ -1511,7 +1562,7 @@ pub fn spawn_with_streaming(
     // Job Object (killing the survivor and closing its write-end → EOF)
     // before waiting for delivery; the analogue of the Unix stop signals.
     #[cfg(unix)]
-    collect_line_drains(stdout_thread, stderr_thread);
+    collect_line_drains(stdout_thread, stderr_thread, DRAIN_COMPLETION_GRACE);
     #[cfg(windows)]
     collect_line_drains(stdout_thread, stderr_thread, &job);
     let body = collect_merger_body(merger_thread, merger_done_rx);
@@ -2109,5 +2160,51 @@ mod tests {
         );
         assert_eq!(errs, vec!["e1\n", "e2\n"], "stderr lines keep their order");
         assert_eq!(merged.len(), 5, "every line from both streams is merged");
+    }
+
+    #[test]
+    fn collect_capped_drain_detaches_when_drain_never_delivers() {
+        // A drain that never delivers (a surviving grandchild keeping the
+        // pipe producing past the completion grace) must not hang the caller:
+        // the wait is bounded, and past it the handle is dropped (the thread
+        // detaches and exits on its own once the survivor does). Deterministic
+        // — a zero grace fires the timeout immediately, no time passes.
+        let (done_tx, done_rx) = mpsc::channel::<Vec<u8>>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            // Hold the sender alive forever to simulate a wedged drain; the
+            // completion message is never sent. Block on the release channel
+            // so the test can let the (detached) thread exit cleanly.
+            let _done_tx = done_tx;
+            let _ = release_rx.recv();
+        });
+        let got = collect_capped_drain(Some((handle, done_rx)), Duration::ZERO);
+        assert!(
+            got.is_none(),
+            "a never-delivering drain must detach, not hang"
+        );
+        // Release the wedged drain so the detached thread exits promptly.
+        release_tx.send(()).expect("release wedged drain");
+    }
+
+    #[test]
+    fn collect_line_drains_detaches_when_drain_never_delivers() {
+        // Same wedged-drain contract as the buffered path: line drains that
+        // never deliver must be detached, not awaited forever.
+        let (done_tx1, done_rx1) = mpsc::channel::<()>();
+        let (rel1_tx, rel1_rx) = mpsc::channel::<()>();
+        let h1 = std::thread::spawn(move || {
+            let _done_tx1 = done_tx1;
+            let _ = rel1_rx.recv();
+        });
+        let (done_tx2, done_rx2) = mpsc::channel::<()>();
+        let (rel2_tx, rel2_rx) = mpsc::channel::<()>();
+        let h2 = std::thread::spawn(move || {
+            let _done_tx2 = done_tx2;
+            let _ = rel2_rx.recv();
+        });
+        collect_line_drains((h1, done_rx1), (h2, done_rx2), Duration::ZERO);
+        rel1_tx.send(()).expect("release stdout drain");
+        rel2_tx.send(()).expect("release stderr drain");
     }
 }

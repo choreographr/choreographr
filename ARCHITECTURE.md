@@ -593,7 +593,7 @@ synchronous `execute_*` entry points (which `block_on` internally).
 | `tools/pdf/` | Native PDF ingestion tools (`pdf_classify`, `pdf_to_markdown`), one file per tool (`classify.rs`, `markdown.rs`) with shared input-gating / output-hygiene helpers in `pdf/mod.rs` and the shared PDF fixture builders in `pdf/test_fixtures.rs`. |
 | `tools/glob_util.rs` | `GlobFilter` — shared glob-matching utility used by `delete_files` and `grep` that follows gitignore conventions (patterns without `/` match basename, patterns with `/` match full path). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`ChoreographrSyscall`) for tool dispatch. |
-| `tools/shell_util.rs` | Shared child-process spawning for the shell/exec tools (`spawn_with_watchdog` / `spawn_with_streaming`): env sanitization, output caps, the timeout watchdog, and process-tree isolation — process-group + pidfd kill on Unix, a Windows Job Object (`ChildJob`) with blocking reads bounded by job termination on Windows. All waits are channel-driven (`recv_timeout` on the watchdog and on every drain's completion channel — no polling); the `Arc<ChildJob>` shared by the watchdog and drain threads is the fifth sanctioned shared-state exception (AGENTS.md). |
+| `tools/shell_util.rs` | Shared child-process spawning for the shell/exec tools (`spawn_with_watchdog` / `spawn_with_streaming`): env sanitization, output caps, the timeout watchdog, and process-tree isolation — process-group + pidfd kill on Unix, a Windows Job Object (`ChildJob`) with blocking reads bounded by job termination on Windows. All waits are channel-driven (`recv_timeout` on the watchdog and on every drain's completion channel — no polling), each bounded by a completion grace that detaches a wedged drain rather than hanging the tool; the `Arc<ChildJob>` shared by the watchdog and drain threads is the fifth sanctioned shared-state exception (AGENTS.md). |
 | `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json`, spawns subprocesses via `McpClient`, wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) and registers them in the `ToolRegistry` under a `mcp/<slug>` group. |
 
 ### Provider Architecture
@@ -2875,7 +2875,11 @@ surviving grandchild that holds a pipe write end (a backgrounded
 thread blocked in `read(2)` past the timeout even though the direct child is
 already gone. Every drain delivers its buffer (or a completion message) over
 a channel, so the spawn helpers wait with `recv_timeout` — the same
-channel-driven pattern as the watchdog — never by polling `is_finished`.
+channel-driven pattern as the watchdog — never by polling `is_finished`, and
+every wait is bounded by a completion grace: a drain that misses it is
+detached rather than hung (on Unix the handle is dropped and the thread exits
+on its own once the survivor does — there is no way to force EOF without
+killing the survivor, which we have no handle to).
 
 On Windows the same helpers swap in the platform analogues: `setup_child`
 has no process group to create, so the child is instead assigned to a Job
@@ -2883,7 +2887,7 @@ Object (`ChildJob`, created right after spawn — `Command` has no pre-exec
 hook — with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` making the handle a
 whole-tree kill switch). The pipes are drained with blocking reads
 (`drain_reader`), which have no `poll(2)`/stop signal to interrupt; a drain
-still silent at the 100ms deadline is wedged on a pipe a surviving
+still silent at the 1s completion grace is wedged on a pipe a surviving
 grandchild holds open, so the caller terminates the job to force EOF
 (killing the survivor — the only way to close the write-end a blocking read
 waits on) before waiting for delivery, bounded by a 5s grace after which the
