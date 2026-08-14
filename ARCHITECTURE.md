@@ -479,8 +479,11 @@ loop) owns the whole runtime pipeline but never mutates the catalog. It is
 are (a) the daemon command loop (`/refresh-models` requests, sent as
 `MaintenanceEvent::RefreshNow`) and (b) the `notify` filesystem watcher's
 callback (raw config-directory events, forwarded as
-`MaintenanceEvent::OverlayFsEvent`). The thread's `recv_timeout` doubles as the
-retry timer for failed / 304 refreshes (6 h, configurable constant). The notify
+`MaintenanceEvent::OverlayFsEvent`). The thread's `recv_timeout` doubles as
+the revalidation cadence (6 h, configurable constant): after every refresh
+outcome — a successful fetch, a 304, or a failure — the next conditional GET
+is armed, so the cache keeps a steady freshness cycle and a failure never
+spins. The notify
 callback is deliberately trivial — it only forwards events; all policy
 (basename filter, re-read, fingerprint compare) lives on the maintenance
 thread. On startup the thread loads the base (cache file → embedded
@@ -729,8 +732,10 @@ models.dev:
   etag; models.dev serves `ETag` + `must-revalidate`). 200 → normalize →
   validate non-empty → hand the new base to the daemon command loop, which
   merges overlays, atomically swaps the catalog (`replace_catalog`), persists
-  the cache, and broadcasts `CatalogUpdated`. 304 / error → log and retry
-  later (the thread's channel `recv_timeout` is the retry timer). The fetch
+  the cache, and broadcasts `CatalogUpdated`. Any outcome (200, 304, or
+  error) arms the next revalidation 6 h out, so the cache stays fresh on a
+  steady cadence and a failure never spins (the thread's channel
+  `recv_timeout` is the timer). The fetch
   helper (`choreo-ai-protocols` `catalog::refresh::fetch_modelsdev`) owns ureq
   + normalization; the daemon command loop never does HTTP.
 - **User overlay.** `$XDG_CONFIG_HOME/choreographr/models-overlay.toml`, the

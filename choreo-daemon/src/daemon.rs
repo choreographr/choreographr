@@ -993,11 +993,19 @@ impl DaemonState {
                     force,
                     "RefreshModels: handing fetch to the maintenance thread"
                 );
+                // Clone the reply: on a dead thread the request must still
+                // get a structured error (a dropped channel would leave the
+                // client's connection thread blocked forever with no reply).
                 if tx
-                    .send(MaintenanceEvent::RefreshNow { force, reply })
+                    .send(MaintenanceEvent::RefreshNow {
+                        force,
+                        reply: reply.clone(),
+                    })
                     .is_err()
                 {
-                    warn!("RefreshModels: maintenance thread is gone");
+                    warn!("RefreshModels: maintenance thread is gone; replying with an error");
+                    let _ =
+                        reply.send(Err("catalog maintenance thread is not running".to_string()));
                 }
             }
             None => {
@@ -1018,8 +1026,9 @@ impl DaemonState {
     /// non-empty before the swap (a hostile/typo'd overlay must never leave
     /// the daemon with an empty catalog). On a live fetch the cache bin +
     /// etag sidecar are persisted atomically. Every swap broadcasts
-    /// `CatalogUpdated` so clients can refresh their provider pickers.
-    #[allow(clippy::too_many_arguments)]
+    /// `CatalogUpdated` so clients can refresh their provider pickers. The
+    /// work is split into small steps (merge → validate → swap → persist →
+    /// broadcast → reply) so each stage stays readable and unit-testable.
     fn handle_catalog_base_changed(
         &mut self,
         base: Vec<choreo_ai_protocols::ProviderEntry>,
@@ -1037,10 +1046,7 @@ impl DaemonState {
         );
 
         // Lowest → highest: base → bundled overlay → user overlay.
-        let mut effective = merge_overlay(&base, bundled_overlay_src());
-        if let Some(overlay) = &user_overlay {
-            effective = merge_overlay(&effective, overlay);
-        }
+        let effective = merge_catalog_layers(&base, user_overlay.as_deref());
 
         if effective.is_empty() {
             // Never swap in an empty catalog: keep the current one and tell
@@ -1057,20 +1063,7 @@ impl DaemonState {
 
         // Single-writer point: the atomic swap. Readers are lock-free.
         replace_catalog(effective.clone());
-
-        if persist
-            && let Err(e) = crate::catalog::write_catalog_cache(
-                &base,
-                etag.as_deref(),
-                &self.catalog_paths.bin,
-                &self.catalog_paths.etag,
-            )
-        {
-            warn!(
-                error = %e,
-                "failed to persist the catalog cache; the next refresh will re-fetch",
-            );
-        }
+        self.persist_catalog_cache(&base, etag.as_deref(), persist);
 
         // Broadcast the new provider list to all activity subscribers so the
         // TUI's provider picker tracks the live catalog.
@@ -1079,14 +1072,33 @@ impl DaemonState {
 
         let models: usize = effective.iter().map(|e| e.models.len()).sum();
         info!(providers = effective.len(), models, "catalog updated",);
+        send_catalog_reply(reply, report_status, effective.len(), models);
+    }
 
-        if let Some(reply) = reply {
-            let status = report_status.unwrap_or(RefreshStatus::Updated);
-            let _ = reply.send(Ok(RefreshReport {
-                providers: effective.len(),
-                models,
-                status,
-            }));
+    /// Persist the cache bin + etag sidecar after a live fetch. Startup
+    /// loads (`persist: false`) are already on disk — a cache-sourced base
+    /// needs no rewrite, and a cache-miss will be persisted on the first
+    /// fetch — so only live fetches write. Failures are logged, never fatal:
+    /// the next refresh re-fetches and tries again.
+    fn persist_catalog_cache(
+        &self,
+        base: &[choreo_ai_protocols::ProviderEntry],
+        etag: Option<&str>,
+        persist: bool,
+    ) {
+        if !persist {
+            return;
+        }
+        if let Err(e) = crate::catalog::write_catalog_cache(
+            base,
+            etag,
+            &self.catalog_paths.bin,
+            &self.catalog_paths.etag,
+        ) {
+            warn!(
+                error = %e,
+                "failed to persist the catalog cache; the next refresh will re-fetch",
+            );
         }
     }
 
@@ -1951,6 +1963,39 @@ fn catalog_provider_pairs() -> Vec<CatalogProvider> {
             display_name: e.display_name.clone(),
         })
         .collect()
+}
+
+/// Merge the layered catalog: normalized models.dev base → bundled overlay →
+/// user overlay (lowest → highest wins, matching `merge_overlay` semantics).
+/// Extracted so `handle_catalog_base_changed` reads as a straight-line
+/// pipeline and the layer order is pinned in one place.
+fn merge_catalog_layers(
+    base: &[choreo_ai_protocols::ProviderEntry],
+    user_overlay: Option<&str>,
+) -> Vec<choreo_ai_protocols::ProviderEntry> {
+    let mut effective = merge_overlay(base, bundled_overlay_src());
+    if let Some(overlay) = user_overlay {
+        effective = merge_overlay(&effective, overlay);
+    }
+    effective
+}
+
+/// Route a `/refresh-models` reply once the swap has happened. The status
+/// defaults to `Updated` for background events that carry no explicit one.
+fn send_catalog_reply(
+    reply: Option<mpsc::Sender<Result<RefreshReport, String>>>,
+    report_status: Option<RefreshStatus>,
+    providers: usize,
+    models: usize,
+) {
+    if let Some(reply) = reply {
+        let status = report_status.unwrap_or(RefreshStatus::Updated);
+        let _ = reply.send(Ok(RefreshReport {
+            providers,
+            models,
+            status,
+        }));
+    }
 }
 
 fn handle_list_models_inner(
@@ -3945,6 +3990,31 @@ mod tests {
         });
         let result = rx.recv().unwrap();
         assert!(result.is_err(), "no maintenance thread → error reply");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("maintenance thread"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(catalog)]
+    fn refresh_models_with_dead_maintenance_thread_replies_error() {
+        // A maintenance sender whose receiver is gone (the thread panicked)
+        // must STILL produce a structured error reply: the client's
+        // connection thread blocks in request_daemon until it hears
+        // something, so dropping the reply silently would hang it forever.
+        let (mut state, _rx) = make_daemon_state();
+        let (maintenance_tx, maintenance_rx) = crossbeam_channel::unbounded::<MaintenanceEvent>();
+        drop(maintenance_rx); // the maintenance thread is dead
+        state.maintenance_tx = Some(maintenance_tx);
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::RefreshModels {
+            force: false,
+            reply,
+        });
+        let result = rx.recv().unwrap();
+        assert!(result.is_err(), "dead maintenance thread → error reply");
         let err = result.unwrap_err();
         assert!(
             err.contains("maintenance thread"),

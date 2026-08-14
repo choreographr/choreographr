@@ -144,14 +144,21 @@ fn should_send_if_none_match(etag: Option<&str>) -> bool {
 }
 
 /// Read the full response body into a `String`, bounded by [`MAX_BODY_BYTES`].
+///
+/// The reader is capped at `MAX_BODY_BYTES + 1` so an exactly-at-cap body is
+/// accepted: with a cap of exactly `MAX_BODY_BYTES`, a body of exactly that
+/// size would be indistinguishable from one that was truncated at the cap, and
+/// a legitimately-sized catalog would be refused. Only a body that actually
+/// exceeds the cap trips the check (`len > MAX_BODY_BYTES`).
 fn read_body(response: ureq::http::Response<ureq::Body>) -> Result<String, RefreshError> {
     let mut bytes = Vec::with_capacity(256 * 1024);
-    let mut reader = response.into_body().into_reader().take(MAX_BODY_BYTES);
+    // Read up to MAX+1 bytes: a body at or under the cap fits; anything over
+    // it leaves a byte behind, which is how the truncation is detected.
+    let mut reader = response.into_body().into_reader().take(MAX_BODY_BYTES + 1);
     reader.read_to_end(&mut bytes)?;
-    if bytes.len() as u64 >= MAX_BODY_BYTES {
-        // The take() cap was hit (or exactly reached): the body is
-        // pathological — refuse it rather than feed a truncated catalog into
-        // normalization.
+    if bytes.len() as u64 > MAX_BODY_BYTES {
+        // The cap was exceeded: the body is pathological — refuse it rather
+        // than feed a truncated catalog into normalization.
         return Err(RefreshError::BodyTooLarge);
     }
     String::from_utf8(bytes).map_err(|_| RefreshError::InvalidUtf8)

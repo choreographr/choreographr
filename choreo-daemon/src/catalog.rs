@@ -12,8 +12,10 @@
 //! channel-based: the daemon hands `/refresh-models` requests to this thread
 //! over a channel (never the command loop doing HTTP), and the notify
 //! callback forwards filesystem events over the same channel. The thread
-//! sleeps on its channel with a timeout, which doubles as the retry timer for
-//! failed / 304 refreshes — no busy loops.
+//! sleeps on its channel with a timeout, which doubles as the revalidation
+//! cadence — the next conditional GET (after a successful fetch, a 304, or a
+//! failure) fires when the timeout elapses — so the cache stays fresh with
+//! no busy loops.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -21,7 +23,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use choreo_ai_protocols::{
-    ProviderEntry, RefreshOutcome, fetch_modelsdev, load_bundled_base, normalize_modelsdev,
+    ProviderEntry, RefreshError, RefreshOutcome, fetch_modelsdev, load_bundled_base,
+    normalize_modelsdev,
 };
 use choreo_proto::RefreshStatus;
 use crossbeam_channel::{Receiver, Sender};
@@ -30,12 +33,13 @@ use tracing::{debug, info, warn};
 
 use crate::daemon::DaemonCommand;
 
-/// Retry interval after a failed or 304 refresh. The maintenance thread waits
-/// on its channel with this as the recv timeout, so a failure never spins —
-/// it just waits for the next trigger (a `/refresh-models` request, an
-/// overlay event, or this interval). models.dev changes infrequently; the
-/// conditional GET is cheap (a 304 round trip), so a 6-hour revalidation is
-/// plenty to keep the cache fresh, and `/refresh-models` bypasses it anytime.
+/// Revalidation cadence after a refresh (successful fetch, 304, or failure).
+/// The maintenance thread waits on its channel with this as the recv timeout,
+/// so the catalog never goes stale and a failure never spins — it just waits
+/// for the next trigger (a `/refresh-models` request, an overlay event, or
+/// this interval). models.dev changes infrequently; the conditional GET is
+/// cheap (a 304 round trip), so a 6-hour revalidation is plenty to keep the
+/// cache fresh, and `/refresh-models` bypasses it anytime.
 const RETRY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Postcard cache filename under the data dir.
@@ -219,6 +223,23 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
+    // Best-effort directory fsync so the rename itself is durable: POSIX
+    // rename durability requires syncing the parent directory, not just the
+    // file. Some platforms/filesystems refuse to fsync a directory handle
+    // (EINVAL) — a failure here only weakens crash durability, never
+    // correctness, so it is logged rather than propagated.
+    if let Some(dir) = path.parent() {
+        match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::debug!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to fsync the catalog directory after rename",
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -388,19 +409,43 @@ fn maintenance_loop(
 /// Perform one models.dev refresh on the maintenance thread.
 ///
 /// * `NotModified` → log + reply `UpToDate` (with the current catalog's
-///   counts) + schedule a revalidation.
+///   counts) + schedule the next revalidation.
 /// * `Fetched` → normalize, validate non-empty, then hand the new base to the
 ///   daemon command loop ([`DaemonCommand::CatalogBaseChanged`] with
 ///   `persist: true`), which swaps the catalog, writes the cache, broadcasts
 ///   `CatalogUpdated`, and replies to the requester.
 /// * `Err` → log + reply the error + schedule a retry.
+///
+/// Every outcome arms `next_retry_at` (the recv-timeout cadence), so the
+/// catalog revalidates on a fixed schedule no matter what the last fetch did.
 fn run_refresh(
     daemon_tx: &mpsc::Sender<DaemonCommand>,
     state: &mut MaintenanceState,
     force: bool,
     reply: Option<mpsc::Sender<Result<RefreshReport, String>>>,
 ) {
-    match fetch_modelsdev(state.etag.as_deref(), force) {
+    // The fetch is injected so the outcome→state machine is unit-testable
+    // without a network round trip; production always uses the real ureq GET.
+    run_refresh_impl(daemon_tx, state, force, reply, |etag, force| {
+        fetch_modelsdev(etag, force)
+    });
+}
+
+/// The refresh state machine behind [`run_refresh`], with the models.dev fetch
+/// abstracted out. Every branch arms `next_retry_at` so the catalog keeps a
+/// steady revalidation cadence; the daemon command loop receives a
+/// `CatalogBaseChanged` (the single-writer swap) only when a new base was
+/// actually fetched.
+fn run_refresh_impl<F>(
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    state: &mut MaintenanceState,
+    force: bool,
+    reply: Option<mpsc::Sender<Result<RefreshReport, String>>>,
+    fetch: F,
+) where
+    F: FnOnce(Option<&str>, bool) -> Result<RefreshOutcome, RefreshError>,
+{
+    match fetch(state.etag.as_deref(), force) {
         Ok(RefreshOutcome::NotModified) => {
             info!(
                 force,
@@ -444,7 +489,11 @@ fn run_refresh(
             );
             state.base = new_base;
             state.etag = etag;
-            state.next_retry_at = None;
+            // Even a successful fetch arms the next revalidation: without
+            // this the catalog would go permanently stale after the first 200
+            // (the event loop only refreshes when next_retry_at is set), and
+            // the etag makes the next conditional GET cheap.
+            state.next_retry_at = Some(Instant::now() + RETRY_INTERVAL);
             let report_status = if force {
                 RefreshStatus::Forced
             } else {
@@ -729,6 +778,184 @@ mod tests {
             report_status: Some(RefreshStatus::Forced),
             reply: None,
         };
+    }
+
+    // ── run_refresh_impl (the refresh state machine, fetcher injected) ──
+
+    /// A minimal models.dev snapshot that normalizes to exactly one provider
+    /// — the payload for the injected `Fetched` branch.
+    const SNAPSHOT_JSON: &str = r#"{
+        "acme": {
+            "name": "Acme",
+            "npm": "@ai-sdk/openai-compatible",
+            "models": {
+                "acme-1": {"reasoning": false, "limit": {"context": 8192}}
+            }
+        }
+    }"#;
+
+    /// A starting maintenance state for the state-machine tests: a small
+    /// base, a cached etag, no revalidation pending.
+    fn maintenance_state() -> MaintenanceState {
+        MaintenanceState {
+            base: tiny_base(),
+            etag: Some("\"v1\"".into()),
+            last_applied_user_overlay: None,
+            next_retry_at: None,
+        }
+    }
+
+    #[test]
+    fn run_refresh_fetched_arms_revalidation_and_sends_base_changed() {
+        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let mut state = maintenance_state();
+        let (reply_tx, _reply_rx) = mpsc::channel();
+
+        run_refresh_impl(
+            &daemon_tx,
+            &mut state,
+            false,
+            Some(reply_tx),
+            |_etag, _force| {
+                Ok(RefreshOutcome::Fetched {
+                    json: SNAPSHOT_JSON.into(),
+                    etag: Some("\"v2\"".into()),
+                })
+            },
+        );
+
+        // The new base + etag were adopted and the NEXT revalidation is
+        // armed — a successful fetch must not stop the cadence (that would
+        // leave the catalog permanently stale after the first 200).
+        assert_eq!(state.etag.as_deref(), Some("\"v2\""));
+        assert_eq!(state.base.len(), 1, "snapshot normalizes to one provider");
+        assert!(
+            state.next_retry_at.is_some(),
+            "a successful fetch must schedule the next revalidation"
+        );
+
+        // The daemon loop gets the swap command with persist + status set.
+        match daemon_rx.recv().unwrap() {
+            DaemonCommand::CatalogBaseChanged {
+                persist,
+                report_status,
+                reply,
+                ..
+            } => {
+                assert!(persist, "a live fetch must persist the cache");
+                assert_eq!(report_status, Some(RefreshStatus::Updated));
+                assert!(
+                    reply.is_some(),
+                    "the /refresh-models reply must be routed through the command"
+                );
+            }
+            other => panic!(
+                "expected CatalogBaseChanged, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn run_refresh_forced_fetch_reports_forced() {
+        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let mut state = maintenance_state();
+
+        run_refresh_impl(&daemon_tx, &mut state, true, None, |_etag, _force| {
+            Ok(RefreshOutcome::Fetched {
+                json: SNAPSHOT_JSON.into(),
+                etag: Some("\"v3\"".into()),
+            })
+        });
+
+        match daemon_rx.recv().unwrap() {
+            DaemonCommand::CatalogBaseChanged { report_status, .. } => {
+                assert_eq!(report_status, Some(RefreshStatus::Forced))
+            }
+            other => panic!(
+                "expected CatalogBaseChanged, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn run_refresh_not_modified_replies_up_to_date_and_revalidates() {
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let mut state = maintenance_state();
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        run_refresh_impl(
+            &daemon_tx,
+            &mut state,
+            false,
+            Some(reply_tx),
+            |etag, force| {
+                // The injected fetcher must see the cached etag and no force.
+                assert_eq!(etag, Some("\"v1\""));
+                assert!(!force);
+                Ok(RefreshOutcome::NotModified)
+            },
+        );
+
+        let report = reply_rx.recv().unwrap().expect("reply is Ok");
+        assert_eq!(report.status, RefreshStatus::UpToDate);
+        assert!(
+            state.next_retry_at.is_some(),
+            "a 304 must schedule the next revalidation"
+        );
+    }
+
+    #[test]
+    fn run_refresh_error_replies_and_schedules_retry() {
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let mut state = maintenance_state();
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        run_refresh_impl(
+            &daemon_tx,
+            &mut state,
+            false,
+            Some(reply_tx),
+            |_etag, _force| Err(choreo_ai_protocols::RefreshError::Network("boom".into())),
+        );
+
+        let err = reply_rx.recv().unwrap().expect_err("reply is Err");
+        assert!(err.contains("boom"), "unexpected error: {err}");
+        assert!(
+            state.next_retry_at.is_some(),
+            "a failure must schedule a retry"
+        );
+    }
+
+    #[test]
+    fn run_refresh_empty_normalization_keeps_current_catalog() {
+        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let mut state = maintenance_state();
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        run_refresh_impl(
+            &daemon_tx,
+            &mut state,
+            false,
+            Some(reply_tx),
+            |_etag, _force| {
+                Ok(RefreshOutcome::Fetched {
+                    json: "not json at all".into(),
+                    etag: Some("\"v4\"".into()),
+                })
+            },
+        );
+
+        // No swap command is sent (the current catalog stays) and the
+        // requester gets a structured error, but the retry cadence is armed.
+        assert!(
+            daemon_rx.try_recv().is_err(),
+            "no swap for an empty normalize"
+        );
+        let err = reply_rx.recv().unwrap().expect_err("reply is Err");
+        assert!(err.contains("non-empty"), "unexpected error: {err}");
+        assert!(state.next_retry_at.is_some());
     }
 
     #[test]

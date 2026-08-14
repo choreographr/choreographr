@@ -23,7 +23,11 @@ use std::path::PathBuf;
 fn main() {
     // `CARGO_MANIFEST_DIR` is set by cargo for every build (including the
     // generator run), so the paths below always resolve to the crate root.
-    let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+    // Refuse to guess when it is missing rather than silently resolving the
+    // data paths against whatever the CWD happens to be.
+    let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| {
+        fatal("CARGO_MANIFEST_DIR is not set; run via `cargo run --bin catalog-gen`")
+    }));
     let catalog_dir = crate_dir.join("catalog");
 
     let snapshot_path = catalog_dir.join("models.dev.json");

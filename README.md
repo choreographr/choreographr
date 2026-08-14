@@ -546,7 +546,8 @@ override any field per-account:
 the cache at `$XDG_DATA_HOME/choreographr/catalog.bin` (falling back to the
 embedded blob) and revalidates it against models.dev with an etag conditional
 GET on a background thread (304 → keep, 200 → normalize, swap, and persist the
-cache). A **user overlay** at
+cache; every outcome arms the next revalidation 6 h out, so the cache stays
+fresh). A **user overlay** at
 `$XDG_CONFIG_HOME/choreographr/models-overlay.toml` is merged on top of the
 bundled overlay with the same schema — provider scalars (`protocol`,
 `base_url`, `max_tokens_field`, `default_model`, `display_name`) and per-model
