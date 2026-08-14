@@ -5,11 +5,14 @@ use choreo_proto::{
 };
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 /// Per-subscriber channel capacity for session message broadcast.
 /// Limits how many messages the session thread can enqueue before the

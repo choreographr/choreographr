@@ -23,3 +23,4 @@ ureq.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ammonia.workspace = true
+uds_windows.workspace = true

@@ -203,6 +203,11 @@ clap = { version = "4.6", features = ["derive"] }
 crossbeam-channel = "0.5"
 snow = "0.10"
 url = "2"
+# Windows Unix domain sockets (std::os::windows::net::UnixStream is still
+# unstable — `windows_unix_domain_sockets`, E0658, rust-lang/rust#150487).
+# uds_windows provides the same bind/connect/try_clone/shutdown API over named
+# pipes; used cfg(windows) only, never on Unix.
+uds_windows = "1.2.1"
 humfmt = "0.6.0"
 hex = "0.4"
 nix = "0.31.3"

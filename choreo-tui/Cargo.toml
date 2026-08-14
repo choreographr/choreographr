@@ -38,6 +38,12 @@ crossbeam = "0.8"
 mio = { version = "1.2", features = ["os-ext"] }
 tui-prompts = "0.6"
 humfmt.workspace = true
+
+# `nix` is a Unix-only crate: it does not compile on Windows at all (no
+# POSIX signals/fds there), so it is gated behind cfg(unix) rather than being
+# a universal dependency. `mio` stays universal — it is cross-platform and
+# its `mio::unix` module is cfg-gated internally.
+[target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "fs"] }
 
 [dev-dependencies]

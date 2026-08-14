@@ -4,11 +4,17 @@ use choreo_transport::error::TransportError;
 use choreo_transport::handshake::handshake_initiator;
 use choreo_transport::key::ensure_transport_keypair;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+// Windows: std::os::windows::net::UnixStream is unstable (E0658, feature
+// `windows_unix_domain_sockets`, rust-lang/rust#150487), so uds_windows provides
+// the same connect/try_clone/shutdown API over named pipes.
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 /// Read DaemonMessages from `reader` in a blocking loop, calling
 /// `handle_daemon_message` for each successfully decoded message.

@@ -20,13 +20,21 @@ use crossterm::event::{
     KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+#[cfg(unix)]
 use mio::unix::pipe;
+#[cfg(unix)]
 use mio::{Events, Interest, Poll, Token};
+#[cfg(unix)]
 use nix::fcntl::{F_SETFD, F_SETFL, FdFlag, OFlag, fcntl};
+#[cfg(unix)]
 use nix::sys::signal::{Signal, raise};
 use ratatui::{Terminal, backend::CrosstermBackend};
+#[cfg(unix)]
 use signal_hook::low_level::pipe as signal_pipe;
-use std::io::{self, Read};
+use std::io;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::{thread, time::Duration};
 use tui_prompts::State;
@@ -74,7 +82,12 @@ const UI_EVENT_QUEUE_HIGH_WATER_MARK: usize = 16_384;
 
 /// Commands sent from the terminal-event thread to the main loop for
 /// coordinating terminal state around suspend/resume cycles.
+///
+/// On Windows the variants are never constructed (there is no job-control
+/// suspend and no SIGCONT/SIGTSTP), but the type is still referenced by
+/// `run_ui_loop`'s `select!` arm, so the dead-code lint is suppressed there.
 #[derive(Debug)]
+#[cfg_attr(windows, allow(dead_code))]
 enum ResumeCommand {
     /// SIGCONT was received — re-initialise raw mode, alternate screen,
     /// and mouse capture after the terminal pty state was reset.
@@ -86,6 +99,7 @@ enum ResumeCommand {
 
 /// Convert a raw signal number to the corresponding `ResumeCommand`.
 /// Returns `None` for uninteresting signals (including invalid numbers).
+#[cfg(unix)]
 fn signal_to_resume_command(signo: i32) -> Option<ResumeCommand> {
     match Signal::try_from(signo) {
         Ok(Signal::SIGCONT) => Some(ResumeCommand::ReinitTerminal),
@@ -142,14 +156,23 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // O_NONBLOCK ensures the read-end drain loop never blocks (the pipe is
     // drained inside the Token(2) handler).  O_CLOEXEC prevents the pipe fds
     // from leaking to child processes on fork+exec.
+    #[cfg(unix)]
     let (signal_rx, signal_tx) = nix::unistd::pipe()?;
+    #[cfg(unix)]
     fcntl(&signal_rx, F_SETFD(FdFlag::FD_CLOEXEC))?;
+    #[cfg(unix)]
     fcntl(&signal_rx, F_SETFL(OFlag::O_NONBLOCK))?;
+    #[cfg(unix)]
     fcntl(&signal_tx, F_SETFD(FdFlag::FD_CLOEXEC))?;
+    #[cfg(unix)]
     signal_pipe::register(Signal::SIGCONT as i32, signal_tx.try_clone()?)?;
+    #[cfg(unix)]
     signal_pipe::register(Signal::SIGWINCH as i32, signal_tx.try_clone()?)?;
+    #[cfg(unix)]
     signal_pipe::register(Signal::SIGTSTP as i32, signal_tx)?;
+    #[cfg(unix)]
     let mut signal_rx_file: std::fs::File = signal_rx.into();
+    #[cfg(unix)]
     let signal_rx_fd = signal_rx_file.as_raw_fd();
 
     let connection_ui_tx = ui_tx.clone();
@@ -233,115 +256,175 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // forwards them through a crossbeam channel so the main loop can block on
     // all event sources simultaneously via select!.
     //
-    // The thread uses mio::Poll to wait on THREE sources:
+    // On Unix the thread uses mio::Poll to wait on THREE sources:
     //   1. stdin (fd 0) — for crossterm events (keyboard, mouse, resize)
     //   2. a notification pipe — for clean shutdown signalling
     //   3. a signal pipe — for SIGCONT/SIGTSTP (suspend/resume)
     //
     // This is truly event-driven: the thread parks in poll with no
-    // timeout and zero CPU usage while idle.
+    // timeout and zero CPU usage while idle.  On Windows there are no
+    // signals to catch (crossterm reports resizes natively from console
+    // events and there is no job-control suspend), so the thread instead
+    // polls crossterm with a short timeout and watches the shutdown notify
+    // between polls.
     let (terminal_tx, terminal_rx) = channel::unbounded::<Event>();
+    // Shutdown notify: on Unix it is a mio pipe pair whose read end the
+    // thread parks on in poll; on Windows it is a crossbeam channel.
+    // Dropping the sender signals shutdown on both — the receiver observes
+    // a Disconnected error.
+    #[cfg(unix)]
     let (notify_tx, mut notify_rx) = pipe::new()?;
+    #[cfg(windows)]
+    let (notify_tx, notify_rx) = channel::unbounded::<()>();
     let (resume_tx, resume_rx) = channel::unbounded::<ResumeCommand>();
+    // On Windows nothing ever sends on resume_tx (no SIGCONT/SIGTSTP), but
+    // the sender must stay alive for the whole run: run_ui_loop's select!
+    // blocks on resume_rx, and a dropped sender would make that arm
+    // permanently ready with Disconnected, busy-spinning the main loop.
+    #[cfg(windows)]
+    let _resume_tx = resume_tx;
 
+    #[cfg(unix)]
     let mut poll = Poll::new()?;
+    #[cfg(unix)]
     poll.registry()
         .register(&mut notify_rx, Token(0), Interest::READABLE)?;
 
+    #[cfg(unix)]
     let stdin_fd = io::stdin().as_raw_fd();
+    #[cfg(unix)]
     let mut stdin_source = mio::unix::SourceFd(&stdin_fd);
+    #[cfg(unix)]
     poll.registry()
         .register(&mut stdin_source, Token(1), Interest::READABLE)?;
 
     // Register the signal pipe with the mio poll instance so the terminal
     // thread can wait on it alongside stdin and the notification pipe.
+    #[cfg(unix)]
     let mut sig_source = mio::unix::SourceFd(&signal_rx_fd);
+    #[cfg(unix)]
     poll.registry()
         .register(&mut sig_source, Token(2), Interest::READABLE)?;
 
-    let terminal_handle = thread::spawn(move || {
-        let mut events = Events::with_capacity(3);
-        loop {
-            // Block in poll until stdin data, shutdown signal,
-            // or a caught signal (SIGCONT / SIGTSTP).
-            if let Err(e) = poll.poll(&mut events, None) {
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                tracing::warn!("[choreo-tui] terminal mio poll error: {e}");
-                break;
-            }
-            for event in &events {
-                match event.token() {
-                    Token(0) => {
-                        // Shutdown via pipe — writer end was dropped
-                        // or an error occurred.  Return unconditionally
-                        // so the thread exits and the main loop can
-                        // join it during cleanup.
-                        return;
-                    }
-                    Token(1) => {
-                        // stdin pty closed — terminal emulator was
-                        // killed or the SSH session dropped.  Break
-                        // out so the main loop sees the channel close
-                        // and shuts down cleanly.
-                        if event.is_read_closed() || event.is_error() {
-                            return;
+    let terminal_handle = {
+        #[cfg(unix)]
+        {
+            thread::spawn(move || {
+                let mut events = Events::with_capacity(3);
+                loop {
+                    // Block in poll until stdin data, shutdown signal,
+                    // or a caught signal (SIGCONT / SIGTSTP).
+                    if let Err(e) = poll.poll(&mut events, None) {
+                        if e.kind() == io::ErrorKind::Interrupted {
+                            continue;
                         }
+                        tracing::warn!("[choreo-tui] terminal mio poll error: {e}");
+                        break;
                     }
-                    Token(2) => {
-                        // Drain all pending signals from the self-pipe,
-                        // logging and discarding read errors so a
-                        // transient fd issue doesn't hang the thread.
-                        //
-                        // SIGWINCH is intentionally not mapped to a
-                        // ResumeCommand: the point of catching it here is
-                        // purely to wake the mio poll so the drain loop
-                        // below runs `event::poll`/`event::read`, which is
-                        // when crossterm converts its internal SIGWINCH
-                        // notification into the `Event::Resize` that
-                        // reflows the UI.
-                        loop {
-                            let mut buf = [0u8; 4];
-                            match signal_rx_file.read(&mut buf) {
-                                Ok(4) => {
-                                    let signo = i32::from_ne_bytes(buf);
-                                    if let Some(cmd) = signal_to_resume_command(signo) {
-                                        let _ = resume_tx.send(cmd);
-                                    }
-                                }
-                                Ok(_) => break,
-                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(e) => {
-                                    tracing::warn!("[choreo-tui] signal pipe read error: {e}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Drain all pending crossterm events.  Our mio instance was woken
-            // because stdin is readable; crossterm's own internal mio was also
-            // woken and has already buffered parsed events, so read() will
-            // return immediately without blocking.
-            loop {
-                match event::poll(Duration::ZERO) {
-                    Ok(true) => match event::read() {
-                        Ok(ev) => {
-                            if terminal_tx.send(ev).is_err() {
+                    for event in &events {
+                        match event.token() {
+                            Token(0) => {
+                                // Shutdown via pipe — writer end was dropped
+                                // or an error occurred.  Return unconditionally
+                                // so the thread exits and the main loop can
+                                // join it during cleanup.
                                 return;
                             }
+                            Token(1) => {
+                                // stdin pty closed — terminal emulator was
+                                // killed or the SSH session dropped.  Break
+                                // out so the main loop sees the channel close
+                                // and shuts down cleanly.
+                                if event.is_read_closed() || event.is_error() {
+                                    return;
+                                }
+                            }
+                            Token(2) => {
+                                // Drain all pending signals from the self-pipe,
+                                // logging and discarding read errors so a
+                                // transient fd issue doesn't hang the thread.
+                                //
+                                // SIGWINCH is intentionally not mapped to a
+                                // ResumeCommand: the point of catching it here is
+                                // purely to wake the mio poll so the drain loop
+                                // below runs `event::poll`/`event::read`, which is
+                                // when crossterm converts its internal SIGWINCH
+                                // notification into the `Event::Resize` that
+                                // reflows the UI.
+                                loop {
+                                    let mut buf = [0u8; 4];
+                                    match signal_rx_file.read(&mut buf) {
+                                        Ok(4) => {
+                                            let signo = i32::from_ne_bytes(buf);
+                                            if let Some(cmd) = signal_to_resume_command(signo) {
+                                                let _ = resume_tx.send(cmd);
+                                            }
+                                        }
+                                        Ok(_) => break,
+                                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "[choreo-tui] signal pipe read error: {e}"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        Err(_) => break,
-                    },
-                    Ok(false) => break,
-                    Err(_) => break,
+                    }
+                    // Drain all pending crossterm events.  Our mio instance was woken
+                    // because stdin is readable; crossterm's own internal mio was also
+                    // woken and has already buffered parsed events, so read() will
+                    // return immediately without blocking.
+                    loop {
+                        match event::poll(Duration::ZERO) {
+                            Ok(true) => match event::read() {
+                                Ok(ev) => {
+                                    if terminal_tx.send(ev).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(_) => break,
+                            },
+                            Ok(false) => break,
+                            Err(_) => break,
+                        }
+                    }
                 }
-            }
+            })
         }
-    });
+        #[cfg(windows)]
+        {
+            thread::spawn(move || {
+                // No signal pipe on Windows: crossterm reports resize natively, and
+                // there is no job-control suspend. Poll with a short timeout so the
+                // shutdown notify (a dropped sender) is observed promptly.
+                loop {
+                    if notify_rx.try_recv().is_ok() {
+                        return;
+                    }
+                    match event::poll(Duration::from_millis(100)) {
+                        Ok(true) => loop {
+                            match event::read() {
+                                Ok(ev) => {
+                                    if terminal_tx.send(ev).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        },
+                        Ok(false) => {}
+                        Err(_) => {}
+                    }
+                }
+            })
+        }
+    };
 
     let mut app = App::new();
     app.image_job_tx = Some(worker.job_tx);
@@ -558,6 +641,7 @@ fn run_ui_loop(
 ///
 /// Returns `true` when re-rendering is necessary (`ReinitTerminal`),
 /// or `false` when the terminal was only torn down (`PrepareForSuspend`).
+#[cfg(unix)]
 fn handle_resume_command(
     cmd: ResumeCommand,
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -592,6 +676,20 @@ fn handle_resume_command(
             Ok(false)
         }
     }
+}
+
+/// Windows twin of [`handle_resume_command`]: no-op.
+///
+/// Windows has no POSIX job-control signals, so `ResumeCommand` is never
+/// produced on Windows (the resume channel never fires); the receiver arm in
+/// `run_ui_loop` stays compiled on both platforms for symmetry.
+#[cfg(windows)]
+fn handle_resume_command(
+    _cmd: ResumeCommand,
+    _terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+) -> io::Result<bool> {
+    // Windows has no job-control suspend; ResumeCommand is never produced.
+    Ok(false)
 }
 
 /// With the kitty protocol's `REPORT_ALL_KEYS_AS_ESCAPE_CODES` enhancement, a
@@ -2497,6 +2595,7 @@ mod tests {
     use crate::test_util::test_app;
     use choreo_proto::Turn;
 
+    #[cfg(unix)]
     #[test]
     fn sigcont_maps_to_reinit_terminal() {
         assert!(matches!(
@@ -2505,6 +2604,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn sigtstp_maps_to_prepare_for_suspend() {
         assert!(matches!(
@@ -2513,6 +2613,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn sigwinch_is_not_a_resume_command() {
         // SIGWINCH is registered on the self-pipe purely to wake the terminal
@@ -2523,12 +2624,14 @@ mod tests {
         assert!(signal_to_resume_command(Signal::SIGWINCH as i32).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn uninteresting_signal_returns_none() {
         assert!(signal_to_resume_command(Signal::SIGINT as i32).is_none());
         assert!(signal_to_resume_command(Signal::SIGTERM as i32).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn invalid_signal_number_returns_none() {
         assert!(signal_to_resume_command(9999).is_none());

@@ -1,9 +1,15 @@
 use choreo_proto::{ClientMessage, DaemonMessage, read_message, write_message};
 use std::io::{BufReader, BufWriter, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
 use tracing::{debug, error, info};
+// Windows: std::os::windows::net::UnixStream is unstable (E0658, feature
+// `windows_unix_domain_sockets`, rust-lang/rust#150487), so uds_windows provides
+// the same connect/try_clone/shutdown API over named pipes.
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 use crate::acp_jsonrpc;
 use crate::error::AcpError;

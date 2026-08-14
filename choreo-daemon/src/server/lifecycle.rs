@@ -1,9 +1,13 @@
 use crate::daemon::{DaemonCommand, DaemonState};
 use crate::sessions::SessionCommand;
 use choreo_transport::key::TransportSecretKey;
+// The signal constants are consumed by the Unix iterator thread; the Windows
+// flag thread imports them locally (signal-hook's iterator module is unix-only).
+#[cfg(unix)]
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -12,6 +16,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 
 /// Grace period for joining connection threads during shutdown. After
 /// `BroadcastShuttingDown`, every healthy writer flushes the notification and
@@ -219,26 +225,61 @@ pub fn run_server(
 
     // Signal handler thread: sets the shutdown flag and connects to our own
     // socket to unblock the blocking accept() call on the main thread.
-    let sig_shutdown = Arc::clone(&shutdown);
-    let sig_path = socket_path.to_string();
-    thread::spawn(move || {
-        let mut signals = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) {
-            Ok(s) => s,
-            Err(e) => {
+    //
+    // Unix: blocking iterator over the self-pipe (unchanged behavior).
+    #[cfg(unix)]
+    {
+        let sig_shutdown = Arc::clone(&shutdown);
+        let sig_path = socket_path.to_string();
+        thread::spawn(move || {
+            let mut signals = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("failed to register signal handlers: {e}");
+                    return;
+                }
+            };
+            for _ in signals.forever() {
+                sig_shutdown.store(true, Ordering::SeqCst);
+                // Wake the accept loop by connecting to our own socket.
+                // The pending connection causes the next blocking accept()
+                // to return immediately so the shutdown flag is checked.
+                if let Ok(stream) = UnixStream::connect(&sig_path) {
+                    drop(stream);
+                }
+            }
+        });
+    }
+
+    // Windows: no sigwait and no iterator module — poll signal-hook flags set
+    // by the CRT console handler (SIGINT/SIGTERM), then wake the accept loop
+    // the same way (a connect to our own socket unblocks accept()).
+    #[cfg(windows)]
+    {
+        let sig_shutdown = Arc::clone(&shutdown);
+        let sig_path = socket_path.to_string();
+        thread::spawn(move || {
+            use signal_hook::consts::{SIGINT, SIGTERM};
+            let int_flag = Arc::new(AtomicBool::new(false));
+            let term_flag = Arc::new(AtomicBool::new(false));
+            if let Err(e) = signal_hook::flag::register(SIGINT, Arc::clone(&int_flag))
+                .and_then(|_| signal_hook::flag::register(SIGTERM, Arc::clone(&term_flag)))
+            {
                 error!("failed to register signal handlers: {e}");
                 return;
             }
-        };
-        for _ in signals.forever() {
-            sig_shutdown.store(true, Ordering::SeqCst);
-            // Wake the accept loop by connecting to our own socket.
-            // The pending connection causes the next blocking accept()
-            // to return immediately so the shutdown flag is checked.
-            if let Ok(stream) = UnixStream::connect(&sig_path) {
-                drop(stream);
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if int_flag.swap(false, Ordering::SeqCst) || term_flag.swap(false, Ordering::SeqCst)
+                {
+                    sig_shutdown.store(true, Ordering::SeqCst);
+                    if let Ok(stream) = UnixStream::connect(&sig_path) {
+                        drop(stream);
+                    }
+                }
             }
-        }
-    });
+        });
+    }
 
     // Daemon command handler thread.
     let cmd_handle = thread::spawn(move || {

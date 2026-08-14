@@ -6,14 +6,28 @@ use choreo_sanitize::{ByteBudget, TRUNCATION_SUFFIX};
 use crossbeam_channel;
 use std::{
     io::Read,
-    os::fd::{AsFd, AsRawFd, OwnedFd},
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::mpsc,
     time::Duration,
 };
-use tracing::{debug, trace, warn};
+// Unix-only process-control primitives: `std::os::fd` and
+// `std::os::unix::process` do not exist on Windows (the Windows analogues are
+// `std::os::windows::io::AsRawHandle` plus the Job Object FFI, see
+// `ChildJob`).
+#[cfg(unix)]
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::sync::Arc;
+use tracing::{debug, warn};
+// `trace` is used only by the Linux-only `open_pidfd`; gating the import
+// keeps the non-Linux build warning-free.
+#[cfg(target_os = "linux")]
+use tracing::trace;
 
 /// Bounded wait used by the pipe-drain helpers: `poll(2)` in 100ms slices so a
 /// stop signal (sent once the direct child is reaped) is observed quickly.
@@ -76,6 +90,11 @@ fn setup_child(cmd: &mut Command) {
     // in production, an LLM tool call would hang for the same duration).
     // `process_group(0)` is a safe API (the child calls setpgid(0, 0) before
     // exec), so no `unsafe` / pre_exec hook is needed here.
+    //
+    // Windows has no process groups to put the child in; tree isolation
+    // there is a Job Object (`ChildJob`), created after spawn because
+    // `std::process::Command` has no pre-exec hook on Windows.
+    #[cfg(unix)]
     cmd.process_group(0);
 }
 
@@ -84,6 +103,7 @@ fn setup_child(cmd: &mut Command) {
 /// (pidfd(2), available since kernel 5.3); returns `None` when the syscall is
 /// unavailable (older kernel, seccomp policy) or the child has already
 /// exited — callers then fall back to the PID-based kill path.
+#[cfg(unix)]
 #[cfg(target_os = "linux")]
 fn open_pidfd(pid: u32) -> Option<OwnedFd> {
     // rustix wraps pidfd_open(2) (flags must be empty) and returns the fd as
@@ -104,7 +124,10 @@ fn open_pidfd(pid: u32) -> Option<OwnedFd> {
     }
 }
 
-/// Non-Linux platforms have no pidfd(2); timeout kills stay PID-based there.
+/// Non-Linux Unix platforms have no pidfd(2); timeout kills stay PID-based
+/// there. Windows is excluded entirely — it has no pidfd and no PID-based
+/// killpg either (tree kills go through the Job Object, see `ChildJob`).
+#[cfg(unix)]
 #[cfg(not(target_os = "linux"))]
 fn open_pidfd(_pid: u32) -> Option<OwnedFd> {
     None
@@ -131,6 +154,7 @@ fn open_pidfd(_pid: u32) -> Option<OwnedFd> {
 /// (normally ESRCH, but a recycled PID could collide with an orphaned group
 /// id and take down an unrelated tree). Non-leaders fall straight back to a
 /// direct kill of the child itself.
+#[cfg(unix)]
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
     // `child.id()` is never 0, but rustix's `Pid::from_raw` returns an
@@ -200,6 +224,153 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
     rustix::process::kill_process(pid, rustix::process::Signal::KILL).is_ok()
 }
 
+/// Windows process-tree isolation: the child is assigned to a Job Object so a
+/// timeout (or the job handle dropping) can terminate the whole tree — the
+/// equivalent of Unix process-group killpg(2). JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+/// ensures descendants cannot outlive the daemon's watch over them.
+///
+/// A HANDLE is an index into the kernel handle table, not a pointer into our
+/// address space: the Job Object it names lives in kernel memory and every
+/// operation on it (Assign/Terminate/Close) is thread-safe kernel-side. Sharing
+/// the handle across the watchdog and drain threads (via `Arc<ChildJob>`) is
+/// therefore sound; the `unsafe impl`s only let the value cross thread
+/// boundaries — the handle itself is closed exactly once, by `Drop` on the
+/// last owner.
+#[cfg(windows)]
+struct ChildJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for ChildJob {}
+#[cfg(windows)]
+unsafe impl Sync for ChildJob {}
+
+#[cfg(windows)]
+impl ChildJob {
+    /// Create a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and assign
+    /// `child` to it. The limit makes the job a process-tree kill switch: when
+    /// the last job handle closes (or `terminate` is called), every process in
+    /// the job is terminated — so a grandchild that inherited the pipes cannot
+    /// outlive the daemon's watch over them.
+    fn assign(child: &std::process::Child) -> std::io::Result<Self> {
+        // SAFETY: four kernel32 FFI calls with well-formed arguments.
+        // `CreateJobObjectW` with null attributes/name creates an anonymous
+        // job (returns NULL on failure). `info` is a zeroed
+        // JOBOBJECT_EXTENDED_LIMIT_INFORMATION (Default::default()) whose only
+        // changed field enables KILL_ON_JOB_CLOSE; the length passed to
+        // SetInformationJobObject matches the struct. `child.as_raw_handle()`
+        // is the live process handle std keeps for the child, valid until
+        // `child` is dropped. Every failure path closes the job handle before
+        // returning, so no handle leaks.
+        unsafe {
+            let job = windows_sys::Win32::System::JobObjects::CreateJobObjectW(
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            if job.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut info: windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+                Default::default();
+            info.BasicLimitInformation.LimitFlags =
+                windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if windows_sys::Win32::System::JobObjects::SetInformationJobObject(
+                job,
+                windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<
+                    windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                >() as u32,
+            ) == 0
+            {
+                let err = std::io::Error::last_os_error();
+                windows_sys::Win32::Foundation::CloseHandle(job);
+                return Err(err);
+            }
+            if windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+                job,
+                child.as_raw_handle(),
+            ) == 0
+            {
+                let err = std::io::Error::last_os_error();
+                windows_sys::Win32::Foundation::CloseHandle(job);
+                return Err(err);
+            }
+            Ok(ChildJob(job))
+        }
+    }
+
+    /// Terminate every process in the job. Returns `true` on success (the
+    /// API returns nonzero even when the job already has no processes).
+    fn terminate(&self) -> bool {
+        // SAFETY: `self.0` is a valid job handle created by `assign`; it is
+        // still open (Drop has not run) because `&self` borrows it.
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) != 0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ChildJob {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a valid open job handle and this is the unique
+        // CloseHandle for it (ChildJob has no Clone, so the handle cannot be
+        // double-closed). KILL_ON_JOB_CLOSE then reaps any process still in
+        // the job — the whole tree — when the last handle closes.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// Wait up to `poll_ms` for a drain thread to finish on its own; returns
+/// `true` if it did. Windows anonymous pipe reads are blocking and have no
+/// poll(2)/stop-signal to interrupt, so a surviving grandchild that inherited
+/// a pipe write-end can keep a drain alive past the reaped direct child
+/// indefinitely; callers bound the wait here, then terminate the Job Object
+/// (killing every descendant and closing their write-ends) and rejoin.
+/// Polling `is_finished` in short slices mirrors the `join_bounded` poll loop
+/// used elsewhere in the daemon — 10ms slices keep observed latency low
+/// without busy-spinning.
+#[cfg(windows)]
+fn join_bounded<T>(thread: &std::thread::JoinHandle<T>, poll_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(poll_ms);
+    while !thread.is_finished() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    true
+}
+
+/// Join a buffered drain thread, first giving it [`DRAIN_POLL_MS`] to finish
+/// on its own (EOF once the direct child is reaped). A drain still blocked at
+/// the deadline is wedged on a pipe a surviving grandchild holds open; the
+/// Job Object is terminated to force EOF, then the drain is joined to
+/// completion. `None` (the stream was never piped) returns `None`.
+#[cfg(windows)]
+fn join_drain(thread: Option<std::thread::JoinHandle<Vec<u8>>>, job: &ChildJob) -> Option<Vec<u8>> {
+    let thread = thread?;
+    if !join_bounded(&thread, DRAIN_POLL_MS as u64) {
+        job.terminate();
+    }
+    thread.join().ok()
+}
+
+/// Join a line-drain thread (the streaming path), first giving it
+/// [`DRAIN_POLL_MS`] to finish on its own; if it is still blocked (a
+/// grandchild holds a pipe write-end), terminate the Job Object to force EOF
+/// before joining — see [`join_drain`].
+#[cfg(windows)]
+fn join_line_drain(thread: std::thread::JoinHandle<()>, job: &ChildJob) {
+    if !join_bounded(&thread, DRAIN_POLL_MS as u64) {
+        job.terminate();
+    }
+    if let Err(e) = thread.join() {
+        warn!("reader thread panicked: {:?}", e);
+    }
+}
+
 /// Spawn the watchdog thread that enforces `timeout_ms` on a child process.
 ///
 /// The watchdog blocks on a channel receive with the given timeout. When the
@@ -214,8 +385,7 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
 /// closed when the watchdog thread exits.
 fn spawn_watchdog(
     timeout_ms: u64,
-    pid: u32,
-    pidfd: Option<OwnedFd>,
+    kill_tree: impl FnOnce() -> bool + Send + 'static,
     done_rx: mpsc::Receiver<()>,
     killed_tx: mpsc::Sender<()>,
     abort_tx: Option<crossbeam_channel::Sender<()>>,
@@ -225,16 +395,17 @@ fn spawn_watchdog(
             .recv_timeout(Duration::from_millis(timeout_ms))
             .is_err()
             // Timeout expired before the main thread signalled completion —
-            // kill the child's process tree (see `kill_child_tree`). Only set
+            // kill the child's process tree via the `kill_tree` closure
+            // (killpg on Unix, Job Object termination on Windows). Only set
             // was_killed when a kill actually lands (both killpg and kill
             // return ESRCH when everything already exited, which can happen in
             // a narrow race where the timeout fires at the same instant the
             // child finishes).
-            && kill_child_tree(pid, pidfd.as_ref())
+            && kill_tree()
         {
             warn!(
-                pid,
-                timeout_ms, "shell tool timed out; killed child process group"
+                timeout_ms,
+                "shell tool timed out; killed child process tree"
             );
             let _ = killed_tx.send(());
             if let Some(abort_tx) = abort_tx {
@@ -260,6 +431,7 @@ fn spawn_watchdog(
 /// tool timeout into a multi-second hang. Draining in poll slices lets the
 /// stop signal (sent by the spawn helpers once `child.wait()` returns) cut the
 /// wait short.
+#[cfg(unix)]
 fn poll_readable(
     fd: rustix::fd::BorrowedFd<'_>,
     stop_rx: &mpsc::Receiver<()>,
@@ -329,6 +501,7 @@ enum DrainAccumulate {
 /// open (a surviving grandchild). If `fcntl` fails — which never happens on a
 /// freshly-created pipe — the code falls back to reading a single chunk per
 /// poll verdict, which is safe but slower.
+#[cfg(unix)]
 fn drain_fd<R: Read + AsFd>(
     mut reader: R,
     stop_rx: mpsc::Receiver<()>,
@@ -405,6 +578,7 @@ fn drain_fd<R: Read + AsFd>(
 }
 
 /// Put `fd` in non-blocking mode. Returns `false` if `fcntl` fails.
+#[cfg(unix)]
 fn set_nonblocking(fd: rustix::fd::BorrowedFd<'_>) -> bool {
     // F_GETFL then F_SETFL with O_NONBLOCK is the standard way to make a pipe
     // read end non-blocking; only the read end's own behaviour changes (the
@@ -413,6 +587,58 @@ fn set_nonblocking(fd: rustix::fd::BorrowedFd<'_>) -> bool {
     match rustix::fs::fcntl_getfl(fd) {
         Ok(flags) => rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK).is_ok(),
         Err(_) => false,
+    }
+}
+
+/// Windows pipe drain: anonymous pipes have no poll(2)/non-blocking mode, so
+/// read to EOF in a dedicated thread. Boundedness comes from the Job Object:
+/// terminating the job closes the write-ends (descendants die), so a blocked
+/// read unblocks with EOF — no stop signal or poll needed.
+///
+/// Mirrors `drain_fd`'s contract: `on_data` observes every chunk, the returned
+/// buffer obeys [`DrainAccumulate`] (first `cap` bytes win), and the child can
+/// never deadlock on a full pipe because the drain keeps consuming.
+#[cfg(windows)]
+fn drain_reader<R: Read + Send>(
+    mut reader: R,
+    on_data: &mut dyn FnMut(&[u8]),
+    accumulate: DrainAccumulate,
+) -> Vec<u8> {
+    let mut full: Vec<u8> = Vec::new();
+    // The accumulation cap is tracked by a shared ByteBudget (the same
+    // "first N bytes" engine the streaming paths use) so the raw copy and
+    // the streamed copy can never disagree on the cap, exactly as in
+    // `drain_fd`.
+    let mut budget = match accumulate {
+        DrainAccumulate::None => None,
+        DrainAccumulate::Capped(cap) => Some(ByteBudget::new(cap)),
+    };
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return full, // EOF: all pipe write ends are closed
+            Ok(n) => {
+                on_data(&buf[..n]);
+                // The accumulation cap only bounds the *returned* copy:
+                // on_data still receives every chunk and the read loop keeps
+                // consuming, so a child that out-produces the cap never
+                // blocks on a full pipe.
+                match budget.as_mut() {
+                    Some(budget) => {
+                        let take = budget.fit(n);
+                        full.extend_from_slice(&buf[..take]);
+                    }
+                    None => full.extend_from_slice(&buf[..n]),
+                }
+            }
+            // A blocking read can only be unblocked by the Job Object being
+            // terminated (the write-ends close); EINTR is retried as usual.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                debug!(error = %e, "read from child pipe failed; stopping drain");
+                return full;
+            }
+        }
     }
 }
 
@@ -519,6 +745,7 @@ fn forward_complete_lines(chunk: &[u8], pending: &mut Vec<u8>, on_line: &mut dyn
 /// redirected at a recycled PID (see `open_pidfd` / `kill_child_tree`), and
 /// drains stdout/stderr in bounded background threads so a surviving
 /// grandchild cannot hang the tool past the timeout (see `drain_fd`).
+#[cfg(unix)]
 pub(crate) fn spawn_with_watchdog(
     cmd: &mut Command,
     timeout_ms: u64,
@@ -530,7 +757,13 @@ pub(crate) fn spawn_with_watchdog(
 
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let (killed_tx, killed_rx) = mpsc::channel::<()>();
-    let watchdog = spawn_watchdog(timeout_ms, pid, pidfd, done_rx, killed_tx, None);
+    let watchdog = spawn_watchdog(
+        timeout_ms,
+        move || kill_child_tree(pid, pidfd.as_ref()),
+        done_rx,
+        killed_tx,
+        None,
+    );
 
     // Drain stdout/stderr concurrently so the child can never block on a full
     // pipe buffer (the classic pipe deadlock). Each drain is bounded by a stop
@@ -578,6 +811,93 @@ pub(crate) fn spawn_with_watchdog(
     let stderr = stderr_thread
         .and_then(|t| t.join().ok())
         .unwrap_or_default();
+    let was_killed = killed_rx.try_recv().is_ok();
+
+    Ok((
+        Output {
+            stdout,
+            stderr,
+            status,
+        },
+        was_killed,
+    ))
+}
+
+/// Windows twin of [`spawn_with_watchdog`] with the same contract (Output +
+/// `was_killed`, timeout semantics identical to the buffered Unix path): the
+/// child is isolated in a Job Object (`ChildJob`) instead of a process group,
+/// and the pipes are drained with blocking reads bounded by that job
+/// (`drain_reader` + a bounded join that terminates the job to force EOF).
+///
+/// The job is created AFTER spawn — `Command` has no pre-exec hook on
+/// Windows — so there is a narrow window where the child runs ungoverned;
+/// assignment failure kills the child before propagating.
+#[cfg(windows)]
+pub(crate) fn spawn_with_watchdog(
+    cmd: &mut Command,
+    timeout_ms: u64,
+) -> Result<(Output, bool), ToolExecError> {
+    setup_child(cmd);
+    let mut child = cmd.spawn()?;
+    // Assignment failure leaves a live child running with no kill switch;
+    // reap it before propagating the error.
+    let job = Arc::new(ChildJob::assign(&child).map_err(|e| {
+        let _ = child.kill();
+        let _ = child.wait();
+        e
+    })?);
+
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (killed_tx, killed_rx) = mpsc::channel::<()>();
+    // The watchdog terminates the job (the whole tree) on timeout. The main
+    // thread keeps its own `Arc` clone so it can force EOF on the drains after
+    // the direct child is reaped (see `join_drain`).
+    let watchdog_job = Arc::clone(&job);
+    let watchdog = spawn_watchdog(
+        timeout_ms,
+        move || watchdog_job.terminate(),
+        done_rx,
+        killed_tx,
+        None,
+    );
+
+    // Drain stdout/stderr concurrently so the child can never block on a full
+    // pipe buffer (the classic pipe deadlock). The reads are blocking (Windows
+    // pipes have no poll/non-blocking mode); boundedness comes from the Job
+    // Object — see `drain_reader`. A pipe that was not piped (None) is
+    // skipped, leaving the Output field empty — matching the Unix behaviour.
+    let stdout_thread = child.stdout.take().map(|s| {
+        std::thread::spawn(move || {
+            drain_reader(
+                s,
+                &mut |_| {},
+                DrainAccumulate::Capped(MAX_TOOL_OUTPUT_BYTES),
+            )
+        })
+    });
+    let stderr_thread = child.stderr.take().map(|s| {
+        std::thread::spawn(move || {
+            drain_reader(
+                s,
+                &mut |_| {},
+                DrainAccumulate::Capped(MAX_TOOL_OUTPUT_BYTES),
+            )
+        })
+    });
+
+    let status = child.wait()?;
+    let _ = done_tx.send(());
+    if let Err(e) = watchdog.join() {
+        warn!("watchdog thread panicked: {:?}", e);
+    }
+
+    // Join the drain threads with a bounded wait: the direct child is reaped,
+    // so a drain that has not hit EOF by the deadline is wedged on a pipe a
+    // surviving grandchild holds open. `join_drain` then terminates the job to
+    // force EOF (the descendant dies and its write-end closes) before joining
+    // to completion — the Windows analogue of the Unix stop signals.
+    let stdout = join_drain(stdout_thread, &job).unwrap_or_default();
+    let stderr = join_drain(stderr_thread, &job).unwrap_or_default();
     let was_killed = killed_rx.try_recv().is_ok();
 
     Ok((
@@ -690,6 +1010,7 @@ impl StreamByteCap {
 /// the per-stream accumulation is [`DrainAccumulate::None`]: the merger
 /// thread accumulates the body, so `drain_fd`'s own buffer is kept empty
 /// while `on_data` still observes every chunk.
+#[cfg(unix)]
 fn spawn_line_drain<R>(
     reader: R,
     stop_rx: mpsc::Receiver<()>,
@@ -704,6 +1025,37 @@ where
             reader,
             stop_rx,
             DRAIN_POLL_MS,
+            &mut |chunk: &[u8]| {
+                forward_complete_lines(chunk, &mut pending, &mut |line| {
+                    let _ = merge_tx.send(line);
+                });
+            },
+            DrainAccumulate::None,
+        );
+        // Flush any final unterminated line (matches `BufRead::lines()`
+        // yielding a last line without a trailing newline).
+        if !pending.is_empty() {
+            let _ = merge_tx.send(pending);
+        }
+    })
+}
+
+/// Windows twin of the Unix `spawn_line_drain` with the same body, except it
+/// uses the blocking [`drain_reader`] and drops the `stop_rx` parameter: the
+/// Job Object bounds the drain (terminating it closes the write-ends), so no
+/// stop signal is needed.
+#[cfg(windows)]
+fn spawn_line_drain<R>(
+    reader: R,
+    merge_tx: crossbeam_channel::Sender<Vec<u8>>,
+) -> std::thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut pending: Vec<u8> = Vec::new();
+        drain_reader(
+            reader,
             &mut |chunk: &[u8]| {
                 forward_complete_lines(chunk, &mut pending, &mut |line| {
                     let _ = merge_tx.send(line);
@@ -789,6 +1141,7 @@ impl RecordFraming {
 /// stalled subscriber can never wedge the tool past its timeout (the abort
 /// drops the merge receiver, the drains' sends fail, and every thread joins
 /// promptly).
+#[cfg(unix)]
 pub fn spawn_with_streaming(
     cmd: &mut Command,
     timeout_ms: u64,
@@ -894,7 +1247,13 @@ pub fn spawn_with_streaming(
     // sender lets the watchdog unwedge the merger when it kills the child.
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let (killed_tx, killed_rx) = mpsc::channel::<()>();
-    let watchdog = spawn_watchdog(timeout_ms, pid, pidfd, done_rx, killed_tx, Some(abort_tx));
+    let watchdog = spawn_watchdog(
+        timeout_ms,
+        move || kill_child_tree(pid, pidfd.as_ref()),
+        done_rx,
+        killed_tx,
+        Some(abort_tx),
+    );
 
     // Wait for the process to finish (both background threads drain the
     // pipes concurrently, preventing any blocking deadlock).
@@ -957,6 +1316,168 @@ pub fn spawn_with_streaming(
             // empty (see the doc comment). format_shell_output then produces
             // `$ cmd\n<body>\nExit code: N` with the body byte-identical to
             // what the client saw streamed.
+            stdout: body,
+            stderr: Vec::new(),
+            status,
+        },
+        was_killed,
+    ))
+}
+
+/// Windows twin of the Unix `spawn_with_streaming` with the same contract:
+/// streamed, interleaved stdout+stderr body, `was_killed` flag, and timeout
+/// semantics identical to the streaming Unix path — with the pidfd/process-
+/// group machinery replaced by Job Object isolation (`ChildJob`) and blocking
+/// pipe drains bounded by that job (`drain_reader` + `join_line_drain`).
+///
+/// The job is created AFTER spawn (no pre-exec hook on Windows); assignment
+/// failure kills the child before propagating. The caller must set
+/// `Stdio::piped()` on both stdout and stderr.
+#[cfg(windows)]
+pub fn spawn_with_streaming(
+    cmd: &mut Command,
+    timeout_ms: u64,
+    framing: RecordFraming,
+    output_tx: crossbeam_channel::Sender<Vec<u8>>,
+) -> Result<(Output, bool), ToolExecError> {
+    setup_child(cmd);
+    let mut child = cmd.spawn()?;
+    // Assignment failure leaves a live child running with no kill switch;
+    // reap it before propagating the error.
+    let job = Arc::new(ChildJob::assign(&child).map_err(|e| {
+        let _ = child.kill();
+        let _ = child.wait();
+        e
+    })?);
+
+    // Take stdout so wait() cannot grab it — we read it incrementally in a
+    // background thread (see `drain_reader` for the bounded-drain rationale).
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("stdout not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("stderr not piped"))?;
+
+    // ── Merge channel ────────────────────────────────────────────────────
+    //
+    // Both drain threads forward complete lines here in arrival order; a
+    // single consumer (the merger thread below) forwards them to the client
+    // and accumulates the body (identical rationale to the Unix path).
+    let (merge_tx, merge_rx) = crossbeam_channel::bounded::<Vec<u8>>(STREAMING_CHANNEL_CAPACITY);
+
+    // Both pipes are drained by the same `spawn_line_drain` helper (the
+    // Windows twin: blocking reads, no stop signal — the Job Object bounds
+    // them). `DrainAccumulate::None` keeps `drain_reader`'s own buffer empty
+    // — the merger accumulates the body.
+    let stdout_thread = spawn_line_drain(stdout, merge_tx.clone());
+    let stderr_thread = spawn_line_drain(stderr, merge_tx.clone());
+
+    // The main thread drops its sender so the merge channel disconnects the
+    // moment BOTH drain threads finish — that disconnect is what terminates
+    // the merger below. Without this drop, the merger would wait forever.
+    drop(merge_tx);
+
+    // Abort signal: the watchdog sends on this when it kills the child for a
+    // timeout (identical to the Unix path — a stalled subscriber can never
+    // wedge the tool past its timeout).
+    let (abort_tx, abort_rx) = crossbeam_channel::bounded::<()>(1);
+
+    // Thread: consume merged lines in arrival order, forward each through the
+    // shared byte cap (the live view), and accumulate the same capped bytes
+    // into the body returned to the caller (identical to the Unix path).
+    let merger_thread = std::thread::spawn(move || {
+        let mut stream_cap = StreamByteCap::new(
+            MAX_TOOL_OUTPUT_BYTES.saturating_sub(framing.bytes()),
+            output_tx,
+            abort_rx,
+        );
+        let mut full: Vec<u8> = Vec::new();
+        while let Ok(line) = merge_rx.recv() {
+            // Escape Cf chars BEFORE the bytes enter the stream budget, so
+            // the recorded body is byte-identical to the live view (see the
+            // Unix path for the full rationale).
+            let lossy = String::from_utf8_lossy(&line);
+            let escaped = sanitize_transcript(&lossy);
+            if !stream_cap.push(escaped.as_bytes(), &mut full) {
+                // Abort (timeout) or client gone: stop accumulating.
+                break;
+            }
+        }
+        full
+    });
+
+    // Watchdog thread: enforce timeout. The watchdog terminates the job (the
+    // whole tree) on timeout; the main thread keeps its own `Arc` clone so it
+    // can force EOF on the drains after the direct child is reaped.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (killed_tx, killed_rx) = mpsc::channel::<()>();
+    let watchdog_job = Arc::clone(&job);
+    let watchdog = spawn_watchdog(
+        timeout_ms,
+        move || watchdog_job.terminate(),
+        done_rx,
+        killed_tx,
+        Some(abort_tx),
+    );
+
+    // Wait for the process to finish (both background threads drain the
+    // pipes concurrently, preventing any blocking deadlock).
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            // `wait` failing is nearly unreachable (std retries EINTR), but a
+            // silent thread leak here would be permanent: tear down every
+            // thread before propagating. Terminating the job closes every
+            // descendant's pipe write-end, so the drains' blocking reads hit
+            // EOF, the merge channel disconnects, and the merger ends too.
+            // The dropped `done_tx` also makes the watchdog treat this as a
+            // timeout and kill the (possibly still running) child — harmless.
+            job.terminate();
+            if let Err(e) = stdout_thread.join() {
+                warn!("stdout reader thread panicked: {:?}", e);
+            }
+            if let Err(e) = stderr_thread.join() {
+                warn!("stderr reader thread panicked: {:?}", e);
+            }
+            if let Err(e) = merger_thread.join() {
+                warn!("stream merger thread panicked: {:?}", e);
+            }
+            if let Err(e) = watchdog.join() {
+                warn!("watchdog thread panicked: {:?}", e);
+            }
+            return Err(e.into());
+        }
+    };
+    let _ = done_tx.send(());
+
+    // Join the drain threads first so the merge channel disconnects, then
+    // the merger — its `recv` loop ends on that disconnect and returns the
+    // fully accumulated interleaved body. The bounded join terminates the job
+    // if a surviving grandchild still holds a pipe write-end (blocking
+    // Windows reads have no poll to interrupt): the descendant dies, EOF
+    // arrives, and the join completes — the analogue of the Unix stop
+    // signals.
+    join_line_drain(stdout_thread, &job);
+    join_line_drain(stderr_thread, &job);
+    let body = match merger_thread.join() {
+        Ok(buf) => buf,
+        Err(e) => {
+            warn!("stream merger thread panicked: {:?}", e);
+            Vec::new()
+        }
+    };
+    if let Err(e) = watchdog.join() {
+        warn!("watchdog thread panicked: {:?}", e);
+    }
+    let was_killed = killed_rx.try_recv().is_ok();
+
+    Ok((
+        Output {
+            // stdout carries the interleaved stdout+stderr body; stderr is
+            // empty (see the Unix path's doc comment).
             stdout: body,
             stderr: Vec::new(),
             status,

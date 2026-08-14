@@ -3,9 +3,15 @@ use choreo_proto::{ClientMessage, DaemonMessage, read_message, socket_path, writ
 use clap::Parser;
 use std::env;
 use std::io::{BufReader, BufWriter, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
+// Windows: std::os::windows::net::UnixStream is unstable (E0658, feature
+// `windows_unix_domain_sockets`, rust-lang/rust#150487), so uds_windows provides
+// the same connect/try_clone/shutdown API over named pipes.
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 pub mod bridge;
 pub mod telegram;
