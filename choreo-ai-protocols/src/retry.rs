@@ -99,6 +99,7 @@ pub enum ProviderHttpError {
         detail: String,
     },
     RateLimited {
+        status: u16,
         retry_after_secs: Option<u64>,
         detail: String,
     },
@@ -122,13 +123,14 @@ impl std::fmt::Display for ProviderHttpError {
                 write!(f, "unauthorized ({status}): {detail}")
             }
             Self::RateLimited {
+                status,
                 retry_after_secs,
                 detail,
             } => {
                 if let Some(secs) = retry_after_secs {
-                    write!(f, "rate limited (retry after {secs}s): {detail}")
+                    write!(f, "rate limited ({status}, retry after {secs}s): {detail}")
                 } else {
-                    write!(f, "rate limited: {detail}")
+                    write!(f, "rate limited ({status}): {detail}")
                 }
             }
             Self::ServerError { status, detail } => {
@@ -274,6 +276,7 @@ fn status_to_error(status: u16, detail: &str, retry_after_secs: Option<u64>) -> 
             detail: detail.to_string(),
         },
         429 => ProviderHttpError::RateLimited {
+            status,
             retry_after_secs,
             detail: detail.to_string(),
         },
@@ -560,6 +563,37 @@ mod tests {
         );
         assert_eq!(extract_error_message(r#"{"error":null}"#), None);
         assert_eq!(extract_error_message("not json at all"), None);
+    }
+
+    #[test]
+    fn rate_limited_status_survives_the_whole_error_chain() {
+        // Regression: the pre-fix detail de-dup dropped the status for 429s
+        // because `RateLimited` carried no `status` field — a parseable body
+        // rendered as `rate limited: Quota exceeded` with the status silently
+        // lost.  The status must appear in the Display at every layer.
+        let http = ProviderHttpError::RateLimited {
+            status: 429,
+            retry_after_secs: None,
+            detail: "Quota exceeded".into(),
+        };
+        assert_eq!(http.to_string(), "rate limited (429): Quota exceeded");
+
+        let with_retry_after = ProviderHttpError::RateLimited {
+            status: 429,
+            retry_after_secs: Some(30),
+            detail: "Quota exceeded".into(),
+        };
+        assert_eq!(
+            with_retry_after.to_string(),
+            "rate limited (429, retry after 30s): Quota exceeded"
+        );
+
+        // The provider → inference conversions must thread the status through
+        // unchanged (each Display still carries it).
+        let provider: crate::shared::ProviderError = http.into();
+        assert_eq!(provider.to_string(), "rate limited (429): Quota exceeded");
+        let inference = crate::shared::provider_error_to_inference(provider);
+        assert_eq!(inference.to_string(), "rate limited (429): Quota exceeded");
     }
 
     // ── AttemptDeadline ──────────────────────────────────────────────────

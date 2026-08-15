@@ -26,8 +26,9 @@ pub enum MaxTokensField {
 pub enum ProviderError {
     #[error("unauthorized ({status}): {detail}")]
     Unauthorized { status: u16, detail: String },
-    #[error("rate limited: {detail}")]
+    #[error("rate limited ({status}): {detail}")]
     RateLimited {
+        status: u16,
         retry_after_secs: Option<u64>,
         detail: String,
     },
@@ -56,9 +57,11 @@ impl From<crate::retry::ProviderHttpError> for ProviderError {
                 ProviderError::Unauthorized { status, detail }
             }
             crate::retry::ProviderHttpError::RateLimited {
+                status,
                 retry_after_secs,
                 detail,
             } => ProviderError::RateLimited {
+                status,
                 retry_after_secs,
                 detail,
             },
@@ -100,9 +103,11 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
             InferenceError::Unauthorized { status, detail }
         }
         ProviderError::RateLimited {
+            status,
             retry_after_secs,
             detail,
         } => InferenceError::RateLimited {
+            status,
             retry_after_secs,
             detail,
         },

@@ -142,8 +142,9 @@ impl std::fmt::Display for DiscardedToolCall {
 pub enum InferenceError {
     #[error("unauthorized ({status}): {detail}")]
     Unauthorized { status: u16, detail: String },
-    #[error("rate limited: {detail}")]
+    #[error("rate limited ({status}): {detail}")]
     RateLimited {
+        status: u16,
         retry_after_secs: Option<u64>,
         detail: String,
     },

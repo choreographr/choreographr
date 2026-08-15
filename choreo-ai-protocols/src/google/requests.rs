@@ -387,6 +387,7 @@ fn status_to_google_error(status: u16, detail: &str) -> GoogleError {
             detail: detail.to_string(),
         },
         429 => GoogleError::RateLimited {
+            status,
             retry_after_secs: None,
             detail: detail.to_string(),
         },

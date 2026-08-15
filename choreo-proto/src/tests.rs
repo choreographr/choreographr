@@ -654,6 +654,7 @@ fn inference_error_metric_labels_are_stable() {
     );
     assert_eq!(
         InferenceError::RateLimited {
+            status: 429,
             retry_after_secs: None,
             detail: "x".into()
         }
@@ -713,6 +714,7 @@ fn inference_error_metric_labels_are_distinct() {
         }
         .metric_label(),
         InferenceError::RateLimited {
+            status: 429,
             retry_after_secs: None,
             detail: "x".into(),
         }

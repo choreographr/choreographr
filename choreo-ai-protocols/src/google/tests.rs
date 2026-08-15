@@ -574,6 +574,7 @@ fn error_type_label_maps_correctly() {
     );
     assert_eq!(
         crate::shared::error_type_label(GoogleError::RateLimited {
+            status: 429,
             retry_after_secs: None,
             detail: "too many".into(),
         }),
@@ -695,15 +696,18 @@ fn status_to_google_error_unauthorized() {
 #[test]
 fn status_to_google_error_rate_limited() {
     let err = crate::retry::ProviderHttpError::RateLimited {
+        status: 429,
         retry_after_secs: Some(30),
         detail: "rate limited".into(),
     };
     let google_err: GoogleError = err.into();
     match google_err {
         GoogleError::RateLimited {
+            status,
             retry_after_secs,
             detail: _,
         } => {
+            assert_eq!(status, 429);
             assert_eq!(retry_after_secs, Some(30));
         }
         other => panic!("expected RateLimited, got {other:?}"),
