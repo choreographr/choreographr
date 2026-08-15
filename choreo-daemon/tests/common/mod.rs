@@ -18,6 +18,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use choreo_daemon::accounts::AccountManager;
+use choreo_daemon::broadcast::LagLimits;
 use choreo_daemon::server::acl::Acl;
 use choreo_daemon::{DaemonState, run_server};
 use std::collections::HashMap;
@@ -37,6 +38,15 @@ pub fn test_db() -> redb::Database {
 /// under test. The `daemon_tx` channel is a dummy — `run_server` overwrites
 /// it with the real command channel before serving.
 pub fn test_daemon_state() -> DaemonState {
+    test_daemon_state_with_limits(LagLimits::default())
+}
+
+/// Like [`test_daemon_state`] but with injectable lag thresholds. The
+/// default caps (64 MiB / 512 MiB) are far too large for a test to cross with
+/// a few KiB of streamed output, so the eviction integration test builds its
+/// daemon state through this seam with tiny caps (see
+/// `tests/stream_integrity.rs`).
+pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
     let (daemon_tx, _daemon_rx) = mpsc::channel();
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -65,7 +75,7 @@ pub fn test_daemon_state() -> DaemonState {
         activity_subscribers: HashMap::new(),
         client_subscribed_sessions: HashMap::new(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        lag_limits: choreo_daemon::broadcast::LagLimits::default(),
+        lag_limits: limits,
         model_cache: HashMap::new(),
         mcp_manager: choreo_daemon::mcp::McpManager::empty(),
         // The integration harness runs the real `run_server`, which spawns the
@@ -101,6 +111,11 @@ pub struct SpawnedDaemon {
     pub server_pk: [u8; 32],  // X25519 public key of the server
     handle: Option<thread::JoinHandle<std::io::Result<()>>>,
     _tmp: tempfile::TempDir, // keeps socket + ACL file alive
+    /// Objects the daemon depends on for its lifetime (e.g. a
+    /// `MockProvider` whose serve thread must outlive the daemon). Kept in
+    /// the same struct so dropping the daemon also tears them down, in the
+    /// right order (the `Drop` impl shuts the daemon down first).
+    _keepalive: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 impl SpawnedDaemon {
@@ -115,10 +130,23 @@ impl SpawnedDaemon {
     /// `handle` exit while waiting for readiness and recover from with a fresh
     /// tempdir/port/socket/state.
     pub fn start(authorized_pks: &[[u8; 32]]) -> Self {
+        Self::start_with_state(|| (test_daemon_state(), Vec::new()), authorized_pks)
+    }
+
+    /// Like [`Self::start`] but builds each attempt's [`DaemonState`] from
+    /// `build`, which may also hand back keep-alive objects (e.g. a
+    /// `choreo_ai_protocols::test_utils::MockProvider` whose serve thread
+    /// must outlive the daemon — see the `_keepalive` field). The factory is
+    /// re-invoked per retry attempt because `run_server` consumes the state.
+    pub fn start_with_state(
+        build: impl Fn() -> (DaemonState, Vec<Box<dyn std::any::Any + Send>>) + Send + 'static,
+        authorized_pks: &[[u8; 32]],
+    ) -> Self {
         const START_ATTEMPTS: usize = 5;
 
         for attempt in 1..=START_ATTEMPTS {
-            if let Some(daemon) = Self::try_start(authorized_pks, attempt) {
+            let (state, keepalive) = build();
+            if let Some(daemon) = Self::try_start(state, keepalive, authorized_pks, attempt) {
                 return daemon;
             }
         }
@@ -127,9 +155,14 @@ impl SpawnedDaemon {
 
     /// One attempt at starting a daemon, or `None` when `run_server` exits
     /// early while waiting for readiness — the ephemeral-port re-bind race
-    /// under parallel load — so [`Self::start`] can retry with a fresh
-    /// tempdir/port/socket/state.
-    fn try_start(authorized_pks: &[[u8; 32]], attempt: usize) -> Option<Self> {
+    /// under parallel load — so [`Self::start_with_state`] can retry with a
+    /// fresh tempdir/port/socket/state (and, via `build`, a fresh keepalive).
+    fn try_start(
+        state: DaemonState,
+        keepalive: Vec<Box<dyn std::any::Any + Send>>,
+        authorized_pks: &[[u8; 32]],
+        attempt: usize,
+    ) -> Option<Self> {
         // Fresh Noise keypair for the server. `rand::rng()` is the
         // thread-local CSPRNG; `random_from_rng` fills the 32-byte secret
         // from it. The public half is what tests hand to the client side;
@@ -171,7 +204,6 @@ impl SpawnedDaemon {
         };
         let tcp_addr_str = tcp_addr.to_string();
 
-        let state = test_daemon_state();
         let mut handle: Option<thread::JoinHandle<std::io::Result<()>>> =
             Some(thread::spawn(move || {
                 run_server(
@@ -227,6 +259,7 @@ impl SpawnedDaemon {
                 server_pk,
                 handle,
                 _tmp: tmp,
+                _keepalive: keepalive,
             });
         }
         None

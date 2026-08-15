@@ -285,7 +285,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 - Credential management: `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`
 - Account management: `AccountAdded`, `AccountAddFailed`, `AccountRemoved`, `AccountRemoveFailed`, `Accounts`, `AccountListFailed`, `SessionAccountSet`
 - Reasoning effort: `ReasoningEffortSet`, `ReasoningEffortSetFailed`
-- Misc: `Pong`, `ShuttingDown`
+- Misc: `Pong`, `ShuttingDown`, `Evicted` (best-effort advisory sent just before a lag-eviction disconnect; clients use it to distinguish eviction from a crash)
 
 **Wire format:**
 
@@ -296,7 +296,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 └──────────────────┴────────────────────────────────────────┘
 ```
 
-- Protocol version: `2`
+- Protocol version: `3` (v3 = removed `TurnFinalized` — the final-turn snapshot now rides `TurnAppended`, and failed-turn error blocks ride `TurnAppended` too — and added `Evicted`, a best-effort lag-eviction advisory; mixed-version peers fail fast at the version gate)
 - Max frame size: 32 MiB
 - Framing functions: `encode_frame`, `decode_frame`, `read_message`, `write_message`
 - **Error type**: `ProtoError` (thiserror enum) — `Codec`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io`
@@ -575,8 +575,8 @@ synchronous `execute_*` entry points (which `block_on` internally).
 
 | Module | Purpose |
 |---|---|---|
-| `server/lifecycle.rs` | Accept loop (blocking `UnixListener` + signal-wakeup), signal handling, shutdown orchestration. On graceful shutdown, `DaemonMessage::ShuttingDown` is routed through each connection's single writer thread (via a `client_writers` registry in the daemon command loop); the writer thread flushes it and closes its own socket, so a client observes the notification before the EOF. The accept-loop thread never writes to or closes client sockets — there are no retained stream clones and no backstop close pass, so the notification cannot be lost to a race with a socket close. A momentarily-full writer channel is escalated to a bounded round-robin fan-out (shared 2 s grace, 10 ms poll, thread-free) so backpressure cannot silently drop the notification and one wedged client cannot delay the others. The writer channel is created and REGISTERED with the daemon before the connection thread is spawned (see the `server/connection.rs` row's `register_client_writer`), so a connection accepted concurrently with shutdown is guaranteed to be in the registry when the broadcast is processed — the register is ordered before the broadcast on the FIFO command channel (Unix: same thread; TCP: the accept thread is joined before the broadcast). Before returning, `run_server` also waits — bounded, 5 s — for the TCP accept thread (woken by a probe connect to the listener's actual bound address, falling back to loopback for unspecified `0.0.0.0`/`::` binds, so a concrete non-loopback bind is woken too; the probe's own connect is bounded by a 1 s `connect_timeout` so a full accept backlog cannot stall shutdown on the kernel's SYN-retry timeout) and then for each connection thread (Unix handles tracked directly, TCP handles ferried back over a channel) and, through it, its writer thread, to flush the notification and close its own socket, so notify-before-EOF holds even when `run_server` is embedded in-process rather than exiting the process. Connection handles are pruned eagerly once the retained Vec grows past 64, so a long-running daemon does not accumulate one `JoinHandle` per connection ever accepted (pinned by a unit test). Live connections are also capped at 256 (`MAX_CONCURRENT_CONNECTIONS`, both transports combined, pinned by unit tests + an integration test): at the cap a newly-accepted connection is dropped immediately (bare EOF) so wedged-but-open clients cannot exhaust thread/FD resources. `cleanup_client`'s writer join is bounded (5 s `WRITER_JOIN_GRACE`) so a writer wedged in a blocking socket write cannot hang its connection thread's cleanup; a timed-out writer is detached and the shutdown drain remains the backstop. The cap is enforced with a daemon-wide `Arc<AtomicUsize>` live-connection counter (RAII `ConnectionSlot`) shared across both accept paths and every connection thread's exit — a single-purpose, lock-free resource-accounting exception to the workspace's message-passing rule (documented in AGENTS.md). Signal handling is channel-driven on both platforms: Unix blocks in `signal_hook`'s iterator (self-pipe); Windows has no sigwait/iterator, so `low_level::register` forwards SIGINT/SIGTERM as channel messages and the handler thread blocks in `recv()` — both wake the accept loop via a connect to the daemon's own socket, with no flag polling. |
-| `server/connection.rs` | Per-client `client_thread` (Unix) and `tcp_client_thread` (TCP/Noise) — read `ClientMessages` from the socket, dispatch via `daemon_tx` mpsc channel. Single-writer discipline: each connection has exactly one writer thread draining its `writer_rx`; `ShuttingDown` is a special-cased message that makes the writer close the socket after flushing (notify-before-EOF), and no other thread ever writes to the socket. The writer loops of both transports share one implementation (a `ConnectionWriter` trait + `writer_thread`), so the sole-writer contract and the `ShuttingDown` close live in exactly one place — pinned by unit tests with a mock `ConnectionWriter` (flush `ShuttingDown`, close, stop draining; stop on send error; end cleanly on disconnect). The writer channel is created and registered with the daemon by `register_client_writer`, called by the acceptor BEFORE the connection thread spawns (see the `server/lifecycle.rs` row) — a failed TCP handshake unregisters via `ClientDisconnected` so the registry stays honest. Replies are written through `send_to_writer`, a deliberately BLOCKING send: the 128-slot channel is the connection's backpressure mechanism, and dropping replies would break the request/response contract; the shutdown fan-out + bounded connection drain bound the worst-case delay. Session-summary subscription is an explicit client decision on both transports: a client opts into `SessionCreated`/`SessionStatusChanged`/`SessionDeleted` push broadcasts with `SubscribeSessionsSummary` (previously `tcp_client_thread` auto-registered every Noise client on connect; the GUI now sends the subscribe message at connect to keep its session list live). `cleanup_client` joins the connection's writer thread with a 5 s bound (`WRITER_JOIN_GRACE`) so a writer wedged in a blocking socket write cannot hang the connection thread's cleanup — a timed-out writer is detached and exits on its own once the client goes away. |
+| `server/lifecycle.rs` | Accept loop (blocking `UnixListener` + signal-wakeup), signal handling, shutdown orchestration. On graceful shutdown, `DaemonMessage::ShuttingDown` is routed through each connection's single writer thread (via a `client_writers` registry in the daemon command loop); the writer thread flushes it and closes its own socket, so a client observes the notification before the EOF. The accept-loop thread never writes to or closes client sockets — there are no retained stream clones and no backstop close pass, so the notification cannot be lost to a race with a socket close. With the lossless unbounded writer channels an enqueue can never be `Full` (the old bounded round-robin fan-out for full channels is dead code); a wedged writer is bounded by its 5 s socket write timeout plus the writer-join grace. The writer channel is created and REGISTERED with the daemon before the connection thread is spawned (see the `server/connection.rs` row's `register_client_writer`), so a connection accepted concurrently with shutdown is guaranteed to be in the registry when the broadcast is processed — the register is ordered before the broadcast on the FIFO command channel (Unix: same thread; TCP: the accept thread is joined before the broadcast). Before returning, `run_server` also waits — bounded, 5 s — for the TCP accept thread (woken by a probe connect to the listener's actual bound address, falling back to loopback for unspecified `0.0.0.0`/`::` binds, so a concrete non-loopback bind is woken too; the probe's own connect is bounded by a 1 s `connect_timeout` so a full accept backlog cannot stall shutdown on the kernel's SYN-retry timeout) and then for each connection thread (Unix handles tracked directly, TCP handles ferried back over a channel) and, through it, its writer thread, to flush the notification and close its own socket, so notify-before-EOF holds even when `run_server` is embedded in-process rather than exiting the process. Connection handles are pruned eagerly once the retained Vec grows past 64, so a long-running daemon does not accumulate one `JoinHandle` per connection ever accepted (pinned by a unit test). Live connections are also capped at 256 (`MAX_CONCURRENT_CONNECTIONS`, both transports combined, pinned by unit tests + an integration test): at the cap a newly-accepted connection is dropped immediately (bare EOF) so wedged-but-open clients cannot exhaust thread/FD resources. `cleanup_client`'s writer join is bounded (5 s `WRITER_JOIN_GRACE`) so a writer wedged in a blocking socket write cannot hang its connection thread's cleanup; a timed-out writer is detached and the shutdown drain remains the backstop. The cap is enforced with a daemon-wide `Arc<AtomicUsize>` live-connection counter (RAII `ConnectionSlot`) shared across both accept paths and every connection thread's exit — a single-purpose, lock-free resource-accounting exception to the workspace's message-passing rule (documented in AGENTS.md). Signal handling is channel-driven on both platforms: Unix blocks in `signal_hook`'s iterator (self-pipe); Windows has no sigwait/iterator, so `low_level::register` forwards SIGINT/SIGTERM as channel messages and the handler thread blocks in `recv()` — both wake the accept loop via a connect to the daemon's own socket, with no flag polling. |
+| `server/connection.rs` | Per-client `client_thread` (Unix) and `tcp_client_thread` (TCP/Noise) — read `ClientMessages` from the socket, dispatch via `daemon_tx` mpsc channel. Single-writer discipline: each connection has exactly one writer thread draining its `writer_rx`; `ShuttingDown` AND `Evicted` are special-cased messages that make the writer flush, close the socket, and stop draining (notify-before-EOF / advisory-before-EOF), and no other thread ever writes to the socket. The writer loops of both transports share one implementation (a `ConnectionWriter` trait + `writer_thread`), so the sole-writer contract and the special-case closes live in exactly one place — pinned by unit tests with a mock `ConnectionWriter` (flush `ShuttingDown`, flush `Evicted`, stop on send error, end cleanly on disconnect). The writer channel is an UNBOUNDED crossbeam channel (the connection's `SubscriberSink`), created and registered with the daemon by `register_client_writer`, called by the acceptor BEFORE the connection thread spawns (see the `server/lifecycle.rs` row) — a failed TCP handshake unregisters via `ClientDisconnected` so the registry stays honest. The writer thread decrements the sink's in-flight byte counter (and the daemon-wide `global_lag`) on every dequeue, the exact counterpart of the producers' enqueue increment; on a send error (broken pipe, or the 5 s `WRITER_WRITE_TIMEOUT` on a wedged client whose receive window is zero) it shuts the socket down itself — unblocking the reader's blocking read so `cleanup_client` reaps the connection. Replies are written through `send_to_writer`, a plain unbounded send that still increments the byte counters (replies were never dropped — a blocking send just blocked; with unbounded channels they can no longer block either). Session-summary subscription is an explicit client decision on both transports: a client opts into `SessionCreated`/`SessionStatusChanged`/`SessionDeleted` push broadcasts with `SubscribeSessionsSummary` (previously `tcp_client_thread` auto-registered every Noise client on connect; the GUI now sends the subscribe message at connect to keep its session list live). `cleanup_client` joins the connection's writer thread with a 5 s bound (`WRITER_JOIN_GRACE`) so a writer wedged in a blocking socket write cannot hang the connection thread's cleanup — a timed-out writer is detached and exits on its own once the client goes away. |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management, and the runtime catalog swap (`CatalogBaseChanged` → `replace_catalog`, the single writer of the `PROVIDER_CATALOG` ArcSwap), `CatalogUpdated` broadcasts, and `/refresh-models` plumbing (the fetch is delegated to the maintenance thread, never run here). `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` (including `total_timeout_secs`) and converts the shared fields into `ProviderOverrides` for the other protocols. |
 | `config.rs` | Daemon-level configuration: `DaemonConfig` (`max_turns`, `[context]`), `config_path()`, `load_daemon_config()`, and the deprecated `load_service_config()`. (Previously lived in `openai/config.rs`; it is daemon config, not provider config.) |
@@ -833,7 +833,7 @@ Reasoning text is not only *displayed* — for several providers it must also be
 
 **Capture** happens inside each adapter before the display field is consumed: OpenAI chat wraps the raw reasoning string — from whichever chat field the provider populated (`reasoning_content`, `reasoning`, or `reasoning_text`, with that precedence) — into `ChatReasoning { field, bytes }`, tagging the artifact with the field it came from; Anthropic serializes the ordered thinking / redacted_thinking blocks (signatures + redacted data intact, order preserved) into `AnthropicThinking`; Google collects the `thoughtSignature` values (the `thought: true` marker may carry a signature on **any** part type — the wire-format fix; there is no separate `thinking` key) into `GoogleSignatures`; Responses collects the raw reasoning output items verbatim — type tag, id, summary, `encrypted_content` in stateless mode, and any unknown fields (e.g. a newer `content` shape), preserved exactly as returned — into `ResponsesItems`. The artifact rides out of the provider crate on `ChatAssistantToolUse`/`FinalTextResult.reasoning_artifact` and is stored on the `Turn` by the agent loop via `SessionState::set_assistant_response` — which now takes an `AssistantResponse` struct bundling text, reasoning, tool calls, usage, and the artifact + producer pair — alongside `Turn.reasoning_producer` (provider slug + model).
 
-**Carry** is a pure store-and-forward: the daemon never reads the payload bytes. It also strips the artifact (and its producer) from every client-bound `DaemonMessage` payload — `TurnAppended`, `TurnFinalized`, `SessionState`, and `TurnsRedone` carry client copies with `reasoning_artifact`/`reasoning_producer` set to `None` (see `turn_for_client` in `choreo-daemon/src/sessions.rs`), so the bytes never leave the daemon process; only the request builder consumes them, from the authoritative `Turn` in `SessionState` and the DB. The builder's only job is the *whether*: an artifact is attached to an assistant message only when (1) **same-model provenance** holds — `turn.reasoning_producer == {current provider_slug, current model}` — so a turn produced by a different model (mid-session `/model` switch) never replays its possibly-encrypted payload, and (2) the resolved `ReasoningPassback` policy says to:
+**Carry** is a pure store-and-forward: the daemon never reads the payload bytes. It also strips the artifact (and its producer) from every client-bound `DaemonMessage` payload — `TurnAppended`, `SessionState`, and `TurnsRedone` carry client copies with `reasoning_artifact`/`reasoning_producer` set to `None` (see `turn_for_client` in `choreo-daemon/src/sessions.rs`), so the bytes never leave the daemon process; only the request builder consumes them, from the authoritative `Turn` in `SessionState` and the DB. The builder's only job is the *whether*: an artifact is attached to an assistant message only when (1) **same-model provenance** holds — `turn.reasoning_producer == {current provider_slug, current model}` — so a turn produced by a different model (mid-session `/model` switch) never replays its possibly-encrypted payload, and (2) the resolved `ReasoningPassback` policy says to:
 
 | `reasoning_passback` | Meaning | Wire behavior |
 |---|---|---|
@@ -1569,7 +1569,11 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
 
 **Streaming is byte-bounded end to end.** The bounded streaming channel only bounds
 *in-flight* chunks (backpressure); the *total* is capped too, so the live view can never
-diverge unboundedly from the recorded result:
+diverge unboundedly from the recorded result. (Note the two independent bounds: this
+section is about `ByteBudget` capping a single tool's *content*; the lossless delivery
+design separately bounds *delivery* — the per-client in-flight bytes that trigger
+lag-eviction — see the broadcast section below. They don't collide: content is capped
+at the source, delivery is capped per client queue.)
 
 - `spawn_with_streaming` (sh/exec/fish/nu) streams **both** stdout and stderr:
   the two pipes are drained in background threads, split into lines (CRLF
@@ -2358,48 +2362,56 @@ to the session still miss pre-attach content — the worker owns the live turn
 and only syncs back on `RequestFinished`.)
 
 The all-activity subscription is **sticky**: the daemon's activity broadcast
-(`handle_broadcast_activity`) drops messages for a subscriber whose writer
-buffer is momentarily full but never evicts the subscriber — only a
-disconnected receiver is removed.  This mirrors the per-session `broadcast()`
-policy and matters because the TUI registers for all activity exactly once at
-startup and never re-subscribes: evicting it on a full buffer would
-permanently blind it to every background session, so switching into a
-streaming session would show a blank turn until the next chunk arrived over
-the (just attached) per-session path instead of the accumulated content.
+(`handle_broadcast_activity`) never drops a message for a subscriber —
+only a disconnected receiver is removed.  This matters because the TUI
+registers for all activity exactly once at startup and never re-subscribes:
+evicting it would permanently blind it to every background session, so
+switching into a streaming session would show a blank turn until the next
+chunk arrived over the (just attached) per-session path instead of the
+accumulated content.
 
-All three subscriber fan-outs share this drop-on-full / evict-on-disconnect
-rule via the single `crate::broadcast::try_send_keep_on_full` helper: the
-all-activity broadcast (`handle_broadcast_activity`), the summary broadcast
-(`DaemonState::broadcast`), and the per-session `broadcast()` in sessions.rs.
-The per-subscriber `try_send` outcome is classified once by
-`try_send_classify` (`Delivered`/`Disconnected`/`Full`); the retain-predicate
-and the shutdown fast path in `handle_broadcast_shutting_down` both consume
-that classification, so the Ok/Disconnected/Full arms live in exactly one
-place.  The helper is the only place the policy lives, so the paths cannot
-drift.  It is non-blocking by construction (`try_send`), so a slow subscriber
-can never
-stall the daemon's single-threaded command loop or a session thread — the
-summary broadcast previously used a blocking `send` here, which let one slow
-client freeze the whole daemon loop; aligning it with the shared policy
-removed that stall.
+All three subscriber fan-outs — the all-activity broadcast
+(`handle_broadcast_activity`), the summary broadcast (`DaemonState::broadcast`),
+and the per-session `broadcast()` in sessions.rs — share ONE lossless
+policy via `crate::broadcast::SubscriberSink`.  Each subscriber's writer
+channel is UNBOUNDED, so an enqueue can never be `Full`: the daemon never
+drops a broadcast message, and a slow subscriber can never stall the
+daemon's single-threaded command loop or a session thread (unbounded
+`send` never blocks).  Delivery is guaranteed, in-order (FIFO), and
+exactly-once for every connected non-evicted client.
 
-The one deliberate exception to drop-on-full is the shutdown fan-out
-(`broadcast::send_shutting_down_bounded`): `ShuttingDown` is the
-notify-before-EOF guarantee, so a momentarily-full writer channel is polled
-round-robin (bounded by a shared grace, thread-free, never blocking on the
-writer) instead of being dropped — see the `server/lifecycle.rs` row.
+Memory is bounded by LAG-BASED EVICTION instead of drops.  Each
+`SubscriberSink` carries an in-flight byte counter (an `Arc<AtomicUsize>`
+shared between the producers that increment it on enqueue and the
+connection's writer thread that decrements it on dequeue — sanctioned
+exception #6, see AGENTS.md); `SubscriberSink::enqueue` reports
+`EnqueueOutcome::{Delivered, Disconnected, ClientOverLag, GlobalOverBudget}`
+based on [`LagLimits`] (`per_client_cap` 64 MiB, daemon-wide `global_budget`
+512 MiB — injectable in tests).  The crossing message is STILL enqueued
+(lossless); the outcome only tells the caller to evict the lagging client
+(`DaemonCommand::EvictClient`) or the largest-backlog client
+(`EvictLargestLagging`).  `handle_evict_client` removes the client from
+every subscriber map, tells its sessions to drop it (`RemoveSubscriber`),
+and enqueues a best-effort `Evicted` advisory before dropping the sink.
 
-Dropped messages are not lost silently: every drop-on-full increments the
-`choreo_broadcast_dropped_total{path}` Prometheus counter (paths `summary`,
-`activity`, `session`, `attach`) served on `/metrics`, so a permanently
-wedged subscriber — one whose buffer stays full forever — remains observable
-even though per-message logging is deliberately skipped as noise under a fast
-burst.  The one place a drop is more consequential than a routine broadcast
-is the attach snapshot (`handle_attach` in sessions.rs): it is the joining
-client's only complete view of accumulated content, so a full buffer there
-also logs a `warn!` while still refusing to block the session thread (the
-client stays subscribed and the in-flight turn's `ToolCallFinished` +
-`SessionMessageAppended` resyncs it).
+The thresholds are SOFT bounds: a race can overshoot the cap by at most
+one message's bytes before the eviction command lands — an exact hard
+cutoff would require a blocking or dropping send, which is exactly what
+this design eliminates.
+
+Eviction needs no daemon-held socket handle: each connection's writer gets
+a 5 s socket write timeout (`WRITER_WRITE_TIMEOUT`), so a wedged client
+(zero receive window) cannot stall its writer forever — the write fails,
+the writer shuts the socket down itself (notify-before-EOF on the graceful
+path), and the reader's blocking read unblocks into the normal
+`cleanup_client` teardown.  See the `server/connection.rs` row.
+
+Evictions are not lost silently: every one increments the
+`choreo_evictions_total` Prometheus counter served on `/metrics`, so a
+permanently wedged subscriber — one whose backlog keeps crossing the cap —
+remains observable.  The old `choreo_broadcast_dropped_total` counter (and
+the drop-on-full policy it measured) is gone: the daemon no longer drops
+broadcast messages.
 
 Token bookkeeping follows the same per-session rule.  `LiveOutputTokenCount`
 (during streaming) and `SessionState` snapshots (attach / `load_tools` /

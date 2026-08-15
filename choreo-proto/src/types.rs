@@ -341,13 +341,15 @@ impl Turn {
             size += 16 + call.call_id.len() + call.name.len() + call.arguments_json.len();
         }
         for result in &self.tool_results {
-            size += 32 + result.call_id.len()
+            size += 32
+                + result.call_id.len()
                 + result.name.len()
                 + result.content.len()
                 + result.invocation_description.len();
         }
         for image in &self.displayed_images {
-            size += 48 + image.data.len()
+            size += 48
+                + image.data.len()
                 + image.metadata.mime_type.len()
                 + image.metadata.alt.as_ref().map_or(0, String::len);
         }
@@ -908,7 +910,11 @@ fn session_status_size(status: &SessionStatus) -> usize {
 
 /// Byte length of a `ReasoningCapability` payload.
 fn reasoning_capability_size(cap: &ReasoningCapability) -> usize {
-    16 + cap.available_effort_levels.iter().map(String::len).sum::<usize>()
+    16 + cap
+        .available_effort_levels
+        .iter()
+        .map(String::len)
+        .sum::<usize>()
 }
 
 impl DaemonMessage {
@@ -1082,9 +1088,7 @@ impl DaemonMessage {
             Self::AccountAdded { name } => OVERHEAD + name.len(),
             Self::AccountAddFailed { name, error } => OVERHEAD + 16 + name.len() + error.len(),
             Self::AccountRemoved { name } => OVERHEAD + name.len(),
-            Self::AccountRemoveFailed { name, error } => {
-                OVERHEAD + 16 + name.len() + error.len()
-            }
+            Self::AccountRemoveFailed { name, error } => OVERHEAD + 16 + name.len() + error.len(),
             Self::Accounts { accounts } => {
                 OVERHEAD
                     + accounts

@@ -1194,12 +1194,26 @@ impl StreamByteCap {
     /// `select!` against the abort signal, so a timeout kill still unwedges
     /// the tool. A dropped receiver fails the send, which stops the stream
     /// the same way an abort does.
+    ///
+    /// CRITICAL: a DISCONNECTED abort channel is NOT an abort. The watchdog
+    /// drops its `abort_tx` sender the moment the direct child is reaped —
+    /// which happens on NORMAL completion too — so treating the recv arm's
+    /// disconnect as a stop signal would silently truncate any tool whose
+    /// streamed output filled the bounded channel: the merger would stop
+    /// forwarding the instant the child finished, with no abort having
+    /// occurred. Only an `Ok(())` abort (a real timeout kill) stops; a
+    /// disconnect falls back to a plain blocking send (the tool's lifetime is
+    /// already decided, and a permanently-wedged consumer is bounded by the
+    /// merger's collect grace).
     fn forward(&self, bytes: &[u8]) -> bool {
         match self.tx.try_send(bytes.to_vec()) {
             Ok(()) => true,
             Err(_) => crossbeam_channel::select! {
                 send(self.tx, bytes.to_vec()) -> res => res.is_ok(),
-                recv(self.abort_rx) -> _ => false,
+                recv(self.abort_rx) -> abort => match abort {
+                    Ok(()) => false,
+                    Err(_) => self.tx.send(bytes.to_vec()).is_ok(),
+                },
             },
         }
     }
@@ -2083,6 +2097,43 @@ mod tests {
         assert_eq!(rx.try_recv().expect("queued chunk"), b"full");
         assert!(rx.try_recv().is_err(), "aborted send must not deliver");
         assert!(out.is_empty(), "aborted send must not be accumulated");
+    }
+
+    #[test]
+    fn stream_byte_cap_abort_disconnect_does_not_stop_streaming() {
+        // Regression: the watchdog drops its abort sender the moment the
+        // direct child is reaped — on NORMAL completion too. A DISCONNECTED
+        // abort channel must not be treated as an abort: doing so would
+        // silently truncate any tool whose streamed output fills the bounded
+        // streaming channel, because the merger's blocked forward would see
+        // the recv arm become immediately ready the instant the child
+        // finished (this was a real truncation bug, exposed by large-output
+        // tools like `seq 1 10000` under backpressure).
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
+        let (abort_tx, abort_rx) = crossbeam_channel::bounded::<()>(1);
+        let mut cap = StreamByteCap::new(100, tx.clone(), abort_rx);
+        let mut out = Vec::new();
+        drop(abort_tx); // watchdog exited normally — the abort channel is dead
+
+        // Fill the channel so the next push must block in the select. The
+        // consumer stays blocked (it waits for BOTH messages), so the send
+        // arm completes once it drains the first — the disconnected abort arm
+        // is ignored, not honored. No time-based waits: the select blocks
+        // only until the ready consumer drains.
+        tx.try_send(b"full".to_vec()).expect("fill channel");
+        let consumer = std::thread::spawn(move || {
+            let first = rx.recv().unwrap();
+            let second = rx.recv().unwrap();
+            (first, second)
+        });
+        assert!(
+            cap.push(b"more", &mut out),
+            "a disconnected abort channel must not stop the stream"
+        );
+        let (first, second) = consumer.join().expect("consumer");
+        assert_eq!(first, b"full");
+        assert_eq!(second, b"more");
+        assert_eq!(out, b"more", "the delayed chunk must still be accumulated");
     }
 
     #[test]
