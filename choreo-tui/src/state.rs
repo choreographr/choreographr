@@ -4014,16 +4014,6 @@ impl TurnEventHandler for App {
         display.mark_content_changed();
     }
 
-    fn handle_turn_finalized(&mut self, session_id: u64, turn_id: u32, turn: Turn) {
-        tracing::trace!(%turn_id, "handle_turn_finalized");
-        self.sync_turn_images(session_id, turn_id, &turn);
-        let display = self.display_for(session_id);
-        invalidate_turn_cache(display, turn_id);
-        display.view.insert_or_replace(turn_id, turn);
-        display.bump_turn_version(turn_id);
-        display.mark_content_changed();
-    }
-
     fn handle_turns_undone(&mut self, session_id: u64, turn_ids: &[u32]) {
         tracing::trace!(?turn_ids, "handle_turns_undone");
         let display = self.display_for(session_id);

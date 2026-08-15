@@ -3828,24 +3828,6 @@ mod tests {
                     reasoning_producer: None,
                 },
             },
-            DaemonMessage::TurnFinalized {
-                session_id: 42,
-                turn_id: 1,
-                turn: Turn {
-                    created_at: TimestampMs::now(),
-                    undone: false,
-                    error: None,
-                    user_text: None,
-                    assistant_text: None,
-                    assistant_reasoning: None,
-                    tool_calls: vec![],
-                    token_usage: None,
-                    tool_results: vec![],
-                    displayed_images: vec![],
-                    reasoning_artifact: None,
-                    reasoning_producer: None,
-                },
-            },
             DaemonMessage::Started {
                 session_id: 42,
                 request_id: 1,
@@ -3938,6 +3920,7 @@ mod tests {
             DaemonMessage::AccountAdded { name: "a".into() },
             DaemonMessage::Accounts { accounts: vec![] },
             DaemonMessage::ShuttingDown,
+            DaemonMessage::Evicted,
         ];
 
         for msg in cases {

@@ -1958,6 +1958,12 @@ pub(crate) fn run_agent_loop(
                 // not mask the original inference error, which the caller needs
                 // to surface as RequestOutcome::Failed.
                 session.set_turn_error(current_turn_id, e.to_string());
+                tracing::debug!(
+                    session_id = ctx.session_id,
+                    turn_id = current_turn_id,
+                    %e,
+                    "failure marked on turn; finalize will deliver the error turn to clients via TurnAppended",
+                );
                 if let Err(persist_err) = finalize_and_broadcast_turn(session, ctx, current_turn_id)
                 {
                     warn!(
@@ -1976,8 +1982,16 @@ pub(crate) fn run_agent_loop(
     }
 }
 
-/// Persist the finalized turn to the database and broadcast the
-/// [`DaemonMessage::TurnFinalized`] event to all connected clients.
+/// Persist the finalized turn to the database and broadcast it to all
+/// connected clients.
+///
+/// The final snapshot rides [`DaemonMessage::TurnAppended`] — the same
+/// delivery the turn already used when it was appended mid-stream.
+/// `TurnFinalized` (a second, redundant repair snapshot repeating an already
+/// delivered turn) was removed from the protocol entirely (v3);
+/// `TurnAppended` is now the single authoritative turn delivery, so clients
+/// render the final/error turn from it. The DB write inside `finalize_turn`
+/// is required and unchanged.
 fn finalize_and_broadcast_turn(
     session: &mut SessionState,
     ctx: &RequestContext,
@@ -1987,7 +2001,7 @@ fn finalize_and_broadcast_turn(
     if let Some(turn) = session.turns.get(&current_turn_id) {
         let _ = ctx
             .cmd_tx
-            .send(SessionCommand::Broadcast(DaemonMessage::TurnFinalized {
+            .send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
                 session_id: ctx.session_id,
                 turn_id: current_turn_id,
                 turn: turn_for_client(turn),
@@ -3344,7 +3358,7 @@ mod tests {
 
     #[test]
     fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
-        // TurnFinalized is the final turn snapshot sent to clients — the
+        // TurnAppended is the final turn snapshot sent to clients — the
         // reasoning artifact must be stripped here too, while the DB write
         // (inside finalize_and_broadcast_turn) persists the full turn.
         let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
@@ -3381,7 +3395,7 @@ mod tests {
         finalize_and_broadcast_turn(&mut session, &ctx, turn_id).unwrap();
 
         match cmd_rx.try_recv() {
-            Ok(SessionCommand::Broadcast(DaemonMessage::TurnFinalized { turn, .. })) => {
+            Ok(SessionCommand::Broadcast(DaemonMessage::TurnAppended { turn, .. })) => {
                 assert_eq!(turn.reasoning_artifact, None);
                 assert_eq!(turn.reasoning_producer, None);
                 assert_eq!(turn.assistant_text.as_deref(), Some("hi"));
@@ -3390,8 +3404,8 @@ mod tests {
                     Some("thinking out loud")
                 );
             }
-            Ok(_) => panic!("expected TurnFinalized broadcast, got different command"),
-            Err(e) => panic!("expected TurnFinalized broadcast, got error: {e}"),
+            Ok(_) => panic!("expected TurnAppended broadcast, got different command"),
+            Err(e) => panic!("expected TurnAppended broadcast, got error: {e}"),
         }
         // The authoritative turn keeps the artifact after finalize + broadcast.
         assert!(session.turns[&turn_id].reasoning_artifact.is_some());
@@ -3447,19 +3461,21 @@ mod tests {
         );
         assert_eq!(turn.user_text.as_deref(), Some("hi"));
 
-        // The turn was finalized: a TurnFinalized broadcast carries the error
+        // The turn was finalized: a TurnAppended broadcast carries the error
         // to clients (the authoritative turn keeps it too, for the DB write).
-        let mut saw_finalized = false;
+        // The stream also contains mid-turn TurnAppended broadcasts (the
+        // user-text append) that legitimately carry no error, so require only
+        // that an error-bearing TurnAppended arrived.
+        let mut saw_error_appended = false;
         while let Ok(msg) = cmd_rx.try_recv() {
-            if let SessionCommand::Broadcast(DaemonMessage::TurnFinalized { turn, .. }) = msg {
-                saw_finalized = true;
-                assert_eq!(
-                    turn.error.as_deref(),
-                    Some("client error (402): Insufficient Balance")
-                );
+            if let SessionCommand::Broadcast(DaemonMessage::TurnAppended { turn, .. }) = msg
+                && let Some(err) = turn.error
+            {
+                assert_eq!(err, "client error (402): Insufficient Balance");
+                saw_error_appended = true;
             }
         }
-        assert!(saw_finalized, "expected a TurnFinalized broadcast");
+        assert!(saw_error_appended, "expected a TurnAppended broadcast carrying the failure");
     }
 
     // -- resolve_reasoning_effort tests ------------------------------------

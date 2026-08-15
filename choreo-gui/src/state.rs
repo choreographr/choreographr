@@ -41,11 +41,6 @@ impl TurnEventHandler for AppState {
         self.session_view.insert_or_replace(turn_id, turn);
     }
 
-    fn handle_turn_finalized(&mut self, _session_id: u64, turn_id: u32, turn: Turn) {
-        debug!(%turn_id, "turn finalized");
-        self.session_view.insert_or_replace(turn_id, turn);
-    }
-
     fn handle_turns_undone(&mut self, _session_id: u64, turn_ids: &[u32]) {
         trace!(?turn_ids, "handle_turns_undone");
         for &id in turn_ids {

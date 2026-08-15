@@ -45,7 +45,6 @@ pub struct SessionStateData {
 
 pub trait TurnEventHandler {
     fn handle_turn_appended(&mut self, session_id: u64, turn_id: u32, turn: Turn);
-    fn handle_turn_finalized(&mut self, session_id: u64, turn_id: u32, turn: Turn);
     fn handle_turns_undone(&mut self, session_id: u64, turn_ids: &[u32]);
     fn handle_turns_redone(&mut self, session_id: u64, turns: BTreeMap<u32, Turn>);
     fn handle_request_stream(
@@ -168,11 +167,6 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             turn_id,
             turn,
         } => handler.handle_turn_appended(*session_id, *turn_id, turn.clone()),
-        DaemonMessage::TurnFinalized {
-            session_id,
-            turn_id,
-            turn,
-        } => handler.handle_turn_finalized(*session_id, *turn_id, turn.clone()),
         DaemonMessage::TurnsUndone {
             session_id,
             turn_ids,

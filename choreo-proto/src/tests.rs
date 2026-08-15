@@ -160,11 +160,11 @@ fn decode_tolerates_array_encoded_struct() {
     // Named mode writes structs as maps with field-name keys, but decode also
     // accepts the array (field-order) form — that is the compatibility
     // contract that keeps a future switch to compact mode backwards-readable.
-    // Hand-build `[2, [10, 20, 30]]`: version 2, then a `TokenUsage` struct
+    // Hand-build `[3, [10, 20, 30]]`: version 3, then a `TokenUsage` struct
     // serialized WITHOUT field names as a 3-element array.
     let blob = [
         0x92, // array of 2: (version, message)
-        0x02, // PROTOCOL_VERSION = 2
+        0x03, // PROTOCOL_VERSION = 3
         0x93, // array of 3: TokenUsage { input_tokens, output_tokens, total_tokens }
         0x0a, // input_tokens = 10
         0x14, // output_tokens = 20
@@ -582,7 +582,7 @@ fn reasoning_capability_serde_round_trip() {
     assert_eq!(decoded, cap);
 }
 
-// ── TurnAppended / TurnFinalized round-trip tests ───────────────────────
+// ── TurnAppended / Evicted round-trip tests ───────────────────────
 
 #[test]
 fn turn_appended_serde_round_trip() {
@@ -611,33 +611,71 @@ fn turn_appended_serde_round_trip() {
 }
 
 #[test]
-fn turn_finalized_serde_round_trip() {
+fn evicted_serde_round_trip_and_no_session_id() {
+    // Evicted is a unit variant (best-effort lag-eviction advisory): it must
+    // round-trip through the wire format and carry no session_id, so the
+    // daemon's activity-broadcast dedup treats it as origin-less.
+    let msg = DaemonMessage::Evicted;
+    let frame = encode_frame(&msg).expect("encode");
+    let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, DaemonMessage::Evicted);
+    assert_eq!(decoded.session_id(), None);
+}
+
+// ── approx_wire_size tests ─────────────────────────────────────
+
+#[test]
+fn approx_wire_size_scales_with_payload() {
+    // A variant carrying a 100-byte String must estimate at least 100 bytes:
+    // the string payload itself dominates the serialized size.
+    let msg = DaemonMessage::Failed {
+        session_id: 1,
+        request_id: 1,
+        error: "x".repeat(100),
+    };
+    assert!(msg.approx_wire_size() >= 100);
+
+    // A turn-bearing variant must track the turn's own estimate (a 100-byte
+    // assistant_text inside the turn).
     let turn = Turn {
         created_at: TimestampMs::now(),
         undone: false,
         error: None,
-        user_text: Some("hello".into()),
-        assistant_text: Some("response".into()),
-        assistant_reasoning: Some("thinking".into()),
+        user_text: Some("hi".into()),
+        assistant_text: Some("x".repeat(100)),
+        assistant_reasoning: None,
         tool_calls: vec![],
-        token_usage: Some(TokenUsage {
-            input_tokens: 10,
-            output_tokens: 20,
-            total_tokens: 30,
-        }),
+        token_usage: None,
         tool_results: vec![],
         displayed_images: vec![],
         reasoning_artifact: None,
         reasoning_producer: None,
     };
-    let msg = DaemonMessage::TurnFinalized {
+    let turn_size = turn.approx_size();
+    assert!(turn_size >= 100);
+    let msg = DaemonMessage::TurnAppended {
         session_id: 1,
-        turn_id: 2,
+        turn_id: 1,
         turn: turn.clone(),
     };
-    let frame = encode_frame(&msg).expect("encode");
-    let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
-    assert_eq!(decoded, msg);
+    assert!(msg.approx_wire_size() >= turn_size);
+    // A second copy of the same turn must not change the estimate.
+    let msg2 = DaemonMessage::TurnAppended {
+        session_id: 1,
+        turn_id: 1,
+        turn,
+    };
+    assert_eq!(msg.approx_wire_size(), msg2.approx_wire_size());
+}
+
+#[test]
+fn approx_wire_size_empty_variants_are_small_positive() {
+    // Empty/unit variants must still report a small positive fixed envelope,
+    // so lag accounting never sees a zero-byte message.
+    assert!(DaemonMessage::Pong.approx_wire_size() > 0);
+    assert!(DaemonMessage::Pong.approx_wire_size() < 128);
+    assert!(DaemonMessage::Evicted.approx_wire_size() > 0);
+    assert!(DaemonMessage::Evicted.approx_wire_size() < 128);
 }
 
 // ── InferenceError metric_label tests ─────────────────────────

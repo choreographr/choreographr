@@ -122,19 +122,15 @@ impl DaemonBridge {
 
             let result = choreo_client_core::run_daemon_reader(&mut reader, |msg| {
                 debug!(?msg, "received daemon message");
-                // Extract images from TurnAppended/TurnFinalized before passing
+                // Extract images from TurnAppended before passing
                 // to the standard handler.
-                match &msg {
-                    DaemonMessage::TurnAppended { turn, .. }
-                    | DaemonMessage::TurnFinalized { turn, .. } => {
-                        for record in &turn.displayed_images {
-                            let _ = image_event_tx.send(BridgeEvent::Image {
-                                _mime: record.metadata.mime_type.clone(),
-                                data: record.data.clone(),
-                            });
-                        }
+                if let DaemonMessage::TurnAppended { turn, .. } = &msg {
+                    for record in &turn.displayed_images {
+                        let _ = image_event_tx.send(BridgeEvent::Image {
+                            _mime: record.metadata.mime_type.clone(),
+                            data: record.data.clone(),
+                        });
                     }
-                    _ => {}
                 }
                 if let Some(event) = daemon_to_bridge_events(msg, &mut buffers, &mut tool_buffers) {
                     let _ = event_tx.send(event);
@@ -223,7 +219,6 @@ fn daemon_to_bridge_events(
             Some(BridgeEvent::ToolCallFailed { name, error })
         }
         DaemonMessage::TurnAppended { .. }
-        | DaemonMessage::TurnFinalized { .. }
         | DaemonMessage::TurnsUndone { .. }
         | DaemonMessage::TurnsRedone { .. } => {
             // Images are extracted from turns in the reader thread callback.

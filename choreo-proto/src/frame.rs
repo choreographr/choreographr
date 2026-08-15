@@ -9,8 +9,11 @@ use std::io::Cursor;
 /// version field does not match, ensuring that mixed-version peers are
 /// caught at deserialisation time.
 ///
-/// 1 = postcard era; 2 = MessagePack (named mode, rmp-serde >= 1.3).
-pub const PROTOCOL_VERSION: u8 = 2;
+/// 1 = postcard era; 2 = MessagePack (named mode, rmp-serde >= 1.3);
+/// 3 = removed `TurnFinalized` (the final-turn snapshot now rides
+/// `TurnAppended`), added `Evicted` (best-effort lag-eviction advisory).
+/// Mixed-version peers still fail fast at the version gate, unchanged.
+pub const PROTOCOL_VERSION: u8 = 3;
 /// Max serialised *payload* size, enforced identically on encode (before the
 /// 4-byte length prefix is added — [`encode_inner`]) and on decode
 /// (`read_payload`, which checks the length prefix before reading the body).

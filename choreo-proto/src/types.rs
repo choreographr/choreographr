@@ -310,6 +310,65 @@ pub struct Turn {
     pub reasoning_producer: Option<ReasoningProducer>,
 }
 
+impl Turn {
+    /// Cheap, conservative estimate of this turn's serialized byte size.
+    ///
+    /// Used by [`DaemonMessage::approx_wire_size`] (daemon-side lag
+    /// accounting). Sums the variable-size fields — text, tool-call
+    /// arguments, tool-result content, and image binary data — plus a fixed
+    /// per-record overhead, and deliberately over-estimates: it is a
+    /// threshold gauge, so over-counting only makes the lag limit slightly
+    /// conservative, while under-counting could let a genuinely lagging
+    /// client escape eviction. Fixed-size scalars (timestamps, token counts,
+    /// flags) are ignored.
+    pub fn approx_size(&self) -> usize {
+        // Fixed per-turn overhead (variant/field tags, scalars, Option
+        // markers), over-estimated a little.
+        let mut size = 32usize;
+        if let Some(s) = &self.error {
+            size += s.len();
+        }
+        if let Some(s) = &self.user_text {
+            size += s.len();
+        }
+        if let Some(s) = &self.assistant_text {
+            size += s.len();
+        }
+        if let Some(s) = &self.assistant_reasoning {
+            size += s.len();
+        }
+        for call in &self.tool_calls {
+            size += 16 + call.call_id.len() + call.name.len() + call.arguments_json.len();
+        }
+        for result in &self.tool_results {
+            size += 32 + result.call_id.len()
+                + result.name.len()
+                + result.content.len()
+                + result.invocation_description.len();
+        }
+        for image in &self.displayed_images {
+            size += 48 + image.data.len()
+                + image.metadata.mime_type.len()
+                + image.metadata.alt.as_ref().map_or(0, String::len);
+        }
+        if let Some(artifact) = &self.reasoning_artifact {
+            // Opaque round-trip payload: count the raw bytes, tagged by the
+            // variant that owns them.
+            let payload = match artifact {
+                ReasoningArtifact::ChatReasoning { bytes, .. } => bytes.len(),
+                ReasoningArtifact::AnthropicThinking(bytes)
+                | ReasoningArtifact::GoogleSignatures(bytes)
+                | ReasoningArtifact::ResponsesItems(bytes) => bytes.len(),
+            };
+            size += 16 + payload;
+        }
+        if let Some(producer) = &self.reasoning_producer {
+            size += 16 + producer.provider_slug.len() + producer.model.len();
+        }
+        size
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionStatus {
@@ -550,11 +609,6 @@ pub enum DaemonMessage {
         turn_id: u32,
         turn: Turn,
     },
-    TurnFinalized {
-        session_id: u64,
-        turn_id: u32,
-        turn: Turn,
-    },
     SessionStatusChanged {
         session_id: u64,
         status: SessionStatus,
@@ -762,6 +816,13 @@ pub enum DaemonMessage {
         error: String,
     },
     ShuttingDown,
+    /// Best-effort advisory, sent by the daemon immediately before it
+    /// disconnects a client that has fallen too far behind the streaming
+    /// frontier (lag eviction). Clients use it to distinguish an
+    /// "evicted for lag" disconnect from a daemon crash. Best-effort: the
+    /// daemon may drop the connection before this message is flushed, so
+    /// clients must not treat its absence as meaningful.
+    Evicted,
 }
 
 impl DaemonMessage {
@@ -779,7 +840,6 @@ impl DaemonMessage {
             | Self::SessionDeleted { session_id }
             | Self::SessionDeleteFailed { session_id, .. }
             | Self::TurnAppended { session_id, .. }
-            | Self::TurnFinalized { session_id, .. }
             | Self::TurnsUndone { session_id, .. }
             | Self::TurnsRedone { session_id, .. }
             | Self::Started { session_id, .. }
@@ -823,7 +883,224 @@ impl DaemonMessage {
             | Self::ModelsRefreshed { .. }
             | Self::ModelsRefreshFailed { .. }
             | Self::CatalogUpdated { .. }
-            | Self::ShuttingDown => None,
+            | Self::ShuttingDown
+            | Self::Evicted => None,
+        }
+    }
+}
+
+/// Byte length of an `Option<String>`'s payload (0 when None). Shared by
+/// [`DaemonMessage::approx_wire_size`] so every optional string field is
+/// counted the same way.
+fn option_str_len(s: &Option<String>) -> usize {
+    s.as_ref().map_or(0, String::len)
+}
+
+/// Byte length of a `SessionStatus` payload (a small enum; only the
+/// `ToolCall(String)` and `Retrying` variants carry data).
+fn session_status_size(status: &SessionStatus) -> usize {
+    match status {
+        SessionStatus::ToolCall(name) => 8 + name.len(),
+        SessionStatus::Retrying { .. } => 16,
+        SessionStatus::Sleeping | SessionStatus::Inactive | SessionStatus::Inference => 4,
+    }
+}
+
+/// Byte length of a `ReasoningCapability` payload.
+fn reasoning_capability_size(cap: &ReasoningCapability) -> usize {
+    16 + cap.available_effort_levels.iter().map(String::len).sum::<usize>()
+}
+
+impl DaemonMessage {
+    /// Cheap, conservative estimate of this message's serialized byte size.
+    ///
+    /// Used by the daemon's lag accounting (a later phase) to gauge how many
+    /// bytes a slow client has fallen behind the streaming frontier. It
+    /// deliberately over-estimates rather than serializes: the accounting is
+    /// a threshold gauge, so a slightly-too-big estimate can only trigger
+    /// eviction a little early — never let a genuinely lagging client slip
+    /// past the limit. O(1) in message count — it sums the variable-size
+    /// fields (strings, byte buffers, vecs, turn maps) plus a fixed
+    /// per-variant envelope overhead, and ignores fixed-size scalars.
+    pub fn approx_wire_size(&self) -> usize {
+        // Fixed envelope overhead per variant: the variant tag, MessagePack
+        // field-name keys, and length prefixes. Over-estimating by a fixed
+        // amount is fine — it only makes the eviction threshold slightly
+        // conservative.
+        const OVERHEAD: usize = 48;
+        match self {
+            Self::SessionCreated {
+                title,
+                working_dir,
+                account_name,
+                selected_model,
+                reasoning_effort,
+                ..
+            } => {
+                OVERHEAD
+                    + 8
+                    + option_str_len(title)
+                    + option_str_len(working_dir)
+                    + option_str_len(account_name)
+                    + option_str_len(selected_model)
+                    + option_str_len(reasoning_effort)
+            }
+            Self::Sessions { sessions } => {
+                OVERHEAD
+                    + sessions
+                        .iter()
+                        .map(|s| {
+                            // Fixed per-summary overhead (scalars, status
+                            // tag, flags) + the variable-size fields.
+                            64 + option_str_len(&s.title)
+                                + option_str_len(&s.selected_model)
+                                + option_str_len(&s.reasoning_effort)
+                                + 8 // parent_session_id: Option<u64>
+                                + option_str_len(&s.working_dir)
+                                + option_str_len(&s.account_name)
+                                + s.active_tool_groups.iter().map(String::len).sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+            Self::SessionAttached { .. } => OVERHEAD + 8,
+            Self::SessionState {
+                title,
+                selected_model,
+                working_dir,
+                turns,
+                active_tool_groups,
+                reasoning_effort,
+                status,
+                reasoning_capability,
+                ..
+            } => {
+                OVERHEAD
+                    + 8
+                    + option_str_len(title)
+                    + option_str_len(selected_model)
+                    + 8 // parent_session_id: Option<u64>
+                    + option_str_len(working_dir)
+                    + option_str_len(reasoning_effort)
+                    + active_tool_groups.iter().map(String::len).sum::<usize>()
+                    + turns
+                        .iter()
+                        .map(|(id, turn)| 8 + *id as usize + turn.approx_size())
+                        .sum::<usize>()
+                    + session_status_size(status)
+                    + reasoning_capability
+                        .as_ref()
+                        .map_or(0, reasoning_capability_size)
+            }
+            Self::TurnAppended { turn, .. } => OVERHEAD + 12 + turn.approx_size(),
+            Self::SessionStatusChanged { status, .. } => {
+                OVERHEAD + 12 + session_status_size(status)
+            }
+            Self::SessionFailed {
+                operation, error, ..
+            } => OVERHEAD + 8 + operation.len() + error.len(),
+            Self::Started { .. } => OVERHEAD + 16,
+            Self::ToolCallStarted {
+                call_id,
+                tool_name,
+                arguments_json,
+                invocation_description,
+                ..
+            } => {
+                OVERHEAD
+                    + 16
+                    + call_id.len()
+                    + tool_name.len()
+                    + arguments_json.len()
+                    + invocation_description.len()
+            }
+            Self::ToolCallFinished {
+                call_id, tool_name, ..
+            } => OVERHEAD + 16 + call_id.len() + tool_name.len(),
+            Self::ToolResultChunk { data, .. } => OVERHEAD + 16 + data.len(),
+            Self::ToolCallFailed {
+                call_id,
+                tool_name,
+                error,
+                ..
+            } => OVERHEAD + 24 + call_id.len() + tool_name.len() + error.len(),
+            Self::TokenUsageUpdate { .. } => OVERHEAD + 16,
+            Self::LiveOutputTokenCount { .. } => OVERHEAD + 16,
+            Self::OutputChunk { stream, data, .. } => {
+                let stream_len = match stream {
+                    OutputStream::Answer | OutputStream::Reasoning => 4,
+                };
+                OVERHEAD + 16 + stream_len + data.len()
+            }
+            Self::Done { .. } => OVERHEAD + 16,
+            Self::Failed { error, .. } => OVERHEAD + 12 + error.len(),
+            Self::Cancelled { .. } => OVERHEAD + 12,
+            Self::Pong => OVERHEAD,
+            Self::Models {
+                models,
+                selected_model,
+            } => {
+                OVERHEAD
+                    + models.iter().map(String::len).sum::<usize>()
+                    + option_str_len(selected_model)
+            }
+            Self::ModelsFailed { error } => OVERHEAD + error.len(),
+            Self::ModelsRefreshed { .. } => OVERHEAD + 16,
+            Self::ModelsRefreshFailed { error } => OVERHEAD + error.len(),
+            Self::CatalogUpdated { providers } => {
+                OVERHEAD
+                    + providers
+                        .iter()
+                        .map(|p| 16 + p.slug.len() + p.display_name.len())
+                        .sum::<usize>()
+            }
+            Self::ModelSelected { model, .. } => OVERHEAD + 8 + model.len(),
+            Self::ModelSelectionFailed { model, error, .. } => {
+                OVERHEAD + 16 + model.len() + error.len()
+            }
+            Self::Unlocked | Self::Locked | Self::ShuttingDown | Self::Evicted => OVERHEAD,
+            Self::LockedError { error } => OVERHEAD + error.len(),
+            Self::CredentialAdded { service } => OVERHEAD + service.len(),
+            Self::CredentialAddFailed { service, error } => {
+                OVERHEAD + 16 + service.len() + error.len()
+            }
+            Self::CredentialRemoved { service } => OVERHEAD + service.len(),
+            Self::CredentialRemoveFailed { service, error } => {
+                OVERHEAD + 16 + service.len() + error.len()
+            }
+            Self::SessionDeleted { .. } => OVERHEAD + 8,
+            Self::SessionDeleteFailed { error, .. } => OVERHEAD + 16 + error.len(),
+            Self::TurnsUndone { turn_ids, .. } => OVERHEAD + 8 + turn_ids.len() * 4,
+            Self::TurnsRedone { turns, .. } => {
+                OVERHEAD
+                    + 8
+                    + turns
+                        .iter()
+                        .map(|(id, turn)| 8 + *id as usize + turn.approx_size())
+                        .sum::<usize>()
+            }
+            Self::Credential { service, key } => OVERHEAD + service.len() + option_str_len(key),
+            Self::AccountAdded { name } => OVERHEAD + name.len(),
+            Self::AccountAddFailed { name, error } => OVERHEAD + 16 + name.len() + error.len(),
+            Self::AccountRemoved { name } => OVERHEAD + name.len(),
+            Self::AccountRemoveFailed { name, error } => {
+                OVERHEAD + 16 + name.len() + error.len()
+            }
+            Self::Accounts { accounts } => {
+                OVERHEAD
+                    + accounts
+                        .iter()
+                        .map(|a| 32 + a.name.len() + a.provider.len())
+                        .sum::<usize>()
+            }
+            Self::AccountListFailed { error } => OVERHEAD + error.len(),
+            Self::SessionAccountSet { account, .. } => OVERHEAD + 8 + account.len(),
+            Self::ContextWindowResolved { .. } => OVERHEAD + 12,
+            Self::SessionWorkingDirSet { path, .. } => OVERHEAD + 8 + option_str_len(path),
+            Self::SessionTitleSet { title, .. } => OVERHEAD + 8 + title.len(),
+            Self::ReasoningEffortSet { effort, .. } => OVERHEAD + 8 + effort.len(),
+            Self::ReasoningEffortSetFailed { effort, error, .. } => {
+                OVERHEAD + 16 + effort.len() + error.len()
+            }
         }
     }
 }

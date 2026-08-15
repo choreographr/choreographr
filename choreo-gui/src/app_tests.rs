@@ -124,7 +124,7 @@ fn apply_daemon_turn_appended_with_image() {
     };
 
     dispatch_daemon_message(
-        &DaemonMessage::TurnFinalized {
+        &DaemonMessage::TurnAppended {
             session_id: 1,
             turn_id: 1,
             turn,
