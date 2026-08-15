@@ -636,27 +636,45 @@ pub(crate) fn render_turn_lines(
 ) -> RenderedTurnLines {
     let mut all_lines: Vec<Line<'static>> = Vec::new();
 
-    // ── Error block ──────────────────────────────────────────
+    // ── User text block (green accent) ───────────────────────
+    // Rendered first so a failed request's transcript still shows what the
+    // user asked for above the error that stopped it.
+    if let Some(ref text) = turn.user_text {
+        let body = markdown_lines(text, content_width);
+        let timestamp_ms = Some(turn.created_at.as_millis());
+        let margin = add_margin_lines(body, content_width, Color::Green, timestamp_ms);
+        all_lines.extend(margin.0);
+    }
+
+    // ── Error block (red) ────────────────────────────────────
+    // A request-level failure (provider 4xx/5xx, network error, deadline)
+    // renders as a red block.  The history Paragraph is non-wrapping — an
+    // unwrapped line would clip at the viewport edge, truncating long error
+    // JSON mid-token — so the text is pre-wrapped at the content width via
+    // the same plain-text wrapper the tool output uses (preserving every
+    // character verbatim); `lines_height`'s div_ceil math then sizes the
+    // block correctly.
     if let Some(ref err) = turn.error {
         let header = format!("Error: {err}");
-        let lines = vec![Line::from(Span::styled(
-            header,
-            Style::default().fg(Color::Red),
-        ))];
+        let lines: Vec<Line<'static>> = plain_text_lines(&header, content_width)
+            .into_iter()
+            .map(|line| {
+                // `plain_text_lines` emits default-styled spans; repaint the
+                // whole line red so every continuation matches the header.
+                let text: String = line
+                    .spans
+                    .into_iter()
+                    .map(|s| s.content.to_string())
+                    .collect();
+                Line::from(Span::styled(text, Style::default().fg(Color::Red)))
+            })
+            .collect();
         all_lines.extend(lines);
         return RenderedTurnLines {
             lines: all_lines,
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
         };
-    }
-
-    // ── User text block (green accent) ───────────────────────
-    if let Some(ref text) = turn.user_text {
-        let body = markdown_lines(text, content_width);
-        let timestamp_ms = Some(turn.created_at.as_millis());
-        let margin = add_margin_lines(body, content_width, Color::Green, timestamp_ms);
-        all_lines.extend(margin.0);
     }
 
     // ── Assistant response block (blue accent) ───────────────
@@ -2612,6 +2630,87 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Error: something went wrong"));
+    }
+
+    #[test]
+    fn render_turn_lines_error_wraps_long_message() {
+        // The error block is drawn into a non-wrapping history Paragraph, so
+        // long error text (e.g. provider JSON) must be pre-wrapped at the
+        // content width — otherwise it clips at the viewport edge mid-token.
+        let long = "client error (402): request failed with status 402: \
+{\"error\":{\"message\":\"Insufficient Balance\",\"type\":\"unknown_error\",\"code\":\"invalid_request_error\"}}";
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: Some(long.to_string()),
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let rendered = render_turn_lines(&turn, 40, 45, false, &[]);
+        assert!(
+            rendered.lines.len() > 1,
+            "a long error must wrap into multiple lines, got {} lines",
+            rendered.lines.len()
+        );
+        // Every rendered line fits the content width (the non-wrapping
+        // Paragraph's invariant), and concatenating them reproduces the
+        // original header text verbatim — nothing clipped, nothing dropped.
+        for line in &rendered.lines {
+            assert!(line.width() <= 40, "line overflows: {line:?}");
+        }
+        let joined: String = rendered
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<String>();
+        assert_eq!(joined, format!("Error: {long}"));
+        assert!(joined.contains("invalid_request_error"));
+    }
+
+    #[test]
+    fn render_turn_lines_error_shows_user_text_above() {
+        // A failed request's turn carries the user's message plus the error.
+        // The transcript must show both — the user text first, then the red
+        // error block — so the failure has its context.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: Some("Insufficient Balance".into()),
+            user_text: Some("hi".into()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
+        let texts: Vec<String> = rendered.lines.iter().map(|l| l.to_string()).collect();
+        let user_idx = texts
+            .iter()
+            .position(|t| t.contains("hi"))
+            .expect("user text");
+        let error_idx = texts
+            .iter()
+            .position(|t| t.contains("Error: Insufficient Balance"))
+            .expect("error block");
+        assert!(
+            user_idx < error_idx,
+            "user text must render above the error block"
+        );
+        assert!(
+            rendered.reasoning_header_idx.is_none() && rendered.tool_result_header_idxs.is_empty(),
+            "an error turn has no reasoning/tool-result metadata"
+        );
     }
 
     #[test]
