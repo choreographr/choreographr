@@ -144,11 +144,14 @@ binaries at the **top level** (no `bin/` prefix)
 plus both service files, exec bits preserved — `install.sh` and the Homebrew
 formula reference them directly.
 
-**All shipped binaries are stripped and thin-LTO'd.** The workspace
-`[profile.release]` sets `strip = "symbols"` and `lto = "thin"` (root
-`Cargo.toml`), so every artifact — tarball, `.deb`, `.rpm`, Homebrew, AUR —
-ships binaries without a symbol table (~22% smaller; ~10% smaller tarball)
-with cross-crate optimization. Panic messages keep their `file:line` locations
+**All shipped binaries are stripped.** The workspace `[profile.release]` sets
+`strip = "symbols"` (root `Cargo.toml`), so every artifact — tarball, `.deb`,
+`.rpm`, Homebrew, AUR — ships binaries without a symbol table (~22% smaller;
+~10% smaller tarball). Thin LTO is NOT enabled: `lto = "thin"` was removed
+from the profile because it made every release link (and thus the default
+local `cargo build --release`) slow and memory-hungry; if a release ever wants
+cross-crate optimization back, set `CARGO_PROFILE_RELEASE_LTO=thin` in
+`scripts/release.sh`. Panic messages keep their `file:line` locations
 (compiled-in string constants via `#[track_caller]`); only
 `RUST_BACKTRACE=1` symbolization is lost, and the daemon emits no backtraces.
 `panic = "abort"` is deliberately NOT set: the daemon isolates

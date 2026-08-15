@@ -64,9 +64,10 @@ just ci
 just preflight               # checks cargo + zig, notes nextest
 #
 # Note: `just release` raises the fd soft limit itself (release.sh runs
-# `ulimit -n 65536` — thin-LTO linking opens thousands of files and dies
-# with ProcessFdQuotaExceeded at the default 1024). If your shell refuses
-# the raise, run it under a raised limit: `ulimit -n 65536 && just release`.
+# `ulimit -n 65536` — linking the four large binaries can open thousands of
+# files and die with ProcessFdQuotaExceeded at the default 1024). If your
+# shell refuses the raise, run it under a raised limit:
+# `ulimit -n 65536 && just release`.
 ```
 
 ---

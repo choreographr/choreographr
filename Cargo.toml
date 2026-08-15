@@ -136,8 +136,8 @@ dependent-version = "fix"
 # .cargo/config.toml; nightly-only, the repo is pinned via rust-toolchain.toml):
 # - -Zshare-generics=yes: emit each generic monomorphization once per crate
 #   graph instead of once per using crate — the big dev-build win. Deliberately
-#   dev-ONLY: in release, thin LTO already dedups generic code at link time,
-#   and share-generics has a history of codegen bugs under optimization.
+#   dev-ONLY: it has a history of codegen bugs under optimization, and with no
+#   LTO in the release profile there is no link-time dedup to compare against.
 # - -Zunstable-options + --jobs-frontend=16: parallelize the rustc query
 #   frontend across 16 threads (replaces the deprecated -Zthreads).
 [profile.dev]
@@ -145,7 +145,7 @@ debug = "line-tables-only"
 rustflags = ["-Zunstable-options", "--jobs-frontend=16", "-Zshare-generics=yes"]
 
 # Release profile for shipped binaries (all four artifact types build with
-# `cargo build --release`). Two deliberate settings, one deliberate omission:
+# `cargo build --release`). One deliberate setting, one deliberate omission:
 #
 # - strip = "symbols": cuts shipped size ~22% (tarball ~10%). Panic messages
 #   keep their file:line locations (compiled-in string constants via
@@ -153,11 +153,6 @@ rustflags = ["-Zunstable-options", "--jobs-frontend=16", "-Zshare-generics=yes"]
 #   in the daemon emits backtraces. Keep .deb/.rpm/tarball uniform: the RPM
 #   path disables brp post-install processing (__os_install_post %{nil}) so
 #   rpm never re-processes these already-stripped binaries.
-# - lto = "thin": cross-crate optimization at a fraction of fat-LTO's build
-#   time. Works with the wild linker (used on this machine via
-#   -fuse-ld=wild, see ~/.cargo/config.toml) through its linker-plugin LTO
-#   support, which wild lists as functional-with-known-issues — if a future
-#   wild regression breaks linking, drop back to lto = false.
 # - NO panic = "abort": the daemon isolates request-worker panics with
 #   catch_unwind (sessions.rs) — abort would turn any single request panic
 #   into a whole-daemon crash.
@@ -165,7 +160,6 @@ rustflags = ["-Zunstable-options", "--jobs-frontend=16", "-Zshare-generics=yes"]
 # rustflags: -Zunstable-options + --jobs-frontend=16 (same parallel-frontend
 # flag as dev). No -Zshare-generics here — see the dev-profile note above.
 [profile.release]
-lto = "thin"
 strip = "symbols"
 rustflags = ["-Zunstable-options", "--jobs-frontend=16"]
 

@@ -88,10 +88,11 @@ bump checklist. The manual steps that must stay in lockstep:
 
 ## Notes
 
-- **Binaries are stripped and thin-LTO'd.** The workspace `[profile.release]`
-  sets `strip = "symbols"` and `lto = "thin"` (root `Cargo.toml`), so the
-  tarball, `.deb`, and `.rpm` all ship stripped binaries (~22% smaller) with
-  cross-crate optimization. Panic `file:line` locations survive (compiled-in
+- **Binaries are stripped.** The workspace `[profile.release]` sets
+  `strip = "symbols"` (root `Cargo.toml`), so the tarball, `.deb`, and `.rpm`
+  all ship stripped binaries (~22% smaller). (Thin LTO was removed from the
+  profile because it made release links slow — see `ARCHITECTURE.md`.) Panic
+  `file:line` locations survive (compiled-in
   constants); only `RUST_BACKTRACE=1` symbolization is lost. `panic = "abort"`
   is deliberately NOT set (the daemon catches request-worker panics with
   `catch_unwind`). The RPM spec's `__os_install_post %{nil}` stays so brp
