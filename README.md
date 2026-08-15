@@ -323,8 +323,9 @@ Unix socket `/tmp/Choreographr.sock` and stores its data under
 
 Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.91** — and a [Zig toolchain](https://ziglang.org/) (`brew install zig`), which `choreographr` needs to compile the `zlob` glob/walker dependency.
 
+The repo pins **nightly** via `rust-toolchain.toml` (needed for the per-profile compiler flags in the root `Cargo.toml`). `rustup` auto-installs the pinned channel the first time you run `cargo` in the checkout:
+
 ```bash
-rustup install stable
 brew install zig
 cargo build --release
 ```

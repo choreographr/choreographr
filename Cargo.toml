@@ -126,6 +126,24 @@ description = "Agentic coding assistant — daemon, TUI, and bridges"
 [workspace.metadata.release]
 dependent-version = "fix"
 
+# Dev profile (the default for `cargo build` / `cargo run` / `cargo test`).
+# debug = "line-tables-only": emit line tables (file:line for backtraces)
+# without full debug info — cuts compile time and .rlib/.bin size vs the
+# default full debuginfo while still giving usable backtraces when things
+# go wrong during development.
+#
+# rustflags (requires the [unstable] profile-rustflags opt-in in
+# .cargo/config.toml; nightly-only, the repo is pinned via rust-toolchain.toml):
+# - -Zshare-generics=yes: emit each generic monomorphization once per crate
+#   graph instead of once per using crate — the big dev-build win. Deliberately
+#   dev-ONLY: in release, thin LTO already dedups generic code at link time,
+#   and share-generics has a history of codegen bugs under optimization.
+# - -Zunstable-options + --jobs-frontend=16: parallelize the rustc query
+#   frontend across 16 threads (replaces the deprecated -Zthreads).
+[profile.dev]
+debug = "line-tables-only"
+rustflags = ["-Zunstable-options", "--jobs-frontend=16", "-Zshare-generics=yes"]
+
 # Release profile for shipped binaries (all four artifact types build with
 # `cargo build --release`). Two deliberate settings, one deliberate omission:
 #
@@ -143,17 +161,13 @@ dependent-version = "fix"
 # - NO panic = "abort": the daemon isolates request-worker panics with
 #   catch_unwind (sessions.rs) — abort would turn any single request panic
 #   into a whole-daemon crash.
-# Dev profile (the default for `cargo build` / `cargo run` / `cargo test`).
-# debug = "line-tables-only": emit line tables (file:line for backtraces)
-# without full debug info — cuts compile time and .rlib/.bin size vs the
-# default full debuginfo while still giving usable backtraces when things
-# go wrong during development.
-[profile.dev]
-debug = "line-tables-only"
-
+#
+# rustflags: -Zunstable-options + --jobs-frontend=16 (same parallel-frontend
+# flag as dev). No -Zshare-generics here — see the dev-profile note above.
 [profile.release]
 lto = "thin"
 strip = "symbols"
+rustflags = ["-Zunstable-options", "--jobs-frontend=16"]
 
 [workspace.dependencies]
 anyhow = "1"

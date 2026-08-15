@@ -1,0 +1,9 @@
+# Pin the workspace to the nightly Rust toolchain. Nightly is required for
+# the per-profile `rustflags` in the root Cargo.toml ([unstable]
+# profile-rustflags in .cargo/config.toml) and for the nightly-only -Z flags
+# they carry (-Zshare-generics in dev, --jobs-frontend in dev and release).
+#
+# `channel = "nightly"` tracks the latest nightly; if a nightly regression
+# breaks the build, pin a date instead (e.g. nightly-2026-08-14).
+[toolchain]
+channel = "nightly"

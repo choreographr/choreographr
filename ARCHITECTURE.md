@@ -3020,6 +3020,17 @@ declared via `rust-version` in every crate manifest (inherited from
 `[workspace.package]` in the root `Cargo.toml`). Keep code and dependencies
 within this floor; the CI MSRV job enforces it.
 
+**Building requires nightly.** `rust-toolchain.toml` pins the workspace to
+the nightly channel (rustup auto-installs it on first `cargo` run). Nightly
+enables the per-profile `rustflags` in the root `Cargo.toml` via the
+unstable `profile-rustflags` feature (opted in under `[unstable]` in
+`.cargo/config.toml`): `-Zshare-generics=yes` in `[profile.dev]` only, and
+`-Zunstable-options --jobs-frontend=16` (parallel rustc frontend, the
+replacement for the deprecated `-Zthreads`) in both dev and release.
+Profile rustflags replace `[build]` rustflags but concatenate with
+`[target.'cfg(...)']` rustflags, so per-machine linker flags (e.g. the wild
+linker in `~/.cargo/config.toml`) still apply.
+
 The `choreo-daemon` crate depends on `zlob` (a Zig-implemented glob and
 gitignore-aware directory walker used by `grep`, `find`, `delete_files`, and
 pathspec matching). Building it therefore requires the **Zig toolchain** on

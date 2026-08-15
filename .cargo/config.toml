@@ -30,3 +30,14 @@ test-lean = "nextest run --workspace"
 test-integration = "nextest run --workspace --all-features --run-ignored only"
 # everything: unit + integration in one pass
 test-all = "nextest run --workspace --all-features --run-ignored all"
+
+# Per-profile rustflags (unstable Cargo feature, nightly-only — the repo is
+# pinned to nightly via rust-toolchain.toml). This is what lets the root
+# Cargo.toml scope compiler flags by profile: -Zshare-generics=yes in
+# [profile.dev] only, --jobs-frontend=16 in both dev and release. The opt-in
+# lives here (config) rather than on the CLI so plain `cargo build` / `cargo
+# test` pick it up. Note: profile rustflags replace [build] rustflags but are
+# concatenated with [target.'cfg(...)'] rustflags, so the wild-linker flags
+# in ~/.cargo/config.toml still apply.
+[unstable]
+profile-rustflags = true
