@@ -228,6 +228,12 @@ pub fn main() -> anyhow::Result<()> {
         client_writers: HashMap::new(),
         activity_subscribers: std::collections::HashMap::new(),
         client_subscribed_sessions: std::collections::HashMap::new(),
+        // One daemon-wide lag counter shared by every connection's sink and
+        // every session thread (see `broadcast::SubscriberSink`). The accept
+        // path clones it so `register_client_writer` can hand it to the
+        // connection threads' writers.
+        global_lag: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        lag_limits: crate::broadcast::LagLimits::default(),
         model_cache: HashMap::new(),
         mcp_manager,
         // Populated by `run_server`, which spawns the maintenance thread

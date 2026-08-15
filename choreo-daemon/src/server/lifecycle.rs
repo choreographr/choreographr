@@ -297,6 +297,13 @@ pub fn run_server(
         });
     }
 
+    // Clone the daemon-wide lag counter for the accept paths BEFORE `state`
+    // moves into the command-loop thread below: `register_client_writer`
+    // hands it to every connection's writer thread so dequeue-side accounting
+    // decrements the SAME counter the command loop and session threads
+    // increment on enqueue.
+    let global_lag = Arc::clone(&state.global_lag);
+
     // Daemon command handler thread.
     let cmd_handle = thread::spawn(move || {
         loop {
@@ -397,6 +404,10 @@ pub fn run_server(
         // Arc for the Unix accept path, so the shared cap is enforced across
         // both transports.
         let conn_count = Arc::clone(&conn_count);
+        // Clone the lag counter for the TCP accept thread too — the main
+        // thread keeps the original for the Unix accept path, and each
+        // connection thread gets its own clone from here.
+        let global_lag_tcp = Arc::clone(&global_lag);
         tcp_accept_handle = Some(thread::spawn(move || {
             loop {
                 if tcp_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -429,6 +440,7 @@ pub fn run_server(
                         let tx = daemon_tx.clone();
                         let sk_bytes = *transport_sk.as_bytes();
                         let acl = Arc::clone(&acl);
+                        let global_lag = Arc::clone(&global_lag_tcp);
                         // Register the writer channel BEFORE the handshake (see
                         // register_client_writer): the main thread joins this
                         // accept thread before sending the shutdown broadcast,
@@ -461,7 +473,7 @@ pub fn run_server(
                                 }
                             };
                             if let Err(e) = crate::server::connection::tcp_client_thread(
-                                noise, tx, client_id, writer_tx, writer_rx,
+                                noise, tx, client_id, writer_tx, writer_rx, global_lag,
                             ) {
                                 error!(error = %e, "TCP client error");
                             }
@@ -505,6 +517,7 @@ pub fn run_server(
                 };
                 crate::metrics::record_connection_accepted();
                 let tx = daemon_tx.clone();
+                let global_lag = Arc::clone(&global_lag);
                 // Register the writer channel with the daemon BEFORE spawning
                 // the connection thread — see register_client_writer for why
                 // this closes the "connection accepted concurrently with
@@ -519,7 +532,7 @@ pub fn run_server(
                         // thread exits, even on panic.
                         let _slot = slot;
                         if let Err(e) = crate::server::connection::client_thread(
-                            stream, tx, client_id, writer_tx, writer_rx,
+                            stream, tx, client_id, writer_tx, writer_rx, global_lag,
                         ) {
                             error!(error = %e, "client error");
                         }

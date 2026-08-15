@@ -3372,6 +3372,8 @@ mod tests {
             tool_registry: ToolRegistry::new().build(),
             daemon_tx,
             max_turns: 0,
+            lag_limits: crate::broadcast::LagLimits::default(),
+            global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let mut session = SessionState::empty();
         let (turn_id, _) = session.start_turn(Some("hello".into()));
@@ -3430,6 +3432,8 @@ mod tests {
             tool_registry: ToolRegistry::new().build(),
             daemon_tx,
             max_turns: 0,
+            lag_limits: crate::broadcast::LagLimits::default(),
+            global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let provider = make_failing_provider();
         let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
@@ -3475,7 +3479,10 @@ mod tests {
                 saw_error_appended = true;
             }
         }
-        assert!(saw_error_appended, "expected a TurnAppended broadcast carrying the failure");
+        assert!(
+            saw_error_appended,
+            "expected a TurnAppended broadcast carrying the failure"
+        );
     }
 
     // -- resolve_reasoning_effort tests ------------------------------------
@@ -3780,6 +3787,8 @@ mod tests {
             tool_registry: registry,
             daemon_tx,
             max_turns: 0,
+            lag_limits: crate::broadcast::LagLimits::default(),
+            global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let (result, cancelled, _image) = execute_tool_with_timeout(
             &tool_call,

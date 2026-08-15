@@ -30,7 +30,7 @@ mod backend {
         api_errors_total: IntCounterVec,
         connections_total: IntCounter,
         turns_total: IntCounterVec,
-        broadcast_dropped_total: IntCounterVec,
+        evictions_total: IntCounter,
         request_duration_seconds: HistogramVec,
         tool_execution_duration_seconds: HistogramVec,
         api_call_duration_seconds: HistogramVec,
@@ -84,10 +84,9 @@ mod backend {
                 "Total number of agent loop turns by model",
                 &["model"]
             )?,
-            broadcast_dropped_total: prometheus::register_int_counter_vec!(
-                "choreo_broadcast_dropped_total",
-                "Messages dropped because a subscriber's writer buffer was full, by broadcast path",
-                &["path"]
+            evictions_total: prometheus::register_int_counter!(
+                "choreo_evictions_total",
+                "Total number of lagging clients evicted (disconnected) because their queue fell too far behind"
             )?,
             request_duration_seconds: prometheus::register_histogram_vec!(
                 "choreo_request_duration_seconds",
@@ -215,16 +214,14 @@ mod backend {
         }
     }
 
-    /// Count a message dropped because a subscriber's writer buffer was full.
-    ///
-    /// `path` identifies the fan-out that dropped it ("summary", "activity",
-    /// "session", "attach") so a wedged subscriber is observable via `/metrics`
-    /// even though the drop itself is deliberately silent in the logs (one line
-    /// per dropped message would be noise under a fast burst).  This is a no-op
-    /// when metrics were never initialized (e.g. unit-test binaries).
-    pub fn record_broadcast_dropped(path: &str) {
+    /// Count a lag-eviction: a client disconnected because its queue (or the
+    /// daemon-wide backlog) crossed the lag limits.  The old drop-on-full
+    /// policy is gone, so evictions are the only lossy event left and stay
+    /// observable via `/metrics`.  This is a no-op when metrics were never
+    /// initialized (e.g. unit-test binaries).
+    pub fn record_eviction() {
         if let Some(m) = METRICS.get() {
-            m.broadcast_dropped_total.with_label_values(&[path]).inc();
+            m.evictions_total.inc();
         }
     }
 
@@ -365,20 +362,12 @@ mod backend {
 
         #[serial(metrics)]
         #[test]
-        fn test_broadcast_dropped_increments_counter() {
+        fn test_eviction_increments_counter() {
             ensure_init();
             let m = METRICS.get().unwrap();
-            let before = m
-                .broadcast_dropped_total
-                .with_label_values(&["summary"])
-                .get();
-            record_broadcast_dropped("summary");
-            assert_eq!(
-                m.broadcast_dropped_total
-                    .with_label_values(&["summary"])
-                    .get(),
-                before + 1
-            );
+            let before = m.evictions_total.get();
+            record_eviction();
+            assert_eq!(m.evictions_total.get(), before + 1);
         }
 
         #[serial(metrics)]
@@ -397,7 +386,7 @@ mod backend {
             record_turn("test_model");
             record_client_connected();
             record_connection_accepted();
-            record_broadcast_dropped("summary");
+            record_eviction();
             // Gather and encode all metrics via the text encoder, verify
             // that the output contains expected HELP/TYPE lines.
             let metric_families = prometheus::gather();
@@ -410,8 +399,8 @@ mod backend {
             assert!(output.contains("# TYPE choreo_sessions_active gauge"));
             assert!(output.contains("# HELP choreo_requests_total"));
             assert!(output.contains("# TYPE choreo_requests_total counter"));
-            assert!(output.contains("# HELP choreo_broadcast_dropped_total"));
-            assert!(output.contains("# TYPE choreo_broadcast_dropped_total counter"));
+            assert!(output.contains("# HELP choreo_evictions_total"));
+            assert!(output.contains("# TYPE choreo_evictions_total counter"));
             assert!(output.contains("# HELP choreo_request_duration_seconds"));
             assert!(output.contains("# TYPE choreo_request_duration_seconds histogram"));
         }
@@ -458,7 +447,7 @@ mod backend {
 
     pub fn record_api_error(_model: &str, _error_type: &str) {}
 
-    pub fn record_broadcast_dropped(_path: &str) {}
+    pub fn record_eviction() {}
 
     /// No-op: the daemon refuses `--metrics-addr` at startup when the feature
     /// is off, so this should never run — warn loudly if something calls it.

@@ -2,182 +2,170 @@
 //!
 //! The daemon thread (summary + all-activity broadcasts in `daemon.rs`) and
 //! the session threads (per-session `broadcast()` in `sessions.rs`) all fan a
-//! message out to a map of per-client `SyncSender` subscribers.  They must
-//! apply the SAME policy to a subscriber that cannot keep up, or behavior
-//! drifts between paths (one loop evicting a client another loop keeps, one
-//! blocking while another drops, etc.).
+//! message out to a map of per-client [`SubscriberSink`]s.  They must apply
+//! the SAME policy to a subscriber that cannot keep up, or behavior drifts
+//! between paths (one loop evicting a client another loop keeps, one blocking
+//! while another drops, etc.).
 //!
-//! The shared policy, applied by [`try_send_keep_on_full`]:
+//! The shared policy is **lossless delivery with lag-based eviction**:
 //!
-//! * buffer full   -> drop the message, KEEP the subscriber.  A
-//!   momentarily-full buffer is a transient backpressure condition; the
-//!   subscriber (e.g. the TUI) is still connected and may catch up, and the
-//!   final message of a turn (`ToolCallFinished` + `SessionMessageAppended`)
-//!   delivers the complete content anyway.  Evicting here would permanently
-//!   blind a subscriber that never re-subscribes (the TUI registers for all
-//!   activity exactly once at startup).  Each drop is counted by
-//!   `metrics::record_broadcast_dropped` under the caller's `path` label, so
-//!   a wedged subscriber stays observable via `/metrics` without log noise.
-//! * receiver gone -> evict the subscriber.  A disconnected client is dead;
-//!   keeping its sender would leak the entry and burn a `try_send` + clone on
-//!   every future broadcast.
+//! * Every subscriber's writer channel is UNBOUNDED, so an enqueue can never
+//!   be `Full` — the daemon NEVER drops a broadcast message.  A slow client
+//!   can never stall a session thread or the daemon command loop: `send` on
+//!   an unbounded crossbeam channel never blocks.
+//! * Delivery is guaranteed, in-order (channels are FIFO), exactly-once for
+//!   every connected non-evicted client.
+//! * A client that falls too far behind is EVICTED (disconnected): the
+//!   per-client in-flight byte counter crossing [`LagLimits::per_client_cap`]
+//!   or the daemon-wide total crossing [`LagLimits::global_budget`] returns
+//!   [`EnqueueOutcome::ClientOverLag`]/[`EnqueueOutcome::GlobalOverBudget`]
+//!   and the caller triggers the eviction.  The client reconciles on
+//!   reconnect via the attach/snapshot path (client-side reconnect is a
+//!   later phase).
+//! * receiver gone -> the client is dead; the caller drops the subscriber.
 //!
-//! Crucially the policy NEVER blocks: `try_send` returns immediately, so a
-//! slow subscriber can never stall the daemon's single-threaded command loop
-//! or a session thread.
-//!
-//! The shutdown fan-out (`send_shutting_down_bounded`) is the one deliberate
-//! exception to drop-on-full: `ShuttingDown` is the notify-before-EOF
-//! guarantee, so a momentarily-full writer channel is polled (round-robin,
-//! bounded) until the writer drains instead of being silently dropped.  It
-//! still never *blocks* on the writer — only the poll interval is slept.
+//! The thresholds are SOFT bounds: the crossing message itself is still
+//! enqueued (lossless), and concurrent producers can overshoot the cap by at
+//! most one message's worth of bytes before the eviction command is
+//! processed.  That is deliberate — an exact hard cutoff would require a
+//! blocking or dropping send, which is exactly what this design eliminates.
 
 use choreo_proto::DaemonMessage;
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
-use tracing::warn;
+use crossbeam_channel::Sender;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Outcome of one non-blocking try_send to a subscriber channel. Shared by
-/// the broadcast retain-predicate (`try_send_keep_on_full`) and the shutdown
-/// fast path (`handle_broadcast_shutting_down`) so the Ok/Disconnected/Full
-/// arms live in exactly one place.
-pub(crate) enum SendOutcome {
+/// Per-subscriber delivery sink: an UNBOUNDED crossbeam channel plus a
+/// shared in-flight byte counter.
+///
+/// Clone cheaply (channel sender + `Arc<AtomicUsize>`) so the same sink can
+/// be registered in several maps at once — e.g. a connection's writer sink
+/// appears in `client_writers`, `summary_subscribers`, and
+/// `activity_subscribers`, all sharing ONE byte counter.
+#[derive(Clone)]
+pub struct SubscriberSink {
+    pub tx: Sender<DaemonMessage>,
+    /// Bytes sitting in this subscriber's queue right now. Producers
+    /// increment (on enqueue), the connection's writer thread decrements
+    /// (on dequeue). This is the 6th sanctioned shared-state exception —
+    /// lock-free, single-purpose, carries no protocol data. It exists
+    /// because the byte lag of a queue is inherently shared state: the
+    /// producers and the draining writer thread run on different threads and
+    /// must both touch the same running total, which a channel cannot
+    /// express without a dedicated accounting thread. The lock-free atomic
+    /// is safe because every mutation is a single independent
+    /// `fetch_add`/`fetch_sub` — no read-modify-write composite that needs a
+    /// critical section (the one-place soft-bound check is per-producer on
+    /// the post-add value, deliberately racy, see `enqueue`).
+    /// (Documented in AGENTS.md/ARCHITECTURE.md in a later phase.)
+    pub bytes_in_flight: Arc<AtomicUsize>,
+}
+
+impl SubscriberSink {
+    pub fn new(tx: Sender<DaemonMessage>) -> Self {
+        SubscriberSink {
+            tx,
+            bytes_in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Enqueue `msg` into this subscriber's queue and account its bytes.
+    ///
+    /// Never blocks and never drops: the channel is unbounded, so delivery
+    /// is guaranteed for as long as the receiver is alive.  The return value
+    /// only tells the caller whether an eviction is warranted AFTER the
+    /// message has been enqueued.
+    ///
+    /// The two counters are bumped before the send so that every message
+    /// that ever reaches the writer thread's dequeue decrement was
+    /// previously counted — the writer's per-dequeue `fetch_sub` is the only
+    /// counterpart, so the accounting stays balanced.
+    pub fn enqueue(
+        &self,
+        msg: &DaemonMessage,
+        limits: &LagLimits,
+        global: &AtomicUsize,
+    ) -> EnqueueOutcome {
+        let size = msg.approx_wire_size();
+        let new_total = global.fetch_add(size, Ordering::Relaxed) + size;
+        let new_client = self.bytes_in_flight.fetch_add(size, Ordering::Relaxed) + size;
+
+        // Classify against the soft thresholds.  The message is STILL
+        // enqueued below regardless — the threshold only decides whether the
+        // caller must evict this client, never whether delivery happens
+        // (lossless).  `ClientOverLag` takes precedence over the global
+        // budget: the client that crossed its own cap is the one to shed.
+        let outcome = if new_client > limits.per_client_cap {
+            EnqueueOutcome::ClientOverLag
+        } else if new_total > limits.global_budget {
+            EnqueueOutcome::GlobalOverBudget
+        } else {
+            EnqueueOutcome::Delivered
+        };
+
+        match self.tx.send(msg.clone()) {
+            Ok(()) => outcome,
+            // Receiver gone — the client is dead.  The counters were
+            // incremented but the sink is about to be evicted (dropped), so
+            // their values are never read again; no correction needed.
+            Err(_) => EnqueueOutcome::Disconnected,
+        }
+    }
+
+    /// Enqueue `msg` with byte accounting but WITHOUT the lag-threshold
+    /// check. Used for one-shot guaranteed deliveries that are not evidence
+    /// of a lagging client — the attach `SessionState` snapshot (a single
+    /// large message to a freshly-attached client whose writer is healthy)
+    /// and connection replies. The accounting still matters: the writer
+    /// thread decrements the same counters on every dequeue, so every
+    /// enqueue must be counted or the counters would underflow.
+    pub fn send_unchecked(&self, msg: &DaemonMessage, global: &AtomicUsize) {
+        let size = msg.approx_wire_size();
+        self.bytes_in_flight.fetch_add(size, Ordering::Relaxed);
+        global.fetch_add(size, Ordering::Relaxed);
+        let _ = self.tx.send(msg.clone());
+    }
+}
+
+/// Outcome of one [`SubscriberSink::enqueue`].  Every variant other than
+/// [`EnqueueOutcome::Disconnected`] means the message WAS delivered into the
+/// subscriber's queue — the outcome only says what the caller must do next.
+pub enum EnqueueOutcome {
+    /// Delivered into the subscriber's queue.
     Delivered,
+    /// Receiver gone — the client is dead; evict the subscriber.
     Disconnected,
-    Full,
+    /// This client's in-flight bytes crossed `limits.per_client_cap`.
+    /// The message WAS still enqueued (lossless); the caller must trigger
+    /// eviction of this client.
+    ClientOverLag,
+    /// The daemon-wide total crossed `limits.global_budget`. The message WAS
+    /// still enqueued; the caller must trigger eviction of the largest
+    /// lagging client.
+    GlobalOverBudget,
 }
 
-/// Classify one `try_send` attempt. [`try_send_keep_on_full`] and the
-/// shutdown fast path apply different policies to [`SendOutcome::Full`]
-/// (drop-and-keep vs. escalate to the bounded fan-out), but both treat
-/// [`SendOutcome::Disconnected`] as eviction and [`SendOutcome::Delivered`]
-/// as keep.
-pub(crate) fn try_send_classify(
-    tx: &mpsc::SyncSender<DaemonMessage>,
-    message: &DaemonMessage,
-) -> SendOutcome {
-    match tx.try_send(message.clone()) {
-        Ok(()) => SendOutcome::Delivered,
-        Err(mpsc::TrySendError::Disconnected(_)) => SendOutcome::Disconnected,
-        Err(mpsc::TrySendError::Full(_)) => SendOutcome::Full,
-    }
+/// Lag thresholds. Default = 64 MiB per client, 512 MiB daemon-wide.
+/// MUST be injectable so unit/integration tests can use tiny caps.
+#[derive(Debug, Clone, Copy)]
+pub struct LagLimits {
+    pub per_client_cap: usize,
+    pub global_budget: usize,
 }
 
-/// Try to deliver `message` to one subscriber, returning whether the
-/// subscriber should remain registered.
-///
-/// `path` labels the fan-out in the drop metric ("summary", "activity",
-/// "session").  This is meant to be used as the retain predicate of the
-/// subscriber maps:
-///
-/// ```ignore
-/// subscribers.retain(|client_id, tx| try_send_keep_on_full(tx, *client_id, "summary", &msg));
-/// ```
-///
-/// See the module docs for the drop-on-full / evict-on-disconnect policy.
-pub(crate) fn try_send_keep_on_full(
-    tx: &mpsc::SyncSender<DaemonMessage>,
-    client_id: u64,
-    path: &str,
-    message: &DaemonMessage,
-) -> bool {
-    match try_send_classify(tx, message) {
-        // Delivered — keep the subscriber.
-        SendOutcome::Delivered => true,
-        // Buffer full: drop the message but KEEP the subscriber.  Logging
-        // every dropped chunk here would be pure noise under a fast burst
-        // (one line per message per subscriber), so we stay silent in the
-        // logs and instead count the drop so a wedged subscriber remains
-        // observable via /metrics.
-        SendOutcome::Full => {
-            crate::metrics::record_broadcast_dropped(path);
-            true
-        }
-        // Receiver gone — the client is dead, stop sending to it.
-        SendOutcome::Disconnected => {
-            warn!("removing disconnected subscriber {client_id}");
-            false
+impl Default for LagLimits {
+    fn default() -> Self {
+        LagLimits {
+            per_client_cap: 64 * 1024 * 1024,
+            global_budget: 512 * 1024 * 1024,
         }
     }
-}
-
-/// Poll interval between delivery attempts to a full writer channel during
-/// the shutdown fan-out.  A healthy writer drains a slot in well under this;
-/// the poll only paces retries to a slow-but-alive writer.
-pub(crate) const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Deliver `ShuttingDown` to every client whose writer channel was full on
-/// the fast path of `handle_broadcast_shutting_down`, polling each channel
-/// round-robin so all clients share one `grace` window — a wedged client can
-/// no longer delay the others, and total shutdown latency is bounded by
-/// `grace`, not `grace × N`.
-///
-/// Delivery never blocks on a writer thread: `try_send` returns immediately
-/// and only `poll` is slept, so a slow-but-alive writer gets a fresh chance
-/// each pass while a wedged one (writer stuck in a blocking socket write,
-/// client not reading) is abandoned after `grace`.  Abandonment is safe: the
-/// daemon exits right after shutdown and the OS closes the socket, so the
-/// client sees a bare EOF; each abandoned client is counted via
-/// `metrics::record_broadcast_dropped` so it stays observable on `/metrics`.
-///
-/// Returns the ids of clients that were NOT delivered (disconnected or
-/// timed-out) so the caller can drop them from its registry.  `poll` is
-/// injectable so unit tests can use `Duration::ZERO` (a deterministic busy
-/// retry with no time-based waits); production passes
-/// [`SHUTDOWN_POLL_INTERVAL`].
-pub(crate) fn send_shutting_down_bounded(
-    clients: Vec<(u64, mpsc::SyncSender<DaemonMessage>)>,
-    grace: Duration,
-    poll: Duration,
-) -> Vec<u64> {
-    let mut pending = clients;
-    if pending.is_empty() {
-        return Vec::new();
-    }
-    let deadline = Instant::now() + grace;
-    let mut failed = Vec::new();
-    while !pending.is_empty() {
-        pending.retain(|(client_id, tx)| {
-            match tx.try_send(DaemonMessage::ShuttingDown) {
-                // Delivered — the writer thread will flush it and close its
-                // own socket; drop this client from the pending set.
-                Ok(()) => false,
-                // Receiver gone — the client is dead mid-shutdown.
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    warn!("removing disconnected client {client_id} during shutdown");
-                    failed.push(*client_id);
-                    false
-                }
-                // Still full — keep polling this client on the next pass.
-                Err(mpsc::TrySendError::Full(_)) => true,
-            }
-        });
-        if pending.is_empty() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            // The remaining writers did not drain in time. Abandon them (the
-            // process exits momentarily and the OS closes their sockets, so
-            // each client sees a bare EOF) and count every drop so a wedged
-            // client stays observable via /metrics.
-            for (client_id, _) in &pending {
-                crate::metrics::record_broadcast_dropped("client");
-                warn!("shutdown notification timed out for slow client {client_id}");
-            }
-            failed.extend(pending.into_iter().map(|(client_id, _)| client_id));
-            break;
-        }
-        thread::sleep(poll);
-    }
-    failed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use choreo_proto::SessionStatus;
-    use std::sync::mpsc;
 
     fn status_msg(session_id: u64) -> DaemonMessage {
         DaemonMessage::SessionStatusChanged {
@@ -187,121 +175,204 @@ mod tests {
         }
     }
 
+    /// Tiny, injectable limits so a test can cross a cap with a handful of
+    /// messages instead of megabytes.
+    fn tiny_limits() -> LagLimits {
+        LagLimits {
+            per_client_cap: 128,
+            global_budget: 256,
+        }
+    }
+
+    /// Drain a crossbeam receiver to count messages; bounded crossbeam
+    /// channels act as the receiver's drainer so we can observe delivery.
     #[test]
-    fn try_send_keep_on_full_delivers_and_keeps_subscriber() {
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
+    fn enqueue_delivers_and_counts_bytes() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let sink = SubscriberSink::new(tx);
+        let global = AtomicUsize::new(0);
+        let limits = tiny_limits();
         let msg = status_msg(1);
-        assert!(try_send_keep_on_full(&tx, 7, "summary", &msg));
-        assert_eq!(rx.recv().unwrap(), msg);
+        let size = msg.approx_wire_size();
+
+        let outcome = sink.enqueue(&msg, &limits, &global);
+        assert!(matches!(outcome, EnqueueOutcome::Delivered));
+        assert_eq!(rx.recv().unwrap(), msg, "message must be delivered");
+        // Both counters reflect the enqueued bytes.
+        assert_eq!(sink.bytes_in_flight.load(Ordering::Relaxed), size);
+        assert_eq!(global.load(Ordering::Relaxed), size);
+
+        // Dequeue-side accounting (the writer thread's job) balances them.
+        sink.bytes_in_flight.fetch_sub(size, Ordering::Relaxed);
+        global.fetch_sub(size, Ordering::Relaxed);
+        assert_eq!(sink.bytes_in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(global.load(Ordering::Relaxed), 0);
     }
 
+    /// Crossing the per-client cap returns `ClientOverLag` AND the message is
+    /// still enqueued (lossless).
     #[test]
-    fn try_send_keep_on_full_drops_on_full_buffer_and_keeps_subscriber() {
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
-        // A capacity-1 channel lets one filler message fill the buffer so the
-        // next try_send fails with Full.
-        let filler = status_msg(1);
-        tx.send(filler.clone()).unwrap();
+    fn enqueue_over_per_client_cap_returns_client_over_lag_but_still_delivers() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let sink = SubscriberSink::new(tx);
+        let global = AtomicUsize::new(0);
+        // per_client_cap = 128: a message with a ~100-byte payload + a
+        // status message both fit, a second payload message crosses it.
+        let limits = LagLimits {
+            per_client_cap: 128,
+            global_budget: usize::MAX, // isolate the per-client threshold
+        };
+        let payload_msg = || DaemonMessage::Failed {
+            session_id: 1,
+            request_id: 1,
+            error: "x".repeat(100),
+        };
 
-        let broadcast = status_msg(2);
-        // Full buffer: the message is dropped but the subscriber is retained.
-        assert!(try_send_keep_on_full(&tx, 7, "session", &broadcast));
-        assert_eq!(rx.recv().unwrap(), filler);
-        assert!(rx.try_recv().is_err(), "full-buffer message was dropped");
+        // First: well under the cap → Delivered.
+        let m1 = status_msg(1);
+        assert!(matches!(
+            sink.enqueue(&m1, &limits, &global),
+            EnqueueOutcome::Delivered
+        ));
 
-        // Once the buffer drains, delivery resumes.
-        assert!(try_send_keep_on_full(&tx, 7, "session", &broadcast));
-        assert_eq!(rx.recv().unwrap(), broadcast);
-    }
-
-    #[test]
-    fn try_send_keep_on_full_evicts_on_disconnected() {
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
-        drop(rx); // Disconnect the receiver
-        assert!(!try_send_keep_on_full(&tx, 7, "summary", &status_msg(1)));
-    }
-
-    /// A bounded send to an empty channel delivers immediately — `grace = 0`
-    /// proves no waiting was needed and no client is reported failed.
-    #[test]
-    fn bounded_shutdown_delivers_when_channel_has_room() {
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
-        let failed = send_shutting_down_bounded(vec![(7, tx)], Duration::ZERO, Duration::ZERO);
+        // A big message crosses the cap but MUST still be delivered.
+        let m2 = payload_msg();
+        let outcome = sink.enqueue(&m2, &limits, &global);
         assert!(
-            failed.is_empty(),
-            "a channel with room must accept ShuttingDown: {failed:?}"
+            matches!(outcome, EnqueueOutcome::ClientOverLag),
+            "crossing the per-client cap must report ClientOverLag"
         );
-        assert_eq!(rx.try_recv().unwrap(), DaemonMessage::ShuttingDown);
-    }
-
-    /// A channel that stays full past the grace period is abandoned and its
-    /// client reported failed. `grace = 0` makes the first full attempt the
-    /// deadline, so the test is fully deterministic (no sleeps).
-    #[test]
-    fn bounded_shutdown_gives_up_on_still_full_channel() {
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
-        // Fill the single slot so every try_send sees Full.
-        tx.send(DaemonMessage::Pong).unwrap();
-        let failed = send_shutting_down_bounded(vec![(7, tx)], Duration::ZERO, Duration::ZERO);
-        assert_eq!(failed, vec![7], "stuck client must be reported failed");
-        // The filler is still there; ShuttingDown was never delivered.
-        assert_eq!(rx.try_recv().unwrap(), DaemonMessage::Pong);
-        assert!(rx.try_recv().is_err());
-    }
-
-    /// A disconnected writer is reported failed and removed from the pending
-    /// set instead of being polled forever.
-    #[test]
-    fn bounded_shutdown_evicts_disconnected_client() {
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
-        drop(rx);
-        let failed = send_shutting_down_bounded(vec![(7, tx)], Duration::ZERO, Duration::ZERO);
-        assert_eq!(failed, vec![7]);
-    }
-
-    /// A momentarily-full channel is NOT dropped: the fan-out polls
-    /// round-robin until the writer drains a slot. A capacity-0 rendezvous
-    /// channel makes the wait load-bearing — `try_send` only succeeds while
-    /// a receiver is blocked in `recv`, so delivery provably waits for the
-    /// drainer rather than giving up. `poll = ZERO` (a busy retry) plus the
-    /// ready-handshake keep the test deterministic: the drainer is
-    /// guaranteed to block, so the retry loop always completes.
-    #[test]
-    fn bounded_shutdown_waits_for_writer_that_drains() {
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(0);
-        let (ready_tx, ready_rx) = mpsc::channel::<()>();
-        let drainer = thread::spawn(move || {
-            let _ = ready_tx.send(());
-            rx.recv().expect("rendezvous must deliver ShuttingDown")
-        });
-        ready_rx.recv().expect("drainer must become ready");
-        let failed =
-            send_shutting_down_bounded(vec![(7, tx)], Duration::from_secs(5), Duration::ZERO);
-        assert!(
-            failed.is_empty(),
-            "delivery must wait for the writer to drain, got failures: {failed:?}"
-        );
+        assert_eq!(rx.recv().unwrap(), m1);
         assert_eq!(
-            drainer.join().expect("drainer panicked"),
-            DaemonMessage::ShuttingDown
+            rx.recv().unwrap(),
+            m2,
+            "the over-lag message is still enqueued"
         );
     }
 
-    /// Mixed clients: a connected one is delivered, a stuck one is reported
-    /// failed — the two outcomes coexist in a single fan-out.
+    /// Crossing the global budget (while no per-client cap is crossed)
+    /// returns `GlobalOverBudget` and the message is still enqueued.
     #[test]
-    fn bounded_shutdown_delivers_healthy_and_reports_stuck() {
-        let (healthy_tx, healthy_rx) = mpsc::sync_channel::<DaemonMessage>(1);
-        let (stuck_tx, stuck_rx) = mpsc::sync_channel::<DaemonMessage>(1);
-        stuck_tx.send(DaemonMessage::Pong).unwrap(); // fill the only slot
+    fn enqueue_over_global_budget_returns_global_over_budget_but_still_delivers() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let sink = SubscriberSink::new(tx);
+        let global = AtomicUsize::new(0);
+        // Global budget tiny; per-client cap huge so only the global fires.
+        let limits = LagLimits {
+            per_client_cap: usize::MAX,
+            global_budget: 128,
+        };
 
-        let failed = send_shutting_down_bounded(
-            vec![(1, healthy_tx), (2, stuck_tx)],
-            Duration::ZERO,
-            Duration::ZERO,
+        // One status message (~small) stays under the global budget.
+        let m1 = status_msg(1);
+        assert!(matches!(
+            sink.enqueue(&m1, &limits, &global),
+            EnqueueOutcome::Delivered
+        ));
+
+        // A big message pushes the daemon-wide total over the budget.
+        let m2 = DaemonMessage::Failed {
+            session_id: 1,
+            request_id: 2,
+            error: "y".repeat(200),
+        };
+        let outcome = sink.enqueue(&m2, &limits, &global);
+        assert!(
+            matches!(outcome, EnqueueOutcome::GlobalOverBudget),
+            "crossing the global budget must report GlobalOverBudget"
         );
-        assert_eq!(failed, vec![2]);
-        assert_eq!(healthy_rx.try_recv().unwrap(), DaemonMessage::ShuttingDown);
-        assert_eq!(stuck_rx.try_recv().unwrap(), DaemonMessage::Pong);
+        assert_eq!(rx.recv().unwrap(), m1);
+        assert_eq!(
+            rx.recv().unwrap(),
+            m2,
+            "the over-budget message is still enqueued"
+        );
+    }
+
+    /// A dropped receiver yields `Disconnected` even though the counters were
+    /// incremented (the sink is about to be evicted, so nobody reads them).
+    #[test]
+    fn enqueue_returns_disconnected_when_receiver_gone() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let sink = SubscriberSink::new(tx);
+        let global = AtomicUsize::new(0);
+        let limits = tiny_limits();
+        drop(rx); // receiver gone
+
+        let outcome = sink.enqueue(&status_msg(1), &limits, &global);
+        assert!(matches!(outcome, EnqueueOutcome::Disconnected));
+    }
+
+    /// The per-client counter increments on every enqueue and only a matching
+    /// dequeue decrement brings it back down — this is the exact bookkeeping
+    /// the writer thread performs per message.
+    #[test]
+    fn counters_increment_and_decrement_with_approx_wire_size() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let sink = SubscriberSink::new(tx);
+        let global = AtomicUsize::new(0);
+        let limits = LagLimits {
+            per_client_cap: usize::MAX,
+            global_budget: usize::MAX,
+        };
+
+        // Two messages of known size: Failed with 100-byte and 50-byte errors.
+        let m1 = DaemonMessage::Failed {
+            session_id: 1,
+            request_id: 1,
+            error: "a".repeat(100),
+        };
+        let m2 = DaemonMessage::Failed {
+            session_id: 2,
+            request_id: 2,
+            error: "b".repeat(50),
+        };
+        let s1 = m1.approx_wire_size();
+        let s2 = m2.approx_wire_size();
+
+        assert!(matches!(
+            sink.enqueue(&m1, &limits, &global),
+            EnqueueOutcome::Delivered
+        ));
+        assert!(matches!(
+            sink.enqueue(&m2, &limits, &global),
+            EnqueueOutcome::Delivered
+        ));
+        assert_eq!(sink.bytes_in_flight.load(Ordering::Relaxed), s1 + s2);
+        assert_eq!(global.load(Ordering::Relaxed), s1 + s2);
+
+        // Drain both from the channel, decrementing like the writer thread.
+        assert_eq!(rx.recv().unwrap(), m1);
+        assert_eq!(rx.recv().unwrap(), m2);
+        sink.bytes_in_flight.fetch_sub(s1, Ordering::Relaxed);
+        sink.bytes_in_flight.fetch_sub(s2, Ordering::Relaxed);
+        global.fetch_sub(s1, Ordering::Relaxed);
+        global.fetch_sub(s2, Ordering::Relaxed);
+        assert_eq!(sink.bytes_in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(global.load(Ordering::Relaxed), 0);
+    }
+
+    /// `LagLimits::default()` is the documented 64 MiB / 512 MiB pair.
+    #[test]
+    fn default_limits_are_64_mib_per_client_and_512_mib_global() {
+        let limits = LagLimits::default();
+        assert_eq!(limits.per_client_cap, 64 * 1024 * 1024);
+        assert_eq!(limits.global_budget, 512 * 1024 * 1024);
+    }
+
+    /// A `ClientOverLag` on one sink must not be masked by the global budget
+    /// also being crossed — per-client precedence is part of the policy.
+    #[test]
+    fn per_client_overlag_takes_precedence_over_global_over_budget() {
+        let (tx, _rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let sink = SubscriberSink::new(tx);
+        let global = AtomicUsize::new(0);
+        // Both thresholds tiny: any message crosses both, per-client must win.
+        let limits = LagLimits {
+            per_client_cap: 8,
+            global_budget: 8,
+        };
+        let outcome = sink.enqueue(&status_msg(1), &limits, &global);
+        assert!(matches!(outcome, EnqueueOutcome::ClientOverLag));
     }
 }

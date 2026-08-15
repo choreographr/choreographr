@@ -7,19 +7,13 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::net::Shutdown;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 #[cfg(windows)]
 use uds_windows::UnixStream;
-
-/// Per-subscriber channel capacity for session message broadcast.
-/// Limits how many messages the session thread can enqueue before the
-/// client's writer thread drains them.  Creates natural backpressure
-/// from the TUI event loop back to the daemon session thread, replacing
-/// the previous thread::sleep() pacing for tool result chunks.
-pub(crate) const SUBSCRIBER_CHANNEL_CAPACITY: usize = 128;
 
 /// Bound for joining a connection's writer thread during cleanup. A healthy
 /// writer exits immediately on channel disconnect (dropping `writer_tx` in
@@ -28,6 +22,27 @@ pub(crate) const SUBSCRIBER_CHANNEL_CAPACITY: usize = 128;
 /// — which cannot exit on the channel disconnect alone (see the comment at
 /// the call site in `cleanup_client`).
 const WRITER_JOIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Socket write timeout applied to every connection's writer. Bounds a single
+/// blocking `write` syscall so a wedged client — one whose socket receive
+/// window is permanently zero — cannot stall its writer thread forever.
+///
+/// This is the mechanism that makes LAG EVICTION work without the daemon
+/// holding a force-close handle on the connection (no retained socket clone,
+/// no extra FD per connection): when the daemon evicts a lagging client it
+/// enqueues the best-effort `Evicted` advisory and drops every sink; a
+/// healthy writer flushes the advisory and closes its own socket (notify-
+/// before-EOF), while a wedged writer hits this timeout on its in-flight
+/// write, the write fails, and the writer shuts the socket down itself —
+/// which unblocks the reader's blocking read and runs the normal
+/// `cleanup_client` teardown. Either way the connection is reaped promptly
+/// and its queued bytes released.
+///
+/// A slow-but-alive client is never falsely killed: the timeout is per
+/// syscall, so a socket that makes any progress (each write completes in
+/// under this) survives; only a client that stops reading entirely trips it,
+/// which is exactly the lag condition eviction targets.
+const WRITER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A per-connection message sink implementing the single-writer contract.
 ///
@@ -67,19 +82,43 @@ impl ConnectionWriter for choreo_transport::noise::NoiseStream {
 ///
 /// Each connection has exactly one writer thread, so messages on `rx` are
 /// serialized and fragments of one logical message can never interleave.
-/// `ShuttingDown` is special-cased: it is flushed, then the socket is closed
-/// HERE (by the writer thread itself), so the client observes the
-/// notification before the EOF with no other thread ever writing to or
-/// closing the socket. (ShuttingDown is only ever enqueued by the daemon's
-/// shutdown broadcast.) An error at any point stops the loop — the socket is
-/// broken, so continuing would just fail again.
-fn writer_thread<W: ConnectionWriter>(mut writer: W, rx: mpsc::Receiver<DaemonMessage>) {
+/// `ShuttingDown` and `Evicted` are special-cased identically: each is
+/// flushed, then the socket is closed HERE (by the writer thread itself), so
+/// the client observes the notification before the EOF with no other thread
+/// ever writing to or closing the socket. (ShuttingDown is only ever enqueued
+/// by the daemon's shutdown broadcast; Evicted by a lag eviction.) An error at
+/// any point stops the loop and SHUTS THE SOCKET DOWN — a send error can be a
+/// broken pipe (socket gone) or a [`WRITER_WRITE_TIMEOUT`] on a wedged client
+/// whose receive window is zero (socket still open); either way, shutting
+/// down unblocks the reader's blocking read so `cleanup_client` reaps the
+/// connection (shutdown on an already-broken socket is a harmless no-op).
+///
+/// Byte accounting: on EACH dequeue the per-client and daemon-wide lag
+/// counters are decremented by the message's approximate wire size, the exact
+/// counterpart of [`SubscriberSink::enqueue`]'s increment. Decrementing even
+/// on a failed send keeps the daemon-wide backlog honest — the bytes left the
+/// queue regardless of whether the socket accepted them, and the connection
+/// is being torn down either way.
+fn writer_thread<W: ConnectionWriter>(
+    mut writer: W,
+    rx: crossbeam_channel::Receiver<DaemonMessage>,
+    bytes: Arc<AtomicUsize>,
+    global: Arc<AtomicUsize>,
+) {
     for msg in rx {
+        let size = msg.approx_wire_size();
         if let Err(e) = writer.send_message(&msg) {
             warn!("writer thread error: {e}");
+            // The failing message still left the queue — account it so the
+            // backlog reflects what is actually still queued, then stop.
+            bytes.fetch_sub(size, Ordering::Relaxed);
+            global.fetch_sub(size, Ordering::Relaxed);
+            writer.shutdown();
             break;
         }
-        if matches!(msg, DaemonMessage::ShuttingDown) {
+        bytes.fetch_sub(size, Ordering::Relaxed);
+        global.fetch_sub(size, Ordering::Relaxed);
+        if matches!(msg, DaemonMessage::ShuttingDown | DaemonMessage::Evicted) {
             writer.shutdown();
             break;
         }
@@ -108,44 +147,49 @@ pub(crate) fn register_client_writer(
     daemon_tx: &mpsc::Sender<DaemonCommand>,
 ) -> (
     u64,
-    SyncSender<DaemonMessage>,
-    mpsc::Receiver<DaemonMessage>,
+    crate::broadcast::SubscriberSink,
+    crossbeam_channel::Receiver<DaemonMessage>,
 ) {
-    let (writer_tx, writer_rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+    let (writer_tx, writer_rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+    let sink = crate::broadcast::SubscriberSink::new(writer_tx);
     let client_id = rand::random::<u64>();
     let _ = daemon_tx.send(DaemonCommand::RegisterClientWriter {
         client_id,
-        writer: writer_tx.clone(),
+        writer: sink.clone(),
     });
-    (client_id, writer_tx, writer_rx)
+    (client_id, sink, writer_rx)
 }
 
 /// Send a reply to a client's writer channel.
 ///
-/// Deliberately a BLOCKING send, unlike the drop-on-full policy used for
-/// broadcasts ([`crate::broadcast::try_send_keep_on_full`]): a reply is a
-/// request/response contract, and silently dropping it would leave the client
-/// waiting forever for a reply that never arrives. The 128-slot bounded
-/// channel plus blocking send IS the connection's backpressure mechanism — a
-/// client that stops reading stalls only its own connection thread, never the
-/// daemon command loop or other connections.
-///
-/// The one interaction to keep in mind is shutdown: if the channel is full
-/// when `ShuttingDown` is broadcast, the notification queues behind the
-/// backlog, and the shutdown fan-out
-/// ([`crate::broadcast::send_shutting_down_bounded`]) polls for up to
-/// `SHUTDOWN_NOTIFY_GRACE` before giving up; the bounded connection drain in
-/// `run_server` caps the rest. A pathological client can therefore delay
-/// (never hang) shutdown by bounded amounts.
-fn send_to_writer(writer_tx: &SyncSender<DaemonMessage>, msg: DaemonMessage) {
-    let _ = writer_tx.send(msg);
+/// Replies ride the same unbounded channel as broadcasts, so they MUST keep
+/// the lag counters consistent: the writer thread decrements the per-client
+/// and daemon-wide counters on every dequeue, so every enqueue — broadcast or
+/// reply — increments them first. The lag limits are NOT enforced here: a
+/// reply is a request/response contract that must never be dropped (lossless
+/// for replies was already true — a blocking send never dropped, it just
+/// blocked; with an unbounded channel it can no longer block either), and
+/// replies are small and infrequent next to broadcast streams, so they cannot
+/// meaningfully inflate a lagging client's backlog.
+fn send_to_writer(ctx: &ClientCtx, msg: DaemonMessage) {
+    let size = msg.approx_wire_size();
+    ctx.writer
+        .bytes_in_flight
+        .fetch_add(size, Ordering::Relaxed);
+    ctx.global_lag.fetch_add(size, Ordering::Relaxed);
+    let _ = ctx.writer.tx.send(msg);
 }
 
 /// Shared per-client context passed through the dispatch and handler functions.
 /// Bundles the channels and mutable per-connection state into one struct so
 /// the call sites don't pass 5–6 individual arguments to every function.
 struct ClientCtx<'a> {
-    writer_tx: &'a SyncSender<DaemonMessage>,
+    /// This connection's delivery sink (see `send_to_writer`).
+    writer: &'a crate::broadcast::SubscriberSink,
+    /// Daemon-wide lag counter, shared by every connection; replies must
+    /// increment it so the writer thread's per-dequeue decrement stays
+    /// balanced (see `send_to_writer`).
+    global_lag: &'a AtomicUsize,
     daemon_tx: &'a mpsc::Sender<DaemonCommand>,
     attached_session_id: &'a mut Option<u64>,
     attached_session_tx: &'a mut Option<mpsc::Sender<SessionCommand>>,
@@ -159,14 +203,14 @@ fn cleanup_client(
     attached_session_tx: Option<mpsc::Sender<SessionCommand>>,
     client_id: u64,
     daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: SyncSender<DaemonMessage>,
+    writer: crate::broadcast::SubscriberSink,
     writer_handle: std::thread::JoinHandle<()>,
 ) {
     if let Some(ref tx) = attached_session_tx {
         let _ = tx.send(SessionCommand::Detach { client_id });
     }
     let _ = daemon_tx.send(DaemonCommand::ClientDisconnected { client_id });
-    drop(writer_tx);
+    drop(writer);
     // Join the writer with a bound: a wedged writer (client open but not
     // reading) is stuck in a blocking socket write and cannot exit on the
     // channel disconnect alone. Cleanup must not hang the connection thread on
@@ -224,7 +268,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             let (reply, rx) = mpsc::channel();
             let _ = ctx.daemon_tx.send(DaemonCommand::ListSessions { reply });
             if let Ok(sessions) = rx.recv() {
-                send_to_writer(ctx.writer_tx, DaemonMessage::Sessions { sessions });
+                send_to_writer(ctx, DaemonMessage::Sessions { sessions });
             }
         }
         ClientMessage::SubscribeSessionsSummary => {
@@ -232,7 +276,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 .daemon_tx
                 .send(DaemonCommand::RegisterSummarySubscriber {
                     client_id: ctx.client_id,
-                    writer: ctx.writer_tx.clone(),
+                    writer: ctx.writer.clone(),
                 });
         }
         ClientMessage::UnsubscribeSessionsSummary => {
@@ -253,7 +297,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 // be routed to whatever session the user is viewing.  The
                 // TUI resolves it via `App::resolve_daemon_session`.
                 send_to_writer(
-                    ctx.writer_tx,
+                    ctx,
                     DaemonMessage::Failed {
                         session_id: 0,
                         request_id,
@@ -297,7 +341,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 });
             } else {
                 send_to_writer(
-                    ctx.writer_tx,
+                    ctx,
                     DaemonMessage::Failed {
                         session_id: 0,
                         request_id,
@@ -308,7 +352,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
         }
         ClientMessage::Ping => {
             debug!("client {}: Ping", ctx.client_id);
-            send_to_writer(ctx.writer_tx, DaemonMessage::Pong);
+            send_to_writer(ctx, DaemonMessage::Pong);
         }
         ClientMessage::SetModel { model } => {
             info!(
@@ -321,7 +365,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let _ = tx.send(SessionCommand::SetModel { model });
             } else {
                 send_to_writer(
-                    ctx.writer_tx,
+                    ctx,
                     DaemonMessage::ModelSelectionFailed {
                         session_id: 0,
                         model,
@@ -341,7 +385,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let _ = tx.send(SessionCommand::SetReasoningEffort { effort });
             } else {
                 send_to_writer(
-                    ctx.writer_tx,
+                    ctx,
                     DaemonMessage::ReasoningEffortSetFailed {
                         session_id: 0,
                         effort,
@@ -356,7 +400,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let _ = tx.send(SessionCommand::GetReasoningEffort { reply });
                 if let Ok(effort) = rx.recv() {
                     send_to_writer(
-                        ctx.writer_tx,
+                        ctx,
                         DaemonMessage::ReasoningEffortSet {
                             session_id: 0,
                             effort,
@@ -365,7 +409,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 }
             } else {
                 send_to_writer(
-                    ctx.writer_tx,
+                    ctx,
                     DaemonMessage::ReasoningEffortSet {
                         session_id: 0,
                         effort: "off".to_string(),
@@ -433,13 +477,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             });
             match result {
                 Ok(Ok(())) => {
-                    send_to_writer(ctx.writer_tx, DaemonMessage::AccountAdded { name });
+                    send_to_writer(ctx, DaemonMessage::AccountAdded { name });
                 }
                 Ok(Err(e)) => {
-                    send_to_writer(
-                        ctx.writer_tx,
-                        DaemonMessage::AccountAddFailed { name, error: e },
-                    );
+                    send_to_writer(ctx, DaemonMessage::AccountAddFailed { name, error: e });
                 }
                 Err(_) => warn!("daemon disconnected while handling add account"),
             }
@@ -451,13 +492,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             });
             match result {
                 Ok(Ok(())) => {
-                    send_to_writer(ctx.writer_tx, DaemonMessage::AccountRemoved { name });
+                    send_to_writer(ctx, DaemonMessage::AccountRemoved { name });
                 }
                 Ok(Err(e)) => {
-                    send_to_writer(
-                        ctx.writer_tx,
-                        DaemonMessage::AccountRemoveFailed { name, error: e },
-                    );
+                    send_to_writer(ctx, DaemonMessage::AccountRemoveFailed { name, error: e });
                 }
                 Err(_) => warn!("daemon disconnected while handling remove account"),
             }
@@ -468,10 +506,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             });
             match result {
                 Ok(Ok(accounts)) => {
-                    send_to_writer(ctx.writer_tx, DaemonMessage::Accounts { accounts });
+                    send_to_writer(ctx, DaemonMessage::Accounts { accounts });
                 }
                 Ok(Err(e)) => {
-                    send_to_writer(ctx.writer_tx, DaemonMessage::AccountListFailed { error: e });
+                    send_to_writer(ctx, DaemonMessage::AccountListFailed { error: e });
                 }
                 Err(_) => warn!("daemon disconnected while handling list accounts"),
             }
@@ -484,7 +522,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 .daemon_tx
                 .send(DaemonCommand::RegisterActivitySubscriber {
                     client_id: ctx.client_id,
-                    writer: ctx.writer_tx.clone(),
+                    writer: ctx.writer.clone(),
                 });
         }
         ClientMessage::UnsubscribeAllActivity => {
@@ -508,13 +546,24 @@ pub(crate) fn client_thread(
     stream: UnixStream,
     daemon_tx: mpsc::Sender<DaemonCommand>,
     client_id: u64,
-    writer_tx: SyncSender<DaemonMessage>,
-    writer_rx: mpsc::Receiver<DaemonMessage>,
+    writer: crate::broadcast::SubscriberSink,
+    writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
+    global_lag: Arc<AtomicUsize>,
 ) -> io::Result<()> {
+    // Bound the writer's blocking socket writes so a wedged client (receive
+    // window permanently zero) cannot stall it forever — this is what makes
+    // lag eviction reap the connection without a daemon-held close handle.
+    // The timeout applies to every clone of this socket.
+    stream.set_write_timeout(Some(WRITER_WRITE_TIMEOUT))?;
     let reader = BufReader::new(stream.try_clone()?);
-    let writer = BufWriter::new(stream);
+    let writer_buf = BufWriter::new(stream);
 
-    let writer_handle = std::thread::spawn(move || writer_thread(writer, writer_rx));
+    // The writer thread decrements the SAME per-client byte counter the
+    // daemon's sinks increment on enqueue, plus the daemon-wide counter.
+    let bytes = Arc::clone(&writer.bytes_in_flight);
+    let global = Arc::clone(&global_lag);
+    let writer_handle =
+        std::thread::spawn(move || writer_thread(writer_buf, writer_rx, bytes, global));
 
     let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
     let mut attached_session_id: Option<u64> = None;
@@ -530,7 +579,8 @@ pub(crate) fn client_thread(
         match read_message::<_, ClientMessage>(&mut reader) {
             Ok(msg) => {
                 let mut ctx = ClientCtx {
-                    writer_tx: &writer_tx,
+                    writer: &writer,
+                    global_lag: &global_lag,
                     daemon_tx: &daemon_tx,
                     attached_session_id: &mut attached_session_id,
                     attached_session_tx: &mut attached_session_tx,
@@ -561,7 +611,7 @@ pub(crate) fn client_thread(
         attached_session_tx,
         client_id,
         &daemon_tx,
-        writer_tx,
+        writer,
         writer_handle,
     );
     Ok(())
@@ -571,12 +621,23 @@ pub(crate) fn tcp_client_thread(
     noise: choreo_transport::noise::NoiseStream,
     daemon_tx: mpsc::Sender<DaemonCommand>,
     client_id: u64,
-    writer_tx: SyncSender<DaemonMessage>,
-    writer_rx: mpsc::Receiver<DaemonMessage>,
+    writer: crate::broadcast::SubscriberSink,
+    writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
+    global_lag: Arc<AtomicUsize>,
 ) -> io::Result<()> {
     // Writer thread: blocks on writer_rx, sends via NoiseStream encryption.
-    let writer = noise.try_clone()?;
-    let writer_handle = std::thread::spawn(move || writer_thread(writer, writer_rx));
+    // Bound the underlying socket's blocking writes (see WRITER_WRITE_TIMEOUT)
+    // so a wedged client cannot stall the writer forever; the timeout applies
+    // to every clone of the TcpStream.
+    noise
+        .get_ref()
+        .set_write_timeout(Some(WRITER_WRITE_TIMEOUT))?;
+    let writer_buf = noise.try_clone()?;
+
+    let bytes = Arc::clone(&writer.bytes_in_flight);
+    let global = Arc::clone(&global_lag);
+    let writer_handle =
+        std::thread::spawn(move || writer_thread(writer_buf, writer_rx, bytes, global));
 
     let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
     let mut attached_session_id: Option<u64> = None;
@@ -599,7 +660,8 @@ pub(crate) fn tcp_client_thread(
         match reader.recv_client_message() {
             Ok(msg) => {
                 let mut ctx = ClientCtx {
-                    writer_tx: &writer_tx,
+                    writer: &writer,
+                    global_lag: &global_lag,
                     daemon_tx: &daemon_tx,
                     attached_session_id: &mut attached_session_id,
                     attached_session_tx: &mut attached_session_tx,
@@ -625,7 +687,7 @@ pub(crate) fn tcp_client_thread(
         attached_session_tx,
         client_id,
         &daemon_tx,
-        writer_tx,
+        writer,
         writer_handle,
     );
     Ok(())
@@ -649,7 +711,7 @@ fn switch_attached_session(
     }
     let _ = session_tx.send(SessionCommand::Attach {
         client_id: ctx.client_id,
-        tx: ctx.writer_tx.clone(),
+        tx: ctx.writer.clone(),
     });
     *ctx.attached_session_tx = Some(session_tx);
     *ctx.attached_session_id = Some(new_session_id);
@@ -696,7 +758,7 @@ fn handle_client_create_session(
             // This keeps the old session alive when
             // creating from the session manager page.
             send_to_writer(
-                ctx.writer_tx,
+                ctx,
                 DaemonMessage::SessionCreated {
                     session_id: sid,
                     title,
@@ -710,7 +772,7 @@ fn handle_client_create_session(
         }
         Ok(Err(e)) => {
             send_to_writer(
-                ctx.writer_tx,
+                ctx,
                 DaemonMessage::SessionFailed {
                     session_id: 0,
                     operation: "create_session".into(),
@@ -736,12 +798,12 @@ fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
             // Send SessionAttached before SessionCommand::Attach so that
             // the TUI's attached_session_id is set before SessionState
             // arrives — otherwise SessionState is silently dropped.
-            send_to_writer(ctx.writer_tx, DaemonMessage::SessionAttached { session_id });
+            send_to_writer(ctx, DaemonMessage::SessionAttached { session_id });
             switch_attached_session(session_id, session_tx, ctx);
         }
         Ok(Err(e)) => {
             send_to_writer(
-                ctx.writer_tx,
+                ctx,
                 DaemonMessage::SessionFailed {
                     session_id: 0,
                     operation: "attach_session".into(),
@@ -770,7 +832,7 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
             }
             _ => {
                 send_to_writer(
-                    ctx.writer_tx,
+                    ctx,
                     DaemonMessage::SessionFailed {
                         session_id: 0,
                         operation: "set_account".into(),
@@ -781,7 +843,7 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
         }
     } else {
         send_to_writer(
-            ctx.writer_tx,
+            ctx,
             DaemonMessage::SessionFailed {
                 session_id: 0,
                 operation: "set_account".into(),
@@ -811,10 +873,10 @@ fn handle_unlock_sync(ctx: &mut ClientCtx, private_key: Vec<u8>) {
     });
     match result {
         Ok(Ok(())) => {
-            send_to_writer(ctx.writer_tx, DaemonMessage::Unlocked);
+            send_to_writer(ctx, DaemonMessage::Unlocked);
         }
         Ok(Err(e)) => {
-            send_to_writer(ctx.writer_tx, DaemonMessage::LockedError { error: e });
+            send_to_writer(ctx, DaemonMessage::LockedError { error: e });
         }
         Err(_) => warn!("daemon disconnected while handling unlock"),
     }
@@ -828,7 +890,7 @@ fn handle_list_models_sync(ctx: &mut ClientCtx, attached_session_id: Option<u64>
     match result {
         Ok(Ok((models, selected_model))) => {
             send_to_writer(
-                ctx.writer_tx,
+                ctx,
                 DaemonMessage::Models {
                     models,
                     selected_model,
@@ -836,7 +898,7 @@ fn handle_list_models_sync(ctx: &mut ClientCtx, attached_session_id: Option<u64>
             );
         }
         Ok(Err(e)) => {
-            send_to_writer(ctx.writer_tx, DaemonMessage::ModelsFailed { error: e });
+            send_to_writer(ctx, DaemonMessage::ModelsFailed { error: e });
         }
         Err(_) => warn!("daemon disconnected while handling list models"),
     }
@@ -855,7 +917,7 @@ fn handle_refresh_models_sync(ctx: &mut ClientCtx, force: bool) {
     match result {
         Ok(Ok(report)) => {
             send_to_writer(
-                ctx.writer_tx,
+                ctx,
                 DaemonMessage::ModelsRefreshed {
                     providers: report.providers,
                     models: report.models,
@@ -864,10 +926,7 @@ fn handle_refresh_models_sync(ctx: &mut ClientCtx, force: bool) {
             );
         }
         Ok(Err(e)) => {
-            send_to_writer(
-                ctx.writer_tx,
-                DaemonMessage::ModelsRefreshFailed { error: e },
-            );
+            send_to_writer(ctx, DaemonMessage::ModelsRefreshFailed { error: e });
         }
         Err(_) => warn!("daemon disconnected while handling refresh models"),
     }
@@ -881,7 +940,7 @@ fn handle_get_credential_sync(ctx: &mut ClientCtx, service: String) {
     match result {
         Ok(Some(key)) => {
             send_to_writer(
-                ctx.writer_tx,
+                ctx,
                 DaemonMessage::Credential {
                     service,
                     key: Some(key),
@@ -889,10 +948,7 @@ fn handle_get_credential_sync(ctx: &mut ClientCtx, service: String) {
             );
         }
         Ok(None) => {
-            send_to_writer(
-                ctx.writer_tx,
-                DaemonMessage::Credential { service, key: None },
-            );
+            send_to_writer(ctx, DaemonMessage::Credential { service, key: None });
         }
         Err(_) => warn!("daemon disconnected while handling get credential"),
     }
@@ -911,7 +967,7 @@ fn handle_delete_session_sync(ctx: &mut ClientCtx, session_id: u64) {
         }
         Ok(Err(e)) => {
             send_to_writer(
-                ctx.writer_tx,
+                ctx,
                 DaemonMessage::SessionDeleteFailed {
                     session_id,
                     error: e.to_string(),
@@ -936,11 +992,11 @@ fn handle_add_credential_sync(
     });
     match result {
         Ok(Ok(())) => {
-            send_to_writer(ctx.writer_tx, DaemonMessage::CredentialAdded { service });
+            send_to_writer(ctx, DaemonMessage::CredentialAdded { service });
         }
         Ok(Err(e)) => {
             send_to_writer(
-                ctx.writer_tx,
+                ctx,
                 DaemonMessage::CredentialAddFailed { service, error: e },
             );
         }
@@ -955,11 +1011,11 @@ fn handle_remove_credential_sync(ctx: &mut ClientCtx, service: String) {
     });
     match result {
         Ok(Ok(())) => {
-            send_to_writer(ctx.writer_tx, DaemonMessage::CredentialRemoved { service });
+            send_to_writer(ctx, DaemonMessage::CredentialRemoved { service });
         }
         Ok(Err(e)) => {
             send_to_writer(
-                ctx.writer_tx,
+                ctx,
                 DaemonMessage::CredentialRemoveFailed { service, error: e },
             );
         }
@@ -970,6 +1026,16 @@ fn handle_remove_credential_sync(ctx: &mut ClientCtx, service: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: a fresh unbounded delivery sink with its byte counter at
+    /// zero, plus the receiver to observe deliveries.
+    fn test_sink() -> (
+        crate::broadcast::SubscriberSink,
+        crossbeam_channel::Receiver<DaemonMessage>,
+    ) {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        (crate::broadcast::SubscriberSink::new(tx), rx)
+    }
 
     /// A `ConnectionWriter` test double that forwards every written message
     /// to a channel and records shutdown calls on another. Message-passing
@@ -1025,9 +1091,15 @@ mod tests {
     /// so the client observes the notification before the EOF.
     #[test]
     fn writer_thread_flushes_shutting_down_then_shuts_down_and_stops() {
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(8);
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
         let (writer, sent_rx, shutdown_rx) = mock_writer(None);
-        let handle = std::thread::spawn(move || writer_thread(writer, rx));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let global = Arc::new(AtomicUsize::new(0));
+        let handle = std::thread::spawn({
+            let bytes = Arc::clone(&bytes);
+            let global = Arc::clone(&global);
+            move || writer_thread(writer, rx, bytes, global)
+        });
 
         tx.send(DaemonMessage::Pong).unwrap();
         tx.send(DaemonMessage::ShuttingDown).unwrap();
@@ -1047,14 +1119,57 @@ mod tests {
         );
     }
 
-    /// A send error is fatal for the connection: the loop stops (and does
-    /// NOT call shutdown — the socket is broken anyway).
+    /// `Evicted` is handled exactly like `ShuttingDown`: flushed, socket shut
+    /// down, draining stops — the lag-eviction advisory is also a
+    /// notify-before-EOF on the graceful path (the daemon additionally
+    /// force-closes the socket, but the ordering guarantee is preserved here).
     #[test]
-    fn writer_thread_stops_on_send_error_without_shutdown() {
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(8);
+    fn writer_thread_flushes_evicted_then_shuts_down_and_stops() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let (writer, sent_rx, shutdown_rx) = mock_writer(None);
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let global = Arc::new(AtomicUsize::new(0));
+        let handle = std::thread::spawn({
+            let bytes = Arc::clone(&bytes);
+            let global = Arc::clone(&global);
+            move || writer_thread(writer, rx, bytes, global)
+        });
+
+        tx.send(DaemonMessage::Pong).unwrap();
+        tx.send(DaemonMessage::Evicted).unwrap();
+        // Queued after the advisory: must never be written.
+        tx.send(DaemonMessage::Pong).unwrap();
+
+        handle.join().expect("writer thread panicked");
+        let written: Vec<_> = sent_rx.try_iter().collect();
+        assert_eq!(
+            written,
+            vec![DaemonMessage::Pong, DaemonMessage::Evicted],
+            "Evicted must be flushed in order, then draining must stop"
+        );
+        assert!(
+            shutdown_rx.try_recv().is_ok(),
+            "the writer thread must close the socket itself after Evicted"
+        );
+    }
+
+    /// A send error is fatal for the connection: the loop stops AND shuts the
+    /// socket down. A send error is either a broken pipe (socket gone —
+    /// shutdown is a harmless no-op) or a [`WRITER_WRITE_TIMEOUT`] on a wedged
+    /// client whose receive window is zero (socket still open — shutdown is
+    /// what unblocks the reader's blocking read so the connection is reaped).
+    #[test]
+    fn writer_thread_stops_and_shuts_down_on_send_error() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
         // Fail on the second write: the first Pong goes out, the loop breaks.
         let (writer, sent_rx, shutdown_rx) = mock_writer(Some(2));
-        let handle = std::thread::spawn(move || writer_thread(writer, rx));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let global = Arc::new(AtomicUsize::new(0));
+        let handle = std::thread::spawn({
+            let bytes = Arc::clone(&bytes);
+            let global = Arc::clone(&global);
+            move || writer_thread(writer, rx, bytes, global)
+        });
 
         tx.send(DaemonMessage::Pong).unwrap();
         tx.send(DaemonMessage::Pong).unwrap();
@@ -1065,8 +1180,8 @@ mod tests {
         let written: Vec<_> = sent_rx.try_iter().collect();
         assert_eq!(written.len(), 1, "writer must stop at the failing message");
         assert!(
-            shutdown_rx.try_recv().is_err(),
-            "shutdown must not be called on a send error"
+            shutdown_rx.try_recv().is_ok(),
+            "writer must shut the socket down on a send error so the reader is unblocked"
         );
     }
 
@@ -1074,9 +1189,15 @@ mod tests {
     /// normal drain-to-exit path for a disconnected client.
     #[test]
     fn writer_thread_exits_cleanly_on_disconnect() {
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(8);
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
         let (writer, sent_rx, shutdown_rx) = mock_writer(None);
-        let handle = std::thread::spawn(move || writer_thread(writer, rx));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let global = Arc::new(AtomicUsize::new(0));
+        let handle = std::thread::spawn({
+            let bytes = Arc::clone(&bytes);
+            let global = Arc::clone(&global);
+            move || writer_thread(writer, rx, bytes, global)
+        });
 
         tx.send(DaemonMessage::Pong).unwrap();
         drop(tx); // all senders gone: the for-loop drains and ends
@@ -1087,14 +1208,67 @@ mod tests {
         assert!(shutdown_rx.try_recv().is_err());
     }
 
+    /// The writer thread decrements the per-client and daemon-wide byte
+    /// counters once per dequeued message, using each message's approximate
+    /// wire size — the exact counterpart of `enqueue`'s increment. A
+    /// two-message drain must zero both counters.
+    #[test]
+    fn writer_thread_decrements_byte_counters_per_message() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let (writer, _sent_rx, _shutdown_rx) = mock_writer(None);
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let global = Arc::new(AtomicUsize::new(0));
+        let handle = std::thread::spawn({
+            let bytes = Arc::clone(&bytes);
+            let global = Arc::clone(&global);
+            move || writer_thread(writer, rx, bytes, global)
+        });
+
+        let m1 = DaemonMessage::Failed {
+            session_id: 1,
+            request_id: 1,
+            error: "a".repeat(100),
+        };
+        let m2 = DaemonMessage::Failed {
+            session_id: 2,
+            request_id: 2,
+            error: "b".repeat(50),
+        };
+        let s1 = m1.approx_wire_size();
+        let s2 = m2.approx_wire_size();
+
+        // Pre-seed the counters exactly as `enqueue` would have (the two
+        // messages are queued and counted before the writer starts).
+        bytes.fetch_add(s1 + s2, Ordering::Relaxed);
+        global.fetch_add(s1 + s2, Ordering::Relaxed);
+
+        tx.send(m1).unwrap();
+        tx.send(m2).unwrap();
+        drop(tx);
+        handle.join().expect("writer thread panicked");
+
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            0,
+            "every dequeued message must decrement the per-client counter"
+        );
+        assert_eq!(
+            global.load(Ordering::Relaxed),
+            0,
+            "every dequeued message must decrement the daemon-wide counter"
+        );
+    }
+
     #[test]
     fn handle_unlock_sync_ok() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1113,11 +1287,13 @@ mod tests {
     #[test]
     fn handle_unlock_sync_err() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1139,11 +1315,13 @@ mod tests {
     #[test]
     fn handle_unlock_sync_disconnected() {
         let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1157,11 +1335,13 @@ mod tests {
     #[test]
     fn handle_list_models_sync_ok() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1186,11 +1366,13 @@ mod tests {
         // (via the maintenance thread) replies with a report, which the
         // connection routes to the client as ModelsRefreshed.
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1221,11 +1403,13 @@ mod tests {
     #[test]
     fn handle_refresh_models_sync_err() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1246,11 +1430,13 @@ mod tests {
     #[test]
     fn handle_list_models_sync_err() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1272,11 +1458,13 @@ mod tests {
     #[test]
     fn handle_get_credential_sync_some() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1300,11 +1488,13 @@ mod tests {
     #[test]
     fn handle_get_credential_sync_none() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1329,13 +1519,14 @@ mod tests {
     fn switch_session_to_different_sends_detach_to_old() {
         let (old_tx, old_rx) = mpsc::channel();
         let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
-        let (writer_tx, _writer_rx) =
-            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, _writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let (daemon_tx, _daemon_rx) = mpsc::channel();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(old_tx);
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
@@ -1362,13 +1553,14 @@ mod tests {
     fn switch_session_same_skips_detach() {
         let (old_tx, old_rx) = mpsc::channel();
         let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
-        let (writer_tx, _writer_rx) =
-            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, _writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let (daemon_tx, _daemon_rx) = mpsc::channel();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(old_tx);
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
@@ -1391,11 +1583,13 @@ mod tests {
     #[test]
     fn handle_delete_session_sync_success_no_message_sent() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1414,11 +1608,13 @@ mod tests {
     #[test]
     fn handle_delete_session_sync_error() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1441,11 +1637,13 @@ mod tests {
     #[test]
     fn handle_delete_session_sync_disconnected() {
         let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1459,13 +1657,14 @@ mod tests {
     #[test]
     fn switch_session_from_none_no_detach() {
         let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
-        let (writer_tx, _writer_rx) =
-            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, _writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let (daemon_tx, _daemon_rx) = mpsc::channel();
         let mut attached_id: Option<u64> = None;
         let mut attached_tx: Option<mpsc::Sender<SessionCommand>> = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
@@ -1486,13 +1685,14 @@ mod tests {
     #[test]
     fn dispatch_undo_when_attached_sends_undo_command() {
         let (daemon_tx, _daemon_rx) = mpsc::channel();
-        let (writer_tx, _writer_rx) =
-            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, _writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let (session_tx, session_rx) = mpsc::channel();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(session_tx);
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
@@ -1510,12 +1710,13 @@ mod tests {
     #[test]
     fn dispatch_undo_when_not_attached_is_noop() {
         let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (writer_tx, writer_rx) =
-            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1533,13 +1734,14 @@ mod tests {
     #[test]
     fn dispatch_redo_when_attached_sends_redo_command() {
         let (daemon_tx, _daemon_rx) = mpsc::channel();
-        let (writer_tx, _writer_rx) =
-            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, _writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let (session_tx, session_rx) = mpsc::channel();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(session_tx);
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
@@ -1557,12 +1759,13 @@ mod tests {
     #[test]
     fn dispatch_redo_when_not_attached_is_noop() {
         let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (writer_tx, writer_rx) =
-            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
@@ -1579,13 +1782,14 @@ mod tests {
     #[test]
     fn dispatch_continue_generation_when_attached_sends_run_input() {
         let (daemon_tx, _daemon_rx) = mpsc::channel();
-        let (writer_tx, _writer_rx) =
-            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, _writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let (session_tx, session_rx) = mpsc::channel();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(session_tx);
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
@@ -1611,12 +1815,13 @@ mod tests {
     #[test]
     fn dispatch_continue_generation_when_not_attached_sends_failed() {
         let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (writer_tx, writer_rx) =
-            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
-            writer_tx: &writer_tx,
+            writer: &sink,
+            global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,

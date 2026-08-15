@@ -1,3 +1,4 @@
+use crate::broadcast::{EnqueueOutcome, LagLimits, SubscriberSink};
 use crate::context::{LoadedSkill, SkillMeta};
 use crate::daemon::DaemonCommand;
 use crate::db::{self, SessionRecord, write_session_retry, write_turn_retry};
@@ -13,6 +14,7 @@ use choreo_proto::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, mpsc};
 use tracing::{debug, error, info, trace, warn};
 use unicode_segmentation::UnicodeSegmentation;
@@ -165,9 +167,16 @@ pub enum SessionCommand {
     StatusChanged(SessionStatus),
     Attach {
         client_id: u64,
-        tx: std::sync::mpsc::SyncSender<DaemonMessage>,
+        tx: SubscriberSink,
     },
     Detach {
+        client_id: u64,
+    },
+    /// Remove a subscriber without detaching the session (used by the daemon
+    /// when a client is evicted for lag or fully disconnects — the daemon
+    /// knows the client's session memberships and cleans them up promptly
+    /// instead of waiting for the next broadcast to notice the dead sink).
+    RemoveSubscriber {
         client_id: u64,
     },
     GetSummary {
@@ -245,6 +254,13 @@ pub struct RequestContext {
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
     /// Daemon-wide cap on agent tool-loop iterations per request (0 = unlimited).
     pub max_turns: u32,
+    /// Lag thresholds for the lossless broadcast fan-out (see `crate::broadcast`).
+    /// Session threads are producers in that fan-out, so they enforce the same
+    /// per-client cap and global budget as the daemon command loop.
+    pub lag_limits: LagLimits,
+    /// Daemon-wide backlog counter, shared with every session thread and the
+    /// daemon command loop (the 6th sanctioned shared-state exception).
+    pub global_lag: Arc<AtomicUsize>,
 }
 
 pub struct ChildResult {
@@ -512,7 +528,7 @@ pub struct SessionState {
     pub next_turn_id: u32,
     last_undo_turn_ids: Option<Vec<u32>>,
     pub turns: BTreeMap<u32, Turn>,
-    subscribers: HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
+    subscribers: HashMap<u64, SubscriberSink>,
     pub(crate) active_requests: BTreeMap<u32, ActiveRequest>,
     pub provider: Option<InferenceProvider>,
     pub loaded_skill_bodies: Vec<LoadedSkill>,
@@ -541,11 +557,7 @@ impl SessionState {
     /// Re-resolve context window from the catalog when the stored value
     /// is `None` (e.g. sessions created before a model was added to the
     /// catalog, or after the provider was lazily resolved on unlock).
-    fn resolve_context_window_if_missing(
-        &mut self,
-        session_id: u64,
-        daemon_tx: &mpsc::Sender<DaemonCommand>,
-    ) {
+    fn resolve_context_window_if_missing(&mut self, ctx: &RequestContext) {
         if self.config.context_window.is_some() {
             return;
         }
@@ -555,14 +567,14 @@ impl SessionState {
         if let Some(cw) = provider.resolve_context_window(model) {
             debug!(
                 "session {}: re-resolved context_window={} for model={}",
-                session_id, cw, model
+                ctx.session_id, cw, model
             );
             self.config.context_window = Some(cw);
             broadcast(
                 &mut self.subscribers,
-                daemon_tx,
+                ctx,
                 DaemonMessage::ContextWindowResolved {
-                    session_id,
+                    session_id: ctx.session_id,
                     context_window: cw,
                 },
             );
@@ -579,10 +591,7 @@ impl SessionState {
         }
     }
 
-    fn from_snapshot(
-        snapshot: SessionSnapshot,
-        subscribers: HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
-    ) -> Self {
+    fn from_snapshot(snapshot: SessionSnapshot, subscribers: HashMap<u64, SubscriberSink>) -> Self {
         let turn_count = snapshot.turns.len() as u32;
         Self {
             config: snapshot.config,
@@ -850,34 +859,59 @@ pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
 }
 
 fn broadcast(
-    subscribers: &mut HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    subscribers: &mut HashMap<u64, SubscriberSink>,
+    ctx: &RequestContext,
     message: DaemonMessage,
 ) {
     // Forward to daemon-level activity subscribers so clients subscribed
     // to all session activity (e.g. the TUI after SubscribeAllActivity)
     // receive every session-scoped event without having to attach to every
     // session individually.
-    let _ = daemon_tx.send(DaemonCommand::BroadcastActivity(message.clone()));
+    let _ = ctx
+        .daemon_tx
+        .send(DaemonCommand::BroadcastActivity(message.clone()));
 
-    // Shared drop-on-full / evict-on-disconnect policy (see crate::broadcast):
-    // a slow subscriber must never stall this session thread, and a transient
-    // full buffer must never permanently evict it.
-    subscribers.retain(|client_id, tx| {
-        crate::broadcast::try_send_keep_on_full(tx, *client_id, "session", &message)
+    // Lossless + lag-eviction (shared with the daemon's summary/activity
+    // fan-outs, see crate::broadcast): every message is enqueued into each
+    // subscriber's UNBOUNDED queue — a slow subscriber can never stall this
+    // session thread and no message is ever dropped — and a subscriber whose
+    // queue crossed the lag limits is evicted (disconnected) so the backlog
+    // stays bounded. Eviction is signalled to the daemon (which owns the
+    // connection) rather than done here: this thread holds only the sink.
+    let mut evict_clients = Vec::new();
+    let mut evict_largest = false;
+    subscribers.retain(|client_id, sink| {
+        match sink.enqueue(&message, &ctx.lag_limits, &ctx.global_lag) {
+            EnqueueOutcome::Delivered => true,
+            EnqueueOutcome::Disconnected => false,
+            EnqueueOutcome::ClientOverLag => {
+                evict_clients.push(*client_id);
+                true
+            }
+            EnqueueOutcome::GlobalOverBudget => {
+                evict_largest = true;
+                true
+            }
+        }
     });
+    for client_id in evict_clients {
+        let _ = ctx.daemon_tx.send(DaemonCommand::EvictClient { client_id });
+    }
+    if evict_largest {
+        let _ = ctx.daemon_tx.send(DaemonCommand::EvictLargestLagging);
+    }
 }
 
 fn fail_request(
-    subscribers: &mut HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    subscribers: &mut HashMap<u64, SubscriberSink>,
+    ctx: &RequestContext,
     session_id: u64,
     request_id: u32,
     error: impl Into<String>,
 ) -> bool {
     broadcast(
         subscribers,
-        daemon_tx,
+        ctx,
         DaemonMessage::Started {
             session_id,
             request_id,
@@ -887,7 +921,7 @@ fn fail_request(
     );
     broadcast(
         subscribers,
-        daemon_tx,
+        ctx,
         DaemonMessage::Failed {
             session_id,
             request_id,
@@ -974,7 +1008,7 @@ pub fn session_main(
     // Re-resolve context window from the catalog when loading an existing
     // session whose stored context_window is None (e.g. sessions created
     // before a model was added to the catalog).
-    state.resolve_context_window_if_missing(ctx.session_id, &ctx.daemon_tx);
+    state.resolve_context_window_if_missing(&ctx);
 
     match db::read_turns(&ctx.db, ctx.session_id) {
         Ok(turns) => {
@@ -1050,6 +1084,9 @@ fn process_command(
         SessionCommand::Detach { client_id } => {
             handle_detach(client_id, state, shutdown_requested, ctx)
         }
+        SessionCommand::RemoveSubscriber { client_id } => {
+            handle_remove_subscriber(client_id, state, shutdown_requested, ctx)
+        }
         SessionCommand::GetSummary { reply } => handle_get_summary(reply, state, ctx),
         SessionCommand::RequestFinished {
             request_id,
@@ -1102,7 +1139,7 @@ fn handle_run_input(
     if text.is_empty() {
         return fail_request(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             ctx.session_id,
             request_id,
             "empty input",
@@ -1122,11 +1159,11 @@ fn handle_run_input(
                 state.provider = Some(provider);
                 // Re-resolve context window now that the provider is
                 // available (e.g. after unlocking the daemon).
-                state.resolve_context_window_if_missing(ctx.session_id, &ctx.daemon_tx);
+                state.resolve_context_window_if_missing(ctx);
                 let Some(p) = state.provider.as_ref() else {
                     return fail_request(
                         &mut state.subscribers,
-                        &ctx.daemon_tx,
+                        ctx,
                         ctx.session_id,
                         request_id,
                         "internal error: provider not set after resolution".to_string(),
@@ -1137,7 +1174,7 @@ fn handle_run_input(
             _ => {
                 return fail_request(
                     &mut state.subscribers,
-                    &ctx.daemon_tx,
+                    ctx,
                     ctx.session_id,
                     request_id,
                     format!(
@@ -1149,7 +1186,7 @@ fn handle_run_input(
     } else {
         return fail_request(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             ctx.session_id,
             request_id,
             "no account configured on this session — use /account <name> to set one",
@@ -1160,7 +1197,7 @@ fn handle_run_input(
         None => {
             return fail_request(
                 &mut state.subscribers,
-                &ctx.daemon_tx,
+                ctx,
                 ctx.session_id,
                 request_id,
                 "no model selected",
@@ -1170,7 +1207,7 @@ fn handle_run_input(
     if *shutdown_requested {
         return fail_request(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             ctx.session_id,
             request_id,
             "session is shutting down",
@@ -1179,7 +1216,7 @@ fn handle_run_input(
     if !state.active_requests.is_empty() {
         return fail_request(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             ctx.session_id,
             request_id,
             "session already has an active request",
@@ -1188,7 +1225,7 @@ fn handle_run_input(
 
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::Started {
             session_id: ctx.session_id,
             request_id,
@@ -1256,7 +1293,7 @@ fn handle_run_child_input(
     }
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::Started {
             session_id: ctx.session_id,
             request_id,
@@ -1312,7 +1349,7 @@ fn handle_cancel(request_id: u32, state: &mut SessionState, ctx: &RequestContext
             let _ = active.cancel_tx.send(());
             broadcast(
                 &mut state.subscribers,
-                &ctx.daemon_tx,
+                ctx,
                 DaemonMessage::Cancelled {
                     session_id: ctx.session_id,
                     request_id: rid,
@@ -1337,7 +1374,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         );
         broadcast(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             DaemonMessage::ModelSelectionFailed {
                 session_id: ctx.session_id,
                 model,
@@ -1360,7 +1397,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
     if let Some(cw) = cw {
         broadcast(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             DaemonMessage::ContextWindowResolved {
                 session_id: ctx.session_id,
                 context_window: cw,
@@ -1388,7 +1425,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         state.config.reasoning_effort = Some("off".to_string());
         broadcast(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             DaemonMessage::ReasoningEffortSet {
                 session_id: ctx.session_id,
                 effort: "off".to_string(),
@@ -1402,7 +1439,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
     );
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::ModelSelected {
             session_id: ctx.session_id,
             model: model.clone(),
@@ -1468,7 +1505,7 @@ fn handle_status_changed(
     let last_modified = state.config.last_modified;
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::SessionStatusChanged {
             session_id: ctx.session_id,
             status: new_status.clone(),
@@ -1491,7 +1528,7 @@ fn handle_status_changed(
 /// the correct turn — without this, those chunks would be silently dropped.
 fn handle_attach(
     client_id: u64,
-    tx: std::sync::mpsc::SyncSender<DaemonMessage>,
+    tx: SubscriberSink,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
@@ -1516,54 +1553,35 @@ fn handle_attach(
     // the broadcast_activity filter in the daemon won't see this message
     // anyway (it's sent directly, not through session's broadcast()).
     //
-    // They are advisory: `try_send` drops them if the client's writer
-    // buffer is momentarily full (the session thread must never block on
-    // a slow client), and the snapshot below — or the next broadcast —
-    // supersedes them anyway.
+    // Both these and the snapshot below go through `send_unchecked`:
+    // with lossless unbounded channels they are GUARANTEED to arrive, but
+    // a freshly-attached client's one-shot snapshot must not trip the lag
+    // cap (a large snapshot is not evidence of a lagging client), and the
+    // byte accounting still keeps the writer thread's per-dequeue
+    // decrement balanced.
     if !state.active_requests.is_empty()
         && let Some(tx) = state.subscribers.get(&client_id)
     {
         for (&request_id, active) in &state.active_requests {
-            let _ = tx.try_send(DaemonMessage::Started {
-                session_id: ctx.session_id,
-                request_id,
-                turn_id: active.turn_id,
-                estimated_prompt_tokens: 0,
-            });
+            tx.send_unchecked(
+                &DaemonMessage::Started {
+                    session_id: ctx.session_id,
+                    request_id,
+                    turn_id: active.turn_id,
+                    estimated_prompt_tokens: 0,
+                },
+                &ctx.global_lag,
+            );
         }
     }
 
     // The snapshot is the new client's only complete view of accumulated
-    // content, so a drop here is more consequential than a routine
-    // broadcast drop — but the session thread must STILL never block: a
-    // client whose 128-deep writer buffer is full is already far behind
-    // (and would otherwise stall the entire session command loop, which
-    // also forwards to the daemon's activity broadcast for every other
-    // subscriber).  Drop on full, warn, count it in /metrics, and keep the
-    // client subscribed — it stays live for subsequent broadcasts and the
-    // in-flight turn's final `ToolCallFinished` + `SessionMessageAppended`
-    // will resync the complete content.
+    // content, so lossless delivery matters more here than anywhere else —
+    // and the unbounded channel makes it guaranteed (the old code could
+    // drop it on a full 128-slot buffer).
     let snapshot = state.session_state_message(ctx.session_id);
     if let Some(tx) = state.subscribers.get(&client_id) {
-        match tx.try_send(snapshot) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                warn!(
-                    "session {}: dropped attach snapshot for client {}: writer buffer full",
-                    ctx.session_id, client_id
-                );
-                crate::metrics::record_broadcast_dropped("attach");
-            }
-            // The client disconnected between registration and the
-            // snapshot — nothing to deliver; the disconnect/untrack path
-            // cleans up the stale subscription.
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                debug!(
-                    "session {}: attach snapshot for client {} dropped: receiver gone",
-                    ctx.session_id, client_id
-                );
-            }
-        }
+        tx.send_unchecked(&snapshot, &ctx.global_lag);
     }
     false
 }
@@ -1586,6 +1604,27 @@ fn handle_detach(
             client_id,
             session_id: ctx.session_id,
         });
+    state.active_requests.is_empty() && (state.subscribers.is_empty() || *shutdown_requested)
+}
+
+/// Remove a subscriber at the daemon's request (client evicted for lag or
+/// fully disconnected). Mirrors [`handle_detach`] but does NOT send
+/// `UntrackSessionSubscription` — the daemon already removed the client from
+/// its own tracking in `client_subscribed_sessions` when it initiated the
+/// eviction/cleanup, and sending the untrack here would race the daemon's own
+/// removal. The exit predicate is the same as detach: a session with no
+/// subscribers and no active requests (and not mid-shutdown) can exit.
+fn handle_remove_subscriber(
+    client_id: u64,
+    state: &mut SessionState,
+    shutdown_requested: &bool,
+    ctx: &RequestContext,
+) -> bool {
+    debug!(
+        "session {}: removing subscriber {}",
+        ctx.session_id, client_id
+    );
+    state.subscribers.remove(&client_id);
     state.active_requests.is_empty() && (state.subscribers.is_empty() || *shutdown_requested)
 }
 
@@ -1721,7 +1760,7 @@ fn handle_request_finished(
     });
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::SessionStatusChanged {
             session_id: ctx.session_id,
             status: SessionStatus::Inactive,
@@ -1743,7 +1782,7 @@ fn handle_broadcast(
 ) -> bool {
     // Broadcast through the main session thread's live subscriber
     // map so that in-flight worker broadcasts respect detach.
-    broadcast(&mut state.subscribers, &ctx.daemon_tx, message);
+    broadcast(&mut state.subscribers, ctx, message);
     false
 }
 
@@ -1776,7 +1815,7 @@ fn handle_sync_accumulated_usage(
     // a client can never be ahead of the snapshot it receives on attach.
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::TokenUsageUpdate {
             session_id: ctx.session_id,
             token_usage: state.config.accumulated_usage,
@@ -1825,7 +1864,7 @@ fn handle_set_title(title: String, state: &mut SessionState, ctx: &RequestContex
     // new title immediately, without waiting for the next persist cycle.
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::SessionTitleSet {
             session_id: ctx.session_id,
             title: title.clone(),
@@ -1870,7 +1909,7 @@ fn handle_set_working_dir(
     // path immediately, without waiting for the next persist cycle.
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::SessionWorkingDirSet {
             session_id: ctx.session_id,
             path: Some(path.to_string_lossy().into_owned()),
@@ -1914,7 +1953,7 @@ fn handle_load_tools(
     // Broadcast updated session state so the client (e.g. TUI status bar)
     // picks up the new active_tool_groups immediately.
     let session_state = state.session_state_message(ctx.session_id);
-    broadcast(&mut state.subscribers, &ctx.daemon_tx, session_state);
+    broadcast(&mut state.subscribers, ctx, session_state);
     persist_session_metadata(state, ctx, "LoadTools");
     let _ = reply.send(Ok(result));
 
@@ -1951,7 +1990,7 @@ fn handle_unload_tools(
     // Broadcast updated session state so the client picks up the new
     // active_tool_groups immediately.
     let session_state = state.session_state_message(ctx.session_id);
-    broadcast(&mut state.subscribers, &ctx.daemon_tx, session_state);
+    broadcast(&mut state.subscribers, ctx, session_state);
     persist_session_metadata(state, ctx, "UnloadTools");
     let _ = reply.send(Ok(result));
 
@@ -1979,7 +2018,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
             if let Some(cw) = cw {
                 broadcast(
                     &mut state.subscribers,
-                    &ctx.daemon_tx,
+                    ctx,
                     DaemonMessage::ContextWindowResolved {
                         session_id: ctx.session_id,
                         context_window: cw,
@@ -1997,7 +2036,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
     state.config.account_name = Some(name.clone());
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::SessionAccountSet {
             session_id: ctx.session_id,
             account: name,
@@ -2019,7 +2058,7 @@ fn handle_set_reasoning_effort(
         warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
         broadcast(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             DaemonMessage::ReasoningEffortSetFailed {
                 session_id: ctx.session_id,
                 effort,
@@ -2057,7 +2096,7 @@ fn handle_set_reasoning_effort(
         );
         broadcast(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             DaemonMessage::ReasoningEffortSet {
                 session_id: ctx.session_id,
                 effort,
@@ -2070,7 +2109,7 @@ fn handle_set_reasoning_effort(
         warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
         broadcast(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             DaemonMessage::ReasoningEffortSetFailed {
                 session_id: ctx.session_id,
                 effort,
@@ -2144,7 +2183,7 @@ fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     }
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::TurnsUndone {
             session_id: ctx.session_id,
             turn_ids,
@@ -2175,7 +2214,7 @@ fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     }
     broadcast(
         &mut state.subscribers,
-        &ctx.daemon_tx,
+        ctx,
         DaemonMessage::TurnsRedone {
             session_id: ctx.session_id,
             turns: turns
@@ -2198,7 +2237,7 @@ fn handle_shutdown(
         let _ = active.cancel_tx.send(());
         broadcast(
             &mut state.subscribers,
-            &ctx.daemon_tx,
+            ctx,
             DaemonMessage::Cancelled {
                 session_id: ctx.session_id,
                 request_id,
@@ -2343,7 +2382,6 @@ fn persist_and_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::connection::SUBSCRIBER_CHANNEL_CAPACITY;
     use crate::tools::ToolRegistry;
     use choreo_proto::SessionStatus;
     use std::collections::HashMap;
@@ -2584,8 +2622,17 @@ mod tests {
             tool_registry,
             daemon_tx,
             max_turns: 0,
+            lag_limits: LagLimits::default(),
+            global_lag: Arc::new(AtomicUsize::new(0)),
         };
         (test_state(), ctx)
+    }
+
+    /// A fresh lossless delivery sink for a fake client, plus its receiver
+    /// to observe deliveries.
+    fn test_sink() -> (SubscriberSink, crossbeam_channel::Receiver<DaemonMessage>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        (SubscriberSink::new(tx), rx)
     }
 
     #[test]
@@ -2656,8 +2703,8 @@ mod tests {
 
     #[test]
     fn broadcast_delivers_message_to_all_subscribers() {
-        let (tx1, rx1) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        let (tx2, rx2) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx1, rx1) = test_sink();
+        let (tx2, rx2) = test_sink();
         let (mut state, ctx) = broadcast_setup();
         state.subscribers.insert(10, tx1);
         state.subscribers.insert(20, tx2);
@@ -2716,7 +2763,7 @@ mod tests {
 
     #[test]
     fn broadcast_handles_disconnected_subscriber_gracefully() {
-        let (tx, _rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, _rx) = test_sink();
         drop(_rx);
         let (mut state, ctx) = broadcast_setup();
         state.subscribers.insert(99, tx);
@@ -2732,35 +2779,24 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_keeps_slow_subscriber_on_full_buffer() {
-        // Regression test mirroring the daemon-level broadcast tests: a
-        // momentarily-full writer buffer must drop the message but KEEP the
-        // session subscriber.  The TUI registers per-session once at attach
-        // and relies on the stream (final `ToolCallFinished` +
-        // `SessionMessageAppended` delivers complete content), so evicting it
-        // on a full buffer would blind it to this session's stream.
-        let (mut state, ctx) = broadcast_setup();
-        // A capacity-1 channel lets us fill the buffer with a single message
-        // so the next try_send fails with Full.
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
+    fn broadcast_enqueues_losslessly_and_signals_eviction() {
+        // Lossless + lag-eviction: a session subscriber whose queue crosses
+        // the lag cap still receives the crossing message (never dropped),
+        // and the session thread signals the daemon to evict that client
+        // (the daemon owns the connection and does the disconnect).
+        let (mut state, mut ctx) = broadcast_setup();
+        ctx.lag_limits = LagLimits {
+            per_client_cap: 16,
+            global_budget: usize::MAX,
+        };
+        let (tx, rx) = test_sink();
         state.subscribers.insert(10, tx);
 
-        // Fill the subscriber's buffer so the broadcast below cannot enqueue.
-        let filler = DaemonMessage::Pong;
-        state
-            .subscribers
-            .get(&10)
-            .expect("subscriber registered")
-            .send(filler.clone())
-            .expect("filler fits in capacity-1 channel");
-
-        // Buffer is full: the broadcast message is dropped, not queued, and
-        // the subscriber must survive.
-        let broadcast = DaemonMessage::Done {
+        // A message large enough to cross the tiny per-client cap.
+        let broadcast = DaemonMessage::Failed {
             session_id: ctx.session_id,
             request_id: 5,
-            token_usage: None,
-            last_prompt_tokens: None,
+            error: "x".repeat(100),
         };
         let mut shutdown = false;
         process_command(
@@ -2770,22 +2806,12 @@ mod tests {
             &ctx,
         );
 
-        assert!(
-            state.subscribers.contains_key(&10),
-            "a full buffer must not evict the session subscriber"
-        );
-        assert_eq!(rx.recv().unwrap(), filler);
-        assert!(rx.try_recv().is_err(), "message dropped while buffer full");
-
-        // Once the buffer drains, later broadcasts flow again.
-        process_command(
-            SessionCommand::Broadcast(broadcast.clone()),
-            &mut state,
-            &mut shutdown,
-            &ctx,
-        );
+        // Lossless: the crossing message was delivered, not dropped.
         assert_eq!(rx.recv().unwrap(), broadcast);
+        // The subscriber stays in the map (eviction happens daemon-side via
+        // the EvictClient signal + the daemon's handle_evict_client).
         assert!(state.subscribers.contains_key(&10));
+        // The session itself keeps running.
         assert!(!shutdown);
     }
 
@@ -2794,7 +2820,7 @@ mod tests {
     #[test]
     fn set_working_dir_updates_config_and_broadcasts() {
         let (mut state, ctx) = broadcast_setup();
-        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, rx) = test_sink();
         state.subscribers.insert(10, tx);
         let (reply_tx, reply_rx) = mpsc::channel();
         // Pre-populate the skill cache so we can verify it gets invalidated.
@@ -3354,7 +3380,7 @@ mod tests {
             total_tokens: 45,
         };
 
-        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sub_tx, sub_rx) = test_sink();
         let mut shutdown = false;
         process_command(
             SessionCommand::Attach {
@@ -3394,10 +3420,12 @@ mod tests {
             tool_registry,
             daemon_tx,
             max_turns: 0,
+            lag_limits: LagLimits::default(),
+            global_lag: Arc::new(AtomicUsize::new(0)),
         };
         let mut state = test_state();
 
-        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sub_tx, sub_rx) = test_sink();
         state.subscribers.insert(42, sub_tx);
 
         // The worker's cumulative total, as routed from the private clone in
@@ -3482,7 +3510,7 @@ mod tests {
             &ctx,
         );
 
-        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sub_tx, sub_rx) = test_sink();
         process_command(
             SessionCommand::Attach {
                 client_id: 42,
@@ -3521,6 +3549,8 @@ mod tests {
             tool_registry,
             daemon_tx,
             max_turns: 0,
+            lag_limits: LagLimits::default(),
+            global_lag: Arc::new(AtomicUsize::new(0)),
         };
         let mut state = test_state();
         let mut shutdown = false;
@@ -3582,7 +3612,7 @@ mod tests {
             },
         );
 
-        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sub_tx, sub_rx) = test_sink();
         let mut shutdown = false;
         process_command(
             SessionCommand::Attach {
@@ -3628,7 +3658,7 @@ mod tests {
         let (mut state, ctx) = broadcast_setup();
         // No active_requests — default empty.
 
-        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (sub_tx, sub_rx) = test_sink();
         let mut shutdown = false;
         process_command(
             SessionCommand::Attach {

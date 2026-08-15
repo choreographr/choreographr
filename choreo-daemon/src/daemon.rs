@@ -1,4 +1,5 @@
 use crate::accounts::{AccountConfig, AccountManager, accounts_config_path};
+use crate::broadcast::{EnqueueOutcome, LagLimits, SubscriberSink};
 use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshRequester};
 use crate::db::{self, SessionRecord};
 use crate::mcp::McpManager;
@@ -18,20 +19,12 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
-
-/// Grace period for delivering `ShuttingDown` to a client whose writer
-/// channel is momentarily full during daemon shutdown. Bounded so a writer
-/// thread stuck in a blocking socket write cannot hang shutdown: after the
-/// grace period the notification is dropped and the process exits (closing
-/// the socket, so the client sees a bare EOF). Shared by all slow clients
-/// via the round-robin fan-out, so total shutdown latency is bounded by this
-/// constant rather than `grace × clients`.
-const SHUTDOWN_NOTIFY_GRACE: Duration = Duration::from_secs(2);
 
 /// Reply type for the ListModels command.
 pub(super) type ListModelsReply =
@@ -62,18 +55,26 @@ pub struct DaemonState {
     pub db: Arc<redb::Database>,
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
-    pub summary_subscribers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
+    pub summary_subscribers: HashMap<u64, SubscriberSink>,
     /// Writer channel of EVERY connected client (both transports), registered
     /// on connect and removed on disconnect. The shutdown path uses it to
     /// route `ShuttingDown` through each connection's single writer thread —
     /// distinct from the opt-in summary/activity subscriber maps.
-    pub client_writers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
-    pub activity_subscribers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
+    pub client_writers: HashMap<u64, SubscriberSink>,
+    pub activity_subscribers: HashMap<u64, SubscriberSink>,
     /// Tracks which clients are direct session subscribers of which sessions.
     /// Used by `handle_broadcast_activity` to skip duplicate delivery to
     /// clients that are both activity subscribers AND session subscribers
     /// — the message reaches them through the per-session subscriber path.
     pub client_subscribed_sessions: HashMap<u64, HashSet<u64>>,
+    /// Daemon-wide bytes in flight to every connected client's queue, shared
+    /// by ALL subscriber sinks (see `broadcast::SubscriberSink::enqueue`).
+    /// The 6th sanctioned shared-state exception (see AGENTS.md); writers
+    /// decrement it on every dequeue, eviction releases a client's remainder.
+    pub global_lag: Arc<AtomicUsize>,
+    /// Lag thresholds (per-client cap + daemon-wide budget). Injectable so
+    /// tests can use tiny caps; defaults are 64 MiB / 512 MiB.
+    pub lag_limits: LagLimits,
     pub model_cache: HashMap<String, (Vec<String>, Instant)>,
     pub mcp_manager: McpManager,
     /// Sender to the ONE background catalog-maintenance thread (see
@@ -186,14 +187,14 @@ pub enum DaemonCommand {
     },
     RegisterSummarySubscriber {
         client_id: u64,
-        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
+        writer: SubscriberSink,
     },
     UnregisterSummarySubscriber {
         client_id: u64,
     },
     RegisterActivitySubscriber {
         client_id: u64,
-        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
+        writer: SubscriberSink,
     },
     UnregisterActivitySubscriber {
         client_id: u64,
@@ -220,8 +221,16 @@ pub enum DaemonCommand {
     /// `ShuttingDown` through that connection's single writer thread.
     RegisterClientWriter {
         client_id: u64,
-        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
+        writer: SubscriberSink,
     },
+    /// Disconnect a client that fell too far behind its delivery queue (see
+    /// `broadcast::EnqueueOutcome::ClientOverLag`). Idempotent.
+    EvictClient {
+        client_id: u64,
+    },
+    /// Disconnect the currently most-lagging client (see
+    /// `broadcast::EnqueueOutcome::GlobalOverBudget`).
+    EvictLargestLagging,
     /// Deliver `DaemonMessage::ShuttingDown` to every connected client via its
     /// writer channel; each connection's writer thread then closes its own
     /// socket, so clients observe the notification before EOF.
@@ -434,6 +443,8 @@ impl DaemonState {
             DaemonCommand::RegisterClientWriter { client_id, writer } => {
                 self.handle_register_client_writer(client_id, writer)
             }
+            DaemonCommand::EvictClient { client_id } => self.handle_evict_client(client_id),
+            DaemonCommand::EvictLargestLagging => self.handle_evict_largest_lagging(),
             DaemonCommand::BroadcastShuttingDown => self.handle_broadcast_shutting_down(),
             DaemonCommand::BroadcastActivity(msg) => self.handle_broadcast_activity(msg),
             DaemonCommand::BroadcastSessionStatus { session_id, status } => {
@@ -514,6 +525,13 @@ impl DaemonState {
         let tool_registry = Arc::clone(&self.tool_registry);
         let daemon_tx = self.daemon_tx.clone();
         let max_turns = self.max_turns;
+        // The session thread is a producer in the lossless fan-out: it
+        // enforces the same lag caps as the command loop and shares the one
+        // daemon-wide backlog counter. Copied/cloned BEFORE the `move`
+        // closure so the closure never borrows `self` (which the method
+        // still uses after spawning).
+        let lag_limits = self.lag_limits;
+        let global_lag = Arc::clone(&self.global_lag);
 
         // Resolve provider from the session's account name
         let account_name = metadata.account_name.clone();
@@ -538,6 +556,8 @@ impl DaemonState {
                     tool_registry,
                     daemon_tx,
                     max_turns,
+                    lag_limits,
+                    global_lag,
                 },
             );
         });
@@ -572,14 +592,36 @@ impl DaemonState {
 
     /// Send a message to all summary subscribers, removing dead ones.
     ///
-    /// Non-blocking: a slow subscriber gets its message dropped on a full
-    /// buffer instead of stalling the daemon's single-threaded command loop.
-    /// The drop-on-full / evict-on-disconnect policy is shared with the
-    /// activity broadcast and the per-session broadcast (see `crate::broadcast`).
+    /// Lossless + lag-eviction, shared with the activity broadcast and the
+    /// per-session broadcast (see `crate::broadcast`): every message is
+    /// enqueued into each subscriber's UNBOUNDED queue (never dropped, never
+    /// blocking the command loop), and a subscriber whose queue crossed the
+    /// lag limits is evicted (disconnected) so the backlog stays bounded.
     fn broadcast(&mut self, msg: DaemonMessage) {
-        self.summary_subscribers.retain(|client_id, tx| {
-            crate::broadcast::try_send_keep_on_full(tx, *client_id, "summary", &msg)
+        let mut evict_clients = Vec::new();
+        let mut evict_largest = false;
+        self.summary_subscribers.retain(|client_id, sink| {
+            match sink.enqueue(&msg, &self.lag_limits, &self.global_lag) {
+                EnqueueOutcome::Delivered => true,
+                EnqueueOutcome::Disconnected => false,
+                EnqueueOutcome::ClientOverLag => {
+                    evict_clients.push(*client_id);
+                    true
+                }
+                EnqueueOutcome::GlobalOverBudget => {
+                    evict_largest = true;
+                    true
+                }
+            }
         });
+        // Process evictions AFTER the retain loop (mutating `self` inside the
+        // closure would fight the borrow of `self.summary_subscribers`).
+        for client_id in evict_clients {
+            self.handle_evict_client(client_id);
+        }
+        if evict_largest {
+            self.handle_evict_largest_lagging();
+        }
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1218,11 +1260,7 @@ impl DaemonState {
     }
 
     /// Register a client to receive session summary broadcasts.
-    fn handle_register_summary_subscriber(
-        &mut self,
-        client_id: u64,
-        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
-    ) {
+    fn handle_register_summary_subscriber(&mut self, client_id: u64, writer: SubscriberSink) {
         self.summary_subscribers.insert(client_id, writer);
     }
 
@@ -1272,21 +1310,22 @@ impl DaemonState {
     }
 
     /// Register a client to receive all session activity broadcasts.
-    fn handle_register_activity_subscriber(
-        &mut self,
-        client_id: u64,
-        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
-    ) {
+    fn handle_register_activity_subscriber(&mut self, client_id: u64, writer: SubscriberSink) {
         info!("registering activity subscriber: client_id={}", client_id);
         self.activity_subscribers.insert(client_id, writer.clone());
         // Send the CURRENT provider list to the freshly-subscribed client so
         // its provider picker reflects the live catalog immediately (not just
         // the static default) — a client that connects after the daemon's
         // startup refresh has already broadcast would otherwise wait for the
-        // next catalog change. Drop-on-full is fine here: the TUI re-requests
-        // on every catalog swap anyway, and the channel has 128 slots.
+        // next catalog change. Enqueued through the lossless sink so the
+        // writer thread's byte accounting stays balanced; the outcome is
+        // ignored because a fresh subscription cannot be over the lag cap.
         let providers = catalog_provider_pairs();
-        let _ = writer.try_send(DaemonMessage::CatalogUpdated { providers });
+        let _ = writer.enqueue(
+            &DaemonMessage::CatalogUpdated { providers },
+            &self.lag_limits,
+            &self.global_lag,
+        );
     }
 
     /// Unregister a client from all session activity broadcasts.
@@ -1308,71 +1347,132 @@ impl DaemonState {
 
     /// Register a connection's writer channel so the shutdown path can route
     /// `ShuttingDown` through that connection's single writer thread.
-    fn handle_register_client_writer(
-        &mut self,
-        client_id: u64,
-        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
-    ) {
+    fn handle_register_client_writer(&mut self, client_id: u64, writer: SubscriberSink) {
         debug!("registering client writer: client_id={}", client_id);
         // A fresh connection owns its client_id, so any prior entry is stale.
         self.client_writers.insert(client_id, writer);
     }
 
-    /// Deliver `DaemonMessage::ShuttingDown` to every connected client via its
-    /// writer channel; each connection's writer thread then closes its own
-    /// socket, so clients observe the notification before EOF. A
-    /// momentarily-full writer channel is escalated to a bounded round-robin
-    /// poll (see `broadcast::send_shutting_down_bounded`) so backpressure
-    /// cannot silently drop the notification; the bound keeps shutdown from
-    /// hanging on a writer stuck in a blocking write, and a wedged client can
-    /// no longer delay the others.
-    fn handle_broadcast_shutting_down(&mut self) {
-        let clients = self.client_writers.len();
-        info!("broadcasting ShuttingDown to {clients} client(s)");
-        // Fast path: non-blocking try_send per client. A FULL channel is NOT
-        // dropped here (that would lose the notification); it is escalated to
-        // the bounded fan-out below so the notify-before-EOF guarantee
-        // survives transient backpressure. A disconnected client is evicted.
-        let mut slow_clients: Vec<(u64, mpsc::SyncSender<DaemonMessage>)> = Vec::new();
-        self.client_writers.retain(|client_id, tx| {
-            // One shared classification (broadcast::try_send_classify) feeds
-            // both this fast path and the per-subscriber broadcast policy, so
-            // the Ok/Disconnected/Full arms live in exactly one place.
-            match crate::broadcast::try_send_classify(tx, &DaemonMessage::ShuttingDown) {
-                crate::broadcast::SendOutcome::Delivered => true,
-                crate::broadcast::SendOutcome::Disconnected => false,
-                crate::broadcast::SendOutcome::Full => {
-                    slow_clients.push((*client_id, tx.clone()));
-                    true
+    /// Disconnect a client whose delivery queue crossed the lag limits.
+    ///
+    /// Idempotent (no-op for an unknown client): multiple producers can
+    /// observe `ClientOverLag` for the same client before the first eviction
+    /// command lands, and each re-signal must not double-evict or panic.
+    ///
+    /// The connection is torn down WITHOUT the daemon holding a socket
+    /// handle: the `Evicted` advisory is enqueued best-effort, and the
+    /// connection is reaped by its own writer thread — a healthy writer
+    /// flushes the advisory and closes its socket (notify-before-EOF); a
+    /// wedged writer (client not reading) hits its socket write timeout
+    /// (`server::connection::WRITER_WRITE_TIMEOUT`), the write fails, and
+    /// the writer shuts the socket down, unblocking the reader's blocking
+    /// read and running the normal `cleanup_client` teardown.
+    fn handle_evict_client(&mut self, client_id: u64) {
+        if !self.client_writers.contains_key(&client_id) {
+            return;
+        }
+        info!(
+            "evicting lagging client: client_id={}, backlog_bytes={}",
+            client_id,
+            self.client_writers
+                .get(&client_id)
+                .map_or(0, |s| s.bytes_in_flight.load(Ordering::Relaxed))
+        );
+        self.summary_subscribers.remove(&client_id);
+        self.activity_subscribers.remove(&client_id);
+        // Promptly remove this client from every session's subscriber map
+        // instead of waiting for the lazy disconnect detection on the next
+        // broadcast — the evicted client's queued bytes should be released
+        // as soon as possible, and a session must not keep streaming to a
+        // client that is being torn down.
+        if let Some(sessions) = self.client_subscribed_sessions.remove(&client_id) {
+            for session_id in &sessions {
+                if let Some(entry) = self.active_sessions.get(session_id) {
+                    let _ = entry
+                        .cmd_tx
+                        .send(SessionCommand::RemoveSubscriber { client_id });
                 }
             }
-        });
-        // Slow path: bounded round-robin delivery for full channels (see
-        // broadcast::send_shutting_down_bounded). Each connection's writer
-        // thread then flushes the notification and closes its own socket, so
-        // clients observe it before EOF. A client that could not be notified
-        // (disconnected, or a writer still wedged after the grace period) is
-        // dropped from the registry to keep its invariant — connected clients
-        // only — honest.
-        let failed = crate::broadcast::send_shutting_down_bounded(
-            slow_clients,
-            SHUTDOWN_NOTIFY_GRACE,
-            crate::broadcast::SHUTDOWN_POLL_INTERVAL,
-        );
-        for client_id in failed {
-            self.client_writers.remove(&client_id);
+        }
+        // Best-effort advisory: a healthy writer flushes it and closes its
+        // own socket; a wedged writer never sees it (the write timeout
+        // reaps the connection instead). Enqueue BEFORE dropping the sink.
+        if let Some(sink) = self.client_writers.get(&client_id) {
+            let _ = sink.tx.send(DaemonMessage::Evicted);
+        }
+        self.client_writers.remove(&client_id);
+        crate::metrics::record_eviction();
+    }
+
+    /// Disconnect the currently most-lagging client (used when the daemon-wide
+    /// backlog crosses [`LagLimits::global_budget`]). Scans every subscriber
+    /// map for the largest per-client byte counter — including clients that
+    /// only appear as session subscribers — and evicts that one.
+    fn handle_evict_largest_lagging(&mut self) {
+        let mut best: Option<(u64, usize)> = None;
+        let mut consider = |id: &u64, sink: &SubscriberSink| {
+            let bytes = sink.bytes_in_flight.load(Ordering::Relaxed);
+            if bytes > 0 && best.is_none_or(|(_, b)| bytes > b) {
+                best = Some((*id, bytes));
+            }
+        };
+        for (id, sink) in &self.client_writers {
+            consider(id, sink);
+        }
+        for (id, sink) in &self.activity_subscribers {
+            consider(id, sink);
+        }
+        for (id, sink) in &self.summary_subscribers {
+            consider(id, sink);
+        }
+        if let Some((client_id, _)) = best {
+            self.handle_evict_client(client_id);
         }
     }
 
+    /// Deliver `DaemonMessage::ShuttingDown` to every connected client via its
+    /// writer channel; each connection's writer thread then closes its own
+    /// socket, so clients observe the notification before EOF.
+    ///
+    /// With the lossless unbounded channels an enqueue can never be `Full` —
+    /// the old bounded round-robin poll existed only for the bounded 128-slot
+    /// channels this design replaced. The wedged-writer case (client open but
+    /// not reading, writer stuck in a blocking socket write) is still bounded
+    /// by the writer-join grace in `cleanup_client` + `run_server`, unchanged.
+    fn handle_broadcast_shutting_down(&mut self) {
+        let clients = self.client_writers.len();
+        info!("broadcasting ShuttingDown to {clients} client(s)");
+        self.client_writers.retain(|client_id, sink| {
+            match sink.tx.send(DaemonMessage::ShuttingDown) {
+                Ok(()) => true,
+                Err(_) => {
+                    warn!("removing disconnected client {client_id} during shutdown");
+                    false
+                }
+            }
+        });
+    }
+
     /// Clean up all per-client tracking when a client disconnects.
-    /// Removes from summary subscribers, activity subscribers, and session
-    /// subscription tracking in a single atomic operation so stale entries
-    /// don't accumulate.
+    /// Removes from summary subscribers, activity subscribers, session
+    /// subscription tracking, the writer registry, and the evict handle in a
+    /// single atomic operation so stale entries don't accumulate.
     fn handle_client_disconnected(&mut self, client_id: u64) {
         info!("client disconnected cleanup: client_id={}", client_id);
         self.summary_subscribers.remove(&client_id);
         self.activity_subscribers.remove(&client_id);
-        self.client_subscribed_sessions.remove(&client_id);
+        // Promptly remove the client from every session it was attached to
+        // (same as eviction), so a session does not keep streaming to a dead
+        // client's sink until the next broadcast detects the disconnect.
+        if let Some(sessions) = self.client_subscribed_sessions.remove(&client_id) {
+            for session_id in &sessions {
+                if let Some(entry) = self.active_sessions.get(session_id) {
+                    let _ = entry
+                        .cmd_tx
+                        .send(SessionCommand::RemoveSubscriber { client_id });
+                }
+            }
+        }
         // Drop the registered writer channel so this connection's writer
         // thread can exit: with the connection-local sender (dropped by
         // cleanup_client) gone too, writer_rx disconnects and the thread's
@@ -1411,17 +1511,20 @@ impl DaemonState {
 
     /// Broadcast a message to all activity subscribers, removing dead ones.
     ///
-    /// Non-blocking: a slow subscriber gets its message dropped on a full
-    /// buffer instead of stalling the daemon's single-threaded command loop.
-    /// The drop-on-full / evict-on-disconnect policy is shared with the
-    /// summary broadcast and the per-session broadcast (see `crate::broadcast`).
+    /// Lossless + lag-eviction, shared with the summary broadcast and the
+    /// per-session broadcast (see `crate::broadcast`): every message is
+    /// enqueued into each subscriber's UNBOUNDED queue (never dropped, never
+    /// blocking the command loop), and a subscriber whose queue crossed the
+    /// lag limits is evicted so the backlog stays bounded.
     ///
     /// Skips delivery to clients that are also direct session subscribers of
     /// the originating session — those clients receive the message through
     /// the per-session subscriber path, avoiding duplicate delivery.
     fn handle_broadcast_activity(&mut self, msg: DaemonMessage) {
         let origin_session_id = msg.session_id();
-        self.activity_subscribers.retain(|client_id, tx| {
+        let mut evict_clients = Vec::new();
+        let mut evict_largest = false;
+        self.activity_subscribers.retain(|client_id, sink| {
             // Skip if this client is also a direct subscriber of the
             // session that originated this message — they'll receive it
             // through the per-session broadcast path.
@@ -1431,14 +1534,27 @@ impl DaemonState {
             {
                 return true;
             }
-            // Shared drop-on-full / evict-on-disconnect policy (see
-            // crate::broadcast): a momentarily-full writer buffer must NOT
-            // evict the subscriber — the TUI registers for all activity once
-            // at startup and never re-subscribes, so evicting it would
-            // permanently blind it to every background session.  Only a
-            // disconnected receiver removes the subscriber.
-            crate::broadcast::try_send_keep_on_full(tx, *client_id, "activity", &msg)
+            match sink.enqueue(&msg, &self.lag_limits, &self.global_lag) {
+                EnqueueOutcome::Delivered => true,
+                EnqueueOutcome::Disconnected => false,
+                EnqueueOutcome::ClientOverLag => {
+                    evict_clients.push(*client_id);
+                    true
+                }
+                EnqueueOutcome::GlobalOverBudget => {
+                    evict_largest = true;
+                    true
+                }
+            }
         });
+        // Process evictions AFTER the retain loop (mutating `self` inside the
+        // closure would fight the borrow of `self.activity_subscribers`).
+        for client_id in evict_clients {
+            self.handle_evict_client(client_id);
+        }
+        if evict_largest {
+            self.handle_evict_largest_lagging();
+        }
     }
 
     /// Handle a cancel request from a client.  Sends `SessionCommand::Cancel`
@@ -2077,7 +2193,6 @@ fn handle_list_models_inner(
 mod tests {
     use super::*;
     use crate::providers::test_util::make_test_provider;
-    use crate::server::connection::SUBSCRIBER_CHANNEL_CAPACITY;
     use crate::sessions::SessionMetadata;
     use choreo_proto::{DaemonMessage, SessionStatus, TimestampMs, Turn};
     use std::collections::{BTreeMap, HashMap};
@@ -2109,6 +2224,8 @@ mod tests {
             client_writers: HashMap::new(),
             activity_subscribers: HashMap::new(),
             client_subscribed_sessions: HashMap::new(),
+            global_lag: Arc::new(AtomicUsize::new(0)),
+            lag_limits: LagLimits::default(),
             model_cache: HashMap::new(),
             mcp_manager: crate::mcp::McpManager::empty(),
             maintenance_tx: None,
@@ -2117,6 +2234,74 @@ mod tests {
         (state, daemon_rx)
     }
 
+    /// A fresh lossless delivery sink for a fake client, plus its receiver
+    /// to observe deliveries.
+    fn test_sink() -> (SubscriberSink, crossbeam_channel::Receiver<DaemonMessage>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        (SubscriberSink::new(tx), rx)
+    }
+
+    #[test]
+    fn handle_evict_client_removes_from_maps_and_sends_advisory() {
+        let (mut state, _rx) = make_daemon_state();
+        // Register the client in every map the way a live connection would.
+        let (sink, rx) = test_sink();
+        state.client_writers.insert(7, sink.clone());
+        state.summary_subscribers.insert(7, sink.clone());
+        state.activity_subscribers.insert(7, sink.clone());
+        state
+            .client_subscribed_sessions
+            .insert(7, HashSet::from([1]));
+
+        state.handle_command(DaemonCommand::EvictClient { client_id: 7 });
+
+        // Evicted from every daemon-side map.
+        assert!(!state.client_writers.contains_key(&7));
+        assert!(!state.summary_subscribers.contains_key(&7));
+        assert!(!state.activity_subscribers.contains_key(&7));
+        assert!(!state.client_subscribed_sessions.contains_key(&7));
+        // The best-effort advisory was enqueued before the sink was dropped.
+        assert_eq!(rx.recv().unwrap(), DaemonMessage::Evicted);
+    }
+
+    #[test]
+    fn handle_evict_client_is_idempotent_for_unknown_client() {
+        let (mut state, _rx) = make_daemon_state();
+        // Evicting an unknown client must be a silent no-op (multiple
+        // producers can signal the same over-lag client before the first
+        // eviction lands).
+        state.handle_command(DaemonCommand::EvictClient { client_id: 999 });
+        assert!(state.client_writers.is_empty());
+    }
+
+    #[test]
+    fn handle_evict_largest_lagging_evicts_biggest_backlog() {
+        let (mut state, _rx) = make_daemon_state();
+        let (sink_small, _) = test_sink();
+        sink_small.bytes_in_flight.store(10, Ordering::Relaxed);
+        state.client_writers.insert(1, sink_small);
+        let (sink_big, _) = test_sink();
+        sink_big.bytes_in_flight.store(1_000, Ordering::Relaxed);
+        state.client_writers.insert(2, sink_big);
+
+        state.handle_command(DaemonCommand::EvictLargestLagging);
+
+        assert!(
+            !state.client_writers.contains_key(&2),
+            "the largest backlog must be evicted"
+        );
+        assert!(state.client_writers.contains_key(&1));
+    }
+
+    #[test]
+    fn handle_evict_largest_lagging_noop_when_all_healthy() {
+        let (mut state, _rx) = make_daemon_state();
+        let (sink, _) = test_sink();
+        state.client_writers.insert(1, sink);
+        // Zero backlog: nothing to shed.
+        state.handle_command(DaemonCommand::EvictLargestLagging);
+        assert!(state.client_writers.contains_key(&1));
+    }
     #[test]
     fn handle_list_sessions_empty() {
         let (mut state, _rx) = make_daemon_state();
@@ -2363,7 +2548,7 @@ mod tests {
     #[test]
     fn handle_register_unregister_subscriber() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, _rx_sub) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, _rx_sub) = test_sink();
         assert!(!state.summary_subscribers.contains_key(&42));
         state.handle_command(DaemonCommand::RegisterSummarySubscriber {
             client_id: 42,
@@ -2397,7 +2582,7 @@ mod tests {
                 last_prompt_tokens: None,
             },
         );
-        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, rx) = test_sink();
         state.handle_command(DaemonCommand::RegisterSummarySubscriber {
             client_id: 1,
             writer: tx,
@@ -2859,7 +3044,7 @@ mod tests {
     #[test]
     fn broadcast_sends_to_subscriber() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, rx) = test_sink();
         state.summary_subscribers.insert(1, tx);
         let msg = DaemonMessage::SessionDeleted { session_id: 42 };
         state.broadcast(msg.clone());
@@ -2872,7 +3057,7 @@ mod tests {
     #[test]
     fn broadcast_removes_disconnected_subscriber() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, rx) = test_sink();
         state.summary_subscribers.insert(1, tx);
         drop(rx); // Disconnect the receiver
         state.broadcast(DaemonMessage::SessionDeleted { session_id: 42 });
@@ -2881,36 +3066,34 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_drops_on_full_buffer_and_keeps_subscriber() {
+    fn broadcast_enqueues_losslessly_and_evicts_over_lag_client() {
         let (mut state, _rx) = make_daemon_state();
-        // Capacity-1 channel: fill it with one message so the next broadcast
-        // cannot enqueue.  The summary broadcast must drop the message (not
-        // block the daemon loop) while retaining the subscriber.
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
-        state.summary_subscribers.insert(1, tx);
-        let filler = DaemonMessage::SessionDeleted { session_id: 41 };
-        state
-            .summary_subscribers
-            .get(&1)
-            .expect("subscriber registered")
-            .send(filler.clone())
-            .expect("filler fits in capacity-1 channel");
+        // Tiny per-client cap so a single message crosses it; the global
+        // budget is infinite so only the per-client threshold fires.
+        state.lag_limits = LagLimits {
+            per_client_cap: 16,
+            global_budget: usize::MAX,
+        };
+        // The subscriber must also be in the writer registry for eviction to
+        // have a connection to tear down (handle_evict_client requires it).
+        let (sink, rx) = test_sink();
+        state.summary_subscribers.insert(7, sink.clone());
+        state.client_writers.insert(7, sink);
 
-        // Buffer is full: the broadcast message is dropped, not queued, and
-        // the subscriber survives.
         let msg = DaemonMessage::SessionDeleted { session_id: 42 };
         state.broadcast(msg.clone());
-        assert!(
-            state.summary_subscribers.contains_key(&1),
-            "a full buffer must not evict the summary subscriber"
-        );
-        assert_eq!(rx.recv().unwrap(), filler);
-        assert!(rx.try_recv().is_err(), "message dropped while buffer full");
 
-        // Once the buffer drains, later broadcasts flow again.
-        state.broadcast(msg.clone());
+        // Lossless: the crossing message is still delivered, never dropped.
         assert_eq!(rx.recv().unwrap(), msg);
-        assert!(state.summary_subscribers.contains_key(&1));
+        // …but the client is evicted for lag, from every map.
+        assert!(
+            !state.summary_subscribers.contains_key(&7),
+            "over-lag subscriber must be evicted from the summary map"
+        );
+        assert!(
+            !state.client_writers.contains_key(&7),
+            "over-lag subscriber must be evicted from the writer registry"
+        );
     }
 
     #[test]
@@ -3273,7 +3456,7 @@ mod tests {
     /// Drain the send-on-subscribe `CatalogUpdated` that registering an
     /// activity subscriber delivers to the fresh client, so tests can assert
     /// on the messages that follow registration.
-    fn drain_send_on_subscribe(rx: &mpsc::Receiver<DaemonMessage>) {
+    fn drain_send_on_subscribe(rx: &crossbeam_channel::Receiver<DaemonMessage>) {
         let msg = rx.recv().unwrap();
         assert!(
             matches!(&msg, DaemonMessage::CatalogUpdated { providers } if !providers.is_empty()),
@@ -3284,7 +3467,7 @@ mod tests {
     #[test]
     fn handle_register_activity_subscriber_adds_to_map() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, _) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, _) = test_sink();
 
         state.handle_command(DaemonCommand::RegisterActivitySubscriber {
             client_id: 10,
@@ -3297,8 +3480,8 @@ mod tests {
     #[test]
     fn handle_register_activity_subscriber_replaces_existing() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx1, _) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        let (tx2, _) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx1, _) = test_sink();
+        let (tx2, _) = test_sink();
 
         state.handle_command(DaemonCommand::RegisterActivitySubscriber {
             client_id: 10,
@@ -3316,7 +3499,7 @@ mod tests {
     #[test]
     fn handle_unregister_activity_subscriber_preserves_session_tracking() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, _) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, _) = test_sink();
 
         // Set up: client 10 is subscribed to activity AND subscribed to session 42
         state.handle_command(DaemonCommand::RegisterActivitySubscriber {
@@ -3343,7 +3526,7 @@ mod tests {
     #[test]
     fn handle_client_disconnected_clears_all_tracking() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, _) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, _) = test_sink();
 
         // Set up: client 10 is registered in all three maps
         state.handle_command(DaemonCommand::RegisterSummarySubscriber {
@@ -3516,7 +3699,7 @@ mod tests {
     #[test]
     fn handle_broadcast_activity_sends_to_subscriber() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, rx) = test_sink();
 
         state.handle_command(DaemonCommand::RegisterActivitySubscriber {
             client_id: 10,
@@ -3543,7 +3726,7 @@ mod tests {
         let (mut state, _rx) = make_daemon_state();
         // Use a sync_channel with capacity 1 so we can detect if a message
         // was sent vs skipped.
-        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, rx) = test_sink();
 
         // Client 10 is both an activity subscriber AND a subscriber of session 1
         state.handle_command(DaemonCommand::RegisterActivitySubscriber {
@@ -3579,7 +3762,7 @@ mod tests {
     #[test]
     fn handle_broadcast_activity_no_dedup_for_different_session() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, rx) = test_sink();
 
         // Client 10 subscribes to session 1, but the broadcast is about session 2
         state.handle_command(DaemonCommand::RegisterActivitySubscriber {
@@ -3611,7 +3794,7 @@ mod tests {
         // Messages without a session_id (Models, Pong, etc.) should always
         // be delivered to all activity subscribers.
         let (mut state, _rx) = make_daemon_state();
-        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, rx) = test_sink();
 
         state.handle_command(DaemonCommand::RegisterActivitySubscriber {
             client_id: 10,
@@ -3633,7 +3816,7 @@ mod tests {
     fn handle_broadcast_activity_removes_disconnected_subscriber() {
         let (mut state, _rx) = make_daemon_state();
         // Use a sync_channel so we can drop the receiver
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, rx) = test_sink();
 
         state.handle_command(DaemonCommand::RegisterActivitySubscriber {
             client_id: 10,
@@ -3656,44 +3839,31 @@ mod tests {
     }
 
     #[test]
-    fn handle_broadcast_activity_keeps_slow_subscriber_on_full_buffer() {
-        // Regression test: a momentarily-full writer buffer must drop the
-        // message but KEEP the activity subscriber.  The TUI subscribes to
-        // all activity exactly once at startup and never re-subscribes;
-        // evicting it on a full buffer would permanently blind it to every
-        // background session, so switching into a streaming session would
-        // show a blank turn until the next chunk arrived over the per-session
-        // path instead of the accumulated content.
+    fn handle_broadcast_activity_evicts_over_lag_subscriber() {
+        // Lossless + lag-eviction: a subscriber whose queue crosses the lag
+        // cap still receives the crossing message (never dropped), but is
+        // then EVICTED — disconnecting is the price of never dropping. The
+        // TUI's reconnect-and-resync (attach snapshot) is the recovery path
+        // (a later phase); the daemon side is tested here.
         let (mut state, _rx) = make_daemon_state();
-        // A capacity-1 channel lets us fill the buffer with a single message
-        // so the next try_send fails with Full.
-        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(1);
+        state.lag_limits = LagLimits {
+            per_client_cap: 16,
+            global_budget: usize::MAX,
+        };
+        let (tx, rx) = test_sink();
 
         state.handle_command(DaemonCommand::RegisterActivitySubscriber {
             client_id: 10,
-            writer: tx,
+            writer: tx.clone(),
         });
-        // Drain the send-on-subscribe CatalogUpdated so the single slot is
-        // free for the filler below (the register already used it).
+        // The writer registry entry is what eviction tears down (the real
+        // connection registers it at accept time).
+        state.client_writers.insert(10, tx);
+        // Drain the send-on-subscribe CatalogUpdated so the assertions below
+        // only observe the broadcast.
         drain_send_on_subscribe(&rx);
 
-        // Fill the subscriber's buffer so the broadcast below cannot enqueue.
-        let filler = DaemonMessage::SessionStatusChanged {
-            session_id: 1,
-            status: SessionStatus::Inactive,
-            last_modified: 0,
-        };
-        // Send the filler through the real subscriber channel by grabbing the
-        // registered sender out of the state map.
-        state
-            .activity_subscribers
-            .get(&10)
-            .expect("subscriber registered")
-            .send(filler.clone())
-            .expect("filler fits in capacity-1 channel");
-
-        // Broadcast a second message — the buffer is full, so it must be
-        // dropped, not delivered, and the subscriber must survive.
+        // The message crosses the tiny cap (OutputChunk payload ~70 bytes).
         let broadcast = DaemonMessage::OutputChunk {
             session_id: 7,
             request_id: 99,
@@ -3702,33 +3872,24 @@ mod tests {
         };
         state.handle_command(DaemonCommand::BroadcastActivity(broadcast.clone()));
 
-        // The subscriber is still registered after the dropped message.
-        assert!(
-            state.activity_subscribers.contains_key(&10),
-            "a full buffer must not evict the activity subscriber"
-        );
-
-        // The filler was delivered; the broadcast message was dropped.
-        assert_eq!(rx.recv().unwrap(), filler);
-        assert!(
-            rx.try_recv().is_err(),
-            "broadcast message should have been dropped while the buffer was full"
-        );
-
-        // Once the buffer drains, later broadcasts flow again.
-        state.handle_command(DaemonCommand::BroadcastActivity(broadcast.clone()));
+        // Lossless: the crossing message was delivered, not dropped.
         assert_eq!(rx.recv().unwrap(), broadcast);
+        // …and the subscriber is evicted from every map.
         assert!(
-            state.activity_subscribers.contains_key(&10),
-            "subscriber must still be present after recovering"
+            !state.activity_subscribers.contains_key(&10),
+            "over-lag subscriber must be evicted from the activity map"
+        );
+        assert!(
+            !state.client_writers.contains_key(&10),
+            "over-lag subscriber must be evicted from the writer registry"
         );
     }
 
     #[test]
     fn handle_broadcast_activity_handles_multiple_clients() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx1, rx1) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        let (tx2, rx2) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx1, rx1) = test_sink();
+        let (tx2, rx2) = test_sink();
 
         // Client 10: activity subscriber + session 1 subscriber
         // Client 20: activity subscriber only
@@ -4057,8 +4218,7 @@ mod tests {
     fn catalog_base_changed_swaps_broadcasts_and_replies() {
         let _restore = RestoreBundledCatalogOnDrop;
         let (mut state, _rx) = make_daemon_state();
-        let (writer_tx, writer_rx) =
-            std::sync::mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (writer_tx, writer_rx) = test_sink();
         state.activity_subscribers.insert(1, writer_tx);
         let (reply, reply_rx) = mpsc::channel();
 
@@ -4223,8 +4383,7 @@ context_window = 1024
         // immediately (send-on-subscribe), so the TUI's picker tracks the live
         // catalog even when it connects after the startup swap broadcast.
         let (mut state, _rx) = make_daemon_state();
-        let (writer_tx, writer_rx) =
-            std::sync::mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (writer_tx, writer_rx) = test_sink();
 
         state.handle_register_activity_subscriber(1, writer_tx);
 

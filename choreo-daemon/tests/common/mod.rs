@@ -64,6 +64,8 @@ pub fn test_daemon_state() -> DaemonState {
         client_writers: HashMap::new(),
         activity_subscribers: HashMap::new(),
         client_subscribed_sessions: HashMap::new(),
+        global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        lag_limits: choreo_daemon::broadcast::LagLimits::default(),
         model_cache: HashMap::new(),
         mcp_manager: choreo_daemon::mcp::McpManager::empty(),
         // The integration harness runs the real `run_server`, which spawns the

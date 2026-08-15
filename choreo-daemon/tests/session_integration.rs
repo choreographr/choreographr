@@ -1,12 +1,12 @@
+use choreo_daemon::broadcast::{LagLimits, SubscriberSink};
 use choreo_daemon::{RequestContext, SessionCommand, db, session_main};
 use choreo_proto::DaemonMessage;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 
 mod common;
-
-const CHANNEL_CAPACITY: usize = 128;
 
 fn spawn_session(
     db: Arc<redb::Database>,
@@ -31,6 +31,8 @@ fn spawn_session(
                 tool_registry,
                 daemon_tx,
                 max_turns: 0,
+                lag_limits: LagLimits::default(),
+                global_lag: Arc::new(AtomicUsize::new(0)),
             },
         );
     });
@@ -44,7 +46,8 @@ fn session_starts_and_accepts_commands() {
     let db = Arc::new(common::test_db());
     let (session_tx, _handle) = spawn_session(db, 1);
 
-    let (writer_tx, writer_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+    let (tx, writer_rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+    let writer_tx = SubscriberSink::new(tx);
     let client_id = 42;
 
     session_tx
@@ -101,7 +104,8 @@ fn session_cancel_nonexistent_request_does_not_panic() {
         .unwrap();
 
     // Session should still be functional afterwards.
-    let (writer_tx, _writer_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+    let (tx, _writer_rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+    let writer_tx = SubscriberSink::new(tx);
     session_tx
         .send(SessionCommand::Attach {
             client_id: 10,
