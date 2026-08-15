@@ -253,10 +253,22 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             Ok(Some(ResponsesStreamEvent::ResponseCompleted { id, usage }))
         }
         "response.failed" => {
+            // `response.failed.error` is the OpenAI error object
+            // `{"code", "message", "param", "type"}` — the
+            // human-readable text lives in `message`.  Some providers or
+            // emulators emit a plain string instead, so accept both; last
+            // resort is the serialized error object so a mid-stream failure
+            // is never silently blank.
             let error = payload
                 .get("error")
-                .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
+                .map(|value| match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| other.to_string()),
+                })
                 .unwrap_or_default();
             Ok(Some(ResponsesStreamEvent::ResponseFailed(error)))
         }

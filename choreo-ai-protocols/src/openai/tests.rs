@@ -185,6 +185,54 @@ fn parse_responses_stream_event_unknown_type_returns_none() {
     assert!(result.is_none());
 }
 
+#[test]
+fn parse_responses_stream_event_response_failed_decodes_error_object() {
+    // `response.failed.error` is the OpenAI error object `{code, message,
+    // param, type}`; the surfaced text must be `message`, not a blank string
+    // (the old `as_str()` on the object yielded nothing).
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.failed","error":{"code":"server_error","message":"Request failed due to internal server error.","param":null,"type":"server_error"}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseFailed(error) => {
+            assert_eq!(error, "Request failed due to internal server error.")
+        }
+        _ => panic!("expected ResponseFailed"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_response_failed_accepts_plain_string() {
+    // Some providers/emulators put a plain string in `error` — that shape
+    // must keep working.
+    let event = parse_responses_stream_event(r#"{"type":"response.failed","error":"overloaded"}"#)
+        .expect("parse")
+        .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseFailed(error) => assert_eq!(error, "overloaded"),
+        _ => panic!("expected ResponseFailed"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_response_failed_object_without_message_keeps_serialized() {
+    // An error object with no `message` field still surfaces something — the
+    // serialized object — rather than an empty string.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.failed","error":{"code":"internal_error"}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseFailed(error) => {
+            assert!(error.contains("internal_error"), "got: {error}")
+        }
+        _ => panic!("expected ResponseFailed"),
+    }
+}
+
 // ── Reasoning item SSE event tests (phase 2c) ───────────────────────
 
 #[test]
