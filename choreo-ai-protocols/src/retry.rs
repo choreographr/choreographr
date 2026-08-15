@@ -383,10 +383,52 @@ where
         let detail = if trimmed_body.is_empty() {
             format!("request failed with status {status}")
         } else {
-            format!("request failed with status {status}: {trimmed_body}")
+            match extract_error_message(trimmed_body) {
+                // The body wrapped a recognizable JSON error envelope — use
+                // its human-readable `message` instead of dumping the whole
+                // body.  The status is already carried by the error variant's
+                // own prefix (e.g. "client error (402): …"), so it is not
+                // repeated here.
+                Some(message) => message,
+                // Not JSON / no recognizable message field: keep the status
+                // context plus the verbatim body so nothing is lost.
+                None => format!("request failed with status {status}: {trimmed_body}"),
+            }
         };
         return Err(status_to_error(status, &detail, retry_after_secs));
     }
+}
+
+/// Extract a concise human-readable message from a provider error body,
+/// unwrapping the standard JSON error envelopes used across providers:
+///
+/// - OpenAI-compatible APIs (OpenAI, DeepSeek, OpenRouter, Groq, …):
+///   `{"error": {"message": "…", "type": "…", "param": …,
+///   "code": …}}` — `error.message` is the standard human-readable field.
+/// - Anthropic: `{"type": "error", "error": {"type": "…",
+///   "message": "…"}}` — same `error.message` shape.
+/// - Gemini: `{"error": {"code": …, "message": "…", "status":
+///   "…"}}` — same `error.message` shape.
+/// - Some proxies: `{"message": "…"}` or `{"error": "plain string"}`.
+///
+/// Returns `None` (the caller keeps the verbatim body) when the body is not
+/// JSON or carries no recognizable string `message` — an unknown or hostile
+/// body is never mis-summarized, and the raw text still reaches the user.
+fn extract_error_message(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let message = match value.get("error") {
+        // `{"error": {"message": "…"}}` — the standard envelope.
+        Some(serde_json::Value::Object(map)) => {
+            map.get("message").and_then(serde_json::Value::as_str)
+        }
+        // `{"error": "plain string"}` — rare compat-layer shape.
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    // Top-level `{"message": "…"}` (some reverse-proxies unwrap for you).
+    let message = message.or_else(|| value.get("message").and_then(serde_json::Value::as_str));
+    let message = message.map(str::trim).filter(|m| !m.is_empty())?;
+    Some(message.to_string())
 }
 
 #[cfg(test)]
@@ -457,6 +499,67 @@ mod tests {
             millis <= base * 1.25,
             "delay {millis}ms above jitter ceiling"
         );
+    }
+
+    // ── extract_error_message ────────────────────────────────────────────
+
+    #[test]
+    fn extract_error_message_openai_envelope() {
+        // The standard OpenAI-compatible shape (DeepSeek, OpenRouter, …):
+        // `error.message` is the human-readable summary.
+        let body = r#"{"error":{"message":"Insufficient Balance","type":"unknown_error","param":null,"code":"invalid_request_error"}}"#;
+        assert_eq!(
+            extract_error_message(body).as_deref(),
+            Some("Insufficient Balance")
+        );
+    }
+
+    #[test]
+    fn extract_error_message_anthropic_and_gemini_shapes() {
+        // Anthropic nests under `type` + `error`; Gemini puts `code` next to
+        // `message`.  Both still expose `error.message`, so the same lookup
+        // unwraps them.
+        let anthropic =
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        assert_eq!(
+            extract_error_message(anthropic).as_deref(),
+            Some("Overloaded")
+        );
+        let gemini =
+            r#"{"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
+        assert_eq!(
+            extract_error_message(gemini).as_deref(),
+            Some("Quota exceeded")
+        );
+    }
+
+    #[test]
+    fn extract_error_message_compat_shapes() {
+        // Top-level `message` (proxy-unwrapped) and a plain-string `error`
+        // (rare compat layer) are both recognized.
+        assert_eq!(
+            extract_error_message(r#"{"message":"bad request"}"#).as_deref(),
+            Some("bad request")
+        );
+        assert_eq!(
+            extract_error_message(r#"{"error":"plain failure"}"#).as_deref(),
+            Some("plain failure")
+        );
+    }
+
+    #[test]
+    fn extract_error_message_falls_back_for_non_envelope_bodies() {
+        // Not JSON, JSON without a string message, or an empty message all
+        // yield None — the caller keeps the verbatim body rather than
+        // mis-summarizing an unknown shape.
+        assert_eq!(extract_error_message("<html>502 Bad Gateway</html>"), None);
+        assert_eq!(extract_error_message(r#"{"error":{"code":7}}"#), None);
+        assert_eq!(
+            extract_error_message(r#"{"error":{"message":"   "}}"#),
+            None
+        );
+        assert_eq!(extract_error_message(r#"{"error":null}"#), None);
+        assert_eq!(extract_error_message("not json at all"), None);
     }
 
     // ── AttemptDeadline ──────────────────────────────────────────────────

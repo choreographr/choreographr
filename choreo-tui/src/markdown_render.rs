@@ -650,12 +650,15 @@ pub(crate) fn render_turn_lines(
     // A request-level failure (provider 4xx/5xx, network error, deadline)
     // renders as a red block.  The history Paragraph is non-wrapping — an
     // unwrapped line would clip at the viewport edge, truncating long error
-    // JSON mid-token — so the text is pre-wrapped at the content width via
+    // text mid-token — so the text is pre-wrapped at the content width via
     // the same plain-text wrapper the tool output uses (preserving every
     // character verbatim); `lines_height`'s div_ceil math then sizes the
-    // block correctly.
+    // block correctly.  The body is provider-controlled bytes, so it goes
+    // through the same terminal-safety gate as tool output (escape
+    // OSC/CSI/control chars, expand tabs) before reaching the screen.
     if let Some(ref err) = turn.error {
         let header = format!("Error: {err}");
+        let header = expand_tabs(&sanitize_for_terminal(&header));
         let lines: Vec<Line<'static>> = plain_text_lines(&header, content_width)
             .into_iter()
             .map(|line| {
@@ -2710,6 +2713,38 @@ mod tests {
         assert!(
             rendered.reasoning_header_idx.is_none() && rendered.tool_result_header_idxs.is_empty(),
             "an error turn has no reasoning/tool-result metadata"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_error_sanitizes_hostile_body() {
+        // The error body is provider-controlled bytes: OSC clipboard writes /
+        // control chars must render as inert escaped text, never reach the
+        // terminal as live sequences (same sink defense as tool output).
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: Some("boom\u{1b}]52;c;evil\u{7}".into()),
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
+        let joined: String = rendered.lines.iter().map(|l| l.to_string()).collect();
+        assert!(
+            !joined.contains('\u{1b}'),
+            "no live ESC may survive: {joined:?}"
+        );
+        assert!(!joined.contains('\u{7}'), "BEL must be escaped: {joined:?}");
+        assert!(
+            joined.contains("\\u{1b}"),
+            "OSC ESC must render as escaped text: {joined:?}"
         );
     }
 

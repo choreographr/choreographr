@@ -4171,23 +4171,31 @@ impl TurnEventHandler for App {
 
     fn handle_failed(&mut self, session_id: u64, request_id: u32, error: String) {
         tracing::trace!(%request_id, %error, "handle_failed");
-        // The daemon reports connection-level failures (e.g. "no session
-        // attached" from RunInput/SetModel/SetReasoningEffort with no
-        // attached session) with the sentinel id 0 meaning "the attached
-        // session".  Resolve it so the failure lands in the session the
-        // user is actually attached to rather than a phantom session-0
-        // display; with no attached session there is nothing to update.
-        let Some(session_id) = self.resolve_daemon_session(session_id) else {
+        // The daemon uses id 0 as a sentinel for connection-level failures
+        // (e.g. "no session attached" from RunInput/SetModel/
+        // SetReasoningEffort) meaning "the attached session".  Resolve it so
+        // the failure lands in the session the user is actually attached to
+        // rather than a phantom session-0 display.
+        let reported = session_id;
+        let is_connection_level = reported == 0;
+        let Some(session_id) = self.resolve_daemon_session(reported) else {
             tracing::debug!(%request_id, %error, "dropping failure: no attached session to route the 0-sentinel to");
+            // No display to update, but a connection-level rejection (e.g.
+            // "no session attached") is exactly what the user needs to see
+            // on the status line.
+            if is_connection_level {
+                self.error = Some(error);
+            }
             return;
         };
-        // Surface the failure on the global status/error bar, but only when it
-        // belongs to the attached session — a background session's failed
-        // request must not clobber the status line the user is looking at
-        // (the same attached-session gating the ModelSelected /
-        // ReasoningEffortSet arms use). Done before the mutable display borrow
-        // below so `self.error` is still reachable.
-        if self.attached_session_id == Some(session_id) {
+        // A connection-level failure has no turn to render an error block in,
+        // so the global status/error bar is its only surface.  A request-level
+        // failure (a real session id) already renders the full error as the
+        // turn's red block in the transcript — writing it here too would
+        // print the same message twice on screen — so it is only recorded on
+        // the per-session display.  (Written before the mutable display
+        // borrow below so `self.error` is still reachable.)
+        if is_connection_level {
             self.error = Some(error.clone());
         }
         let display = self.display_for(session_id);
@@ -7672,11 +7680,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_failed_for_attached_session_writes_global_error() {
-        // A request that fails in the session the user is attached to must
-        // surface on the global error bar (regression: the multi-session
-        // refactor wrote only the never-rendered per-session `display.error`,
-        // so request failures were invisible in the TUI).
+    fn handle_failed_for_request_failure_does_not_write_global_error() {
+        // A request-level failure (a real session id) renders its full error
+        // as the turn's red block in the transcript; the global status/error
+        // bar must not print it a second time.  The per-session display still
+        // records it.
         let mut app = test_app();
         app.attached_session_id = Some(42);
         app.active_session_id = Some(42);
@@ -7685,22 +7693,21 @@ mod tests {
         app.handle_failed(42, 1, "client error (402): Insufficient Balance".into());
 
         assert_eq!(
-            app.error.as_deref(),
-            Some("client error (402): Insufficient Balance"),
-            "the attached session's failure must be visible on the global error bar"
+            app.error, None,
+            "a request failure's transcript block must not be duplicated on the status bar"
         );
         assert_eq!(
             app.display_for(42).error.as_deref(),
             Some("client error (402): Insufficient Balance"),
-            "the per-session display records the failure too"
+            "the per-session display records the failure"
         );
     }
 
     #[test]
-    fn handle_failed_sentinel_zero_writes_global_error_for_attached_session() {
-        // The daemon's 0-sentinel means "the attached session": a
-        // connection-level failure must reach both the per-session display
-        // and the global error bar.
+    fn handle_failed_connection_level_writes_global_error_for_attached_session() {
+        // The daemon's 0-sentinel marks a connection-level failure (e.g. "no
+        // session attached"), which has no turn to render an error block in:
+        // the global status/error bar is its only surface.
         let mut app = App::new();
         app.attached_session_id = Some(42);
         app.active_session_id = Some(42);
@@ -7717,6 +7724,20 @@ mod tests {
             !app.session_displays.contains_key(&0),
             "the 0-sentinel must not create a phantom session-0 display"
         );
+    }
+
+    #[test]
+    fn handle_failed_connection_level_without_attached_session_still_writes_global_error() {
+        // A connection-level rejection with no session to route the sentinel
+        // to has no display to update, but the user must still see it on the
+        // status line — there is no transcript block for it.
+        let mut app = test_app();
+        app.attached_session_id = None;
+        assert!(app.error.is_none());
+
+        app.handle_failed(0, 9, "no session attached".into());
+
+        assert_eq!(app.error.as_deref(), Some("no session attached"));
     }
 
     #[test]
