@@ -2410,9 +2410,10 @@ user switches to it (`reset_for_session_switch` preserves live estimates).
 
 The same rule extends to every other per-session status message the daemon
 broadcasts over the all-activity subscription.  `ModelSelected`,
-`ReasoningEffortSet`, `ReasoningEffortSetFailed` and `SessionAccountSet`
-are routed to the display of the session they belong to (and only touch the
-status bar's identity fields when that session is the attached one);
+`ReasoningEffortSet`, `ReasoningEffortSetFailed`, `SessionAccountSet` and
+`Failed` (request failures) are routed to the display of the session they
+belong to (and only touch the status bar's identity fields — or, for
+`Failed`, the global error line — when that session is the attached one);
 `ModelSelectionFailed` — whose failure means there is no new model to
 record — is gated the same way but updates no display.  The routing and the
 gate are one operation: the shared `route_session_update` helper resolves
@@ -2422,7 +2423,13 @@ sentinel, `Suppress` for background noise).  For a non-attached session the
 `connection.rs` handler returns early so the global status/error line is not
 rewritten either — a background session changing its model, reasoning effort
 or account must not rewrite the fields of the session on screen, nor reflow
-its viewport via a status-height change.
+its viewport via a status-height change.  Request failures additionally
+get recorded on the turn itself (`Turn.error`): the agent loop marks the
+open turn and finalizes + broadcasts it before propagating the inference
+error, so both clients render a red "Error:" block in the transcript and the
+failure survives a daemon restart.  (`handle_failed` runs through
+`dispatch_daemon_message`, not `route_session_update`, so it applies the
+same attached-session gate to the global error line directly.)
 
 Two daemon conventions keep this gating correct:
 

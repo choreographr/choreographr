@@ -1949,6 +1949,24 @@ pub(crate) fn run_agent_loop(
                     tool_results.clear();
                     return Ok(false);
                 }
+                // Any other inference failure (provider 4xx/5xx, network error,
+                // deadline) leaves the current turn open and without a visible
+                // record. Mark the failure on the turn and finalize + broadcast
+                // it so clients render a red "Error:" block in the transcript
+                // and the failure survives a daemon restart (finalize persists
+                // the turn). The finalize is best-effort: a storage error must
+                // not mask the original inference error, which the caller needs
+                // to surface as RequestOutcome::Failed.
+                session.set_turn_error(current_turn_id, e.to_string());
+                if let Err(persist_err) = finalize_and_broadcast_turn(session, ctx, current_turn_id)
+                {
+                    warn!(
+                        session_id = ctx.session_id,
+                        turn_id = current_turn_id,
+                        error = %persist_err,
+                        "failed to persist the failed turn; the inference error is still reported",
+                    );
+                }
                 return Err(e.into());
             }
         }
@@ -2354,7 +2372,7 @@ mod tests {
     use super::*;
     use crate::daemon::DaemonCommand;
     use crate::providers::InferenceProvider;
-    use crate::providers::test_util::make_test_provider;
+    use crate::providers::test_util::{make_failing_provider, make_test_provider};
     use crate::reasoning::{
         build_chat_request_messages, initial_prev_resp_id, warn_on_missing_reasoning_artifacts,
     };
@@ -3378,6 +3396,70 @@ mod tests {
         // The authoritative turn keeps the artifact after finalize + broadcast.
         assert!(session.turns[&turn_id].reasoning_artifact.is_some());
         assert!(session.turns[&turn_id].reasoning_producer.is_some());
+    }
+
+    #[test]
+    fn agent_loop_failure_marks_and_finalizes_turn() {
+        // A provider-level failure (e.g. 402 Insufficient Balance) must be
+        // recorded on the turn and the turn finalized + broadcast so clients
+        // render a red "Error:" block in the transcript and the failure
+        // survives a daemon restart — while the loop still reports the
+        // original inference error to the caller (RequestOutcome::Failed).
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db,
+            tool_registry: ToolRegistry::new().build(),
+            daemon_tx,
+            max_turns: 0,
+        };
+        let provider = make_failing_provider();
+        let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+        let mut session = SessionState::empty();
+
+        let result = run_agent_loop(
+            &provider,
+            &mut session,
+            "test-model",
+            7,
+            &cancel_rx,
+            &ctx,
+            Some("hi".into()),
+        );
+
+        // The inference error propagates to the caller unchanged.
+        let err = result.expect_err("the failing provider must fail the request");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("402") && msg.contains("Insufficient Balance"),
+            "expected the 402 client error, got: {msg}"
+        );
+
+        // The open turn carries the failure so clients can render it.
+        let turn = session.turns.get(&0).expect("turn 0 exists");
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("client error (402): Insufficient Balance")
+        );
+        assert_eq!(turn.user_text.as_deref(), Some("hi"));
+
+        // The turn was finalized: a TurnFinalized broadcast carries the error
+        // to clients (the authoritative turn keeps it too, for the DB write).
+        let mut saw_finalized = false;
+        while let Ok(msg) = cmd_rx.try_recv() {
+            if let SessionCommand::Broadcast(DaemonMessage::TurnFinalized { turn, .. }) = msg {
+                saw_finalized = true;
+                assert_eq!(
+                    turn.error.as_deref(),
+                    Some("client error (402): Insufficient Balance")
+                );
+            }
+        }
+        assert!(saw_finalized, "expected a TurnFinalized broadcast");
     }
 
     // -- resolve_reasoning_effort tests ------------------------------------

@@ -358,4 +358,51 @@ pub(crate) mod test_util {
             slug: "test-stub".to_string(),
         }
     }
+
+    /// Provider client that fails every streaming turn with a 4xx client
+    /// error — used to exercise the agent loop's request-failure path
+    /// (turn error marking + finalize) without touching the network.
+    #[derive(Debug)]
+    pub(crate) struct FailingProviderClient;
+
+    impl ProviderClient for FailingProviderClient {
+        fn provider_slug(&self) -> &str {
+            "test-failing"
+        }
+
+        fn chat_completion_turn(
+            &self,
+            _params: ChatTurnRequest<'_>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            Err(InferenceError::ClientError {
+                status: 402,
+                detail: "Insufficient Balance".to_string(),
+            })
+        }
+
+        fn chat_completion_turn_streaming(
+            &self,
+            _params: ChatTurnRequest<'_>,
+            _on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            Err(InferenceError::ClientError {
+                status: 402,
+                detail: "Insufficient Balance".to_string(),
+            })
+        }
+
+        fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+            Err(InferenceError::ClientError {
+                status: 402,
+                detail: "Insufficient Balance".to_string(),
+            })
+        }
+    }
+
+    pub(crate) fn make_failing_provider() -> InferenceProvider {
+        InferenceProvider {
+            client: Arc::new(FailingProviderClient),
+            slug: "test-failing".to_string(),
+        }
+    }
 }

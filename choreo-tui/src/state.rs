@@ -4181,7 +4181,18 @@ impl TurnEventHandler for App {
             tracing::debug!(%request_id, %error, "dropping failure: no attached session to route the 0-sentinel to");
             return;
         };
+        // Surface the failure on the global status/error bar, but only when it
+        // belongs to the attached session — a background session's failed
+        // request must not clobber the status line the user is looking at
+        // (the same attached-session gating the ModelSelected /
+        // ReasoningEffortSet arms use). Done before the mutable display borrow
+        // below so `self.error` is still reachable.
+        if self.attached_session_id == Some(session_id) {
+            self.error = Some(error.clone());
+        }
         let display = self.display_for(session_id);
+        // The per-session display records the failure for whichever session it
+        // belongs to (rendered once the user views that session).
         display.error = Some(error);
         // A failed request never re-broadcasts its turn, so `insert_or_replace`
         // won't clean the description map — clear it here (before the
@@ -7657,6 +7668,78 @@ mod tests {
         assert!(
             !app.session_displays.contains_key(&0),
             "the 0-sentinel must not create a phantom session-0 display"
+        );
+    }
+
+    #[test]
+    fn handle_failed_for_attached_session_writes_global_error() {
+        // A request that fails in the session the user is attached to must
+        // surface on the global error bar (regression: the multi-session
+        // refactor wrote only the never-rendered per-session `display.error`,
+        // so request failures were invisible in the TUI).
+        let mut app = test_app();
+        app.attached_session_id = Some(42);
+        app.active_session_id = Some(42);
+        assert!(app.error.is_none());
+
+        app.handle_failed(42, 1, "client error (402): Insufficient Balance".into());
+
+        assert_eq!(
+            app.error.as_deref(),
+            Some("client error (402): Insufficient Balance"),
+            "the attached session's failure must be visible on the global error bar"
+        );
+        assert_eq!(
+            app.display_for(42).error.as_deref(),
+            Some("client error (402): Insufficient Balance"),
+            "the per-session display records the failure too"
+        );
+    }
+
+    #[test]
+    fn handle_failed_sentinel_zero_writes_global_error_for_attached_session() {
+        // The daemon's 0-sentinel means "the attached session": a
+        // connection-level failure must reach both the per-session display
+        // and the global error bar.
+        let mut app = App::new();
+        app.attached_session_id = Some(42);
+        app.active_session_id = Some(42);
+        assert!(app.error.is_none());
+
+        app.handle_failed(0, 7, "no session attached".into());
+
+        assert_eq!(app.error.as_deref(), Some("no session attached"));
+        assert_eq!(
+            app.display_for(42).error.as_deref(),
+            Some("no session attached")
+        );
+        assert!(
+            !app.session_displays.contains_key(&0),
+            "the 0-sentinel must not create a phantom session-0 display"
+        );
+    }
+
+    #[test]
+    fn handle_failed_for_background_session_does_not_write_global_error() {
+        // The TUI subscribes to all activity, so a background session's
+        // request failure arrives too.  It must be recorded on that session's
+        // display but must not clobber the global status/error bar the user
+        // is looking at (same gating as the ModelSelected / ReasoningEffortSet
+        // arms).
+        let mut app = test_app();
+        app.attached_session_id = Some(42);
+        app.active_session_id = Some(42);
+        assert!(app.error.is_none());
+
+        app.handle_failed(99, 3, "background failure".into());
+
+        assert_eq!(
+            app.error, None,
+            "background failure must not write the global error bar"
+        );
+        assert_eq!(
+            app.display_for(99).error.as_deref(),
+            Some("background failure")
         );
     }
 
