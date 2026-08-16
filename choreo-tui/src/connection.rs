@@ -1303,17 +1303,42 @@ fn handle_chat_event(
                 MouseEventKind::Up(MouseButton::Left) => {
                     let text = selection::finish_selection(app, mouse.row, mouse.column);
                     if let Some(text) = text {
-                        clipboard::copy_to_clipboard(&text);
-                        tracing::info!(
-                            bytes = text.len(),
-                            "[choreo-tui] copied selection to clipboard via OSC 52"
-                        );
-                        app.status = Some("Selection copied to clipboard.".to_string());
+                        if clipboard::copy_to_clipboard(&text) {
+                            tracing::info!(
+                                bytes = text.len(),
+                                "[choreo-tui] copied selection to clipboard via OSC 52"
+                            );
+                            app.status = Some("Selection copied to clipboard.".to_string());
+                        } else {
+                            // Over the OSC 52 size cap: say so instead of
+                            // pretending the copy succeeded (see clipboard.rs).
+                            tracing::warn!(
+                                bytes = text.len(),
+                                "[choreo-tui] selection exceeds the OSC 52 size cap; not copied"
+                            );
+                            app.status =
+                                Some("Selection too large to copy to clipboard.".to_string());
+                        }
                     }
                 }
+                // A scroll wheel mid-gesture abandons the selection AND
+                // scrolls — terminal-native behavior (scrolling clears the
+                // selection, the wheel input still lands).  The delta is
+                // accumulated exactly like the history-box scroll arm below,
+                // so the per-frame scroll consumer applies it in batch;
+                // without this the event would be swallowed by the gesture
+                // and the user's wheel input would vanish.
+                MouseEventKind::ScrollUp => {
+                    selection::cancel_selection(app);
+                    app.scroll_accumulator = app.scroll_accumulator.saturating_add(1);
+                }
+                MouseEventKind::ScrollDown => {
+                    selection::cancel_selection(app);
+                    app.scroll_accumulator = app.scroll_accumulator.saturating_sub(1);
+                }
                 _ => {
-                    // Any other mouse event (scroll wheel, right-click, a
-                    // second Down before the first Up) cancels the gesture.
+                    // Any other mouse event (right-click, a second Down
+                    // before the first Up) cancels the gesture.
                     selection::cancel_selection(app);
                 }
             }
@@ -1650,6 +1675,12 @@ fn handle_chat_ctrl_key(
         }
         KeyCode::Char('m') => {
             tracing::debug!("Ctrl+M opening model selector");
+            // An armed selection is keyed to the Chat page's history, but
+            // the selector is a modal overlay that routes mouse events away
+            // from the selection arms — a mid-drag Ctrl+M must not leave the
+            // gesture dangling underneath it (it would swallow the first
+            // click after the selector closes).
+            app.text_selection = None;
             app.model_selector.open();
             client_tx
                 .send(ClientMessage::ListModels)
@@ -3314,7 +3345,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_scroll_during_selection_cancels_it() {
+    fn mouse_scroll_during_selection_cancels_it_and_scrolls() {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
@@ -3336,10 +3367,16 @@ mod tests {
             start_row + 1,
         );
         // A scroll wheel mid-gesture abandons the selection (matches
-        // terminal-native selection, where scrolling clears the selection).
+        // terminal-native selection, where scrolling clears the selection)
+        // AND the wheel input still lands: the delta is accumulated like any
+        // other scroll event, not swallowed by the gesture.
         send_mouse(&mut app, MouseEventKind::ScrollDown, 0, start_row);
         assert!(app.text_selection.is_none(), "scroll cancels the selection");
         assert!(app.status.is_none(), "cancelled selection copies nothing");
+        assert_eq!(
+            app.scroll_accumulator, -1,
+            "the wheel scroll must still accumulate after cancelling"
+        );
     }
 
     #[test]

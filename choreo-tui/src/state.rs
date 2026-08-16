@@ -704,11 +704,26 @@ pub(crate) fn cached_or_compute_lines(
     }
 
     let rendered = compute();
-    let lines = Arc::from(rendered.lines);
-    let content_ranges = Arc::from(rendered.content_ranges);
+    let lines: Arc<[Line<'static>]> = Arc::from(rendered.lines);
+    let content_ranges: Arc<[Option<(usize, usize)>]> = Arc::from(rendered.content_ranges);
+    let visual_offsets = compute_visual_offsets(&lines, key.viewport_width);
+    // Pin the parallel-array invariant the selection machinery relies on:
+    // every rendered line must carry a content range (`None` marks
+    // pure-chrome rows) and a cumulative visual-row offset.  A mismatch here
+    // is a programming error in the renderer, not a runtime condition.
+    debug_assert_eq!(
+        content_ranges.len(),
+        lines.len(),
+        "every rendered line must carry a content range"
+    );
+    debug_assert_eq!(
+        visual_offsets.len(),
+        lines.len(),
+        "visual offsets must stay aligned with the rendered lines"
+    );
     let turn = RenderedTurn {
         height: lines_height(&lines, key.viewport_width).max(1),
-        visual_offsets: compute_visual_offsets(&lines, key.viewport_width),
+        visual_offsets,
         lines,
         content_ranges,
         reasoning_header_idx: rendered.reasoning_header_idx,
@@ -2732,6 +2747,12 @@ impl App {
 
     pub(crate) fn set_page(&mut self, page: Page) {
         self.page = page;
+        // A selection is stored in screen coordinates keyed to the Chat
+        // page's rendered history; leaving the page (or re-entering via an
+        // attach flow, which changes the underlying session) invalidates
+        // that context, so drop the gesture rather than highlight stale rows
+        // or swallow the first click on return.
+        self.text_selection = None;
         if let Some(d) = self.active_display() {
             d.progress_dirty = true;
         }
@@ -5219,6 +5240,25 @@ mod tests {
         assert!(
             app.text_selection.is_none(),
             "session switch must clear the in-progress selection"
+        );
+    }
+
+    #[test]
+    fn set_page_clears_text_selection() {
+        // Leaving the Chat page invalidates the selection's screen-coordinate
+        // context (it is keyed to the history it was drawn over); a stale
+        // gesture must not survive a page switch and swallow the first click
+        // on return.
+        let mut app = test_app();
+        app.text_selection = Some(crate::selection::TextSelection {
+            anchor: (0, 0),
+            head: (2, 3),
+            active: true,
+        });
+        app.set_page(Page::SessionManager);
+        assert!(
+            app.text_selection.is_none(),
+            "page switch must clear the in-progress selection"
         );
     }
 

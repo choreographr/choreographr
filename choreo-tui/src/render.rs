@@ -1604,9 +1604,13 @@ mod tests {
 
     /// Wrap a line vector as a rendered turn with no headers.
     fn rendered(lines: Vec<Line<'static>>) -> RenderedTurnLines {
+        // Every line gets a full-width content range so the cache-alignment
+        // invariant asserted in `cached_or_compute_lines` holds for test
+        // fixtures too (each entry must align with `lines`).
+        let content_ranges = lines.iter().map(|l| Some((0, l.width()))).collect();
         RenderedTurnLines {
             lines,
-            content_ranges: Vec::new(),
+            content_ranges,
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
         }

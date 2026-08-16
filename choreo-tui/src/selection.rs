@@ -163,18 +163,50 @@ fn text_for_row(
     let (turn_idx, visual_row) = find_turn_at_row(app, row)?;
     let display = app.active_display_ref()?;
     let rendered = cached_rendered_turn(display, turn_idx, vp_width)?;
+    let (line_idx, (lo, hi)) = content_range_for_row(
+        &rendered.visual_offsets,
+        &rendered.content_ranges,
+        visual_row,
+        col_start,
+        col_end,
+        vp_width,
+    )?;
+    Some(slice_line_columns(&rendered.lines[line_idx], lo, hi))
+}
+
+/// Resolve a turn-local visual row and viewport column range to the
+/// content-clamped display-column range of the semantic line it covers.
+///
+/// The single row→line→column mapping shared by the extraction path
+/// ([`text_for_row`]) and the draw-time highlight
+/// ([`apply_selection_to_lines`]), so the two can never drift apart again —
+/// they already diverged twice (the screen-row offset bug and the
+/// within-line column bug, both fixed by pinning exactly this mapping).
+/// `visual_offsets`/`content_ranges` are the turn's cached arrays, aligned
+/// with its rendered lines (see the `debug_assert`s in
+/// `cached_or_compute_lines`); `col_end == usize::MAX` means "to the end of
+/// the line".  Returns `(line_idx, (lo, hi))` — the semantic line and its
+/// selectable display-column range — or `None` when the row maps to no
+/// selectable content (pure-chrome rows, image rows, rows past the end of
+/// the text).
+fn content_range_for_row(
+    visual_offsets: &[usize],
+    content_ranges: &[Option<(usize, usize)>],
+    visual_row: usize,
+    col_start: usize,
+    col_end: usize,
+    vp_width: usize,
+) -> Option<(usize, (usize, usize))> {
     // Map the turn-local visual row to a semantic line, then to the visual
     // row *within* that line (0 for every line in practice: lines are
     // pre-wrapped narrower than the viewport).
-    let line_idx = rendered
-        .visual_offsets
-        .partition_point(|&o| o <= visual_row);
-    if line_idx >= rendered.lines.len() {
+    let line_idx = visual_offsets.partition_point(|&o| o <= visual_row);
+    if line_idx >= visual_offsets.len() {
         return None;
     }
     let line_start_row = line_idx
         .checked_sub(1)
-        .and_then(|i| rendered.visual_offsets.get(i))
+        .and_then(|i| visual_offsets.get(i))
         .copied()
         .unwrap_or(0);
     let within_line = visual_row.saturating_sub(line_start_row);
@@ -188,9 +220,10 @@ fn text_for_row(
     } else {
         base.saturating_add(col_end)
     };
-    // Clamp to the line's meaningful content so the copy never includes the
-    // box chrome (`┃` gutter, indents, trailing fill) or pure-chrome rows.
-    let content = rendered.content_ranges.get(line_idx).copied().flatten();
+    // Clamp to the line's meaningful content so neither the highlight nor
+    // the copy ever includes the box chrome (`┃` gutter, indents, trailing
+    // fill) or pure-chrome rows.
+    let content = content_ranges.get(line_idx).copied().flatten();
     let (lo, hi) = match content {
         Some((lo, hi)) if lo < hi => (line_col_lo.max(lo), line_col_hi.min(hi)),
         _ => return None,
@@ -198,7 +231,7 @@ fn text_for_row(
     if lo >= hi {
         return None;
     }
-    Some(slice_line_columns(&rendered.lines[line_idx], lo, hi))
+    Some((line_idx, (lo, hi)))
 }
 
 /// Read-only render-cache lookup for a turn's rendered lines.
@@ -295,32 +328,21 @@ pub(crate) fn apply_selection_to_lines(
                 usize::MAX
             };
             // Translate the viewport columns into the semantic line's own
-            // column space by the visual row WITHIN this line (0 for the
-            // common 1-row line) — mirroring the extraction path in
-            // `text_for_row`.  The original bug multiplied by `vr` (the
-            // turn-local row, e.g. 2 for a box's content line), pushing the
-            // selection columns past the line's end so nothing was ever
-            // highlighted.
-            let within_line = vr.saturating_sub(row_lo);
-            let base = within_line.saturating_mul(vp.width as usize);
-            let line_col_lo = base.saturating_add(col_lo);
-            let line_col_hi = if col_hi == usize::MAX {
-                usize::MAX
-            } else {
-                base.saturating_add(col_hi)
-            };
-            // Clamp to the line's meaningful content (the renderer records
-            // where each line's real text starts/ends), so the highlight
-            // never spills onto the box chrome — `┃` gutter, indents, and
-            // trailing fill — and pure-chrome rows stay unhighlighted.
-            let content = content_ranges.get(li).copied().flatten();
-            let (c_lo, c_hi) = match content {
-                Some((lo, hi)) if lo < hi => (line_col_lo.max(lo), line_col_hi.min(hi)),
-                _ => continue,
-            };
-            if c_lo >= c_hi {
+            // column space and clamp to its meaningful content — the exact
+            // mapping extraction uses (`content_range_for_row`), so the
+            // highlight and the copy can never disagree about which cells
+            // are selected.  Pure-chrome rows and rows outside the line's
+            // content range stay unhighlighted.
+            let Some((_, (c_lo, c_hi))) = content_range_for_row(
+                text_offsets,
+                content_ranges,
+                vr,
+                col_lo,
+                col_hi,
+                vp.width as usize,
+            ) else {
                 continue;
-            }
+            };
             *line = style_line_selection(line, c_lo, c_hi);
             // A real (single-visual-row) line is fully covered by its one row.
             if row_hi - row_lo <= 1 {
@@ -542,28 +564,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_multi_row_joins_turns() {
-        // Selecting across the boxed turn blocks copies the visible gutter
-        // rows in between (terminal-native semantics: what you see is what
-        // you copy), so assert both words appear in render order rather than
-        // asserting an exact string.
-        let mut app = app_with_turns(&[(0, "first"), (1, "second")], 30);
-        let (start, _) = locate(&app, "first");
-        let (_, end) = locate(&app, "second");
-        let text = drag_and_finish(&mut app, start, end).expect("selection should extract");
-        let first_pos = text.find("first").expect("first word copied");
-        let second_pos = text.find("second").expect("second word copied");
-        assert!(first_pos < second_pos, "turns copied in render order");
-        assert!(text.contains('\n'), "rows are joined with newlines");
-    }
-
-    #[test]
     fn extract_skips_box_chrome_across_turns() {
         // Selecting across boxed turn blocks must copy ONLY the content text:
         // the `┃` gutter, leading box padding, and trailing fill of every
         // selected row are excluded, and pure-chrome rows (separators,
         // padding) contribute nothing.  Regression for the box chrome being
-        // dragged into the copied text.
+        // dragged into the copied text.  (Also covers the multi-row case:
+        // both turns' words arrive in render order joined by newlines.)
         let mut app = app_with_turns(&[(0, "first"), (1, "second")], 30);
         let (start, _) = locate(&app, "first");
         let (_, end) = locate(&app, "second");
@@ -575,6 +582,7 @@ mod tests {
         let first_pos = text.find("first").expect("first word copied");
         let second_pos = text.find("second").expect("second word copied");
         assert!(first_pos < second_pos, "turns copied in render order");
+        assert!(text.contains('\n'), "rows are joined with newlines");
         for line in text.lines() {
             assert_eq!(
                 line.trim_end().len(),

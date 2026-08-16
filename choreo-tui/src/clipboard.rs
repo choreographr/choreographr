@@ -11,6 +11,11 @@
 //!   Terminal.app): the sequence is silently ignored, never an error.
 //! - The terminal can refuse the write (kitty/iTerm2 permission prompts)
 //!   without affecting the TUI at all.
+//! - Selections larger than [`MAX_OSC52_BYTES`] are refused up front (the
+//!   caller surfaces a "too large" status): OSC 52 payloads are base64 (a
+//!   4/3 expansion), and several terminals cap or drop very large paste
+//!   sequences, so writing a multi-megabyte sequence would stall the UI loop
+//!   for a paste the terminal would likely discard anyway.
 //!
 //! This mirrors the existing `terminal_progress` module's OSC 9;4 usage:
 //! build the sequence as a string, write it to stdout, ignore errors.  A
@@ -20,6 +25,15 @@
 
 use base64::Engine as _;
 use std::io::Write;
+
+/// Maximum size (in bytes of text) of a selection written via OSC 52.
+const MAX_OSC52_BYTES: usize = 1 << 20; // 1 MiB of text
+
+/// Whether `text` fits under the OSC 52 size cap.  Split out so the
+/// threshold is unit-testable without writing to a real stdout.
+fn within_osc52_limit(text: &str) -> bool {
+    text.len() <= MAX_OSC52_BYTES
+}
 
 /// Build the OSC 52 sequence that asks the terminal to place `text` on the
 /// system clipboard (`c` selection).  Pure function so the byte layout is
@@ -31,15 +45,22 @@ pub(crate) fn build_osc52(text: &str) -> String {
 
 /// Copy `text` to the system clipboard via OSC 52.
 ///
+/// Returns `true` when the sequence was written; `false` (without writing)
+/// when the text exceeds [`MAX_OSC52_BYTES`], so the caller can report a
+/// "too large to copy" status instead of pretending the copy succeeded.
 /// Writes to stdout exactly like `terminal_progress::update_terminal_progress`.
 /// Errors are swallowed on purpose: an unsupported or denying terminal must
 /// degrade to "nothing happened", never disturb the UI loop.
-pub(crate) fn copy_to_clipboard(text: &str) {
+pub(crate) fn copy_to_clipboard(text: &str) -> bool {
+    if !within_osc52_limit(text) {
+        return false;
+    }
     let seq = build_osc52(text);
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     let _ = write!(handle, "{seq}");
     let _ = handle.flush();
+    true
 }
 
 #[cfg(test)]
@@ -81,5 +102,17 @@ mod tests {
             .decode(b64)
             .expect("payload must be valid base64");
         assert_eq!(String::from_utf8(decoded).unwrap(), "→ 😀");
+    }
+
+    #[test]
+    fn osc52_size_cap_boundary() {
+        // Text at the cap is accepted; one byte over is refused (the caller
+        // shows a "too large" status instead of stalling the UI on a
+        // multi-megabyte escape sequence terminals may drop anyway).
+        assert!(within_osc52_limit(""));
+        assert!(within_osc52_limit("x".repeat(MAX_OSC52_BYTES).as_str()));
+        assert!(!within_osc52_limit(
+            "x".repeat(MAX_OSC52_BYTES + 1).as_str()
+        ));
     }
 }
