@@ -29,12 +29,12 @@ use unicode_width::UnicodeWidthStr;
 
 /// Background color for the in-progress selection highlight.
 ///
-/// Deliberately a solid mid-blue, not `Modifier::REVERSED`: history turns
-/// render on the dark-gray `BG_SHADE` background (see `add_margin_lines`),
-/// and reverse-video on a cell that already has an explicit background swaps
-/// the text to dark-on-dark — effectively invisible.  A dedicated background
-/// color reads as a selection on both the shaded turns and the plain text
-/// between them, like a terminal's own selection.
+/// A solid, dedicated color rather than `Modifier::REVERSED`: the history's
+/// turns carry explicit `BG_SHADE` backgrounds, so reverse-video would
+/// depend on the terminal's swap semantics (and can render dark-on-dark on
+/// shaded cells).  A fixed background color reads as a selection on both the
+/// shaded turns and the plain text between them, like a terminal's own
+/// selection.
 pub(crate) const SELECTION_BG: Color = Color::Rgb(0x2F, 0x5F, 0xAF);
 
 /// An in-progress mouse text selection over the history pane.
@@ -257,9 +257,13 @@ pub(crate) fn apply_selection_to_lines(
     let scroll = display.effective_scroll(&vp);
     // The renderer draws the content bottom-anchored inside the viewport:
     // content row `c` maps to screen row `c + scroll + vh - total` (see
-    // `find_turn_at_row` for the inverse).  For visible rows this is never
-    // negative, so the saturating math below is exact.
-    let row_base = scroll.saturating_add(vh).saturating_sub(total);
+    // `find_turn_at_row` for the inverse).  At the bottom of an overflowing
+    // history (scroll == 0, total > vh) this offset is NEGATIVE — a
+    // saturating unsigned subtraction would clamp it to 0 and no screen row
+    // would ever match, silently hiding the highlight (the original bug:
+    // the selection copied fine but was never drawn).  Compute it signed and
+    // style only rows that land inside the viewport.
+    let row_offset = scroll as isize + vh as isize - total as isize;
     for (k, line) in lines.iter_mut().enumerate() {
         let li = line_start + k;
         let row_lo = li
@@ -274,7 +278,11 @@ pub(crate) fn apply_selection_to_lines(
         // at content_width < viewport width); the inner loop generalizes to
         // multi-row lines defensively.
         for vr in row_lo..row_hi {
-            let screen_row = turn_start.saturating_add(vr).saturating_add(row_base);
+            let screen_row = turn_start as isize + vr as isize + row_offset;
+            if screen_row < 0 || screen_row >= vh as isize {
+                continue;
+            }
+            let screen_row = screen_row as usize;
             let start_row = start.0 as usize;
             let end_row = end.0 as usize;
             if screen_row < start_row || screen_row > end_row {
@@ -290,7 +298,15 @@ pub(crate) fn apply_selection_to_lines(
             } else {
                 usize::MAX
             };
-            let base = vr.saturating_mul(vp.width as usize);
+            // Translate the viewport columns into the semantic line's own
+            // column space by the visual row WITHIN this line (0 for the
+            // common 1-row line) — mirroring the extraction path in
+            // `text_for_row`.  The original bug multiplied by `vr` (the
+            // turn-local row, e.g. 2 for a box's content line), pushing the
+            // selection columns past the line's end so nothing was ever
+            // highlighted.
+            let within_line = vr.saturating_sub(row_lo);
+            let base = within_line.saturating_mul(vp.width as usize);
             let line_col_lo = base.saturating_add(col_lo);
             let line_col_hi = if col_hi == usize::MAX {
                 usize::MAX
@@ -674,6 +690,156 @@ mod tests {
         let styled = style_line_selection(&shaded, 0, 5);
         assert_eq!(styled.spans.len(), 1);
         assert_eq!(styled.spans[0].style.bg, Some(SELECTION_BG));
+    }
+
+    // ── apply_selection_to_lines (screen-row mapping) ──
+
+    #[test]
+    fn apply_selection_to_lines_overflowing_history_styles_visible_rows() {
+        // Regression: when the history overflows the viewport (the common
+        // long-conversation case), the content is bottom-anchored — at the
+        // bottom, content row c sits at screen row c + vh - total, which is
+        // NEGATIVE.  A saturating unsigned offset clamped it to 0, so no
+        // screen row ever matched and the highlight was never drawn (the
+        // selection copied fine but had no visual feedback).
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        for i in 0..6 {
+            app.display_for(0)
+                .view
+                .insert_or_replace(i, turn(&format!("turn {i}")));
+        }
+        app.rebuild_height_prefix();
+        let vh = app.history_viewport.height as usize;
+        let total = app.total_history_height();
+        assert!(total > vh, "history must overflow the viewport");
+
+        // Select screen rows 0..2, columns 5..10.
+        app.text_selection = Some(TextSelection {
+            anchor: (0, 5),
+            head: (2, 10),
+            active: true,
+        });
+
+        // Resolve each selected screen row to (turn_idx, line_idx) via the
+        // same mapping extraction uses.
+        let selected: Vec<(usize, usize)> = {
+            let display = app.active_display_ref().unwrap();
+            (0..3)
+                .map(|screen_row| {
+                    let (turn_idx, visual_row) =
+                        find_turn_at_row(&app, screen_row).expect("visible row maps");
+                    let cached = display.render_cache[turn_idx].as_ref().unwrap();
+                    let line_idx = cached
+                        .rendered
+                        .visual_offsets
+                        .partition_point(|&o| o <= visual_row);
+                    (
+                        turn_idx,
+                        line_idx.min(cached.rendered.lines.len().saturating_sub(1)),
+                    )
+                })
+                .collect()
+        };
+        assert!(
+            !selected.is_empty() && selected.len() == 3,
+            "all selected screen rows must resolve"
+        );
+
+        for (turn_idx, line_idx) in selected {
+            let (cached_lines, offsets, turn_start) = {
+                let display = app.active_display_ref().unwrap();
+                let cached = display.render_cache[turn_idx].as_ref().unwrap();
+                (
+                    cached.rendered.lines.clone(),
+                    cached.rendered.visual_offsets.clone(),
+                    display
+                        .height_prefix
+                        .get(turn_idx.wrapping_sub(1))
+                        .copied()
+                        .unwrap_or(0),
+                )
+            };
+            let mut lines = cached_lines.to_vec();
+            apply_selection_to_lines(&app, turn_start, &offsets, 0, &mut lines);
+            assert!(
+                lines[line_idx]
+                    .spans
+                    .iter()
+                    .any(|s| s.style.bg == Some(SELECTION_BG)),
+                "screen row for turn {turn_idx} line {line_idx} must be highlighted"
+            );
+        }
+
+        // A row outside the selection must stay unhighlighted.
+        let (turn_idx, visual_row) = find_turn_at_row(&app, 8).expect("visible row");
+        let (cached_lines, offsets, turn_start) = {
+            let display = app.active_display_ref().unwrap();
+            let cached = display.render_cache[turn_idx].as_ref().unwrap();
+            (
+                cached.rendered.lines.clone(),
+                cached.rendered.visual_offsets.clone(),
+                display
+                    .height_prefix
+                    .get(turn_idx.wrapping_sub(1))
+                    .copied()
+                    .unwrap_or(0),
+            )
+        };
+        let mut lines = cached_lines.to_vec();
+        apply_selection_to_lines(&app, turn_start, &offsets, 0, &mut lines);
+        let line_idx = offsets
+            .partition_point(|&o| o <= visual_row)
+            .min(lines.len().saturating_sub(1));
+        assert!(
+            !lines[line_idx]
+                .spans
+                .iter()
+                .any(|s| s.style.bg == Some(SELECTION_BG)),
+            "row outside the selection must stay unhighlighted"
+        );
+    }
+
+    #[test]
+    fn apply_selection_to_lines_short_history_styles_visible_rows() {
+        // The short-history case (content fits the viewport, blank band on
+        // top): content row c maps to screen row c + vh - total (positive).
+        let mut app = app_with_turns(&[(0, "hello"), (1, "world")], 30);
+        let (start, _) = locate(&app, "hello");
+        app.text_selection = Some(TextSelection {
+            anchor: start,
+            head: start,
+            active: true,
+        });
+        let ((r, c), _) = selection_range(&app).unwrap();
+        app.text_selection = Some(TextSelection {
+            anchor: (r, c),
+            head: (r, c.saturating_add(5)),
+            active: true,
+        });
+        let (turn_idx, _) = find_turn_at_row(&app, r).expect("row maps");
+        let (cached_lines, offsets, turn_start) = {
+            let display = app.active_display_ref().unwrap();
+            let cached = display.render_cache[turn_idx].as_ref().unwrap();
+            (
+                cached.rendered.lines.clone(),
+                cached.rendered.visual_offsets.clone(),
+                display
+                    .height_prefix
+                    .get(turn_idx.wrapping_sub(1))
+                    .copied()
+                    .unwrap_or(0),
+            )
+        };
+        let mut lines = cached_lines.to_vec();
+        apply_selection_to_lines(&app, turn_start, &offsets, 0, &mut lines);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.style.bg == Some(SELECTION_BG))),
+            "the selected row must be highlighted"
+        );
     }
 
     // ── approx_tokens ──
