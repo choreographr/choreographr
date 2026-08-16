@@ -341,34 +341,52 @@ impl Turn {
             size += s.len();
         }
         for call in &self.tool_calls {
-            size += 16 + call.call_id.len() + call.name.len() + call.arguments_json.len();
+            // Real MessagePack named-mode cost per `AssistantToolCallRecord` is
+            // ~57 B of overhead (map header + variant tag + the three field-
+            // name keys), so a 16 B allowance under-counted tool-heavy turns:
+            // the lag gauge must never UNDER-estimate the serialized payload
+            // (a genuinely lagging client could then escape eviction). 64 B
+            // leaves comfortable slack for longer keys/payload headers.
+            size += 64 + call.call_id.len() + call.name.len() + call.arguments_json.len();
         }
         for result in &self.tool_results {
-            size += 32
+            // Real per-`ToolResultRecord` overhead is ~79 B (five field keys,
+            // the longest being `invocation_description` at 21 chars); the
+            // old 32 B allowance under-counted by ~47 B per result. 96 B
+            // over-covers it, keeping the gauge conservative.
+            size += 96
                 + result.call_id.len()
                 + result.name.len()
                 + result.content.len()
                 + result.invocation_description.len();
         }
         for image in &self.displayed_images {
-            size += 48
+            // Real per-`DisplayedImageRecord` overhead is ~127 B (the nested
+            // `ImageMetadata` struct adds its own tag + five field keys); the
+            // old 48 B allowance under-counted by ~79 B per image. 160 B
+            // over-covers it.
+            size += 160
                 + image.data.len()
                 + image.metadata.mime_type.len()
                 + image.metadata.alt.as_ref().map_or(0, String::len);
         }
         if let Some(artifact) = &self.reasoning_artifact {
             // Opaque round-trip payload: count the raw bytes, tagged by the
-            // variant that owns them.
+            // variant that owns them. Real overhead is ~40 B for the bare-byte
+            // variants but ~88 B for `ChatReasoning` (an extra nested map +
+            // the `field` enum tag), so 96 B covers every variant with slack.
             let payload = match artifact {
                 ReasoningArtifact::ChatReasoning { bytes, .. } => bytes.len(),
                 ReasoningArtifact::AnthropicThinking(bytes)
                 | ReasoningArtifact::GoogleSignatures(bytes)
                 | ReasoningArtifact::ResponsesItems(bytes) => bytes.len(),
             };
-            size += 16 + payload;
+            size += 96 + payload;
         }
         if let Some(producer) = &self.reasoning_producer {
-            size += 16 + producer.provider_slug.len() + producer.model.len();
+            // Real per-`ReasoningProducer` overhead is ~60 B (its own variant
+            // tag + two field keys); the old 16 B allowance under-counted.
+            size += 64 + producer.provider_slug.len() + producer.model.len();
         }
         size
     }
@@ -927,13 +945,18 @@ fn session_status_size(status: &SessionStatus) -> usize {
     }
 }
 
-/// Byte length of a `ReasoningCapability` payload.
+/// Byte length of a `ReasoningCapability` payload: the named-mode variant
+/// tag, map header, `available_effort_levels` field key, the array header,
+/// and one string header per effort level, plus the level slugs' payloads.
+/// Fixed at ~47 B for a 4-level set, so the 64 B fixed part over-covers it
+/// and the per-element +1 accounts for longer level lists.
 fn reasoning_capability_size(cap: &ReasoningCapability) -> usize {
-    16 + cap
-        .available_effort_levels
-        .iter()
-        .map(String::len)
-        .sum::<usize>()
+    64 + cap.available_effort_levels.len()
+        + cap
+            .available_effort_levels
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
 }
 
 impl DaemonMessage {
@@ -948,8 +971,10 @@ impl DaemonMessage {
     /// past the limit. O(1) in message count — it sums the variable-size
     /// fields (strings, byte buffers, vecs, turn maps) plus a fixed
     /// per-variant envelope overhead, and ignores fixed-size scalars.
-    /// The over-estimate is pinned against the real encoded payload by
-    /// `approx_wire_size_never_underestimates_encoded_payload`.
+    /// The over-estimate is pinned by
+    /// [`approx_wire_size_never_underestimates_encoded_payload`], which encodes
+    /// every `DaemonMessage` variant with realistic payloads and asserts the
+    /// estimate covers the actual bytes.
     pub fn approx_wire_size(&self) -> usize {
         // Fixed envelope overhead for FIELDLESS variants (Pong, Evicted, …):
         // just the variant tag, so this generous fixed value is a comfortable
@@ -1051,7 +1076,7 @@ impl DaemonMessage {
                 error,
                 ..
             } => named_field_overhead(5) + call_id.len() + tool_name.len() + error.len(),
-            Self::TokenUsageUpdate { .. } => named_field_overhead(3),
+            Self::TokenUsageUpdate { .. } => named_field_overhead(4),
             Self::LiveOutputTokenCount { .. } => named_field_overhead(3),
             Self::OutputChunk { stream, data, .. } => {
                 let stream_len = match stream {
@@ -1083,7 +1108,17 @@ impl DaemonMessage {
                         .map(|p| 32 + p.slug.len() + p.display_name.len())
                         .sum::<usize>()
             }
-            Self::ModelSelected { model, .. } => named_field_overhead(2) + model.len(),
+            Self::ModelSelected {
+                model,
+                reasoning_capability,
+                ..
+            } => {
+                named_field_overhead(2)
+                    + model.len()
+                    + reasoning_capability
+                        .as_ref()
+                        .map_or(0, reasoning_capability_size)
+            }
             Self::ModelSelectionFailed { model, error, .. } => {
                 named_field_overhead(3) + model.len() + error.len()
             }
@@ -1359,5 +1394,535 @@ mod tests {
                 total_tokens: 35,
             }
         );
+    }
+
+    /// The lag-eviction gauge must never UNDER-estimate the serialized payload,
+    /// or a genuinely lagging client could escape eviction: the estimate is the
+    /// threshold the daemon's lag accounting compares against the per-client
+    /// cap / global budget, so under-counting directly weakens the memory
+    /// bound. Every `DaemonMessage` variant is encoded with a realistic (and
+    /// deliberately DENSE for the record-bearing ones) payload, and the
+    /// estimate must cover the actual frame bytes. This is the property the
+    /// record-size allowances in [`Turn::approx_size`] and the per-variant
+    /// field counts are tuned against — a future serde/encoding change or a
+    /// new variant that shrinks the margin must re-prove it here.
+    #[test]
+    fn approx_wire_size_never_underestimates_encoded_payload() {
+        fn turn(n_calls: usize, n_results: usize, n_images: usize) -> Turn {
+            Turn {
+                created_at: TimestampMs(1_700_000_000_000),
+                undone: false,
+                error: Some("boom".into()),
+                user_text: Some("hello world".into()),
+                assistant_text: Some("x".repeat(100)),
+                assistant_reasoning: Some("thinking".repeat(10)),
+                tool_calls: (0..n_calls)
+                    .map(|i| AssistantToolCallRecord {
+                        call_id: format!("call_{i}"),
+                        name: "sh".into(),
+                        arguments_json: format!(r#"{{"command":"echo step {i}"}}"#),
+                    })
+                    .collect(),
+                token_usage: Some(TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    total_tokens: 3,
+                }),
+                tool_results: (0..n_results)
+                    .map(|i| ToolResultRecord {
+                        call_id: format!("call_{i}"),
+                        name: "sh".into(),
+                        content: format!("output line {i} of the tool\n"),
+                        is_error: false,
+                        invocation_description: format!("Running: echo step {i}"),
+                    })
+                    .collect(),
+                displayed_images: (0..n_images)
+                    .map(|i| DisplayedImageRecord {
+                        metadata: ImageMetadata {
+                            mime_type: "image/png".into(),
+                            width: 640,
+                            height: 480,
+                            byte_len: 100,
+                            alt: Some(format!("screenshot {i}")),
+                        },
+                        data: vec![0u8; 100],
+                        tool_call_id: Some(format!("call_{i}")),
+                    })
+                    .collect(),
+                reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+                    field: ChatReasoningField::ReasoningContent,
+                    bytes: b"{\"type\":\"thinking\",\"signature\":\"sig_abc\"}".to_vec(),
+                }),
+                reasoning_producer: Some(ReasoningProducer {
+                    provider_slug: "anthropic".into(),
+                    model: "claude-4.6".into(),
+                }),
+            }
+        }
+
+        fn summary(id: u64) -> SessionSummary {
+            SessionSummary {
+                session_id: id,
+                title: Some(format!("session {id}")),
+                selected_model: Some("gpt-5.6".into()),
+                reasoning_effort: Some("high".into()),
+                parent_session_id: Some(3),
+                working_dir: Some("/home/user/projects/demo".into()),
+                created_at: 1_700_000_000_000,
+                last_modified: 1_700_000_000_001,
+                turn_count: 12,
+                status: SessionStatus::ToolCall("sh".into()),
+                active_tool_groups: vec![
+                    "core".into(),
+                    "git".into(),
+                    "shell".into(),
+                    "filesystem".into(),
+                ],
+                account_name: Some("default".into()),
+                token_usage: Some(TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    total_tokens: 150,
+                }),
+                context_window: Some(128_000),
+                last_prompt_tokens: Some(100),
+            }
+        }
+
+        let dense_turn = turn(10, 10, 3);
+        let one_turn = turn(1, 1, 0);
+        // A second artifact shape: bare-byte variants (Anthropic/Google/Responses)
+        // have a cheaper wire form than `ChatReasoning`, but must still fit.
+        let mut bare_artifact_turn = turn(10, 10, 3);
+        bare_artifact_turn.reasoning_artifact = Some(ReasoningArtifact::ResponsesItems(
+            b"[{\"type\":\"reasoning\",\"id\":\"re_1\"}]".to_vec(),
+        ));
+        let samples: Vec<(&str, DaemonMessage)> = vec![
+            (
+                "SessionCreated",
+                DaemonMessage::SessionCreated {
+                    session_id: 1,
+                    title: Some("t".into()),
+                    parent_session_id: Some(2),
+                    working_dir: Some("/tmp".into()),
+                    account_name: Some("default".into()),
+                    selected_model: Some("gpt-5.6".into()),
+                    reasoning_effort: Some("high".into()),
+                },
+            ),
+            (
+                "Sessions",
+                DaemonMessage::Sessions {
+                    sessions: (0..20).map(summary).collect(),
+                },
+            ),
+            (
+                "SessionAttached",
+                DaemonMessage::SessionAttached { session_id: 1 },
+            ),
+            (
+                "SessionState",
+                DaemonMessage::SessionState {
+                    session_id: 1,
+                    title: Some("t".into()),
+                    selected_model: Some("gpt-5.6".into()),
+                    parent_session_id: Some(2),
+                    working_dir: Some("/tmp".into()),
+                    turns: std::collections::BTreeMap::from([
+                        (1, dense_turn.clone()),
+                        (2, one_turn.clone()),
+                    ]),
+                    active_tool_groups: vec!["core".into(), "shell".into(), "git".into()],
+                    token_usage: Some(TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        total_tokens: 150,
+                    }),
+                    context_window: Some(128_000),
+                    last_prompt_tokens: Some(100),
+                    status: SessionStatus::Inference,
+                    reasoning_effort: Some("high".into()),
+                    reasoning_capability: Some(ReasoningCapability {
+                        available_effort_levels: vec![
+                            "off".into(),
+                            "low".into(),
+                            "medium".into(),
+                            "high".into(),
+                        ],
+                    }),
+                },
+            ),
+            (
+                "TurnAppended",
+                DaemonMessage::TurnAppended {
+                    session_id: 1,
+                    turn_id: 1,
+                    turn: dense_turn.clone(),
+                },
+            ),
+            (
+                "TurnAppendedBareArtifact",
+                DaemonMessage::TurnAppended {
+                    session_id: 1,
+                    turn_id: 2,
+                    turn: bare_artifact_turn.clone(),
+                },
+            ),
+            (
+                "SessionStatusChanged",
+                DaemonMessage::SessionStatusChanged {
+                    session_id: 1,
+                    status: SessionStatus::ToolCall("sh".into()),
+                    last_modified: 0,
+                },
+            ),
+            (
+                "SessionFailed",
+                DaemonMessage::SessionFailed {
+                    session_id: 1,
+                    operation: "create_session".into(),
+                    error: "some failure happened here".into(),
+                },
+            ),
+            (
+                "Started",
+                DaemonMessage::Started {
+                    session_id: 1,
+                    request_id: 1,
+                    turn_id: 1,
+                    estimated_prompt_tokens: 100,
+                },
+            ),
+            (
+                "ToolCallStarted",
+                DaemonMessage::ToolCallStarted {
+                    session_id: 1,
+                    request_id: 1,
+                    call_id: "call_1".into(),
+                    tool_name: "sh".into(),
+                    arguments_json: r#"{"command":"echo hi"}"#.into(),
+                    invocation_description: "Running command: `echo hi`.".into(),
+                },
+            ),
+            (
+                "ToolCallFinished",
+                DaemonMessage::ToolCallFinished {
+                    session_id: 1,
+                    request_id: 1,
+                    call_id: "call_1".into(),
+                    tool_name: "sh".into(),
+                },
+            ),
+            (
+                "ToolResultChunk",
+                DaemonMessage::ToolResultChunk {
+                    session_id: 1,
+                    request_id: 1,
+                    call_id: "call_1".into(),
+                    data: vec![b'x'; 100],
+                },
+            ),
+            (
+                "ToolCallFailed",
+                DaemonMessage::ToolCallFailed {
+                    session_id: 1,
+                    request_id: 1,
+                    call_id: "call_1".into(),
+                    tool_name: "sh".into(),
+                    error: "command not found".into(),
+                },
+            ),
+            (
+                "TokenUsageUpdate",
+                DaemonMessage::TokenUsageUpdate {
+                    session_id: 1,
+                    token_usage: TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        total_tokens: 150,
+                    },
+                    last_prompt_tokens: Some(100),
+                },
+            ),
+            (
+                "LiveOutputTokenCount",
+                DaemonMessage::LiveOutputTokenCount {
+                    session_id: 1,
+                    request_id: 1,
+                    output_tokens: 42,
+                },
+            ),
+            (
+                "OutputChunk",
+                DaemonMessage::OutputChunk {
+                    session_id: 1,
+                    request_id: 1,
+                    stream: OutputStream::Answer,
+                    data: vec![b'x'; 100],
+                },
+            ),
+            (
+                "Done",
+                DaemonMessage::Done {
+                    session_id: 1,
+                    request_id: 1,
+                    token_usage: Some(TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        total_tokens: 150,
+                    }),
+                    last_prompt_tokens: Some(100),
+                },
+            ),
+            (
+                "Failed",
+                DaemonMessage::Failed {
+                    session_id: 1,
+                    request_id: 1,
+                    error: "x".repeat(100),
+                },
+            ),
+            (
+                "Cancelled",
+                DaemonMessage::Cancelled {
+                    session_id: 1,
+                    request_id: 1,
+                },
+            ),
+            ("Pong", DaemonMessage::Pong),
+            (
+                "Models",
+                DaemonMessage::Models {
+                    models: vec!["gpt-4".into(), "gpt-4o".into(), "gpt-5.6".into()],
+                    selected_model: Some("gpt-5.6".into()),
+                },
+            ),
+            (
+                "ModelsFailed",
+                DaemonMessage::ModelsFailed {
+                    error: "failed to list models".into(),
+                },
+            ),
+            (
+                "ModelsRefreshed",
+                DaemonMessage::ModelsRefreshed {
+                    providers: 208,
+                    models: 1234,
+                    status: RefreshStatus::Updated,
+                },
+            ),
+            (
+                "ModelsRefreshFailed",
+                DaemonMessage::ModelsRefreshFailed {
+                    error: "network error".into(),
+                },
+            ),
+            (
+                "CatalogUpdated",
+                DaemonMessage::CatalogUpdated {
+                    providers: (0..208)
+                        .map(|i| CatalogProvider {
+                            slug: format!("provider-slug-{i}"),
+                            display_name: format!("Provider Display Name {i}"),
+                        })
+                        .collect(),
+                },
+            ),
+            (
+                "ModelSelected",
+                DaemonMessage::ModelSelected {
+                    session_id: 1,
+                    model: "gpt-5.6".into(),
+                    reasoning_capability: Some(ReasoningCapability {
+                        available_effort_levels: vec![
+                            "off".into(),
+                            "low".into(),
+                            "medium".into(),
+                            "high".into(),
+                        ],
+                    }),
+                },
+            ),
+            (
+                "ModelSelectionFailed",
+                DaemonMessage::ModelSelectionFailed {
+                    session_id: 1,
+                    model: "gpt-5.6".into(),
+                    error: "model not found".into(),
+                },
+            ),
+            ("Unlocked", DaemonMessage::Unlocked),
+            ("Locked", DaemonMessage::Locked),
+            (
+                "LockedError",
+                DaemonMessage::LockedError {
+                    error: "wrong password".into(),
+                },
+            ),
+            (
+                "CredentialAdded",
+                DaemonMessage::CredentialAdded {
+                    service: "openai".into(),
+                },
+            ),
+            (
+                "CredentialAddFailed",
+                DaemonMessage::CredentialAddFailed {
+                    service: "openai".into(),
+                    error: "already exists".into(),
+                },
+            ),
+            (
+                "CredentialRemoved",
+                DaemonMessage::CredentialRemoved {
+                    service: "openai".into(),
+                },
+            ),
+            (
+                "CredentialRemoveFailed",
+                DaemonMessage::CredentialRemoveFailed {
+                    service: "openai".into(),
+                    error: "not found".into(),
+                },
+            ),
+            (
+                "SessionDeleted",
+                DaemonMessage::SessionDeleted { session_id: 1 },
+            ),
+            (
+                "SessionDeleteFailed",
+                DaemonMessage::SessionDeleteFailed {
+                    session_id: 1,
+                    error: "db error".into(),
+                },
+            ),
+            (
+                "TurnsUndone",
+                DaemonMessage::TurnsUndone {
+                    session_id: 1,
+                    turn_ids: vec![1, 2, 3, 4, 5],
+                },
+            ),
+            (
+                "TurnsRedone",
+                DaemonMessage::TurnsRedone {
+                    session_id: 1,
+                    turns: std::collections::BTreeMap::from([(1, dense_turn), (2, one_turn)]),
+                },
+            ),
+            (
+                "Credential",
+                DaemonMessage::Credential {
+                    service: "openai".into(),
+                    key: Some("sk-123".into()),
+                },
+            ),
+            (
+                "AccountAdded",
+                DaemonMessage::AccountAdded {
+                    name: "default".into(),
+                },
+            ),
+            (
+                "AccountAddFailed",
+                DaemonMessage::AccountAddFailed {
+                    name: "default".into(),
+                    error: "invalid provider".into(),
+                },
+            ),
+            (
+                "AccountRemoved",
+                DaemonMessage::AccountRemoved {
+                    name: "default".into(),
+                },
+            ),
+            (
+                "AccountRemoveFailed",
+                DaemonMessage::AccountRemoveFailed {
+                    name: "default".into(),
+                    error: "not found".into(),
+                },
+            ),
+            (
+                "Accounts",
+                DaemonMessage::Accounts {
+                    accounts: (0..10)
+                        .map(|i| AccountInfo {
+                            name: format!("account-{i}"),
+                            provider: "openai".into(),
+                            has_credential: i % 2 == 0,
+                        })
+                        .collect(),
+                },
+            ),
+            (
+                "AccountListFailed",
+                DaemonMessage::AccountListFailed {
+                    error: "failed to list accounts".into(),
+                },
+            ),
+            (
+                "SessionAccountSet",
+                DaemonMessage::SessionAccountSet {
+                    session_id: 1,
+                    account: "default".into(),
+                },
+            ),
+            (
+                "ContextWindowResolved",
+                DaemonMessage::ContextWindowResolved {
+                    session_id: 1,
+                    context_window: 128_000,
+                },
+            ),
+            (
+                "SessionWorkingDirSet",
+                DaemonMessage::SessionWorkingDirSet {
+                    session_id: 1,
+                    path: Some("/tmp".into()),
+                },
+            ),
+            (
+                "SessionTitleSet",
+                DaemonMessage::SessionTitleSet {
+                    session_id: 1,
+                    title: "hello".into(),
+                },
+            ),
+            (
+                "ReasoningEffortSet",
+                DaemonMessage::ReasoningEffortSet {
+                    session_id: 1,
+                    effort: "high".into(),
+                },
+            ),
+            (
+                "ReasoningEffortSetFailed",
+                DaemonMessage::ReasoningEffortSetFailed {
+                    session_id: 1,
+                    effort: "high".into(),
+                    error: "model does not support it".into(),
+                },
+            ),
+            ("ShuttingDown", DaemonMessage::ShuttingDown),
+            ("Evicted", DaemonMessage::Evicted),
+        ];
+
+        let mut checked = 0usize;
+        for (name, msg) in &samples {
+            let frame = crate::encode_frame(msg).expect("encode");
+            // The 4-byte BE length prefix precedes the payload; the estimate
+            // must cover the payload itself.
+            let payload = frame.len() - 4;
+            let est = msg.approx_wire_size();
+            assert!(
+                est >= payload,
+                "approx_wire_size ({est}) UNDER-estimates the {payload}-byte encoded payload by {} for {name}: {msg:?}",
+                payload - est
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, samples.len(), "every sample must be checked");
     }
 }

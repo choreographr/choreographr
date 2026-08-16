@@ -29,6 +29,22 @@
 //! most one message's worth of bytes before the eviction command is
 //! processed.  That is deliberate — an exact hard cutoff would require a
 //! blocking or dropping send, which is exactly what this design eliminates.
+//!
+//! The byte counters stay BALANCED on every path, to within one bounded race:
+//! the writer thread decrements on each dequeue and, when it stops early
+//! (`Evicted`/`ShuttingDown`/send error), drains whatever is still queued and
+//! decrements that too; every enqueue path ([`SubscriberSink::enqueue`],
+//! [`SubscriberSink::send_unchecked`], the connection thread's
+//! `send_to_writer`) self-corrects both counters when the send fails on a
+//! dead receiver. The one residual race is a straggler enqueued in the
+//! microsecond window between the writer's last drain pass and its receiver
+//! being dropped: that `send` SUCCEEDS (the receiver is still alive), the
+//! message is never dequeued, and its bytes stay in the daemon-wide counter
+//! forever. The leak is bounded to at most one message's bytes per teardown
+//! event (a producer that sends after the receiver is gone self-corrects), so
+//! it is acceptable — but it is real, which is why the invariant is "every
+//! increment is matched by a decrement except the bounded exit-window
+//! straggler", not a claim of exactness.
 
 use choreo_proto::DaemonMessage;
 use crossbeam_channel::Sender;
@@ -70,53 +86,67 @@ impl SubscriberSink {
         }
     }
 
+    /// Shared enqueue-with-accounting core used by [`Self::enqueue`] and
+    /// [`Self::send_unchecked`] (and by the connection thread's
+    /// `send_to_writer`, which routes replies through the same sink).
+    ///
+    /// The two counters are bumped BEFORE the send so that every message that
+    /// ever reaches the writer thread's dequeue decrement was previously
+    /// counted — the writer's per-dequeue `fetch_sub` is the only counterpart,
+    /// so the accounting stays balanced. On a dead receiver (writer thread
+    /// already exited, so nothing will ever decrement these bytes) BOTH
+    /// counters are restored: the per-client one dies with the sink anyway,
+    /// but `global` is shared and read by every other enqueue, so leaving it
+    /// incremented would slowly leak the daemon-wide budget and could
+    /// eventually trigger spurious evictions.
+    ///
+    /// Returns the post-add `(client, global)` byte totals when the message
+    /// was accepted, or `None` when the receiver was gone.
+    pub(crate) fn send_accounted(
+        &self,
+        msg: &DaemonMessage,
+        global: &AtomicUsize,
+    ) -> Option<(usize, usize)> {
+        let size = msg.approx_wire_size();
+        let new_total = global.fetch_add(size, Ordering::Relaxed) + size;
+        let new_client = self.bytes_in_flight.fetch_add(size, Ordering::Relaxed) + size;
+        if self.tx.send(msg.clone()).is_ok() {
+            Some((new_client, new_total))
+        } else {
+            // Receiver gone — restore both counters (see the doc comment).
+            self.bytes_in_flight.fetch_sub(size, Ordering::Relaxed);
+            global.fetch_sub(size, Ordering::Relaxed);
+            None
+        }
+    }
+
     /// Enqueue `msg` into this subscriber's queue and account its bytes.
     ///
     /// Never blocks and never drops: the channel is unbounded, so delivery
     /// is guaranteed for as long as the receiver is alive.  The return value
     /// only tells the caller whether an eviction is warranted AFTER the
     /// message has been enqueued.
-    ///
-    /// The two counters are bumped before the send so that every message
-    /// that ever reaches the writer thread's dequeue decrement was
-    /// previously counted — the writer's per-dequeue `fetch_sub` is the only
-    /// counterpart, so the accounting stays balanced.
     pub fn enqueue(
         &self,
         msg: &DaemonMessage,
         limits: &LagLimits,
         global: &AtomicUsize,
     ) -> EnqueueOutcome {
-        let size = msg.approx_wire_size();
-        let new_total = global.fetch_add(size, Ordering::Relaxed) + size;
-        let new_client = self.bytes_in_flight.fetch_add(size, Ordering::Relaxed) + size;
+        let Some((new_client, new_total)) = self.send_accounted(msg, global) else {
+            return EnqueueOutcome::Disconnected;
+        };
 
         // Classify against the soft thresholds.  The message is STILL
-        // enqueued below regardless — the threshold only decides whether the
+        // enqueued regardless — the threshold only decides whether the
         // caller must evict this client, never whether delivery happens
         // (lossless).  `ClientOverLag` takes precedence over the global
         // budget: the client that crossed its own cap is the one to shed.
-        let outcome = if new_client > limits.per_client_cap {
+        if new_client > limits.per_client_cap {
             EnqueueOutcome::ClientOverLag
         } else if new_total > limits.global_budget {
             EnqueueOutcome::GlobalOverBudget
         } else {
             EnqueueOutcome::Delivered
-        };
-
-        match self.tx.send(msg.clone()) {
-            Ok(()) => outcome,
-            Err(_) => {
-                // Receiver gone — the writer thread has already exited, so
-                // nothing will ever decrement these bytes. Self-correct BOTH
-                // counters: the per-client one dies with the sink anyway, but
-                // `global` is shared and read by every other enqueue, so
-                // leaving it incremented would slowly leak the daemon-wide
-                // budget and could eventually trigger spurious evictions.
-                self.bytes_in_flight.fetch_sub(size, Ordering::Relaxed);
-                global.fetch_sub(size, Ordering::Relaxed);
-                EnqueueOutcome::Disconnected
-            }
         }
     }
 
@@ -131,18 +161,7 @@ impl SubscriberSink {
     /// counters would underflow — and a failed send (receiver gone) is
     /// self-corrected here for the same reason as in [`Self::enqueue`].
     pub fn send_unchecked(&self, msg: &DaemonMessage, global: &AtomicUsize) -> bool {
-        let size = msg.approx_wire_size();
-        self.bytes_in_flight.fetch_add(size, Ordering::Relaxed);
-        global.fetch_add(size, Ordering::Relaxed);
-        if self.tx.send(msg.clone()).is_ok() {
-            true
-        } else {
-            // Receiver gone — no writer thread will ever decrement this;
-            // restore both counters (see `enqueue`).
-            self.bytes_in_flight.fetch_sub(size, Ordering::Relaxed);
-            global.fetch_sub(size, Ordering::Relaxed);
-            false
-        }
+        self.send_accounted(msg, global).is_some()
     }
 }
 

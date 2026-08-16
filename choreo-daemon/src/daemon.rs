@@ -598,24 +598,22 @@ impl DaemonState {
     /// blocking the command loop), and a subscriber whose queue crossed the
     /// lag limits is evicted (disconnected) so the backlog stays bounded.
     fn broadcast(&mut self, msg: DaemonMessage) {
-        let mut evict_clients = Vec::new();
-        let mut evict_largest = false;
-        self.summary_subscribers.retain(|client_id, sink| {
-            match sink.enqueue(&msg, &self.lag_limits, &self.global_lag) {
-                EnqueueOutcome::Delivered => true,
-                EnqueueOutcome::Disconnected => false,
-                EnqueueOutcome::ClientOverLag => {
-                    evict_clients.push(*client_id);
-                    true
-                }
-                EnqueueOutcome::GlobalOverBudget => {
-                    evict_largest = true;
-                    true
-                }
-            }
-        });
-        // Process evictions AFTER the retain loop (mutating `self` inside the
-        // closure would fight the borrow of `self.summary_subscribers`).
+        let (evict_clients, evict_largest) = fan_out_evicting(
+            &mut self.summary_subscribers,
+            &msg,
+            &self.lag_limits,
+            &self.global_lag,
+            |_| false, // summary subscribers are never duplicate-suppressed
+        );
+        self.finish_evictions(evict_clients, evict_largest);
+    }
+
+    /// Process the eviction work collected by [`fan_out_evicting`]:
+    /// disconnect each over-lag client, and (when the daemon-wide budget was
+    /// crossed) disconnect the currently most-lagging client. Runs AFTER the
+    /// retain loop because eviction mutates `self` (removing sinks) while
+    /// the loop still borrows the subscriber map.
+    fn finish_evictions(&mut self, evict_clients: Vec<u64>, evict_largest: bool) {
         for client_id in evict_clients {
             self.handle_evict_client(client_id);
         }
@@ -1371,7 +1369,7 @@ impl DaemonState {
         if !self.client_writers.contains_key(&client_id) {
             return;
         }
-        info!(
+        warn!(
             "evicting lagging client: client_id={}, backlog_bytes={}",
             client_id,
             self.client_writers
@@ -1385,15 +1383,7 @@ impl DaemonState {
         // broadcast — the evicted client's queued bytes should be released
         // as soon as possible, and a session must not keep streaming to a
         // client that is being torn down.
-        if let Some(sessions) = self.client_subscribed_sessions.remove(&client_id) {
-            for session_id in &sessions {
-                if let Some(entry) = self.active_sessions.get(session_id) {
-                    let _ = entry
-                        .cmd_tx
-                        .send(SessionCommand::RemoveSubscriber { client_id });
-                }
-            }
-        }
+        self.remove_client_from_sessions(client_id);
         // Best-effort advisory: a healthy writer flushes it and closes its
         // own socket; a wedged writer never sees it (the write timeout
         // reaps the connection instead). Enqueue BEFORE dropping the sink,
@@ -1469,6 +1459,21 @@ impl DaemonState {
         // Promptly remove the client from every session it was attached to
         // (same as eviction), so a session does not keep streaming to a dead
         // client's sink until the next broadcast detects the disconnect.
+        self.remove_client_from_sessions(client_id);
+        // Drop the registered writer channel so this connection's writer
+        // thread can exit: with the connection-local sender (dropped by
+        // cleanup_client) gone too, writer_rx disconnects and the thread's
+        // for-loop terminates.
+        self.client_writers.remove(&client_id);
+    }
+
+    /// Remove `client_id` from every session's subscriber map via
+    /// `RemoveSubscriber` commands, and drop its session-membership tracking.
+    /// Used when a client is being torn down (lag-evicted or fully
+    /// disconnected) so sessions stop streaming to it promptly instead of
+    /// waiting for the next broadcast to notice the dead sink; releasing the
+    /// queued bytes sooner also relieves lag-budget pressure earlier.
+    fn remove_client_from_sessions(&mut self, client_id: u64) {
         if let Some(sessions) = self.client_subscribed_sessions.remove(&client_id) {
             for session_id in &sessions {
                 if let Some(entry) = self.active_sessions.get(session_id) {
@@ -1478,11 +1483,6 @@ impl DaemonState {
                 }
             }
         }
-        // Drop the registered writer channel so this connection's writer
-        // thread can exit: with the connection-local sender (dropped by
-        // cleanup_client) gone too, writer_rx disconnects and the thread's
-        // for-loop terminates.
-        self.client_writers.remove(&client_id);
     }
 
     /// Track that `client_id` is a direct subscriber of `session_id`.
@@ -1527,39 +1527,26 @@ impl DaemonState {
     /// the per-session subscriber path, avoiding duplicate delivery.
     fn handle_broadcast_activity(&mut self, msg: DaemonMessage) {
         let origin_session_id = msg.session_id();
-        let mut evict_clients = Vec::new();
-        let mut evict_largest = false;
-        self.activity_subscribers.retain(|client_id, sink| {
-            // Skip if this client is also a direct subscriber of the
-            // session that originated this message — they'll receive it
-            // through the per-session broadcast path.
-            if let Some(ref sid) = origin_session_id
-                && let Some(sessions) = self.client_subscribed_sessions.get(client_id)
-                && sessions.contains(sid)
-            {
-                return true;
-            }
-            match sink.enqueue(&msg, &self.lag_limits, &self.global_lag) {
-                EnqueueOutcome::Delivered => true,
-                EnqueueOutcome::Disconnected => false,
-                EnqueueOutcome::ClientOverLag => {
-                    evict_clients.push(*client_id);
-                    true
+        let (evict_clients, evict_largest) = fan_out_evicting(
+            &mut self.activity_subscribers,
+            &msg,
+            &self.lag_limits,
+            &self.global_lag,
+            |client_id| {
+                // Skip if this client is also a direct subscriber of the
+                // session that originated this message — they'll receive it
+                // through the per-session broadcast path, avoiding duplicate
+                // delivery.
+                if let Some(ref sid) = origin_session_id
+                    && let Some(sessions) = self.client_subscribed_sessions.get(&client_id)
+                    && sessions.contains(sid)
+                {
+                    return true;
                 }
-                EnqueueOutcome::GlobalOverBudget => {
-                    evict_largest = true;
-                    true
-                }
-            }
-        });
-        // Process evictions AFTER the retain loop (mutating `self` inside the
-        // closure would fight the borrow of `self.activity_subscribers`).
-        for client_id in evict_clients {
-            self.handle_evict_client(client_id);
-        }
-        if evict_largest {
-            self.handle_evict_largest_lagging();
-        }
+                false
+            },
+        );
+        self.finish_evictions(evict_clients, evict_largest);
     }
 
     /// Handle a cancel request from a client.  Sends `SessionCommand::Cancel`
@@ -2096,6 +2083,48 @@ fn fetch_and_cache_models(
             );
         }
     }
+}
+
+/// Fan `msg` out to `subscribers` under the shared lossless + lag-eviction
+/// policy: every message is enqueued into each subscriber's UNBOUNDED queue
+/// (never dropped, never blocking the caller), and the outcome is classified
+/// into the clients to evict (`ClientOverLag`) and whether the daemon-wide
+/// budget was crossed (`GlobalOverBudget`). `should_skip` lets a caller
+/// exclude specific subscribers from delivery without evicting them (the
+/// activity broadcast's duplicate-suppression for clients that are also
+/// direct session subscribers). Shared by the summary (`DaemonState::broadcast`)
+/// and activity (`handle_broadcast_activity`) fan-outs so the eviction-
+/// collection logic lives in exactly one place; the caller performs the
+/// actual evictions via [`DaemonState::finish_evictions`] AFTER this returns
+/// (mutating the daemon inside the retain closure would fight the borrow of
+/// the subscriber map).
+fn fan_out_evicting(
+    subscribers: &mut HashMap<u64, SubscriberSink>,
+    msg: &DaemonMessage,
+    lag_limits: &LagLimits,
+    global: &AtomicUsize,
+    mut should_skip: impl FnMut(u64) -> bool,
+) -> (Vec<u64>, bool) {
+    let mut evict_clients = Vec::new();
+    let mut evict_largest = false;
+    subscribers.retain(|client_id, sink| {
+        if should_skip(*client_id) {
+            return true;
+        }
+        match sink.enqueue(msg, lag_limits, global) {
+            EnqueueOutcome::Delivered => true,
+            EnqueueOutcome::Disconnected => false,
+            EnqueueOutcome::ClientOverLag => {
+                evict_clients.push(*client_id);
+                true
+            }
+            EnqueueOutcome::GlobalOverBudget => {
+                evict_largest = true;
+                true
+            }
+        }
+    });
+    (evict_clients, evict_largest)
 }
 
 /// Build the slug + display-name pair list for a `CatalogUpdated` broadcast

@@ -32,6 +32,8 @@ The client can either run on the same computer as the server agent (via local so
 
 Client/server communication is encoded in [MessagePack](https://msgpack.org/) in *named* mode — a self-describing, compact binary format with broad language support (struct field names and enum variant names travel on the wire, so the format is evolution-safe for future mobile/web/third-party clients). [Postcard](https://postcard.jamesmunns.com/) remains only on internal Rust-only channels: the RISC-V VM↔host protocol and encrypted credential storage.
 
+Delivery is **lossless**: the daemon never drops a broadcast message. Each connected client gets an unbounded queue drained by its own writer thread, so a slow client can never stall a session or the daemon loop — memory is bounded instead by **lag-based eviction** (per-client 64 MiB cap, 512 MiB daemon-wide). A client that falls too far behind receives a best-effort `Evicted` advisory and is disconnected; it reconciles on reconnect via the attach/snapshot path. Final turns ride a single `TurnAppended` delivery (protocol v3), so the live stream and the recorded turn can never diverge.
+
 Currently the primary client is **`choreo-tui`** - a fullscreen terminal UI.
 
 Other clients being developed: 

@@ -135,10 +135,18 @@ fn writer_thread<W: ConnectionWriter>(
     // forever and, accumulated across evictions, permanently exhaust the
     // global budget — cascading evictions of healthy clients). The drain is
     // non-blocking on purpose: the writer must exit promptly so the receiver
-    // drops and any producer that enqueues a straggler AFTER this drain gets
-    // a failed send, which it self-corrects (see `SubscriberSink::enqueue` /
-    // `send_unchecked` / `send_to_writer`).
-    while let Ok(msg) = rx.try_recv() {
+    // drops and any producer that enqueues after this point gets a failed
+    // send, which it self-corrects (see [`SubscriberSink::send_accounted`]).
+    //
+    // The one residual race, bounded and accepted: a producer whose `send`
+    // lands in the microsecond window between this drain's last pass and the
+    // receiver being dropped (at function return) SUCCEEDS — the receiver is
+    // still alive — and that message is never dequeued, so its bytes stay in
+    // the daemon-wide counter forever. It is at most one message's bytes per
+    // teardown event (a producer that sends after the receiver is gone
+    // self-corrects), so the accounting stays honest to within that tiny,
+    // event-bounded slack.
+    for msg in rx.try_iter() {
         let size = msg.approx_wire_size();
         bytes.fetch_sub(size, Ordering::Relaxed);
         global.fetch_sub(size, Ordering::Relaxed);
@@ -183,30 +191,18 @@ pub(crate) fn register_client_writer(
 /// Send a reply to a client's writer channel.
 ///
 /// Replies ride the same unbounded channel as broadcasts, so they MUST keep
-/// the lag counters consistent: the writer thread decrements the per-client
-/// and daemon-wide counters on every dequeue, so every enqueue — broadcast or
-/// reply — increments them first. The lag limits are NOT enforced here: a
-/// reply is a request/response contract that must never be dropped (lossless
-/// for replies was already true — a blocking send never dropped, it just
-/// blocked; with an unbounded channel it can no longer block either), and
-/// replies are small and infrequent next to broadcast streams, so they cannot
-/// meaningfully inflate a lagging client's backlog.
+/// the lag counters consistent: `send_accounted` increments both before the
+/// send (the writer thread decrements them on every dequeue) and self-
+/// corrects both if the receiver is gone. The lag limits are NOT enforced
+/// here: a reply is a request/response contract that must never be dropped
+/// (lossless for replies was already true — a blocking send never dropped,
+/// it just blocked; with an unbounded channel it can no longer block
+/// either), and replies are small and infrequent next to broadcast streams,
+/// so they cannot meaningfully inflate a lagging client's backlog. A dropped
+/// reply on a dead receiver is fine: the connection is being torn down
+/// anyway.
 fn send_to_writer(ctx: &ClientCtx, msg: DaemonMessage) {
-    let size = msg.approx_wire_size();
-    ctx.writer
-        .bytes_in_flight
-        .fetch_add(size, Ordering::Relaxed);
-    ctx.global_lag.fetch_add(size, Ordering::Relaxed);
-    if ctx.writer.tx.send(msg).is_err() {
-        // Receiver gone — the writer thread has exited, so nothing will ever
-        // decrement these bytes. Self-correct BOTH counters: the per-client
-        // one dies with the sink, but the daemon-wide counter is shared and
-        // must not leak (same invariant as `SubscriberSink::enqueue`).
-        ctx.writer
-            .bytes_in_flight
-            .fetch_sub(size, Ordering::Relaxed);
-        ctx.global_lag.fetch_sub(size, Ordering::Relaxed);
-    }
+    ctx.writer.send_accounted(&msg, ctx.global_lag);
 }
 
 /// Shared per-client context passed through the dispatch and handler functions.
