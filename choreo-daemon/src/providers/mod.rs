@@ -195,6 +195,15 @@ impl InferenceProvider {
 }
 
 #[cfg(test)]
+// Tests in this module read the process-wide `PROVIDER_CATALOG` ArcSwap
+// (`resolve_context_window` falls back to `lookup_context_window`), which the
+// daemon catalog-swap tests (`daemon.rs`, `#[serial(catalog)]`) mutate
+// concurrently. Under libtest's in-process parallel execution a swap can land
+// mid-assertion and the lookup resolves from the wrong catalog (nextest
+// isolates each test in its own process, so this only bites the `cargo test`
+// fallback). Sharing the `catalog` serial key with every catalog
+// reader/mutator in this binary serializes them against each other.
+#[serial_test::serial(catalog)]
 mod tests {
     use super::*;
     use crate::accounts::AccountConfig;

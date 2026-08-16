@@ -2382,6 +2382,17 @@ pub const REQUEST_IMAGE_WIDTH: u32 = 640;
 pub const REQUEST_IMAGE_HEIGHT: u32 = 640;
 
 #[cfg(test)]
+// Every test in this module reads the process-wide `PROVIDER_CATALOG`
+// ArcSwap (via `build_chat_request_messages`/`initial_prev_resp_id`/
+// `warn_on_missing_reasoning_artifacts` → `model_reasoning_passback`, and
+// `resolve_reasoning_effort` → `model_reasoning_capability`), and the daemon
+// catalog-swap tests (`daemon.rs`, `#[serial(catalog)]`) mutate that global
+// concurrently. Under libtest's in-process parallel execution a swap can land
+// mid-assertion and the passback policy resolves from the wrong catalog
+// (nextest isolates each test in its own process, so this only bites the
+// `cargo test` fallback). Sharing the `catalog` serial key with every catalog
+// reader/mutator in this binary serializes them against each other.
+#[serial_test::serial(catalog)]
 mod tests {
     use super::*;
     use crate::daemon::DaemonCommand;

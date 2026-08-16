@@ -3499,6 +3499,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_register_activity_subscriber_adds_to_map() {
         let (mut state, _rx) = make_daemon_state();
         let (tx, _) = test_sink();
@@ -3512,6 +3513,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_register_activity_subscriber_replaces_existing() {
         let (mut state, _rx) = make_daemon_state();
         let (tx1, _) = test_sink();
@@ -3531,6 +3533,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_unregister_activity_subscriber_preserves_session_tracking() {
         let (mut state, _rx) = make_daemon_state();
         let (tx, _) = test_sink();
@@ -3558,6 +3561,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_client_disconnected_clears_all_tracking() {
         let (mut state, _rx) = make_daemon_state();
         let (tx, _) = test_sink();
@@ -3731,6 +3735,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_broadcast_activity_sends_to_subscriber() {
         let (mut state, _rx) = make_daemon_state();
         let (tx, rx) = test_sink();
@@ -3756,6 +3761,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_broadcast_activity_skips_dedup_for_session_subscriber() {
         let (mut state, _rx) = make_daemon_state();
         // Use a sync_channel with capacity 1 so we can detect if a message
@@ -3794,6 +3800,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_broadcast_activity_no_dedup_for_different_session() {
         let (mut state, _rx) = make_daemon_state();
         let (tx, rx) = test_sink();
@@ -3824,6 +3831,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_broadcast_activity_sends_when_no_session_id() {
         // Messages without a session_id (Models, Pong, etc.) should always
         // be delivered to all activity subscribers.
@@ -3847,6 +3855,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_broadcast_activity_removes_disconnected_subscriber() {
         let (mut state, _rx) = make_daemon_state();
         // Use a sync_channel so we can drop the receiver
@@ -3873,6 +3882,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_broadcast_activity_evicts_over_lag_subscriber() {
         // Lossless + lag-eviction: a subscriber whose queue crosses the lag
         // cap still receives the crossing message (never dropped), but is
@@ -3920,6 +3930,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
     fn handle_broadcast_activity_handles_multiple_clients() {
         let (mut state, _rx) = make_daemon_state();
         let (tx1, rx1) = test_sink();
