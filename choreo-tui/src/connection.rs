@@ -1301,7 +1301,7 @@ fn handle_chat_event(
                     selection::update_selection(app, mouse.row, mouse.column);
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
-                    let text = selection::finish_selection(app, mouse.row, mouse.column);
+                    let text = selection::finish_selection(app);
                     if let Some(text) = text {
                         if clipboard::copy_to_clipboard(&text) {
                             tracing::info!(
@@ -1321,19 +1321,17 @@ fn handle_chat_event(
                         }
                     }
                 }
-                // A scroll wheel mid-gesture abandons the selection AND
-                // scrolls — terminal-native behavior (scrolling clears the
-                // selection, the wheel input still lands).  The delta is
-                // accumulated exactly like the history-box scroll arm below,
-                // so the per-frame scroll consumer applies it in batch;
-                // without this the event would be swallowed by the gesture
-                // and the user's wheel input would vanish.
+                // A scroll wheel mid-gesture scrolls AND keeps the selection:
+                // the gesture is stored in content coordinates, so the
+                // anchor/head stay pinned to the text and the draw-time
+                // highlight re-evaluates against the new scroll (terminal-
+                // native selection follows the content).  The delta
+                // accumulates exactly like the history-box scroll arm below,
+                // so the per-frame scroll consumer applies it in batch.
                 MouseEventKind::ScrollUp => {
-                    selection::cancel_selection(app);
                     app.scroll_accumulator = app.scroll_accumulator.saturating_add(1);
                 }
                 MouseEventKind::ScrollDown => {
-                    selection::cancel_selection(app);
                     app.scroll_accumulator = app.scroll_accumulator.saturating_sub(1);
                 }
                 _ => {
@@ -3345,7 +3343,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_scroll_during_selection_cancels_it_and_scrolls() {
+    fn mouse_scroll_during_selection_keeps_selection_and_scrolls() {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
@@ -3366,16 +3364,18 @@ mod tests {
             3,
             start_row + 1,
         );
-        // A scroll wheel mid-gesture abandons the selection (matches
-        // terminal-native selection, where scrolling clears the selection)
-        // AND the wheel input still lands: the delta is accumulated like any
-        // other scroll event, not swallowed by the gesture.
+        // A scroll wheel mid-gesture keeps the selection (it is anchored to
+        // the text in content coordinates, so it scrolls with the content)
+        // AND the wheel input lands: the delta accumulates like any other
+        // scroll event, not swallowed by the gesture.
         send_mouse(&mut app, MouseEventKind::ScrollDown, 0, start_row);
-        assert!(app.text_selection.is_none(), "scroll cancels the selection");
-        assert!(app.status.is_none(), "cancelled selection copies nothing");
+        assert!(
+            app.text_selection.is_some_and(|s| s.active),
+            "scrolling must keep the active selection"
+        );
         assert_eq!(
             app.scroll_accumulator, -1,
-            "the wheel scroll must still accumulate after cancelling"
+            "the wheel scroll must still accumulate during the gesture"
         );
     }
 

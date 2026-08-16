@@ -7,22 +7,25 @@
 //! text to the clipboard itself.  This mirrors opencode's select-to-copy.
 //!
 //! Scope (v1): the chat *history pane* only — the input box and overlay
-//! popups are out.  The selection is stored in *viewport* coordinates (row in
-//! `[0, viewport height)`, column in `[0, viewport width)`), the same space
-//! mouse events arrive in, and resolved to content at extraction/render time
-//! through the existing `find_turn_at_row` + render-cache machinery — the
-//! exact inverse of the click hit-testing the TUI already does.  Resolving
-//! fresh at gesture end also means streaming that lands mid-drag cannot
-//! corrupt the result: each row maps to whatever content is current then.
+//! popups are out.  The selection is stored in *content* coordinates — a
+//! global content line in `[0, total history height)` plus a viewport column
+//! — NOT screen coordinates: mouse events arrive in viewport space, so each
+//! is mapped to the content it covers the moment it is processed
+//! ([`screen_to_content`], the exact inverse of the click hit-testing the
+//! TUI already does).  Storing content coordinates is what lets the
+//! selection survive scrolling: the anchor and head stay pinned to the text
+//! they were placed on, and the draw-time highlight re-evaluates against the
+//! current scroll every frame, so what is highlighted is exactly what gets
+//! copied.  Resolving fresh at gesture end also means streaming that lands
+//! mid-drag cannot corrupt the result: each row maps to whatever content is
+//! current then.
 //!
 //! Coordinates: the history pane's lines are pre-wrapped at `content_width`
 //! (viewport width − 9) and drawn in a non-wrapping `Paragraph`, so every
 //! semantic line occupies exactly one visual row; the code still walks the
 //! cached `visual_offsets` so a hypothetical multi-row line maps correctly.
 
-use crate::state::{
-    App, RenderedTurn, SessionDisplayState, find_turn_at_row, grapheme_offset_at_column,
-};
+use crate::state::{App, RenderedTurn, SessionDisplayState, grapheme_offset_at_column};
 use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -39,27 +42,50 @@ pub(crate) const SELECTION_BG: Color = Color::Rgb(0x2F, 0x5F, 0xAF);
 
 /// An in-progress mouse text selection over the history pane.
 ///
-/// Both endpoints are viewport-relative screen coordinates (row ∈ `[0,
-/// viewport height)`, column ∈ `[0, viewport width)`).  `active` flips to
-/// true once the drag has actually moved — that is what distinguishes a
-/// selection gesture from a plain click (a click still performs its existing
-/// toggle/cursor actions; only a real drag copies text on release).
+/// Both endpoints are *content* coordinates — a global content line (row in
+/// `[0, total history height)`, stable across scrolling) plus a viewport
+/// display column — so the selection stays pinned to the text it was drawn
+/// over when the user scrolls mid-gesture.  `active` flips to true once the
+/// drag has actually moved — that is what distinguishes a selection gesture
+/// from a plain click (a click still performs its existing toggle/cursor
+/// actions; only a real drag copies text on release).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TextSelection {
-    /// Mouse-down position.
-    pub anchor: (u16, u16),
-    /// Live drag head; updated on every drag event.
-    pub head: (u16, u16),
+    /// Mouse-down position: (content line, viewport column).
+    pub anchor: (usize, u16),
+    /// Live drag head: (content line, viewport column); updated on every
+    /// drag event.
+    pub head: (usize, u16),
     /// True once `head != anchor` (a real selection, not a click).
     pub active: bool,
+}
+
+/// Map a viewport position to content space: the global content line under
+/// that screen row, plus the viewport column unchanged.
+///
+/// The exact inverse of `find_turn_at_row`'s formula (content line = screen
+/// row + total − scroll − vh), clamped into the valid content range: a row
+/// in the blank band above short bottom-anchored content resolves to content
+/// line 0, and a row at/below the last content line resolves to the last
+/// line (a drag past the pane edge selects through the bottom).  The column
+/// is left as-is — it is resolved against the line's content range at
+/// highlight/extraction time.
+fn screen_to_content(app: &App, row: u16, column: u16) -> (usize, u16) {
+    let vh = app.history_viewport.height as isize;
+    let total = app.total_history_height() as isize;
+    let scroll = app.effective_scroll() as isize;
+    let last_line = (total - 1).max(0);
+    let content_line = (row as isize + total - scroll - vh).clamp(0, last_line);
+    (content_line as usize, column)
 }
 
 /// Arm a potential selection at the mouse-down position.  A selection only
 /// becomes real (highlighted, copied) once the drag moves.
 pub(crate) fn start_selection(app: &mut App, row: u16, column: u16) {
+    let anchor = screen_to_content(app, row, column);
     app.text_selection = Some(TextSelection {
-        anchor: (row, column),
-        head: (row, column),
+        anchor,
+        head: anchor,
         active: false,
     });
 }
@@ -72,22 +98,25 @@ pub(crate) fn is_selecting(app: &App) -> bool {
 
 /// Extend the selection to the current drag position.
 pub(crate) fn update_selection(app: &mut App, row: u16, column: u16) {
+    // Resolve the head before the mutable borrow so `screen_to_content`
+    // (which reads app state) and the `text_selection` write don't overlap.
+    let head = screen_to_content(app, row, column);
     if let Some(sel) = &mut app.text_selection {
-        sel.head = (row, column);
+        sel.head = head;
         if sel.head != sel.anchor {
             sel.active = true;
         }
     }
 }
 
-/// Abandon the in-progress selection (scroll, right-click, page switch…).
+/// Abandon the in-progress selection (right-click, page switch…).
 pub(crate) fn cancel_selection(app: &mut App) {
     app.text_selection = None;
 }
 
 /// The normalized (start, end) endpoints of the selection, or `None` when
 /// there is no active selection (including a plain click that never dragged).
-pub(crate) fn selection_range(app: &App) -> Option<((u16, u16), (u16, u16))> {
+pub(crate) fn selection_range(app: &App) -> Option<((usize, u16), (usize, u16))> {
     let sel = app.text_selection?;
     if !sel.active {
         return None;
@@ -95,10 +124,10 @@ pub(crate) fn selection_range(app: &App) -> Option<((u16, u16), (u16, u16))> {
     Some(normalize(sel.anchor, sel.head))
 }
 
-/// Order two endpoints so `start <= end` in (row, column) space, making a
-/// bottom-to-top drag (or a right-to-left drag on the end row) select the
-/// same rectangle as the equivalent top-to-bottom one.
-fn normalize(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+/// Order two endpoints so `start <= end` in (content line, column) space,
+/// making a bottom-to-top drag (or a right-to-left drag on the end row)
+/// select the same rectangle as the equivalent top-to-bottom one.
+fn normalize(a: (usize, u16), b: (usize, u16)) -> ((usize, u16), (usize, u16)) {
     if (b.0, b.1) < (a.0, a.1) {
         (b, a)
     } else {
@@ -109,9 +138,15 @@ fn normalize(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
 /// Finish the selection at the release point: return the selected text (if
 /// the gesture was a real drag over copyable rows) and always clear the
 /// selection state.  Returns `None` for a plain click.
-pub(crate) fn finish_selection(app: &mut App, row: u16, column: u16) -> Option<String> {
-    // The release event's position is authoritative for the final head.
-    update_selection(app, row, column);
+///
+/// The release position is deliberately NOT applied to the head: the head
+/// already sits at the last drag position in *content* coordinates, and
+/// re-resolving the release screen position would point at whatever content
+/// now happens to sit under the cursor — which after a mid-gesture scroll is
+/// NOT the text the user selected.  Only explicit drag events move the head,
+/// so the selection stays pinned to the text even when the viewport moved
+/// under it.
+pub(crate) fn finish_selection(app: &mut App) -> Option<String> {
     let text = if app.text_selection.is_some_and(|s| s.active) {
         extract_selection_text(app)
     } else {
@@ -123,26 +158,30 @@ pub(crate) fn finish_selection(app: &mut App, row: u16, column: u16) -> Option<S
 
 /// Extract the plain text covered by the active selection rectangle.
 ///
-/// Rows are resolved one at a time through `find_turn_at_row` + the render
-/// cache.  Rows that do not resolve — the blank band above short content,
-/// drags past the bottom edge of the pane, image blocks — are skipped, so
-/// the copyable region is exactly the region the highlight covers.
+/// Content lines are resolved one at a time through the height prefix + the
+/// render cache.  Lines that resolve to no copyable content — pure-chrome
+/// rows, image blocks, lines past the end — are skipped, so the copyable
+/// region is exactly the region the highlight covers.
 fn extract_selection_text(app: &App) -> Option<String> {
-    let ((start_row, start_col), (end_row, end_col)) = selection_range(app)?;
+    let ((start_line, start_col), (end_line, end_col)) = selection_range(app)?;
+    let display = app.active_display_ref()?;
     let vp_width = app.history_viewport.width as usize;
     let mut out = String::new();
-    for row in start_row..=end_row {
-        let col_lo = if row == start_row {
+    // Iterate the selection's *content* lines directly — no screen mapping,
+    // which is exactly why the selection survives scrolling (the endpoints
+    // are content-anchored, so this is scroll-independent).
+    for content_line in start_line..=end_line {
+        let col_lo = if content_line == start_line {
             start_col as usize
         } else {
             0
         };
-        let col_hi = if row == end_row {
+        let col_hi = if content_line == end_line {
             end_col as usize
         } else {
             usize::MAX
         };
-        if let Some(text) = text_for_row(app, row, col_lo, col_hi, vp_width) {
+        if let Some(text) = text_for_content_line(display, vp_width, content_line, col_lo, col_hi) {
             if !out.is_empty() {
                 out.push('\n');
             }
@@ -152,16 +191,30 @@ fn extract_selection_text(app: &App) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// Resolve one viewport row of the selection to the text slice it covers.
-fn text_for_row(
-    app: &App,
-    row: u16,
+/// Resolve one content line of the selection to the text slice it covers.
+fn text_for_content_line(
+    display: &SessionDisplayState,
+    vp_width: usize,
+    content_line: usize,
     col_start: usize,
     col_end: usize,
-    vp_width: usize,
 ) -> Option<String> {
-    let (turn_idx, visual_row) = find_turn_at_row(app, row)?;
-    let display = app.active_display_ref()?;
+    // Map the global content line to a visible turn and the turn-local
+    // visual row — the inverse of `find_turn_at_row`'s screen mapping (the
+    // height prefix is the same cumulative array that function binary
+    // searches).
+    if content_line >= display.total_history_height() {
+        return None;
+    }
+    let turn_idx = display
+        .height_prefix
+        .partition_point(|&p| p <= content_line);
+    let turn_start = turn_idx
+        .checked_sub(1)
+        .and_then(|prev| display.height_prefix.get(prev))
+        .copied()
+        .unwrap_or(0);
+    let visual_row = content_line.saturating_sub(turn_start);
     let rendered = cached_rendered_turn(display, turn_idx, vp_width)?;
     let (line_idx, (lo, hi)) = content_range_for_row(
         &rendered.visual_offsets,
@@ -178,7 +231,7 @@ fn text_for_row(
 /// content-clamped display-column range of the semantic line it covers.
 ///
 /// The single row→line→column mapping shared by the extraction path
-/// ([`text_for_row`]) and the draw-time highlight
+/// ([`text_for_content_line`]) and the draw-time highlight
 /// ([`apply_selection_to_lines`]), so the two can never drift apart again —
 /// they already diverged twice (the screen-row offset bug and the
 /// within-line column bug, both fixed by pinning exactly this mapping).
@@ -259,7 +312,7 @@ fn cached_rendered_turn(
 /// Apply the selection highlight to the visible slice of one turn's lines.
 ///
 /// Called from `render_history` for the visible semantic-line slice of each
-/// turn.  For every line occupying any selected screen row, the covered
+/// turn.  For every line occupying any selected *content* line, the covered
 /// column range (translated into the line's own column space) is restyled
 /// with the selection background.  The render cache is never mutated: lines
 /// are restyled at draw time only.
@@ -275,24 +328,8 @@ pub(crate) fn apply_selection_to_lines(
         return;
     };
     let vp = app.history_viewport;
-    let vh = vp.height as usize;
-    if vh == 0 {
-        return;
-    }
-    let Some(display) = app.active_display_ref() else {
-        return;
-    };
-    let total = display.total_history_height();
-    let scroll = display.effective_scroll(&vp);
-    // The renderer draws the content bottom-anchored inside the viewport:
-    // content row `c` maps to screen row `c + scroll + vh - total` (see
-    // `find_turn_at_row` for the inverse).  At the bottom of an overflowing
-    // history (scroll == 0, total > vh) this offset is NEGATIVE — a
-    // saturating unsigned subtraction would clamp it to 0 and no screen row
-    // would ever match, silently hiding the highlight (the original bug:
-    // the selection copied fine but was never drawn).  Compute it signed and
-    // style only rows that land inside the viewport.
-    let row_offset = scroll as isize + vh as isize - total as isize;
+    let (start_line, start_col) = (start.0, start.1 as usize);
+    let (end_line, end_col) = (end.0, end.1 as usize);
     for (k, line) in lines.iter_mut().enumerate() {
         let li = line_start + k;
         let row_lo = li
@@ -307,23 +344,25 @@ pub(crate) fn apply_selection_to_lines(
         // at content_width < viewport width); the inner loop generalizes to
         // multi-row lines defensively.
         for vr in row_lo..row_hi {
-            let screen_row = turn_start as isize + vr as isize + row_offset;
-            if screen_row < 0 || screen_row >= vh as isize {
+            // The selection lives in content space, so a line's content line
+            // (`turn_start + vr`) is compared directly against the selection
+            // range — no screen-row conversion.  That is exactly what makes
+            // the selection survive scrolling: the endpoints stay pinned to
+            // the text, and this re-evaluates against the current scroll
+            // every frame.  (The old screen-row math — a signed
+            // `scroll + vh - total` offset that had to handle the negative
+            // overflow case — is gone entirely.)
+            let content_line = turn_start + vr;
+            if content_line < start_line || content_line > end_line {
                 continue;
             }
-            let screen_row = screen_row as usize;
-            let start_row = start.0 as usize;
-            let end_row = end.0 as usize;
-            if screen_row < start_row || screen_row > end_row {
-                continue;
-            }
-            let col_lo = if screen_row == start_row {
-                start.1 as usize
+            let col_lo = if content_line == start_line {
+                start_col
             } else {
                 0
             };
-            let col_hi = if screen_row == end_row {
-                end.1 as usize
+            let col_hi = if content_line == end_line {
+                end_col
             } else {
                 usize::MAX
             };
@@ -434,6 +473,7 @@ fn slice_line_columns(line: &Line<'_>, col_lo: usize, col_hi: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::find_turn_at_row;
     use crate::test_util::test_app;
     use choreo_proto::Turn;
 
@@ -477,7 +517,7 @@ mod tests {
     fn drag_and_finish(app: &mut App, from: (u16, u16), to: (u16, u16)) -> Option<String> {
         start_selection(app, from.0, from.1);
         update_selection(app, to.0, to.1);
-        finish_selection(app, to.0, to.1)
+        finish_selection(app)
     }
 
     /// Locate `needle` in the rendered history and return its exact selection
@@ -533,7 +573,7 @@ mod tests {
         start_selection(&mut app, r, c);
         update_selection(&mut app, r, c); // no movement
         assert!(!app.text_selection.unwrap().active);
-        assert_eq!(finish_selection(&mut app, r, c), None);
+        assert_eq!(finish_selection(&mut app), None);
         assert!(
             app.text_selection.is_none(),
             "selection cleared after finish"
@@ -548,7 +588,7 @@ mod tests {
         start_selection(&mut app, start.0, start.1);
         update_selection(&mut app, end.0, end.1);
         assert!(app.text_selection.unwrap().active);
-        assert!(finish_selection(&mut app, end.0, end.1).is_some());
+        assert!(finish_selection(&mut app).is_some());
         assert!(app.text_selection.is_none());
     }
 
@@ -559,7 +599,8 @@ mod tests {
         let mut app = app_with_turns(&[(0, "hello world")], 30);
         let (start, end) = locate(&app, "hello");
         start_selection(&mut app, start.0, start.1);
-        let text = finish_selection(&mut app, end.0, end.1).expect("selection should extract");
+        update_selection(&mut app, end.0, end.1);
+        let text = finish_selection(&mut app).expect("selection should extract");
         assert_eq!(text, "hello");
     }
 
@@ -597,7 +638,8 @@ mod tests {
         let mut app = app_with_turns(&[(0, "abcdefghij")], 30);
         let (start, end) = locate(&app, "cdef");
         start_selection(&mut app, start.0, start.1);
-        let text = finish_selection(&mut app, end.0, end.1).expect("selection should extract");
+        update_selection(&mut app, end.0, end.1);
+        let text = finish_selection(&mut app).expect("selection should extract");
         assert_eq!(text, "cdef");
     }
 
@@ -620,7 +662,8 @@ mod tests {
         let mut app = app_with_turns(&[(0, "日本語")], 30);
         let (start, end) = locate(&app, "日本");
         start_selection(&mut app, start.0, start.1);
-        let text = finish_selection(&mut app, end.0, end.1).expect("selection should extract");
+        update_selection(&mut app, end.0, end.1);
+        let text = finish_selection(&mut app).expect("selection should extract");
         assert_eq!(text, "日本");
     }
 
@@ -641,8 +684,96 @@ mod tests {
         let mut app = app_with_turns(&[(0, "styled text")], 30);
         let (start, end) = locate(&app, "text");
         start_selection(&mut app, start.0, start.1);
-        let text = finish_selection(&mut app, end.0, end.1).expect("selection should extract");
+        update_selection(&mut app, end.0, end.1);
+        let text = finish_selection(&mut app).expect("selection should extract");
         assert_eq!(text, "text");
+    }
+
+    #[test]
+    fn selection_survives_scroll_with_text_anchored_endpoints() {
+        // The selection is stored in content coordinates, so scrolling the
+        // viewport mid-gesture must not change which text is selected: the
+        // anchor and head stay pinned to the content, the gesture is never
+        // cancelled, and extraction (scroll-independent) yields exactly the
+        // same text before and after.
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        for i in 0..20u32 {
+            app.display_for(0)
+                .view
+                .insert_or_replace(i, turn(&format!("turn {i}")));
+        }
+        app.rebuild_height_prefix();
+        assert!(
+            app.total_history_height() > app.history_viewport.height as usize,
+            "history must overflow the viewport"
+        );
+
+        // Drag-select across rows 2..7 (content lines total - vh + 2 ..=
+        // total - vh + 7 at scroll 0), spanning two turns' content rows.
+        start_selection(&mut app, 2, 3);
+        update_selection(&mut app, 7, 80);
+        assert!(app.text_selection.unwrap().active);
+        let before = extract_selection_text(&app).expect("selection text");
+        assert!(
+            before.contains("turn 18") && before.contains("turn 19"),
+            "selection should cover both turns: {before:?}"
+        );
+
+        // Scroll up 3 lines (a positive accumulator; apply_scroll_delta
+        // simulates the per-frame consumer, and the selection itself is
+        // never touched by scrolling).
+        app.scroll_accumulator = 3;
+        app.apply_scroll_delta();
+        assert!(
+            app.effective_scroll() > 0,
+            "scroll must have moved off the bottom"
+        );
+        assert!(
+            app.text_selection.is_some_and(|s| s.active),
+            "scrolling must not cancel the selection"
+        );
+        let after = extract_selection_text(&app).expect("selection text after scroll");
+        assert_eq!(
+            before, after,
+            "scrolling must keep the selection anchored to the same text"
+        );
+    }
+
+    #[test]
+    fn release_after_scroll_does_not_rewind_the_head() {
+        // The release position is deliberately NOT applied to the head: after
+        // scrolling mid-gesture, the release *screen* position maps to
+        // different content than the last drag did (the viewport moved under
+        // the cursor), so re-resolving it would silently shrink the
+        // selection.  Only explicit drag events move the head.
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        for i in 0..20u32 {
+            app.display_for(0)
+                .view
+                .insert_or_replace(i, turn(&format!("turn {i}")));
+        }
+        app.rebuild_height_prefix();
+
+        // Drag from row 2 to row 4 (content lines total - vh + 2 ..= total
+        // - vh + 4 at scroll 0), then scroll up WITHOUT moving the mouse.
+        start_selection(&mut app, 2, 3);
+        update_selection(&mut app, 4, 10);
+        let before = extract_selection_text(&app).expect("selection text");
+        app.scroll_accumulator = 3;
+        app.apply_scroll_delta();
+
+        // Release: the head must stay where the last drag left it, so the
+        // copied text is unchanged even though the cursor now sits over
+        // earlier content.
+        let after = finish_selection(&mut app).expect("selection text on release");
+        assert_eq!(
+            before, after,
+            "releasing after a scroll must not rewind the selection head"
+        );
     }
 
     // ── style_line_selection ──
@@ -741,9 +872,21 @@ mod tests {
     /// row's line ended up with the selection background.
     fn row_highlighted(app: &mut App, screen_row: u16) -> bool {
         let vp_width = app.history_viewport.width;
+        // The selection is stored in content space, so the target screen row
+        // must be converted to its content line (the same mapping
+        // `start_selection` applies) before setting up the full-width
+        // selection rectangle.
+        let content_line = {
+            let display = app.active_display_ref().unwrap();
+            let vh = app.history_viewport.height as isize;
+            let total = display.total_history_height() as isize;
+            let scroll = display.effective_scroll(&app.history_viewport) as isize;
+            let last_line = (total - 1).max(0);
+            ((screen_row as isize + total - scroll - vh).clamp(0, last_line)) as usize
+        };
         app.text_selection = Some(TextSelection {
-            anchor: (screen_row, 0),
-            head: (screen_row, vp_width),
+            anchor: (content_line, 0),
+            head: (content_line, vp_width),
             active: true,
         });
         let (turn_idx, visual_row) = find_turn_at_row(app, screen_row).expect("row maps");
@@ -774,12 +917,14 @@ mod tests {
 
     #[test]
     fn apply_selection_to_lines_overflowing_history_styles_visible_rows() {
-        // Regression: when the history overflows the viewport (the common
-        // long-conversation case), the content is bottom-anchored — at the
-        // bottom, content row c sits at screen row c + vh - total, which is
-        // NEGATIVE.  A saturating unsigned offset clamped it to 0, so no
-        // screen row ever matched and the highlight was never drawn (the
-        // selection copied fine but had no visual feedback).
+        // Regression (kept as a behavior pin): when the history overflows
+        // the viewport (the common long-conversation case), the content is
+        // bottom-anchored — a saturating unsigned screen-row offset once
+        // clamped to 0 there, so no screen row ever matched and the
+        // highlight was never drawn.  The content-space selection has no
+        // screen-row math to get wrong, but this still pins that content
+        // rows highlight while chrome rows never do in the overflowing
+        // layout.
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
@@ -844,20 +989,13 @@ mod tests {
     fn apply_selection_to_lines_short_history_styles_visible_rows() {
         // The short-history case (content fits the viewport, blank band on
         // top): content row c maps to screen row c + vh - total (positive).
+        // The selection is built through the public API so the screen →
+        // content conversion is exercised (`locate` returns viewport coords).
         let mut app = app_with_turns(&[(0, "hello"), (1, "world")], 30);
         let (start, _) = locate(&app, "hello");
-        app.text_selection = Some(TextSelection {
-            anchor: start,
-            head: start,
-            active: true,
-        });
-        let ((r, c), _) = selection_range(&app).unwrap();
-        app.text_selection = Some(TextSelection {
-            anchor: (r, c),
-            head: (r, c.saturating_add(5)),
-            active: true,
-        });
-        let (turn_idx, _) = find_turn_at_row(&app, r).expect("row maps");
+        start_selection(&mut app, start.0, start.1);
+        update_selection(&mut app, start.0, start.1.saturating_add(5));
+        let (turn_idx, _) = find_turn_at_row(&app, start.0).expect("row maps");
         let (cached_lines, offsets, content_ranges, turn_start) = {
             let display = app.active_display_ref().unwrap();
             let cached = display.render_cache[turn_idx].as_ref().unwrap();
