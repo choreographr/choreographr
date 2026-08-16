@@ -508,6 +508,14 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // Clear the terminal-native progress bar now that the TUI is exiting.
     terminal_progress::update_terminal_progress(None, None);
 
+    // Surface why the TUI exited (daemon eviction / graceful shutdown / a
+    // dropped connection) once the alternate screen is gone and the message
+    // is visible on the restored terminal. A normal user quit (Ctrl+Q)
+    // leaves `quit_message` None and prints nothing.
+    if let Some(message) = &app.quit_message {
+        println!("{message}");
+    }
+
     match connection_task.join() {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(error.into()),
@@ -559,6 +567,12 @@ fn run_ui_loop(
                     Err(_) => {
                         // Daemon channel disconnected — treat as closed.
                         app.should_quit = true;
+                        // ReaderClosed normally carries the reason; this arm
+                        // only fires if the connection thread dropped its
+                        // sender without one (e.g. a panic mid-read).
+                        app.quit_message.get_or_insert_with(|| {
+                            "the connection to the daemon was closed".to_string()
+                        });
                     }
                 }
             }
@@ -2047,6 +2061,11 @@ fn handle_ui_event(
         }
         UiEvent::ReaderClosed => {
             app.should_quit = true;
+            // If the daemon already told us why (ShuttingDown / Evicted),
+            // keep that message; a bare EOF means the daemon went away
+            // without an advisory (crash, restart, or the socket closed).
+            app.quit_message
+                .get_or_insert_with(|| "the connection to the daemon was closed".to_string());
             Ok(false)
         }
     }
@@ -2598,6 +2617,28 @@ pub(crate) fn handle_daemon_message(
             }
             return Ok(());
         }
+        // ── Connection-level termination ─────────────────────────────
+        // The daemon is going away (graceful shutdown) or has evicted this
+        // client for lagging. In both cases the writer closes the socket
+        // right after the message, so the TUI must stop and tell the user
+        // why — the message is printed once the alternate screen is restored
+        // (see `run_app`). An early return keeps the generic dispatch from
+        // also pushing text into the chat history we are about to leave.
+        DaemonMessage::ShuttingDown => {
+            tracing::info!("daemon announced shutdown; quitting");
+            app.should_quit = true;
+            app.quit_message = Some("the server is shutting down".to_string());
+            return Ok(());
+        }
+        DaemonMessage::Evicted => {
+            tracing::warn!("evicted by the daemon for lag; quitting");
+            app.should_quit = true;
+            app.quit_message = Some(
+                "disconnected by the daemon: evicted for falling behind the streaming lag limit"
+                    .to_string(),
+            );
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -3077,5 +3118,44 @@ mod tests {
                 "row {row} should not match any marker"
             );
         }
+    }
+
+    // ── Connection-level termination ────────────────────────────────────
+
+    #[test]
+    fn reader_closed_quits_with_message() {
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        assert!(
+            !handle_ui_event(UiEvent::ReaderClosed, &mut app, &tx).expect("handle ReaderClosed"),
+            "ReaderClosed is a control-flow event, not a re-render"
+        );
+        assert!(app.should_quit);
+        assert_eq!(
+            app.quit_message.as_deref(),
+            Some("the connection to the daemon was closed"),
+            "a bare EOF must report the dropped connection"
+        );
+    }
+
+    #[test]
+    fn reader_closed_keeps_existing_quit_message() {
+        // The daemon flushes `ShuttingDown` before closing the socket, so the
+        // TUI normally learns the reason from the message and only then sees
+        // the EOF. ReaderClosed must not overwrite that reason with the
+        // generic "connection closed" text.
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        handle_daemon_message(DaemonMessage::ShuttingDown, &mut app, &tx)
+            .expect("handle ShuttingDown");
+
+        handle_ui_event(UiEvent::ReaderClosed, &mut app, &tx).expect("handle ReaderClosed");
+
+        assert_eq!(
+            app.quit_message.as_deref(),
+            Some("the server is shutting down"),
+            "the specific reason must survive the trailing EOF"
+        );
     }
 }

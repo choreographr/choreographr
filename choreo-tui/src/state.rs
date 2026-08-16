@@ -1012,6 +1012,11 @@ pub(crate) struct App {
     pub(crate) pending_job_idx: HashMap<ImageId, (u64, u32, usize)>,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
+    /// Why the TUI is exiting, when it is NOT a user-initiated quit (Ctrl+Q).
+    /// Set when the daemon evicts this client, announces shutdown, or the
+    /// connection drops; printed to the restored terminal after teardown so
+    /// the user sees why the TUI left. `None` on a normal user quit.
+    pub(crate) quit_message: Option<String>,
     pub(crate) image_job_tx: Option<crossbeam::channel::Sender<ImageJob>>,
     pub(crate) attached_session_id: Option<u64>,
     pub(crate) attached_provider_slug: Option<String>,
@@ -2055,6 +2060,7 @@ impl App {
             rendered_images: HashMap::new(),
             history_viewport: HistoryViewport::new(),
             should_quit: false,
+            quit_message: None,
             image_job_tx: None,
             pending_job_idx: HashMap::new(),
             attached_session_id: None,

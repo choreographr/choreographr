@@ -81,6 +81,22 @@ impl DaemonState {
     /// `UpdateMetadata`).  The message carries the index's current
     /// `last_modified` so clients' monotonic `max()` guards keep both sides
     /// in sync.
+    ///
+    /// Duplicate-suppression: every sender of `BroadcastSessionStatus` (the
+    /// session thread's `handle_status_changed` and the exit-to-Inactive path)
+    /// has ALREADY broadcast the same `SessionStatusChanged` through the
+    /// per-session fan-out (`crate::broadcast::fan_out_evicting` on the
+    /// session's own subscriber map) — which also forwards it to the
+    /// all-activity subscribers via `BroadcastActivity`. So a client that is a
+    /// direct subscriber of this session received the change there, and a
+    /// client subscribed to all activity received it through the activity
+    /// fan-out; delivering either of them again here would duplicate the
+    /// message. The summary fan-out therefore skips both classes and only
+    /// serves clients that subscribe to the session list without receiving
+    /// the change elsewhere (the ordering is safe: the session thread sends
+    /// the activity forward and this summary command over the SAME daemon
+    /// channel in that order, so the daemon processes the activity delivery
+    /// before this fan-out runs).
     pub(super) fn handle_broadcast_session_status(
         &mut self,
         session_id: u64,
@@ -105,7 +121,32 @@ impl DaemonState {
         // for deleted sessions, so use its presence as the "session exists"
         // signal.
         if self.session_metadata.contains_key(&session_id) {
-            self.broadcast(msg);
+            // Shared lossless + lag-eviction policy, with the duplicate
+            // suppression described above: skip direct session subscribers of
+            // this session (they got the change via the per-session fan-out)
+            // and activity subscribers (they got it via the activity fan-out),
+            // so every client receives `SessionStatusChanged` exactly once.
+            let (evict_clients, evict_largest) = fan_out_evicting(
+                &mut self.summary_subscribers,
+                &msg,
+                &self.lag_limits,
+                &self.global_lag,
+                |client_id| {
+                    // Direct session subscriber of the changed session — the
+                    // per-session broadcast already delivered this change.
+                    if self
+                        .client_subscribed_sessions
+                        .get(&client_id)
+                        .is_some_and(|sessions| sessions.contains(&session_id))
+                    {
+                        return true;
+                    }
+                    // All-activity subscriber — the session thread's broadcast
+                    // forwarded this exact change via `BroadcastActivity`.
+                    self.activity_subscribers.contains_key(&client_id)
+                },
+            );
+            self.finish_evictions(evict_clients, evict_largest);
         }
     }
 

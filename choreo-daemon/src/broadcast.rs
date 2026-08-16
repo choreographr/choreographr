@@ -40,11 +40,17 @@
 //! microsecond window between the writer's last drain pass and its receiver
 //! being dropped: that `send` SUCCEEDS (the receiver is still alive), the
 //! message is never dequeued, and its bytes stay in the daemon-wide counter
-//! forever. The leak is bounded to at most one message's bytes per teardown
-//! event (a producer that sends after the receiver is gone self-corrects), so
-//! it is acceptable — but it is real, which is why the invariant is "every
-//! increment is matched by a decrement except the bounded exit-window
-//! straggler", not a claim of exactness.
+//! forever. The leak is bounded to whatever a producer manages to enqueue in
+//! that window — in practice zero or one message (the daemon removes the sink
+//! from its maps in the same command that starts the teardown, and session
+//! threads stop broadcasting once their `RemoveSubscriber` lands, so the
+//! window contains at most a straggler or two, never an unbounded stream).
+//! A producer that sends AFTER the receiver is gone self-corrects, so the
+//! accounting stays honest to within that tiny, event-bounded slack — but the
+//! bound is "a few messages at most, in practice", not a strict one-message
+//! guarantee. That is why the invariant is "every increment is matched by a
+//! decrement except the bounded exit-window straggler", not a claim of
+//! exactness.
 
 use choreo_proto::DaemonMessage;
 use crossbeam_channel::Sender;

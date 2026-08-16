@@ -6836,4 +6836,37 @@ mod unsent_draft_tests {
         );
         assert_eq!(app.ai_providers.provider_selection, 0);
     }
+
+    // ── Connection-level termination (eviction / server shutdown) ───────
+
+    #[test]
+    fn daemon_message_evicted_quits_with_message() {
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        handle_daemon_message(DaemonMessage::Evicted, &mut app, &tx).expect("handle Evicted");
+
+        assert!(app.should_quit, "eviction must terminate the TUI");
+        let msg = app.quit_message.as_deref().expect("quit message set");
+        assert!(
+            msg.contains("evicted"),
+            "quit message must explain the eviction, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn daemon_message_shutting_down_quits_with_message() {
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        handle_daemon_message(DaemonMessage::ShuttingDown, &mut app, &tx)
+            .expect("handle ShuttingDown");
+
+        assert!(app.should_quit, "server shutdown must terminate the TUI");
+        let msg = app.quit_message.as_deref().expect("quit message set");
+        assert!(
+            msg.contains("shutting down"),
+            "quit message must explain the shutdown, got: {msg}"
+        );
+    }
 }

@@ -416,6 +416,105 @@ fn handle_broadcast_session_status() {
 }
 
 #[test]
+fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribers() {
+    // A status change is broadcast through THREE fan-outs for one logical
+    // event: the session thread's per-session fan-out (to attached clients),
+    // its `BroadcastActivity` forward (to all-activity clients), and this
+    // summary command (to session-list subscribers). The summary fan-out must
+    // skip clients that already received the change through either of the
+    // other two, so every client gets exactly one copy.
+    let (mut state, _rx) = make_daemon_state();
+    state.session_metadata.insert(
+        42,
+        SessionMetadata {
+            title: None,
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            created_at: 1000,
+            last_modified: 1000,
+            turn_count: 0,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: None,
+            accumulated_usage: TokenUsage::default(),
+            context_window: None,
+            last_prompt_tokens: None,
+        },
+    );
+
+    // Client 1: attached to session 42 (direct session subscriber) AND a
+    // summary subscriber — receives the change via the per-session fan-out.
+    let (tx1, rx1) = test_sink();
+    state.handle_command(DaemonCommand::RegisterSummarySubscriber {
+        client_id: 1,
+        writer: tx1,
+    });
+    state.handle_command(DaemonCommand::TrackSessionSubscription {
+        client_id: 1,
+        session_id: 42,
+    });
+
+    // Client 2: all-activity subscriber AND a summary subscriber — receives
+    // the change via the `BroadcastActivity` forward.
+    let (tx2, rx2) = test_sink();
+    state.handle_command(DaemonCommand::RegisterSummarySubscriber {
+        client_id: 2,
+        writer: tx2.clone(),
+    });
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 2,
+        writer: tx2,
+    });
+    // Drain the send-on-subscribe CatalogUpdated so only the status change
+    // (or its absence) is observed below.
+    let sent = rx2.recv().unwrap();
+    assert!(
+        matches!(&sent, DaemonMessage::CatalogUpdated { providers } if !providers.is_empty()),
+        "expected the send-on-subscribe CatalogUpdated, got {sent:?}"
+    );
+
+    // Client 3: plain summary subscriber, not attached, not activity — the
+    // summary fan-out is its ONLY delivery path.
+    let (tx3, rx3) = test_sink();
+    state.handle_command(DaemonCommand::RegisterSummarySubscriber {
+        client_id: 3,
+        writer: tx3,
+    });
+
+    state.handle_command(DaemonCommand::BroadcastSessionStatus {
+        session_id: 42,
+        status: SessionStatus::Inference,
+    });
+
+    // Client 1 (session subscriber) and client 2 (activity subscriber) must
+    // NOT receive a second copy through the summary path.
+    assert!(
+        rx1.try_recv().is_err(),
+        "session subscriber must not get a duplicate via the summary fan-out"
+    );
+    assert!(
+        rx2.try_recv().is_err(),
+        "activity subscriber must not get a duplicate via the summary fan-out"
+    );
+    // Client 3 (summary-only) must receive it — exactly once.
+    let msg = rx3.recv().unwrap();
+    assert!(matches!(
+        msg,
+        DaemonMessage::SessionStatusChanged {
+            session_id: 42,
+            status: SessionStatus::Inference,
+            ..
+        }
+    ));
+    assert!(
+        rx3.try_recv().is_err(),
+        "summary-only client gets exactly one copy"
+    );
+}
+
+#[test]
 fn handle_create_session_succeeds_when_locked() {
     // CreateSession should succeed even when the daemon is locked,
     // because a session is just a container — credentials are only

@@ -142,10 +142,14 @@ fn writer_thread<W: ConnectionWriter>(
     // lands in the microsecond window between this drain's last pass and the
     // receiver being dropped (at function return) SUCCEEDS — the receiver is
     // still alive — and that message is never dequeued, so its bytes stay in
-    // the daemon-wide counter forever. It is at most one message's bytes per
-    // teardown event (a producer that sends after the receiver is gone
-    // self-corrects), so the accounting stays honest to within that tiny,
-    // event-bounded slack.
+    // the daemon-wide counter forever. The leak is bounded to whatever a
+    // producer manages to enqueue in that window — in practice zero or one
+    // message (the daemon removes the sink from its maps in the same command
+    // that starts this teardown, so no producer keeps broadcasting to it
+    // beyond a straggler or two) — and a producer that sends after the
+    // receiver is gone self-corrects, so the accounting stays honest to
+    // within that tiny, event-bounded slack. It is not a strict one-message
+    // guarantee, but it is never an unbounded stream.
     for msg in rx.try_iter() {
         let size = msg.approx_wire_size();
         bytes.fetch_sub(size, Ordering::Relaxed);
