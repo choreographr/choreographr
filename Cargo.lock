@@ -2376,6 +2376,7 @@ dependencies = [
  "ansi-to-tui",
  "anstyle-progress",
  "anyhow",
+ "base64 0.23.1",
  "choreo-client-core",
  "choreo-keystore",
  "choreo-markdown",

@@ -1,9 +1,11 @@
 mod cache;
+mod clipboard;
 mod connection;
 mod diff_render;
 mod markdown_render;
 mod render;
 mod scrollbar;
+mod selection;
 mod state;
 mod syntax;
 

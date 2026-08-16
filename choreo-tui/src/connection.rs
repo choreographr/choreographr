@@ -5,7 +5,7 @@ use crate::state::{
     SessionManagerView, UiEvent, find_turn_at_row, input_inner_width, merge_token_usage,
 };
 use crate::terminal_progress;
-use crate::{ShellCommand, build_picker, parse_input_line};
+use crate::{ShellCommand, build_picker, clipboard, parse_input_line, selection};
 use choreo_client_core::{
     ClientError, ConnectionMode, broken_pipe, build_add_credential_message,
     dispatch_daemon_message, is_valid_account_name, resolve_private_key,
@@ -584,6 +584,13 @@ fn run_ui_loop(
             }
             recv(resume_rx) -> msg => {
                 if let Ok(cmd) = msg {
+                    // A stale selection must not survive a suspend/resume
+                    // cycle: the viewport and scroll state are re-established
+                    // on resume, so an old rectangle would highlight the
+                    // wrong rows until the next mouse event cleared it.
+                    if matches!(&cmd, ResumeCommand::PrepareForSuspend) {
+                        app.text_selection = None;
+                    }
                     dirty = handle_resume_command(cmd, terminal)?;
                 }
             }
@@ -613,6 +620,9 @@ fn run_ui_loop(
             }
             while let Ok(cmd) = resume_rx.try_recv() {
                 progress = true;
+                if matches!(&cmd, ResumeCommand::PrepareForSuspend) {
+                    app.text_selection = None;
+                }
                 dirty = handle_resume_command(cmd, terminal)?;
             }
 
@@ -1277,6 +1287,39 @@ fn handle_chat_event(
                 _ => {}
             }
         }
+        // Text selection in the history pane: while a selection gesture is in
+        // progress (mouse-down in the history box through mouse-up), every
+        // mouse event extends or finalizes it.  Checked before the scrollbar
+        // arms so a drag that crosses the scrollbar column keeps selecting —
+        // matching terminal-native selection, where a drag spans the whole
+        // screen.  A scrollbar click can never arm a text selection (its Down
+        // lands in the scrollbar arm below, which never calls
+        // `start_selection`).
+        Event::Mouse(mouse) if selection::is_selecting(app) => {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    selection::update_selection(app, mouse.row, mouse.column);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    let text = selection::finish_selection(app, mouse.row, mouse.column);
+                    if let Some(text) = text {
+                        let tokens = selection::approx_tokens(&text);
+                        clipboard::copy_to_clipboard(&text);
+                        tracing::info!(
+                            bytes = text.len(),
+                            tokens,
+                            "[choreo-tui] copied selection to clipboard via OSC 52"
+                        );
+                        app.status = Some(format!("{tokens} tokens copied to clipboard"));
+                    }
+                }
+                _ => {
+                    // Any other mouse event (scroll wheel, right-click, a
+                    // second Down before the first Up) cancels the gesture.
+                    selection::cancel_selection(app);
+                }
+            }
+        }
         // Left-click (and drag) in the scrollbar column.
         // This must be checked BEFORE the drag handler so that a new click
         // on the scrollbar always reaches this handler, even when the drag
@@ -1430,6 +1473,17 @@ fn handle_chat_event(
                             && let Some(session_id) = app.active_session_id
                         {
                             app.fullscreen_image_target = Some((session_id, turn_id, img_idx));
+                        } else {
+                            // Plain-text click: arm a potential text selection
+                            // at the click point.  It only becomes real
+                            // (highlighted + copied on release) once the drag
+                            // moves; a plain click keeps its existing behavior
+                            // (none here — the toggle/fullscreen targets above
+                            // are the only interactive rows).  Skipped for
+                            // those targets so a click that toggles a
+                            // reasoning/tool header or opens an image never
+                            // leaves a dangling armed selection behind.
+                            selection::start_selection(app, mouse.row, mouse.column);
                         }
                     }
                 }
@@ -3118,6 +3172,175 @@ mod tests {
                 "row {row} should not match any marker"
             );
         }
+    }
+
+    // ── Mouse text selection (select-to-copy) ───────────────────────────
+
+    /// Drive one mouse event through the full `handle_terminal_event` path
+    /// (kitty normalization → page dispatch → Chat page mouse arms).
+    fn send_mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        handle_terminal_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            app,
+            &tx,
+        )
+        .expect("handle mouse event");
+    }
+
+    /// The first viewport row that maps to content (0 when the history fills
+    /// the viewport; the bottom-anchored content starts lower when it fits).
+    fn first_content_row(app: &App) -> u16 {
+        let vh = app.history_viewport.height;
+        let total = app.total_history_height() as u16;
+        vh.saturating_sub(total)
+    }
+
+    #[test]
+    fn mouse_drag_selects_copies_and_reports_status() {
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        insert_turn(&mut app, 0, "user a", "assistant a");
+        insert_turn(&mut app, 1, "user b", "assistant b");
+        app.rebuild_height_prefix();
+
+        let start_row = first_content_row(&app);
+        send_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            start_row,
+        );
+        assert!(
+            app.text_selection.is_some(),
+            "mouse-down in the history box arms a selection"
+        );
+        assert!(
+            !app.text_selection.unwrap().active,
+            "armed but not active before any drag"
+        );
+
+        send_mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            5,
+            start_row + 1,
+        );
+        assert!(
+            app.text_selection.unwrap().active,
+            "drag activates the selection"
+        );
+
+        send_mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            5,
+            start_row + 1,
+        );
+        assert!(
+            app.text_selection.is_none(),
+            "selection cleared after release"
+        );
+        let status = app.status.as_deref().expect("copy sets a status message");
+        assert!(
+            status.ends_with("tokens copied to clipboard"),
+            "unexpected status: {status}"
+        );
+    }
+
+    #[test]
+    fn mouse_click_without_drag_does_not_copy() {
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        insert_turn(&mut app, 0, "user a", "assistant a");
+        app.rebuild_height_prefix();
+
+        let start_row = first_content_row(&app);
+        send_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            3,
+            start_row,
+        );
+        send_mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            3,
+            start_row,
+        );
+        assert!(
+            app.text_selection.is_none(),
+            "a plain click must not leave a selection armed"
+        );
+        assert!(
+            app.status.is_none(),
+            "a plain click must not trigger a copy status"
+        );
+    }
+
+    #[test]
+    fn mouse_scroll_during_selection_cancels_it() {
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        insert_turn(&mut app, 0, "user a", "assistant a");
+        insert_turn(&mut app, 1, "user b", "assistant b");
+        app.rebuild_height_prefix();
+
+        let start_row = first_content_row(&app);
+        send_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            start_row,
+        );
+        send_mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            3,
+            start_row + 1,
+        );
+        // A scroll wheel mid-gesture abandons the selection (matches
+        // terminal-native selection, where scrolling clears the selection).
+        send_mouse(&mut app, MouseEventKind::ScrollDown, 0, start_row);
+        assert!(app.text_selection.is_none(), "scroll cancels the selection");
+        assert!(app.status.is_none(), "cancelled selection copies nothing");
+    }
+
+    #[test]
+    fn mouse_down_in_scrollbar_column_does_not_arm_selection() {
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        for i in 0..20 {
+            insert_turn(&mut app, i, "user text", "assistant response");
+        }
+        app.rebuild_height_prefix();
+        assert!(
+            app.scrollbar_visible(),
+            "content must overflow the viewport"
+        );
+
+        // Click in the scrollbar column (viewport width) — that is a
+        // scrollbar interaction, never a text selection.
+        let vp_width = app.history_viewport.width;
+        send_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            vp_width,
+            0,
+        );
+        assert!(
+            app.text_selection.is_none(),
+            "scrollbar-column clicks must not arm a text selection"
+        );
     }
 
     // ── Connection-level termination ────────────────────────────────────

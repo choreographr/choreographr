@@ -2,6 +2,7 @@ use crate::RenderedImage;
 use crate::diff_render::truncate_str;
 use crate::markdown_render::{display_width, reasoning_expanded_default, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
+use crate::selection;
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, CTRL_HELP_LINE1, CTRL_HELP_LINE2, INPUT_PAD,
     Page, RenderCacheKey, SessionManagerView, cached_or_compute_lines, cached_visual_lines,
@@ -546,7 +547,28 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let row_end = top_line + visible_height;
             let line_start = text_offsets.partition_point(|&o| o <= row_start);
             let line_end = text_offsets.partition_point(|&o| o <= row_end);
-            let visible_lines = text_lines_arc[line_start..line_end].to_vec();
+            let mut visible_lines = text_lines_arc[line_start..line_end].to_vec();
+            // Apply the in-progress text-selection highlight to the visible
+            // slice at draw time — the render cache stays pure, and the same
+            // cached lines drive both the highlight and the copy, so what is
+            // highlighted is exactly what gets copied.  `i` is the
+            // visible-turn index; the turn's first content row is
+            // `height_prefix[i-1]` (0 for the first turn).
+            let turn_start = i
+                .checked_sub(1)
+                .and_then(|prev| {
+                    app.active_display_ref()
+                        .and_then(|d| d.height_prefix.get(prev))
+                        .copied()
+                })
+                .unwrap_or(0);
+            selection::apply_selection_to_lines(
+                app,
+                turn_start,
+                &text_offsets[..],
+                line_start,
+                &mut visible_lines,
+            );
             render_text_block(
                 frame,
                 area,

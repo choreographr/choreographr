@@ -1,5 +1,6 @@
 use crate::RenderedImage;
 use crate::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
+use crate::selection::TextSelection;
 use choreo_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use choreo_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
 use choreo_proto::{
@@ -1034,6 +1035,11 @@ pub(crate) struct App {
     pub(crate) providers: Vec<ProviderInfo>,
     pub(crate) scroll_accumulator: isize,
     pub(crate) scrollbar_dragging: bool,
+    /// In-progress mouse text selection over the history pane (see
+    /// `selection`).  `None` when no selection gesture is active; cleared on
+    /// session switch and suspend so a stale rectangle never highlights a
+    /// different session's content.
+    pub(crate) text_selection: Option<TextSelection>,
     pub(crate) last_terminal_size: Option<(u16, u16)>,
     pub(crate) terminal_resized: bool,
     pub(crate) history_index: Option<usize>,
@@ -2024,7 +2030,7 @@ pub(crate) fn byte_offset_at_column(s: &str, target_col: usize) -> usize {
 ///
 /// Returns `s.len()` when `target_col` is larger than the string's display
 /// width.
-fn grapheme_offset_at_column(s: &str, target_col: usize) -> usize {
+pub(crate) fn grapheme_offset_at_column(s: &str, target_col: usize) -> usize {
     let mut col = 0;
     for (byte_i, g) in s.grapheme_indices(true) {
         let g_w = UnicodeWidthStr::width(g);
@@ -2083,6 +2089,7 @@ impl App {
                 .collect(),
             scroll_accumulator: 0,
             scrollbar_dragging: false,
+            text_selection: None,
             history_index: None,
             saved_draft: String::new(),
             saved_draft_cursor: 0,
@@ -2274,9 +2281,7 @@ impl App {
         });
         if old_width != new_width || old_height != self.history_viewport.height {
             for display in self.session_displays.values_mut() {
-                for cached in &mut display.render_cache {
-                    *cached = None;
-                }
+                display.render_cache.fill(None);
                 display.markers_dirty = true;
                 if old_width != new_width {
                     tracing::debug!(
@@ -2453,6 +2458,10 @@ impl App {
 
     pub(crate) fn reset_for_session_switch(&mut self, session_id: u64) {
         self.active_session_id = Some(session_id);
+        // A selection is keyed to the previous session's rendered content in
+        // screen coordinates; it must not linger and highlight the next
+        // session's history.
+        self.text_selection = None;
         let display = self.display_for(session_id);
         // Keep the session's live state: `view.turns` and `view.request_to_turn`
         // (accumulated via the all-activity subscription while the user was
@@ -5181,6 +5190,26 @@ mod tests {
         assert!(
             find_turn_at_row(&app, blank_row).is_none(),
             "empty rows above the content must not hit a turn"
+        );
+    }
+
+    // ── text selection lifecycle ──
+
+    #[test]
+    fn reset_for_session_switch_clears_text_selection() {
+        // A selection is stored in screen coordinates keyed to the previous
+        // session's rendered content; switching sessions must clear it so a
+        // stale rectangle can never highlight another session's history.
+        let mut app = test_app();
+        app.text_selection = Some(crate::selection::TextSelection {
+            anchor: (0, 0),
+            head: (2, 3),
+            active: true,
+        });
+        app.reset_for_session_switch(1);
+        assert!(
+            app.text_selection.is_none(),
+            "session switch must clear the in-progress selection"
         );
     }
 
