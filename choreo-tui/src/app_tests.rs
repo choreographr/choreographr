@@ -1645,10 +1645,12 @@ fn terminal_event_inserts_char_at_cursor() {
 }
 
 #[test]
-fn terminal_event_ctrl_backspace_deletes_word_backward() {
+fn terminal_event_ctrl_backspace_clears_draft_prompt() {
     let mut app = test_app();
     app.input.text = "hello world".to_string();
-    app.input.cursor = 11;
+    // Cursor parked mid-text: clearing the draft must empty the whole
+    // buffer regardless of where the cursor sits.
+    app.input.cursor = 6;
     let (tx, _rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
@@ -1658,8 +1660,11 @@ fn terminal_event_ctrl_backspace_deletes_word_backward() {
     )
     .expect("handle ctrl+backspace");
 
-    assert_eq!(app.input.text, "hello ");
-    assert_eq!(app.input.cursor, 6);
+    assert!(
+        app.input.text.is_empty(),
+        "ctrl+backspace must clear the draft prompt"
+    );
+    assert_eq!(app.input.cursor, 0);
 }
 
 #[test]
