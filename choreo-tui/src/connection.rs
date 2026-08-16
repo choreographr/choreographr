@@ -1321,18 +1321,22 @@ fn handle_chat_event(
                         }
                     }
                 }
-                // A scroll wheel mid-gesture scrolls AND keeps the selection:
-                // the gesture is stored in content coordinates, so the
-                // anchor/head stay pinned to the text and the draw-time
-                // highlight re-evaluates against the new scroll (terminal-
-                // native selection follows the content).  The delta
-                // accumulates exactly like the history-box scroll arm below,
-                // so the per-frame scroll consumer applies it in batch.
+                // A scroll wheel mid-gesture scrolls immediately AND keeps
+                // the selection: the anchor stays pinned to the text it was
+                // placed on (content coordinates), while the live drag head
+                // re-resolves to the content now under the cursor — so the
+                // selection tracks the cursor as the viewport moves, and the
+                // highlight updates on the wheel event itself (terminal-
+                // native drag-while-scroll).  The scroll is applied
+                // synchronously (not via the frame accumulator) so the head
+                // is resolved against the post-scroll content immediately.
                 MouseEventKind::ScrollUp => {
-                    app.scroll_accumulator = app.scroll_accumulator.saturating_add(1);
+                    app.scroll_up(1);
+                    selection::update_selection(app, mouse.row, mouse.column);
                 }
                 MouseEventKind::ScrollDown => {
-                    app.scroll_accumulator = app.scroll_accumulator.saturating_sub(1);
+                    app.scroll_down(1);
+                    selection::update_selection(app, mouse.row, mouse.column);
                 }
                 _ => {
                     // Any other mouse event (right-click, a second Down
@@ -3346,10 +3350,15 @@ mod tests {
     fn mouse_scroll_during_selection_keeps_selection_and_scrolls() {
         let mut app = test_app();
         app.history_viewport.width = 80;
-        app.history_viewport.height = 20;
-        insert_turn(&mut app, 0, "user a", "assistant a");
-        insert_turn(&mut app, 1, "user b", "assistant b");
+        app.history_viewport.height = 10;
+        for i in 0..20 {
+            insert_turn(&mut app, i, "user text", "assistant response");
+        }
         app.rebuild_height_prefix();
+        assert!(
+            app.scrollbar_visible(),
+            "history must overflow the viewport"
+        );
 
         let start_row = first_content_row(&app).expect("selectable content row");
         send_mouse(
@@ -3364,18 +3373,66 @@ mod tests {
             3,
             start_row + 1,
         );
-        // A scroll wheel mid-gesture keeps the selection (it is anchored to
-        // the text in content coordinates, so it scrolls with the content)
-        // AND the wheel input lands: the delta accumulates like any other
-        // scroll event, not swallowed by the gesture.
-        send_mouse(&mut app, MouseEventKind::ScrollDown, 0, start_row);
+        // A scroll wheel mid-gesture keeps the selection (the anchor stays
+        // pinned to the text while the head tracks the cursor) AND the wheel
+        // input lands immediately: the scroll is applied synchronously, not
+        // swallowed by the gesture.
+        let scroll_before = app.effective_scroll();
+        send_mouse(&mut app, MouseEventKind::ScrollUp, 0, start_row);
         assert!(
             app.text_selection.is_some_and(|s| s.active),
             "scrolling must keep the active selection"
         );
-        assert_eq!(
-            app.scroll_accumulator, -1,
-            "the wheel scroll must still accumulate during the gesture"
+        assert!(
+            app.effective_scroll() > scroll_before,
+            "the wheel scroll must land during the gesture"
+        );
+    }
+
+    #[test]
+    fn mouse_scroll_during_selection_tracks_cursor_and_keeps_anchor() {
+        // The anchor stays pinned to the text it was placed on (content
+        // coordinates) while the live drag head re-resolves to the content
+        // now under the cursor — so scrolling mid-gesture updates the
+        // selection immediately, without waiting for the next drag event.
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        for i in 0..20 {
+            insert_turn(&mut app, i, "user text", "assistant response");
+        }
+        app.rebuild_height_prefix();
+
+        let start_row = first_content_row(&app).expect("selectable content row");
+        send_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            3,
+            start_row,
+        );
+        send_mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            80,
+            start_row + 5,
+        );
+        let ((anchor0, _), (head0, _)) =
+            selection::selection_range(&app).expect("active selection");
+
+        // Scroll up mid-gesture (the wheel event is reported at the cursor
+        // position): older content moves under the cursor, so the head moves
+        // to an earlier content line while the anchor stays put.
+        send_mouse(&mut app, MouseEventKind::ScrollUp, 80, start_row + 5);
+        let ((anchor1, _), (head1, _)) =
+            selection::selection_range(&app).expect("active selection");
+        assert_eq!(anchor0, anchor1, "the anchor stays pinned to its text");
+        assert!(
+            head1 < head0,
+            "the head tracks the content under the cursor"
+        );
+        assert!(
+            app.text_selection.is_some_and(|s| s.active),
+            "scrolling must keep the active selection"
         );
     }
 

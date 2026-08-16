@@ -690,12 +690,13 @@ mod tests {
     }
 
     #[test]
-    fn selection_survives_scroll_with_text_anchored_endpoints() {
-        // The selection is stored in content coordinates, so scrolling the
-        // viewport mid-gesture must not change which text is selected: the
-        // anchor and head stay pinned to the content, the gesture is never
-        // cancelled, and extraction (scroll-independent) yields exactly the
-        // same text before and after.
+    fn anchor_stays_pinned_to_text_while_head_tracks_the_cursor() {
+        // Scrolling mid-gesture: the anchor stays on the text it was placed
+        // on (content coordinates), while the live drag head re-resolves to
+        // the content now under the (stationary) cursor — so the selection
+        // tracks the cursor as the viewport moves, and the highlight reflects
+        // it on the scroll event itself rather than waiting for the next
+        // drag.
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
@@ -710,34 +711,27 @@ mod tests {
             "history must overflow the viewport"
         );
 
-        // Drag-select across rows 2..7 (content lines total - vh + 2 ..=
-        // total - vh + 7 at scroll 0), spanning two turns' content rows.
+        // Drag rows 2..7 at scroll 0: anchor = content line 92, head = line 97.
         start_selection(&mut app, 2, 3);
         update_selection(&mut app, 7, 80);
         assert!(app.text_selection.unwrap().active);
-        let before = extract_selection_text(&app).expect("selection text");
-        assert!(
-            before.contains("turn 18") && before.contains("turn 19"),
-            "selection should cover both turns: {before:?}"
-        );
+        let ((a0, _), (h0, _)) = selection_range(&app).unwrap();
+        assert_eq!((a0, h0), (92, 97));
 
-        // Scroll up 3 lines (a positive accumulator; apply_scroll_delta
-        // simulates the per-frame consumer, and the selection itself is
-        // never touched by scrolling).
+        // Simulate the selection arm's scroll handling: apply the scroll,
+        // then re-resolve the head at the cursor (the wheel event position).
         app.scroll_accumulator = 3;
         app.apply_scroll_delta();
-        assert!(
-            app.effective_scroll() > 0,
-            "scroll must have moved off the bottom"
+        update_selection(&mut app, 7, 80);
+        let ((a1, _), (h1, _)) = selection_range(&app).unwrap();
+        assert_eq!(
+            a1, 92,
+            "the anchor stays pinned to the text it was placed on"
         );
+        assert_eq!(h1, 94, "the head tracks the content now under the cursor");
         assert!(
             app.text_selection.is_some_and(|s| s.active),
             "scrolling must not cancel the selection"
-        );
-        let after = extract_selection_text(&app).expect("selection text after scroll");
-        assert_eq!(
-            before, after,
-            "scrolling must keep the selection anchored to the same text"
         );
     }
 
