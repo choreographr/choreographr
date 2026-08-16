@@ -1051,16 +1051,7 @@ fn handle_remove_credential_sync(ctx: &mut ClientCtx, service: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Test helper: a fresh unbounded delivery sink with its byte counter at
-    /// zero, plus the receiver to observe deliveries.
-    fn test_sink() -> (
-        crate::broadcast::SubscriberSink,
-        crossbeam_channel::Receiver<DaemonMessage>,
-    ) {
-        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
-        (crate::broadcast::SubscriberSink::new(tx), rx)
-    }
+    use crate::broadcast::test_sink;
 
     /// A `ConnectionWriter` test double that forwards every written message
     /// to a channel and records shutdown calls on another. Message-passing

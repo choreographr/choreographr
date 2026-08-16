@@ -1,6 +1,7 @@
 mod error;
 mod frame;
 mod io;
+mod size;
 mod types;
 
 pub use error::ProtoError;

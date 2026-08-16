@@ -48,6 +48,7 @@
 
 use choreo_proto::DaemonMessage;
 use crossbeam_channel::Sender;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -163,6 +164,63 @@ impl SubscriberSink {
     pub fn send_unchecked(&self, msg: &DaemonMessage, global: &AtomicUsize) -> bool {
         self.send_accounted(msg, global).is_some()
     }
+}
+
+/// Fan `msg` out to `subscribers` under the shared lossless + lag-eviction
+/// policy: every message is enqueued into each subscriber's UNBOUNDED queue
+/// (never dropped, never blocking the caller), and the outcome is classified
+/// into the clients to evict ([`EnqueueOutcome::ClientOverLag`]) and whether
+/// the daemon-wide budget was crossed ([`EnqueueOutcome::GlobalOverBudget`]).
+/// `should_skip` lets a caller exclude specific subscribers from delivery
+/// without evicting them (the activity broadcast's duplicate-suppression for
+/// clients that are also direct session subscribers).
+///
+/// Shared by ALL THREE subscriber fan-outs — the daemon's summary broadcast
+/// (`DaemonState::broadcast`), the daemon's all-activity broadcast
+/// (`DaemonState::handle_broadcast_activity`), and the per-session broadcast
+/// (`crate::sessions`) — so the eviction-collection logic lives in exactly
+/// one place and the paths cannot drift. The caller performs the actual
+/// evictions AFTER this returns (mutating the subscriber owner inside the
+/// retain closure would fight the borrow of the subscriber map): the daemon
+/// calls its `finish_evictions`, a session thread sends `EvictClient` /
+/// `EvictLargestLagging` daemon commands.
+pub(crate) fn fan_out_evicting(
+    subscribers: &mut HashMap<u64, SubscriberSink>,
+    msg: &DaemonMessage,
+    lag_limits: &LagLimits,
+    global: &AtomicUsize,
+    mut should_skip: impl FnMut(u64) -> bool,
+) -> (Vec<u64>, bool) {
+    let mut evict_clients = Vec::new();
+    let mut evict_largest = false;
+    subscribers.retain(|client_id, sink| {
+        if should_skip(*client_id) {
+            return true;
+        }
+        match sink.enqueue(msg, lag_limits, global) {
+            EnqueueOutcome::Delivered => true,
+            EnqueueOutcome::Disconnected => false,
+            EnqueueOutcome::ClientOverLag => {
+                evict_clients.push(*client_id);
+                true
+            }
+            EnqueueOutcome::GlobalOverBudget => {
+                evict_largest = true;
+                true
+            }
+        }
+    });
+    (evict_clients, evict_largest)
+}
+
+/// Test helper: a fresh lossless delivery sink with its byte counter at
+/// zero, plus the receiver to observe deliveries. Shared by the unit-test
+/// modules in `daemon.rs`, `sessions.rs`, and `server/connection.rs` so the
+/// three copies don't drift.
+#[cfg(test)]
+pub(crate) fn test_sink() -> (SubscriberSink, crossbeam_channel::Receiver<DaemonMessage>) {
+    let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+    (SubscriberSink::new(tx), rx)
 }
 
 /// Outcome of one [`SubscriberSink::enqueue`].  Every variant other than
