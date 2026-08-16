@@ -484,13 +484,27 @@ are (a) the daemon command loop (`/refresh-models` requests, sent as
 `MaintenanceEvent::RefreshNow`) and (b) the `notify` filesystem watcher's
 callback (raw config-directory events, forwarded as
 `MaintenanceEvent::OverlayFsEvent`). The thread's `recv_timeout` doubles as
-the revalidation cadence (24 h, configurable constant): after every refresh
-outcome — a successful fetch, a 304, or a failure — the next conditional GET
-is armed, so the cache keeps a steady freshness cycle and a failure never
-spins. A burst of `/refresh-models` requests is **coalesced** into one fetch
+the revalidation timer: after every refresh outcome — a successful fetch, a
+304, or a failure — the next conditional GET is armed
+[`REFRESH_ATTEMPT_INTERVAL`] (25 h) out, so the cache keeps a steady
+freshness cycle and a failure never spins. The 25 h period (rather than 24 h)
+makes each daemon's fetch time drift +1 h/day, so across a population of
+daemons the load wraps around the daily cycle instead of piling onto working
+hours. **Refresh pacing is anchored on a wall-clock attempt timestamp
+persisted in the DB** (`catalog_state` table): the maintenance thread records
+it BEFORE every fetch (crash-safe — a daemon that dies mid-fetch and restarts
+reads a fresh timestamp and honors the remaining cooldown), every outcome
+counts (200/304/failure), and the cooldown survives restarts. At startup the
+thread fetches immediately iff there is no valid cache, no recorded attempt,
+or the attempt is stale; otherwise it skips the network hit and arms the
+in-run timer for the remaining time (monotonic within a run — suspend pauses
+the countdown; a restart re-derives from the DB anchor in strict wall time).
+A burst of `/refresh-models` requests is **coalesced** into one fetch
 (fold the force flags — the shared fetch is forced if ANY requester asked —
 but each requester's reply status reflects its OWN flag, so a plain request
-folded into a forced burst is reported `Updated`, not `Forced`), and the
+folded into a forced burst is reported `Updated`, not `Forced`), the whole
+burst is ONE recorded attempt, and `/refresh-models` bypasses the cooldown
+but still records the attempt (so the DB anchor reflects reality). The
 `/refresh-models` path also **re-reads the user overlay** (fingerprint-gated,
 shared with the watcher) so it is the documented reload fallback when the
 watch could not start. At startup the thread first **creates the runtime
@@ -503,9 +517,9 @@ callback is deliberately trivial — it only forwards events; all policy
 thread. On startup the thread loads the base (cache file → embedded
 `catalog.bin`), reads the user overlay, sends `CatalogBaseChanged` to the
 command loop (which merges + swaps + broadcasts), then runs the conditional
-GET against models.dev. The thread is detached: the process exits after
-`run_server` returns, and its sends to the daemon channel fail harmlessly once
-the command loop is gone.
+GET against models.dev (gated as above). The thread is detached: the process
+exits after `run_server` returns, and its sends to the daemon channel fail
+harmlessly once the command loop is gone.
 
 
 ### `choreo-acp` — ACP bridge (Agent Communication Protocol)
@@ -582,7 +596,7 @@ synchronous `execute_*` entry points (which `block_on` internally).
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management, and the runtime catalog swap (`CatalogBaseChanged` → `replace_catalog`, the single writer of the `PROVIDER_CATALOG` ArcSwap), `CatalogUpdated` broadcasts, and `/refresh-models` plumbing (the fetch is delegated to the maintenance thread, never run here). `DaemonState` is owned by this thread only (no shared state). The per-client subscriber/eviction methods — registration, the lossless broadcast fan-outs, lag eviction, shutdown notification, and disconnect cleanup — live in the child module `daemon/subscriber_handlers.rs` (`pub(super)` methods on `DaemonState`; `handle_command` dispatches their `DaemonCommand` variants here) so this file stays focused on core command handling. |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` (including `total_timeout_secs`) and converts the shared fields into `ProviderOverrides` for the other protocols. |
 | `config.rs` | Daemon-level configuration: `DaemonConfig` (`max_turns`, `[context]`), `config_path()`, `load_daemon_config()`, and the deprecated `load_service_config()`. (Previously lived in `openai/config.rs`; it is daemon config, not provider config.) |
-| `catalog.rs` | Runtime catalog maintenance (S4): `CatalogPaths` (XDG data/config locations for the cache, etag sidecar, and user overlay), atomic cache persistence (temp → fsync → rename, `catalog.bin` postcard + one-line `models.dev.etag`), the ONE background **maintenance thread** (creates the runtime dirs up front so the `notify` watch installs first-time, loads the cache → embedded `catalog.bin`, reads the user overlay, runs the startup conditional GET, watches the config dir with `notify` — a failed watch is **retried** as a last-resort fallback — serves `/refresh-models` requests with **coalescing** of bursts into one fetch (per-requester status), all channel-driven, never mutating the catalog itself), and the **fingerprint-gated overlay reload** (pure compare collapses editor save-event storms; shared by the watcher and the `/refresh-models` path). Every change is delivered to the daemon command loop as `DaemonCommand::CatalogBaseChanged` (a swap) or `DaemonCommand::CatalogNotModified` (a 304 — a pure reply routed through the loop so a queued overlay reload is applied before the `UpToDate` counts are computed). |
+| `catalog.rs` | Runtime catalog maintenance (S4): `CatalogPaths` (XDG data/config locations for the cache bin + user overlay), atomic cache persistence (temp → fsync → rename, `catalog.bin` postcard), the ONE background **maintenance thread** (creates the runtime dirs up front so the `notify` watch installs first-time, loads the cache → embedded `catalog.bin`, reads the user overlay, runs the startup conditional GET — **gated**: fetch immediately iff no valid cache / no recorded attempt / stale, else skip and arm the timer for the remaining time — records the DB `catalog_state.last_attempt_ms` BEFORE every fetch (the crash-safe 25 h cooldown, single writer of the attempt timestamp), watches the config dir with `notify` — a failed watch is **retried** as a last-resort fallback — serves `/refresh-models` requests with **coalescing** of bursts into one fetch (per-requester status; one recorded attempt per burst), all channel-driven, never mutating the catalog itself), and the **fingerprint-gated overlay reload** (pure compare collapses editor save-event storms; shared by the watcher and the `/refresh-models` path). Every change is delivered to the daemon command loop as `DaemonCommand::CatalogBaseChanged` (a swap) or `DaemonCommand::CatalogNotModified` (a 304 — a pure reply routed through the loop so a queued overlay reload is applied before the `UpToDate` counts are computed). |
 | `providers/mod.rs` | `InferenceProvider` — protocol-erased facade wrapping `Arc<dyn ProviderClient>` plus the catalog slug. `from_account_config()` dispatches by `ProviderProtocol` and constructs the right client from `choreo-ai-protocols`. Records API metrics (`record_api_call`/`record_api_error`) around each turn — timing lives here, not in the provider crate. |
 | `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional working directory. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
@@ -744,23 +758,45 @@ models.dev:
 
 - **Cache.** The normalized base is cached at
   `$XDG_DATA_HOME/choreographr/catalog.bin` (postcard, same format as the
-  embedded blob — one load path) with a one-line `models.dev.etag` sidecar.
-  Both are written **atomically** (temp file → fsync → rename). Load order at
-  startup: valid cache file → embedded `catalog.bin` (a corrupt cache logs a
-  warning and falls back). The effective catalog is
-  `merge_overlay(base, [bundled_overlay, user_overlay])`.
-- **Background refresh.** A dedicated maintenance thread
-  (`choreo-daemon/src/catalog.rs`) does a conditional GET against
-  `https://models.dev/api.json` at startup (`If-None-Match` with the cached
+  embedded blob — one load path), written **atomically** (temp file → fsync →
+  rename). The models.dev **etag is persisted in the DB** (`catalog_state`
+  table), written by the daemon command loop AFTER the bin is on disk — so a
+  crash between the two leaves the OLD etag paired with the OLD bin
+  (self-healing: the next conditional GET 200s and stores a fresh etag),
+  never a NEW etag over OLD content (which would 304 forever against a stale
+  cache). The etag is only *used* when the cache loaded — a missing/corrupt
+  cache produces no `If-None-Match`, so the next fetch is a plain GET that
+  rebuilds both. Load order at startup: valid cache file → embedded
+  `catalog.bin` (a corrupt cache logs a warning and falls back). The
+  effective catalog is `merge_overlay(base, [bundled_overlay, user_overlay])`.
+- **Refresh pacing — the 25 h attempt cooldown.** A models.dev fetch is
+  attempted at most once per 25 h, whatever the last outcome (200/304/
+  failure). The cooldown is anchored on a **wall-clock attempt timestamp in
+  the DB** (`catalog_state.last_attempt_ms`), written by the maintenance
+  thread **BEFORE the fetch starts** — so a daemon that crashes mid-fetch and
+  restarts immediately cannot re-fetch, and the cadence survives restarts (a
+  daemon restarted daily fetches once per ~day of wall time, not once per
+  start). The 25 h period (not 24 h) makes each daemon's fetch time drift
+  +1 h/day, spreading load across the daily cycle. `/refresh-models` bypasses
+  the cooldown but still records the attempt. A DB-write failure is logged
+  and the fetch proceeds — the timestamp is advisory pacing.
+- **Startup gate.** The maintenance thread fetches at startup immediately iff
+  there is no valid cache, no recorded attempt (first run / upgrade from a
+  build without the key), or the attempt is stale; otherwise it skips the
+  startup fetch and arms the in-run timer for the remaining time, derived
+  from the persisted timestamp. Within a single run the countdown is
+  monotonic — suspend pauses it (a suspended laptop fetches after 25 h of
+  *awake* time); restart behavior is strict wall time via the DB anchor.
+- **Background refresh.** The same maintenance thread does the conditional
+  GET against `https://models.dev/api.json` (`If-None-Match` with the DB
   etag; models.dev serves `ETag` + `must-revalidate`). 200 → normalize →
   validate non-empty → hand the new base to the daemon command loop, which
   merges overlays, atomically swaps the catalog (`replace_catalog`), persists
-  the cache, and broadcasts `CatalogUpdated`. Any outcome (200, 304, or
-  error) arms the next revalidation 24 h out, so the cache stays fresh on a
-  steady cadence and a failure never spins (the thread's channel
-  `recv_timeout` is the timer). The fetch
-  helper (`choreo-ai-protocols` `catalog::refresh::fetch_modelsdev`) owns ureq
-  + normalization; the daemon command loop never does HTTP.
+  the cache + etag, and broadcasts `CatalogUpdated`. Every outcome arms the
+  next revalidation 25 h out (the thread's channel `recv_timeout` is the
+  timer). The fetch helper (`choreo-ai-protocols`
+  `catalog::refresh::fetch_modelsdev`) owns ureq + normalization; the daemon
+  command loop never does HTTP.
 - **User overlay.** `$XDG_CONFIG_HOME/choreographr/models-overlay.toml`, the
   same schema as the bundled layer, merged last (highest precedence). The
   maintenance thread watches the config *directory* with the `notify` crate
@@ -781,7 +817,11 @@ models.dev:
   the user overlay** (fingerprint-gated, shared with the watcher) so it is the
   documented reload fallback when the watch could not start, and a burst of
   queued requests is **coalesced** into a single fetch (force flags OR-ed;
-  each requester's reply status reflects its own flag). A 304 reply is
+  each requester's reply status reflects its own flag; the whole burst is ONE
+  recorded attempt). `/refresh-models` **bypasses the 25 h cooldown** (explicit
+  user intent) but still records the attempt timestamp, so the DB anchor
+  reflects reality — otherwise the next startup would re-fetch immediately. A
+  304 reply is
   **routed through the daemon command loop** (as `CatalogNotModified`, not
   sent directly by the maintenance thread) so an overlay reload queued just
   before the request is applied first and the `UpToDate` counts reflect the
@@ -1987,7 +2027,7 @@ The child session uses `ToolContext` (`active_tool_groups`, `reasoning_effort`, 
 ### Data model
 
 Sessions are persisted to a `redb` (v4) embedded key-value store at
-`~/.local/share/choreographr/state.redb`. Six tables:
+`~/.local/share/choreographr/state.redb`. Seven tables:
 
 | Table | Key | Value |
 |---|---|---|
@@ -1997,6 +2037,7 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 | `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
 | `deleted_sessions` | `u64` session ID | `()` tombstone — marks a deleted session whose still-shutting-down thread may re-create the record; written only when the delete is deferred (a live thread exists), cleared once the exit finalize re-deletes the record, purged at startup |
 | `meta` | `&str` key (e.g. `schema_version`) | `u64` — persisted schema version (currently `1`) |
+| `catalog_state` | `&str` key | `&[u8]` — runtime catalog-refresh state (S4): `last_attempt_ms` (Unix epoch millis, 8-byte LE — the 25 h cooldown anchor, written by the maintenance thread BEFORE every fetch) and `etag` (UTF-8 — the models.dev entity-tag, written by the daemon command loop after the cache bin is persisted). Created lazily on first write; purely additive, no schema bump |
 
 `SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `working_dir`,
 `turn_count`, `created_at`, `context_config`, `account_name`.

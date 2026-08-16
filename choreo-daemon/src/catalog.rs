@@ -11,16 +11,30 @@
 //! thread-communication exception). All cross-thread communication here is
 //! channel-based: the daemon hands `/refresh-models` requests to this thread
 //! over a channel (never the command loop doing HTTP), and the notify
-//! callback forwards filesystem events over the same channel. The thread
-//! sleeps on its channel with a timeout, which doubles as the revalidation
-//! cadence — the next conditional GET (after a successful fetch, a 304, or a
-//! failure) fires when the timeout elapses — so the cache stays fresh with
-//! no busy loops.
+//! callback forwards filesystem events over the same channel.
+//!
+//! **Refresh pacing (S4).** A models.dev fetch is attempted at most once per
+//! [`REFRESH_ATTEMPT_INTERVAL`] (25 h), regardless of whether the last attempt
+//! succeeded, 304'd, or failed. The cooldown is anchored on a **wall-clock
+//! attempt timestamp persisted in the DB** ([`crate::db`] `catalog_state`),
+//! written BEFORE the fetch starts — so the cadence survives restarts (a
+//! daemon restarted every few hours fetches once per ~day of wall time, not
+//! once per start) and a crash mid-fetch cannot re-trigger an immediate
+//! re-fetch. At startup the thread fetches immediately iff there is no valid
+//! cache, no recorded attempt, or the attempt is stale; otherwise it arms the
+//! in-run timer for the remaining time. The thread sleeps on its channel with
+//! a timeout, which doubles as the revalidation cadence — the next conditional
+//! GET fires when the timeout elapses — so the cache stays fresh with no busy
+//! loops. Within a single run the countdown is monotonic (suspend pauses it:
+//! a laptop that sleeps overnight fetches after 25 h of *awake* time);
+//! restart behavior is strict wall time via the DB anchor. `/refresh-models`
+//! bypasses the cooldown (explicit user intent) but still records the
+//! attempt.
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use choreo_ai_protocols::{
     ProviderEntry, RefreshError, RefreshOutcome, fetch_modelsdev, load_bundled_base,
@@ -32,20 +46,24 @@ use notify::{RecursiveMode, Watcher};
 use tracing::{debug, info, warn};
 
 use crate::daemon::DaemonCommand;
+use crate::db::{get_catalog_etag, get_catalog_last_attempt_ms, set_catalog_last_attempt_ms};
 
-/// Revalidation cadence after a refresh (successful fetch, 304, or failure).
-/// The maintenance thread waits on its channel with this as the recv timeout,
-/// so the catalog never goes stale and a failure never spins — it just waits
-/// for the next trigger (a `/refresh-models` request, an overlay event, or
-/// this interval). models.dev changes infrequently; the conditional GET is
-/// cheap (a 304 round trip), so a 24-hour revalidation is plenty to keep the
-/// cache fresh, and `/refresh-models` bypasses it anytime.
-const RETRY_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Cooldown between models.dev fetch attempts — the revalidation cadence AND
+/// the no-reattempt window, whatever the last outcome (200/304/failure).
+/// The thread waits on its channel with the remaining time as the recv
+/// timeout, so the catalog never goes stale and a failure never spins — it
+/// just waits for the next trigger (a `/refresh-models` request, an overlay
+/// event, or this interval).
+///
+/// 25 h rather than 24 h: a fixed period that is not a divisor of the day
+/// makes each daemon's fetch time drift +1 h/day, so across a population of
+/// daemons (or across days for one daemon) the load wraps around the daily
+/// cycle instead of a majority always hitting the server during working
+/// hours. `/refresh-models` bypasses it anytime.
+const REFRESH_ATTEMPT_INTERVAL: Duration = Duration::from_secs(25 * 60 * 60);
 
 /// Postcard cache filename under the data dir.
 const CATALOG_BIN_NAME: &str = "catalog.bin";
-/// models.dev etag sidecar filename under the data dir (one line).
-const ETAG_NAME: &str = "models.dev.etag";
 /// User overlay filename under the config dir.
 const USER_OVERLAY_NAME: &str = "models-overlay.toml";
 
@@ -89,14 +107,14 @@ pub enum MaintenanceEvent {
 
 /// Filesystem locations the runtime catalog pipeline touches. Kept in one
 /// struct so the daemon state, the maintenance-thread spawn, and the unit
-/// tests all agree on where things live.
+/// tests all agree on where things live. The etag and the last-attempt
+/// timestamp deliberately do NOT live here — they are persisted in the DB
+/// (`catalog_state` table, see [`crate::db`]), not on the filesystem.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogPaths {
     /// Postcard cache of the normalized models.dev base
     /// (`$XDG_DATA_HOME/choreographr/catalog.bin`).
     pub bin: PathBuf,
-    /// models.dev etag sidecar (`$XDG_DATA_HOME/choreographr/models.dev.etag`).
-    pub etag: PathBuf,
     /// User overlay TOML (`$XDG_CONFIG_HOME/choreographr/models-overlay.toml`),
     /// watched for changes.
     pub overlay: PathBuf,
@@ -115,7 +133,6 @@ impl CatalogPaths {
         match (&data_dir, &config_dir) {
             (Some(data), Some(config)) => Self {
                 bin: data.join(CATALOG_BIN_NAME),
-                etag: data.join(ETAG_NAME),
                 overlay: config.join(USER_OVERLAY_NAME),
             },
             _ => {
@@ -156,21 +173,6 @@ pub(crate) fn load_cached_base(path: &Path) -> Option<Vec<ProviderEntry>> {
     }
 }
 
-/// Load the cached models.dev etag (one line, trimmed). `None` when the
-/// sidecar is missing or empty.
-pub(crate) fn load_cached_etag(path: &Path) -> Option<String> {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let trimmed = contents.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
-}
-
 /// Read the user overlay file. `Ok(None)` means the file is absent; `Err` is
 /// an unreadable-but-present file (permissions, etc.) — callers warn and keep
 /// the last-applied value rather than churn on a transient read error.
@@ -192,36 +194,16 @@ pub(crate) fn overlay_fingerprint_changed(last_applied: Option<&str>, fresh: Opt
     last_applied != fresh
 }
 
-/// Persist the cache bin + etag sidecar, both atomically (temp file in the
-/// same directory → fsync → rename, so a reader sees either the old or the
-/// new file, never a torn one). The etag is written only when present — a
-/// server that stopped sending etags must not leave a stale sidecar lying
-/// around (the sidecar would be served back as If-None-Match forever).
-pub(crate) fn write_catalog_cache(
-    base: &[ProviderEntry],
-    etag: Option<&str>,
-    bin_path: &Path,
-    etag_path: &Path,
-) -> io::Result<()> {
+/// Persist the cache bin atomically (temp file in the same directory → fsync →
+/// rename, so a reader sees either the old or the new file, never a torn one).
+/// The models.dev **etag is NOT written here** — it is persisted to the DB by
+/// the daemon command loop AFTER this returns ([`crate::daemon::DaemonState::
+/// persist_catalog_cache`]), so a crash between the two writes leaves the OLD
+/// etag paired with the OLD bin, which self-heals via a 200 on the next fetch
+/// (a new etag over old content would 304 forever instead).
+pub(crate) fn write_catalog_cache(base: &[ProviderEntry], bin_path: &Path) -> io::Result<()> {
     let bytes = postcard::to_allocvec(base).map_err(io::Error::other)?;
-    write_file_atomic(bin_path, &bytes)?;
-    match etag {
-        Some(etag) => {
-            let mut line = etag.to_string();
-            line.push('\n');
-            write_file_atomic(etag_path, line.as_bytes())?;
-        }
-        None => {
-            // A fetch without an etag must clear any stale sidecar, otherwise
-            // the old etag would be served as If-None-Match forever.
-            match std::fs::remove_file(etag_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-    }
-    Ok(())
+    write_file_atomic(bin_path, &bytes)
 }
 
 /// Ensure the runtime directories exist before the maintenance pipeline
@@ -229,8 +211,8 @@ pub(crate) fn write_catalog_cache(
 /// one: nothing ever creates it until the user writes an overlay, and
 /// `notify` cannot watch a directory that does not exist — so on a fresh
 /// system the initial watch would fail and (previously) only be retried on
-/// the 24 h revalidation cadence, leaving a later-created overlay unwatched
-/// for a day. Creating it up front makes the first watch install succeed.
+/// the revalidation cadence, leaving a later-created overlay unwatched for a
+/// day. Creating it up front makes the first watch install succeed.
 /// The **data dir** (cache parent) is created for symmetry; `write_file_atomic`
 /// would create it on first persist anyway. A creation failure is logged,
 /// never fatal — the daemon degrades to the embedded catalog and manual
@@ -255,11 +237,16 @@ fn ensure_runtime_dirs(paths: &CatalogPaths) {
 
 /// Spawn the ONE background catalog-maintenance thread. Returns the channel
 /// sender the daemon command loop uses to hand `/refresh-models` requests to
-/// it. The thread is detached (the process exits after `run_server` returns;
-/// a lingering maintenance thread cannot outlive main, and its sends to the
-/// daemon channel fail harmlessly once the command loop is gone).
+/// it. The DB is handed in because the thread is the single writer of the
+/// catalog refresh state (`catalog_state`: last-attempt timestamp — it
+/// observes every fetch outcome, unlike the command loop, which only sees
+/// accepted swaps). The thread is detached (the process exits after
+/// `run_server` returns; a lingering maintenance thread cannot outlive main,
+/// and its sends to the daemon channel fail harmlessly once the command loop
+/// is gone).
 pub(crate) fn spawn_catalog_maintenance(
     daemon_tx: mpsc::Sender<DaemonCommand>,
+    db: Arc<redb::Database>,
     paths: CatalogPaths,
 ) -> Sender<MaintenanceEvent> {
     let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceEvent>();
@@ -268,22 +255,28 @@ pub(crate) fn spawn_catalog_maintenance(
     let notify_tx = tx.clone();
     let _ = std::thread::Builder::new()
         .name("catalog-maintenance".into())
-        .spawn(move || maintenance_loop(daemon_tx, paths, rx, notify_tx));
+        .spawn(move || maintenance_loop(daemon_tx, db, paths, rx, notify_tx));
     tx
 }
 
 /// Mutable state of the maintenance thread: the current normalized base +
-/// etag (the *facts* the daemon merges overlays onto) and the fingerprint of
-/// the last user overlay it handed to the daemon loop.
+/// etag (the *facts* the daemon merges overlays onto), the wall-clock
+/// last-attempt anchor (loaded from the DB at startup, kept in sync by
+/// [`record_attempt`]), and the fingerprint of the last user overlay it
+/// handed to the daemon loop.
 struct MaintenanceState {
     base: Vec<ProviderEntry>,
     etag: Option<String>,
+    /// Unix epoch millis of the last fetch attempt (DB `catalog_state`).
+    /// `None` = never attempted (first run / upgrade) → fetch immediately.
+    last_attempt_ms: Option<u64>,
     last_applied_user_overlay: Option<String>,
     next_retry_at: Option<Instant>,
 }
 
 fn maintenance_loop(
     daemon_tx: mpsc::Sender<DaemonCommand>,
+    db: Arc<redb::Database>,
     paths: CatalogPaths,
     rx: Receiver<MaintenanceEvent>,
     notify_tx: Sender<MaintenanceEvent>,
@@ -295,16 +288,27 @@ fn maintenance_loop(
     ensure_runtime_dirs(&paths);
 
     // ── 1. Load the base: valid cache file first, embedded catalog.bin as
-    // the fallback (the S4 load order).
-    let (base, etag) = match load_cached_base(&paths.bin) {
+    // the fallback (the S4 load order). The etag is only read from the DB
+    // when the cache loaded: a missing/corrupt cache must produce `etag =
+    // None` so the next fetch is a plain GET that rebuilds both — a 304
+    // with no cache would otherwise leave the daemon on the embedded blob
+    // forever (the etag-requires-cache invariant, pinned by tests).
+    let (base, etag, cache_valid) = match load_cached_base(&paths.bin) {
         Some(base) => {
-            let etag = load_cached_etag(&paths.etag);
+            let etag = match get_catalog_etag(&db) {
+                Ok(etag) => etag,
+                Err(e) => {
+                    warn!(error = %e, "failed to read the catalog etag from the DB; \
+                          the next refresh will be a plain GET");
+                    None
+                }
+            };
             info!(
                 providers = base.len(),
                 "loaded catalog cache from disk ({} bytes)",
                 std::fs::metadata(&paths.bin).map(|m| m.len()).unwrap_or(0),
             );
-            (base, etag)
+            (base, etag, true)
         }
         None => {
             let base = load_bundled_base();
@@ -312,7 +316,21 @@ fn maintenance_loop(
                 providers = base.len(),
                 "no valid catalog cache; using the embedded catalog.bin",
             );
-            (base, None)
+            (base, None, false)
+        }
+    };
+
+    // ── 1b. Load the persisted last-attempt anchor. `None` (never attempted
+    // — first run, or an upgrade from a build without the key) means stale:
+    // the startup gate below fetches immediately.
+    let last_attempt_ms = match get_catalog_last_attempt_ms(&db) {
+        Ok(last_attempt) => last_attempt,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "failed to read the catalog last-attempt timestamp; treating it as stale",
+            );
+            None
         }
     };
 
@@ -333,6 +351,7 @@ fn maintenance_loop(
     let mut state = MaintenanceState {
         base,
         etag,
+        last_attempt_ms,
         last_applied_user_overlay: user_overlay.clone(),
         next_retry_at: None,
     };
@@ -390,8 +409,27 @@ fn maintenance_loop(
         }
     }
 
-    // ── 5. Initial conditional GET (best-effort; failures log + retry).
-    run_refresh(&daemon_tx, &mut state, false, Vec::new());
+    // ── 5. Initial conditional GET — gated on cache freshness. Fetch
+    // immediately iff there is no valid cache, no recorded attempt (first
+    // run / upgrade), or the last attempt is stale (≥ REFRESH_ATTEMPT_INTERVAL
+    // wall-clock ago). Otherwise the cache is fresh enough: skip the startup
+    // fetch entirely and arm the in-run timer for the remaining time, derived
+    // from the persisted attempt timestamp — so a daemon restarted within the
+    // cooldown window does NOT hit the network at every start, and the 25 h
+    // drift of the fetch time across the daily cycle survives restarts.
+    if should_fetch_at_startup(cache_valid, state.last_attempt_ms, wall_now_ms()) {
+        record_attempt(&db, &mut state);
+        run_refresh(&daemon_tx, &mut state, false, Vec::new());
+    } else if let Some(deadline) =
+        next_retry_deadline(state.last_attempt_ms, Instant::now(), wall_now_ms())
+    {
+        state.next_retry_at = Some(deadline);
+        info!(
+            ?deadline,
+            "catalog cache is fresh; skipping the startup fetch and arming the \
+             revalidation timer for the remaining time",
+        );
+    }
 
     // ── 6. Event loop: wait on the channel (requests + overlay events) with
     // the retry timer as the recv timeout.
@@ -399,7 +437,7 @@ fn maintenance_loop(
         // Last-resort re-arm of the config-dir watch if the initial attempt
         // failed (a dir deleted at runtime, or a creation failure in step 0
         // that has since been fixed). This runs on the loop's natural cadence
-        // (channel events + the 24 h revalidation timeout); the step-0 dir
+        // (channel events + the revalidation timeout); the step-0 dir
         // creation is the primary fix, so this path is rarely taken. Cheap
         // while unarmed (a failed watch is a quick syscall); a no-op once
         // armed.
@@ -426,7 +464,7 @@ fn maintenance_loop(
         let timeout = state
             .next_retry_at
             .map(|at| at.saturating_duration_since(Instant::now()))
-            .unwrap_or(RETRY_INTERVAL);
+            .unwrap_or(REFRESH_ATTEMPT_INTERVAL);
         match rx.recv_timeout(timeout) {
             Ok(MaintenanceEvent::RefreshNow { force, reply }) => {
                 // /refresh-models is the documented fallback for overlay
@@ -439,8 +477,14 @@ fn maintenance_loop(
                 // Coalesce: drain any RefreshNows queued while we were idle so
                 // a burst of /refresh-models becomes ONE fetch. Fold the force
                 // flag (a --force anywhere in the burst forces) and keep every
-                // reply sender so no requester is left hanging.
+                // reply sender so no requester is left hanging. The whole
+                // burst is ONE attempt (one timestamp write below).
                 let (any_force, replies) = fold_refresh_nows(&rx, force, reply);
+                // Explicit user intent bypasses the cooldown, but the attempt
+                // is still recorded (and the timer re-armed by run_refresh) so
+                // the DB anchor reflects reality — otherwise the next startup
+                // would re-fetch immediately.
+                record_attempt(&db, &mut state);
                 run_refresh(&daemon_tx, &mut state, any_force, replies);
             }
             Ok(MaintenanceEvent::OverlayFsEvent(Ok(event))) => {
@@ -458,6 +502,7 @@ fn maintenance_loop(
                     && Instant::now() >= at
                 {
                     state.next_retry_at = None;
+                    record_attempt(&db, &mut state);
                     run_refresh(&daemon_tx, &mut state, false, Vec::new());
                 }
             }
@@ -466,6 +511,77 @@ fn maintenance_loop(
                 break;
             }
         }
+    }
+}
+
+/// Whether the startup path should fetch immediately: no valid cache, no
+/// recorded attempt (first run / upgrade from a build without the key), or a
+/// stale attempt (`now − last_attempt ≥ REFRESH_ATTEMPT_INTERVAL`). The gate
+/// is deliberately conservative — anything unknown fetches — because the
+/// cost of a wrong "fetch" is one polite conditional GET, while the cost of
+/// a wrong "skip" is an arbitrarily stale cache.
+///
+/// Pure function of injected wall-clock `now_ms` so it is unit-testable
+/// without any time-based logic.
+fn should_fetch_at_startup(cache_valid: bool, last_attempt_ms: Option<u64>, now_ms: u64) -> bool {
+    if !cache_valid {
+        return true;
+    }
+    match last_attempt_ms {
+        None => true,
+        Some(at) => now_ms.saturating_sub(at) >= REFRESH_ATTEMPT_INTERVAL.as_millis() as u64,
+    }
+}
+
+/// Derive the in-run revalidation deadline from the persisted wall-clock
+/// attempt anchor: `now + (REFRESH_ATTEMPT_INTERVAL − elapsed)`, saturated at
+/// `now` when the deadline has already passed (the next loop iteration then
+/// fires the refresh immediately). `None` when there is no recorded attempt
+/// (nothing to derive from — the startup gate fetches instead).
+///
+/// The wall↔instant correspondence is captured here once, at startup: `now`
+/// (monotonic) and `now_ms` (wall) are read at the same moment, so the
+/// computed duration maps correctly onto the monotonic timeline. A suspend
+/// inside a single run therefore pauses the countdown (the monotonic clock
+/// does not advance during sleep), which is the accepted awake-time
+/// semantics; a restart re-derives from the DB anchor and gets strict wall
+/// time.
+fn next_retry_deadline(last_attempt_ms: Option<u64>, now: Instant, now_ms: u64) -> Option<Instant> {
+    let at = last_attempt_ms?;
+    let elapsed = Duration::from_millis(now_ms.saturating_sub(at));
+    let remaining = REFRESH_ATTEMPT_INTERVAL.saturating_sub(elapsed);
+    Some(now + remaining)
+}
+
+/// Wall-clock epoch millis (`u64`). The cooldown anchor must be wall time so
+/// it survives restarts; the in-run deadline is derived from it at startup
+/// (see [`next_retry_deadline`]). Falls back to 0 (ancient → stale → fetch)
+/// if the clock is before the Unix epoch, which never happens in practice.
+fn wall_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Record the start of a fetch attempt (wall-clock epoch millis) in the DB
+/// BEFORE the fetch runs. This is the crash-safe cooldown: a daemon that
+/// dies mid-fetch and restarts immediately reads a fresh timestamp and
+/// honors the remaining cooldown instead of re-fetching. Every attempt —
+/// startup refresh, timer revalidation, or `/refresh-models` (a coalesced
+/// burst is ONE attempt) — goes through this; the outcome (200/304/failure)
+/// is irrelevant to the pacing, which is the point of the no-reattempt rule.
+/// A DB write failure is logged, never fatal: the timestamp is advisory
+/// pacing, and the worst case is the next startup re-fetching.
+fn record_attempt(db: &redb::Database, state: &mut MaintenanceState) {
+    let now_ms = wall_now_ms();
+    state.last_attempt_ms = Some(now_ms);
+    if let Err(e) = set_catalog_last_attempt_ms(db, now_ms) {
+        warn!(
+            error = %e,
+            "failed to persist the catalog attempt timestamp; the cooldown will \
+             not survive a restart (the next startup re-fetches)",
+        );
     }
 }
 
@@ -534,7 +650,7 @@ fn run_refresh_impl<F>(
             }
             // The cache is still valid; revalidate later to keep it fresh
             // without hammering models.dev.
-            state.next_retry_at = Some(Instant::now() + RETRY_INTERVAL);
+            state.next_retry_at = Some(Instant::now() + REFRESH_ATTEMPT_INTERVAL);
         }
         Ok(RefreshOutcome::Fetched { json, etag }) => {
             let new_base = normalize_modelsdev(&json);
@@ -551,7 +667,7 @@ fn run_refresh_impl<F>(
                         "models.dev response did not parse into a non-empty catalog".to_string(),
                     ));
                 }
-                state.next_retry_at = Some(Instant::now() + RETRY_INTERVAL);
+                state.next_retry_at = Some(Instant::now() + REFRESH_ATTEMPT_INTERVAL);
                 return;
             }
             info!(
@@ -566,7 +682,7 @@ fn run_refresh_impl<F>(
             // this the catalog would go permanently stale after the first 200
             // (the event loop only refreshes when next_retry_at is set), and
             // the etag makes the next conditional GET cheap.
-            state.next_retry_at = Some(Instant::now() + RETRY_INTERVAL);
+            state.next_retry_at = Some(Instant::now() + REFRESH_ATTEMPT_INTERVAL);
             let _ = daemon_tx.send(DaemonCommand::CatalogBaseChanged {
                 base: state.base.clone(),
                 etag: state.etag.clone(),
@@ -580,7 +696,7 @@ fn run_refresh_impl<F>(
             for r in reply {
                 let _ = r.tx.send(Err(e.to_string()));
             }
-            state.next_retry_at = Some(Instant::now() + RETRY_INTERVAL);
+            state.next_retry_at = Some(Instant::now() + REFRESH_ATTEMPT_INTERVAL);
         }
     }
 }
@@ -724,20 +840,17 @@ mod tests {
     fn cached_base_round_trips_through_postcard() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("catalog.bin");
-        let etag = dir.path().join("models.dev.etag");
 
         // No cache yet → None, and the caller falls back to embedded.
         assert!(load_cached_base(&bin).is_none());
-        assert!(load_cached_etag(&etag).is_none());
 
-        write_catalog_cache(&tiny_base(), Some("\"v1\""), &bin, &etag).unwrap();
+        write_catalog_cache(&tiny_base(), &bin).unwrap();
 
         let loaded = load_cached_base(&bin).expect("cache loads");
         // ProviderEntry has no PartialEq; compare the load-bearing fields.
         assert_eq!(loaded.len(), tiny_base().len());
         assert_eq!(loaded[0].slug, "acme");
         assert_eq!(loaded[1].slug, "zoocorp");
-        assert_eq!(load_cached_etag(&etag).as_deref(), Some("\"v1\""));
     }
 
     #[test]
@@ -748,22 +861,6 @@ mod tests {
         // A corrupt cache must not brick the daemon: it logs a warning and
         // returns None so the embedded catalog.bin is used instead.
         assert!(load_cached_base(&bin).is_none());
-    }
-
-    #[test]
-    fn write_without_etag_does_not_leave_stale_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("catalog.bin");
-        let etag = dir.path().join("models.dev.etag");
-
-        write_catalog_cache(&tiny_base(), Some("old"), &bin, &etag).unwrap();
-        assert_eq!(load_cached_etag(&etag).as_deref(), Some("old"));
-
-        // A later fetch without an etag must clear the sidecar, otherwise the
-        // stale etag would be served as If-None-Match forever.
-        write_catalog_cache(&tiny_base(), None, &bin, &etag).unwrap();
-        assert!(load_cached_etag(&etag).is_none());
-        assert!(load_cached_base(&bin).is_some());
     }
 
     #[test]
@@ -841,10 +938,11 @@ mod tests {
     fn catalog_paths_resolve_under_choreographr_dirs() {
         // from_dirs() follows the same convention as db_path/accounts_config_path.
         // We can't assert the absolute value (the XDG dirs are env-dependent),
-        // but the file NAMES must match the documented contract.
+        // but the file NAMES must match the documented contract. The etag and
+        // last-attempt timestamp are deliberately NOT here — they live in the
+        // DB (catalog_state), not on the filesystem.
         let paths = CatalogPaths::from_dirs();
         assert!(paths.bin.ends_with("choreographr/catalog.bin"));
-        assert!(paths.etag.ends_with("choreographr/models.dev.etag"));
         assert!(paths.overlay.ends_with("choreographr/models-overlay.toml"));
     }
 
@@ -881,11 +979,13 @@ mod tests {
     }"#;
 
     /// A starting maintenance state for the state-machine tests: a small
-    /// base, a cached etag, no revalidation pending.
+    /// base, a cached etag, a recent (fresh) attempt timestamp, no
+    /// revalidation pending.
     fn maintenance_state() -> MaintenanceState {
         MaintenanceState {
             base: tiny_base(),
             etag: Some("\"v1\"".into()),
+            last_attempt_ms: Some(1_700_000_000_000),
             last_applied_user_overlay: None,
             next_retry_at: None,
         }
@@ -1087,6 +1187,98 @@ mod tests {
         assert!(state.next_retry_at.is_some());
     }
 
+    // ── should_fetch_at_startup (the startup gate) ──
+
+    /// A wall-clock `now` for the gate/deadline tests, far enough past the
+    /// epoch that the arithmetic is realistic.
+    const NOW_MS: u64 = 1_700_000_000_000;
+    /// The interval as millis (25 h), for boundary tests.
+    const INTERVAL_MS: u64 = 25 * 60 * 60 * 1000;
+
+    #[test]
+    fn startup_gate_fetches_without_a_valid_cache() {
+        // No valid cache → fetch immediately, whatever the recorded attempt
+        // says (even a fresh one): a missing/corrupt catalog.bin must be
+        // rebuilt, not sat on forever.
+        assert!(should_fetch_at_startup(false, None, NOW_MS));
+        assert!(should_fetch_at_startup(false, Some(NOW_MS - 1_000), NOW_MS));
+        assert!(should_fetch_at_startup(false, Some(NOW_MS), NOW_MS));
+    }
+
+    #[test]
+    fn startup_gate_fetches_without_a_recorded_attempt() {
+        // Missing timestamp = first run or an upgrade from a build without
+        // the key → unknown freshness → fetch (conservative: a wrong fetch is
+        // one polite conditional GET; a wrong skip is a stale cache).
+        assert!(should_fetch_at_startup(true, None, NOW_MS));
+    }
+
+    #[test]
+    fn startup_gate_skips_fetch_while_attempt_is_fresh() {
+        // A valid cache + a recorded attempt inside the cooldown window →
+        // skip the startup fetch (the daemon does not hit the network at
+        // every start, and the 25 h drift survives restarts).
+        assert!(!should_fetch_at_startup(true, Some(NOW_MS - 1_000), NOW_MS));
+        assert!(!should_fetch_at_startup(
+            true,
+            Some(NOW_MS - INTERVAL_MS / 2),
+            NOW_MS
+        ));
+    }
+
+    #[test]
+    fn startup_gate_fetches_at_or_after_the_interval() {
+        // Exactly at the boundary (elapsed == 25 h) is STALE — the window is
+        // `now − last_attempt >= interval`.
+        assert!(should_fetch_at_startup(
+            true,
+            Some(NOW_MS - INTERVAL_MS),
+            NOW_MS
+        ));
+        assert!(should_fetch_at_startup(
+            true,
+            Some(NOW_MS - INTERVAL_MS - 60_000),
+            NOW_MS
+        ));
+        // A timestamp from the future (clock skew) reads as fresh.
+        assert!(!should_fetch_at_startup(
+            true,
+            Some(NOW_MS + 3_600_000),
+            NOW_MS
+        ));
+    }
+
+    // ── next_retry_deadline (the in-run timer derivation) ──
+
+    #[test]
+    fn retry_deadline_is_none_without_a_recorded_attempt() {
+        // Nothing to derive from — the startup gate fetches instead.
+        assert_eq!(next_retry_deadline(None, Instant::now(), NOW_MS), None);
+    }
+
+    #[test]
+    fn retry_deadline_is_remaining_time_after_a_fresh_attempt() {
+        // A fresh attempt arms the timer for the REMAINING time, not a full
+        // interval — so a daemon that restarts 1 h into the cooldown waits
+        // 24 more hours, preserving the original wall-clock deadline.
+        let now = Instant::now();
+        let deadline = next_retry_deadline(Some(NOW_MS - 3_600_000), now, NOW_MS)
+            .expect("a fresh attempt yields a deadline");
+        let expected = Duration::from_millis(INTERVAL_MS - 3_600_000);
+        assert_eq!(deadline.duration_since(now), expected);
+    }
+
+    #[test]
+    fn retry_deadline_saturates_at_now_when_already_due() {
+        // The deadline has already passed (stale but the gate somehow skipped
+        // the fetch): saturate to `now` so the next loop iteration fires the
+        // refresh immediately instead of waiting.
+        let now = Instant::now();
+        let deadline = next_retry_deadline(Some(NOW_MS - INTERVAL_MS - 60_000), now, NOW_MS)
+            .expect("a stale attempt still yields a deadline");
+        assert_eq!(deadline, now);
+    }
+
     #[test]
     fn catalog_updated_payload_round_trips_catalog_provider() {
         // CatalogProvider is the wire pair the daemon broadcasts; make sure
@@ -1234,7 +1426,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = CatalogPaths {
             bin: dir.path().join("data/choreographr/catalog.bin"),
-            etag: dir.path().join("data/choreographr/models.dev.etag"),
             overlay: dir.path().join("config/choreographr/models-overlay.toml"),
         };
 

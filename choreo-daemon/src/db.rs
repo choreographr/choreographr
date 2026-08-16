@@ -17,6 +17,24 @@ const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credenti
 /// schema version under [`SCHEMA_VERSION_KEY`]; the test-only
 /// `next_session_id` counter shares the same table (test key, shared table).
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+/// Runtime catalog-refresh state (S4): the last models.dev fetch-attempt
+/// timestamp and the current etag. One table for both so the refresh state is
+/// a single coherent record. A new table is created lazily on first write, so
+/// adding it is purely additive — no schema version bump (the migration chain
+/// stays empty).
+const CATALOG_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalog_state");
+/// Key for the last models.dev fetch-attempt timestamp (Unix epoch millis, 8
+/// bytes little-endian). Written BEFORE every fetch: the cooldown is armed at
+/// attempt start, so a daemon that crashes mid-fetch and restarts immediately
+/// reads a fresh timestamp and honors the remaining cooldown instead of
+/// re-fetching.
+const CATALOG_LAST_ATTEMPT_KEY: &str = "last_attempt_ms";
+/// Key for the models.dev etag (UTF-8 bytes of the raw entity-tag). Written by
+/// the daemon command loop AFTER the cache bin is persisted, so the etag
+/// always describes content at least as new as what is on disk (bin-first
+/// ordering keeps a crash between the two writes paired with the OLD content,
+/// which self-heals via a 200 on the next fetch).
+const CATALOG_ETAG_KEY: &str = "etag";
 const SESSION_KV: TableDefinition<(u64, String), Vec<u8>> = TableDefinition::new("session_kv");
 /// Tombstones for deleted sessions whose still-shutting-down thread may
 /// re-create the record.  Keyed by session id; present means "deleted — purge
@@ -837,6 +855,121 @@ pub fn remove_credential_blob(db: &redb::Database, service: &str) -> Result<(), 
     Ok(())
 }
 
+// ── Catalog state table ───────────────────────────────────────────────────────
+
+/// Record the wall-clock time (Unix epoch millis) at which a models.dev fetch
+/// attempt STARTED. The S4 pacing anchor: every attempt (startup refresh,
+/// timer revalidation, `/refresh-models`, a coalesced burst — always one
+/// write) goes through this, and the outcome (200/304/failure) is irrelevant
+/// to the recorded value — the 25h no-reattempt rule is anchored on "when we
+/// last tried", not "when we last succeeded".
+pub fn set_catalog_last_attempt_ms(db: &redb::Database, ms: u64) -> io::Result<()> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+    {
+        let mut table = write_txn
+            .open_table(CATALOG_STATE)
+            .map_err(|e| db_err(format!("redb open catalog_state: {e}")))?;
+        let bytes = ms.to_le_bytes();
+        table
+            .insert(CATALOG_LAST_ATTEMPT_KEY, bytes.as_slice())
+            .map_err(|e| db_err(format!("redb set catalog last_attempt_ms: {e}")))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| db_err(format!("redb commit last_attempt_ms: {e}")))?;
+    Ok(())
+}
+
+/// Read the recorded catalog fetch-attempt timestamp. `None` when no attempt
+/// has ever been recorded (first run, or an upgrade from a build without the
+/// key) — callers treat that as "stale, fetch now". A stored value with an
+/// unexpected length is logged and treated as absent, the same policy as
+/// undecodable session records: the timestamp is advisory pacing, so a corrupt
+/// value must never fail the caller (or the daemon).
+pub fn get_catalog_last_attempt_ms(db: &redb::Database) -> io::Result<Option<u64>> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+    let table = match read_txn.open_table(CATALOG_STATE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(db_err(format!("redb open catalog_state: {e}"))),
+    };
+    match table
+        .get(CATALOG_LAST_ATTEMPT_KEY)
+        .map_err(|e| db_err(format!("redb get catalog last_attempt_ms: {e}")))?
+    {
+        Some(guard) => match <[u8; 8]>::try_from(guard.value()) {
+            Ok(bytes) => Ok(Some(u64::from_le_bytes(bytes))),
+            Err(_) => {
+                warn!("catalog last_attempt_ms has an invalid length; treating as absent");
+                Ok(None)
+            }
+        },
+        None => Ok(None),
+    }
+}
+
+/// Store or clear the models.dev etag. `Some` inserts the raw entity-tag
+/// (replacing any previous value); `None` removes the key — a fetch that came
+/// back without an etag must not leave a stale one behind (it would be served
+/// as `If-None-Match` forever).
+pub fn set_catalog_etag(db: &redb::Database, etag: Option<&str>) -> io::Result<()> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+    {
+        let mut table = write_txn
+            .open_table(CATALOG_STATE)
+            .map_err(|e| db_err(format!("redb open catalog_state: {e}")))?;
+        match etag {
+            Some(etag) => {
+                table
+                    .insert(CATALOG_ETAG_KEY, etag.as_bytes())
+                    .map_err(|e| db_err(format!("redb set catalog etag: {e}")))?;
+            }
+            None => {
+                table
+                    .remove(CATALOG_ETAG_KEY)
+                    .map_err(|e| db_err(format!("redb remove catalog etag: {e}")))?;
+            }
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| db_err(format!("redb commit etag: {e}")))?;
+    Ok(())
+}
+
+/// Read the stored models.dev etag. `None` when absent or blank (an empty
+/// stored value is treated as absent — it could never be a valid entity-tag).
+pub fn get_catalog_etag(db: &redb::Database) -> io::Result<Option<String>> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+    let table = match read_txn.open_table(CATALOG_STATE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(db_err(format!("redb open catalog_state: {e}"))),
+    };
+    match table
+        .get(CATALOG_ETAG_KEY)
+        .map_err(|e| db_err(format!("redb get catalog etag: {e}")))?
+    {
+        Some(guard) => {
+            let trimmed = String::from_utf8_lossy(guard.value()).trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
 // ── Session KV table ───────────────────────────────────────────────────────────
 
 /// Insert or overwrite a key-value pair for the given session.
@@ -1393,6 +1526,88 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
         assert_eq!(purge_tombstoned_sessions(&db).unwrap(), 0);
+    }
+
+    #[test]
+    fn catalog_last_attempt_ms_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+
+        // A fresh database has no catalog_state table yet → None (the caller
+        // treats that as "stale, fetch now").
+        assert_eq!(get_catalog_last_attempt_ms(&db).unwrap(), None);
+
+        set_catalog_last_attempt_ms(&db, 1_700_000_123_456).unwrap();
+        assert_eq!(
+            get_catalog_last_attempt_ms(&db).unwrap(),
+            Some(1_700_000_123_456)
+        );
+
+        // Overwrite: a later attempt replaces the earlier one (one attempt
+        // timestamp, always the most recent).
+        set_catalog_last_attempt_ms(&db, 1_700_000_500_000).unwrap();
+        assert_eq!(
+            get_catalog_last_attempt_ms(&db).unwrap(),
+            Some(1_700_000_500_000)
+        );
+    }
+
+    #[test]
+    fn catalog_last_attempt_ms_corrupt_length_treated_as_absent() {
+        // A stored value with the wrong length (e.g. an interrupted/foreign
+        // write) must be treated as absent with a warning, never an error —
+        // the timestamp is advisory pacing and a corrupt value must not fail
+        // the daemon.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(CATALOG_STATE).unwrap();
+                table
+                    .insert(CATALOG_LAST_ATTEMPT_KEY, b"too short".as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        assert_eq!(get_catalog_last_attempt_ms(&db).unwrap(), None);
+    }
+
+    #[test]
+    fn catalog_etag_round_trips_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+
+        assert_eq!(get_catalog_etag(&db).unwrap(), None);
+
+        set_catalog_etag(&db, Some("\"v1\"")).unwrap();
+        assert_eq!(get_catalog_etag(&db).unwrap().as_deref(), Some("\"v1\""));
+
+        // Replacing an etag stores the new one.
+        set_catalog_etag(&db, Some("W/\"v2\"")).unwrap();
+        assert_eq!(get_catalog_etag(&db).unwrap().as_deref(), Some("W/\"v2\""));
+
+        // A fetch that returned no etag must clear the stored one, otherwise
+        // the stale etag would be served as If-None-Match forever.
+        set_catalog_etag(&db, None).unwrap();
+        assert_eq!(get_catalog_etag(&db).unwrap(), None);
+    }
+
+    #[test]
+    fn catalog_etag_blank_value_reads_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(CATALOG_STATE).unwrap();
+                table.insert(CATALOG_ETAG_KEY, b"   ".as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        // Blank (whitespace-only) reads as absent — it could never be a valid
+        // entity-tag.
+        assert_eq!(get_catalog_etag(&db).unwrap(), None);
     }
 
     #[test]

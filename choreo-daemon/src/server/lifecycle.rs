@@ -217,8 +217,11 @@ pub fn run_server(
     // `DaemonCommand::CatalogBaseChanged` back to the command loop, the single
     // writer of the catalog ArcSwap). Spawned before the accept loop so the
     // startup swap lands promptly.
-    let maintenance_tx =
-        crate::catalog::spawn_catalog_maintenance(daemon_tx.clone(), state.catalog_paths.clone());
+    let maintenance_tx = crate::catalog::spawn_catalog_maintenance(
+        daemon_tx.clone(),
+        state.db.clone(),
+        state.catalog_paths.clone(),
+    );
     state.maintenance_tx = Some(maintenance_tx);
 
     let shutdown = Arc::new(AtomicBool::new(false));

@@ -551,8 +551,18 @@ override any field per-account:
 the cache at `$XDG_DATA_HOME/choreographr/catalog.bin` (falling back to the
 embedded blob) and revalidates it against models.dev with an etag conditional
 GET on a background thread (304 → keep, 200 → normalize, swap, and persist the
-cache; every outcome arms the next revalidation 24 h out, so the cache stays
-fresh). A **user overlay** at
+cache). **Refresh pacing is a 25 h attempt cooldown**: the daemon attempts a
+fetch at most once per 25 h regardless of the last outcome (200/304/failure),
+anchored on a wall-clock attempt timestamp persisted in the daemon DB
+(`catalog_state`), recorded BEFORE each fetch — so the cadence survives
+restarts, a crash mid-fetch cannot re-trigger an immediate re-fetch, and each
+daemon's fetch time drifts +1 h/day to spread load across the daily cycle.
+The startup fetch is **gated**: it runs immediately iff there is no valid
+cache, no recorded attempt, or the attempt is stale; otherwise the daemon
+skips the network hit and arms the revalidation timer for the remaining time
+(`/refresh-models` bypasses the cooldown anytime). The models.dev **etag also
+lives in the DB**, written only after the cache bin is on disk (crash-safe
+ordering; a missing cache never sends `If-None-Match`). A **user overlay** at
 `$XDG_CONFIG_HOME/choreographr/models-overlay.toml` is merged on top of the
 bundled overlay with the same schema — provider scalars (`protocol`,
 `base_url`, `max_tokens_field`, `default_model`, `display_name`) and per-model

@@ -167,8 +167,8 @@ pub enum DaemonCommand {
         /// with a fresh value means the file was edited; `None` after `Some`
         /// means it was deleted.
         user_overlay: Option<String>,
-        /// Persist the cache bin + etag sidecar after swapping (live fetches
-        /// only — a startup cache load is already on disk).
+        /// Persist the cache bin (file) + etag (DB) after swapping (live
+        /// fetches only — a startup cache load is already on disk).
         persist: bool,
         /// Reply channel(s) for a `/refresh-models` request (empty for
         /// background events; one entry per coalesced requester, each
@@ -1034,8 +1034,8 @@ impl DaemonState {
     /// Merge order, lowest → highest wins: normalized models.dev base →
     /// bundled overlay → user overlay. The merged catalog is validated
     /// non-empty before the swap (a hostile/typo'd overlay must never leave
-    /// the daemon with an empty catalog). On a live fetch the cache bin +
-    /// etag sidecar are persisted atomically. Every swap broadcasts
+    /// the daemon with an empty catalog). On a live fetch the cache bin is
+    /// persisted atomically and the etag to the DB. Every swap broadcasts
     /// `CatalogUpdated` so clients can refresh their provider pickers. The
     /// work is split into small steps (merge → validate → swap → persist →
     /// broadcast → reply) so each stage stays readable and unit-testable.
@@ -1110,11 +1110,17 @@ impl DaemonState {
         }
     }
 
-    /// Persist the cache bin + etag sidecar after a live fetch. Startup
-    /// loads (`persist: false`) are already on disk — a cache-sourced base
-    /// needs no rewrite, and a cache-miss will be persisted on the first
-    /// fetch — so only live fetches write. Failures are logged, never fatal:
-    /// the next refresh re-fetches and tries again.
+    /// Persist the cache bin + etag after a live fetch. Startup loads
+    /// (`persist: false`) are already on disk — a cache-sourced base needs no
+    /// rewrite, and a cache-miss will be persisted on the first fetch — so
+    /// only live fetches write. The **bin file is written first, the etag to
+    /// the DB second**: a crash between the two leaves the OLD etag paired
+    /// with the OLD bin (self-healing — the next conditional GET 200s and
+    /// stores a fresh etag), never a NEW etag over OLD content (which would
+    /// 304 forever against a stale cache). If the bin write fails, the etag
+    /// is deliberately NOT updated — it must never describe content that is
+    /// not on disk. Failures are logged, never fatal: the next refresh
+    /// re-fetches and tries again.
     fn persist_catalog_cache(
         &self,
         base: &[choreo_ai_protocols::ProviderEntry],
@@ -1124,15 +1130,19 @@ impl DaemonState {
         if !persist {
             return;
         }
-        if let Err(e) = crate::catalog::write_catalog_cache(
-            base,
-            etag,
-            &self.catalog_paths.bin,
-            &self.catalog_paths.etag,
-        ) {
+        // Bin first: the etag write below must only happen once the content
+        // it validates is durably on disk.
+        if let Err(e) = crate::catalog::write_catalog_cache(base, &self.catalog_paths.bin) {
             warn!(
                 error = %e,
                 "failed to persist the catalog cache; the next refresh will re-fetch",
+            );
+            return;
+        }
+        if let Err(e) = crate::db::set_catalog_etag(&self.db, etag) {
+            warn!(
+                error = %e,
+                "failed to persist the catalog etag; the next refresh will do a plain GET",
             );
         }
     }
