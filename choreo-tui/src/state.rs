@@ -2307,6 +2307,12 @@ impl App {
             height: new_height,
         });
         if old_width != new_width || old_height != self.history_viewport.height {
+            // A selection is stored as (content line, viewport column); a
+            // terminal resize re-wraps every line, so a stored column no
+            // longer points at the same text (and the anchor is deliberately
+            // never re-resolved — only the head follows the cursor).  Drop
+            // the gesture like suspend/page-switch do.
+            self.text_selection = None;
             for display in self.session_displays.values_mut() {
                 display.render_cache.fill(None);
                 display.markers_dirty = true;
@@ -5262,6 +5268,7 @@ mod tests {
             head: (2, 3),
             cursor: (0, 0),
             active: true,
+            head_sync: None,
         });
         app.reset_for_session_switch(1);
         assert!(
@@ -5282,11 +5289,40 @@ mod tests {
             head: (2, 3),
             cursor: (0, 0),
             active: true,
+            head_sync: None,
         });
         app.set_page(Page::SessionManager);
         assert!(
             app.text_selection.is_none(),
             "page switch must clear the in-progress selection"
+        );
+    }
+
+    #[test]
+    fn terminal_resize_clears_text_selection() {
+        // A resize re-wraps every rendered line, so a stored (content line,
+        // viewport column) anchor would point at different text afterwards.
+        // The gesture must be dropped exactly like a suspend/page switch
+        // drops it (the anchor is deliberately never re-resolved).
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 30;
+        app.text_selection = Some(crate::selection::TextSelection {
+            anchor: (0, 0),
+            head: (2, 3),
+            cursor: (0, 0),
+            active: true,
+            head_sync: None,
+        });
+        // A different cached terminal size drives a viewport change without
+        // touching a real terminal (crossterm::size() is only queried when
+        // `terminal_resized` is set).
+        app.last_terminal_size = Some((60, 20));
+        app.terminal_resized = false;
+        app.update_viewport_from_terminal_size();
+        assert!(
+            app.text_selection.is_none(),
+            "terminal resize must clear the in-progress selection"
         );
     }
 

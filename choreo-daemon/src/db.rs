@@ -857,13 +857,33 @@ pub fn remove_credential_blob(db: &redb::Database, service: &str) -> Result<(), 
 
 // ── Catalog state table ───────────────────────────────────────────────────────
 
-/// Record the wall-clock time (Unix epoch millis) at which a models.dev fetch
-/// attempt STARTED. The S4 pacing anchor: every attempt (startup refresh,
-/// timer revalidation, `/refresh-models`, a coalesced burst — always one
-/// write) goes through this, and the outcome (200/304/failure) is irrelevant
-/// to the recorded value — the 25h no-reattempt rule is anchored on "when we
-/// last tried", not "when we last succeeded".
-pub fn set_catalog_last_attempt_ms(db: &redb::Database, ms: u64) -> io::Result<()> {
+/// Read a raw value out of the `catalog_state` table.  `Ok(None)` when the
+/// table does not exist yet (it is created lazily on the first write) or the
+/// key is absent — the shared existence-tolerant read both getters use, so
+/// the redb boilerplate lives in one place.
+fn catalog_state_get(db: &redb::Database, key: &str) -> io::Result<Option<Vec<u8>>> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+    let table = match read_txn.open_table(CATALOG_STATE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(db_err(format!("redb open catalog_state: {e}"))),
+    };
+    match table
+        .get(key)
+        .map_err(|e| db_err(format!("redb get catalog_state {key}: {e}")))?
+    {
+        Some(guard) => Ok(Some(guard.value().to_vec())),
+        None => Ok(None),
+    }
+}
+
+/// Set or clear one `catalog_state` key in a single write transaction.
+/// `Some` inserts the value (creating the table on the first write); `None`
+/// removes the key.  Both writers (the maintenance thread's attempt
+/// timestamp, the command loop's etag) go through this.
+fn catalog_state_write(db: &redb::Database, key: &str, value: Option<&[u8]>) -> io::Result<()> {
     let write_txn = db
         .begin_write()
         .map_err(|e| db_err(format!("redb write txn: {e}")))?;
@@ -871,15 +891,33 @@ pub fn set_catalog_last_attempt_ms(db: &redb::Database, ms: u64) -> io::Result<(
         let mut table = write_txn
             .open_table(CATALOG_STATE)
             .map_err(|e| db_err(format!("redb open catalog_state: {e}")))?;
-        let bytes = ms.to_le_bytes();
-        table
-            .insert(CATALOG_LAST_ATTEMPT_KEY, bytes.as_slice())
-            .map_err(|e| db_err(format!("redb set catalog last_attempt_ms: {e}")))?;
+        match value {
+            Some(value) => {
+                table
+                    .insert(key, value)
+                    .map_err(|e| db_err(format!("redb set catalog_state {key}: {e}")))?;
+            }
+            None => {
+                table
+                    .remove(key)
+                    .map_err(|e| db_err(format!("redb remove catalog_state {key}: {e}")))?;
+            }
+        }
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit last_attempt_ms: {e}")))?;
+        .map_err(|e| db_err(format!("redb commit catalog_state {key}: {e}")))?;
     Ok(())
+}
+
+/// Record the wall-clock time (Unix epoch millis) at which a models.dev fetch
+/// attempt STARTED. The S4 pacing anchor: every attempt (startup refresh,
+/// timer revalidation, `/refresh-models`, a coalesced burst — always one
+/// write) goes through this, and the outcome (200/304/failure) is irrelevant
+/// to the recorded value — the 25h no-reattempt rule is anchored on "when we
+/// last tried", not "when we last succeeded".
+pub fn set_catalog_last_attempt_ms(db: &redb::Database, ms: u64) -> io::Result<()> {
+    catalog_state_write(db, CATALOG_LAST_ATTEMPT_KEY, Some(&ms.to_le_bytes()))
 }
 
 /// Read the recorded catalog fetch-attempt timestamp. `None` when no attempt
@@ -889,26 +927,15 @@ pub fn set_catalog_last_attempt_ms(db: &redb::Database, ms: u64) -> io::Result<(
 /// undecodable session records: the timestamp is advisory pacing, so a corrupt
 /// value must never fail the caller (or the daemon).
 pub fn get_catalog_last_attempt_ms(db: &redb::Database) -> io::Result<Option<u64>> {
-    let read_txn = db
-        .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
-    let table = match read_txn.open_table(CATALOG_STATE) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(db_err(format!("redb open catalog_state: {e}"))),
+    let Some(bytes) = catalog_state_get(db, CATALOG_LAST_ATTEMPT_KEY)? else {
+        return Ok(None);
     };
-    match table
-        .get(CATALOG_LAST_ATTEMPT_KEY)
-        .map_err(|e| db_err(format!("redb get catalog last_attempt_ms: {e}")))?
-    {
-        Some(guard) => match <[u8; 8]>::try_from(guard.value()) {
-            Ok(bytes) => Ok(Some(u64::from_le_bytes(bytes))),
-            Err(_) => {
-                warn!("catalog last_attempt_ms has an invalid length; treating as absent");
-                Ok(None)
-            }
-        },
-        None => Ok(None),
+    match <[u8; 8]>::try_from(bytes.as_slice()) {
+        Ok(bytes) => Ok(Some(u64::from_le_bytes(bytes))),
+        Err(_) => {
+            warn!("catalog last_attempt_ms has an invalid length; treating as absent");
+            Ok(None)
+        }
     }
 }
 
@@ -917,56 +944,20 @@ pub fn get_catalog_last_attempt_ms(db: &redb::Database) -> io::Result<Option<u64
 /// back without an etag must not leave a stale one behind (it would be served
 /// as `If-None-Match` forever).
 pub fn set_catalog_etag(db: &redb::Database, etag: Option<&str>) -> io::Result<()> {
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
-    {
-        let mut table = write_txn
-            .open_table(CATALOG_STATE)
-            .map_err(|e| db_err(format!("redb open catalog_state: {e}")))?;
-        match etag {
-            Some(etag) => {
-                table
-                    .insert(CATALOG_ETAG_KEY, etag.as_bytes())
-                    .map_err(|e| db_err(format!("redb set catalog etag: {e}")))?;
-            }
-            None => {
-                table
-                    .remove(CATALOG_ETAG_KEY)
-                    .map_err(|e| db_err(format!("redb remove catalog etag: {e}")))?;
-            }
-        }
-    }
-    write_txn
-        .commit()
-        .map_err(|e| db_err(format!("redb commit etag: {e}")))?;
-    Ok(())
+    catalog_state_write(db, CATALOG_ETAG_KEY, etag.map(str::as_bytes))
 }
 
 /// Read the stored models.dev etag. `None` when absent or blank (an empty
 /// stored value is treated as absent — it could never be a valid entity-tag).
 pub fn get_catalog_etag(db: &redb::Database) -> io::Result<Option<String>> {
-    let read_txn = db
-        .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
-    let table = match read_txn.open_table(CATALOG_STATE) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(db_err(format!("redb open catalog_state: {e}"))),
+    let Some(bytes) = catalog_state_get(db, CATALOG_ETAG_KEY)? else {
+        return Ok(None);
     };
-    match table
-        .get(CATALOG_ETAG_KEY)
-        .map_err(|e| db_err(format!("redb get catalog etag: {e}")))?
-    {
-        Some(guard) => {
-            let trimmed = String::from_utf8_lossy(guard.value()).trim().to_string();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed))
-            }
-        }
-        None => Ok(None),
+    let trimmed = String::from_utf8_lossy(&bytes).trim().to_string();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed))
     }
 }
 
