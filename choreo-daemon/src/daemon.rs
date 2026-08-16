@@ -1396,18 +1396,25 @@ impl DaemonState {
         }
         // Best-effort advisory: a healthy writer flushes it and closes its
         // own socket; a wedged writer never sees it (the write timeout
-        // reaps the connection instead). Enqueue BEFORE dropping the sink.
+        // reaps the connection instead). Enqueue BEFORE dropping the sink,
+        // through the accounting path: the writer's per-dequeue decrement
+        // (or the exit drain, if the advisory is abandoned behind the stop
+        // point) needs a matching increment, and a dead receiver
+        // self-corrects inside `send_unchecked`.
         if let Some(sink) = self.client_writers.get(&client_id) {
-            let _ = sink.tx.send(DaemonMessage::Evicted);
+            let _ = sink.send_unchecked(&DaemonMessage::Evicted, &self.global_lag);
         }
         self.client_writers.remove(&client_id);
         crate::metrics::record_eviction();
     }
 
     /// Disconnect the currently most-lagging client (used when the daemon-wide
-    /// backlog crosses [`LagLimits::global_budget`]). Scans every subscriber
-    /// map for the largest per-client byte counter — including clients that
-    /// only appear as session subscribers — and evicts that one.
+    /// backlog crosses [`LagLimits::global_budget`]). Only `client_writers`
+    /// is scanned: every real connection's per-client counter lives on its
+    /// writer sink (the activity/summary/session maps hold clones of that
+    /// same sink, sharing one `Arc<AtomicUsize>`), and a client without a
+    /// writer entry has no connection to tear down — `handle_evict_client`
+    /// would no-op on it, silently failing to relieve the pressure.
     fn handle_evict_largest_lagging(&mut self) {
         let mut best: Option<(u64, usize)> = None;
         let mut consider = |id: &u64, sink: &SubscriberSink| {
@@ -1417,12 +1424,6 @@ impl DaemonState {
             }
         };
         for (id, sink) in &self.client_writers {
-            consider(id, sink);
-        }
-        for (id, sink) in &self.activity_subscribers {
-            consider(id, sink);
-        }
-        for (id, sink) in &self.summary_subscribers {
             consider(id, sink);
         }
         if let Some((client_id, _)) = best {
@@ -1443,12 +1444,16 @@ impl DaemonState {
         let clients = self.client_writers.len();
         info!("broadcasting ShuttingDown to {clients} client(s)");
         self.client_writers.retain(|client_id, sink| {
-            match sink.tx.send(DaemonMessage::ShuttingDown) {
-                Ok(()) => true,
-                Err(_) => {
-                    warn!("removing disconnected client {client_id} during shutdown");
-                    false
-                }
+            // Accounted send: the writer thread decrements on dequeue (and
+            // the exit drain picks up anything queued behind the
+            // notification), so the notification must be counted like every
+            // other message; `send_unchecked` self-corrects when the
+            // receiver is gone.
+            if sink.send_unchecked(&DaemonMessage::ShuttingDown, &self.global_lag) {
+                true
+            } else {
+                warn!("removing disconnected client {client_id} during shutdown");
+                false
             }
         });
     }

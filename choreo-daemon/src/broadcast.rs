@@ -57,7 +57,8 @@ pub struct SubscriberSink {
     /// `fetch_add`/`fetch_sub` — no read-modify-write composite that needs a
     /// critical section (the one-place soft-bound check is per-producer on
     /// the post-add value, deliberately racy, see `enqueue`).
-    /// (Documented in AGENTS.md/ARCHITECTURE.md in a later phase.)
+    /// (Sanctioned exception #6 — see AGENTS.md and ARCHITECTURE.md's
+    /// `broadcast.rs` module row for the full rationale.)
     pub bytes_in_flight: Arc<AtomicUsize>,
 }
 
@@ -105,25 +106,43 @@ impl SubscriberSink {
 
         match self.tx.send(msg.clone()) {
             Ok(()) => outcome,
-            // Receiver gone — the client is dead.  The counters were
-            // incremented but the sink is about to be evicted (dropped), so
-            // their values are never read again; no correction needed.
-            Err(_) => EnqueueOutcome::Disconnected,
+            Err(_) => {
+                // Receiver gone — the writer thread has already exited, so
+                // nothing will ever decrement these bytes. Self-correct BOTH
+                // counters: the per-client one dies with the sink anyway, but
+                // `global` is shared and read by every other enqueue, so
+                // leaving it incremented would slowly leak the daemon-wide
+                // budget and could eventually trigger spurious evictions.
+                self.bytes_in_flight.fetch_sub(size, Ordering::Relaxed);
+                global.fetch_sub(size, Ordering::Relaxed);
+                EnqueueOutcome::Disconnected
+            }
         }
     }
 
     /// Enqueue `msg` with byte accounting but WITHOUT the lag-threshold
-    /// check. Used for one-shot guaranteed deliveries that are not evidence
-    /// of a lagging client — the attach `SessionState` snapshot (a single
-    /// large message to a freshly-attached client whose writer is healthy)
-    /// and connection replies. The accounting still matters: the writer
-    /// thread decrements the same counters on every dequeue, so every
-    /// enqueue must be counted or the counters would underflow.
-    pub fn send_unchecked(&self, msg: &DaemonMessage, global: &AtomicUsize) {
+    /// check, returning whether the receiver was alive. Used for one-shot
+    /// guaranteed deliveries that are not evidence of a lagging client — the
+    /// attach `SessionState` snapshot (a single large message to a
+    /// freshly-attached client whose writer is healthy), connection replies,
+    /// and the best-effort `Evicted`/`ShuttingDown` advisories. The
+    /// accounting still matters: the writer thread decrements the same
+    /// counters on every dequeue, so every enqueue must be counted or the
+    /// counters would underflow — and a failed send (receiver gone) is
+    /// self-corrected here for the same reason as in [`Self::enqueue`].
+    pub fn send_unchecked(&self, msg: &DaemonMessage, global: &AtomicUsize) -> bool {
         let size = msg.approx_wire_size();
         self.bytes_in_flight.fetch_add(size, Ordering::Relaxed);
         global.fetch_add(size, Ordering::Relaxed);
-        let _ = self.tx.send(msg.clone());
+        if self.tx.send(msg.clone()).is_ok() {
+            true
+        } else {
+            // Receiver gone — no writer thread will ever decrement this;
+            // restore both counters (see `enqueue`).
+            self.bytes_in_flight.fetch_sub(size, Ordering::Relaxed);
+            global.fetch_sub(size, Ordering::Relaxed);
+            false
+        }
     }
 }
 
@@ -289,8 +308,10 @@ mod tests {
         );
     }
 
-    /// A dropped receiver yields `Disconnected` even though the counters were
-    /// incremented (the sink is about to be evicted, so nobody reads them).
+    /// A dropped receiver yields `Disconnected` and both byte counters are
+    /// restored: the writer thread is gone, so nothing will ever decrement
+    /// the enqueue's bytes — the per-client counter dies with the sink, but
+    /// the daemon-wide counter is shared and must not leak.
     #[test]
     fn enqueue_returns_disconnected_when_receiver_gone() {
         let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
@@ -299,8 +320,46 @@ mod tests {
         let limits = tiny_limits();
         drop(rx); // receiver gone
 
-        let outcome = sink.enqueue(&status_msg(1), &limits, &global);
+        let msg = status_msg(1);
+        let outcome = sink.enqueue(&msg, &limits, &global);
         assert!(matches!(outcome, EnqueueOutcome::Disconnected));
+        // Self-correction: the failed enqueue must leave both counters at
+        // zero, not leak the message's bytes into the daemon-wide budget.
+        assert_eq!(sink.bytes_in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(global.load(Ordering::Relaxed), 0);
+    }
+
+    /// `send_unchecked` (the no-threshold-check path used for attach
+    /// snapshots and the `Evicted`/`ShuttingDown` advisories) self-corrects
+    /// both counters the same way when the receiver is gone.
+    #[test]
+    fn send_unchecked_self_corrects_on_dead_receiver() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let sink = SubscriberSink::new(tx);
+        let global = AtomicUsize::new(0);
+        drop(rx); // receiver gone
+
+        let msg = status_msg(1);
+        let size = msg.approx_wire_size();
+        assert!(
+            !sink.send_unchecked(&msg, &global),
+            "dead receiver must report false"
+        );
+        assert_eq!(sink.bytes_in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(global.load(Ordering::Relaxed), 0);
+
+        // Sanity: with a live receiver the same call reports true and the
+        // counters reflect the enqueued bytes.
+        let (tx2, rx2) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let sink2 = SubscriberSink::new(tx2);
+        let global2 = AtomicUsize::new(0);
+        assert!(
+            sink2.send_unchecked(&msg, &global2),
+            "live receiver must report true"
+        );
+        assert_eq!(rx2.recv().unwrap(), msg, "message must be delivered");
+        assert_eq!(sink2.bytes_in_flight.load(Ordering::Relaxed), size);
+        assert_eq!(global2.load(Ordering::Relaxed), size);
     }
 
     /// The per-client counter increments on every enqueue and only a matching

@@ -2399,6 +2399,18 @@ one message's bytes before the eviction command lands — an exact hard
 cutoff would require a blocking or dropping send, which is exactly what
 this design eliminates.
 
+The byte counters stay BALANCED on every path. The writer thread
+decrements on each dequeue; when it stops early (send error, or the
+`Evicted`/`ShuttingDown` stop) it drains whatever is still queued and
+decrements that too, so an abandoned backlog can never stay frozen in the
+daemon-wide total and permanently exhaust the global budget. Every enqueue
+path (`enqueue`, `send_unchecked`, the connection's `send_to_writer`)
+self-corrects both counters when the send fails on a dead receiver (writer
+thread already gone), and the `Evicted`/`ShuttingDown` advisories are
+accounted like any other message. The one residual race is a straggler
+enqueued in the microseconds between the writer's exit drain and its
+receiver being dropped — the sender's failed send then self-corrects it.
+
 Eviction needs no daemon-held socket handle: each connection's writer gets
 a 5 s socket write timeout (`WRITER_WRITE_TIMEOUT`), so a wedged client
 (zero receive window) cannot stall its writer forever — the write fails,

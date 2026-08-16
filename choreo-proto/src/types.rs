@@ -322,9 +322,12 @@ impl Turn {
     /// client escape eviction. Fixed-size scalars (timestamps, token counts,
     /// flags) are ignored.
     pub fn approx_size(&self) -> usize {
-        // Fixed per-turn overhead (variant/field tags, scalars, Option
-        // markers), over-estimated a little.
-        let mut size = 32usize;
+        // Fixed per-turn overhead from `named_field_overhead(13)` (the 13
+        // named-mode field-name keys + tags; an all-None turn serializes to
+        // ~200 bytes). The arms below add only payload bytes on top, so the
+        // estimate always over-counts: it is a threshold gauge, where
+        // over-counting just makes the lag limit slightly conservative.
+        let mut size = named_field_overhead(13);
         if let Some(s) = &self.error {
             size += s.len();
         }
@@ -893,9 +896,25 @@ impl DaemonMessage {
 
 /// Byte length of an `Option<String>`'s payload (0 when None). Shared by
 /// [`DaemonMessage::approx_wire_size`] so every optional string field is
-/// counted the same way.
+/// counted the same way. Only the payload is counted here — the MessagePack
+/// field-name key and length prefix are covered by the per-field allowance of
+/// [`named_field_overhead`], which the arm's fixed base provides.
 fn option_str_len(s: &Option<String>) -> usize {
     s.as_ref().map_or(0, String::len)
+}
+
+/// Estimated MessagePack named-mode overhead for a struct variant with `n`
+/// fields: the variant tag, map headers, and one field-name key per field.
+/// The allowance is ~24 bytes per field (the longest field-name keys in use
+/// are ~21 chars plus a length prefix; the value side is a nil marker, a
+/// scalar, or a string header — all covered here) plus a fixed tag/header
+/// allowance, so the base alone covers every field's key + value tag whether
+/// the value is absent or present. Arms then add only the variable PAYLOAD
+/// bytes on top. Over-estimating a little is the conservative direction for
+/// a lag-eviction gauge: under-counting could let a lagging client escape
+/// eviction.
+fn named_field_overhead(fields: usize) -> usize {
+    40 + fields * 24
 }
 
 /// Byte length of a `SessionStatus` payload (a small enum; only the
@@ -920,20 +939,23 @@ fn reasoning_capability_size(cap: &ReasoningCapability) -> usize {
 impl DaemonMessage {
     /// Cheap, conservative estimate of this message's serialized byte size.
     ///
-    /// Used by the daemon's lag accounting (a later phase) to gauge how many
-    /// bytes a slow client has fallen behind the streaming frontier. It
+    /// Used by the daemon's lag accounting (broadcast::SubscriberSink) to
+    /// gauge how many bytes a slow client has fallen behind the streaming
+    /// frontier. It
     /// deliberately over-estimates rather than serializes: the accounting is
     /// a threshold gauge, so a slightly-too-big estimate can only trigger
     /// eviction a little early — never let a genuinely lagging client slip
     /// past the limit. O(1) in message count — it sums the variable-size
     /// fields (strings, byte buffers, vecs, turn maps) plus a fixed
     /// per-variant envelope overhead, and ignores fixed-size scalars.
+    /// The over-estimate is pinned against the real encoded payload by
+    /// `approx_wire_size_never_underestimates_encoded_payload`.
     pub fn approx_wire_size(&self) -> usize {
-        // Fixed envelope overhead per variant: the variant tag, MessagePack
-        // field-name keys, and length prefixes. Over-estimating by a fixed
-        // amount is fine — it only makes the eviction threshold slightly
-        // conservative.
-        const OVERHEAD: usize = 48;
+        // Fixed envelope overhead for FIELDLESS variants (Pong, Evicted, …):
+        // just the variant tag, so this generous fixed value is a comfortable
+        // over-estimate. Struct variants get their per-field named-mode key
+        // overhead from `named_field_overhead` instead.
+        const OVERHEAD: usize = 96;
         match self {
             Self::SessionCreated {
                 title,
@@ -943,8 +965,7 @@ impl DaemonMessage {
                 reasoning_effort,
                 ..
             } => {
-                OVERHEAD
-                    + 8
+                named_field_overhead(6)
                     + option_str_len(title)
                     + option_str_len(working_dir)
                     + option_str_len(account_name)
@@ -952,23 +973,25 @@ impl DaemonMessage {
                     + option_str_len(reasoning_effort)
             }
             Self::Sessions { sessions } => {
-                OVERHEAD
+                named_field_overhead(1)
                     + sessions
                         .iter()
                         .map(|s| {
-                            // Fixed per-summary overhead (scalars, status
-                            // tag, flags) + the variable-size fields.
-                            64 + option_str_len(&s.title)
+                            // 15-field SessionSummary: named-mode keys + tags
+                            // + status string (the variable-size status
+                            // payload is not otherwise counted).
+                            named_field_overhead(15)
+                                + option_str_len(&s.title)
                                 + option_str_len(&s.selected_model)
                                 + option_str_len(&s.reasoning_effort)
-                                + 8 // parent_session_id: Option<u64>
                                 + option_str_len(&s.working_dir)
                                 + option_str_len(&s.account_name)
                                 + s.active_tool_groups.iter().map(String::len).sum::<usize>()
+                                + session_status_size(&s.status)
                         })
                         .sum::<usize>()
             }
-            Self::SessionAttached { .. } => OVERHEAD + 8,
+            Self::SessionAttached { .. } => named_field_overhead(1),
             Self::SessionState {
                 title,
                 selected_model,
@@ -980,11 +1003,9 @@ impl DaemonMessage {
                 reasoning_capability,
                 ..
             } => {
-                OVERHEAD
-                    + 8
+                named_field_overhead(13)
                     + option_str_len(title)
                     + option_str_len(selected_model)
-                    + 8 // parent_session_id: Option<u64>
                     + option_str_len(working_dir)
                     + option_str_len(reasoning_effort)
                     + active_tool_groups.iter().map(String::len).sum::<usize>()
@@ -997,14 +1018,14 @@ impl DaemonMessage {
                         .as_ref()
                         .map_or(0, reasoning_capability_size)
             }
-            Self::TurnAppended { turn, .. } => OVERHEAD + 12 + turn.approx_size(),
+            Self::TurnAppended { turn, .. } => named_field_overhead(3) + turn.approx_size(),
             Self::SessionStatusChanged { status, .. } => {
-                OVERHEAD + 12 + session_status_size(status)
+                named_field_overhead(3) + session_status_size(status)
             }
             Self::SessionFailed {
                 operation, error, ..
-            } => OVERHEAD + 8 + operation.len() + error.len(),
-            Self::Started { .. } => OVERHEAD + 16,
+            } => named_field_overhead(3) + operation.len() + error.len(),
+            Self::Started { .. } => named_field_overhead(4),
             Self::ToolCallStarted {
                 call_id,
                 tool_name,
@@ -1012,8 +1033,7 @@ impl DaemonMessage {
                 invocation_description,
                 ..
             } => {
-                OVERHEAD
-                    + 16
+                named_field_overhead(6)
                     + call_id.len()
                     + tool_name.len()
                     + arguments_json.len()
@@ -1021,89 +1041,100 @@ impl DaemonMessage {
             }
             Self::ToolCallFinished {
                 call_id, tool_name, ..
-            } => OVERHEAD + 16 + call_id.len() + tool_name.len(),
-            Self::ToolResultChunk { data, .. } => OVERHEAD + 16 + data.len(),
+            } => named_field_overhead(4) + call_id.len() + tool_name.len(),
+            Self::ToolResultChunk { call_id, data, .. } => {
+                named_field_overhead(4) + call_id.len() + data.len()
+            }
             Self::ToolCallFailed {
                 call_id,
                 tool_name,
                 error,
                 ..
-            } => OVERHEAD + 24 + call_id.len() + tool_name.len() + error.len(),
-            Self::TokenUsageUpdate { .. } => OVERHEAD + 16,
-            Self::LiveOutputTokenCount { .. } => OVERHEAD + 16,
+            } => named_field_overhead(5) + call_id.len() + tool_name.len() + error.len(),
+            Self::TokenUsageUpdate { .. } => named_field_overhead(3),
+            Self::LiveOutputTokenCount { .. } => named_field_overhead(3),
             Self::OutputChunk { stream, data, .. } => {
                 let stream_len = match stream {
                     OutputStream::Answer | OutputStream::Reasoning => 4,
                 };
-                OVERHEAD + 16 + stream_len + data.len()
+                named_field_overhead(4) + stream_len + data.len()
             }
-            Self::Done { .. } => OVERHEAD + 16,
-            Self::Failed { error, .. } => OVERHEAD + 12 + error.len(),
-            Self::Cancelled { .. } => OVERHEAD + 12,
+            Self::Done { .. } => named_field_overhead(4),
+            Self::Failed { error, .. } => named_field_overhead(3) + error.len(),
+            Self::Cancelled { .. } => named_field_overhead(2),
             Self::Pong => OVERHEAD,
             Self::Models {
                 models,
                 selected_model,
             } => {
-                OVERHEAD
+                named_field_overhead(2)
                     + models.iter().map(String::len).sum::<usize>()
                     + option_str_len(selected_model)
             }
-            Self::ModelsFailed { error } => OVERHEAD + error.len(),
-            Self::ModelsRefreshed { .. } => OVERHEAD + 16,
-            Self::ModelsRefreshFailed { error } => OVERHEAD + error.len(),
+            Self::ModelsFailed { error } => named_field_overhead(1) + error.len(),
+            // providers/models are usize COUNTS (fixed-size scalars), covered
+            // by the per-field allowance.
+            Self::ModelsRefreshed { .. } => named_field_overhead(3),
+            Self::ModelsRefreshFailed { error } => named_field_overhead(1) + error.len(),
             Self::CatalogUpdated { providers } => {
-                OVERHEAD
+                named_field_overhead(1)
                     + providers
                         .iter()
-                        .map(|p| 16 + p.slug.len() + p.display_name.len())
+                        .map(|p| 32 + p.slug.len() + p.display_name.len())
                         .sum::<usize>()
             }
-            Self::ModelSelected { model, .. } => OVERHEAD + 8 + model.len(),
+            Self::ModelSelected { model, .. } => named_field_overhead(2) + model.len(),
             Self::ModelSelectionFailed { model, error, .. } => {
-                OVERHEAD + 16 + model.len() + error.len()
+                named_field_overhead(3) + model.len() + error.len()
             }
             Self::Unlocked | Self::Locked | Self::ShuttingDown | Self::Evicted => OVERHEAD,
-            Self::LockedError { error } => OVERHEAD + error.len(),
-            Self::CredentialAdded { service } => OVERHEAD + service.len(),
+            Self::LockedError { error } => named_field_overhead(1) + error.len(),
+            Self::CredentialAdded { service } => named_field_overhead(1) + service.len(),
             Self::CredentialAddFailed { service, error } => {
-                OVERHEAD + 16 + service.len() + error.len()
+                named_field_overhead(2) + service.len() + error.len()
             }
-            Self::CredentialRemoved { service } => OVERHEAD + service.len(),
+            Self::CredentialRemoved { service } => named_field_overhead(1) + service.len(),
             Self::CredentialRemoveFailed { service, error } => {
-                OVERHEAD + 16 + service.len() + error.len()
+                named_field_overhead(2) + service.len() + error.len()
             }
-            Self::SessionDeleted { .. } => OVERHEAD + 8,
-            Self::SessionDeleteFailed { error, .. } => OVERHEAD + 16 + error.len(),
-            Self::TurnsUndone { turn_ids, .. } => OVERHEAD + 8 + turn_ids.len() * 4,
+            Self::SessionDeleted { .. } => named_field_overhead(1),
+            Self::SessionDeleteFailed { error, .. } => named_field_overhead(2) + error.len(),
+            Self::TurnsUndone { turn_ids, .. } => named_field_overhead(2) + turn_ids.len() * 4,
             Self::TurnsRedone { turns, .. } => {
-                OVERHEAD
-                    + 8
+                named_field_overhead(2)
                     + turns
                         .iter()
                         .map(|(id, turn)| 8 + *id as usize + turn.approx_size())
                         .sum::<usize>()
             }
-            Self::Credential { service, key } => OVERHEAD + service.len() + option_str_len(key),
-            Self::AccountAdded { name } => OVERHEAD + name.len(),
-            Self::AccountAddFailed { name, error } => OVERHEAD + 16 + name.len() + error.len(),
-            Self::AccountRemoved { name } => OVERHEAD + name.len(),
-            Self::AccountRemoveFailed { name, error } => OVERHEAD + 16 + name.len() + error.len(),
+            Self::Credential { service, key } => {
+                named_field_overhead(2) + service.len() + option_str_len(key)
+            }
+            Self::AccountAdded { name } => named_field_overhead(1) + name.len(),
+            Self::AccountAddFailed { name, error } => {
+                named_field_overhead(2) + name.len() + error.len()
+            }
+            Self::AccountRemoved { name } => named_field_overhead(1) + name.len(),
+            Self::AccountRemoveFailed { name, error } => {
+                named_field_overhead(2) + name.len() + error.len()
+            }
             Self::Accounts { accounts } => {
-                OVERHEAD
+                named_field_overhead(1)
                     + accounts
                         .iter()
-                        .map(|a| 32 + a.name.len() + a.provider.len())
+                        .map(|a| 48 + a.name.len() + a.provider.len())
                         .sum::<usize>()
             }
-            Self::AccountListFailed { error } => OVERHEAD + error.len(),
-            Self::SessionAccountSet { account, .. } => OVERHEAD + 8 + account.len(),
-            Self::ContextWindowResolved { .. } => OVERHEAD + 12,
-            Self::SessionWorkingDirSet { path, .. } => OVERHEAD + 8 + option_str_len(path),
-            Self::SessionTitleSet { title, .. } => OVERHEAD + 8 + title.len(),
-            Self::ReasoningEffortSet { effort, .. } => OVERHEAD + 8 + effort.len(),
+            Self::AccountListFailed { error } => named_field_overhead(1) + error.len(),
+            Self::SessionAccountSet { account, .. } => named_field_overhead(2) + account.len(),
+            Self::ContextWindowResolved { .. } => named_field_overhead(2),
+            Self::SessionWorkingDirSet { path, .. } => {
+                named_field_overhead(2) + option_str_len(path)
+            }
+            Self::SessionTitleSet { title, .. } => named_field_overhead(2) + title.len(),
+            Self::ReasoningEffortSet { effort, .. } => named_field_overhead(2) + effort.len(),
             Self::ReasoningEffortSetFailed { effort, error, .. } => {
-                OVERHEAD + 16 + effort.len() + error.len()
+                named_field_overhead(3) + effort.len() + error.len()
             }
         }
     }

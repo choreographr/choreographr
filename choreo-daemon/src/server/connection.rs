@@ -98,14 +98,17 @@ impl ConnectionWriter for choreo_transport::noise::NoiseStream {
 /// counterpart of [`SubscriberSink::enqueue`]'s increment. Decrementing even
 /// on a failed send keeps the daemon-wide backlog honest — the bytes left the
 /// queue regardless of whether the socket accepted them, and the connection
-/// is being torn down either way.
+/// is being torn down either way. Whatever is still QUEUED when the loop
+/// stops (send error, or the `Evicted`/`ShuttingDown` stop) is drained below
+/// the loop and decremented too, so an abandoned backlog can never stay
+/// frozen in the daemon-wide counter and silently eat the global budget.
 fn writer_thread<W: ConnectionWriter>(
     mut writer: W,
     rx: crossbeam_channel::Receiver<DaemonMessage>,
     bytes: Arc<AtomicUsize>,
     global: Arc<AtomicUsize>,
 ) {
-    for msg in rx {
+    for msg in &rx {
         let size = msg.approx_wire_size();
         if let Err(e) = writer.send_message(&msg) {
             warn!("writer thread error: {e}");
@@ -122,6 +125,23 @@ fn writer_thread<W: ConnectionWriter>(
             writer.shutdown();
             break;
         }
+    }
+    // Drain-and-decrement whatever is still queued: after a send error or a
+    // ShuttingDown/Evicted stop, the socket is closed and these messages will
+    // never be written — but they were all counted at enqueue. Subtracting
+    // them here keeps the daemon-wide total honest (the per-client counter
+    // dies with the sink, but `global` is shared across every client: an
+    // evicted client's abandoned backlog would otherwise stay frozen in it
+    // forever and, accumulated across evictions, permanently exhaust the
+    // global budget — cascading evictions of healthy clients). The drain is
+    // non-blocking on purpose: the writer must exit promptly so the receiver
+    // drops and any producer that enqueues a straggler AFTER this drain gets
+    // a failed send, which it self-corrects (see `SubscriberSink::enqueue` /
+    // `send_unchecked` / `send_to_writer`).
+    while let Ok(msg) = rx.try_recv() {
+        let size = msg.approx_wire_size();
+        bytes.fetch_sub(size, Ordering::Relaxed);
+        global.fetch_sub(size, Ordering::Relaxed);
     }
 }
 
@@ -177,7 +197,16 @@ fn send_to_writer(ctx: &ClientCtx, msg: DaemonMessage) {
         .bytes_in_flight
         .fetch_add(size, Ordering::Relaxed);
     ctx.global_lag.fetch_add(size, Ordering::Relaxed);
-    let _ = ctx.writer.tx.send(msg);
+    if ctx.writer.tx.send(msg).is_err() {
+        // Receiver gone — the writer thread has exited, so nothing will ever
+        // decrement these bytes. Self-correct BOTH counters: the per-client
+        // one dies with the sink, but the daemon-wide counter is shared and
+        // must not leak (same invariant as `SubscriberSink::enqueue`).
+        ctx.writer
+            .bytes_in_flight
+            .fetch_sub(size, Ordering::Relaxed);
+        ctx.global_lag.fetch_sub(size, Ordering::Relaxed);
+    }
 }
 
 /// Shared per-client context passed through the dispatch and handler functions.
@@ -1256,6 +1285,78 @@ mod tests {
             global.load(Ordering::Relaxed),
             0,
             "every dequeued message must decrement the daemon-wide counter"
+        );
+    }
+
+    /// The abandoned-backlog drain: when the writer stops at `Evicted` (or a
+    /// send error), messages queued AFTER the stop point are never written —
+    /// but they were counted at enqueue. The post-loop drain must decrement
+    /// both counters for them, or an evicted client's backlog would stay
+    /// frozen in the daemon-wide total forever (the leak that could
+    /// permanently exhaust the global budget). The abandoned messages must
+    /// NOT appear on the wire.
+    #[test]
+    fn writer_thread_drains_and_decrements_abandoned_backlog() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let (writer, sent_rx, _shutdown_rx) = mock_writer(None);
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let global = Arc::new(AtomicUsize::new(0));
+        let handle = std::thread::spawn({
+            let bytes = Arc::clone(&bytes);
+            let global = Arc::clone(&global);
+            move || writer_thread(writer, rx, bytes, global)
+        });
+
+        let m1 = DaemonMessage::Failed {
+            session_id: 1,
+            request_id: 1,
+            error: "a".repeat(100),
+        };
+        let m2 = DaemonMessage::Failed {
+            session_id: 2,
+            request_id: 2,
+            error: "b".repeat(50),
+        };
+        let m3 = DaemonMessage::Failed {
+            session_id: 3,
+            request_id: 3,
+            error: "c".repeat(25),
+        };
+        let s1 = m1.approx_wire_size();
+        let s2 = m2.approx_wire_size();
+        let s3 = m3.approx_wire_size();
+
+        // Pre-seed the counters exactly as `enqueue` would have for ALL four
+        // messages (m1 + Evicted are written; m2/m3 are abandoned behind the
+        // stop point).
+        let evicted_size = DaemonMessage::Evicted.approx_wire_size();
+        let total = s1 + s2 + s3 + evicted_size;
+        bytes.fetch_add(total, Ordering::Relaxed);
+        global.fetch_add(total, Ordering::Relaxed);
+
+        tx.send(m1.clone()).unwrap();
+        tx.send(DaemonMessage::Evicted).unwrap();
+        // Queued behind the advisory: never written, but must be decremented
+        // by the exit drain.
+        tx.send(m2).unwrap();
+        tx.send(m3).unwrap();
+
+        handle.join().expect("writer thread panicked");
+        let written: Vec<_> = sent_rx.try_iter().collect();
+        assert_eq!(
+            written,
+            vec![m1.clone(), DaemonMessage::Evicted],
+            "messages behind the advisory must never be written"
+        );
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            0,
+            "abandoned backlog must be decremented from the per-client counter"
+        );
+        assert_eq!(
+            global.load(Ordering::Relaxed),
+            0,
+            "abandoned backlog must be decremented from the daemon-wide counter"
         );
     }
 

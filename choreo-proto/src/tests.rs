@@ -678,6 +678,118 @@ fn approx_wire_size_empty_variants_are_small_positive() {
     assert!(DaemonMessage::Evicted.approx_wire_size() < 128);
 }
 
+/// The estimate is the lag-eviction gauge: it must never UNDER-estimate the
+/// serialized payload, or a genuinely lagging client could escape eviction.
+/// Encode each representative message and require the estimate to cover the
+/// actual payload bytes (the frame minus the 4-byte length prefix).
+#[test]
+fn approx_wire_size_never_underestimates_encoded_payload() {
+    let turn = Turn {
+        created_at: TimestampMs::now(),
+        undone: false,
+        error: Some("boom".into()),
+        user_text: Some("hello world".into()),
+        assistant_text: Some("x".repeat(100)),
+        assistant_reasoning: Some("thinking".repeat(10)),
+        tool_calls: vec![AssistantToolCallRecord {
+            call_id: "call_1".into(),
+            name: "sh".into(),
+            arguments_json: r#"{"command":"echo hi"}"#.into(),
+        }],
+        token_usage: Some(TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+        }),
+        tool_results: vec![ToolResultRecord {
+            call_id: "call_1".into(),
+            name: "sh".into(),
+            content: "hi".into(),
+            is_error: false,
+            invocation_description: "Running: echo hi".into(),
+        }],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    let summary = SessionSummary {
+        session_id: 1,
+        title: Some("t".into()),
+        selected_model: Some("m".into()),
+        reasoning_effort: Some("high".into()),
+        parent_session_id: None,
+        working_dir: Some("/tmp".into()),
+        created_at: 0,
+        last_modified: 0,
+        turn_count: 0,
+        status: SessionStatus::ToolCall("sh".into()),
+        active_tool_groups: vec!["shell".into()],
+        account_name: Some("acc".into()),
+        token_usage: None,
+        context_window: None,
+        last_prompt_tokens: None,
+    };
+    let samples: Vec<DaemonMessage> = vec![
+        DaemonMessage::Pong,
+        DaemonMessage::Evicted,
+        DaemonMessage::Failed {
+            session_id: 1,
+            request_id: 1,
+            error: "x".repeat(100),
+        },
+        DaemonMessage::TurnAppended {
+            session_id: 1,
+            turn_id: 1,
+            turn: turn.clone(),
+        },
+        DaemonMessage::TurnsRedone {
+            session_id: 1,
+            turns: BTreeMap::from([(1, turn)]),
+        },
+        DaemonMessage::SessionStatusChanged {
+            session_id: 1,
+            status: SessionStatus::ToolCall("sh".into()),
+            last_modified: 0,
+        },
+        DaemonMessage::OutputChunk {
+            session_id: 1,
+            request_id: 1,
+            stream: OutputStream::Answer,
+            data: vec![b'x'; 100],
+        },
+        DaemonMessage::Sessions {
+            sessions: vec![summary],
+        },
+        DaemonMessage::SessionState {
+            session_id: 1,
+            title: Some("t".into()),
+            selected_model: Some("m".into()),
+            parent_session_id: None,
+            working_dir: Some("/tmp".into()),
+            turns: BTreeMap::new(),
+            active_tool_groups: vec!["shell".into()],
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+            status: SessionStatus::Inactive,
+            reasoning_effort: Some("high".into()),
+            reasoning_capability: None,
+        },
+    ];
+    for msg in samples {
+        let frame = encode_frame(&msg).expect("encode");
+        // The 4-byte BE length prefix precedes the payload; the estimate must
+        // cover the payload itself.
+        let payload = frame.len() - 4;
+        assert!(
+            msg.approx_wire_size() >= payload,
+            "approx_wire_size ({}) under-estimates the {}-byte encoded payload: {msg:?}",
+            msg.approx_wire_size(),
+            payload
+        );
+    }
+}
+
 // ── InferenceError metric_label tests ─────────────────────────
 
 #[test]
