@@ -445,8 +445,9 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         }
 
         // Get cached lines (Arc clone is O(1)), the pre-computed height,
-        // and cumulative visual-row offsets for O(log n) row→line lookups.
-        let (text_lines_arc, text_height, text_offsets, img_count) = {
+        // cumulative visual-row offsets for O(log n) row→line lookups, and
+        // the per-line content column ranges (for selection clamping).
+        let (text_lines_arc, text_height, text_offsets, content_ranges, img_count) = {
             let display = app.display_for(session_id);
             let Some(turn) = display.view.turns.get(&turn_id) else {
                 continue;
@@ -503,6 +504,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 rendered.lines,
                 rendered.height,
                 rendered.visual_offsets,
+                rendered.content_ranges,
                 count,
             )
         };
@@ -566,6 +568,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 app,
                 turn_start,
                 &text_offsets[..],
+                &content_ranges[..],
                 line_start,
                 &mut visible_lines,
             );
@@ -1603,6 +1606,7 @@ mod tests {
     fn rendered(lines: Vec<Line<'static>>) -> RenderedTurnLines {
         RenderedTurnLines {
             lines,
+            content_ranges: Vec::new(),
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
         }
@@ -1622,6 +1626,7 @@ mod tests {
                 lines,
                 height,
                 visual_offsets,
+                content_ranges: Arc::from([]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: Vec::new(),
             },
@@ -2115,6 +2120,7 @@ mod tests {
                 lines: Arc::from(vec![Line::from("stale")]),
                 height: 99,
                 visual_offsets: Arc::from([1]),
+                content_ranges: Arc::from([]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![0],
             },

@@ -579,6 +579,13 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
 /// hit-test the collapsible reasoning header without re-scanning the output.
 pub(crate) struct RenderedTurnLines {
     pub lines: Vec<Line<'static>>,
+    /// Display-column range `(start, end)` of each line's meaningful content,
+    /// aligned with `lines` — the text the user sees as content, excluding UI
+    /// chrome such as the `┃` margin gutter, indents, and trailing fill.
+    /// `None` for pure-chrome rows (box separators/padding, blank spacers).
+    /// Mouse selection highlights and copies only these cells, so dragging
+    /// over an assistant response never grabs the box around it.
+    pub content_ranges: Vec<Option<(usize, usize)>>,
     /// Semantic-line index of the reasoning header line within `lines`,
     /// present iff the turn has non-whitespace reasoning content.  The
     /// index is stable across collapse/expand (the header is always the
@@ -635,6 +642,10 @@ pub(crate) fn render_turn_lines(
     tool_results_collapsed: &[bool],
 ) -> RenderedTurnLines {
     let mut all_lines: Vec<Line<'static>> = Vec::new();
+    // Per-line content column ranges, aligned with `all_lines` (see
+    // `RenderedTurnLines::content_ranges`).  Every line kind below records
+    // where its real text starts/ends so selection never copies UI chrome.
+    let mut all_content_ranges: Vec<Option<(usize, usize)>> = Vec::new();
 
     // ── User text block (green accent) ───────────────────────
     // Rendered first so a failed request's transcript still shows what the
@@ -642,8 +653,10 @@ pub(crate) fn render_turn_lines(
     if let Some(ref text) = turn.user_text {
         let body = markdown_lines(text, content_width);
         let timestamp_ms = Some(turn.created_at.as_millis());
-        let margin = add_margin_lines(body, content_width, Color::Green, timestamp_ms);
-        all_lines.extend(margin.0);
+        let (margin_lines, _rows, margin_ranges) =
+            add_margin_lines(body, content_width, Color::Green, timestamp_ms);
+        all_lines.extend(margin_lines);
+        all_content_ranges.extend(margin_ranges);
     }
 
     // ── Error block (red) ────────────────────────────────────
@@ -672,9 +685,15 @@ pub(crate) fn render_turn_lines(
                 Line::from(Span::styled(text, Style::default().fg(Color::Red)))
             })
             .collect();
-        all_lines.extend(lines);
+        for line in lines {
+            // Unboxed error rows: the whole (red) text is content.
+            let width = line.width();
+            all_content_ranges.push((width > 0).then_some((0, width)));
+            all_lines.push(line);
+        }
         return RenderedTurnLines {
             lines: all_lines,
+            content_ranges: all_content_ranges,
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
         };
@@ -744,8 +763,10 @@ pub(crate) fn render_turn_lines(
 
         // If we have content, wrap with margin lines (no timestamp).
         if !body.is_empty() {
-            let margin = add_margin_lines(body, content_width, Color::Blue, None);
-            all_lines.extend(margin.0);
+            let (margin_lines, _rows, margin_ranges) =
+                add_margin_lines(body, content_width, Color::Blue, None);
+            all_lines.extend(margin_lines);
+            all_content_ranges.extend(margin_ranges);
         }
     }
 
@@ -904,6 +925,10 @@ pub(crate) fn render_turn_lines(
             line.spans
                 .push(Span::styled(" ".repeat(fill), Style::default()));
             line.spans.push(Span::styled("  ", Style::default()));
+            // Unboxed rows: content starts after the 2-column indent and ends
+            // where the fill begins.  Blank spacer rows carry no content.
+            let end = (2 + content_sum).min(2 + tool_content_width as usize);
+            all_content_ranges.push((content_sum > 0).then_some((2, end)));
         }
         all_lines.extend(body);
     }
@@ -911,10 +936,12 @@ pub(crate) fn render_turn_lines(
     // If no sections produced output, emit a blank line.
     if all_lines.is_empty() {
         all_lines.push(Line::from(Span::styled(String::new(), Style::default())));
+        all_content_ranges.push(None);
     }
 
     RenderedTurnLines {
         lines: all_lines,
+        content_ranges: all_content_ranges,
         reasoning_header_idx,
         tool_result_header_idxs,
     }
@@ -943,14 +970,23 @@ pub(crate) fn reasoning_expanded_default(turn: &Turn) -> bool {
 /// Structural rows: top separator, top padding, bottom padding, bottom separator.
 pub(crate) const MARGIN_STRUCTURAL_ROWS: usize = 4;
 
+/// Return type of [`add_margin_lines`]: the wrapped lines, their total
+/// height, and the per-line content column ranges.
+type MarginLines = (Vec<Line<'static>>, usize, Vec<Option<(usize, usize)>>);
+
 /// Wrap content lines with a vertical accent bar on the left and dark-gray
 /// background shading.
+///
+/// Returns the wrapped lines, their total height, and a per-line content
+/// column range aligned with the returned lines: `(5, 5 + line.width())` for
+/// content rows (the text between the `"  ┃  "` gutter and the trailing
+/// fill), `None` for the structural chrome rows (separator, padding).
 fn add_margin_lines(
     lines: Vec<Line<'static>>,
     content_width: u16,
     accent: Color,
     timestamp_ms: Option<i64>,
-) -> (Vec<Line<'static>>, usize) {
+) -> MarginLines {
     let gray = Style::default().bg(BG_SHADE);
     let no_shading = Style::default().bg(Color::Reset);
     let accent_line = Style::default().fg(accent).bg(Color::Reset);
@@ -969,11 +1005,16 @@ fn add_margin_lines(
     ]);
 
     let mut result = Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
+    let mut content_ranges: Vec<Option<(usize, usize)>> =
+        Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
     result.push(separator);
+    content_ranges.push(None);
     result.push(padding.clone());
+    content_ranges.push(None);
 
     for line in lines {
-        let fill = (content_width as usize).saturating_sub(line.width());
+        let text_width = line.width();
+        let fill = (content_width as usize).saturating_sub(text_width);
 
         let mut spans = vec![
             Span::styled("  ", no_shading),
@@ -992,9 +1033,13 @@ fn add_margin_lines(
         spans.push(Span::styled("  ", no_shading));
 
         result.push(Line::from(spans));
+        // Content occupies columns [5, 5 + text width): after the fixed
+        // `"  ┃  "` gutter, up to where the trailing fill begins.
+        content_ranges.push(Some((5, 5 + text_width)));
     }
 
     result.push(padding);
+    content_ranges.push(None);
 
     // Bottom separator: right-aligned timestamp (user messages only).
     if let Some(ms) = timestamp_ms {
@@ -1015,9 +1060,10 @@ fn add_margin_lines(
             no_shading,
         )]));
     }
+    content_ranges.push(None);
 
     let total_rows = result.len();
-    (result, total_rows)
+    (result, total_rows, content_ranges)
 }
 
 pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
@@ -3900,7 +3946,8 @@ content ---"
         // being passed to format_timestamp (which takes milliseconds),
         // so every user message rendered as a 1970 date (e.g. "Jan 21 1970").
         let ts_ms = 1_705_314_000_000i64; // a plausible modern timestamp
-        let (lines, _rows) = add_margin_lines(Vec::new(), 80, Color::Green, Some(ts_ms));
+        let (lines, _rows, _content_ranges) =
+            add_margin_lines(Vec::new(), 80, Color::Green, Some(ts_ms));
         let bottom = lines.last().expect("bottom separator line");
         let rendered = bottom.to_string();
         let expected = format_timestamp(ts_ms);

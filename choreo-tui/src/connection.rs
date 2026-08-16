@@ -3193,12 +3193,45 @@ mod tests {
         .expect("handle mouse event");
     }
 
-    /// The first viewport row that maps to content (0 when the history fills
-    /// the viewport; the bottom-anchored content starts lower when it fits).
-    fn first_content_row(app: &App) -> u16 {
-        let vh = app.history_viewport.height;
-        let total = app.total_history_height() as u16;
-        vh.saturating_sub(total)
+    /// The first viewport row that maps to a *content* line (one whose
+    /// rendered text is selectable per the renderer's content ranges — box
+    /// chrome rows like separators and padding are excluded).  `None` when
+    /// the history has no selectable content.
+    fn first_content_row(app: &App) -> Option<u16> {
+        let display = app.active_display_ref()?;
+        let vh = app.history_viewport.height as usize;
+        let total = display.total_history_height();
+        let scroll = display.effective_scroll(&app.history_viewport);
+        let row_offset = scroll as isize + vh as isize - total as isize;
+        for (turn_idx, _turn_id) in display.visible_turn_ids.iter().enumerate() {
+            let Some(cached) = display.render_cache[turn_idx].as_ref() else {
+                continue;
+            };
+            let turn_start = display
+                .height_prefix
+                .get(turn_idx.wrapping_sub(1))
+                .copied()
+                .unwrap_or(0);
+            for (line_idx, content) in cached.rendered.content_ranges.iter().enumerate() {
+                let Some((lo, hi)) = content else {
+                    continue;
+                };
+                if lo >= hi {
+                    continue;
+                }
+                let row_lo = cached
+                    .rendered
+                    .visual_offsets
+                    .get(line_idx.wrapping_sub(1))
+                    .copied()
+                    .unwrap_or(0);
+                let screen_row = turn_start as isize + row_lo as isize + row_offset;
+                if screen_row >= 0 && (screen_row as usize) < vh {
+                    return Some(screen_row as u16);
+                }
+            }
+        }
+        None
     }
 
     #[test]
@@ -3210,7 +3243,7 @@ mod tests {
         insert_turn(&mut app, 1, "user b", "assistant b");
         app.rebuild_height_prefix();
 
-        let start_row = first_content_row(&app);
+        let start_row = first_content_row(&app).expect("selectable content row");
         send_mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
@@ -3262,7 +3295,7 @@ mod tests {
         insert_turn(&mut app, 0, "user a", "assistant a");
         app.rebuild_height_prefix();
 
-        let start_row = first_content_row(&app);
+        let start_row = first_content_row(&app).expect("selectable content row");
         send_mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
@@ -3294,7 +3327,7 @@ mod tests {
         insert_turn(&mut app, 1, "user b", "assistant b");
         app.rebuild_height_prefix();
 
-        let start_row = first_content_row(&app);
+        let start_row = first_content_row(&app).expect("selectable content row");
         send_mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),

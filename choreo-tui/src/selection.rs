@@ -188,11 +188,17 @@ fn text_for_row(
     } else {
         base.saturating_add(col_end)
     };
-    Some(slice_line_columns(
-        &rendered.lines[line_idx],
-        line_col_lo,
-        line_col_hi,
-    ))
+    // Clamp to the line's meaningful content so the copy never includes the
+    // box chrome (`┃` gutter, indents, trailing fill) or pure-chrome rows.
+    let content = rendered.content_ranges.get(line_idx).copied().flatten();
+    let (lo, hi) = match content {
+        Some((lo, hi)) if lo < hi => (line_col_lo.max(lo), line_col_hi.min(hi)),
+        _ => return None,
+    };
+    if lo >= hi {
+        return None;
+    }
+    Some(slice_line_columns(&rendered.lines[line_idx], lo, hi))
 }
 
 /// Read-only render-cache lookup for a turn's rendered lines.
@@ -239,6 +245,7 @@ pub(crate) fn apply_selection_to_lines(
     app: &App,
     turn_start: usize,
     text_offsets: &[usize],
+    content_ranges: &[Option<(usize, usize)>],
     line_start: usize,
     lines: &mut [Line<'static>],
 ) {
@@ -313,7 +320,19 @@ pub(crate) fn apply_selection_to_lines(
             } else {
                 base.saturating_add(col_hi)
             };
-            *line = style_line_selection(line, line_col_lo, line_col_hi);
+            // Clamp to the line's meaningful content (the renderer records
+            // where each line's real text starts/ends), so the highlight
+            // never spills onto the box chrome — `┃` gutter, indents, and
+            // trailing fill — and pure-chrome rows stay unhighlighted.
+            let content = content_ranges.get(li).copied().flatten();
+            let (c_lo, c_hi) = match content {
+                Some((lo, hi)) if lo < hi => (line_col_lo.max(lo), line_col_hi.min(hi)),
+                _ => continue,
+            };
+            if c_lo >= c_hi {
+                continue;
+            }
+            *line = style_line_selection(line, c_lo, c_hi);
             // A real (single-visual-row) line is fully covered by its one row.
             if row_hi - row_lo <= 1 {
                 break;
@@ -550,6 +569,33 @@ mod tests {
     }
 
     #[test]
+    fn extract_skips_box_chrome_across_turns() {
+        // Selecting across boxed turn blocks must copy ONLY the content text:
+        // the `┃` gutter, leading box padding, and trailing fill of every
+        // selected row are excluded, and pure-chrome rows (separators,
+        // padding) contribute nothing.  Regression for the box chrome being
+        // dragged into the copied text.
+        let mut app = app_with_turns(&[(0, "first"), (1, "second")], 30);
+        let (start, _) = locate(&app, "first");
+        let (_, end) = locate(&app, "second");
+        let text = drag_and_finish(&mut app, start, end).expect("selection should extract");
+        assert!(
+            !text.contains('┃'),
+            "box gutter must not be copied: {text:?}"
+        );
+        let first_pos = text.find("first").expect("first word copied");
+        let second_pos = text.find("second").expect("second word copied");
+        assert!(first_pos < second_pos, "turns copied in render order");
+        for line in text.lines() {
+            assert_eq!(
+                line.trim_end().len(),
+                line.len(),
+                "no trailing box fill spaces copied: {line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn extract_mid_line_start_and_end() {
         let mut app = app_with_turns(&[(0, "abcdefghij")], 30);
         let (start, end) = locate(&app, "cdef");
@@ -694,6 +740,41 @@ mod tests {
 
     // ── apply_selection_to_lines (screen-row mapping) ──
 
+    /// Apply a full-width selection to `screen_row` and report whether that
+    /// row's line ended up with the selection background.
+    fn row_highlighted(app: &mut App, screen_row: u16) -> bool {
+        let vp_width = app.history_viewport.width;
+        app.text_selection = Some(TextSelection {
+            anchor: (screen_row, 0),
+            head: (screen_row, vp_width),
+            active: true,
+        });
+        let (turn_idx, visual_row) = find_turn_at_row(app, screen_row).expect("row maps");
+        let (cached_lines, offsets, content_ranges, turn_start) = {
+            let display = app.active_display_ref().unwrap();
+            let cached = display.render_cache[turn_idx].as_ref().unwrap();
+            (
+                cached.rendered.lines.clone(),
+                cached.rendered.visual_offsets.clone(),
+                cached.rendered.content_ranges.clone(),
+                display
+                    .height_prefix
+                    .get(turn_idx.wrapping_sub(1))
+                    .copied()
+                    .unwrap_or(0),
+            )
+        };
+        let mut lines = cached_lines.to_vec();
+        apply_selection_to_lines(app, turn_start, &offsets, &content_ranges, 0, &mut lines);
+        let line_idx = offsets
+            .partition_point(|&o| o <= visual_row)
+            .min(lines.len().saturating_sub(1));
+        lines[line_idx]
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(SELECTION_BG))
+    }
+
     #[test]
     fn apply_selection_to_lines_overflowing_history_styles_visible_rows() {
         // Regression: when the history overflows the viewport (the common
@@ -715,89 +796,50 @@ mod tests {
         let total = app.total_history_height();
         assert!(total > vh, "history must overflow the viewport");
 
-        // Select screen rows 0..2, columns 5..10.
-        app.text_selection = Some(TextSelection {
-            anchor: (0, 5),
-            head: (2, 10),
-            active: true,
-        });
-
-        // Resolve each selected screen row to (turn_idx, line_idx) via the
-        // same mapping extraction uses.
-        let selected: Vec<(usize, usize)> = {
+        // Find one visible content row and one visible chrome row (the box
+        // separator/padding rows carry no content and must stay
+        // unhighlighted).
+        let (content_row, chrome_row) = {
             let display = app.active_display_ref().unwrap();
-            (0..3)
-                .map(|screen_row| {
-                    let (turn_idx, visual_row) =
-                        find_turn_at_row(&app, screen_row).expect("visible row maps");
-                    let cached = display.render_cache[turn_idx].as_ref().unwrap();
-                    let line_idx = cached
-                        .rendered
-                        .visual_offsets
-                        .partition_point(|&o| o <= visual_row);
-                    (
-                        turn_idx,
-                        line_idx.min(cached.rendered.lines.len().saturating_sub(1)),
-                    )
-                })
-                .collect()
-        };
-        assert!(
-            !selected.is_empty() && selected.len() == 3,
-            "all selected screen rows must resolve"
-        );
-
-        for (turn_idx, line_idx) in selected {
-            let (cached_lines, offsets, turn_start) = {
-                let display = app.active_display_ref().unwrap();
+            let mut content_row = None;
+            let mut chrome_row = None;
+            for screen_row in 0..vh as u16 {
+                let (turn_idx, visual_row) = find_turn_at_row(&app, screen_row).expect("row maps");
                 let cached = display.render_cache[turn_idx].as_ref().unwrap();
-                (
-                    cached.rendered.lines.clone(),
-                    cached.rendered.visual_offsets.clone(),
-                    display
-                        .height_prefix
-                        .get(turn_idx.wrapping_sub(1))
-                        .copied()
-                        .unwrap_or(0),
-                )
-            };
-            let mut lines = cached_lines.to_vec();
-            apply_selection_to_lines(&app, turn_start, &offsets, 0, &mut lines);
-            assert!(
-                lines[line_idx]
-                    .spans
-                    .iter()
-                    .any(|s| s.style.bg == Some(SELECTION_BG)),
-                "screen row for turn {turn_idx} line {line_idx} must be highlighted"
-            );
-        }
-
-        // A row outside the selection must stay unhighlighted.
-        let (turn_idx, visual_row) = find_turn_at_row(&app, 8).expect("visible row");
-        let (cached_lines, offsets, turn_start) = {
-            let display = app.active_display_ref().unwrap();
-            let cached = display.render_cache[turn_idx].as_ref().unwrap();
-            (
-                cached.rendered.lines.clone(),
-                cached.rendered.visual_offsets.clone(),
-                display
-                    .height_prefix
-                    .get(turn_idx.wrapping_sub(1))
+                let line_idx = cached
+                    .rendered
+                    .visual_offsets
+                    .partition_point(|&o| o <= visual_row)
+                    .min(cached.rendered.lines.len().saturating_sub(1));
+                let has_content = cached
+                    .rendered
+                    .content_ranges
+                    .get(line_idx)
                     .copied()
-                    .unwrap_or(0),
+                    .flatten()
+                    .is_some_and(|(lo, hi)| lo < hi);
+                if has_content {
+                    content_row.get_or_insert(screen_row);
+                } else {
+                    chrome_row.get_or_insert(screen_row);
+                }
+                if content_row.is_some() && chrome_row.is_some() {
+                    break;
+                }
+            }
+            (
+                content_row.expect("a visible content row must exist"),
+                chrome_row.expect("a visible chrome row must exist"),
             )
         };
-        let mut lines = cached_lines.to_vec();
-        apply_selection_to_lines(&app, turn_start, &offsets, 0, &mut lines);
-        let line_idx = offsets
-            .partition_point(|&o| o <= visual_row)
-            .min(lines.len().saturating_sub(1));
+
         assert!(
-            !lines[line_idx]
-                .spans
-                .iter()
-                .any(|s| s.style.bg == Some(SELECTION_BG)),
-            "row outside the selection must stay unhighlighted"
+            row_highlighted(&mut app, content_row),
+            "a content row must be highlighted"
+        );
+        assert!(
+            !row_highlighted(&mut app, chrome_row),
+            "a chrome row (separator/padding) must not be highlighted"
         );
     }
 
@@ -819,12 +861,13 @@ mod tests {
             active: true,
         });
         let (turn_idx, _) = find_turn_at_row(&app, r).expect("row maps");
-        let (cached_lines, offsets, turn_start) = {
+        let (cached_lines, offsets, content_ranges, turn_start) = {
             let display = app.active_display_ref().unwrap();
             let cached = display.render_cache[turn_idx].as_ref().unwrap();
             (
                 cached.rendered.lines.clone(),
                 cached.rendered.visual_offsets.clone(),
+                cached.rendered.content_ranges.clone(),
                 display
                     .height_prefix
                     .get(turn_idx.wrapping_sub(1))
@@ -833,7 +876,7 @@ mod tests {
             )
         };
         let mut lines = cached_lines.to_vec();
-        apply_selection_to_lines(&app, turn_start, &offsets, 0, &mut lines);
+        apply_selection_to_lines(&app, turn_start, &offsets, &content_ranges, 0, &mut lines);
         assert!(
             lines
                 .iter()

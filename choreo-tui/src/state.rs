@@ -661,6 +661,11 @@ pub(crate) struct RenderedTurn {
     /// Used with `partition_point` to map a visual row → semantic line index
     /// in O(log n).
     pub visual_offsets: Arc<[usize]>,
+    /// Display-column range `(start, end)` of each line's meaningful content,
+    /// aligned with `lines` — see [`RenderedTurnLines::content_ranges`].
+    /// Mouse selection clamps its highlight and its copy to these ranges so
+    /// a drag never captures UI chrome (the `┃` gutter, indents, fill).
+    pub content_ranges: Arc<[Option<(usize, usize)>]>,
     /// Semantic-line index of the reasoning header within `lines` (see
     /// [`RenderedTurnLines`]), so click hit-testing never re-scans the
     /// rendered output.
@@ -700,10 +705,12 @@ pub(crate) fn cached_or_compute_lines(
 
     let rendered = compute();
     let lines = Arc::from(rendered.lines);
+    let content_ranges = Arc::from(rendered.content_ranges);
     let turn = RenderedTurn {
         height: lines_height(&lines, key.viewport_width).max(1),
         visual_offsets: compute_visual_offsets(&lines, key.viewport_width),
         lines,
+        content_ranges,
         reasoning_header_idx: rendered.reasoning_header_idx,
         tool_result_header_idxs: rendered.tool_result_header_idxs,
     };
@@ -3731,6 +3738,7 @@ impl SessionDisplayState {
             let text_lines = rendered.lines;
             let text_height = lines_height(&text_lines, viewport.width).max(1);
             let visual_offsets = compute_visual_offsets(&text_lines, viewport.width);
+            let content_ranges = Arc::from(rendered.content_ranges);
 
             // Keep the reasoning header's click-hit range and the precomputed
             // default in sync as the response streams — the header sits below
@@ -3776,6 +3784,7 @@ impl SessionDisplayState {
                     lines: Arc::from(text_lines),
                     height: text_height,
                     visual_offsets,
+                    content_ranges,
                     reasoning_header_idx: rendered.reasoning_header_idx,
                     tool_result_header_idxs: rendered.tool_result_header_idxs,
                 },
@@ -5869,6 +5878,7 @@ mod tests {
                 lines: Arc::from(vec![Line::from("stale")]),
                 height: 1,
                 visual_offsets: Arc::from([1]),
+                content_ranges: Arc::from([]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![],
             },
@@ -6118,6 +6128,7 @@ mod tests {
                 lines: Arc::from(vec![Line::from("stale")]),
                 height: 1,
                 visual_offsets: Arc::from([1]),
+                content_ranges: Arc::from([]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![0],
             },
@@ -6845,6 +6856,7 @@ mod tests {
                     lines: Arc::from(Vec::<Line<'static>>::new()),
                     height: 0,
                     visual_offsets: Arc::from([]),
+                    content_ranges: Arc::from([]),
                     reasoning_header_idx: None,
                     tool_result_header_idxs: vec![],
                 },
@@ -6893,6 +6905,7 @@ mod tests {
                     lines: Arc::from(Vec::<Line<'static>>::new()),
                     height: 0,
                     visual_offsets: Arc::from([]),
+                    content_ranges: Arc::from([]),
                     reasoning_header_idx: None,
                     tool_result_header_idxs: vec![],
                 },
