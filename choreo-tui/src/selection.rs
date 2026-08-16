@@ -23,9 +23,19 @@
 use crate::state::{
     App, RenderedTurn, SessionDisplayState, find_turn_at_row, grapheme_offset_at_column,
 };
-use ratatui::style::Modifier;
+use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
+
+/// Background color for the in-progress selection highlight.
+///
+/// Deliberately a solid mid-blue, not `Modifier::REVERSED`: history turns
+/// render on the dark-gray `BG_SHADE` background (see `add_margin_lines`),
+/// and reverse-video on a cell that already has an explicit background swaps
+/// the text to dark-on-dark — effectively invisible.  A dedicated background
+/// color reads as a selection on both the shaded turns and the plain text
+/// between them, like a terminal's own selection.
+pub(crate) const SELECTION_BG: Color = Color::Rgb(0x2F, 0x5F, 0xAF);
 
 /// An in-progress mouse text selection over the history pane.
 ///
@@ -223,8 +233,8 @@ pub(crate) fn approx_tokens(text: &str) -> usize {
 /// Called from `render_history` for the visible semantic-line slice of each
 /// turn.  For every line occupying any selected screen row, the covered
 /// column range (translated into the line's own column space) is restyled
-/// with `REVERSED` — the terminal-native selection look.  The render cache
-/// is never mutated: lines are restyled at draw time only.
+/// with the selection background.  The render cache is never mutated: lines
+/// are restyled at draw time only.
 pub(crate) fn apply_selection_to_lines(
     app: &App,
     turn_start: usize,
@@ -297,9 +307,10 @@ pub(crate) fn apply_selection_to_lines(
 }
 
 /// Restyle the display-column range `[col_lo, col_hi)` of a line with the
-/// selection highlight, splitting spans at grapheme boundaries so a selection
-/// can never split a ZWJ emoji or combining sequence.  `col_hi` of
-/// `usize::MAX` means "to the end of the line".
+/// selection highlight (a solid [`SELECTION_BG`] background), splitting
+/// spans at grapheme boundaries so a selection can never split a ZWJ emoji
+/// or combining sequence.  `col_hi` of `usize::MAX` means "to the end of
+/// the line".
 pub(crate) fn style_line_selection(
     line: &Line<'static>,
     col_lo: usize,
@@ -346,7 +357,7 @@ pub(crate) fn style_line_selection(
         }
         out.push(Span::styled(
             selected.to_owned(),
-            span.style.add_modifier(Modifier::REVERSED),
+            span.style.bg(SELECTION_BG),
         ));
         if !after.is_empty() {
             out.push(Span::styled(after.to_owned(), span.style));
@@ -581,16 +592,12 @@ mod tests {
     fn style_selection_splits_single_span() {
         let line = Line::from("hello world");
         let styled = style_line_selection(&line, 6, 11);
-        // ["hello ", "world"(REVERSED)] — the selected slice gets REVERSED.
+        // ["hello ", "world"(SELECTION_BG)] — the selected slice gets the
+        // selection background.
         assert_eq!(styled.spans.len(), 2);
         assert_eq!(styled.spans[0].content, "hello ");
         assert_eq!(styled.spans[1].content, "world");
-        assert!(
-            styled.spans[1]
-                .style
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
+        assert_eq!(styled.spans[1].style.bg, Some(SELECTION_BG));
     }
 
     #[test]
@@ -600,12 +607,7 @@ mod tests {
         assert_eq!(styled.spans.len(), 3);
         assert_eq!(styled.spans[0].content, "ab");
         assert_eq!(styled.spans[1].content, "cde");
-        assert!(
-            styled.spans[1]
-                .style
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
+        assert_eq!(styled.spans[1].style.bg, Some(SELECTION_BG));
         assert_eq!(styled.spans[2].content, "fgh");
     }
 
@@ -614,12 +616,7 @@ mod tests {
         let line = Line::from("hello");
         let styled = style_line_selection(&line, 0, usize::MAX);
         assert_eq!(styled.spans.len(), 1);
-        assert!(
-            styled.spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
+        assert_eq!(styled.spans[0].style.bg, Some(SELECTION_BG));
     }
 
     #[test]
@@ -645,18 +642,8 @@ mod tests {
             texts,
             vec!["😀".to_string(), "a".to_string(), "bc".to_string()]
         );
-        assert!(
-            styled.spans[1]
-                .style
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
-        assert!(
-            !styled.spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
+        assert_eq!(styled.spans[1].style.bg, Some(SELECTION_BG));
+        assert_ne!(styled.spans[0].style.bg, Some(SELECTION_BG));
     }
 
     #[test]
@@ -667,16 +654,26 @@ mod tests {
         ));
         let styled = style_line_selection(&styled, 1, 3);
         assert_eq!(styled.spans.len(), 3);
-        // The unselected pieces keep Cyan; the selected piece is Cyan + REVERSED.
+        // The unselected pieces keep Cyan; the selected piece is Cyan + the
+        // selection background.
         assert_eq!(styled.spans[0].style.fg, Some(ratatui::style::Color::Cyan));
         assert_eq!(styled.spans[1].style.fg, Some(ratatui::style::Color::Cyan));
-        assert!(
-            styled.spans[1]
-                .style
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
+        assert_eq!(styled.spans[1].style.bg, Some(SELECTION_BG));
         assert_eq!(styled.spans[2].style.fg, Some(ratatui::style::Color::Cyan));
+    }
+
+    #[test]
+    fn style_selection_overrides_shaded_background() {
+        // History turns render on the dark-gray BG_SHADE background (see
+        // `add_margin_lines`); the selection must replace it with the visible
+        // selection background, not stack on top of it.
+        let shaded = Line::from(Span::styled(
+            "hello",
+            ratatui::style::Style::default().bg(crate::render::BG_SHADE),
+        ));
+        let styled = style_line_selection(&shaded, 0, 5);
+        assert_eq!(styled.spans.len(), 1);
+        assert_eq!(styled.spans[0].style.bg, Some(SELECTION_BG));
     }
 
     // ── approx_tokens ──
