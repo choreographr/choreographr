@@ -13,12 +13,14 @@
 //! is mapped to the content it covers the moment it is processed
 //! ([`screen_to_content`], the exact inverse of the click hit-testing the
 //! TUI already does).  Storing content coordinates is what lets the
-//! selection survive scrolling: the anchor and head stay pinned to the text
-//! they were placed on, and the draw-time highlight re-evaluates against the
-//! current scroll every frame, so what is highlighted is exactly what gets
-//! copied.  Resolving fresh at gesture end also means streaming that lands
-//! mid-drag cannot corrupt the result: each row maps to whatever content is
-//! current then.
+//! selection survive scrolling: the anchor stays pinned to the text it was
+//! placed on, while the live drag head re-resolves to the content under the
+//! cursor — on wheel events immediately, and on content-induced scrolls
+//! (streaming growth, appended turns) at draw time via [`follow_cursor`] —
+//! and the draw-time highlight re-evaluates against the current scroll every
+//! frame, so what is highlighted is exactly what gets copied.  Resolving
+//! fresh at gesture end also means streaming that lands mid-drag cannot
+//! corrupt the result: each row maps to whatever content is current then.
 //!
 //! Coordinates: the history pane's lines are pre-wrapped at `content_width`
 //! (viewport width − 9) and drawn in a non-wrapping `Paragraph`, so every
@@ -26,6 +28,7 @@
 //! cached `visual_offsets` so a hypothetical multi-row line maps correctly.
 
 use crate::state::{App, RenderedTurn, SessionDisplayState, grapheme_offset_at_column};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -56,6 +59,11 @@ pub(crate) struct TextSelection {
     /// Live drag head: (content line, viewport column); updated on every
     /// drag event.
     pub head: (usize, u16),
+    /// The last mouse position (viewport row, column) the gesture saw.  When
+    /// content moves under a stationary pointer (streaming growth, appended
+    /// turns), [`follow_cursor`] re-resolves the head from this screen
+    /// position so the selection's live end tracks the cursor.
+    pub cursor: (u16, u16),
     /// True once `head != anchor` (a real selection, not a click).
     pub active: bool,
 }
@@ -79,6 +87,24 @@ fn screen_to_content(app: &App, row: u16, column: u16) -> (usize, u16) {
     (content_line as usize, column)
 }
 
+/// Map a global content line to its screen row for the current scroll and
+/// viewport — the exact inverse of [`screen_to_content`] (content row `c`
+/// sits at screen row `c + scroll + vh − total`).  `None` when the line is
+/// scrolled out of view.  Shared by the tests that locate content on screen
+/// (`locate`, `first_content_row`) so the bottom-anchored formula lives in
+/// one place.
+#[cfg(test)]
+pub(crate) fn content_to_screen_row(app: &App, content_line: usize) -> Option<u16> {
+    let vh = app.history_viewport.height as isize;
+    let total = app.total_history_height() as isize;
+    let scroll = app.effective_scroll() as isize;
+    let screen_row = content_line as isize + scroll + vh - total;
+    if screen_row < 0 || screen_row >= vh {
+        return None;
+    }
+    Some(screen_row as u16)
+}
+
 /// Arm a potential selection at the mouse-down position.  A selection only
 /// becomes real (highlighted, copied) once the drag moves.
 pub(crate) fn start_selection(app: &mut App, row: u16, column: u16) {
@@ -86,6 +112,7 @@ pub(crate) fn start_selection(app: &mut App, row: u16, column: u16) {
     app.text_selection = Some(TextSelection {
         anchor,
         head: anchor,
+        cursor: (row, column),
         active: false,
     });
 }
@@ -103,6 +130,7 @@ pub(crate) fn update_selection(app: &mut App, row: u16, column: u16) {
     let head = screen_to_content(app, row, column);
     if let Some(sel) = &mut app.text_selection {
         sel.head = head;
+        sel.cursor = (row, column);
         if sel.head != sel.anchor {
             sel.active = true;
         }
@@ -114,38 +142,88 @@ pub(crate) fn cancel_selection(app: &mut App) {
     app.text_selection = None;
 }
 
-/// The normalized (start, end) endpoints of the selection, or `None` when
-/// there is no active selection (including a plain click that never dragged).
+/// Re-resolve the selection's live head to the content now under the cursor.
+///
+/// Called from the draw path right after the height-prefix rebuild settles
+/// content-induced viewport movement (streaming growth, appended turns,
+/// undo/redo): the head is stored in content coordinates at the last mouse
+/// event, but when the viewport's content moves under a stationary pointer
+/// the text under the cursor is different — so the head must be re-derived
+/// from the remembered screen position, or the highlight (and the copy on
+/// release) would lag until the next drag.  Terminal-native drag-while-
+/// scroll: the anchor stays pinned to the text it was placed on, the live
+/// end follows the cursor.  A gesture that has not yet been activated by a
+/// drag is never touched (a plain click + content scroll must not silently
+/// start a selection).
+pub(crate) fn follow_cursor(app: &mut App) {
+    let Some(sel) = app.text_selection else {
+        return;
+    };
+    if !sel.active {
+        return;
+    }
+    let head = screen_to_content(app, sel.cursor.0, sel.cursor.1);
+    if let Some(sel) = &mut app.text_selection {
+        sel.head = head;
+    }
+}
+
+/// The (anchor, head) endpoints of the active selection, or `None` when there
+/// is no active selection (including a plain click that never dragged).
+///
+/// Returned as stored — deliberately NOT sorted into a start/end pair: the
+/// column semantics are anchor-fixed (see [`selection_bounds_for_line`]), so
+/// which endpoint owns which column depends on the row each sits on, not on
+/// their order.  Lexicographically sorting here would swap the columns on a
+/// reverse drag.
 pub(crate) fn selection_range(app: &App) -> Option<((usize, u16), (usize, u16))> {
     let sel = app.text_selection?;
     if !sel.active {
         return None;
     }
-    Some(normalize(sel.anchor, sel.head))
+    Some((sel.anchor, sel.head))
 }
 
-/// Order two endpoints so `start <= end` in (content line, column) space,
-/// making a bottom-to-top drag (or a right-to-left drag on the end row)
-/// select the same rectangle as the equivalent top-to-bottom one.
-fn normalize(a: (usize, u16), b: (usize, u16)) -> ((usize, u16), (usize, u16)) {
-    if (b.0, b.1) < (a.0, a.1) {
-        (b, a)
+/// The display-column range `(lo, hi)` the selection covers on `line`, in
+/// viewport columns.  `hi` of `usize::MAX` means "to the end of the line".
+///
+/// Terminal-native anchor semantics: the anchor row always extends from the
+/// anchor column to end-of-line and the head row from start-of-line to the
+/// head column — so a bottom-to-top drag that also moves horizontally
+/// *mirrors* the columns instead of swapping them (dragging from bottom-right
+/// to top-left selects `[0, head_col)` on the top row and `[anchor_col, EOL)`
+/// on the bottom row, NOT the same rectangle as the forward drag, which is
+/// what the old lexicographic normalization produced).  A drag that never
+/// leaves its row is just the span between the two columns; middle rows are
+/// full width.
+fn selection_bounds_for_line(
+    anchor: (usize, u16),
+    head: (usize, u16),
+    line: usize,
+) -> (usize, usize) {
+    if anchor.0 == head.0 {
+        let (lo, hi) = (anchor.1.min(head.1), anchor.1.max(head.1));
+        (lo as usize, hi as usize)
+    } else if line == anchor.0 {
+        (anchor.1 as usize, usize::MAX)
+    } else if line == head.0 {
+        (0, head.1 as usize)
     } else {
-        (a, b)
+        (0, usize::MAX)
     }
 }
 
-/// Finish the selection at the release point: return the selected text (if
-/// the gesture was a real drag over copyable rows) and always clear the
-/// selection state.  Returns `None` for a plain click.
+/// Finish the selection: return the selected text (if the gesture was a real
+/// drag over copyable rows) and always clear the selection state.  Returns
+/// `None` for a plain click.
 ///
-/// The release position is deliberately NOT applied to the head: the head
-/// already sits at the last drag position in *content* coordinates, and
-/// re-resolving the release screen position would point at whatever content
-/// now happens to sit under the cursor — which after a mid-gesture scroll is
-/// NOT the text the user selected.  Only explicit drag events move the head,
-/// so the selection stays pinned to the text even when the viewport moved
-/// under it.
+/// The release position is deliberately NOT consulted: the head already sits
+/// where the last drag — or the draw-time [`follow_cursor`] sync — left it
+/// in *content* coordinates, and re-resolving the release screen position
+/// would point at whatever content now happens to sit under the cursor, which
+/// after a mid-gesture scroll is NOT the text the user selected.  Only
+/// explicit drag events and `follow_cursor` move the head, so the selection
+/// stays pinned to the text even when the viewport moved under it.
 pub(crate) fn finish_selection(app: &mut App) -> Option<String> {
     let text = if app.text_selection.is_some_and(|s| s.active) {
         extract_selection_text(app)
@@ -156,6 +234,46 @@ pub(crate) fn finish_selection(app: &mut App) -> Option<String> {
     text
 }
 
+/// Drive one mouse event through an in-progress selection gesture.
+///
+/// Returns the text to copy when a left-button release completed a real
+/// selection (`None` otherwise — a plain click, a cancelled gesture, or any
+/// drag/scroll event).  The caller performs the clipboard write and surfaces
+/// the status; the entire gesture state machine lives here.
+pub(crate) fn handle_selection_mouse(app: &mut App, mouse: &MouseEvent) -> Option<String> {
+    match mouse.kind {
+        MouseEventKind::Drag(MouseButton::Left) => {
+            update_selection(app, mouse.row, mouse.column);
+            None
+        }
+        MouseEventKind::Up(MouseButton::Left) => finish_selection(app),
+        // A scroll wheel mid-gesture scrolls immediately AND keeps the
+        // selection: the anchor stays pinned to the text it was placed on
+        // (content coordinates), while the live drag head re-resolves to the
+        // content now under the cursor — so the selection tracks the cursor
+        // as the viewport moves, and the highlight updates on the wheel event
+        // itself (terminal-native drag-while-scroll).  The scroll is applied
+        // synchronously (not via the frame accumulator) so the head is
+        // resolved against the post-scroll content immediately.
+        MouseEventKind::ScrollUp => {
+            app.scroll_up(1);
+            update_selection(app, mouse.row, mouse.column);
+            None
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_down(1);
+            update_selection(app, mouse.row, mouse.column);
+            None
+        }
+        _ => {
+            // Any other mouse event (right-click, a second Down before the
+            // first Up) cancels the gesture.
+            cancel_selection(app);
+            None
+        }
+    }
+}
+
 /// Extract the plain text covered by the active selection rectangle.
 ///
 /// Content lines are resolved one at a time through the height prefix + the
@@ -163,24 +281,16 @@ pub(crate) fn finish_selection(app: &mut App) -> Option<String> {
 /// rows, image blocks, lines past the end — are skipped, so the copyable
 /// region is exactly the region the highlight covers.
 fn extract_selection_text(app: &App) -> Option<String> {
-    let ((start_line, start_col), (end_line, end_col)) = selection_range(app)?;
+    let (anchor, head) = selection_range(app)?;
     let display = app.active_display_ref()?;
     let vp_width = app.history_viewport.width as usize;
+    let (start_line, end_line) = (anchor.0.min(head.0), anchor.0.max(head.0));
     let mut out = String::new();
     // Iterate the selection's *content* lines directly — no screen mapping,
     // which is exactly why the selection survives scrolling (the endpoints
     // are content-anchored, so this is scroll-independent).
     for content_line in start_line..=end_line {
-        let col_lo = if content_line == start_line {
-            start_col as usize
-        } else {
-            0
-        };
-        let col_hi = if content_line == end_line {
-            end_col as usize
-        } else {
-            usize::MAX
-        };
+        let (col_lo, col_hi) = selection_bounds_for_line(anchor, head, content_line);
         if let Some(text) = text_for_content_line(display, vp_width, content_line, col_lo, col_hi) {
             if !out.is_empty() {
                 out.push('\n');
@@ -324,12 +434,12 @@ pub(crate) fn apply_selection_to_lines(
     line_start: usize,
     lines: &mut [Line<'static>],
 ) {
-    let Some((start, end)) = selection_range(app) else {
-        return;
+    let (anchor, head) = match selection_range(app) {
+        Some(range) => range,
+        None => return,
     };
     let vp = app.history_viewport;
-    let (start_line, start_col) = (start.0, start.1 as usize);
-    let (end_line, end_col) = (end.0, end.1 as usize);
+    let (start_line, end_line) = (anchor.0.min(head.0), anchor.0.max(head.0));
     for (k, line) in lines.iter_mut().enumerate() {
         let li = line_start + k;
         let row_lo = li
@@ -356,16 +466,7 @@ pub(crate) fn apply_selection_to_lines(
             if content_line < start_line || content_line > end_line {
                 continue;
             }
-            let col_lo = if content_line == start_line {
-                start_col
-            } else {
-                0
-            };
-            let col_hi = if content_line == end_line {
-                end_col
-            } else {
-                usize::MAX
-            };
+            let (col_lo, col_hi) = selection_bounds_for_line(anchor, head, content_line);
             // Translate the viewport columns into the semantic line's own
             // column space and clamp to its meaningful content — the exact
             // mapping extraction uses (`content_range_for_row`), so the
@@ -529,12 +630,6 @@ mod tests {
     /// verifying the row→turn→line→column mapping end to end.
     fn locate(app: &App, needle: &str) -> ((u16, u16), (u16, u16)) {
         let display = app.active_display_ref().expect("active display");
-        let vp = app.history_viewport;
-        let total = display.total_history_height();
-        let scroll = display.effective_scroll(&vp);
-        // Content row c maps to screen row c + scroll + vh - total (bottom
-        // anchored; see find_turn_at_row).
-        let row_base = scroll + vp.height as usize - total;
         for (turn_idx, _turn_id) in display.visible_turn_ids.iter().enumerate() {
             let cached = display.render_cache[turn_idx]
                 .as_ref()
@@ -556,7 +651,8 @@ mod tests {
                         .copied()
                         .unwrap_or(0);
                     // Every rendered line occupies one visual row in practice.
-                    let screen_row = (turn_start + row_lo + row_base) as u16;
+                    let screen_row = content_to_screen_row(app, turn_start + row_lo)
+                        .expect("needle must be on screen");
                     return ((screen_row, col_start as u16), (screen_row, col_end as u16));
                 }
             }
@@ -644,13 +740,36 @@ mod tests {
     }
 
     #[test]
-    fn extract_reverse_drag_normalizes() {
-        let mut app = app_with_turns(&[(0, "first"), (1, "second")], 30);
-        let (start, _) = locate(&app, "first");
-        let (_, end) = locate(&app, "second");
-        // Bottom-to-top drag must select the same rectangle.
-        let text = drag_and_finish(&mut app, end, start).expect("selection should extract");
-        assert!(text.contains("first") && text.contains("second"));
+    fn reverse_diagonal_drag_keeps_columns_anchored() {
+        // Terminal-native anchor semantics: the anchor row extends from the
+        // anchor column to end-of-line and the head row from start-of-line to
+        // the head column — so a bottom-to-top drag that also moves
+        // horizontally *mirrors* the columns instead of swapping them (the
+        // old lexicographic normalize swapped them, extracting a mirror-image
+        // rectangle: for this drag it would have yielded "one\nline ").
+        let mut app = app_with_turns(&[(0, "line one"), (1, "line two")], 30);
+        // Head at the end of "lin" on the top turn's content row; anchor at
+        // the start of "wo" on the bottom turn's content row (a reverse
+        // diagonal drag).
+        let (_, head_end) = locate(&app, "lin");
+        let (anchor_start, _) = locate(&app, "wo");
+        let text =
+            drag_and_finish(&mut app, anchor_start, head_end).expect("selection should extract");
+        // Head row: [0, head_col) → "lin"; anchor row: [anchor_col, EOL) → "wo".
+        assert_eq!(text, "lin\nwo");
+    }
+
+    #[test]
+    fn selection_bounds_follow_anchor_semantics() {
+        // Anchor row: [anchor_col, EOL); head row: [0, head_col); middle
+        // rows: full width — regardless of which endpoint is on top.
+        let anchor = (5, 30);
+        let head = (2, 4);
+        assert_eq!(selection_bounds_for_line(anchor, head, 2), (0, 4));
+        assert_eq!(selection_bounds_for_line(anchor, head, 3), (0, usize::MAX));
+        assert_eq!(selection_bounds_for_line(anchor, head, 5), (30, usize::MAX));
+        // Same-row drags are just the span between the two columns.
+        assert_eq!(selection_bounds_for_line((3, 8), (3, 2), 3), (2, 8));
     }
 
     #[test]
@@ -736,12 +855,13 @@ mod tests {
     }
 
     #[test]
-    fn release_after_scroll_does_not_rewind_the_head() {
-        // The release position is deliberately NOT applied to the head: after
-        // scrolling mid-gesture, the release *screen* position maps to
-        // different content than the last drag did (the viewport moved under
-        // the cursor), so re-resolving it would silently shrink the
-        // selection.  Only explicit drag events move the head.
+    fn release_uses_head_from_last_sync_without_rewinding() {
+        // The release event never moves the head: after a mid-gesture scroll
+        // the draw-time `follow_cursor` sync re-resolves it to the content
+        // under the cursor, and releasing must preserve exactly that —
+        // re-resolving the release *screen* position would point at different
+        // content than the cursor sat on at the last draw (the viewport moved
+        // under it).
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
@@ -752,22 +872,79 @@ mod tests {
         }
         app.rebuild_height_prefix();
 
-        // Drag from row 2 to row 4 (content lines total - vh + 2 ..= total
-        // - vh + 4 at scroll 0), then scroll up WITHOUT moving the mouse.
+        // Drag rows 2..4 at scroll 0, then scroll up 3 and let the draw-time
+        // sync re-resolve the head (a wheel mid-gesture does both of these).
         start_selection(&mut app, 2, 3);
         update_selection(&mut app, 4, 10);
-        let before = extract_selection_text(&app).expect("selection text");
         app.scroll_accumulator = 3;
         app.apply_scroll_delta();
+        follow_cursor(&mut app);
 
-        // Release: the head must stay where the last drag left it, so the
-        // copied text is unchanged even though the cursor now sits over
-        // earlier content.
-        let after = finish_selection(&mut app).expect("selection text on release");
-        assert_eq!(
-            before, after,
-            "releasing after a scroll must not rewind the selection head"
+        let expected = extract_selection_text(&app).expect("selection text after the sync");
+        // Release: the copied text is whatever the last sync left — the
+        // release position is never consulted, so it can neither extend nor
+        // rewind the selection.
+        let actual = finish_selection(&mut app).expect("selection text on release");
+        assert_eq!(actual, expected, "release must not move the head");
+    }
+
+    #[test]
+    fn follow_cursor_reanchors_head_after_content_scrolls() {
+        // New content appended at the bottom while a selection is active (the
+        // auto-following bottom of a streaming session): the content under
+        // the stationary cursor changes, so the draw-time sync must re-resolve
+        // the head to it — without any mouse movement.  The anchor stays
+        // pinned to the text it was placed on.
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        for i in 0..20u32 {
+            app.display_for(0)
+                .view
+                .insert_or_replace(i, turn(&format!("turn {i}")));
+        }
+        app.rebuild_height_prefix();
+
+        // Drag rows 2..5 at scroll 0 (bottom-anchored: content lines
+        // total−vh+2 ..= total−vh+5).
+        start_selection(&mut app, 2, 3);
+        update_selection(&mut app, 5, 40);
+        let ((anchor0, _), (head0, _)) = selection_range(&app).unwrap();
+        assert_eq!((anchor0, head0), (92, 95));
+
+        // A new turn streams in below, growing the history exactly as a
+        // daemon message would (the viewport is bottom-anchored, so the old
+        // content shifts up and the content under the stationary cursor moves
+        // down).
+        app.display_for(0)
+            .view
+            .insert_or_replace(20, turn("turn 20"));
+        app.rebuild_height_prefix();
+        follow_cursor(&mut app);
+
+        let ((anchor1, _), (head1, _)) = selection_range(&app).unwrap();
+        assert_eq!(anchor1, 92, "the anchor stays pinned to its text");
+        assert_eq!(head1, 100, "the head tracks the content under the cursor");
+        assert!(
+            app.text_selection.is_some_and(|s| s.active),
+            "content scroll must keep the selection active"
         );
+    }
+
+    #[test]
+    fn follow_cursor_does_not_activate_an_armed_click() {
+        // A plain click (armed but never dragged) must not silently become a
+        // selection when the content scrolls under it — only an explicit drag
+        // activates the gesture.
+        let mut app = app_with_turns(&[(0, "hello")], 30);
+        let ((r, c), _) = locate(&app, "hello");
+        start_selection(&mut app, r, c);
+        follow_cursor(&mut app);
+        assert!(
+            !app.text_selection.unwrap().active,
+            "a plain click + content scroll must not start a selection"
+        );
+        assert_eq!(finish_selection(&mut app), None, "nothing to copy");
     }
 
     // ── style_line_selection ──
@@ -867,20 +1044,14 @@ mod tests {
     fn row_highlighted(app: &mut App, screen_row: u16) -> bool {
         let vp_width = app.history_viewport.width;
         // The selection is stored in content space, so the target screen row
-        // must be converted to its content line (the same mapping
-        // `start_selection` applies) before setting up the full-width
-        // selection rectangle.
-        let content_line = {
-            let display = app.active_display_ref().unwrap();
-            let vh = app.history_viewport.height as isize;
-            let total = display.total_history_height() as isize;
-            let scroll = display.effective_scroll(&app.history_viewport) as isize;
-            let last_line = (total - 1).max(0);
-            ((screen_row as isize + total - scroll - vh).clamp(0, last_line)) as usize
-        };
+        // is converted to its content line via the exact mapping
+        // `start_selection` applies (`screen_to_content`), not a hand-rolled
+        // copy of the formula.
+        let (content_line, _) = screen_to_content(app, screen_row, 0);
         app.text_selection = Some(TextSelection {
             anchor: (content_line, 0),
             head: (content_line, vp_width),
+            cursor: (screen_row, 0),
             active: true,
         });
         let (turn_idx, visual_row) = find_turn_at_row(app, screen_row).expect("row maps");

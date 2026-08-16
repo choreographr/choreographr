@@ -1294,54 +1294,25 @@ fn handle_chat_event(
         // matching terminal-native selection, where a drag spans the whole
         // screen.  A scrollbar click can never arm a text selection (its Down
         // lands in the scrollbar arm below, which never calls
-        // `start_selection`).
+        // `start_selection`).  The gesture state machine lives in `selection`;
+        // only the clipboard write and the status message belong to the UI
+        // loop.
         Event::Mouse(mouse) if selection::is_selecting(app) => {
-            match mouse.kind {
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    selection::update_selection(app, mouse.row, mouse.column);
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    let text = selection::finish_selection(app);
-                    if let Some(text) = text {
-                        if clipboard::copy_to_clipboard(&text) {
-                            tracing::info!(
-                                bytes = text.len(),
-                                "[choreo-tui] copied selection to clipboard via OSC 52"
-                            );
-                            app.status = Some("Selection copied to clipboard.".to_string());
-                        } else {
-                            // Over the OSC 52 size cap: say so instead of
-                            // pretending the copy succeeded (see clipboard.rs).
-                            tracing::warn!(
-                                bytes = text.len(),
-                                "[choreo-tui] selection exceeds the OSC 52 size cap; not copied"
-                            );
-                            app.status =
-                                Some("Selection too large to copy to clipboard.".to_string());
-                        }
-                    }
-                }
-                // A scroll wheel mid-gesture scrolls immediately AND keeps
-                // the selection: the anchor stays pinned to the text it was
-                // placed on (content coordinates), while the live drag head
-                // re-resolves to the content now under the cursor — so the
-                // selection tracks the cursor as the viewport moves, and the
-                // highlight updates on the wheel event itself (terminal-
-                // native drag-while-scroll).  The scroll is applied
-                // synchronously (not via the frame accumulator) so the head
-                // is resolved against the post-scroll content immediately.
-                MouseEventKind::ScrollUp => {
-                    app.scroll_up(1);
-                    selection::update_selection(app, mouse.row, mouse.column);
-                }
-                MouseEventKind::ScrollDown => {
-                    app.scroll_down(1);
-                    selection::update_selection(app, mouse.row, mouse.column);
-                }
-                _ => {
-                    // Any other mouse event (right-click, a second Down
-                    // before the first Up) cancels the gesture.
-                    selection::cancel_selection(app);
+            if let Some(text) = selection::handle_selection_mouse(app, &mouse) {
+                if clipboard::copy_to_clipboard(&text) {
+                    tracing::info!(
+                        bytes = text.len(),
+                        "[choreo-tui] copied selection to clipboard via OSC 52"
+                    );
+                    app.status = Some("Selection copied to clipboard.".to_string());
+                } else {
+                    // Over the OSC 52 size cap: say so instead of
+                    // pretending the copy succeeded (see clipboard.rs).
+                    tracing::warn!(
+                        bytes = text.len(),
+                        "[choreo-tui] selection exceeds the OSC 52 size cap; not copied"
+                    );
+                    app.status = Some("Selection too large to copy to clipboard.".to_string());
                 }
             }
         }
@@ -3230,10 +3201,6 @@ mod tests {
     /// the history has no selectable content.
     fn first_content_row(app: &App) -> Option<u16> {
         let display = app.active_display_ref()?;
-        let vh = app.history_viewport.height as usize;
-        let total = display.total_history_height();
-        let scroll = display.effective_scroll(&app.history_viewport);
-        let row_offset = scroll as isize + vh as isize - total as isize;
         for (turn_idx, _turn_id) in display.visible_turn_ids.iter().enumerate() {
             let Some(cached) = display.render_cache[turn_idx].as_ref() else {
                 continue;
@@ -3244,10 +3211,7 @@ mod tests {
                 .copied()
                 .unwrap_or(0);
             for (line_idx, content) in cached.rendered.content_ranges.iter().enumerate() {
-                let Some((lo, hi)) = content else {
-                    continue;
-                };
-                if lo >= hi {
+                if !content.is_some_and(|(lo, hi)| lo < hi) {
                     continue;
                 }
                 let row_lo = cached
@@ -3256,9 +3220,13 @@ mod tests {
                     .get(line_idx.wrapping_sub(1))
                     .copied()
                     .unwrap_or(0);
-                let screen_row = turn_start as isize + row_lo as isize + row_offset;
-                if screen_row >= 0 && (screen_row as usize) < vh {
-                    return Some(screen_row as u16);
+                // Reuse the selection module's content→screen mapping rather
+                // than re-deriving the bottom-anchored formula by hand (and
+                // keep scanning: an off-screen line is not the answer yet).
+                if let Some(screen_row) =
+                    crate::selection::content_to_screen_row(app, turn_start + row_lo)
+                {
+                    return Some(screen_row);
                 }
             }
         }

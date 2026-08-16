@@ -5234,6 +5234,7 @@ mod tests {
         app.text_selection = Some(crate::selection::TextSelection {
             anchor: (0, 0),
             head: (2, 3),
+            cursor: (0, 0),
             active: true,
         });
         app.reset_for_session_switch(1);
@@ -5253,6 +5254,7 @@ mod tests {
         app.text_selection = Some(crate::selection::TextSelection {
             anchor: (0, 0),
             head: (2, 3),
+            cursor: (0, 0),
             active: true,
         });
         app.set_page(Page::SessionManager);

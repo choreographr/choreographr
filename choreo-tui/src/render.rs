@@ -193,6 +193,12 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     // so render_history iterates the correct set of visible turns rather
     // than an empty visible_turn_ids on the first frame after session data arrives.
     app.compute_total_height_and_markers();
+    // The rebuild above settles content-induced viewport movement (streaming
+    // growth, appended turns, undo/redo); re-anchor an in-progress selection's
+    // live head to the content now under the cursor so the highlight (and the
+    // copy on release) tracks the pointer even when no mouse event arrived —
+    // the anchor stays pinned to its text.  See `selection::follow_cursor`.
+    selection::follow_cursor(app);
     render_history(frame, history_chunks[0], app);
 
     // ── Scrollbar ────────────────────────────────────────────
