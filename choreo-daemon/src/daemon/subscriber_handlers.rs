@@ -213,16 +213,30 @@ impl DaemonState {
     /// the writer shuts the socket down, unblocking the reader's blocking
     /// read and running the normal `cleanup_client` teardown.
     pub(super) fn handle_evict_client(&mut self, client_id: u64) {
-        if !self.client_writers.contains_key(&client_id) {
+        // Single lookup serving both the idempotency guard and the two uses
+        // below (backlog read + advisory send). Idempotent (no-op for an
+        // unknown client): multiple producers can observe `ClientOverLag`
+        // for the same client before the first eviction command lands, and
+        // each re-signal must not double-evict or panic.
+        let Some(sink) = self.client_writers.get(&client_id) else {
             return;
-        }
+        };
         warn!(
             "evicting lagging client: client_id={}, backlog_bytes={}",
             client_id,
-            self.client_writers
-                .get(&client_id)
-                .map_or(0, |s| s.bytes_in_flight.load(Ordering::Relaxed))
+            sink.bytes_in_flight.load(Ordering::Relaxed)
         );
+        // Best-effort advisory: a healthy writer flushes it and closes its
+        // own socket; a wedged writer never sees it (the write timeout
+        // reaps the connection instead). Enqueue BEFORE dropping the sink,
+        // through the accounting path: the writer's per-dequeue decrement
+        // (or the exit drain, if the advisory is abandoned behind the stop
+        // point) needs a matching increment, and a dead receiver
+        // self-corrects inside `send_unchecked`. Sent while `sink` is still
+        // borrowed; the borrow ends here, before the map mutations below
+        // (the daemon command loop is single-threaded, so reordering the
+        // advisory ahead of the removals is unobservable).
+        let _ = sink.send_unchecked(&DaemonMessage::Evicted, &self.global_lag);
         self.summary_subscribers.remove(&client_id);
         self.activity_subscribers.remove(&client_id);
         // Promptly remove this client from every session's subscriber map
@@ -231,16 +245,10 @@ impl DaemonState {
         // as soon as possible, and a session must not keep streaming to a
         // client that is being torn down.
         self.remove_client_from_sessions(client_id);
-        // Best-effort advisory: a healthy writer flushes it and closes its
-        // own socket; a wedged writer never sees it (the write timeout
-        // reaps the connection instead). Enqueue BEFORE dropping the sink,
-        // through the accounting path: the writer's per-dequeue decrement
-        // (or the exit drain, if the advisory is abandoned behind the stop
-        // point) needs a matching increment, and a dead receiver
-        // self-corrects inside `send_unchecked`.
-        if let Some(sink) = self.client_writers.get(&client_id) {
-            let _ = sink.send_unchecked(&DaemonMessage::Evicted, &self.global_lag);
-        }
+        // Drop the registered writer channel; the advisory is already
+        // queued, and the connection thread's own sink clone (dropped by
+        // cleanup_client) is what keeps the writer draining until it closes
+        // the socket.
         self.client_writers.remove(&client_id);
         crate::metrics::record_eviction();
     }
