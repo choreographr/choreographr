@@ -1303,14 +1303,12 @@ fn handle_chat_event(
                 MouseEventKind::Up(MouseButton::Left) => {
                     let text = selection::finish_selection(app, mouse.row, mouse.column);
                     if let Some(text) = text {
-                        let tokens = selection::approx_tokens(&text);
                         clipboard::copy_to_clipboard(&text);
                         tracing::info!(
                             bytes = text.len(),
-                            tokens,
                             "[choreo-tui] copied selection to clipboard via OSC 52"
                         );
-                        app.status = Some(format!("{tokens} tokens copied to clipboard"));
+                        app.status = Some("Selection copied to clipboard.".to_string());
                     }
                 }
                 _ => {
@@ -3281,10 +3279,7 @@ mod tests {
             "selection cleared after release"
         );
         let status = app.status.as_deref().expect("copy sets a status message");
-        assert!(
-            status.ends_with("tokens copied to clipboard"),
-            "unexpected status: {status}"
-        );
+        assert_eq!(status, "Selection copied to clipboard.");
     }
 
     #[test]

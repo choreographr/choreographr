@@ -223,17 +223,6 @@ fn cached_rendered_turn(
     Some(&cached.rendered)
 }
 
-/// Rough token estimate for the copied-selection status line.
-///
-/// Not a tokenizer: it reuses the same UTF-8 bytes ÷ 4 heuristic the daemon
-/// documents for non-decodable reasoning artifacts (`choreo-daemon`'s
-/// `estimate_prompt_tokens`), which lands near the ~4 chars/token density of
-/// English prose.  Good enough for a "how much context did I just grab"
-/// status; exact counts would need tiktoken in the TUI.
-pub(crate) fn approx_tokens(text: &str) -> usize {
-    text.len().div_ceil(4)
-}
-
 /// Apply the selection highlight to the visible slice of one turn's lines.
 ///
 /// Called from `render_history` for the visible semantic-line slice of each
@@ -883,25 +872,6 @@ mod tests {
                 .any(|l| l.spans.iter().any(|s| s.style.bg == Some(SELECTION_BG))),
             "the selected row must be highlighted"
         );
-    }
-
-    // ── approx_tokens ──
-
-    #[test]
-    fn approx_tokens_empty_is_zero() {
-        assert_eq!(approx_tokens(""), 0);
-    }
-
-    #[test]
-    fn approx_tokens_basic() {
-        // 20 bytes / 4 = 5 tokens.
-        assert_eq!(approx_tokens("hello world hello!"), 5);
-    }
-
-    #[test]
-    fn approx_tokens_rounds_up() {
-        // 5 bytes → ceil(5/4) = 2 tokens.
-        assert_eq!(approx_tokens("hello"), 2);
     }
 
     // ── slice_line_columns ──
