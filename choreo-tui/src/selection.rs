@@ -336,8 +336,11 @@ fn extract_selection_text(app: &App) -> Option<String> {
     // Collect one slot per selected row: its text, the [`LineJoin`] the row
     // was recorded with (how it glues to the row before it), and its
     // (turn_idx, line_idx) so adjacency can be checked across turns.  Rows
-    // with no copyable content (chrome, blank spacers) contribute no slot;
-    // the gap between two non-adjacent slots is a break.
+    // with no copyable content (pure chrome: box separators, padding,
+    // image blocks, past-end) contribute no slot; blank *content* rows —
+    // the renderer's blank spacers between markdown blocks, blank lines
+    // inside tool output — contribute an empty slot, so a blank line inside
+    // the selected text survives the copy as a blank line.
     let mut slots: Vec<(String, LineJoin, usize, usize)> = Vec::new();
     // Iterate the selection's *content* lines directly — no screen mapping,
     // which is exactly why the selection survives scrolling (the endpoints
@@ -463,7 +466,11 @@ fn text_and_join_for_content_line(
 /// the line".  Returns `(line_idx, (lo, hi))` — the semantic line and its
 /// selectable display-column range — or `None` when the row maps to no
 /// selectable content (pure-chrome rows, image rows, rows past the end of
-/// the text).
+/// the text).  A *blank* content row (an empty `(lo, lo)` range) resolves
+/// to that empty range rather than `None`: it is genuine content with no
+/// characters (the renderer's blank spacer between markdown blocks), so the
+/// extraction path records it as an empty slot and the blank line survives
+/// the copy, while chrome stays `None` and contributes nothing.
 fn content_range_for_row(
     visual_offsets: &[usize],
     content_ranges: &[Option<(usize, usize)>],
@@ -499,14 +506,32 @@ fn content_range_for_row(
     // the copy ever includes the box chrome (`┃` gutter, indents, trailing
     // fill) or pure-chrome rows.
     let content = content_ranges.get(line_idx).copied().flatten();
-    let (lo, hi) = match content {
-        Some((lo, hi)) if lo < hi => (line_col_lo.max(lo), line_col_hi.min(hi)),
-        _ => return None,
-    };
-    if lo >= hi {
-        return None;
+    match content {
+        // A real content row: clamp the selected columns to its content
+        // range; an empty overlap means the selection covers none of it.
+        Some((clo, chi)) if clo < chi => {
+            let lo = line_col_lo.max(clo);
+            let hi = line_col_hi.min(chi);
+            if lo >= hi {
+                return None;
+            }
+            Some((line_idx, (lo, hi)))
+        }
+        // A *blank* content row — an empty `(lo, lo)` range: content with
+        // no characters, e.g. the spacer the renderer leaves between
+        // markdown blocks or genuinely blank lines inside tool output.
+        // Deliberately NOT chrome: the extraction path turns it into an
+        // empty slot (its `Break` join re-inserts the newline), so a blank
+        // line inside the selected text is copied, not dropped.  The
+        // highlight path is unaffected: `style_line_selection` no-ops on an
+        // empty column range.  (An empty overlap on a non-blank row falls
+        // through the first arm to `None` above; only the row's own empty
+        // content range reaches this arm.)
+        Some((clo, chi)) => Some((line_idx, (clo, chi))),
+        // Pure chrome (box separators, padding, image blocks, past-end): no
+        // content, no slot.
+        None => None,
     }
-    Some((line_idx, (lo, hi)))
 }
 
 /// Read-only render-cache lookup for a turn's rendered lines.

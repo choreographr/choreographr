@@ -1081,9 +1081,13 @@ pub(crate) fn render_turn_lines(
                 .push(Span::styled(" ".repeat(fill), Style::default()));
             line.spans.push(Span::styled("  ", Style::default()));
             // Unboxed rows: content starts after the 2-column indent and ends
-            // where the fill begins.  Blank spacer rows carry no content.
+            // where the fill begins.  Blank body rows (the renderer's spacer
+            // rows and genuinely blank tool-output lines) carry no characters
+            // but are *content*, not chrome: they keep an empty `(2, 2)`
+            // range so the selection copies the source's blank lines, while
+            // the turn-edge separators/padding stay `None` and are dropped.
             let end = (2 + content_sum).min(2 + tool_content_width as usize);
-            all_content_ranges.push((content_sum > 0).then_some((2, end)));
+            all_content_ranges.push(Some((2, end)));
             all_joins.push(join);
             all_lines.push(line);
         }
@@ -3030,7 +3034,7 @@ mod tests {
         // Every produced row carries a join, and the copy metadata on the
         // assistant block rows matches the row count (the selection
         // machinery relies on the alignment).
-        let mut turn = Turn {
+        let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
             error: None,
@@ -3046,7 +3050,7 @@ mod tests {
             reasoning_artifact: None,
             reasoning_producer: None,
         };
-        let rendered = render_turn_lines(&mut turn, 20, 24, false, &[]);
+        let rendered = render_turn_lines(&turn, 20, 24, false, &[]);
         assert_eq!(rendered.lines.len(), rendered.joins.len());
         assert_eq!(rendered.lines.len(), rendered.content_ranges.len());
         // The box chrome rows are fresh lines; at least one content row is a

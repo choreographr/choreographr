@@ -713,7 +713,8 @@ fn wrapped_paragraph_copies_unwrapped_text() {
 #[test]
 fn wrapped_paragraphs_keep_paragraph_boundaries() {
     // Paragraph boundaries are real breaks: the copy joins the wrapped rows
-    // of each paragraph, but keeps a newline between separate paragraphs.
+    // of each paragraph, and the blank line the renderer inserts between
+    // separate paragraphs survives as a blank line.
     let p1 = "first paragraph text that wraps around nicely and continues";
     let p2 = "second paragraph also wraps across the same narrow viewport";
     let md = format!("{p1}\n\n{p2}");
@@ -730,8 +731,66 @@ fn wrapped_paragraphs_keep_paragraph_boundaries() {
         drag_and_finish(&mut app, (first, 0), (last, 200)).expect("selection should extract");
     let mut lines = copied.lines();
     assert_eq!(lines.next(), Some(p1), "first paragraph unwrapped");
+    assert_eq!(lines.next(), Some(""), "blank line between paragraphs kept");
     assert_eq!(lines.next(), Some(p2), "second paragraph unwrapped");
     assert_eq!(lines.next(), None, "no extra lines");
+}
+
+#[test]
+fn blank_line_between_heading_and_paragraph_is_copied() {
+    // Regression: the blank spacer row the renderer leaves between a heading
+    // and the following paragraph is a *content* row (an empty `(5, 5)`
+    // range, recorded with a `Break` join) — not chrome.  It used to be
+    // dropped from the slots, so copying the heading and its paragraph
+    // collapsed into "heading\nparagraph" and lost the source's blank line;
+    // the empty slot plus its `Break` join must reproduce "heading\n\n...".
+    let md = "## A Heading\n\nsome paragraph below the heading";
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(md));
+    app.rebuild_height_prefix();
+    let first = locate_row(&app, "A Heading");
+    let last = locate_row(&app, "paragraph");
+    assert!(last > first, "heading and paragraph must span rows");
+
+    let copied =
+        drag_and_finish(&mut app, (first, 0), (last, 200)).expect("selection should extract");
+    assert_eq!(
+        copied, "A Heading\n\nsome paragraph below the heading",
+        "the source's blank line between heading and paragraph survives"
+    );
+    // Sanity note: the heading renders at normalized level 1, whose prefix
+    // is dropped entirely, so the source's "## " is neither displayed nor
+    // copied — only the heading text itself.
+}
+
+#[test]
+fn blank_lines_in_tool_output_are_copied() {
+    // Same bug class as the markdown blank spacers: a genuinely blank line
+    // inside verbatim tool output (a `\n\n` in the content) must survive
+    // the copy as a blank line, not collapse into a single newline.
+    let content = "line one\n\nline two";
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 50;
+    let mut t = turn(""); // no assistant text; only the tool block
+    t.tool_results = vec![ToolResultRecord {
+        call_id: "c1".into(),
+        name: "cat".into(),
+        content: content.into(),
+        is_error: false,
+        invocation_description: "read a file".into(),
+    }];
+    app.display_for(0).view.insert_or_replace(0, t);
+    app.rebuild_height_prefix();
+    let first = locate_row(&app, "line one");
+    let last = locate_row(&app, "line two");
+    assert!(last > first, "the two lines must span rows");
+
+    let copied =
+        drag_and_finish(&mut app, (first, 0), (last, 200)).expect("selection should extract");
+    assert_eq!(copied, content, "the tool output keeps its blank line");
 }
 
 #[test]
