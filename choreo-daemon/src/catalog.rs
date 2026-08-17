@@ -811,6 +811,7 @@ mod tests {
                     openai_reasoning_levels: vec!["off".into(), "high".into()],
                     openai_responses: false,
                     reasoning_passback: None,
+                    reasoning_content_required: None,
                 }],
             },
             ProviderEntry {

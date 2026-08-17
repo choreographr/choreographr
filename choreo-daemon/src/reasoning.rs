@@ -8,7 +8,9 @@
 //! scattered through the agent loop.
 
 use choreo_ai_protocols::openai::{AssistantToolCall, AssistantToolFunction, ChatRequestMessage};
-use choreo_ai_protocols::{ReasoningPassback, model_reasoning_passback};
+use choreo_ai_protocols::{
+    ReasoningPassback, model_reasoning_passback, requires_reasoning_content,
+};
 use choreo_proto::{ReasoningArtifact, Turn};
 use tracing::warn;
 
@@ -41,6 +43,11 @@ pub fn build_chat_request_messages(
     // The passback policy decides *whether* the artifact is replayed; it is
     // constant for the whole request (the model does not change mid-loop).
     let passback = model_reasoning_passback(provider_slug, model);
+    // DeepSeek/Kimi chat requires `reasoning_content` to be PRESENT on every
+    // assistant message, even (indeed especially) when the model produced no
+    // reasoning on a given call — the upstream 400s a tool-loop turn that
+    // omits it. Constant per request (model-bound), so resolve once.
+    let requires_rc = requires_reasoning_content(provider_slug, model);
 
     for turn in session.turns.values() {
         if turn.undone {
@@ -110,7 +117,19 @@ pub fn build_chat_request_messages(
                 content: turn.assistant_text.clone(),
                 tool_call_id: None,
                 tool_calls,
-                reasoning_content: None,
+                // reasoning_content handling for the echo policy: a real
+                // artifact re-emits its text (leave the explicit field None);
+                // on a DeepSeek/Kimi model that requires the field present
+                // and where nothing will be echoed, inject an EMPTY string so
+                // the wire always carries it (mirrors opencode's transform of
+                // `{type:"reasoning", text:""}` on every assistant message).
+                reasoning_content: if requires_rc
+                    && !(include_artifact && turn.reasoning_artifact.is_some())
+                {
+                    Some(String::new())
+                } else {
+                    None
+                },
                 reasoning: None,
                 reasoning_text: None,
                 reasoning_artifact: if include_artifact {

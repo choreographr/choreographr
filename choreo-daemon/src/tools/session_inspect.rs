@@ -30,7 +30,9 @@ use crate::reasoning::{build_chat_request_messages, warn_on_missing_reasoning_ar
 use crate::sessions::SessionState;
 use crate::tools::Tool;
 use crate::tools::context::ToolContext;
-use choreo_ai_protocols::{ReasoningPassback, model_reasoning_passback};
+use choreo_ai_protocols::{
+    ReasoningPassback, model_reasoning_passback, requires_reasoning_content,
+};
 use choreo_proto::{ChatReasoningField, ReasoningArtifact, ReasoningProducer, Turn};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -181,6 +183,11 @@ fn build_report(
     }
 
     let passback = model_reasoning_passback(&provider, &model);
+    // DeepSeek/Kimi chat: the builder injects an empty `reasoning_content` on
+    // assistant messages with nothing to echo, so those turns carry the field
+    // on the wire (not bare). Mirror it here or the ledger-vs-wire parity
+    // check would disagree with the dry-run.
+    let requires_rc = requires_reasoning_content(&provider, &model);
 
     // Reconstruct the state the builder reads. `build_chat_request_messages`
     // only consults `turns` (and the optional system prompt, which we pass as
@@ -252,12 +259,21 @@ fn build_report(
                 ReasoningPassback::ToolLoop => tool_involvement,
                 ReasoningPassback::AllTurns | ReasoningPassback::Signature => true,
             };
-        let wire_echo = include_artifact && turn.reasoning_artifact.is_some();
+        let echo_has_artifact = include_artifact && turn.reasoning_artifact.is_some();
+        // Whether this turn's assistant message carries SOME
+        // `reasoning_content` on the wire: the real artifact text, or (on
+        // models that require the field, e.g. DeepSeek/Kimi) an injected
+        // empty string. The builder injects it only for non-undone turns that
+        // emit a message and have nothing to echo — mirror that exactly.
+        let wire_rc_present =
+            !turn.undone && has_assistant_msg && (echo_has_artifact || requires_rc);
 
         let echo = if !has_assistant_msg {
             "n/a".to_string()
-        } else if wire_echo {
+        } else if echo_has_artifact {
             "yes".to_string()
+        } else if wire_rc_present {
+            "yes(empty)".to_string()
         } else if !same_model {
             "no:producer-mismatch".to_string()
         } else if turn.reasoning_artifact.is_none() {
@@ -307,19 +323,19 @@ fn build_report(
         // produce a message on the wire and count toward the parity check —
         // otherwise any undone turn with an artifact/tool call would make the
         // ledger and the wire tallies disagree on sessions containing undos.
-        if !turn.undone {
-            if wire_echo {
+        if !turn.undone && has_assistant_msg {
+            if wire_rc_present {
                 ledger_echo_count += 1;
-            } else if has_assistant_msg && !turn.tool_calls.is_empty() {
+            } else if !turn.tool_calls.is_empty() {
                 ledger_tool_no_echo += 1;
             }
         }
 
         // Risk classification: "risk" means there is evidence the model
         // reasoned here (artifact bytes or displayed reasoning text) yet the
-        // wire will omit the echo on a tool-call turn — exactly the shape
-        // DeepSeek/Kimi reject with a `reasoning_content` 400.
-        if has_assistant_msg && !turn.tool_calls.is_empty() && !wire_echo {
+        // wire will omit ALL reasoning_content on a tool-call turn — exactly
+        // the shape DeepSeek/Kimi reject with a `reasoning_content` 400.
+        if has_assistant_msg && !turn.tool_calls.is_empty() && !wire_rc_present {
             if turn.reasoning_artifact.is_some() || turn.assistant_reasoning.is_some() {
                 risks.push(format!(
                     "  t{turn_id}: {echo} (user: {})",
@@ -335,10 +351,11 @@ fn build_report(
             }
         }
         // Under ToolLoop, a plain-text assistant turn that produced reasoning
-        // is deliberately sent bare — informational, matches the policy.
+        // is deliberately sent bare — informational, matches the policy (and
+        // suppressed on models that now inject an empty reasoning_content).
         if has_assistant_msg
             && turn.tool_calls.is_empty()
-            && !wire_echo
+            && !wire_rc_present
             && turn.reasoning_artifact.is_some()
             && same_model
             && matches!(passback, ReasoningPassback::ToolLoop)
@@ -634,6 +651,18 @@ mod tests {
         }
     }
 
+    /// A non-DeepSeek OpenAI-compat chat producer (ToolLoop passback but no
+    /// `reasoning_content` injection) so the bare-turn classification paths
+    /// stay exercisable independent of the DeepSeek injection behavior.
+    fn groq_producer(model: &str) -> ReasoningProducer {
+        ReasoningProducer {
+            provider_slug: "groq".into(),
+            model: model.into(),
+        }
+    }
+
+    const GROQ_MODEL: &str = "groq/llama-3.3-70b-versatile";
+
     fn inspect_args(session: Option<u64>) -> SessionInspectArgs {
         SessionInspectArgs {
             session_id: session,
@@ -650,13 +679,14 @@ mod tests {
 
     #[test]
     fn tool_turn_without_artifact_is_flagged_as_risk() {
-        // t0: tool turn with artifact + matching producer → echoed.
-        // t1: tool turn that reasoned (display text) but captured no artifact
-        //     → would be sent bare → the DeepSeek-style 400 candidate.
+        // Non-DeepSeek chat (no injection): t0 tool turn with artifact +
+        // matching producer → echoed; t1 tool turn that reasoned (display
+        // text) but captured no artifact → would be sent bare → the
+        // DeepSeek-style 400 candidate.
         let (_dir, ctx) = seed(
             42,
             42,
-            "deepseek-v4-flash",
+            GROQ_MODEL,
             vec![
                 (
                     0,
@@ -664,13 +694,19 @@ mod tests {
                         "c1",
                         "grep",
                         Some(chat_artifact("think one")),
-                        Some(ds_producer()),
+                        Some(groq_producer(GROQ_MODEL)),
                         Some("think one"),
                     ),
                 ),
                 (
                     1,
-                    tool_turn("c2", "exec", None, Some(ds_producer()), Some("think two")),
+                    tool_turn(
+                        "c2",
+                        "exec",
+                        None,
+                        Some(groq_producer(GROQ_MODEL)),
+                        Some("think two"),
+                    ),
                 ),
             ],
         );
@@ -686,17 +722,50 @@ mod tests {
     }
 
     #[test]
-    fn tool_turn_without_any_reasoning_still_counts_toward_wire_parity() {
-        // A tool turn with neither an artifact nor displayed reasoning (see
-        // the opencode-go/deepseek-v4-flash incident: tool calls streamed with
-        // no reasoning at all). It is sent bare on the wire, so the ledger's
-        // tool-no-echo counter must include it — otherwise the ledger-vs-wire
-        // cross-check reports MISMATCH even though the wire dry-run is exact.
+    fn deepseek_tool_turn_without_any_reasoning_is_injected_empty() {
+        // The opencode-go/deepseek-v4-flash 400 shape: a tool turn with no
+        // reasoning at all. After the injection fix the builder still emits
+        // `reasoning_content: ""`, so the report must show it as echoing an
+        // empty value (not a bare tool turn / not a risk), and the wire
+        // dry-run must report 0 bare tool-call messages.
         let (_dir, ctx) = seed(
             42,
             42,
             "deepseek-v4-flash",
             vec![(0, tool_turn("c1", "exec", None, Some(ds_producer()), None))],
+        );
+        let out = run(&ctx, inspect_args(None));
+        assert!(out.contains("echo=yes(empty)"), "{out}");
+        assert!(
+            out.contains("RISK (tool-call turns with reasoning evidence but no wire echo): none"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("NOTE (tool calls with no reasoning evidence"),
+            "{out}"
+        );
+        assert!(out.contains("carry NONE (provider-reject risk); "), "{out}");
+        assert!(
+            out.contains("0 assistant tool-call message(s) carry NONE"),
+            "{out}"
+        );
+        assert!(out.contains("ledger vs wire: OK"), "{out}");
+    }
+
+    #[test]
+    fn tool_turn_without_any_reasoning_still_counts_toward_wire_parity() {
+        // A non-DeepSeek tool turn with neither an artifact nor displayed
+        // reasoning is sent bare, so the ledger's tool-no-echo counter must
+        // include it — otherwise the ledger-vs-wire cross-check reports
+        // MISMATCH even though the wire dry-run is exact.
+        let (_dir, ctx) = seed(
+            42,
+            42,
+            GROQ_MODEL,
+            vec![(
+                0,
+                tool_turn("c1", "exec", None, Some(groq_producer(GROQ_MODEL)), None),
+            )],
         );
         let out = run(&ctx, inspect_args(None));
         assert!(out.contains("echo=no:no-artifact"), "{out}");
@@ -711,13 +780,13 @@ mod tests {
 
     #[test]
     fn producer_mismatch_drops_echo_as_risk() {
-        // Artifact produced by openai/gpt-4 while the session's model is
-        // deepseek-v4-flash → the provenance gate drops the echo and the
-        // tool-call turn goes bare.
+        // Artifact produced by openai/gpt-4 while the session runs groq
+        // (non-DeepSeek, no injection) → the provenance gate drops the echo
+        // and the tool-call turn goes bare.
         let (_dir, ctx) = seed(
             42,
             42,
-            "deepseek-v4-flash",
+            GROQ_MODEL,
             vec![(
                 0,
                 tool_turn(
@@ -739,18 +808,19 @@ mod tests {
 
     #[test]
     fn plain_text_turn_artifact_is_info_not_risk() {
-        // A final-text assistant turn with an artifact is deliberately sent
-        // bare under ToolLoop (echo only on tool turns) — INFO, not RISK.
+        // A non-DeepSeek (no-injection) final-text assistant turn with an
+        // artifact is deliberately sent bare under ToolLoop (echo only on
+        // tool turns) — INFO, not RISK.
         let (_dir, ctx) = seed(
             42,
             42,
-            "deepseek-v4-flash",
+            GROQ_MODEL,
             vec![(
                 0,
                 text_turn(
                     "answer",
                     Some(chat_artifact("think one")),
-                    Some(ds_producer()),
+                    Some(groq_producer(GROQ_MODEL)),
                 ),
             )],
         );

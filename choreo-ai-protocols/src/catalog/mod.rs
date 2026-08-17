@@ -100,6 +100,16 @@ pub struct ModelEntry {
     /// including `Some(ReasoningPassback::None)` for "never replay this
     /// model's reasoning".
     pub reasoning_passback: Option<ReasoningPassback>,
+    /// Whether this model requires `reasoning_content` to be *present* on
+    /// every assistant message sent back (DeepSeek/Kimi chat: the upstream
+    /// rejects a history whose assistant tool-call message omits
+    /// `reasoning_content`, even when the model produced no reasoning on
+    /// that call). `None` derives the default from the model name on the
+    /// chat-completions (ToolLoop) path — see [`requires_reasoning_content`];
+    /// `Some(..)` is an explicit overlay override (force it on for an
+    /// aliased DeepSeek/Kimi model, or off for an exception).
+    #[serde(default)]
+    pub reasoning_content_required: Option<bool>,
 }
 
 /// Protocol variant — selects wire format and carries protocol-specific fields.
@@ -358,6 +368,48 @@ fn protocol_default_passback(
         ProviderProtocol::AnthropicMessages => ReasoningPassback::AllTurns,
         ProviderProtocol::GoogleGenerativeAi => ReasoningPassback::Signature,
     }
+}
+
+/// Whether the model requires `reasoning_content` to be present on every
+/// assistant message (DeepSeek/Kimi chat completions). An explicit per-model
+/// overlay override wins; otherwise the default derives from the model name
+/// on the chat-completions (ToolLoop) passback path. Unknown providers are
+/// assumed OpenAI-ish chat so a plainly-named DeepSeek/Kimi model still gets
+/// the injection regardless of the hosting slug (mirrors opencode's
+/// `interleaved.field = "reasoning_content"` default keyed on the model id).
+pub fn requires_reasoning_content(provider_slug: &str, model: &str) -> bool {
+    let catalog = PROVIDER_CATALOG.load();
+    let entry = catalog.iter().find(|e| e.slug == provider_slug);
+    let (explicit, protocol, responses) = match entry {
+        Some(e) => match e.models.iter().find(|m| m.model == model) {
+            Some(m) => (m.reasoning_content_required, e.protocol, m.openai_responses),
+            None => (None, e.protocol, false),
+        },
+        None => (
+            None,
+            ProviderProtocol::OpenAi {
+                max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            },
+            false,
+        ),
+    };
+    explicit.unwrap_or_else(|| default_requires_reasoning_content(model, protocol, responses))
+}
+
+/// Derived default: DeepSeek/Kimi OpenAI-compatible chat models must echo
+/// `reasoning_content` on every assistant message. Responses-API models do
+/// not carry the field at all, so it is excluded here.
+fn default_requires_reasoning_content(
+    model: &str,
+    protocol: ProviderProtocol,
+    responses: bool,
+) -> bool {
+    is_deepseek_or_kimi(model) && !responses && matches!(protocol, ProviderProtocol::OpenAi { .. })
+}
+
+fn is_deepseek_or_kimi(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("deepseek") || m.contains("kimi")
 }
 
 #[cfg(test)]
@@ -935,6 +987,7 @@ mod tests {
                 openai_reasoning_levels: vec!["off".into(), "high".into()],
                 openai_responses: false,
                 reasoning_passback: None,
+                reasoning_content_required: None,
             }],
         }]
     }

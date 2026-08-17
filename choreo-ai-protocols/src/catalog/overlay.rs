@@ -178,6 +178,7 @@ fn apply_models_overlay(
                     openai_reasoning_levels: Vec::new(),
                     openai_responses: false,
                     reasoning_passback: None,
+                    reasoning_content_required: None,
                 };
                 apply_model_overlay(&mut model, table);
                 entry.models.push(model);
@@ -224,6 +225,13 @@ fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
                 None => warn!(
                     model = %model.model,
                     "overlay: unknown reasoning_passback; skipping",
+                ),
+            },
+            "reasoning_content_required" => match value.as_bool() {
+                Some(required) => model.reasoning_content_required = Some(required),
+                None => warn!(
+                    model = %model.model,
+                    "overlay: reasoning_content_required is not a bool; skipping",
                 ),
             },
             other => warn!(
@@ -315,6 +323,7 @@ mod tests {
                         openai_reasoning_levels: vec!["off".into(), "high".into()],
                         openai_responses: false,
                         reasoning_passback: None,
+                        reasoning_content_required: None,
                     },
                     ModelEntry {
                         model: "acme-lite".into(),
@@ -323,6 +332,7 @@ mod tests {
                         openai_reasoning_levels: Vec::new(),
                         openai_responses: false,
                         reasoning_passback: None,
+                        reasoning_content_required: None,
                     },
                 ],
             },
@@ -339,6 +349,7 @@ mod tests {
                     openai_reasoning_levels: Vec::new(),
                     openai_responses: false,
                     reasoning_passback: None,
+                    reasoning_content_required: None,
                 }],
             },
         ]

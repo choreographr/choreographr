@@ -260,6 +260,79 @@ fn builder_tool_loop_attaches_artifact_for_tool_result_turns() {
 }
 
 #[test]
+fn builder_injects_empty_reasoning_content_for_deepseek_without_artifact() {
+    // DeepSeek chat requires `reasoning_content` to be present on every
+    // assistant message even when the model produced no reasoning. A tool
+    // turn with no artifact must therefore carry an explicit empty string on
+    // the wire (mirrors opencode's `{type:"reasoning", text:""}` injection).
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "run it",
+        "",
+        None,
+        Some(deepseek_producer()),
+        vec![tool_call_record("call_1", "exec")],
+    );
+
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(
+        assistants[0].reasoning_content,
+        Some(String::new()),
+        "deepseek assistant message must carry an (empty) reasoning_content"
+    );
+}
+
+#[test]
+fn builder_deepseek_artifact_text_outranks_empty_injection() {
+    // When a real artifact exists and is echoed, the explicit reasoning_content
+    // field must stay None so the artifact re-emits its text (not an empty
+    // placeholder crowding it out).
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "run it",
+        "",
+        Some(artifact(b"real thinking")),
+        Some(deepseek_producer()),
+        vec![tool_call_record("call_1", "exec")],
+    );
+
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(assistants[0].reasoning_content, None);
+    assert_eq!(
+        assistants[0].reasoning_artifact,
+        Some(artifact(b"real thinking"))
+    );
+}
+
+#[test]
+fn builder_does_not_inject_empty_reasoning_content_for_non_deepseek() {
+    // Unrelated OpenAI-chat models are untouched: no empty reasoning_content.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "run it",
+        "",
+        None,
+        Some(ReasoningProducer {
+            provider_slug: "openai".into(),
+            model: "gpt-4".into(),
+        }),
+        vec![tool_call_record("call_1", "exec")],
+    );
+
+    let result = build_chat_request_messages(&session, None, "openai", "gpt-4");
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(assistants[0].reasoning_content, None);
+}
+
+#[test]
 fn builder_all_turns_attaches_always() {
     let mut session = SessionState::empty();
     // Unknown model under the anthropic slug → protocol default AllTurns

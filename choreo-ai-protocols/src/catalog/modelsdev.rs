@@ -132,6 +132,9 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
             // carries no passback policy; per-model exceptions come from the
             // overlay.
             reasoning_passback: None,
+            // DeepSeek/Kimi reasoning_content-echo is likewise derived from
+            // the model name/family at lookup time, not baked into the base.
+            reasoning_content_required: None,
         })
         .collect();
 
