@@ -29,6 +29,11 @@ const ADD_BG: Color = Color::Rgb(0, 80, 0);
 /// must occur at a **line boundary** rather than anywhere in the string, so
 /// that content inside other kinds of markdown code blocks (e.g. file contents
 /// displayed by `write_file`) won't trigger a false positive.
+///
+/// This is now only ever consulted on the **interior** of a ` ```diff ` fence
+/// already recognised by the markdown renderer (see
+/// [`try_render_diff_content`]) — the raw-signal sniffs are opt-in gates for
+/// fence interiors, never whole tool outputs.
 pub fn is_diff_text(text: &str) -> bool {
     // Explicit fenced diff block
     if text.contains("\n```diff\n") || text.starts_with("```diff\n") {
@@ -472,10 +477,14 @@ fn render_unified(diffs: &[FileDiff], total_width: usize) -> Vec<Line<'static>> 
     out
 }
 
-/// Main entry point: detect if the text is a diff, parse it, and render.
+/// Parse a ` ```diff ` fence interior and render it as a diff.
 ///
-/// Returns `None` when the text is not recognised as a diff, allowing
-/// callers to fall through to their normal rendering path.
+/// The caller has already established opt-in: this is only ever invoked with
+/// the *interior* of a markdown ` ```diff ` fence (see
+/// `markdown_render::render_markdown_block`), which is in turn reachable only
+/// through the markdown allowlist for tool results (`MARKDOWN_TOOLS`).
+/// Returns `None` when the text is not recognised as a diff, allowing the
+/// caller to fall through to its generic code-block rendering.
 pub fn try_render_diff_content(diff_text: &str, width: u16) -> Option<Vec<Line<'static>>> {
     if !is_diff_text(diff_text) {
         return None;

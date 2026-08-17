@@ -914,25 +914,21 @@ pub(crate) fn render_turn_lines(
     // else — including errors — defaults to expanded.
     let mut tool_result_header_idxs: Vec<usize> = Vec::new();
 
-    // Tools whose output is never a diff. The diff auto-detection heuristic
-    // in `diff_render::is_diff_text` keys on lines starting with `--- ` (a
-    // unified-diff path header), but framed tool output can legitimately
-    // begin with that prefix — e.g. `pdf_to_markdown` opens every extraction
-    // with the "--- UNTRUSTED content extracted from PDF" delimiter line.
-    // Without this gate the heuristic would misparse that header as `--- a/`
-    // and render the whole result as a bogus side-by-side diff, dropping the
-    // actual extracted content from the display. These tools' results must
-    // always fall through to the regular markdown path.
-    const DIFF_EXCLUDED_TOOLS: &[&str] = &["pdf_to_markdown"];
-
-    /// Tools whose result content is Markdown by design and may therefore use
-    /// the styled markdown renderer. Everything else renders as **plain
-    /// text** — verbatim — so `**` in a grep match or shell line is data, not
-    /// emphasis, and a hostile result cannot weaponize markdown syntax to
-    /// restyle or hide part of the output. Fail-closed: a tool not listed
-    /// here never reaches `markdown_lines`, mirroring how `DIFF_EXCLUDED_TOOLS`
-    /// gates diff auto-detection.
-    const MARKDOWN_TOOLS: &[&str] = &["pdf_to_markdown"];
+    /// Tools whose result content is Markdown by design and may therefore be
+    /// parsed as markdown. `pdf_to_markdown` emits extracted page text;
+    /// `git_diff`/`git_show`/`edit_file` emit ` ```diff `-fenced unified diffs
+    /// (the daemon wraps every diff via `diff_util::generate_diff` — git tools
+    /// through `append_fenced_diff`, `tools/git/diff.rs`, `edit_file` inline
+    /// at `tools/fs/edit_file.rs`) — parsing those results as markdown is
+    /// exactly what lets the renderer's ` ```diff ` handling (see
+    /// `render_markdown_block`) turn each fence interior into a
+    /// side-by-side/unified diff. Everything else renders as **plain text** —
+    /// verbatim — so `**` in a grep match or shell line is data, not emphasis,
+    /// and a hostile result cannot weaponize markdown syntax to restyle or
+    /// hide part of the output. Fail-closed: a tool not listed here never
+    /// reaches the markdown parser, and a ` ```diff ` fence outside one of
+    /// these tools is literal data, not diff opt-in.
+    const MARKDOWN_TOOLS: &[&str] = &["pdf_to_markdown", "git_diff", "git_show", "edit_file"];
 
     for (i, tr) in turn.tool_results.iter().enumerate() {
         let accent = if tr.is_error {
@@ -1047,18 +1043,15 @@ pub(crate) fn render_turn_lines(
                     let (lines, joins) = plain_text_lines_joined(&content, tool_content_width);
                     body.extend(lines);
                     body_joins.extend(joins);
-                } else if !DIFF_EXCLUDED_TOOLS.contains(&tr.name.as_str())
-                    && let Some(diff_lines) = try_render_diff_content(&content, tool_content_width)
-                {
-                    // Every diff row is a distinct line in the copy — the
-                    // renderer never reflows a diff row onto multiple rows.
-                    body.extend(diff_lines.iter().cloned());
-                    body_joins.extend(std::iter::repeat_n(LineJoin::Break, diff_lines.len()));
                 } else if MARKDOWN_TOOLS.contains(&tr.name.as_str()) {
-                    // Tools that emit markdown by design (e.g. pdf_to_markdown)
-                    // keep the styled renderer; everything else is verbatim
-                    // data and must NOT be re-interpreted as markdown (see
-                    // MARKDOWN_TOOLS).
+                    // Tools that emit markdown by design (pdf_to_markdown's
+                    // extracted page text, git_diff/git_show/edit_file's fenced
+                    // diffs) keep the styled renderer — a ` ```diff ` fence
+                    // inside their output renders as a diff via the CodeBlock
+                    // arm of `render_markdown_block`. Everything else is
+                    // verbatim data and must NOT be re-interpreted as markdown
+                    // (see MARKDOWN_TOOLS); there is no content-based diff or
+                    // markdown auto-detection anymore.
                     let (lines, joins) = markdown_lines_joined(&content, tool_content_width);
                     body.extend(lines);
                     body_joins.extend(joins);
@@ -1413,6 +1406,40 @@ fn render_markdown_block(
             joins.extend(heading_joins);
         }
         MarkdownBlock::CodeBlock { language, code } => {
+            // A ` ```diff ` fence is an explicit opt-in: the emitting tool
+            // chose the markdown `diff` language tag, so the fence interior
+            // is handed to the diff renderer instead of the generic code
+            // block. The renderer is fed *fence interiors only* — the raw
+            // `--- ` / `diff --git` auto-detection sniffs no longer run
+            // against whole tool outputs, which is what used to misparse
+            // `pdf_to_markdown`'s "--- UNTRUSTED …" delimiter as a diff path
+            // header. If the interior does not parse as a diff (junk under
+            // the tag) we fall through to the literal-fence code path below
+            // so the raw text always stays visible.
+            if language.as_deref() == Some("diff") {
+                let diff_width = u16::try_from(width.saturating_sub(indent)).unwrap_or(u16::MAX);
+                if let Some(diff_lines) = try_render_diff_content(code, diff_width) {
+                    for line in diff_lines {
+                        // Mirror the generic code path's indent handling so a
+                        // fenced diff inside a blockquote/list stays inside its
+                        // container and never overflows the width.
+                        if indent > 0 {
+                            let mut spans =
+                                vec![Span::styled(" ".repeat(indent), Style::default())];
+                            spans.extend(line.spans.clone());
+                            lines.push(Line::from(spans));
+                        } else {
+                            lines.push(line);
+                        }
+                        // Every diff row is a distinct source line — never
+                        // reflowed and never space-joined — so the copy
+                        // reproduces the diff verbatim.
+                        joins.push(LineJoin::Break);
+                    }
+                    return;
+                }
+            }
+
             let header = language
                 .as_deref()
                 .map(|value| format!("```{value}"))
@@ -2692,6 +2719,41 @@ mod tests {
         assert!(result.len() >= 3, "code block should have at least 3 lines");
         assert_eq!(result[0].to_string(), "```rust");
         assert_eq!(result.last().unwrap().to_string(), "```");
+    }
+
+    #[test]
+    fn markdown_lines_diff_fence_renders_as_diff() {
+        // A ` ```diff ` fence is the opt-in signal: the interior is handed to
+        // the diff renderer, and the fence lines themselves are consumed.
+        let md = "```diff\ndiff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ \
+b/file.txt\n@@ -1 +1 @@\n-old\n+new\n```";
+        let result = markdown_lines(md, 80);
+        let text = result
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Side-by-side artifacts (width 80 ≥ MIN_SIDEBYSIDE_WIDTH 40).
+        assert!(text.contains("+++ b/"), "{text}");
+        assert!(text.contains('│'), "{text}");
+        // No literal fence remains.
+        assert!(!text.contains("```"), "fence must be consumed: {text}");
+    }
+
+    #[test]
+    fn markdown_lines_diff_fence_with_junk_falls_back_to_literal_fence() {
+        // A ` ```diff ` tag around non-diff content must not render as a bogus
+        // diff — the renderer falls back to the literal code block so the raw
+        // text always stays visible (fail-closed).
+        let md = "```diff\njust some words\n```";
+        let result = markdown_lines(md, 80);
+        let text = result
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("```diff"), "literal fence expected: {text}");
+        assert!(!text.contains('│'), "no diff artifacts expected: {text}");
     }
 
     #[test]
@@ -3987,11 +4049,12 @@ mod tests {
     #[test]
     fn render_turn_lines_pdf_to_markdown_not_rendered_as_diff() {
         // `pdf_to_markdown` opens every extraction with the untrusted-content
-        // delimiter `--- UNTRUSTED content extracted from PDF; ...`, and the
-        // diff auto-detection heuristic keys on lines starting with `--- `.
-        // Without the tool-name gate this header would be misparsed as a
-        // `--- a/` diff path header and the whole result rendered as a bogus
-        // side-by-side diff. The gate must send it down the markdown path.
+        // delimiter `--- UNTRUSTED content extracted from PDF; ...`. At width
+        // 85 therefore no content-based diff sniff runs at all anymore — the
+        // renderer never feeds whole tool outputs to the diff parser
+        // (` ```diff ` fences inside markdown-parsed results are the only diff
+        // opt-in, see `render_markdown_block`). The delimiter must survive as
+        // ordinary markdown text, not a `--- a/` path header.
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
@@ -4042,10 +4105,108 @@ content ---"
     }
 
     #[test]
-    fn render_turn_lines_diff_content_still_renders_for_other_tools() {
-        // The tool-name gate must be narrow: tools *not* listed in
-        // DIFF_EXCLUDED_TOOLS keep diff auto-detection, so real diffs (e.g.
-        // `git_show` with include_diff) still render side-by-side.
+    fn render_turn_lines_fenced_diff_renders_for_git_tools() {
+        // `git_show`/`git_diff` are markdown-gated tools whose diffs arrive
+        // wrapped in ` ```diff ` fences (daemon `append_fenced_diff`). The
+        // fence is the opt-in: the interior renders side-by-side, the fence
+        // lines themselves are consumed, and surrounding text (commit
+        // preamble) survives — the diff render is fence-local, never
+        // all-or-nothing over the whole result.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "git_show".into(),
+                content: "commit abc1234\nAuthor: Jane\n\n```diff\ndiff --git \
+a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n```"
+                    .into(),
+                is_error: false,
+                invocation_description: "Showing git object at `HEAD`.".into(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Side-by-side diff rendering (width 85 ≥ MIN_SIDEBYSIDE_WIDTH 40)
+        // produces the pane gutter and the `+++ b/` path header.
+        assert!(
+            text.contains("commit abc1234"),
+            "preamble must survive: {text}"
+        );
+        assert!(text.contains("+++ b/"), "{text}");
+        assert!(text.contains('│'), "{text}");
+        // The opt-in fence is fully consumed — no literal ```diff header.
+        assert!(
+            !text.contains("```"),
+            "fence lines must be consumed: {text}"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_edit_file_fenced_diff_renders() {
+        // `edit_file` is a third diff-emitting tool: the daemon appends the
+        // `generate_diff` result inside a ` ```diff ` fence after the summary
+        // line (tools/fs/edit_file.rs). It must be markdown-gated so the fence
+        // is consumed and the diff renders — while the summary line survives
+        // (the old all-or-nothing diff parse dropped it).
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "edit_file".into(),
+                content: "edited file: src/main.rs (1 replacement, +3 chars)\n\n```diff\n\
+diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n```"
+                    .into(),
+                is_error: false,
+                invocation_description: String::new(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("edited file: src/main.rs"),
+            "summary line must survive: {text}"
+        );
+        assert!(text.contains('│'), "diff must render side-by-side: {text}");
+        assert!(
+            !text.contains("```"),
+            "fence lines must be consumed: {text}"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_unfenced_diff_is_plain_text() {
+        // Without the ` ```diff ` fence there is no opt-in: a raw unified diff
+        // in a markdown-gated tool's result is rendered as ordinary markdown
+        // (one paragraph), not as a side-by-side diff. This is the fail-closed
+        // inverse of the old `--- ` / `diff --git` auto-detection.
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
@@ -4073,10 +4234,59 @@ content ---"
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        // Side-by-side diff rendering (width 80 ≥ MIN_SIDEBYSIDE_WIDTH 40)
-        // produces the pane gutter and the `+++ b/` path header.
-        assert!(text.contains("+++ b/"), "{text}");
-        assert!(text.contains('│'), "{text}");
+        // The raw text survives through the markdown path — smart punctuation
+        // mangled `diff --git` into `diff –git`, which only happens if the
+        // content was NOT handed to the diff renderer...
+        assert!(text.contains("diff –git"), "{text}");
+        assert!(text.contains("-old"), "{text}");
+        assert!(text.contains("+new"), "{text}");
+        // ...but no diff-render artifact (the `│` pane gutter) may appear.
+        assert!(
+            !text.contains('│'),
+            "unfenced diff must not diff-render: {text}"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_fenced_diff_in_non_markdown_tool_is_plain() {
+        // Diff opt-in is gated by the markdown allowlist first: a ` ```diff `
+        // fence inside a *non-markdown* tool's output (e.g. shell) is literal
+        // data — the fence shows verbatim, never a rendered diff.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "shell".into(),
+                content: "```diff\ndiff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n```"
+                    .into(),
+                is_error: false,
+                invocation_description: String::new(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("```diff"),
+            "literal fence must appear for a non-markdown tool: {text}"
+        );
+        assert!(
+            !text.contains('│'),
+            "fence in a non-markdown tool must not diff-render: {text}"
+        );
     }
 
     #[test]
