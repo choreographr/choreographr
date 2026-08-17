@@ -66,17 +66,42 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
 // ── Public API ────────────────────────────────────────────────────────────
 
 pub(crate) fn plain_text_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    plain_text_lines_joined(text, width).0
+}
+
+/// [`plain_text_lines`] plus the per-line [`LineJoin`] metadata the copy
+/// path needs to undo the wrapping (see the enum docs).
+///
+/// Wrapped chunks of one original line are marked [`LineJoin::Join`]:
+/// [`wrap_plain_line`] cuts at whitespace boundaries keeping the whitespace
+/// run on the previous chunk, so directly concatenating the chunks
+/// reproduces the input byte-for-byte (the function doc says exactly that:
+/// "concatenating the wrapped lines reproduces the input").  Each original
+/// `\n` (and the first chunk of each original line) is [`LineJoin::Break`].
+pub(crate) fn plain_text_lines_joined(
+    text: &str,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<LineJoin>) {
     if text.is_empty() {
-        vec![Line::from(Span::styled(String::new(), Style::default()))]
+        (
+            vec![Line::from(Span::styled(String::new(), Style::default()))],
+            vec![LineJoin::Break],
+        )
     } else {
         let width = width as usize;
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut joins: Vec<LineJoin> = Vec::new();
         for raw in text.split('\n') {
-            for wrapped in wrap_plain_line(raw, width) {
+            for (i, wrapped) in wrap_plain_line(raw, width).into_iter().enumerate() {
                 lines.push(Line::from(Span::styled(wrapped, Style::default())));
+                joins.push(if i == 0 {
+                    LineJoin::Break
+                } else {
+                    LineJoin::Join
+                });
             }
         }
-        lines
+        (lines, joins)
     }
 }
 
@@ -379,7 +404,17 @@ fn terminal_keeps(c: char) -> bool {
 
 /// Render ANSI-escape-coded text as styled ratatui lines, wrapping at `width`.
 /// Falls back to [`plain_text_lines`] on parse failure.
+#[cfg(test)]
 fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    ansi_lines_joined(text, width).0
+}
+
+/// [`ansi_lines`] plus the per-line [`LineJoin`] copy metadata (see the enum
+/// docs).  Every original `\n` delimited line is a fresh row
+/// ([`LineJoin::Break`]); the word-wrap inside an over-long line records
+/// [`LineJoin::Space`]/[`LineJoin::Join`] per break via
+/// [`wrap_styled_line_joined`].
+fn ansi_lines_joined(text: &str, width: u16) -> (Vec<Line<'static>>, Vec<LineJoin>) {
     use ansi_to_tui::IntoText as _;
 
     let width_usize = width as usize;
@@ -387,6 +422,7 @@ fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     match text.as_bytes().into_text() {
         Ok(t) => {
             let mut result: Vec<Line<'static>> = Vec::new();
+            let mut joins: Vec<LineJoin> = Vec::new();
             for line in &t.lines {
                 if width_usize == 0 || line.width() <= width_usize {
                     let spans: Vec<Span<'static>> = line
@@ -395,15 +431,19 @@ fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                         .map(|span| Span::styled(span.content.to_string(), span.style))
                         .collect();
                     result.push(Line::from(spans));
+                    joins.push(LineJoin::Break);
                 } else {
                     // Word-wrap this over-long line at width.
-                    wrap_styled_line(line, width_usize, &mut result);
+                    wrap_styled_line_joined(line, width_usize, &mut result, &mut joins);
                 }
             }
             if result.is_empty() {
-                vec![Line::from(Span::styled(String::new(), Style::default()))]
+                (
+                    vec![Line::from(Span::styled(String::new(), Style::default()))],
+                    vec![LineJoin::Break],
+                )
             } else {
-                result
+                (result, joins)
             }
         }
         Err(e) => {
@@ -412,7 +452,7 @@ fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 text_len = text.len(),
                 "failed to parse ANSI escape codes, falling back to plain text"
             );
-            plain_text_lines(text, width)
+            plain_text_lines_joined(text, width)
         }
     }
 }
@@ -421,11 +461,16 @@ fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
 ///
 /// Walks the line's styled spans left-to-right, splitting at word (whitespace)
 /// boundaries. If a single word is wider than `max_width` it is split by grapheme
-/// cluster via [`split_word_to_width`].
-fn wrap_styled_line(
+/// cluster via [`split_word_to_width`].  Records the [`LineJoin`] of every
+/// emitted row in `joins` (aligned with `out`) so the selection copy can undo
+/// the wrapping: word-boundary breaks get [`LineJoin::Space`] (the separating
+/// whitespace was consumed — the copy re-inserts one space), grapheme-split
+/// breaks get [`LineJoin::Join`] (nothing was consumed).
+fn wrap_styled_line_joined(
     line: &ratatui::text::Line<'_>,
     max_width: usize,
     out: &mut Vec<Line<'static>>,
+    joins: &mut Vec<LineJoin>,
 ) {
     // ── 1. Tokenize the line into (style, text, is_space) triplets ───────
     //
@@ -472,6 +517,7 @@ fn wrap_styled_line(
             String::new(),
             Style::default(),
         )]));
+        joins.push(LineJoin::Break);
         return;
     }
 
@@ -481,27 +527,54 @@ fn wrap_styled_line(
     // Did we just add a space at the end?  We keep at most one trailing space
     // so that flush + re-start doesn't introduce a leading space.
     let mut trailing_space = false;
+    // The join recorded for the row that will be pushed into `out` next: the
+    // very first row of this input line is a fresh line ([`LineJoin::Break`]);
+    // after a word-boundary flush the next row continues the sentence
+    // ([`LineJoin::Space`]); after a split-word flush the next row is a
+    // mid-word continuation ([`LineJoin::Join`]).
+    let mut pending_join = LineJoin::Break;
 
-    // Helper: split an over-long word across lines, used when the word alone
-    // does not fit on the current (possibly just-flushed) line.
-    let push_split_word = |text: &str,
-                           style: Style,
-                           max_width: usize,
-                           out: &mut Vec<Line<'static>>,
-                           line_spans: &mut Vec<Span<'static>>,
-                           line_width: &mut usize|
-     -> () {
+    /// Push the line currently in `line_spans`, recording the join that was
+    /// pending for it, then set the join for the row that follows (a mid-word
+    /// continuation — used by split-word handling).
+    fn push_current(
+        out: &mut Vec<Line<'static>>,
+        joins: &mut Vec<LineJoin>,
+        line_spans: &mut Vec<Span<'static>>,
+        pending_join: &mut LineJoin,
+        line_width: &mut usize,
+    ) {
+        out.push(Line::from(std::mem::take(line_spans)));
+        joins.push(*pending_join);
+        *line_width = 0;
+        *pending_join = LineJoin::Join;
+    }
+
+    /// Split an over-long word across lines, used when the word alone does
+    /// not fit on the current (possibly just-flushed) line.
+    #[allow(clippy::too_many_arguments)] // all args are distinct writer state; a struct would obscure the loop
+    fn push_split_word(
+        text: &str,
+        style: Style,
+        max_width: usize,
+        out: &mut Vec<Line<'static>>,
+        joins: &mut Vec<LineJoin>,
+        pending_join: &mut LineJoin,
+        line_spans: &mut Vec<Span<'static>>,
+        line_width: &mut usize,
+    ) {
         let chunks = split_word_to_width(text, max_width);
         for (ci, chunk) in chunks.iter().enumerate() {
             if ci > 0 {
-                out.push(Line::from(std::mem::take(line_spans)));
-                *line_width = 0;
+                // A new row begins with this chunk — a mid-word continuation
+                // of the previous row's text.
+                push_current(out, joins, line_spans, pending_join, line_width);
             }
             let cw = display_width(chunk);
             line_spans.push(Span::styled(chunk.clone(), style));
             *line_width += cw;
         }
-    };
+    }
 
     for token in &tokens {
         if token.is_space {
@@ -528,15 +601,21 @@ fn wrap_styled_line(
                 &token.text,
                 token.style,
                 max_width,
-                &mut *out,
+                out,
+                joins,
+                &mut pending_join,
                 &mut line_spans,
                 &mut line_width,
             );
         } else {
             // Flush the current line and start a fresh line with this word.
+            // The previous row is pushed with the join pending for it; the
+            // fresh row continues the sentence, so it joins with a space.
             out.push(Line::from(std::mem::take(&mut line_spans)));
+            joins.push(pending_join);
             line_width = 0;
             trailing_space = false;
+            pending_join = LineJoin::Space;
 
             if word_width <= max_width {
                 line_spans.push(Span::styled(token.text.clone(), token.style));
@@ -546,7 +625,9 @@ fn wrap_styled_line(
                     &token.text,
                     token.style,
                     max_width,
-                    &mut *out,
+                    out,
+                    joins,
+                    &mut pending_join,
                     &mut line_spans,
                     &mut line_width,
                 );
@@ -556,6 +637,7 @@ fn wrap_styled_line(
 
     if !line_spans.is_empty() {
         out.push(Line::from(line_spans));
+        joins.push(pending_join);
     }
 }
 
@@ -575,10 +657,47 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
         .sum::<usize>()
 }
 
+/// How a rendered line joins the rendered line *before* it when both end up
+/// in a copied selection.
+///
+/// The renderer pre-wraps long content so nothing overflows the viewport — a
+/// single original line (a markdown paragraph, a plain-text line, a code
+/// line) becomes several rendered rows.  A naive copy that separates every
+/// row with a newline therefore reproduces the *wrapped* text instead of the
+/// original.  Every rendered line records how it must glue to its predecessor
+/// to undo the renderer's wrapping:
+///
+/// - [`LineJoin::Break`] — a fresh paragraph/block (or a genuinely separate
+///   line: the next item of a list, the next line of a code block, the next
+///   row of a table).  The copy separates the two rows with a newline.
+/// - [`LineJoin::Space`] — a wrapped continuation that broke at a word
+///   boundary; the reflow consumed the separating whitespace (and the caller
+///   may or may not keep a placeholder of it in the rendered spans).  The
+///   copy trims both rows at the seam and re-inserts exactly one space.
+/// - [`LineJoin::Join`] — a wrapped continuation that broke mid-word (a hard
+///   grapheme split of an over-long word, or a plain-text wrap, which keeps
+///   its whitespace on the previous row).  The copy concatenates the two rows
+///   directly, preserving whatever whitespace the rows already carry.
+///
+/// The vector is aligned with [`RenderedTurnLines::lines`]: `joins[i]`
+/// describes row `i`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LineJoin {
+    #[default]
+    Break,
+    Space,
+    Join,
+}
+
 /// A turn rendered into styled lines, plus the metadata the TUI needs to
 /// hit-test the collapsible reasoning header without re-scanning the output.
 pub(crate) struct RenderedTurnLines {
     pub lines: Vec<Line<'static>>,
+    /// Per-line [`LineJoin`] copy metadata, aligned with `lines` (`None` has
+    /// no analogue here — every row, chrome or content, carries a join; the
+    /// selection clamps chrome rows away instead).  The selection extraction
+    /// uses this to rejoin wrapped continuations into the original text.
+    pub joins: Vec<LineJoin>,
     /// Display-column range `(start, end)` of each line's meaningful content,
     /// aligned with `lines` — the text the user sees as content, excluding UI
     /// chrome such as the `┃` margin gutter, indents, and trailing fill.
@@ -646,17 +765,21 @@ pub(crate) fn render_turn_lines(
     // `RenderedTurnLines::content_ranges`).  Every line kind below records
     // where its real text starts/ends so selection never copies UI chrome.
     let mut all_content_ranges: Vec<Option<(usize, usize)>> = Vec::new();
+    // Per-line copy-join metadata, aligned with `all_lines` (see `LineJoin`).
+    // The selection extraction uses this to undo the renderer's wrapping.
+    let mut all_joins: Vec<LineJoin> = Vec::new();
 
     // ── User text block (green accent) ───────────────────────
     // Rendered first so a failed request's transcript still shows what the
     // user asked for above the error that stopped it.
     if let Some(ref text) = turn.user_text {
-        let body = markdown_lines(text, content_width);
+        let (body, body_joins) = markdown_lines_joined(text, content_width);
         let timestamp_ms = Some(turn.created_at.as_millis());
-        let (margin_lines, _rows, margin_ranges) =
-            add_margin_lines(body, content_width, Color::Green, timestamp_ms);
+        let (margin_lines, _rows, margin_ranges, margin_joins) =
+            add_margin_lines(body, body_joins, content_width, Color::Green, timestamp_ms);
         all_lines.extend(margin_lines);
         all_content_ranges.extend(margin_ranges);
+        all_joins.extend(margin_joins);
     }
 
     // ── Error block (red) ────────────────────────────────────
@@ -672,7 +795,8 @@ pub(crate) fn render_turn_lines(
     if let Some(ref err) = turn.error {
         let header = format!("Error: {err}");
         let header = expand_tabs(&sanitize_for_terminal(&header));
-        let lines: Vec<Line<'static>> = plain_text_lines(&header, content_width)
+        let (lines, joins) = plain_text_lines_joined(&header, content_width);
+        let lines: Vec<Line<'static>> = lines
             .into_iter()
             .map(|line| {
                 // `plain_text_lines` emits default-styled spans; repaint the
@@ -685,14 +809,16 @@ pub(crate) fn render_turn_lines(
                 Line::from(Span::styled(text, Style::default().fg(Color::Red)))
             })
             .collect();
-        for line in lines {
+        for (line, join) in lines.into_iter().zip(joins) {
             // Unboxed error rows: the whole (red) text is content.
             let width = line.width();
             all_content_ranges.push((width > 0).then_some((0, width)));
+            all_joins.push(join);
             all_lines.push(line);
         }
         return RenderedTurnLines {
             lines: all_lines,
+            joins: all_joins,
             content_ranges: all_content_ranges,
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
@@ -716,6 +842,7 @@ pub(crate) fn render_turn_lines(
     let mut reasoning_header_idx: Option<usize> = None;
     if has_assistant {
         let mut body: Vec<Line<'static>> = Vec::new();
+        let mut body_joins: Vec<LineJoin> = Vec::new();
 
         let has_reasoning = turn
             .assistant_reasoning
@@ -730,7 +857,9 @@ pub(crate) fn render_turn_lines(
         if let Some(ref text) = turn.assistant_text {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                body.extend(markdown_lines(trimmed, content_width));
+                let (lines, joins) = markdown_lines_joined(trimmed, content_width);
+                body.extend(lines);
+                body_joins.extend(joins);
             }
         }
 
@@ -743,6 +872,7 @@ pub(crate) fn render_turn_lines(
                 // Separate the response from the reasoning section so they
                 // don't merge into one paragraph.
                 body.push(Line::from(Span::styled(String::new(), Style::default())));
+                body_joins.push(LineJoin::Break);
             }
             let arrow = if reasoning_expanded { "▼" } else { "▶" };
             // Record the header's position *within the body* before pushing
@@ -754,8 +884,11 @@ pub(crate) fn render_turn_lines(
                 Span::styled(format!("{arrow} "), Style::default().fg(Color::Gray)),
                 Span::styled("Reasoning", Style::default().fg(Color::Gray)),
             ]));
+            body_joins.push(LineJoin::Break);
             if reasoning_expanded && let Some(ref reasoning) = turn.assistant_reasoning {
-                body.extend(markdown_lines(reasoning.trim(), content_width));
+                let (lines, joins) = markdown_lines_joined(reasoning.trim(), content_width);
+                body.extend(lines);
+                body_joins.extend(joins);
             }
             reasoning_header_idx =
                 Some(all_lines.len() + MARGIN_STRUCTURAL_ROWS / 2 + header_idx_in_body);
@@ -763,10 +896,11 @@ pub(crate) fn render_turn_lines(
 
         // If we have content, wrap with margin lines (no timestamp).
         if !body.is_empty() {
-            let (margin_lines, _rows, margin_ranges) =
-                add_margin_lines(body, content_width, Color::Blue, None);
+            let (margin_lines, _rows, margin_ranges, margin_joins) =
+                add_margin_lines(body, body_joins, content_width, Color::Blue, None);
             all_lines.extend(margin_lines);
             all_content_ranges.extend(margin_ranges);
+            all_joins.extend(margin_joins);
         }
     }
 
@@ -818,6 +952,7 @@ pub(crate) fn render_turn_lines(
         let arrow = if collapsed { "▶" } else { "▼" };
 
         let mut body: Vec<Line<'static>> = Vec::new();
+        let mut body_joins: Vec<LineJoin> = Vec::new();
 
         // Invocation description rendered as markdown so inline code and
         // emphasis highlight properly.  Its first line becomes the header
@@ -826,10 +961,10 @@ pub(crate) fn render_turn_lines(
         // narrower than the content width because the header prepends the
         // triangle glyph ("▶ ") to the first line — wrapping at the full
         // width would push the header row past the right edge.
-        let desc_lines = if tr.invocation_description.is_empty() {
-            Vec::new()
+        let (desc_lines, desc_joins) = if tr.invocation_description.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            markdown_lines(
+            markdown_lines_joined(
                 &tr.invocation_description,
                 tool_content_width.saturating_sub(2),
             )
@@ -854,6 +989,7 @@ pub(crate) fn render_turn_lines(
             ));
         }
         body.push(Line::from(header_spans));
+        body_joins.push(LineJoin::Break);
         tool_result_header_idxs.push(all_lines.len() + header_idx_in_body);
 
         // Continuation lines of a multi-line invocation description are
@@ -862,6 +998,10 @@ pub(crate) fn render_turn_lines(
         // triangle.  Only the label + content are toggled by a click.
         if desc_len > 1 {
             body.extend(desc_lines.into_iter().skip(1));
+            // `desc_joins[1..]` describe each continuation relative to the
+            // line above it.  Since desc[0] now lives on the header row, the
+            // first continuation's join applies to the header row itself.
+            body_joins.extend(desc_joins.into_iter().skip(1));
         }
 
         // Expanded body only — a collapsed result is its header row plus
@@ -872,16 +1012,19 @@ pub(crate) fn render_turn_lines(
             // the description carried the header.
             if desc_len > 0 {
                 body.push(Line::from(Span::styled(String::new(), Style::default())));
+                body_joins.push(LineJoin::Break);
                 body.push(Line::from(Span::styled(
                     format!("{label}: {}", tr.name),
                     Style::default().fg(accent),
                 )));
+                body_joins.push(LineJoin::Break);
             }
             // Full content body — rendered for every expanded result.  The
             // old hard "quiet" suppression is now just the default collapse
             // state: expanding a quiet tool reveals the verbatim content.
             if !tr.content.is_empty() {
                 body.push(Line::from(Span::styled(String::new(), Style::default())));
+                body_joins.push(LineJoin::Break);
                 // Terminal-safety gate: escape everything except SGR color
                 // sequences so hostile file/URL/shell bytes (OSC clipboard
                 // writes, CSI clears, bidi overrides, …) render as inert text
@@ -897,28 +1040,40 @@ pub(crate) fn render_turn_lines(
                 let content = expand_tabs(&content);
                 // Content with ANSI escape codes gets colored rendering.
                 if content.contains("\x1b[") {
-                    body.extend(ansi_lines(&content, tool_content_width));
+                    let (lines, joins) = ansi_lines_joined(&content, tool_content_width);
+                    body.extend(lines);
+                    body_joins.extend(joins);
                 } else if tr.is_error {
-                    body.extend(plain_text_lines(&content, tool_content_width));
+                    let (lines, joins) = plain_text_lines_joined(&content, tool_content_width);
+                    body.extend(lines);
+                    body_joins.extend(joins);
                 } else if !DIFF_EXCLUDED_TOOLS.contains(&tr.name.as_str())
                     && let Some(diff_lines) = try_render_diff_content(&content, tool_content_width)
                 {
-                    body.extend(diff_lines);
+                    // Every diff row is a distinct line in the copy — the
+                    // renderer never reflows a diff row onto multiple rows.
+                    body.extend(diff_lines.iter().cloned());
+                    body_joins.extend(std::iter::repeat_n(LineJoin::Break, diff_lines.len()));
                 } else if MARKDOWN_TOOLS.contains(&tr.name.as_str()) {
                     // Tools that emit markdown by design (e.g. pdf_to_markdown)
                     // keep the styled renderer; everything else is verbatim
                     // data and must NOT be re-interpreted as markdown (see
                     // MARKDOWN_TOOLS).
-                    body.extend(markdown_lines(&content, tool_content_width));
+                    let (lines, joins) = markdown_lines_joined(&content, tool_content_width);
+                    body.extend(lines);
+                    body_joins.extend(joins);
                 } else {
-                    body.extend(plain_text_lines(&content, tool_content_width));
+                    let (lines, joins) = plain_text_lines_joined(&content, tool_content_width);
+                    body.extend(lines);
+                    body_joins.extend(joins);
                 }
             }
         }
 
         // Apply 2-column left/right indent so every row spans the full
         // area width with exactly 2 columns of right margin.
-        for line in &mut body {
+        for (line, join) in body.into_iter().zip(body_joins) {
+            let mut line = line;
             line.spans.insert(0, Span::styled("  ", Style::default()));
             let content_sum: usize = line.spans.iter().skip(1).map(|s| s.width()).sum();
             let fill = (tool_content_width as usize).saturating_sub(content_sum);
@@ -929,18 +1084,21 @@ pub(crate) fn render_turn_lines(
             // where the fill begins.  Blank spacer rows carry no content.
             let end = (2 + content_sum).min(2 + tool_content_width as usize);
             all_content_ranges.push((content_sum > 0).then_some((2, end)));
+            all_joins.push(join);
+            all_lines.push(line);
         }
-        all_lines.extend(body);
     }
 
     // If no sections produced output, emit a blank line.
     if all_lines.is_empty() {
         all_lines.push(Line::from(Span::styled(String::new(), Style::default())));
         all_content_ranges.push(None);
+        all_joins.push(LineJoin::Break);
     }
 
     RenderedTurnLines {
         lines: all_lines,
+        joins: all_joins,
         content_ranges: all_content_ranges,
         reasoning_header_idx,
         tool_result_header_idxs,
@@ -971,8 +1129,13 @@ pub(crate) fn reasoning_expanded_default(turn: &Turn) -> bool {
 pub(crate) const MARGIN_STRUCTURAL_ROWS: usize = 4;
 
 /// Return type of [`add_margin_lines`]: the wrapped lines, their total
-/// height, and the per-line content column ranges.
-type MarginLines = (Vec<Line<'static>>, usize, Vec<Option<(usize, usize)>>);
+/// height, and the per-line content column ranges and copy-join metadata.
+type MarginLines = (
+    Vec<Line<'static>>,
+    usize,
+    Vec<Option<(usize, usize)>>,
+    Vec<LineJoin>,
+);
 
 /// Wrap content lines with a vertical accent bar on the left and dark-gray
 /// background shading.
@@ -980,9 +1143,13 @@ type MarginLines = (Vec<Line<'static>>, usize, Vec<Option<(usize, usize)>>);
 /// Returns the wrapped lines, their total height, and a per-line content
 /// column range aligned with the returned lines: `(5, 5 + line.width())` for
 /// content rows (the text between the `"  ┃  "` gutter and the trailing
-/// fill), `None` for the structural chrome rows (separator, padding).
+/// fill), `None` for the structural chrome rows (separator, padding).  The
+/// per-line [`LineJoin`] metadata is carried through unchanged: structural
+/// chrome rows are fresh lines, content rows keep the join their producer
+/// gave them.
 fn add_margin_lines(
     lines: Vec<Line<'static>>,
+    joins: Vec<LineJoin>,
     content_width: u16,
     accent: Color,
     timestamp_ms: Option<i64>,
@@ -1007,12 +1174,15 @@ fn add_margin_lines(
     let mut result = Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
     let mut content_ranges: Vec<Option<(usize, usize)>> =
         Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
+    let mut box_joins: Vec<LineJoin> = Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
     result.push(separator);
     content_ranges.push(None);
+    box_joins.push(LineJoin::Break);
     result.push(padding.clone());
     content_ranges.push(None);
+    box_joins.push(LineJoin::Break);
 
-    for line in lines {
+    for (line, join) in lines.into_iter().zip(joins) {
         let text_width = line.width();
         let fill = (content_width as usize).saturating_sub(text_width);
 
@@ -1036,10 +1206,12 @@ fn add_margin_lines(
         // Content occupies columns [5, 5 + text width): after the fixed
         // `"  ┃  "` gutter, up to where the trailing fill begins.
         content_ranges.push(Some((5, 5 + text_width)));
+        box_joins.push(join);
     }
 
     result.push(padding);
     content_ranges.push(None);
+    box_joins.push(LineJoin::Break);
 
     // Bottom separator: right-aligned timestamp (user messages only).
     if let Some(ms) = timestamp_ms {
@@ -1061,12 +1233,25 @@ fn add_margin_lines(
         )]));
     }
     content_ranges.push(None);
+    box_joins.push(LineJoin::Break);
 
     let total_rows = result.len();
-    (result, total_rows, content_ranges)
+    (result, total_rows, content_ranges, box_joins)
 }
 
+#[cfg(test)]
 pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
+    markdown_lines_joined(markdown, width).0
+}
+
+/// [`markdown_lines`] plus the per-line [`LineJoin`] copy metadata (see the
+/// enum docs).  Wrapped continuations of one paragraph rejoin with a space;
+/// paragraph/section boundaries, list items, code lines, and table rows are
+/// fresh lines.
+pub(crate) fn markdown_lines_joined(
+    markdown: &str,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<LineJoin>) {
     let document = MarkdownDocument::parse(markdown);
     // Normalize heading levels so the document's first heading always renders
     // as level 1.  LLM output sometimes starts a document at `##` (or deeper)
@@ -1077,23 +1262,28 @@ pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
         .map(|level| (level.saturating_sub(1)) as usize)
         .unwrap_or(0);
     let mut lines = Vec::new();
+    let mut joins = Vec::new();
     render_markdown_blocks(
         &document.blocks,
         &mut lines,
+        &mut joins,
         0,
         width as usize,
         heading_shift,
     );
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
+        joins.push(LineJoin::Break);
     }
     while matches!(lines.last(), Some(line) if line_is_blank(line)) {
         lines.pop();
+        joins.pop();
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
+        joins.push(LineJoin::Break);
     }
-    lines
+    (lines, joins)
 }
 
 /// True when a rendered line is visually blank: every span is empty or
@@ -1108,9 +1298,19 @@ fn line_is_blank(line: &Line<'_>) -> bool {
 /// already blank (zero-width or whitespace-only).  This gives us CSS-like
 /// margin collapsing: multiple adjacent blocks that each want vertical
 /// space produce at most one blank line between them.
+#[cfg(test)]
 fn ensure_blank_line(lines: &mut Vec<Line<'static>>) {
     if lines.last().is_none_or(|l| !line_is_blank(l)) {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    }
+}
+
+/// [`ensure_blank_line`] keeping the per-line [`LineJoin`] vector aligned:
+/// every blank row it inserts is a fresh line ([`LineJoin::Break`]).
+fn ensure_blank_line_joined(lines: &mut Vec<Line<'static>>, joins: &mut Vec<LineJoin>) {
+    if lines.last().is_none_or(|l| !line_is_blank(l)) {
+        lines.push(Line::from(Span::styled(String::new(), Style::default())));
+        joins.push(LineJoin::Break);
     }
 }
 
@@ -1155,13 +1355,14 @@ fn heading_prefix(level: usize) -> Option<String> {
 fn render_markdown_blocks(
     blocks: &[MarkdownBlock],
     lines: &mut Vec<Line<'static>>,
+    joins: &mut Vec<LineJoin>,
     indent: usize,
     width: usize,
     heading_shift: usize,
 ) {
     for (index, block) in blocks.iter().enumerate() {
         if index > 0 {
-            ensure_blank_line(lines);
+            ensure_blank_line_joined(lines, joins);
         }
         // Headings get a *second* blank line for extra visual separation —
         // except when the heading is the first block (index 0) of the
@@ -1170,39 +1371,42 @@ fn render_markdown_blocks(
         // first blank; this push adds the second.
         if index > 0 && matches!(block, MarkdownBlock::Heading { .. }) {
             lines.push(Line::from(Span::styled(String::new(), Style::default())));
+            joins.push(LineJoin::Break);
         }
-        render_markdown_block(block, lines, indent, width, heading_shift);
+        render_markdown_block(block, lines, joins, indent, width, heading_shift);
     }
 }
 
 fn render_markdown_block(
     block: &MarkdownBlock,
     lines: &mut Vec<Line<'static>>,
+    joins: &mut Vec<LineJoin>,
     indent: usize,
     width: usize,
     heading_shift: usize,
 ) {
     match block {
-        MarkdownBlock::Paragraph(content) => lines.extend(inlines_to_lines(
-            content,
-            indent,
-            None,
-            width,
-            Modifier::empty(),
-        )),
+        MarkdownBlock::Paragraph(content) => {
+            let (para_lines, para_joins) =
+                inlines_to_lines(content, indent, None, width, Modifier::empty());
+            lines.extend(para_lines);
+            joins.extend(para_joins);
+        }
         MarkdownBlock::Heading { level, content } => {
             // Normalize the raw markdown level by the document-wide shift so
             // the first heading always renders as level 1 (see markdown_lines).
             let normalized = (*level as usize).saturating_sub(heading_shift).max(1);
             let prefix = heading_prefix(normalized);
             // Headings are rendered bold + underlined for visual distinction.
-            lines.extend(inlines_to_lines(
+            let (heading_lines, heading_joins) = inlines_to_lines(
                 content,
                 indent,
                 prefix,
                 width,
                 Modifier::BOLD | Modifier::UNDERLINED,
-            ));
+            );
+            lines.extend(heading_lines);
+            joins.extend(heading_joins);
         }
         MarkdownBlock::CodeBlock { language, code } => {
             let header = language
@@ -1210,6 +1414,7 @@ fn render_markdown_block(
                 .map(|value| format!("```{value}"))
                 .unwrap_or_else(|| "```".to_string());
             lines.push(indented_line(indent, header));
+            joins.push(LineJoin::Break);
 
             let max_code_width = width.saturating_sub(indent);
             let highlighted = highlight_code(language.as_deref(), code);
@@ -1220,8 +1425,14 @@ fn render_markdown_block(
                 // splitting for words that don't fit.
                 if hl_line.width() > max_code_width {
                     let mut wrapped: Vec<Line<'static>> = Vec::new();
-                    wrap_styled_line(&hl_line, max_code_width, &mut wrapped);
-                    for wl in wrapped {
+                    let mut wrapped_joins: Vec<LineJoin> = Vec::new();
+                    wrap_styled_line_joined(
+                        &hl_line,
+                        max_code_width,
+                        &mut wrapped,
+                        &mut wrapped_joins,
+                    );
+                    for (wi, wl) in wrapped.into_iter().enumerate() {
                         // Strip trailing space spans so they don't get rendered
                         // with shading as an extra column outside the code box.
                         let mut spans = wl.spans;
@@ -1236,33 +1447,47 @@ fn render_markdown_block(
                         } else {
                             lines.push(Line::from(spans));
                         }
+                        // The wrapper accounts for the actual row break type
+                        // (Space at word boundaries, Join for hard splits);
+                        // the first row of each source line is a fresh line.
+                        joins.push(wrapped_joins[wi]);
                     }
                 } else if indent > 0 {
                     let mut spans = vec![Span::styled(" ".repeat(indent), Style::default())];
                     spans.extend(hl_line.spans.clone());
                     lines.push(Line::from(spans));
+                    joins.push(LineJoin::Break);
                 } else {
                     lines.push(hl_line);
+                    joins.push(LineJoin::Break);
                 }
             }
 
             lines.push(indented_line(indent, "```".to_string()));
+            joins.push(LineJoin::Break);
         }
         MarkdownBlock::BlockQuote(blocks) => {
             let mut quoted = Vec::new();
+            let mut quoted_joins = Vec::new();
             // Content is rendered at (width - indent - 2) so that when "> " and the
             // outer indent are prepended on each line the total stays within `width`.
             render_markdown_blocks(
                 blocks,
                 &mut quoted,
+                &mut quoted_joins,
                 0,
                 width.saturating_sub(indent + 2),
                 heading_shift,
             );
-            for line in quoted {
+            for (line, _inner_join) in quoted.into_iter().zip(quoted_joins) {
                 let mut spans = line.spans.clone();
                 spans.insert(0, Span::styled("> ".to_string(), Style::default()));
                 lines.push(indented_line_as_spans(indent, spans));
+                // Every quoted row is a distinct line in the copy: the "> "
+                // prefix is per-row rendering chrome, and re-glueing wrapped
+                // quote rows into one line would merge the markers into the
+                // text.  Copying proceeds row by row.
+                joins.push(LineJoin::Break);
             }
         }
         MarkdownBlock::List {
@@ -1300,7 +1525,7 @@ fn render_markdown_block(
             } else {
                 display_width("• ")
             };
-            let mut rendered_items: Vec<(String, Vec<Line<'static>>)> =
+            let mut rendered_items: Vec<(String, Vec<Line<'static>>, Vec<LineJoin>)> =
                 Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
                 let marker = if *ordered {
@@ -1317,6 +1542,7 @@ fn render_markdown_block(
                 // lined up, but the visible first line was still misaligned.
                 let marker = pad_marker(&marker, max_marker_width);
                 let mut rendered = Vec::new();
+                let mut rendered_joins = Vec::new();
                 // Content is rendered at (width - indent - max_marker_width):
                 // with every marker padded to that width, a first line totals
                 // exactly `width`, and continuation lines (indented to the same
@@ -1324,11 +1550,12 @@ fn render_markdown_block(
                 render_markdown_blocks(
                     item,
                     &mut rendered,
+                    &mut rendered_joins,
                     0,
                     width.saturating_sub(indent + max_marker_width),
                     heading_shift,
                 );
-                rendered_items.push((marker, rendered));
+                rendered_items.push((marker, rendered, rendered_joins));
             }
 
             // Strict majority: more than half of the items must be multi-line
@@ -1336,15 +1563,18 @@ fn render_markdown_block(
             // stays tight because 1 * 2 == 2 is not > 2.
             let multi_line_count = rendered_items
                 .iter()
-                .filter(|(_, rendered)| rendered.len() > 1)
+                .filter(|(_, rendered, _)| rendered.len() > 1)
                 .count();
             let spaced = multi_line_count * 2 > items.len();
 
-            for (index, (marker, rendered)) in rendered_items.into_iter().enumerate() {
+            for (index, (marker, rendered, rendered_joins)) in
+                rendered_items.into_iter().enumerate()
+            {
                 // All continuation lines align under the widest marker so wrapped
                 // text lines up across the whole list.
                 let continuation_indent = indent + max_marker_width;
                 let mut rendered_iter = rendered.into_iter();
+                let mut joins_iter = rendered_joins.into_iter();
                 if let Some(first) = rendered_iter.next() {
                     let mut spans = vec![Span::styled(
                         format!("{}{}", " ".repeat(indent), marker),
@@ -1352,8 +1582,13 @@ fn render_markdown_block(
                     )];
                     spans.extend(first.spans.clone());
                     lines.push(Line::from(spans));
+                    // Each item starts a fresh line; whatever the inner
+                    // renderer said about its first line is superseded.
+                    joins_iter.next(); // consume the inner first-line join
+                    joins.push(LineJoin::Break);
                 } else {
                     lines.push(indented_line(indent, marker));
+                    joins.push(LineJoin::Break);
                 }
                 for line in rendered_iter {
                     let mut spans = vec![Span::styled(
@@ -1362,6 +1597,10 @@ fn render_markdown_block(
                     )];
                     spans.extend(line.spans);
                     lines.push(Line::from(spans));
+                    // Wrapped continuations inside the item rejoin with
+                    // Space/Join exactly as the inner renderer recorded
+                    // (their predecessor's text is the line above them).
+                    joins.push(joins_iter.next().unwrap_or(LineJoin::Break));
                 }
 
                 // Blank line between items only when the list is spaced out as
@@ -1369,7 +1608,7 @@ fn render_markdown_block(
                 // consecutive blanks collapse into one (e.g. when a spaced
                 // item ends with a nested list that already produced a blank).
                 if index + 1 < items.len() && spaced {
-                    ensure_blank_line(lines);
+                    ensure_blank_line_joined(lines, joins);
                 }
             }
 
@@ -1384,15 +1623,23 @@ fn render_markdown_block(
             // block, so the rule is invisible everywhere except the boundary
             // that was previously missing it.
             if !items.is_empty() {
-                ensure_blank_line(lines);
+                ensure_blank_line_joined(lines, joins);
             }
         }
         MarkdownBlock::Table {
             alignments,
             header,
             rows,
-        } => lines.extend(render_table_lines(alignments, header, rows, indent, width)),
-        MarkdownBlock::Rule => lines.push(indented_line(indent, "---".to_string())),
+        } => {
+            let (table_lines, table_joins) =
+                render_table_lines(alignments, header, rows, indent, width);
+            lines.extend(table_lines);
+            joins.extend(table_joins);
+        }
+        MarkdownBlock::Rule => {
+            lines.push(indented_line(indent, "---".to_string()));
+            joins.push(LineJoin::Break);
+        }
     }
 }
 
@@ -1404,13 +1651,16 @@ fn render_table_lines(
     rows: &[Vec<Vec<MarkdownInline>>],
     indent: usize,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<LineJoin>) {
     let column_count = alignments
         .len()
         .max(header.len())
         .max(rows.iter().map(Vec::len).max().unwrap_or(0));
     if column_count == 0 {
-        return vec![Line::from(Span::styled(String::new(), Style::default()))];
+        return (
+            vec![Line::from(Span::styled(String::new(), Style::default()))],
+            vec![LineJoin::Break],
+        );
     }
     let mut table_rows = Vec::with_capacity(rows.len() + 1);
     table_rows.push(normalize_table_row(header, column_count));
@@ -1434,27 +1684,28 @@ fn render_table_lines(
     shrink_column_widths(&mut widths, content_budget);
     let header_alignment = normalized_alignments(alignments, column_count);
     let mut lines = Vec::new();
+    let mut joins = Vec::new();
     lines.push(table_border_line('┌', '┬', '┐', &widths, indent));
-    lines.extend(render_table_row_wrapped(
-        &table_rows[0],
-        &widths,
-        &header_alignment,
-        indent,
-    ));
+    joins.push(LineJoin::Break);
+    let (header_lines, header_joins) =
+        render_table_row_wrapped(&table_rows[0], &widths, &header_alignment, indent);
+    lines.extend(header_lines);
+    joins.extend(header_joins);
     lines.push(table_separator_line(&widths, &header_alignment, indent));
+    joins.push(LineJoin::Break);
     for (index, row) in table_rows.iter().enumerate().skip(1) {
-        lines.extend(render_table_row_wrapped(
-            row,
-            &widths,
-            &header_alignment,
-            indent,
-        ));
+        let (row_lines, row_joins) =
+            render_table_row_wrapped(row, &widths, &header_alignment, indent);
+        lines.extend(row_lines);
+        joins.extend(row_joins);
         if index < table_rows.len() - 1 {
             lines.push(table_border_line('├', '┼', '┤', &widths, indent));
+            joins.push(LineJoin::Break);
         }
     }
     lines.push(table_border_line('└', '┴', '┘', &widths, indent));
-    lines
+    joins.push(LineJoin::Break);
+    (lines, joins)
 }
 
 fn normalized_alignments(
@@ -1556,7 +1807,7 @@ fn render_table_row_wrapped(
     widths: &[usize],
     alignments: &[MarkdownAlignment],
     indent: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<LineJoin>) {
     let wrapped_cells: Vec<Vec<String>> = row
         .iter()
         .zip(widths.iter())
@@ -1583,7 +1834,11 @@ fn render_table_row_wrapped(
         }
         lines.push(indented_line(indent, text));
     }
-    lines
+    // Every table row (visual or wrapped) is a distinct line in the copy:
+    // the cell borders and padding are per-row rendering chrome that must
+    // not be re-glueed into a paragraph.
+    let joins = vec![LineJoin::Break; lines.len()];
+    (lines, joins)
 }
 
 fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
@@ -1744,8 +1999,9 @@ fn inlines_to_lines(
     prefix: Option<String>,
     width: usize,
     modifier: Modifier,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<LineJoin>) {
     let mut lines = Vec::new();
+    let mut joins = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut current_width: usize = 0;
     if indent > 0 {
@@ -1757,20 +2013,29 @@ fn inlines_to_lines(
         current_width += display_width(prefix);
     }
     let mut needs_separator = false;
-    let mut ctx = RenderCtx {
-        lines: &mut lines,
-        current: &mut current_spans,
-        current_width: &mut current_width,
-        needs_separator: &mut needs_separator,
-        indent,
-        width,
-        modifier,
+    let final_join = {
+        let mut ctx = RenderCtx {
+            lines: &mut lines,
+            joins: &mut joins,
+            current: &mut current_spans,
+            current_width: &mut current_width,
+            needs_separator: &mut needs_separator,
+            indent,
+            width,
+            modifier,
+            // The very first line of a paragraph/heading is a fresh line.
+            current_join: LineJoin::Break,
+        };
+        render_inlines_to_lines(inlines, &mut ctx);
+        // Snapshot the final line's join before `ctx` drops its borrows of
+        // the local vectors below.
+        ctx.current_join
     };
-    render_inlines_to_lines(inlines, &mut ctx);
     if !current_spans.is_empty() || lines.is_empty() {
         lines.push(Line::from(std::mem::take(&mut current_spans)));
+        joins.push(final_join);
     }
-    lines
+    (lines, joins)
 }
 
 /// Bundles all mutable state and parameters needed to render a flat list of
@@ -1785,10 +2050,17 @@ fn inlines_to_lines(
 struct RenderCtx<'a> {
     /// Output buffer — completed lines are pushed here.
     lines: &'a mut Vec<Line<'static>>,
+    /// Per-line [`LineJoin`] copy metadata, pushed in lockstep with `lines`.
+    joins: &'a mut Vec<LineJoin>,
     /// Spans being accumulated for the line currently being built.
     current: &'a mut Vec<Span<'static>>,
     /// Display width of `current` (updated alongside every push).
     current_width: &'a mut usize,
+    /// The [`LineJoin`] of the line currently being built (how it joins the
+    /// previously flushed line).  Set when the line is started by
+    /// [`RenderCtx::flush_line_with_next`] and recorded when the line is
+    /// finally pushed.
+    current_join: LineJoin,
     /// Whether the next word needs a space separator before it (set to
     /// `true` after every word/code chunk, reset to `false` on line break
     /// or flush).
@@ -1816,13 +2088,20 @@ impl<'a> RenderCtx<'a> {
     /// Indent padding uses `Style::default()` (not `base_style()`) because
     /// styling modifiers on whitespace are invisible and could confuse tests
     /// or terminal renderers.
-    fn flush_line(&mut self) {
+    ///
+    /// The just-flushed line is recorded with its own `current_join`; the
+    /// caller passes the join the fresh line has toward it: word-wrap →
+    /// [`LineJoin::Space`], a hard source line break → [`LineJoin::Break`],
+    /// a mid-word split → [`LineJoin::Join`].
+    fn flush_line_with_next(&mut self, next_join: LineJoin) {
         self.lines.push(Line::from(std::mem::take(self.current)));
+        self.joins.push(self.current_join);
         *self.current_width = self.indent;
         if self.indent > 0 {
             self.current
                 .push(Span::styled(" ".repeat(self.indent), Style::default()));
         }
+        self.current_join = next_join;
     }
 
     /// Split `word` into grapheme-cluster chunks to fit the available width on the
@@ -1834,7 +2113,8 @@ impl<'a> RenderCtx<'a> {
         let chunked = split_word_to_width(word, available);
         for (ci, chunk) in chunked.iter().enumerate() {
             if ci > 0 {
-                self.flush_line();
+                // The next row is a mid-word continuation of the split.
+                self.flush_line_with_next(LineJoin::Join);
             }
             self.push_span(chunk.clone(), style);
             *self.current_width += display_width(chunk);
@@ -1878,7 +2158,8 @@ fn render_inlines_to_lines(inlines: &[MarkdownInline], ctx: &mut RenderCtx) {
                 let prefix_width = display_width(prefix_text);
                 let projected = *ctx.current_width + prefix_width;
                 if projected > ctx.width && *ctx.current_width > ctx.indent {
-                    ctx.flush_line();
+                    // Mid-inline wrap: the image continues the sentence.
+                    ctx.flush_line_with_next(LineJoin::Space);
                 }
                 ctx.push_span(prefix_text.to_string(), Style::default());
                 *ctx.current_width += prefix_width;
@@ -1893,14 +2174,15 @@ fn render_inlines_to_lines(inlines: &[MarkdownInline], ctx: &mut RenderCtx) {
                 let suffix_width = display_width(&suffix);
                 let projected = *ctx.current_width + suffix_width;
                 if projected > ctx.width && *ctx.current_width > ctx.indent {
-                    ctx.flush_line();
+                    ctx.flush_line_with_next(LineJoin::Space);
                 }
                 ctx.push_span(suffix, Style::default());
                 *ctx.current_width += suffix_width;
                 *ctx.needs_separator = true;
             }
             MarkdownInline::LineBreak => {
-                ctx.flush_line();
+                // A hard source line break: the next line is a fresh line.
+                ctx.flush_line_with_next(LineJoin::Break);
                 *ctx.needs_separator = false;
             }
         }
@@ -1958,7 +2240,8 @@ fn render_text_inline(text: &str, ctx: &mut RenderCtx) {
         let projected = *ctx.current_width + separator_width + word_width;
 
         if projected > ctx.width && *ctx.current_width > ctx.indent {
-            ctx.flush_line();
+            // Word-wrap: the next row continues the sentence.
+            ctx.flush_line_with_next(LineJoin::Space);
             *ctx.needs_separator = i > 0;
         }
 
@@ -1997,7 +2280,7 @@ fn render_code_inline(text: &str, ctx: &mut RenderCtx, color: Color) {
     // (but only when the line already has content — don't flush a blank line).
     let projected = *ctx.current_width + usize::from(*ctx.needs_separator) + word_width;
     if projected > ctx.width && *ctx.current_width > ctx.indent {
-        ctx.flush_line();
+        ctx.flush_line_with_next(LineJoin::Space);
     } else if *ctx.needs_separator && !ctx.current.is_empty() && *ctx.current_width > ctx.indent {
         ctx.push_span(" ".to_string(), ctx.base_style());
         *ctx.current_width += 1;
@@ -2052,7 +2335,8 @@ fn render_link_inline(content: &[MarkdownInline], destination: &str, ctx: &mut R
     let url_width = display_width(destination);
     let projected = *ctx.current_width + sep_width + url_width;
     if projected > ctx.width && *ctx.current_width > ctx.indent {
-        ctx.flush_line();
+        // Mid-inline wrap: the link separator/URL continue the sentence.
+        ctx.flush_line_with_next(LineJoin::Space);
     }
     ctx.push_span(sep.to_string(), ctx.base_style());
     *ctx.current_width += sep_width;
@@ -2634,6 +2918,141 @@ mod tests {
             "bold syntax should not appear literally"
         );
         assert!(text.contains("bold"), "bold text should appear");
+    }
+
+    // ── LineJoin copy metadata ────────────────────────────────────────────
+
+    #[test]
+    fn wrapped_paragraph_joins_with_space() {
+        // A paragraph that wraps onto three rows records Break for its first
+        // row and Space for each continuation — the copy re-inserts the
+        // separating space the reflow consumed.
+        let text = "the quick brown fox jumps over the lazy dog and runs far away";
+        let (lines, joins) = markdown_lines_joined(text, 21);
+        assert_eq!(lines.len(), 3, "paragraph must wrap to three rows");
+        assert_eq!(
+            joins,
+            vec![LineJoin::Break, LineJoin::Space, LineJoin::Space]
+        );
+        // Reassembling the rows with the recorded joins reproduces the input.
+        let mut out = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 && joins[i] == LineJoin::Space {
+                out.push(' ');
+            }
+            out.push_str(&line.to_string());
+        }
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn paragraphs_break_between_blocks() {
+        let md = "one paragraph here\n\nanother paragraph there";
+        let (lines, joins) = markdown_lines_joined(md, 80);
+        assert_eq!(lines.len(), 3, "two paragraphs plus a blank spacer");
+        assert_eq!(
+            joins,
+            vec![LineJoin::Break, LineJoin::Break, LineJoin::Break]
+        );
+    }
+
+    #[test]
+    fn hard_split_word_joins_directly() {
+        // A single word wider than the line is hard-split by grapheme; the
+        // copy joins the pieces directly (no space exists in the original).
+        let word = "supercalifragilisticexpialidocious";
+        let (lines, joins) = markdown_lines_joined(word, 10);
+        assert!(lines.len() >= 3, "word must split across rows");
+        assert_eq!(joins[0], LineJoin::Break, "first row is fresh");
+        assert!(
+            joins.iter().skip(1).all(|&j| j == LineJoin::Join),
+            "every continuation is a mid-word split: {joins:?}"
+        );
+        let rejoin: String = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(rejoin, word, "direct concatenation reproduces the word");
+    }
+
+    #[test]
+    fn plain_text_wrap_joins_directly_and_preserves_whitespace() {
+        // `wrap_plain_line` keeps the whitespace run on the previous row, so
+        // the copy concatenates the rows directly — no invented space, and
+        // the input is reproduced byte-for-byte (including internal runs).
+        let text = "alpha   beta gamma  delta epsilon zeta";
+        let (lines, joins) = plain_text_lines_joined(text, 10);
+        assert!(lines.len() > 1, "line must wrap");
+        assert_eq!(joins[0], LineJoin::Break);
+        assert!(
+            joins.iter().skip(1).all(|&j| j == LineJoin::Join),
+            "every continuation is a direct join: {joins:?}"
+        );
+        let rejoin: String = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(rejoin, text, "direct concatenation reproduces the input");
+    }
+
+    #[test]
+    fn ansi_word_wrap_joins_with_space() {
+        // ANSI-colored text wraps via `wrap_styled_line` (word-boundary
+        // breaks consume the space), so continuations join with Space.
+        let (lines, joins) = ansi_lines_joined("aaaa bbbb cccc dddd eeee", 10);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            joins,
+            vec![LineJoin::Break, LineJoin::Space, LineJoin::Space]
+        );
+    }
+
+    #[test]
+    fn code_block_lines_break_but_wrapped_line_joins() {
+        // Each source line of a code block is a fresh line; a wrapped
+        // over-long source line records its own continuation joins.
+        let md = "```text\nshort line\nverylongwordthatexceedsthewidth\n```";
+        let (lines, joins) = markdown_lines_joined(md, 20);
+        // ```text | short line | verylongwordth... (wrapped 2) | (blank) | ```
+        // The blank row before the closing fence is the markdown parser's
+        // trailing newline in the code content (pre-existing renderer
+        // behavior); as a content-free row it contributes nothing to a copy.
+        assert_eq!(lines.len(), 6);
+        assert_eq!(
+            joins,
+            vec![
+                LineJoin::Break, // ```text
+                LineJoin::Break, // short line
+                LineJoin::Break, // verylongwordth… (row 1 of the wrap)
+                LineJoin::Join,  // …edsthewidth (hard split continuation)
+                LineJoin::Break, // blank row (parser trailing newline)
+                LineJoin::Break, // ```
+            ]
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_joins_stay_aligned() {
+        // Every produced row carries a join, and the copy metadata on the
+        // assistant block rows matches the row count (the selection
+        // machinery relies on the alignment).
+        let mut turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some(
+                "a paragraph that is long enough to wrap across several rows".into(),
+            ),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let rendered = render_turn_lines(&mut turn, 20, 24, false, &[]);
+        assert_eq!(rendered.lines.len(), rendered.joins.len());
+        assert_eq!(rendered.lines.len(), rendered.content_ranges.len());
+        // The box chrome rows are fresh lines; at least one content row is a
+        // wrapped continuation.
+        assert!(rendered.joins.contains(&LineJoin::Space));
+        assert!(rendered.joins.contains(&LineJoin::Break));
     }
 
     // ── display_width ────────────────────────────────────────────────────
@@ -3946,8 +4365,8 @@ content ---"
         // being passed to format_timestamp (which takes milliseconds),
         // so every user message rendered as a 1970 date (e.g. "Jan 21 1970").
         let ts_ms = 1_705_314_000_000i64; // a plausible modern timestamp
-        let (lines, _rows, _content_ranges) =
-            add_margin_lines(Vec::new(), 80, Color::Green, Some(ts_ms));
+        let (lines, _rows, _content_ranges, _joins) =
+            add_margin_lines(Vec::new(), Vec::new(), 80, Color::Green, Some(ts_ms));
         let bottom = lines.last().expect("bottom separator line");
         let rendered = bottom.to_string();
         let expected = format_timestamp(ts_ms);

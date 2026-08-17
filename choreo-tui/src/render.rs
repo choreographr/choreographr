@@ -1605,7 +1605,9 @@ fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown_render::{RenderedTurnLines, compute_visual_offsets, lines_height};
+    use crate::markdown_render::{
+        LineJoin, RenderedTurnLines, compute_visual_offsets, lines_height,
+    };
     use crate::state::{RenderCacheKey, RenderedCache, RenderedTurn};
 
     /// Wrap a line vector as a rendered turn with no headers.
@@ -1613,9 +1615,11 @@ mod tests {
         // Every line gets a full-width content range so the cache-alignment
         // invariant asserted in `cached_or_compute_lines` holds for test
         // fixtures too (each entry must align with `lines`).
+        let joins = lines.iter().map(|_| LineJoin::Break).collect();
         let content_ranges = lines.iter().map(|l| Some((0, l.width()))).collect();
         RenderedTurnLines {
             lines,
+            joins,
             content_ranges,
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
@@ -1636,6 +1640,7 @@ mod tests {
                 lines,
                 height,
                 visual_offsets,
+                joins: Arc::from([]),
                 content_ranges: Arc::from([]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: Vec::new(),
@@ -2130,6 +2135,7 @@ mod tests {
                 lines: Arc::from(vec![Line::from("stale")]),
                 height: 99,
                 visual_offsets: Arc::from([1]),
+                joins: Arc::from([]),
                 content_ranges: Arc::from([]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![0],

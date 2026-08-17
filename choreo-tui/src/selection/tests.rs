@@ -1,7 +1,7 @@
 use super::*;
 use crate::state::find_turn_at_row;
 use crate::test_util::test_app;
-use choreo_proto::Turn;
+use choreo_proto::{ToolResultRecord, Turn};
 
 /// Build a turn with a single assistant text line (and no user text) so
 /// the rendered layout is exactly one line per turn — the easiest canvas
@@ -670,4 +670,127 @@ fn slice_columns_wide_chars() {
     let line = Line::from("日本語x");
     // Columns 0..3 → the first two CJK chars.
     assert_eq!(slice_line_columns(&line, 0, 3), "日本");
+}
+
+// ── wrapped-text copy (unwrapping) ──
+
+/// Screen row of the rendered row containing `needle` (see [`locate`]).
+fn locate_row(app: &App, needle: &str) -> u16 {
+    locate(app, needle).0.0
+}
+
+#[test]
+fn wrapped_paragraph_copies_unwrapped_text() {
+    // Regression: a long assistant response that the renderer wraps onto
+    // several rows used to be copied with the display's wrap points as
+    // newlines — the copy reproduced the wrapped text instead of the
+    // original.  The renderer now records that the rows are continuations of
+    // one paragraph, so the copy must rejoin them with a single space into
+    // the exact original sentence.
+    let text = "the quick brown fox jumps over the lazy dog and runs far away";
+    let mut app = test_app();
+    app.history_viewport.width = 30; // content width 21 → wraps to 3 rows
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(text));
+    app.rebuild_height_prefix();
+    let first = locate_row(&app, "the quick");
+    let last = locate_row(&app, "away");
+    assert!(last > first, "paragraph must wrap to multiple rows");
+
+    let copied =
+        drag_and_finish(&mut app, (first, 0), (last, 200)).expect("selection should extract");
+    assert!(
+        !copied.contains('\n'),
+        "wrapped rows must be re-joined, not newline-separated: {copied:?}"
+    );
+    assert_eq!(
+        copied.trim(),
+        text,
+        "the exact original paragraph is copied"
+    );
+}
+
+#[test]
+fn wrapped_paragraphs_keep_paragraph_boundaries() {
+    // Paragraph boundaries are real breaks: the copy joins the wrapped rows
+    // of each paragraph, but keeps a newline between separate paragraphs.
+    let p1 = "first paragraph text that wraps around nicely and continues";
+    let p2 = "second paragraph also wraps across the same narrow viewport";
+    let md = format!("{p1}\n\n{p2}");
+    let mut app = test_app();
+    app.history_viewport.width = 30; // content width 21 → both wrap
+    app.history_viewport.height = 50;
+    app.display_for(0).view.insert_or_replace(0, turn(&md));
+    app.rebuild_height_prefix();
+    let first = locate_row(&app, "first");
+    let last = locate_row(&app, "viewport");
+    assert!(last > first, "the two paragraphs must span rows");
+
+    let copied =
+        drag_and_finish(&mut app, (first, 0), (last, 200)).expect("selection should extract");
+    let mut lines = copied.lines();
+    assert_eq!(lines.next(), Some(p1), "first paragraph unwrapped");
+    assert_eq!(lines.next(), Some(p2), "second paragraph unwrapped");
+    assert_eq!(lines.next(), None, "no extra lines");
+}
+
+#[test]
+fn wrapped_plain_tool_output_copies_unwrapped_text() {
+    // Long verbatim tool output wraps onto several rows (`plain_text_lines`,)
+    // which keeps its whitespace on the previous row — so the copy must
+    // rejoin the rows directly (no invented space), yielding the exact
+    // original content line.
+    let content = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+    let mut app = test_app();
+    app.history_viewport.width = 30; // tool content width 26 → wraps
+    app.history_viewport.height = 60;
+    let mut t = turn(""); // no assistant text; only the tool block
+    t.tool_results = vec![ToolResultRecord {
+        call_id: "c1".into(),
+        name: "cat".into(),
+        content: content.into(),
+        is_error: false,
+        invocation_description: "read a long file".into(),
+    }];
+    app.display_for(0).view.insert_or_replace(0, t);
+    app.rebuild_height_prefix();
+    let first = locate_row(&app, "alpha");
+    let last = locate_row(&app, "mu");
+    assert!(last > first, "tool output must wrap to multiple rows");
+
+    let copied =
+        drag_and_finish(&mut app, (first, 0), (last, 200)).expect("selection should extract");
+    assert!(
+        !copied.contains('\n'),
+        "wrapped tool rows must be re-joined: {copied:?}"
+    );
+    assert_eq!(copied.trim(), content, "the exact tool line is copied");
+}
+
+#[test]
+fn wrapped_code_block_line_rejoins_with_space() {
+    // A single source line of a code block wraps without losing anything; the
+    // two wrapped rows rejoin with the single space the reflow consumed.
+    let md = "```text\nfunction call(a, b) { return a + b; }\n```";
+    let mut app = test_app();
+    app.history_viewport.width = 30; // content width 21 → code line wraps
+    app.history_viewport.height = 60;
+    let t = turn(md);
+    app.display_for(0).view.insert_or_replace(0, t);
+    app.rebuild_height_prefix();
+    let first = locate_row(&app, "function");
+    let last = locate_row(&app, "return");
+    assert!(last > first, "code line must wrap to multiple rows");
+
+    let copied =
+        drag_and_finish(&mut app, (first, 0), (last, 200)).expect("selection should extract");
+    assert!(
+        !copied.contains('\n'),
+        "wrapped code rows must be re-joined: {copied:?}"
+    );
+    assert_eq!(
+        copied.trim(),
+        "function call(a, b) { return a + b; }",
+        "the code line reads exactly as written"
+    );
 }

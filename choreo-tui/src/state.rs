@@ -16,7 +16,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::markdown_render::{
-    RenderedTurnLines, compute_visual_offsets, lines_height, plain_text_lines,
+    LineJoin, RenderedTurnLines, compute_visual_offsets, lines_height, plain_text_lines,
     reasoning_expanded_default, render_turn_lines, tool_result_default_collapsed,
 };
 use ratatui::text::Line;
@@ -661,6 +661,12 @@ pub(crate) struct RenderedTurn {
     /// Used with `partition_point` to map a visual row → semantic line index
     /// in O(log n).
     pub visual_offsets: Arc<[usize]>,
+    /// Per-line [`LineJoin`] copy metadata aligned with `lines`: how each
+    /// rendered row glues to the row before it when a selection is copied
+    /// (see the enum docs in `markdown_render`).  The selection extraction
+    /// uses this to rejoin wrapped continuations into the original text
+    /// instead of reproducing the renderer's line breaks.
+    pub joins: Arc<[LineJoin]>,
     /// Display-column range `(start, end)` of each line's meaningful content,
     /// aligned with `lines` — see [`RenderedTurnLines::content_ranges`].
     /// Mouse selection clamps its highlight and its copy to these ranges so
@@ -705,12 +711,14 @@ pub(crate) fn cached_or_compute_lines(
 
     let rendered = compute();
     let lines: Arc<[Line<'static>]> = Arc::from(rendered.lines);
+    let joins: Arc<[LineJoin]> = Arc::from(rendered.joins);
     let content_ranges: Arc<[Option<(usize, usize)>]> = Arc::from(rendered.content_ranges);
     let visual_offsets = compute_visual_offsets(&lines, key.viewport_width);
     // Pin the parallel-array invariant the selection machinery relies on:
     // every rendered line must carry a content range (`None` marks
-    // pure-chrome rows) and a cumulative visual-row offset.  A mismatch here
-    // is a programming error in the renderer, not a runtime condition.
+    // pure-chrome rows), a cumulative visual-row offset, and a copy-join
+    // record.  A mismatch here is a programming error in the renderer, not
+    // a runtime condition.
     debug_assert_eq!(
         content_ranges.len(),
         lines.len(),
@@ -721,10 +729,12 @@ pub(crate) fn cached_or_compute_lines(
         lines.len(),
         "visual offsets must stay aligned with the rendered lines"
     );
+    debug_assert_eq!(joins.len(), lines.len(), "joins must align with the lines");
     let turn = RenderedTurn {
         height: lines_height(&lines, key.viewport_width).max(1),
         visual_offsets,
         lines,
+        joins,
         content_ranges,
         reasoning_header_idx: rendered.reasoning_header_idx,
         tool_result_header_idxs: rendered.tool_result_header_idxs,
@@ -3771,6 +3781,7 @@ impl SessionDisplayState {
             let text_height = lines_height(&text_lines, viewport.width).max(1);
             let visual_offsets = compute_visual_offsets(&text_lines, viewport.width);
             let content_ranges = Arc::from(rendered.content_ranges);
+            let joins = Arc::from(rendered.joins);
 
             // Keep the reasoning header's click-hit range and the precomputed
             // default in sync as the response streams — the header sits below
@@ -3816,6 +3827,7 @@ impl SessionDisplayState {
                     lines: Arc::from(text_lines),
                     height: text_height,
                     visual_offsets,
+                    joins,
                     content_ranges,
                     reasoning_header_idx: rendered.reasoning_header_idx,
                     tool_result_header_idxs: rendered.tool_result_header_idxs,
@@ -5982,6 +5994,7 @@ mod tests {
                 lines: Arc::from(vec![Line::from("stale")]),
                 height: 1,
                 visual_offsets: Arc::from([1]),
+                joins: Arc::from([]),
                 content_ranges: Arc::from([]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![],
@@ -6232,6 +6245,7 @@ mod tests {
                 lines: Arc::from(vec![Line::from("stale")]),
                 height: 1,
                 visual_offsets: Arc::from([1]),
+                joins: Arc::from([]),
                 content_ranges: Arc::from([]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![0],
@@ -6960,6 +6974,7 @@ mod tests {
                     lines: Arc::from(Vec::<Line<'static>>::new()),
                     height: 0,
                     visual_offsets: Arc::from([]),
+                    joins: Arc::from([]),
                     content_ranges: Arc::from([]),
                     reasoning_header_idx: None,
                     tool_result_header_idxs: vec![],
@@ -7009,6 +7024,7 @@ mod tests {
                     lines: Arc::from(Vec::<Line<'static>>::new()),
                     height: 0,
                     visual_offsets: Arc::from([]),
+                    joins: Arc::from([]),
                     content_ranges: Arc::from([]),
                     reasoning_header_idx: None,
                     tool_result_header_idxs: vec![],

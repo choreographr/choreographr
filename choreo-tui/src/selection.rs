@@ -27,6 +27,7 @@
 //! semantic line occupies exactly one visual row; the code still walks the
 //! cached `visual_offsets` so a hypothetical multi-row line maps correctly.
 
+use crate::markdown_render::LineJoin;
 use crate::state::{App, RenderedTurn, SessionDisplayState, grapheme_offset_at_column};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::style::Color;
@@ -321,36 +322,95 @@ pub(crate) fn handle_selection_mouse(app: &mut App, mouse: &MouseEvent) -> Optio
 /// Content lines are resolved one at a time through the height prefix + the
 /// render cache.  Lines that resolve to no copyable content — pure-chrome
 /// rows, image blocks, lines past the end — are skipped, so the copyable
-/// region is exactly the region the highlight covers.
+/// region is exactly the region the highlight covers.  Consecutive rows that
+/// are wrapped continuations of one original line (marked by the renderer's
+/// per-line [`LineJoin`] metadata) are glued back together, so copying a
+/// selected paragraph yields the original unwrapped text, not the display's
+/// line-wrapped rows.
 fn extract_selection_text(app: &App) -> Option<String> {
     let (anchor, head) = selection_range(app)?;
     let display = app.active_display_ref()?;
     let vp_width = app.history_viewport.width as usize;
     let (start_line, end_line) = (anchor.0.min(head.0), anchor.0.max(head.0));
-    let mut out = String::new();
+
+    // Collect one slot per selected row: its text, the [`LineJoin`] the row
+    // was recorded with (how it glues to the row before it), and its
+    // (turn_idx, line_idx) so adjacency can be checked across turns.  Rows
+    // with no copyable content (chrome, blank spacers) contribute no slot;
+    // the gap between two non-adjacent slots is a break.
+    let mut slots: Vec<(String, LineJoin, usize, usize)> = Vec::new();
     // Iterate the selection's *content* lines directly — no screen mapping,
     // which is exactly why the selection survives scrolling (the endpoints
     // are content-anchored, so this is scroll-independent).
     for content_line in start_line..=end_line {
         let (col_lo, col_hi) = selection_bounds_for_line(anchor, head, content_line);
-        if let Some(text) = text_for_content_line(display, vp_width, content_line, col_lo, col_hi) {
-            if !out.is_empty() {
-                out.push('\n');
+        if let Some((text, join, turn_idx, line_idx)) =
+            text_and_join_for_content_line(display, vp_width, content_line, col_lo, col_hi)
+        {
+            slots.push((text, join, turn_idx, line_idx));
+        }
+    }
+
+    // Assemble the slots.  Each slot's join metadata says how the text glued
+    // to its immediate predecessor when the renderer wrapped the original
+    // line — except when the two slots are rows of the *same* semantic line
+    // split across viewport rows (never in practice: content is pre-wrapped
+    // narrower than the viewport), which always concatenate directly.
+    let mut out = String::new();
+    for (i, (text, join, turn_idx, line_idx)) in slots.iter().enumerate() {
+        if i == 0 {
+            out.push_str(text);
+            continue;
+        }
+        let (_, _, prev_turn, prev_line) = slots[i - 1];
+        let join = if prev_turn == *turn_idx && prev_line == *line_idx {
+            // Same semantic line across two viewport rows — contiguous text.
+            LineJoin::Join
+        } else {
+            *join
+        };
+        match join {
+            LineJoin::Break => out.push('\n'),
+            LineJoin::Space => {
+                // A word-boundary wrap: the reflow consumed the separating
+                // whitespace.  Re-insert exactly one space, trimming any
+                // whitespace the renderer left at the seam first (some
+                // wrappers keep a placeholder space on the row, others drop
+                // it — trim+insert handles both).  Indentation padding that
+                // the renderer prepends to continuation rows (list items) is
+                // alignment chrome, not text, so it is trimmed away too.
+                let trimmed = out.trim_end().len();
+                out.truncate(trimmed);
+                out.push(' ');
             }
-            out.push_str(&text);
+            LineJoin::Join => {
+                // Direct concatenation — whitespace (if any) is already where
+                // it belongs within the rows (plain-text wraps keep their
+                // whitespace on the previous row; hard splits have none).
+            }
+        }
+        if matches!(join, LineJoin::Space) {
+            out.push_str(text.trim_start());
+        } else {
+            out.push_str(text);
         }
     }
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// Resolve one content line of the selection to the text slice it covers.
-fn text_for_content_line(
+/// Resolve one content line of the selection to the text slice it covers and
+/// the copy-join metadata recorded for its rendered row.
+///
+/// Returns `(text, join, turn_idx, line_idx)` where `join` is the row's
+/// [`LineJoin`] (how it glues to the row *before* it) and `(turn_idx,
+/// line_idx)` locates the row in the render cache for adjacency checks.
+fn text_and_join_for_content_line(
     display: &SessionDisplayState,
     vp_width: usize,
     content_line: usize,
     col_start: usize,
     col_end: usize,
-) -> Option<String> {
+) -> Option<(String, LineJoin, usize, usize)> {
     // Map the global content line to a visible turn and the turn-local
     // visual row — the inverse of `find_turn_at_row`'s screen mapping (the
     // height prefix is the same cumulative array that function binary
@@ -376,7 +436,17 @@ fn text_for_content_line(
         col_end,
         vp_width,
     )?;
-    Some(slice_line_columns(&rendered.lines[line_idx], lo, hi))
+    let join = rendered
+        .joins
+        .get(line_idx)
+        .copied()
+        .unwrap_or(LineJoin::Break);
+    Some((
+        slice_line_columns(&rendered.lines[line_idx], lo, hi),
+        join,
+        turn_idx,
+        line_idx,
+    ))
 }
 
 /// Resolve a turn-local visual row and viewport column range to the
