@@ -234,6 +234,26 @@ pub fn all_display_names() -> Vec<String> {
         .collect()
 }
 
+/// Find which provider in the catalog owns a given model id (exact match on
+/// the model's name).
+///
+/// This is the catalog's source of truth for the model→provider mapping
+/// (ingested from models.dev + the overlay), so a caller that only has a model
+/// id — e.g. a diagnostic with no recorded producer — can resolve its provider
+/// without re-implementing name-prefix heuristics here that would inevitably
+/// drift from the catalog and guess the wrong slug.
+///
+/// Returns `None` when the model id is not known to any provider; the caller
+/// should treat that as "provider unresolvable" rather than guessing a slug
+/// that would feed a wrong `model_reasoning_passback` / `requires_reasoning_content`.
+pub fn provider_slug_for_model(model: &str) -> Option<String> {
+    let catalog = PROVIDER_CATALOG.load();
+    catalog
+        .iter()
+        .find(|e| e.models.iter().any(|m| m.model == model))
+        .map(|e| e.slug.clone())
+}
+
 /// Compute the reasoning capability for a given model on a given provider.
 /// Falls back to protocol defaults for unknown models (best-effort
 /// compatibility with new/untracked models).
@@ -1021,6 +1041,38 @@ mod tests {
         // self-documenting about returning the global to its initial state.
         replace_catalog(bundled.to_vec());
         assert!(lookup_provider("openai").is_some());
+    }
+
+    #[test]
+    fn provider_slug_for_model_resolves_owner_and_unknown_is_none() {
+        // A known model id resolves to the provider that owns it (exact match).
+        // Pick a real id out of the bundled catalog rather than hardcoding a
+        // slug, so the assertion tracks the catalog instead of the test.
+        let _restore = RestoreBundledOnDrop;
+        let bundled = catalog_snapshot();
+        let (slug, model) = bundled
+            .iter()
+            .find_map(|e| e.models.first().map(|m| (e.slug.clone(), m.model.clone())))
+            .expect("bundled catalog has at least one provider with models");
+        assert_eq!(
+            provider_slug_for_model(&model).as_deref(),
+            Some(slug.as_str())
+        );
+
+        // The swap is visible to the new lookup through the same process-global.
+        replace_catalog(tiny_catalog());
+        assert_eq!(
+            provider_slug_for_model("tiny-model").as_deref(),
+            Some("tiny-test")
+        );
+        assert!(
+            provider_slug_for_model("gpt-4o").is_none(),
+            "tiny catalog has no gpt-4o"
+        );
+
+        // An id no provider knows is None — never a guessed slug.
+        replace_catalog(bundled.to_vec());
+        assert_eq!(provider_slug_for_model("no_such_model_exists_xyz"), None);
     }
 
     #[test]

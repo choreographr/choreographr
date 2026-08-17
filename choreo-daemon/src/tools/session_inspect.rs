@@ -31,7 +31,8 @@ use crate::sessions::SessionState;
 use crate::tools::Tool;
 use crate::tools::context::ToolContext;
 use choreo_ai_protocols::{
-    ReasoningPassback, model_reasoning_passback, requires_reasoning_content,
+    ReasoningPassback, model_reasoning_passback, provider_slug_for_model,
+    requires_reasoning_content,
 };
 use choreo_proto::{ChatReasoningField, ReasoningArtifact, ReasoningProducer, Turn};
 use schemars::JsonSchema;
@@ -55,7 +56,8 @@ pub struct SessionInspectArgs {
     pub session_id: Option<u64>,
     /// Provider slug used to resolve the reasoning-passback policy and the
     /// same-model provenance check. Defaults to the most common slug recorded
-    /// on the session's own turns, then to a model-name-prefix inference.
+    /// on the session's own turns, then to the catalog's model→provider
+    /// mapping.
     #[serde(default)]
     pub provider: Option<String>,
     /// Model used to resolve the passback policy and the provenance check.
@@ -128,9 +130,10 @@ impl Tool for SessionInspect {
 /// Build the full diagnostic report for `session_id`.
 ///
 /// The (provider, model) pair is resolved "explicit arg wins, then recorded
-/// session state, then inference" so the report is reproducible with a known
-/// policy even when the session's own data is ambiguous; the report states
-/// which source won so a wrong-looking passback is immediately attributable.
+/// session state, then the catalog's model→provider mapping" so the report is
+/// reproducible with a known policy even when the session's own data is
+/// ambiguous; the report states which source won so a wrong-looking passback
+/// is immediately attributable.
 fn build_report(
     ctx: &ToolContext,
     session_id: u64,
@@ -151,7 +154,7 @@ fn build_report(
     // "deepseek" (e.g. an opencode-style gateway account).
     let dominant_producer = dominant_producer(&turns);
 
-    // Model first; the provider inference needs it.
+    // Model first; the provider lookup needs it.
     let (model, model_source) = match args.model.clone() {
         Some(m) => (m, "arg".to_string()),
         None => match record.selected_model.clone() {
@@ -166,14 +169,13 @@ fn build_report(
         Some(p) => (p, "arg".to_string()),
         None => match dominant_producer.as_ref().map(|p| p.provider_slug.clone()) {
             Some(slug) if !slug.is_empty() => (slug, "dominant-producer".to_string()),
-            _ => {
-                let inferred = infer_provider(&model);
-                if inferred == "unknown" {
-                    (inferred.to_string(), "unresolved".to_string())
-                } else {
-                    (inferred.to_string(), "model-prefix".to_string())
-                }
-            }
+            _ => match provider_slug_for_model(&model) {
+                Some(slug) => (slug, "catalog".to_string()),
+                // The model is unknown to the catalog; report it as
+                // unresolvable rather than guessing a slug that would feed a
+                // wrong passback/reasoning_content policy.
+                None => ("unknown".to_string(), "unresolved".to_string()),
+            },
         },
     };
     if model.is_empty() {
@@ -477,32 +479,6 @@ fn dominant_producer(turns: &BTreeMap<u32, Turn>) -> Option<ReasoningProducer> {
             provider_slug,
             model,
         })
-}
-
-/// Best-effort provider slug from the model's name for the `passback` policy
-/// lookup — only used when a session stores no producer at all.
-fn infer_provider(model: &str) -> &'static str {
-    let m = model.trim().to_ascii_lowercase();
-    if m.contains("deepseek") {
-        "deepseek"
-    } else if m.contains("claude") || m.starts_with("op") {
-        "anthropic"
-    } else if m.contains("gemini") {
-        "google"
-    } else if m.contains("grok") {
-        "xai"
-    } else if m.contains("kimi") {
-        "kimi"
-    } else if m.starts_with("gpt-")
-        || m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("o4")
-        || m.starts_with("o5")
-    {
-        "openai"
-    } else {
-        "unknown"
-    }
 }
 
 /// Compact artifact descriptor for the ledger: variant tag + wire field (for
