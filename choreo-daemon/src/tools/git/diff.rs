@@ -35,6 +35,7 @@ pub fn execute_git_diff_tool(
     let output = git_diff_impl(
         args.repo_path.as_deref(),
         args.cached.unwrap_or(false),
+        true,
         pathspec,
         working_dir,
     )?;
@@ -46,9 +47,16 @@ pub fn execute_git_diff_tool(
 /// When `cached` is true, compares HEAD↔index (staged changes).
 /// When `cached` is false, compares index↔worktree (unstaged changes).
 /// Added files diff against an empty string; deleted files diff against HEAD content.
+///
+/// `include_header` controls the two-line `repository:`/`mode:` preamble: the
+/// standalone git_diff tool emits it, while git_add embeds this output under
+/// its own summary (which already prints `repository:`, `head:`,
+/// `staged_paths:`, `index_changed:`) and passes `false` to avoid duplicating
+/// `repository:` and leaking a `mode: staged` line into the result.
 pub(crate) fn git_diff_impl(
     repo_path: Option<&str>,
     cached: bool,
+    include_header: bool,
     mut pathspec: Vec<String>,
     working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
@@ -76,13 +84,18 @@ pub(crate) fn git_diff_impl(
     let workdir = repo_work_dir_display(&repo);
 
     let mut out = String::new();
-    writeln!(&mut out, "repository: {workdir}").ok();
-    writeln!(
-        &mut out,
-        "mode: {}",
-        if cached { "staged" } else { "working tree" }
-    )
-    .ok();
+    // Only the standalone git_diff tool emits the header; embedded consumers
+    // (git_add) print their own summary lines, so skipping it avoids
+    // duplicating `repository:` and leaking the mode line.
+    if include_header {
+        writeln!(&mut out, "repository: {workdir}").ok();
+        writeln!(
+            &mut out,
+            "mode: {}",
+            if cached { "staged" } else { "working tree" }
+        )
+        .ok();
+    }
 
     let mut has_changes = false;
 

@@ -117,6 +117,11 @@ fn diff_working_tree() {
     )
     .unwrap_or_default();
     assert!(worktree.contains("+modified"), "{}", worktree);
+    // The diff must arrive fenced (````diff` block, closed) so the TUI's
+    // markdown renderer treats the `---`/`+++` lines as code, not headings.
+    assert!(worktree.contains("```diff\n"), "{}", worktree);
+    assert!(worktree.contains("diff --git a/"), "{}", worktree);
+    assert!(worktree.contains("\n```"), "{}", worktree);
 }
 
 #[test]
@@ -139,6 +144,11 @@ fn diff_cached() {
     )
     .unwrap_or_default();
     assert!(cached.contains("+modified"), "{}", cached);
+    // Staged diffs are fenced too (````diff` block, closed) — same contract as
+    // the working-tree diff.
+    assert!(cached.contains("```diff\n"), "{}", cached);
+    assert!(cached.contains("diff --git a/"), "{}", cached);
+    assert!(cached.contains("\n```"), "{}", cached);
 }
 
 #[test]
@@ -170,14 +180,24 @@ fn add_and_commit() {
     let added = "new.txt";
     std::fs::write(repo.join(added), "content").unwrap();
 
-    execute_git_add_tool(
+    let added_result = execute_git_add_tool(
         &GitAddArgs {
             repo_path: repo_path_arg(&repo),
             pathspec: vec![added.into()],
         },
         None,
     )
-    .unwrap();
+    .unwrap_or_default();
+    // git_add embeds the staged diff under its own summary; the diff must be
+    // fenced and `repository:` must appear exactly once — git_add prints it
+    // itself and the embedded diff must not repeat it (the header dedup).
+    assert!(added_result.contains("```diff"), "{}", added_result);
+    assert_eq!(
+        added_result.matches("repository:").count(),
+        1,
+        "{}",
+        added_result
+    );
 
     let result = execute_git_commit_tool(
         &GitCommitArgs {
@@ -371,12 +391,15 @@ fn show_commit_diff_skips_directory_entries() {
 
 #[test]
 #[ignore]
-fn show_commit_message_is_not_indented() {
-    // git_show output is parsed as markdown in the TUI (see the renderer's
-    // MARKDOWN_TOOLS), so the commit message must be emitted unindented: a
-    // 4-space indent would be read as a CommonMark indented code block and
-    // the TUI would wrap the whole message in a literal ``` box. This pins
-    // the daemon-side half of that contract.
+fn show_commit_message_is_fenced_and_verbatim() {
+    // git_show results are markdown-parsed in the TUI (see the renderer's
+    // MARKDOWN_TOOLS), so the commit message — untrusted repo data — must be
+    // emitted verbatim inside a ```-fenced code block. A bare message could be
+    // re-interpreted: `--`/`#` would be mangled by smart punctuation or read
+    // as a comment, and a message containing a ```diff fence would render as a
+    // fake diff. This pins the daemon-side half of that contract: the fence
+    // opens before the subject and the message bytes (including `--` and `#`)
+    // survive unchanged, with the body on consecutive lines.
     let repo = init_repo();
     std::fs::write(repo.join("a.txt"), "a").unwrap();
     git(&repo, &["add", "a.txt"]);
@@ -385,7 +408,7 @@ fn show_commit_message_is_not_indented() {
         &[
             "commit",
             "-m",
-            "subject line",
+            "subject --dry-run #1",
             "-m",
             "body line one\nbody line two",
         ],
@@ -402,9 +425,19 @@ fn show_commit_message_is_not_indented() {
     )
     .unwrap_or_default();
 
-    assert!(result.contains("subject line"), "{}", result);
+    // The message is fenced: the opening ``` fence directly precedes the
+    // subject (no markdown-visible prefix line inside the block).
+    assert!(result.contains("\n```\nsubject"), "{}", result);
+    // Markdown-hostile characters survive byte-for-byte.
+    assert!(result.contains("subject --dry-run #1"), "{}", result);
+    // Multi-paragraph messages keep their lines, consecutively.
     assert!(result.contains("body line one"), "{}", result);
     assert!(result.contains("body line two"), "{}", result);
+    assert!(
+        result.contains("body line one\nbody line two"),
+        "{}",
+        result
+    );
     // The old 4-space-indented form must not come back.
-    assert!(!result.contains("\n    subject line"), "{}", result);
+    assert!(!result.contains("\n    subject"), "{}", result);
 }

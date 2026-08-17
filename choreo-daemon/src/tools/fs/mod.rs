@@ -57,6 +57,34 @@ fn write_text_file(path: &Path, content: &str, overwrite: bool) -> io::Result<()
     atomic_write_text_file(path, content)
 }
 
+/// Wrap content in a fenced code block, choosing a fence wide enough that
+/// content containing backticks cannot close it early.
+///
+/// Shared by write_file, git_show's commit/tag messages, and show_blob:
+/// all of them emit untrusted data (file contents, commit/tag messages)
+/// verbatim inside a fence so a markdown-parsing client (the TUI'S
+/// MARKDOWN_TOOLS renderer) cannot re-interpret the enclosed bytes.
+pub(crate) fn fence_content(content: &str, lang: &str) -> String {
+    // Strip trailing newlines so the closing fence sits directly after the
+    // last line of content, avoiding a blank line before the fence.
+    let trimmed = content.trim_end_matches('\n');
+    let max_run = trimmed
+        .chars()
+        .fold((0usize, 0usize), |(max_run, current), c| {
+            if c == '`' {
+                (max_run.max(current + 1), current + 1)
+            } else {
+                (max_run, 0)
+            }
+        })
+        .0;
+    // A fence one backtick longer than the longest run inside the content can
+    // never be matched by an interior run, so the block cannot close early.
+    let fence_len = (max_run + 1).max(3);
+    let fence = "`".repeat(fence_len);
+    format!("{fence}{lang}\n{trimmed}\n{fence}")
+}
+
 fn atomic_write_text_file(path: &Path, content: &str) -> io::Result<()> {
     // Resolve symlinks before the swap: persisting the temp file over a
     // symlink would replace the link itself with a regular file, while
@@ -99,4 +127,57 @@ fn atomic_write_text_file(path: &Path, content: &str) -> io::Result<()> {
     debug!(path = %target.display(), preserved_mode, "atomic write: replacing file");
     tmp.persist(&target).map_err(|e| e.error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // ── fence_content tests ──────────────────────────────────────────
+
+    #[test]
+    fn fence_content_basic() {
+        let result = super::fence_content("hello", "rust");
+        assert_eq!(result, "```rust\nhello\n```");
+    }
+
+    #[test]
+    fn fence_content_no_lang() {
+        let result = super::fence_content("plain text", "");
+        assert_eq!(result, "```\nplain text\n```");
+    }
+
+    #[test]
+    fn fence_content_with_backticks() {
+        let result = super::fence_content("`code`", "text");
+        // Content contains a single backtick, so fence must be at least 2 wide.
+        assert!(result.starts_with("``"));
+        assert!(result.ends_with("``"));
+        assert!(result.contains("`code`"));
+    }
+
+    #[test]
+    fn fence_content_triple_backticks() {
+        let result = super::fence_content("```\ncode\n```", "text");
+        // Content contains 3 consecutive backticks, so fence must be at least 4 wide.
+        assert!(result.starts_with("````"));
+        assert!(result.ends_with("````"));
+    }
+
+    #[test]
+    fn fence_content_empty_content() {
+        let result = super::fence_content("", "json");
+        assert_eq!(result, "```json\n\n```");
+    }
+
+    #[test]
+    fn fence_content_trailing_newline_stripped() {
+        let result = super::fence_content("hello\n", "text");
+        // Should not have a blank line before the closing fence.
+        assert_eq!(result, "```text\nhello\n```");
+    }
+
+    #[test]
+    fn fence_content_multiple_trailing_newlines_stripped() {
+        let result = super::fence_content("a\nb\n\n", "text");
+        assert_eq!(result, "```text\na\nb\n```");
+    }
 }

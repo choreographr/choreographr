@@ -90,7 +90,12 @@ fn git_add_impl(
         if changed { "yes" } else { "no" }
     )
     .ok();
-    let diff = super::diff::git_diff_impl(repo_path, true, effective_pathspec, working_dir)?;
+    // Embed the staged diff below our own summary. include_header=false:
+    // git_add already prints `repository:` (and its own head/staged_paths/
+    // index_changed lines), so the embedded output must carry only the
+    // per-file ```diff fences — otherwise `repository:` would appear twice
+    // and a `mode: staged` line would leak into the result.
+    let diff = super::diff::git_diff_impl(repo_path, true, false, effective_pathspec, working_dir)?;
     writeln!(&mut out).ok();
     writeln!(&mut out, "{diff}").ok();
     Ok(out.trim_end().to_string())

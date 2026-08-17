@@ -177,15 +177,18 @@ fn show_commit(
     writeln!(out, "Head:     {head_desc}").ok();
     writeln!(out).ok();
 
-    // Full commit message. Emitted unindented: git_show results are parsed
-    // as markdown by the TUI (see MARKDOWN_TOOLS), and a 4-space indent
-    // would be read as a CommonMark indented code block — the TUI would
-    // wrap the whole message in a literal ``` box. Plain lines render as
-    // paragraph rows whose soft breaks stay separate lines on copy.
-    let message = decoded.message;
-    for line in message.lines() {
-        let s = String::from_utf8_lossy(line);
-        writeln!(out, "{s}").ok();
+    // Full commit message, emitted verbatim inside a fenced code block. The
+    // message is untrusted repo data, not daemon-authored markdown: git_show
+    // results are markdown-parsed by the TUI (see MARKDOWN_TOOLS), so a bare
+    // message would be re-interpreted — a heading or list line would restyle
+    // output, smart punctuation would mangle `--`, and a message containing a
+    // ```diff fence would render as a fake diff. Fencing it (with a fence
+    // sized so message backticks cannot close it early) preserves the bytes
+    // exactly. An empty/whitespace message emits nothing — no empty block.
+    let message = String::from_utf8_lossy(decoded.message);
+    if !message.trim().is_empty() {
+        out.push('\n');
+        out.push_str(&crate::tools::fs::fence_content(&message, ""));
     }
 
     // Optionally generate and append the diff
@@ -416,12 +419,10 @@ fn show_blob(object: &gix::Object<'_>, path_hint: Option<&str>) -> Result<String
     if is_binary_content(&content) {
         writeln!(out, "<binary blob: {} bytes>", blob.data.len()).ok();
     } else {
-        writeln!(out, "```{lang}").ok();
-        out.push_str(&content);
-        if !content.ends_with('\n') {
-            writeln!(out).ok();
-        }
-        writeln!(out, "```").ok();
+        // Fence via the shared helper: it sizes the fence so blob content
+        // containing backticks (e.g. a literal ``` line) cannot close the
+        // block early, which the old fixed-width ``` fence allowed.
+        out.push_str(&crate::tools::fs::fence_content(&content, lang));
     }
 
     Ok(out.trim_end().to_string())
@@ -456,13 +457,17 @@ fn show_tag(repo: &gix::Repository, object: &gix::Object<'_>) -> Result<String, 
     }
     writeln!(out).ok();
 
-    // Tag message, unindented for the same reason as the commit message
-    // above: git_show output is markdown-parsed in the TUI, and a 4-space
-    // indent would render as a literal ```-boxed CommonMark code block.
-    let message = decoded.message;
-    for line in message.lines() {
-        let s = String::from_utf8_lossy(line);
-        writeln!(out, "{s}").ok();
+    // Tag message, emitted verbatim inside a fenced code block for the same
+    // reason as the commit message above: the message is untrusted repo data
+    // inside a markdown-parsed git_show result, so a bare message could be
+    // re-interpreted (headings, lists, `--` smart-punctuation mangling, a
+    // spoofed ```diff fence). Fencing it — fence sized so message backticks
+    // cannot close it early — preserves the bytes exactly. An empty/whitespace
+    // message emits nothing — no empty block.
+    let message = String::from_utf8_lossy(decoded.message);
+    if !message.trim().is_empty() {
+        out.push('\n');
+        out.push_str(&crate::tools::fs::fence_content(&message, ""));
     }
 
     // Recurse into the tagged object

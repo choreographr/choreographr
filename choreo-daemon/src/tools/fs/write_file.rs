@@ -29,7 +29,7 @@ pub fn execute_write_file_tool(
         Ok(()) => {
             info!(path = %resolved.display(), bytes = args.content.len(), "write_file: wrote file");
             let lang = ext_to_lang(&resolved.display().to_string());
-            let fenced = fence_content(&args.content, lang);
+            let fenced = super::fence_content(&args.content, lang);
             Ok(format!("wrote file: {}\n\n{}", resolved.display(), fenced))
         }
         Err(error) => {
@@ -89,25 +89,6 @@ fn ext_to_lang(path: &str) -> &'static str {
         "proto" => "protobuf",
         _ => "",
     }
-}
-
-fn fence_content(content: &str, lang: &str) -> String {
-    // Strip trailing newlines so the closing fence sits directly after the
-    // last line of content, avoiding a blank line before the fence.
-    let trimmed = content.trim_end_matches('\n');
-    let max_run = trimmed
-        .chars()
-        .fold((0usize, 0usize), |(max_run, current), c| {
-            if c == '`' {
-                (max_run.max(current + 1), current + 1)
-            } else {
-                (max_run, 0)
-            }
-        })
-        .0;
-    let fence_len = (max_run + 1).max(3);
-    let fence = "`".repeat(fence_len);
-    format!("{fence}{lang}\n{trimmed}\n{fence}")
 }
 
 pub fn describe_write_file_invocation(args: &WriteFileArgs) -> String {
@@ -222,55 +203,5 @@ mod tests {
     fn ext_to_lang_yaml() {
         assert_eq!(super::ext_to_lang("config.yaml"), "yaml");
         assert_eq!(super::ext_to_lang("config.yml"), "yaml");
-    }
-
-    // ── fence_content tests ──────────────────────────────────────────
-
-    #[test]
-    fn fence_content_basic() {
-        let result = super::fence_content("hello", "rust");
-        assert_eq!(result, "```rust\nhello\n```");
-    }
-
-    #[test]
-    fn fence_content_no_lang() {
-        let result = super::fence_content("plain text", "");
-        assert_eq!(result, "```\nplain text\n```");
-    }
-
-    #[test]
-    fn fence_content_with_backticks() {
-        let result = super::fence_content("`code`", "text");
-        // Content contains a single backtick, so fence must be at least 2 wide.
-        assert!(result.starts_with("``"));
-        assert!(result.ends_with("``"));
-        assert!(result.contains("`code`"));
-    }
-
-    #[test]
-    fn fence_content_triple_backticks() {
-        let result = super::fence_content("```\ncode\n```", "text");
-        // Content contains 3 consecutive backticks, so fence must be at least 4 wide.
-        assert!(result.starts_with("````"));
-        assert!(result.ends_with("````"));
-    }
-
-    #[test]
-    fn fence_content_empty_content() {
-        let result = super::fence_content("", "json");
-        assert_eq!(result, "```json\n\n```");
-    }
-
-    #[test]
-    fn fence_content_trailing_newline_stripped() {
-        let result = super::fence_content("hello\n", "text");
-        // Should not have a blank line before the closing fence.
-        assert_eq!(result, "```text\nhello\n```");
-    }
-
-    #[test]
-    fn fence_content_multiple_trailing_newlines_stripped() {
-        let result = super::fence_content("a\nb\n\n", "text");
-        assert_eq!(result, "```text\na\nb\n```");
     }
 }
