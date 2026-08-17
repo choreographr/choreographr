@@ -257,7 +257,6 @@ fn build_report(
         let echo = if !has_assistant_msg {
             "n/a".to_string()
         } else if wire_echo {
-            ledger_echo_count += 1;
             "yes".to_string()
         } else if !same_model {
             "no:producer-mismatch".to_string()
@@ -303,13 +302,25 @@ fn build_report(
             ));
         }
 
+        // Wire-parity counters (vs. the serialized-message dry-run below):
+        // the builder skips `undone` turns entirely, so only non-undone turns
+        // produce a message on the wire and count toward the parity check —
+        // otherwise any undone turn with an artifact/tool call would make the
+        // ledger and the wire tallies disagree on sessions containing undos.
+        if !turn.undone {
+            if wire_echo {
+                ledger_echo_count += 1;
+            } else if has_assistant_msg && !turn.tool_calls.is_empty() {
+                ledger_tool_no_echo += 1;
+            }
+        }
+
         // Risk classification: "risk" means there is evidence the model
         // reasoned here (artifact bytes or displayed reasoning text) yet the
         // wire will omit the echo on a tool-call turn — exactly the shape
         // DeepSeek/Kimi reject with a `reasoning_content` 400.
         if has_assistant_msg && !turn.tool_calls.is_empty() && !wire_echo {
             if turn.reasoning_artifact.is_some() || turn.assistant_reasoning.is_some() {
-                ledger_tool_no_echo += 1;
                 risks.push(format!(
                     "  t{turn_id}: {echo} (user: {})",
                     own_preview(turn.user_text.as_deref(), own_session),
@@ -672,6 +683,30 @@ mod tests {
         assert!(out.contains("ledger vs wire: OK"), "{out}");
         // The daemon's own guard must flag the one bare tool turn too.
         assert!(out.contains("1 problem(s)"), "{out}");
+    }
+
+    #[test]
+    fn tool_turn_without_any_reasoning_still_counts_toward_wire_parity() {
+        // A tool turn with neither an artifact nor displayed reasoning (see
+        // the opencode-go/deepseek-v4-flash incident: tool calls streamed with
+        // no reasoning at all). It is sent bare on the wire, so the ledger's
+        // tool-no-echo counter must include it — otherwise the ledger-vs-wire
+        // cross-check reports MISMATCH even though the wire dry-run is exact.
+        let (_dir, ctx) = seed(
+            42,
+            42,
+            "deepseek-v4-flash",
+            vec![(0, tool_turn("c1", "exec", None, Some(ds_producer()), None))],
+        );
+        let out = run(&ctx, inspect_args(None));
+        assert!(out.contains("echo=no:no-artifact"), "{out}");
+        assert!(
+            out.contains("NOTE (tool calls with no reasoning evidence"),
+            "{out}"
+        );
+        // Both the ledger and the wire must count this one bare tool message
+        // (and the echoed-message total must agree too) → parity OK.
+        assert!(out.contains("ledger vs wire: OK"), "{out}");
     }
 
     #[test]
