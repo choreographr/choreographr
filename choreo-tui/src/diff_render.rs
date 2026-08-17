@@ -22,23 +22,17 @@ const ADD_BG: Color = Color::Rgb(0, 80, 0);
 
 // ── Detection ────────────────────────────────────────────────────────
 
-/// Check if text looks like a unified diff.
+/// Check if text looks like raw unified-diff content.
 ///
-/// Detects both raw unified diff headers and markdown-fenced diff blocks
-/// (```` ```diff ```` / ```` ``` ````).  When looking for `diff --git` the match
-/// must occur at a **line boundary** rather than anywhere in the string, so
-/// that content inside other kinds of markdown code blocks (e.g. file contents
-/// displayed by `write_file`) won't trigger a false positive.
-///
-/// This is now only ever consulted on the **interior** of a ` ```diff ` fence
-/// already recognised by the markdown renderer (see
-/// [`try_render_diff_content`]) — the raw-signal sniffs are opt-in gates for
-/// fence interiors, never whole tool outputs.
+/// Sniffs raw unified diff headers only: `diff --git ` at a line boundary or a
+/// `--- ` path/header line. There is no fenced-diff check here — this function
+/// is only ever consulted on the **interior** of a ` ```diff ` fence already
+/// recognised by the markdown renderer (see [`try_render_diff_content`]), so
+/// the ```` ```diff ```` markers can never appear and would be dead signal.
+/// The match must occur at a **line boundary** rather than anywhere in the
+/// string, so that content inside other kinds of markdown code blocks (e.g.
+/// file contents displayed by `write_file`) won't trigger a false positive.
 pub fn is_diff_text(text: &str) -> bool {
-    // Explicit fenced diff block
-    if text.contains("\n```diff\n") || text.starts_with("```diff\n") {
-        return true;
-    }
     // Raw unified diff header at line start
     text.starts_with("diff --git ") || text.contains("\ndiff --git ")
     // `--- a/` / `--- /dev/` style path headers (part of unified diff)
@@ -484,7 +478,10 @@ fn render_unified(diffs: &[FileDiff], total_width: usize) -> Vec<Line<'static>> 
 /// `markdown_render::render_markdown_block`), which is in turn reachable only
 /// through the markdown allowlist for tool results (`MARKDOWN_TOOLS`).
 /// Returns `None` when the text is not recognised as a diff, allowing the
-/// caller to fall through to its generic code-block rendering.
+/// caller to fall through to its generic code-block rendering. An interior
+/// that sniffs as a diff but renders to zero lines also returns `None`, so an
+/// unparseable interior falls back to the literal fence instead of silently
+/// vanishing.
 pub fn try_render_diff_content(diff_text: &str, width: u16) -> Option<Vec<Line<'static>>> {
     if !is_diff_text(diff_text) {
         return None;
@@ -492,6 +489,16 @@ pub fn try_render_diff_content(diff_text: &str, width: u16) -> Option<Vec<Line<'
     let diffs = parse_diff(diff_text);
     if diffs.is_empty() {
         debug!("detected diff header but parse produced zero files — malformed?");
+        return None;
+    }
+    // A sniffed interior must still have real hunk structure to be worth
+    // rendering. A lone `--- ` line (e.g. `--- just some text`) parses into a
+    // file with zero hunks: the pane builders would emit only a single
+    // nonsense header row. Fail closed so the caller falls back to the
+    // literal code block instead of showing a mangled one-row "diff".
+    let has_hunks = diffs.iter().any(|file| !file.hunks.is_empty());
+    if !has_hunks {
+        debug!("detected diff header but zero hunks — not a real diff; falling back");
         return None;
     }
     let total = width as usize;
@@ -510,6 +517,12 @@ pub fn try_render_diff_content(diff_text: &str, width: u16) -> Option<Vec<Line<'
         );
         render_unified(&diffs, total)
     };
+    // A sniffed interior that yields no rows (e.g. a lone `--- ` line with no
+    // real hunk structure) must fail closed: return `None` so the caller
+    // falls back to the literal code block rather than rendering nothing.
+    if lines.is_empty() {
+        return None;
+    }
     Some(lines)
 }
 
@@ -717,6 +730,23 @@ mod tests {
         assert!(result.is_some());
         let lines = result.unwrap();
         assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn render_lone_three_dash_header_returns_none() {
+        // A `--- ` sniff hit without any real hunk structure (no `@@`, no
+        // +/-/space lines) renders to zero rows. It must fail closed — `None`
+        // — so the caller falls back to the literal fence instead of the
+        // content silently vanishing.
+        assert!(try_render_diff_content("--- just some text", 80).is_none());
+    }
+
+    #[test]
+    fn render_git_diff_returns_some() {
+        // Sanity: a real git diff with a hunk still renders (the empty-render
+        // fallback must not reject parseable diffs).
+        let text = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new";
+        assert!(try_render_diff_content(text, 80).is_some());
     }
 
     // ── truncate_str ──
