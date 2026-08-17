@@ -317,6 +317,18 @@ pub(crate) fn handle_selection_mouse(app: &mut App, mouse: &MouseEvent) -> Optio
     }
 }
 
+/// One selected row's contribution to the copy: the text it covers, the
+/// [`LineJoin`] the renderer recorded for it (how it glues to the row
+/// before it), and its location in the render cache so the assembly loop
+/// can detect two slots that are rows of the same semantic line (which
+/// always concatenate directly).
+struct ExtractedSlot {
+    text: String,
+    join: LineJoin,
+    turn_idx: usize,
+    line_idx: usize,
+}
+
 /// Extract the plain text covered by the active selection rectangle.
 ///
 /// Content lines are resolved one at a time through the height prefix + the
@@ -341,7 +353,7 @@ fn extract_selection_text(app: &App) -> Option<String> {
     // the renderer's blank spacers between markdown blocks, blank lines
     // inside tool output — contribute an empty slot, so a blank line inside
     // the selected text survives the copy as a blank line.
-    let mut slots: Vec<(String, LineJoin, usize, usize)> = Vec::new();
+    let mut slots: Vec<ExtractedSlot> = Vec::new();
     // Iterate the selection's *content* lines directly — no screen mapping,
     // which is exactly why the selection survives scrolling (the endpoints
     // are content-anchored, so this is scroll-independent).
@@ -350,7 +362,12 @@ fn extract_selection_text(app: &App) -> Option<String> {
         if let Some((text, join, turn_idx, line_idx)) =
             text_and_join_for_content_line(display, vp_width, content_line, col_lo, col_hi)
         {
-            slots.push((text, join, turn_idx, line_idx));
+            slots.push(ExtractedSlot {
+                text,
+                join,
+                turn_idx,
+                line_idx,
+            });
         }
     }
 
@@ -360,17 +377,18 @@ fn extract_selection_text(app: &App) -> Option<String> {
     // split across viewport rows (never in practice: content is pre-wrapped
     // narrower than the viewport), which always concatenate directly.
     let mut out = String::new();
-    for (i, (text, join, turn_idx, line_idx)) in slots.iter().enumerate() {
+    for (i, slot) in slots.iter().enumerate() {
         if i == 0 {
-            out.push_str(text);
+            out.push_str(&slot.text);
             continue;
         }
-        let (_, _, prev_turn, prev_line) = slots[i - 1];
-        let join = if prev_turn == *turn_idx && prev_line == *line_idx {
+        let prev_turn = slots[i - 1].turn_idx;
+        let prev_line = slots[i - 1].line_idx;
+        let join = if prev_turn == slot.turn_idx && prev_line == slot.line_idx {
             // Same semantic line across two viewport rows — contiguous text.
             LineJoin::Join
         } else {
-            *join
+            slot.join
         };
         match join {
             LineJoin::Break => out.push('\n'),
@@ -393,9 +411,9 @@ fn extract_selection_text(app: &App) -> Option<String> {
             }
         }
         if matches!(join, LineJoin::Space) {
-            out.push_str(text.trim_start());
+            out.push_str(slot.text.trim_start());
         } else {
-            out.push_str(text);
+            out.push_str(&slot.text);
         }
     }
     if out.is_empty() { None } else { Some(out) }
@@ -431,6 +449,21 @@ fn text_and_join_for_content_line(
         .unwrap_or(0);
     let visual_row = content_line.saturating_sub(turn_start);
     let rendered = cached_rendered_turn(display, turn_idx, vp_width)?;
+    // Pin the parallel-array invariant the extraction relies on (the same
+    // one `cached_or_compute_lines` asserts on the rebuild path): a drift
+    // here would silently degrade a copy to newline-joined rows via the
+    // `unwrap_or(LineJoin::Break)` fallback below, so catch it in debug
+    // builds at the consumer instead of letting it slip through.
+    debug_assert_eq!(
+        rendered.lines.len(),
+        rendered.content_ranges.len(),
+        "content ranges must align with the rendered lines"
+    );
+    debug_assert_eq!(
+        rendered.lines.len(),
+        rendered.joins.len(),
+        "joins must align with the rendered lines"
+    );
     let (line_idx, (lo, hi)) = content_range_for_row(
         &rendered.visual_offsets,
         &rendered.content_ranges,

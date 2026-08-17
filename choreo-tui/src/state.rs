@@ -3777,6 +3777,22 @@ impl SessionDisplayState {
                 reasoning_expanded,
                 &tool_results_collapsed,
             );
+            // Pin the same parallel-array invariant the rebuild path asserts
+            // in `cached_or_compute_lines`: the streaming fast path replaces
+            // the cache entry wholesale, so a join/content-range mismatch
+            // here would silently slip into the cache and degrade a later
+            // selection copy to newline-joined rows.  The asserts catch the
+            // drift in debug builds before the Arc conversions hide it.
+            debug_assert_eq!(
+                rendered.lines.len(),
+                rendered.joins.len(),
+                "joins must align with the lines"
+            );
+            debug_assert_eq!(
+                rendered.lines.len(),
+                rendered.content_ranges.len(),
+                "content ranges must align with the lines"
+            );
             let text_lines = rendered.lines;
             let text_height = lines_height(&text_lines, viewport.width).max(1);
             let visual_offsets = compute_visual_offsets(&text_lines, viewport.width);
@@ -5994,8 +6010,8 @@ mod tests {
                 lines: Arc::from(vec![Line::from("stale")]),
                 height: 1,
                 visual_offsets: Arc::from([1]),
-                joins: Arc::from([]),
-                content_ranges: Arc::from([]),
+                joins: Arc::from([LineJoin::Break]),
+                content_ranges: Arc::from([Some((0, 5))]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![],
             },
@@ -6245,8 +6261,8 @@ mod tests {
                 lines: Arc::from(vec![Line::from("stale")]),
                 height: 1,
                 visual_offsets: Arc::from([1]),
-                joins: Arc::from([]),
-                content_ranges: Arc::from([]),
+                joins: Arc::from([LineJoin::Break]),
+                content_ranges: Arc::from([Some((0, 5))]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![0],
             },

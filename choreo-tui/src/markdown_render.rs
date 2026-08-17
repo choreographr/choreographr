@@ -1577,24 +1577,26 @@ fn render_markdown_block(
                 // All continuation lines align under the widest marker so wrapped
                 // text lines up across the whole list.
                 let continuation_indent = indent + max_marker_width;
-                let mut rendered_iter = rendered.into_iter();
-                let mut joins_iter = rendered_joins.into_iter();
-                if let Some(first) = rendered_iter.next() {
+                // Zip the item's rows with the joins their inner renderer
+                // recorded: the two vectors stay in lockstep by construction,
+                // so `joins` below needs no fallback.  The first row (which
+                // carries the marker) is consumed with its join — each item
+                // starts a fresh line, whatever the inner renderer said about
+                // its first line is superseded.
+                let mut zipped = rendered.into_iter().zip(rendered_joins);
+                if let Some((first, _first_join)) = zipped.next() {
                     let mut spans = vec![Span::styled(
                         format!("{}{}", " ".repeat(indent), marker),
                         Style::default(),
                     )];
                     spans.extend(first.spans.clone());
                     lines.push(Line::from(spans));
-                    // Each item starts a fresh line; whatever the inner
-                    // renderer said about its first line is superseded.
-                    joins_iter.next(); // consume the inner first-line join
                     joins.push(LineJoin::Break);
                 } else {
                     lines.push(indented_line(indent, marker));
                     joins.push(LineJoin::Break);
                 }
-                for line in rendered_iter {
+                for (line, join) in zipped {
                     let mut spans = vec![Span::styled(
                         " ".repeat(continuation_indent),
                         Style::default(),
@@ -1604,7 +1606,7 @@ fn render_markdown_block(
                     // Wrapped continuations inside the item rejoin with
                     // Space/Join exactly as the inner renderer recorded
                     // (their predecessor's text is the line above them).
-                    joins.push(joins_iter.next().unwrap_or(LineJoin::Break));
+                    joins.push(join);
                 }
 
                 // Blank line between items only when the list is spaced out as

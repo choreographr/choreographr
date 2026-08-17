@@ -1634,14 +1634,25 @@ mod tests {
         height: usize,
         visual_offsets: Arc<[usize]>,
     ) -> RenderedCache {
+        // Derive the copy-join and content-range metadata from the lines so
+        // fixtures built through this helper keep the parallel-array
+        // alignment invariant the selection machinery relies on (every
+        // renderer-produced entry and the debug_asserts in
+        // `cached_or_compute_lines` expect lines/joins/content_ranges to
+        // have identical lengths).
+        let joins = lines.iter().map(|_| LineJoin::Break).collect::<Vec<_>>();
+        let content_ranges = lines
+            .iter()
+            .map(|l| Some((0, l.width())))
+            .collect::<Vec<_>>();
         RenderedCache {
             key,
             rendered: RenderedTurn {
                 lines,
                 height,
                 visual_offsets,
-                joins: Arc::from([]),
-                content_ranges: Arc::from([]),
+                joins: Arc::from(joins),
+                content_ranges: Arc::from(content_ranges),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: Vec::new(),
             },
@@ -2135,8 +2146,8 @@ mod tests {
                 lines: Arc::from(vec![Line::from("stale")]),
                 height: 99,
                 visual_offsets: Arc::from([1]),
-                joins: Arc::from([]),
-                content_ranges: Arc::from([]),
+                joins: Arc::from([LineJoin::Break]),
+                content_ranges: Arc::from([Some((0, 5))]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![0],
             },
