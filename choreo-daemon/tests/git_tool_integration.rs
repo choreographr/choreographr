@@ -368,3 +368,43 @@ fn show_commit_diff_skips_directory_entries() {
         result
     );
 }
+
+#[test]
+#[ignore]
+fn show_commit_message_is_not_indented() {
+    // git_show output is parsed as markdown in the TUI (see the renderer's
+    // MARKDOWN_TOOLS), so the commit message must be emitted unindented: a
+    // 4-space indent would be read as a CommonMark indented code block and
+    // the TUI would wrap the whole message in a literal ``` box. This pins
+    // the daemon-side half of that contract.
+    let repo = init_repo();
+    std::fs::write(repo.join("a.txt"), "a").unwrap();
+    git(&repo, &["add", "a.txt"]);
+    git(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "subject line",
+            "-m",
+            "body line one\nbody line two",
+        ],
+    );
+
+    let result = execute_git_show_tool(
+        &GitShowArgs {
+            repo_path: repo_path_arg(&repo),
+            revision: Some("HEAD".into()),
+            path: None,
+            diff: Some(false),
+        },
+        None,
+    )
+    .unwrap_or_default();
+
+    assert!(result.contains("subject line"), "{}", result);
+    assert!(result.contains("body line one"), "{}", result);
+    assert!(result.contains("body line two"), "{}", result);
+    // The old 4-space-indented form must not come back.
+    assert!(!result.contains("\n    subject line"), "{}", result);
+}

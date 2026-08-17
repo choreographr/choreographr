@@ -177,11 +177,15 @@ fn show_commit(
     writeln!(out, "Head:     {head_desc}").ok();
     writeln!(out).ok();
 
-    // Full commit message
+    // Full commit message. Emitted unindented: git_show results are parsed
+    // as markdown by the TUI (see MARKDOWN_TOOLS), and a 4-space indent
+    // would be read as a CommonMark indented code block — the TUI would
+    // wrap the whole message in a literal ``` box. Plain lines render as
+    // paragraph rows whose soft breaks stay separate lines on copy.
     let message = decoded.message;
     for line in message.lines() {
         let s = String::from_utf8_lossy(line);
-        writeln!(out, "    {s}").ok();
+        writeln!(out, "{s}").ok();
     }
 
     // Optionally generate and append the diff
@@ -452,10 +456,13 @@ fn show_tag(repo: &gix::Repository, object: &gix::Object<'_>) -> Result<String, 
     }
     writeln!(out).ok();
 
+    // Tag message, unindented for the same reason as the commit message
+    // above: git_show output is markdown-parsed in the TUI, and a 4-space
+    // indent would render as a literal ```-boxed CommonMark code block.
     let message = decoded.message;
     for line in message.lines() {
         let s = String::from_utf8_lossy(line);
-        writeln!(out, "    {s}").ok();
+        writeln!(out, "{s}").ok();
     }
 
     // Recurse into the tagged object
