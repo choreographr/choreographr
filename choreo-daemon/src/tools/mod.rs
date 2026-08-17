@@ -175,6 +175,7 @@ pub(crate) mod random;
 pub(crate) mod read_file;
 pub(crate) mod read_file_range;
 pub(crate) mod series;
+pub(crate) mod session_inspect;
 pub(crate) mod sh;
 pub mod shell_util;
 pub mod subsession;
@@ -621,6 +622,11 @@ pub fn static_groups() -> &'static [ToolGroup] {
                 name: "vm".into(),
                 description: "RISC-V sandboxed code execution".into(),
             },
+            // Read-only diagnostics and request dry-runs; opt-in via load_tools.
+            ToolGroup {
+                name: "debug".into(),
+                description: "Read-only diagnostics and request dry-runs (session_inspect)".into(),
+            },
         ];
         // The blockchain group only exists when the `blockchain` feature is
         // compiled in (the tools are registered conditionally too), so
@@ -702,6 +708,7 @@ impl ToolRegistry {
         }
         reg.register(random::Random);
         reg.register(time::GetCurrentTime);
+        reg.register(session_inspect::SessionInspect);
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);
         reg.register(x::XUserLookup);

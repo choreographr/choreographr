@@ -1787,6 +1787,7 @@ via `fn group() -> &'static str` on the `Tool` trait. Groups are:
 | `x` | off | X/Twitter API |
 | `vm` | off | RISC-V sandboxed code execution |
 | `blockchain` | off | EVM and Substrate/Polkadot blockchain queries (alloy/subxt) — only present when the `blockchain` cargo feature is enabled |
+| `debug` | off | Read-only diagnostics and request dry-runs (`session_inspect`) — opt-in via `load_tools`, never on by default |
 
 The system prompt lists all groups and their descriptions. The model uses `load_tools` to
 activate additional groups and `unload_tools` to deactivate them. **core** cannot be unloaded.
@@ -1829,6 +1830,19 @@ Implementation details:
   proper `Tool` trait implementations registered in the default registry via
   `ToolRegistry::build()`, using `ToolContext.daemon_tx` to communicate with the
   daemon command loop
+- `session_inspect` (group `debug`) is a **read-only** diagnostic (built with
+  `Tool`): it opens the session record + turns via redb **read** transactions and
+  dry-runs `build_chat_request_messages` + `warn_on_missing_reasoning_artifacts`
+  with the manifest `model_reasoning_passback` policy, serializing each built
+  `ChatRequestMessage` the way the adapter emits it — so its
+  "would carry reasoning_content on the wire" count is exactly what the provider
+  sees. It replays the reasoning-echo decision (ToolLoop/provenance/passback)
+  per assistant turn to surface which turns are sent bare (the DeepSeek/Kimi
+  `reasoning_content` must-be-passed-back 400 shape). Privacy mirrors
+  `turn_for_client`: artifact metadata + producer identity are shown for any
+  session, but message-text previews and raw reasoning bytes are rendered only
+  for the calling session, and raw reasoning additionally requires `include_raw`
+  (thinking blocks / encrypted signatures never leave the daemon otherwise).
 - Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell}`)
 - `ToolGroup` struct and `GROUPS` constant live in `choreo-daemon/src/tools/mod.rs`
 - Group metadata is appended to the system prompt in `context::build_base_prompt()`
