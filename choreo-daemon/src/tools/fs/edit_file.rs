@@ -154,13 +154,17 @@ fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) ->
         summary.char_delta,
     );
 
-    // Append diff if we have original content
+    // Append diff if we have original content. Fenced via the shared helper so
+    // a diff whose content contains a backtick run (e.g. editing a Markdown
+    // file that holds a bare ``` line) cannot close the fence early in the
+    // TUI's markdown parser — the same hardening `fence_content` applies to
+    // blob/commit-message bodies. A backtick-free diff still gets the
+    // canonical 3-backtick ```diff fence.
     if let Some(ref original) = summary.original {
         let diff = crate::diff_util::generate_diff(original, &summary.content, path, path);
         if !diff.is_empty() {
-            out.push_str("\n\n```diff\n");
-            out.push_str(&diff);
-            out.push_str("\n```");
+            out.push_str("\n\n");
+            out.push_str(&super::fence_content(&diff, "diff"));
         }
     }
 

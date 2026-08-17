@@ -15,15 +15,18 @@ pub struct GitDiffArgs {
     pub pathspec: Option<Vec<String>>,
 }
 
-/// Append a unified diff wrapped in a ````diff` fenced code block.
+/// Append a unified diff wrapped in a `` `diff` `` fenced code block.
 ///
-/// This ensures the diff content is clearly delimited from surrounding
-/// tool output when rendered in markdown or the TUI.
+/// This ensures the diff content is clearly delimited from surrounding tool
+/// output when rendered in markdown or the TUI. It goes through the shared
+/// `fence_content` helper so a diff whose content contains a backtick run
+/// (e.g. editing a Markdown file that holds a bare ``` line as a context
+/// line) cannot close the fence early in a markdown-parsing client — the
+/// same hardening applied to blob/commit-message bodies. A backtick-free
+/// diff still gets the canonical 3-backtick ```` ```diff ```` fence.
 pub fn append_fenced_diff(out: &mut String, diff: &str) {
     if !diff.is_empty() {
-        out.push_str("```diff\n");
-        out.push_str(diff);
-        out.push_str("\n```");
+        out.push_str(&crate::tools::fs::fence_content(diff, "diff"));
     }
 }
 

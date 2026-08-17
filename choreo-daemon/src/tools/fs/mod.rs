@@ -163,6 +163,58 @@ mod tests {
     }
 
     #[test]
+    fn fence_content_diff_with_backtick_context_line_never_closes_early() {
+        // A git diff for a Markdown file can carry a bare ``` line as a
+        // *context* line (space-prefixed, so it parses as a valid CommonMark
+        // closing fence). The sized fence must exceed that run so the ```\n```
+        // block cannot be closed by the diff's own content — this is the
+        // hardening `append_fenced_diff`/`edit_file` rely on.
+        //
+        // Built with `concat!` rather than `\`-continued string literals: Rust
+        // line continuations strip the leading whitespace of the next source
+        // line, which would silently drop the all-important space before ```.
+        let diff = concat!(
+            "diff --git a/README.md b/README.md\n",
+            "--- a/README.md\n",
+            "+++ b/README.md\n",
+            "@@ -1,4 +1,4 @@\n",
+            "plain\n",
+            " ```\n",
+            "-old\n",
+            "+new\n",
+            "code\n",
+        );
+        let result = super::fence_content(diff, "diff");
+        // The longest interior run is 3 backticks (the context line) -> fence is
+        // 4 wide, so no interior line can ever match the closing fence.
+        assert!(
+            result.starts_with("````diff\n"),
+            "start: {}...",
+            &result[..result.len().min(40)]
+        );
+        assert!(
+            result.ends_with("\n````"),
+            "end: {}...",
+            &result[..result.len().min(40)]
+        );
+        // The diff's own context line (space + 3 backticks) must survive as
+        // interior content, not be mistaken for the closing fence.
+        assert!(
+            result.contains("\n ```\n"),
+            "context fence must stay inside: {result}"
+        );
+    }
+
+    #[test]
+    fn fence_content_diff_without_backticks_keeps_three_backtick_fence() {
+        // Backtick-free diffs (the common case) keep the canonical 3-backtick
+        // ```diff fence, so existing callers/tests observing that shape pass.
+        let result = super::fence_content("diff --git a/f b/f\n-old\n+new", "diff");
+        assert!(result.starts_with("```diff\n"), "{}", result);
+        assert!(result.ends_with("\n```"), "{}", result);
+    }
+
+    #[test]
     fn fence_content_empty_content() {
         let result = super::fence_content("", "json");
         assert_eq!(result, "```json\n\n```");

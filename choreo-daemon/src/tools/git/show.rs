@@ -154,6 +154,13 @@ fn show_commit(
     let mut out = String::new();
     writeln!(out, "commit {}", commit.id).ok();
 
+    // Metadata lines are daemon-authored markdown, not repo data — except the
+    // Author/Committer name & email, which are arbitrary commit bytes. They are
+    // emitted here unfenced but sit mid-line after a fixed "Author:   " prefix,
+    // so they cannot start a heading, list, or code fence (all of which require
+    // line-start) — the residual exposure is cosmetic (e.g. a `**` inside a name
+    // restyles that span), never structural. Keep this in mind if author names
+    // are ever emitted on their own line.
     let head_desc = super::describe_head(repo).unwrap_or_default();
     let parent_ids: Vec<_> = commit.parent_ids().collect();
 
