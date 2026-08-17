@@ -916,10 +916,11 @@ pub(crate) fn render_turn_lines(
 
     /// Tools whose result content is Markdown by design and may therefore be
     /// parsed as markdown. `pdf_to_markdown` emits extracted page text;
-    /// `git_diff`/`git_show`/`edit_file` emit ` ```diff `-fenced unified diffs
-    /// (the daemon wraps every diff via `diff_util::generate_diff` — git tools
-    /// through `append_fenced_diff`, `tools/git/diff.rs`, `edit_file` inline
-    /// at `tools/fs/edit_file.rs`) — parsing those results as markdown is
+    /// `git_diff`/`git_show`/`git_add`/`edit_file` emit ` ```diff `-fenced
+    /// unified diffs (the daemon wraps every diff via `diff_util::generate_diff`
+    /// — git tools through `append_fenced_diff`/`git_diff_impl`,
+    /// `tools/git/{diff,show,stage}.rs`; `edit_file` inline at
+    /// `tools/fs/edit_file.rs`) — parsing those results as markdown is
     /// exactly what lets the renderer's ` ```diff ` handling (see
     /// `render_markdown_block`) turn each fence interior into a
     /// side-by-side/unified diff. Everything else renders as **plain text** —
@@ -928,7 +929,13 @@ pub(crate) fn render_turn_lines(
     /// hide part of the output. Fail-closed: a tool not listed here never
     /// reaches the markdown parser, and a ` ```diff ` fence outside one of
     /// these tools is literal data, not diff opt-in.
-    const MARKDOWN_TOOLS: &[&str] = &["pdf_to_markdown", "git_diff", "git_show", "edit_file"];
+    const MARKDOWN_TOOLS: &[&str] = &[
+        "pdf_to_markdown",
+        "git_diff",
+        "git_show",
+        "git_add",
+        "edit_file",
+    ];
 
     for (i, tr) in turn.tool_results.iter().enumerate() {
         let accent = if tr.is_error {
@@ -1045,13 +1052,13 @@ pub(crate) fn render_turn_lines(
                     body_joins.extend(joins);
                 } else if MARKDOWN_TOOLS.contains(&tr.name.as_str()) {
                     // Tools that emit markdown by design (pdf_to_markdown's
-                    // extracted page text, git_diff/git_show/edit_file's fenced
-                    // diffs) keep the styled renderer — a ` ```diff ` fence
-                    // inside their output renders as a diff via the CodeBlock
-                    // arm of `render_markdown_block`. Everything else is
-                    // verbatim data and must NOT be re-interpreted as markdown
-                    // (see MARKDOWN_TOOLS); there is no content-based diff or
-                    // markdown auto-detection anymore.
+                    // extracted page text, git_diff/git_show/git_add/edit_file's
+                    // fenced diffs) keep the styled renderer — a ` ```diff `
+                    // fence inside their output renders as a diff via the
+                    // CodeBlock arm of `render_markdown_block`. Everything else
+                    // is verbatim data and must NOT be re-interpreted as
+                    // markdown (see MARKDOWN_TOOLS); there is no content-based
+                    // diff or markdown auto-detection anymore.
                     let (lines, joins) = markdown_lines_joined(&content, tool_content_width);
                     body.extend(lines);
                     body_joins.extend(joins);
@@ -4192,6 +4199,52 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             .join("\n");
         assert!(
             text.contains("edited file: src/main.rs"),
+            "summary line must survive: {text}"
+        );
+        assert!(text.contains('│'), "diff must render side-by-side: {text}");
+        assert!(
+            !text.contains("```"),
+            "fence lines must be consumed: {text}"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_git_add_fenced_diff_renders() {
+        // `git_add` is a fourth diff-emitting tool: the daemon appends the
+        // freshly staged diff via `git_diff_impl` (tools/git/stage.rs), which
+        // produces the same ` ```diff ` fences as `git_diff`. It must be
+        // markdown-gated so the fences render as a diff while the staging
+        // summary line survives.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "git_add".into(),
+                content: "repository: /repo\nhead: main\nstaged_paths: 1\nindex_changed: \
+yes\n\n```diff\ndiff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n```"
+                    .into(),
+                is_error: false,
+                invocation_description: String::new(),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("staged_paths: 1"),
             "summary line must survive: {text}"
         );
         assert!(text.contains('│'), "diff must render side-by-side: {text}");
