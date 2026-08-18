@@ -3150,6 +3150,17 @@ declared via `rust-version` in every crate manifest (inherited from
 `[workspace.package]` in the root `Cargo.toml`). Keep code and dependencies
 within this floor; the CI MSRV job enforces it.
 
+The 1.92 floor (bumped from 1.91 on the 2025-12-11 release) is a deliberate
+housekeeping raise: nothing in the workspace consumes a 1.92-stabilized API
+(zeroed `Box`/`Rc`/`Arc`, `RwLockWriteGuard::downgrade`,
+`BTreeMap::Entry::insert_entry`, `NonZero::div_ceil`, proc-macro `TokenStream`
+`Extend` impls all have no use site here), so it raises headroom without an
+upgrade cost. It does bring the `Iterator::eq{_by}` `TrustedLen` specialization
+(memcmp-class behavior for iterator-based byte/slice equality) and locks in the
+deny-by-default never-type fallback lints. The first dependency a future floor
+bump unblocks is `serial_test` 4.x (requires Rust 1.93.1 — held at 3.x until
+then, see the root `Cargo.toml`).
+
 **Building requires nightly.** `rust-toolchain.toml` pins the workspace to
 the nightly channel (rustup auto-installs it on first `cargo` run). Nightly
 enables the per-profile `rustflags` in the root `Cargo.toml` via the
