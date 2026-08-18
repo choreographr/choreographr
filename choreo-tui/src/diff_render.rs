@@ -324,6 +324,15 @@ fn spans_fixed_width(spans: &mut Vec<Span<'static>>, width: usize) {
             if w <= remaining {
                 remaining -= w;
                 keep = i + 1;
+            } else if remaining == 0 {
+                // The kept prefix already fills the pane to exactly `width`, so
+                // there is no room left — not even for the ellipsis.  Drop the
+                // overflowing span instead of replacing it with
+                // `truncate_str(s, 0)`, which always appends a `…` and would
+                // overshoot the pane by one column (drifting the side-by-side
+                // gutter and making the rendered row one column too wide).
+                spans.truncate(keep);
+                break;
             } else {
                 // This span is wider than the remaining space.  Truncate its
                 // content to fit rather than dropping it entirely (which would
@@ -333,12 +342,16 @@ fn spans_fixed_width(spans: &mut Vec<Span<'static>>, width: usize) {
                     truncate_str(&spans[keep].content, remaining),
                     spans[keep].style,
                 );
-                remaining = 0;
                 break;
             }
         }
-        if remaining > 0 {
-            spans.push(Span::styled(" ".repeat(remaining), Style::default()));
+        // `truncate_str` may come up short at a wide-character boundary (it
+        // cuts on the character before the overflow), and the keep-loop can
+        // finish with leftover budget — re-measure and pad so the pane is
+        // exactly `width` columns wide.
+        let actual: usize = spans.iter().map(|s| s.width()).sum();
+        if actual < width {
+            spans.push(Span::styled(" ".repeat(width - actual), Style::default()));
         }
         return;
     }
@@ -531,6 +544,14 @@ pub fn try_render_diff_content(diff_text: &str, width: u16) -> Option<Vec<Line<'
 /// Truncate a string to at most `max_width` display columns, appending `…`
 /// if truncated.  Uses `unicode-width` for proper CJK/emoji column widths.
 pub(crate) fn truncate_str(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        // A zero-column budget has no room for a string, and even fitting the
+        // ellipsis would consume a column that doesn't exist.  Return an empty
+        // string so callers never receive a `…` whose width exceeds the
+        // requested limit (callers that auto-pad to their exact width would
+        // otherwise overshoot by one).
+        return String::new();
+    }
     if s.width() <= max_width {
         return s.to_string();
     }
@@ -843,6 +864,124 @@ mod tests {
             text.ends_with('…'),
             "truncated content should end with ellipsis"
         );
+    }
+
+    #[test]
+    fn spans_exact_fit_then_overflow_drops_span() {
+        // A kept span can consume the remaining budget *exactly*, leaving
+        // `remaining == 0` for the next (overflowing) span.  The old code
+        // replaced that overflow span with `truncate_str(s, 0)`, which always
+        // emits a lone `…` (one column) — overshooting the pane by one.  The
+        // overflow span must instead be dropped so the pane stays exactly
+        // `width` columns.
+        let mut spans = vec![
+            Span::styled("abcd".to_string(), Style::default()),
+            Span::styled("ef".to_string(), Style::default()),
+            Span::styled("G".to_string(), Style::default()), // fills budget exactly
+            Span::styled("HUGE".to_string(), Style::default()), // must be dropped
+        ];
+        spans_fixed_width(&mut spans, 7);
+        assert_eq!(
+            spans.iter().map(|s| s.width()).sum::<usize>(),
+            7,
+            "exact-fit-then-overflow must not overshoot the pane"
+        );
+        let text: String = spans.iter().flat_map(|s| s.content.chars()).collect();
+        assert_eq!(text, "abcdefG", "the overflowing span is dropped entirely");
+    }
+
+    #[test]
+    fn spans_truncation_pads_wide_char_shortfall() {
+        // When truncation lands just after a wide character (CJK/emoji), the
+        // truncated span can come up a column short of the target.  The pane
+        // must still reach exactly `width` columns.
+        let mut spans = vec![
+            Span::styled("界界界界界".to_string(), Style::default()), // 10 cols
+            Span::styled("tail".to_string(), Style::default()),
+        ];
+        spans_fixed_width(&mut spans, 11);
+        assert_eq!(
+            spans.iter().map(|s| s.width()).sum::<usize>(),
+            11,
+            "wide-char shortfall must be padded to the target width"
+        );
+    }
+
+    #[test]
+    fn truncate_str_zero_width_returns_empty() {
+        // A zero-column budget has no room even for the ellipsis — the
+        // result must be empty, never a one-column `…`.
+        assert_eq!(truncate_str("anything", 0), "");
+        assert_eq!(truncate_str("", 0), "");
+        assert_eq!(truncate_str("界", 0), "");
+    }
+
+    // ── side-by-side gutter alignment (regression) ──
+
+    #[test]
+    fn side_by_side_keeps_gutter_aligned_on_long_lines() {
+        // Regression: syntax-highlighting a long context line can produce a
+        // span that *exactly* fills the remaining pane width followed by an
+        // overflowing span.  The old truncation replaced that overflow span
+        // with `truncate_str(s, 0)`, which always emits a lone `…` (one
+        // column wide) — so the pane became `width + 1` columns, the rendered
+        // diff row overran the content width, and the gutter drifted from row
+        // to row.  Every pane must pin to exactly `width` columns and the
+        // gutter must sit at the same column on every row.
+        let diff = r#"diff --git a/choreo-daemon/examples/zstd_tuning.rs b/choreo-daemon/examples/zstd_tuning.rs
+--- a/choreo-daemon/examples/zstd_tuning.rs
++++ b/choreo-daemon/examples/zstd_tuning.rs
+@@ -26,6 +26,7 @@
+ const DELETED_SESSIONS: TableDefinition<u64, ()> = TableDefinition::new("deleted_sessions");
+ const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credentials");
+ const CATALOG_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalog_state");
++const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
++
+ /// Decompress cap, mirroring the daemon's `MAX_TURN_DECODED_BYTES` so the harness agrees with production on what is a "legitimate" turn.
+ /// harness agrees with production on what is a "legitimate" turn.
+@@ -244,6 +245,15 @@
+     let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+     println!("file size: {} bytes ({:.1} MB)", file_bytes, file_bytes as f64 / (1024.0 * 1024.0));
++
++    // meta: report persisted schema_version etc.
++    if let Ok(t) = read_txn.open_table(META) {
++        for r in t.iter().expect("iter meta") {
++            let (k, v) = r.expect("item");
++            println!("meta[{}] = {}", k.value(), v.value());
++        }
++    }
++    println!();
++
+     // (name, entries, stored value bytes, extra live raw bytes)
+     let mut rows: Vec<(String, u64, u64, u64)> = Vec::new();
+"#;
+        // Mix of even and odd total widths — the divisibility of the panes
+        // changes the truncation boundaries, exercising the exact-fit-then-
+        // overflow span pattern on both panes.
+        for width in [80usize, 85, 101, 120, 140, 150] {
+            let lines = try_render_diff_content(diff, width as u16).expect("render");
+            let mut gutter_cols: Vec<usize> = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                let mut col = 0usize;
+                let mut gutter = None;
+                for span in &line.spans {
+                    let w = span.width();
+                    if span.content == "│" {
+                        gutter = Some(col);
+                    }
+                    col += w;
+                }
+                assert_eq!(
+                    col, width,
+                    "row {i} at width {width} must be exactly {width} columns wide"
+                );
+                gutter_cols.push(gutter.expect("every side-by-side row has a gutter"));
+            }
+            assert!(
+                gutter_cols.iter().all(|&g| g == gutter_cols[0]),
+                "gutter must sit at one column on every row (width {width}): {gutter_cols:?}"
+            );
+        }
     }
 
     // ── is_meta_line ──
