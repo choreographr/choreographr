@@ -174,6 +174,7 @@ pub(crate) mod pdf;
 pub(crate) mod random;
 pub(crate) mod read_file;
 pub(crate) mod read_file_range;
+pub(crate) mod retrieve_webpage;
 pub(crate) mod series;
 pub(crate) mod session_inspect;
 pub(crate) mod sh;
@@ -708,6 +709,7 @@ impl ToolRegistry {
         }
         reg.register(random::Random);
         reg.register(time::GetCurrentTime);
+        reg.register(retrieve_webpage::RetrieveWebpage::default());
         reg.register(session_inspect::SessionInspect);
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);

@@ -51,6 +51,10 @@ This has 2 main purposes:
 - a tool call scripting language - the LLM can quickly write a little script to call tools with custom logic
 - a complete replacement for the shell tool. Giving the LLM direct access to the shell is potentially very dangerous. Disabling the shell tool and doing everything via the VM provides complete control and observability.
 
+### Browsing the web
+
+The `retrieve_webpage` tool renders a URL in a **local** headless Chromium/Chrome (preferring chromium; a binary must already be installed — there is no auto-download) and returns the page's HTML, plain text, a PNG screenshot (inline or to an `output_path`), or a PDF (to `output_path`). It runs locally and offline; for cloud-hosted headless rendering, see the Cloudflare Browser Run / Kitesurf research in this project's history.
+
 ### Multiple live sessions
 
 Each server can run multiple sessions simultaneously (only limited by system resources). Sessions are stored in the database and only "woken-up" when a client connects to them.

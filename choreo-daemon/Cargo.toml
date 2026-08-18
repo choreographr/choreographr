@@ -28,6 +28,11 @@ hex.workspace = true
 # the bounded pipe-drain poll loop, and the non-blocking fcntl on child pipes.
 rustix = { version = "1.1.4", features = ["event", "fs", "process"] }
 
+# Local headless Chromium/Chrome control for the `retrieve_webpage` tool (CDP).
+# Uses default features (no `fetch`): the tool requires a Chromium/Chrome
+# binary already installed on the host — we never auto-download one.
+headless_chrome = "1.0.22"
+
 gix = { version = "0.86", features = ["tree-editor", "revision"] }
 gix-imara-diff = { version = "0.2", features = ["unified_diff"] }
 hmac = "0.13"
