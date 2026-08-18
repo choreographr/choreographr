@@ -3145,21 +3145,16 @@ cargo test -- --ignored   # libtest integration tests
 
 ## Build and run
 
-The workspace targets a minimum supported Rust version (MSRV) of **1.92**,
+The workspace targets a minimum supported Rust version (MSRV) of **1.94.1**,
 declared via `rust-version` in every crate manifest (inherited from
 `[workspace.package]` in the root `Cargo.toml`). Keep code and dependencies
 within this floor; the CI MSRV job enforces it.
 
-The 1.92 floor (bumped from 1.91 on the 2025-12-11 release) is a deliberate
-housekeeping raise: nothing in the workspace consumes a 1.92-stabilized API
-(zeroed `Box`/`Rc`/`Arc`, `RwLockWriteGuard::downgrade`,
-`BTreeMap::Entry::insert_entry`, `NonZero::div_ceil`, proc-macro `TokenStream`
-`Extend` impls all have no use site here), so it raises headroom without an
-upgrade cost. It does bring the `Iterator::eq{_by}` `TrustedLen` specialization
-(memcmp-class behavior for iterator-based byte/slice equality) and locks in the
-deny-by-default never-type fallback lints. The first dependency a future floor
-bump unblocks is `serial_test` 4.x (requires Rust 1.93.1 — held at 3.x until
-then, see the root `Cargo.toml`).
+The 1.94.1 floor (bumped from 1.92 on the 2026-08 dependency refresh) is a
+deliberate housekeeping raise that unblocks two previously-pinned deps:
+`serial_test` 4.x requires Rust 1.93.1 (it was held at 3.x while the floor was
+1.92), and `alloy` 2.4.1 requires Rust 1.94.1 — the new ceiling of the resolved
+dependency graph. See the root `Cargo.toml`.
 
 **Building defaults to nightly.** `rust-toolchain.toml` pins the workspace to
 the `nightly` channel (rustup auto-installs it on first `cargo` run) so that
@@ -3177,8 +3172,8 @@ rustflags, so per-machine linker flags (e.g. the wild linker in
 `~/.cargo/config.toml`) still apply.
 
 **Stable builds are a supported opt-out.** The sources use no nightly-only
-features, so the code targets a stable MSRV floor (`rust-version = "1.92"`,
-enforced by the CI MSRV job) and builds on any stable ≥ 1.92. The nightly-only
+features, so the code targets a stable MSRV floor (`rust-version = "1.94.1"`,
+enforced by the CI MSRV job) and builds on any stable ≥ 1.94.1. The nightly-only
 `profile-rustflags` wiring, however, hard-blocks stable *Cargo* (the keys it
 enables require that unstable feature), so a stable build is run through
 `scripts/build-stable.sh` (`just build-stable` / `check-stable` /

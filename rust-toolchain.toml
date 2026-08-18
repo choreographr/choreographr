@@ -11,7 +11,7 @@
 # breaks the build, pin a date instead (e.g. nightly-2026-08-14).
 #
 # Building with STABLE Rust is an explicit, supported opt-out: the sources use
-# no nightly-only features (MSRV floor is 1.92, see the root Cargo.toml), and
+# no nightly-only features (MSRV floor is 1.94.1, see the root Cargo.toml), and
 # `just build-stable` / `check-stable` / `test-stable` run one command on stable
 # by temporarily stripping the nightly-only `profile-rustflags` bits that
 # otherwise hard-block stable Cargo (see scripts/build-stable.sh).

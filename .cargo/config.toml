@@ -1,6 +1,6 @@
 # MSRV-aware dependency resolution: when cargo resolves dependencies it prefers
 # versions whose declared `rust-version` is compatible with the workspace's
-# minimum supported Rust version (1.92, see the root Cargo.toml). If no
+# minimum supported Rust version (1.94.1, see the root Cargo.toml). If no
 # compatible version satisfies a requirement, fall back to the newest version
 # and emit a warning instead of failing the build. This is a stable Cargo
 # feature and works identically on nightly and stable.

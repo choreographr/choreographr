@@ -327,7 +327,7 @@ Unix socket `/tmp/Choreographr.sock` and stores its data under
 
 ## Build from source
 
-Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.92** — and a [Zig toolchain](https://ziglang.org/) (`brew install zig`), which `choreographr` needs to compile the `zlob` glob/walker dependency.
+Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.94.1** — and a [Zig toolchain](https://ziglang.org/) (`brew install zig`), which `choreographr` needs to compile the `zlob` glob/walker dependency.
 
 The repo builds on **nightly** Rust by default (`rust-toolchain.toml` pins `nightly`), which lets every `cargo` command — including per-crate ones like `cargo check -p choreo-proto` or `cargo test -p choreo-sanitize` — automatically apply the fast per-profile `-Z` compiler flags (`-Zshare-generics` in dev, parallel rustc frontend in dev and release). No opting in or remembering of flags is needed: a bare `cargo` command just builds fast. `rustup` auto-installs the pinned channel the first time you run `cargo` in the checkout:
 
@@ -336,7 +336,7 @@ brew install zig
 cargo build --release
 ```
 
-The **source uses no nightly-only features**, so the code also builds on any stable ≥ 1.92 (the MSRV floor, enforced by CI). Stable builds are a supported but explicit opt-out, because the nightly-only flags we wire in hard-block stable *Cargo* — use the `just` recipes, which temporarily strip those flags for one command and restore them:
+The **source uses no nightly-only features**, so the code also builds on any stable ≥ 1.94.1 (the MSRV floor, enforced by CI). Stable builds are a supported but explicit opt-out, because the nightly-only flags we wire in hard-block stable *Cargo* — use the `just` recipes, which temporarily strip those flags for one command and restore them:
 
 ```bash
 just build-stable   # build on stable (release by default)
@@ -784,7 +784,7 @@ A [`justfile`](./justfile) wraps the common workflows above (and the daemon run
 commands) in one place — `just` lists every recipe, and `just help` explains the
 prerequisites. Install `just` with `cargo install just` (or `brew install just`
 on macOS); the recipes require the same toolchain as the
-[Build from source](#build-from-source) section (cargo ≥ 1.92 + zig), and
+[Build from source](#build-from-source) section (cargo ≥ 1.94.1 + zig), and
 nextest only where noted:
 
 ```bash

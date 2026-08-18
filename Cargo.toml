@@ -101,15 +101,19 @@ members = [
 resolver = "3"
 
 # Shared package metadata inherited by every member via `*.workspace = true`.
-# MSRV: the workspace builds and tests on Rust 1.92 and newer; keep code and
-# dependencies within this floor (see ARCHITECTURE.md).
+# MSRV: the workspace builds and tests on Rust 1.94.1 and newer; keep code
+# and dependencies within this floor (see ARCHITECTURE.md).
+#
+# Bumped from 1.92 to 1.94.1 in the 2026-08 dependency refresh: serial_test
+# 4.x requires Rust 1.93.1 (it was previously held at 3.x because 4.0.1 sat
+# above the old floor), and alloy 2.4.1 now requires 1.94.1.
 #
 # version/license/repository/homepage/readme/description are required by
 # crates.io for published crates; the publish-set members inherit them, while
 # private members opt out with `publish = false`. `readme` is resolved
 # relative to the workspace root (the file that lives at ./README.md).
 [workspace.package]
-rust-version = "1.92"
+rust-version = "1.94.1"
 version = "0.1.0"
 license = "Apache-2.0"
 repository = "https://github.com/choreographr/choreographr"
@@ -195,8 +199,7 @@ serde_json = "1"
 schemars = { version = "1.2.1", features = ["derive"] }
 yaml_serde = "0.10"
 signal-hook = "0.4"
-# Held at 3.x (3.5.0): serial_test 4.0.1 requires Rust 1.93.1, above the workspace MSRV floor (1.92).
-serial_test = "3"
+serial_test = "4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 toml = "1.1"
