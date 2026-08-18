@@ -2221,6 +2221,62 @@ fn render_turn_lines_pdf_to_markdown_keeps_markdown_rendering() {
 }
 
 #[test]
+fn render_turn_lines_write_file_fenced_content_renders_as_markdown() {
+    // `write_file` is markdown-gated: the daemon returns the written file's
+    // contents inside a fenced code block (`fence_content` in tools/fs/mod.rs
+    // sizes the fence so file bytes — backtick runs included — can never
+    // close it early; the language tag comes from `ext_to_lang`). Parsing the
+    // result as markdown turns that fence into a syntax-highlighted code
+    // block instead of literal fence markers, while the "wrote file:" summary
+    // line survives as a plain paragraph.
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![choreo_proto::ToolResultRecord {
+            call_id: "call1".into(),
+            name: "write_file".into(),
+            content: "wrote file: /tmp/hello.rs\n\n```rust\nfn main() {\n    \
+             println!(\"hi\");\n}\n```"
+                .into(),
+            is_error: false,
+            invocation_description: String::new(),
+        }],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+    let text = lines
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Summary line survives verbatim as a paragraph.
+    assert!(text.contains("wrote file: /tmp/hello.rs"), "{text}");
+    // The file contents must reach the code-block path: the ```rust fence is
+    // preserved as the block's chrome and the interior is syntax-highlighted
+    // via syntect — an RGB-coloured span on the interior lines. (Inline code
+    // is Cyan, a named colour, so an RGB span isolates the code-block
+    // highlight; plain-text rendering would show the fence markers verbatim
+    // with no colour at all.)
+    let code_highlighted = lines.iter().any(|l| {
+        l.spans
+            .iter()
+            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))))
+    });
+    assert!(
+        code_highlighted,
+        "write_file code block should be syntax-highlighted:\n{text}"
+    );
+}
+
+#[test]
 fn render_turn_lines_tool_results_error() {
     let turn = Turn {
         created_at: choreo_proto::TimestampMs::now(),

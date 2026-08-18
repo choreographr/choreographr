@@ -916,6 +916,10 @@ pub(crate) fn render_turn_lines(
 
     /// Tools whose result content is Markdown by design and may therefore be
     /// parsed as markdown. `pdf_to_markdown` emits extracted page text;
+    /// `write_file` emits the written file's full contents fenced as a code
+    /// block (daemon `tools/fs/write_file.rs`, fence sized by
+    /// `fence_content` so file bytes — backtick runs included — can never
+    /// close it early, language tag from `ext_to_lang`);
     /// `git_diff`/`git_show`/`git_add`/`edit_file` emit ` ```diff `-fenced
     /// unified diffs (the daemon wraps every diff via `diff_util::generate_diff`
     /// — git tools through `append_fenced_diff`/`git_diff_impl`,
@@ -923,7 +927,9 @@ pub(crate) fn render_turn_lines(
     /// `tools/fs/edit_file.rs`) — parsing those results as markdown is
     /// exactly what lets the renderer's ` ```diff ` handling (see
     /// `render_markdown_block`) turn each fence interior into a
-    /// side-by-side/unified diff. Everything else renders as **plain text** —
+    /// side-by-side/unified diff, and turns `write_file`'s fence into a
+    /// syntax-highlighted code block instead of literal fence markers.
+    /// Everything else renders as **plain text** —
     /// verbatim — so `**` in a grep match or shell line is data, not emphasis,
     /// and a hostile result cannot weaponize markdown syntax to restyle or
     /// hide part of the output. Fail-closed: a tool not listed here never
@@ -935,6 +941,7 @@ pub(crate) fn render_turn_lines(
         "git_show",
         "git_add",
         "edit_file",
+        "write_file",
     ];
 
     for (i, tr) in turn.tool_results.iter().enumerate() {
