@@ -3445,7 +3445,7 @@ fn list_items_compact_when_single_line() {
     assert!(whole.contains("• gamma"), "third item should render");
     // No blank lines between single-line items.
     let blank_lines: Vec<bool> = result
-        .windows(2)
+        .array_windows::<2>()
         .map(|w| w[0].width() == 0 && w[1].width() > 0)
         .collect();
     assert_eq!(
@@ -3499,7 +3499,7 @@ fn list_spaces_all_items_when_majority_wraps() {
     );
     // No consecutive blank lines anywhere.
     let has_double_blank = result
-        .windows(2)
+        .array_windows::<2>()
         .any(|w| w[0].width() == 0 && w[1].width() == 0);
     assert!(
         !has_double_blank,
@@ -3531,7 +3531,7 @@ fn even_split_stays_tight() {
     let md = format!("- {long}\n- {long}\n- short1\n- short2");
     let result = markdown_lines(&md, 40);
     let blank_lines: Vec<bool> = result
-        .windows(2)
+        .array_windows::<2>()
         .map(|w| w[0].width() == 0 && w[1].width() > 0)
         .collect();
     assert_eq!(
@@ -3598,7 +3598,7 @@ fn nested_list_makes_own_spacing_decision() {
     // No consecutive blank lines anywhere (visually blank includes
     // indented whitespace-only lines).
     let has_double_blank = result
-        .windows(2)
+        .array_windows::<2>()
         .any(|w| w[0].to_string().trim().is_empty() && w[1].to_string().trim().is_empty());
     assert!(
         !has_double_blank,
@@ -3660,7 +3660,7 @@ fn nested_list_gets_blank_line_before_next_item() {
     // No consecutive blank lines anywhere (visually blank includes
     // indented whitespace-only lines).
     let has_double_blank = result
-        .windows(2)
+        .array_windows::<2>()
         .any(|w| w[0].to_string().trim().is_empty() && w[1].to_string().trim().is_empty());
     assert!(!has_double_blank, "no consecutive blank lines\n{whole}");
 }
@@ -3669,7 +3669,7 @@ fn nested_list_gets_blank_line_before_next_item() {
 fn ordered_list_items_compact_when_single_line() {
     let result = markdown_lines("1. first\n2. second\n3. third", 80);
     let blank: Vec<bool> = result
-        .windows(2)
+        .array_windows::<2>()
         .map(|w| w[0].width() == 0 && w[1].width() > 0)
         .collect();
     assert_eq!(
@@ -3708,7 +3708,7 @@ fn spaced_list_nested_list_single_blank_between_items() {
     );
     // No two consecutive visually-blank rows anywhere.
     let has_double_blank = text
-        .windows(2)
+        .array_windows::<2>()
         .any(|w| w[0].trim().is_empty() && w[1].trim().is_empty());
     assert!(!has_double_blank, "no two consecutive blank lines\n{whole}");
 }
@@ -3735,7 +3735,7 @@ fn mixed_list_and_paragraph_separated_by_one_blank() {
     let md = "paragraph\n- list";
     let result = markdown_lines(md, 80);
     let blank: Vec<bool> = result
-        .windows(2)
+        .array_windows::<2>()
         .map(|w| w[0].width() == 0 && w[1].width() > 0)
         .collect();
     assert_eq!(
