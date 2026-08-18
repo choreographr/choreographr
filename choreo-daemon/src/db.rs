@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use choreo_proto::{ContextConfig, ReasoningProducer, Turn};
@@ -20,8 +20,8 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 /// Runtime catalog-refresh state (S4): the last models.dev fetch-attempt
 /// timestamp and the current etag. One table for both so the refresh state is
 /// a single coherent record. A new table is created lazily on first write, so
-/// adding it is purely additive — no schema version bump (the migration chain
-/// stays empty).
+/// adding it is purely additive — no schema version bump and no migration
+/// entry is needed for it.
 const CATALOG_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalog_state");
 /// Key for the last models.dev fetch-attempt timestamp (Unix epoch millis, 8
 /// bytes little-endian). Written BEFORE every fetch: the cooldown is armed at
@@ -129,6 +129,16 @@ pub const SCHEMA_VERSION: u64 = 2;
 /// GB/s-scale. Tuning this is a constant, not a design change — the codec is
 /// concrete (zstd) and the on-disk contract is "zstd-compressed MessagePack".
 const COMPRESSION_LEVEL: i32 = 3;
+
+/// Maximum number of bytes a single `session_turns` value may expand to when a
+/// zstd frame is decompressed. A zstd frame advertises its uncompressed size in
+/// its header, and `Decoder`/`decode_all` allocate that much on faith — a
+/// corrupt or malicious row could therefore claim an absurd size and pin the
+/// daemon's memory. We cap decompression and treat an over-limit frame as
+/// undecodable (the caller skips it with a warning, same as any corrupt row).
+/// Set comfortably above any legitimate turn payload: conversation text + tool
+/// output + reasoning artifacts.
+const MAX_TURN_DECODED_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 /// The 4-byte little-endian magic that prefixes every zstd frame
 /// (0xFD2FB528). It is zstd's *inherent* frame marker, not a wrapper tag we
@@ -731,12 +741,37 @@ fn zstd_encode(payload: &[u8]) -> io::Result<Vec<u8>> {
         .map_err(|e| db_err(format!("zstd encode turn: {e}")))
 }
 
-/// Recover the original MessagePack bytes from a zstd frame. The zstd frame is
-/// self-terminating (it carries the uncompressed length), so `decode_all` needs
-/// no size hint.
+/// Recover the original MessagePack bytes from a zstd frame, bounded by
+/// [`MAX_TURN_DECODED_BYTES`] (see [`zstd_decode_with_limit`]).
 fn zstd_decode(blob: &[u8]) -> io::Result<Vec<u8>> {
-    zstd::stream::decode_all(std::io::Cursor::new(blob))
-        .map_err(|e| db_err(format!("zstd decode turn: {e}")))
+    zstd_decode_with_limit(blob, MAX_TURN_DECODED_BYTES)
+}
+
+/// Decompress a zstd frame into a buffer of at most `limit` bytes. A zstd frame
+/// advertises its uncompressed size in its header and `decode_all` would
+/// allocate that much on faith, so we stream-decode through a `Take` cap
+/// instead: a frame that would expand past `limit` is rejected as undecodable
+/// (defense-in-depth against a corrupt/malicious row). A legitimate turn's
+/// content is far below the cap, so the bound never bites. The limit is a
+/// parameter so the bomb guard is unit-testable without allocating a huge
+/// buffer; production callers use [`MAX_TURN_DECODED_BYTES`].
+fn zstd_decode_with_limit(blob: &[u8], limit: u64) -> io::Result<Vec<u8>> {
+    let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(blob))
+        .map_err(|e| db_err(format!("zstd decode turn (init): {e}")))?;
+    let mut buf = Vec::new();
+    // `Read::take` truncates the read at limit+1 bytes, so we never allocate an
+    // attacker-claimed size; buf ending at (or over) the limit means the frame
+    // expands further than we're willing to accept.
+    (&mut decoder)
+        .take(limit + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| db_err(format!("zstd decode turn: {e}")))?;
+    if buf.len() as u64 > limit {
+        return Err(db_err(format!(
+            "turn frame expands past {limit} bytes; refusing"
+        )));
+    }
+    Ok(buf)
 }
 
 /// The 1 → 2 schema migration: re-encode every `session_turns` value from raw
@@ -754,11 +789,11 @@ fn zstd_decode(blob: &[u8]) -> io::Result<Vec<u8>> {
 /// contract: a crash mid-rewrite leaves the pre-migration state intact).
 fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
     info!("applying 1→2 migration: re-encoding session_turns values with zstd");
-    // Read every value and compute the compressed replacement first (we cannot
-    // mutate the table while iterating it under redb's borrow rules, and
-    // doing the CPU-bound compression without holding the write lock keeps
-    // the write transaction minimal).
-    let mut rewrites: Vec<((u64, u32), Vec<u8>)> = Vec::new();
+    // Pass 1 (read txn): identify which rows need re-encoding. We buffer only
+    // the (session_id, turn_id) keys — never the values — so memory stays flat
+    // no matter how many turns, or how large, the database holds (turn history
+    // is the bulk of the DB, and buffering every blob would spike startup RAM).
+    let mut keys: Vec<(u64, u32)> = Vec::new();
     let mut skipped = 0usize;
     {
         let read_txn = db
@@ -777,10 +812,9 @@ fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
             let (key, value) =
                 result.map_err(|e| db_err(format!("redb iter item (migration): {e}")))?;
             let (sid, idx) = key.value();
-            let bytes = value.value();
             // Already a zstd frame ⇒ this row survived an earlier (stamp-less)
             // run of this same migration; leave it byte-for-byte intact.
-            if bytes.starts_with(&ZSTD_FRAME_MAGIC) {
+            if value.value().starts_with(&ZSTD_FRAME_MAGIC) {
                 debug!(
                     session_id = sid,
                     turn_id = idx,
@@ -789,14 +823,18 @@ fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
                 skipped += 1;
                 continue;
             }
-            let compressed = zstd_encode(bytes)?;
-            rewrites.push(((sid, idx), compressed));
+            keys.push((sid, idx));
         }
     }
-    if rewrites.is_empty() {
+    if keys.is_empty() {
         info!(skipped, "no raw session_turns values to re-encode");
         return Ok(());
     }
+    // Pass 2 (exactly one redb write transaction, the atomic-change contract: a
+    // crash mid-rewrite leaves the pre-migration state intact). We re-read each
+    // value inside the write snapshot and re-encode it in place — migration runs
+    // single-threaded at startup with no competing writers, so holding the write
+    // lock while compressing is safe and keeps memory flat (only keys buffered).
     let write_txn = db
         .begin_write()
         .map_err(|e| db_err(format!("redb write txn (migration): {e}")))?;
@@ -804,7 +842,16 @@ fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
         let mut table = write_txn
             .open_table(SESSION_TURNS)
             .map_err(|e| db_err(format!("redb open turns (migration): {e}")))?;
-        for (key, compressed) in &rewrites {
+        for key in &keys {
+            // The write snapshot reflects the pre-write state for every key here
+            // (keys are distinct, each read before its write), so get() returns
+            // the legacy raw-MessagePack blob that Pass 1 identified.
+            let raw = table
+                .get(*key)
+                .map_err(|e| db_err(format!("redb get turn (migration): {e}")))?
+                .ok_or_else(|| db_err(format!("turn vanished during migration: {key:?}")))
+                .map(|g| g.value().to_vec())?;
+            let compressed = zstd_encode(&raw)?;
             table
                 .insert(*key, compressed.as_slice())
                 .map_err(|e| db_err(format!("redb insert turn (migration): {e}")))?;
@@ -814,7 +861,7 @@ fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
         .commit()
         .map_err(|e| db_err(format!("redb commit turn migration: {e}")))?;
     info!(
-        encoded = rewrites.len(),
+        encoded = keys.len(),
         skipped, "re-encoded session_turns values with zstd"
     );
     Ok(())
@@ -855,24 +902,28 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
         .open_table(SESSION_TURNS)
         .map_err(|e| db_err(format!("redb open turns: {e}")))?;
     let mut turns: Vec<(u32, Turn)> = Vec::new();
-    for result in table
-        .iter()
-        .map_err(|e| db_err(format!("redb iter turns: {e}")))?
-    {
+    // Bounded range scan over exactly this session's turn ids rather than
+    // iterating (and, since schema 2, decompressing) every turn in every
+    // session — the old full-table scan made each read O(total turns) and
+    // wasted zstd decode cycles on unrelated sessions' blobs.
+    let iter = table
+        .range::<(u64, u32)>((session_id, 0u32)..(session_range_end(session_id), 0u32))
+        .map_err(|e| db_err(format!("redb range turns: {e}")))?;
+    for result in iter {
         let (key, value) = result.map_err(|e| db_err(format!("redb iter item: {e}")))?;
-        let (sid, idx) = key.value();
-        if sid == session_id {
-            match zstd_decode(value.value())
-                .and_then(|buf| rmp_serde::from_slice::<Turn>(&buf).map_err(io::Error::other))
-            {
-                Ok(turn) => turns.push((idx, turn)),
-                Err(e) => {
-                    tracing::warn!(session_id, turn_id = idx, error = %e, "undecodable turn, skipping");
-                }
+        let (_, idx) = key.value();
+        match zstd_decode(value.value())
+            .and_then(|buf| rmp_serde::from_slice::<Turn>(&buf).map_err(io::Error::other))
+        {
+            Ok(turn) => turns.push((idx, turn)),
+            Err(e) => {
+                tracing::warn!(session_id, turn_id = idx, error = %e, "undecodable turn, skipping");
             }
         }
     }
-    turns.sort_by_key(|(idx, _)| *idx);
+    // The range scan yields rows already in (session_id, turn_id) key order,
+    // and every row here shares the same session, so turns come out sorted by
+    // turn_id — no explicit sort needed.
     Ok(turns)
 }
 
@@ -1433,6 +1484,48 @@ mod tests {
             reasoning_artifact: None,
             reasoning_producer: None,
         }
+    }
+
+    #[test]
+    fn zstd_round_trip_and_bounded_decode() {
+        // Compressible payload: compresses well, so the stored frame is smaller
+        // than the source (the point of the schema-2 codec) and the framing is
+        // exactly a zstd frame (magic prefix).
+        let payload = b"hello world hello world redundant redundant ".repeat(64);
+        let compressed = zstd_encode(&payload).unwrap();
+        assert!(
+            compressed.starts_with(&ZSTD_FRAME_MAGIC),
+            "encoded blob must be a zstd frame"
+        );
+        assert!(
+            compressed.len() < payload.len(),
+            "compressible turn text must shrink after zstd"
+        );
+
+        // Round trip: decode recovers the exact original bytes.
+        let decoded = zstd_decode(&compressed).unwrap();
+        assert_eq!(decoded, payload);
+
+        // Incompressible payload still round-trips (frame may not shrink, but
+        // must decode back losslessly).
+        let randomish: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let c2 = zstd_encode(&randomish).unwrap();
+        assert_eq!(zstd_decode(&c2).unwrap(), randomish);
+    }
+
+    #[test]
+    fn zstd_bounded_decode_rejects_oversized_frame() {
+        // A small, highly-compressible payload that expands well past a small
+        // limit must be rejected rather than fully allocated — the
+        // decompression-bomb guard (production cap: MAX_TURN_DECODED_BYTES).
+        let compressed = zstd_encode(&b"x".repeat(10_000)).unwrap();
+        // limit 100 ≪ 10 kB expanded size ⇒ undecodable.
+        assert!(zstd_decode_with_limit(&compressed, 100).is_err());
+        // A limit large enough for the payload still decodes.
+        assert_eq!(
+            zstd_decode_with_limit(&compressed, 1_000_000).unwrap(),
+            b"x".repeat(10_000)
+        );
     }
 
     #[test]

@@ -2082,6 +2082,13 @@ every existing turn row by wrapping its MessagePack bytes in a zstd frame
 (compression is codec-orthogonal to serialization, so no deserialize/
 re-serialize is needed); the stored rows are identified as already-compressed
 by the zstd frame magic so the migration is safe to re-run after a crash.
+Decompression on read is **bounded** to `MAX_TURN_DECODED_BYTES` (256 MiB per
+row, far above any legitimate turn payload): `read_turns` stream-decodes
+through a `Take` cap instead of trusting the frame header's declared content
+size, so a corrupt/malicious row cannot pin the daemon's memory (a
+"decompression bomb"). Reads also use a bounded `(session_id, …)` key-range
+scan over only the target session's turns rather than decompressing the whole
+table.
 
 - **Versioning policy (additive vs breaking).** An additive change — a new
   struct field with `#[serde(default)]`, or a new enum variant appended — needs
