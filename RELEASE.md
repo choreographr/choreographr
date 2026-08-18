@@ -61,6 +61,9 @@ just ci
 # 3. Toolchain present on the build machines you'll use:
 #    Linux box:  zig, cargo-zigbuild, gh, (dpkg-deb, rpmbuild optional)
 #    MacBook:    zig, gh
+#    (Both also need a STABLE rust toolchain: `just release` builds the dist
+#    binaries on stable Rust via scripts/build-stable.sh — `rustup toolchain
+#    install stable` if it isn't the rustup default.)
 just preflight               # checks cargo + zig, notes nextest
 #
 # Note: `just release` raises the fd soft limit itself (release.sh runs
@@ -222,6 +225,9 @@ a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
 
 Both machines run the same dry-run flow. `scripts/release.sh`:
 
+- builds the shipped binaries on **stable** Rust (each cargo build runs through
+  `scripts/build-stable.sh`, reproducible and matching the crates.io/MSRV
+  story; see the README build notes),
 - reads the version from `Cargo.toml`,
 - guards against a dirty tree,
 - builds with `--features pdf,metrics,blockchain` (the workspace patch hardens

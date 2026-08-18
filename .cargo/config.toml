@@ -2,7 +2,8 @@
 # versions whose declared `rust-version` is compatible with the workspace's
 # minimum supported Rust version (1.92, see the root Cargo.toml). If no
 # compatible version satisfies a requirement, fall back to the newest version
-# and emit a warning instead of failing the build.
+# and emit a warning instead of failing the build. This is a stable Cargo
+# feature and works identically on nightly and stable.
 [resolver]
 incompatible-rust-versions = "fallback"
 
@@ -31,13 +32,20 @@ test-integration = "nextest run --workspace --all-features --run-ignored only"
 # everything: unit + integration in one pass
 test-all = "nextest run --workspace --all-features --run-ignored all"
 
-# Per-profile rustflags (unstable Cargo feature, nightly-only — the repo is
-# pinned to nightly via rust-toolchain.toml). This is what lets the root
-# Cargo.toml scope compiler flags by profile: -Zshare-generics=yes in
-# [profile.dev] only, --jobs-frontend=16 in both dev and release. The opt-in
-# lives here (config) rather than on the CLI so plain `cargo build` / `cargo
-# test` pick it up. Note: profile rustflags replace [build] rustflags but are
-# concatenated with [target.'cfg(...)'] rustflags, so the wild-linker flags
-# in ~/.cargo/config.toml still apply.
+# Per-profile rustflags (unstable Cargo feature, nightly-only). This opt-in is
+# what lets the root Cargo.toml scope `-Z` compiler flags by profile —
+# `-Zshare-generics=yes` in [profile.dev] only, `--jobs-frontend=16` in dev and
+# release — so EVERY adhoc `cargo` command (including per-crate `-p x` builds
+# and `cargo test` / `cargo nextest run`) automatically builds fast under the
+# nightly default toolchain (see rust-toolchain.toml). An LLM/agent issuing raw
+# `cargo` commands needs to know nothing: the flags just apply.
+#
+# This block, plus the per-profile `rustflags` keys it enables, HARD-BLOCKS
+# stable Cargo. Stable builds are therefore an explicit opt-out, run through
+# scripts/build-stable.sh (`just build-stable` / `check-stable` / `test-stable`),
+# which temporarily strips these nightly-only bits, runs `cargo +stable ...`,
+# and restores them. Note: profile rustflags replace [build] rustflags but
+# concatenate with [target.'cfg(...)'] rustflags, so per-machine linker flags
+# (e.g. the wild-linker flags in ~/.cargo/config.toml) still apply.
 [unstable]
 profile-rustflags = true

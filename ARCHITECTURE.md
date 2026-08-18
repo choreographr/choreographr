@@ -3161,16 +3161,29 @@ deny-by-default never-type fallback lints. The first dependency a future floor
 bump unblocks is `serial_test` 4.x (requires Rust 1.93.1 — held at 3.x until
 then, see the root `Cargo.toml`).
 
-**Building requires nightly.** `rust-toolchain.toml` pins the workspace to
-the nightly channel (rustup auto-installs it on first `cargo` run). Nightly
-enables the per-profile `rustflags` in the root `Cargo.toml` via the
-unstable `profile-rustflags` feature (opted in under `[unstable]` in
-`.cargo/config.toml`): `-Zshare-generics=yes` in `[profile.dev]` only, and
-`-Zunstable-options --jobs-frontend=16` (parallel rustc frontend, the
-replacement for the deprecated `-Zthreads`) in both dev and release.
-Profile rustflags replace `[build]` rustflags but concatenate with
-`[target.'cfg(...)']` rustflags, so per-machine linker flags (e.g. the wild
-linker in `~/.cargo/config.toml`) still apply.
+**Building defaults to nightly.** `rust-toolchain.toml` pins the workspace to
+the `nightly` channel (rustup auto-installs it on first `cargo` run) so that
+EVERY adhoc `cargo` command — including per-crate builds like `cargo build -p
+choreo-x` / `cargo check -p x` / `cargo nextest run -p x` — automatically
+applies the fast per-profile `-Z` compiler flags. Nightly enables the
+per-profile `rustflags` in the root `Cargo.toml` via the unstable
+`profile-rustflags` feature (opted in under `[unstable]` in `.cargo/config.toml`):
+`-Zshare-generics=yes` in `[profile.dev]` only, and `-Zunstable-options
+--jobs-frontend=16` (parallel rustc frontend, the replacement for the
+deprecated `-Zthreads`) in both dev and release. An LLM/agent issuing raw
+`cargo` commands gets the fast build with no extra ceremony. Profile rustflags
+replace `[build]` rustflags but concatenate with `[target.'cfg(...)']`
+rustflags, so per-machine linker flags (e.g. the wild linker in
+`~/.cargo/config.toml`) still apply.
+
+**Stable builds are a supported opt-out.** The sources use no nightly-only
+features, so the code targets a stable MSRV floor (`rust-version = "1.92"`,
+enforced by the CI MSRV job) and builds on any stable ≥ 1.92. The nightly-only
+`profile-rustflags` wiring, however, hard-blocks stable *Cargo* (the keys it
+enables require that unstable feature), so a stable build is run through
+`scripts/build-stable.sh` (`just build-stable` / `check-stable` /
+`test-stable`): it temporarily strips the nightly-only `rustflags` keys and the
+`[unstable]` block, runs `cargo +stable ...`, and restores them on exit.
 
 The `choreo-daemon` crate depends on `zlob` (a Zig-implemented glob and
 gitignore-aware directory walker used by `grep`, `find`, `delete_files`, and

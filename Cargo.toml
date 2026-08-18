@@ -133,7 +133,10 @@ dependent-version = "fix"
 # go wrong during development.
 #
 # rustflags (requires the [unstable] profile-rustflags opt-in in
-# .cargo/config.toml; nightly-only, the repo is pinned via rust-toolchain.toml):
+# .cargo/config.toml; nightly-only — see rust-toolchain.toml): auto-applied to
+# every adhoc `cargo` command under the nightly default toolchain, including
+# per-crate `cargo build -p choreo-x` / `cargo check -p x` / `cargo nextest
+# run -p x`.
 # - -Zshare-generics=yes: emit each generic monomorphization once per crate
 #   graph instead of once per using crate — the big dev-build win. Deliberately
 #   dev-ONLY: it has a history of codegen bugs under optimization, and with no
@@ -158,7 +161,8 @@ rustflags = ["-Zunstable-options", "--jobs-frontend=16", "-Zshare-generics=yes"]
 #   into a whole-daemon crash.
 #
 # rustflags: -Zunstable-options + --jobs-frontend=16 (same parallel-frontend
-# flag as dev). No -Zshare-generics here — see the dev-profile note above.
+# flag as dev), auto-applied under the nightly default toolchain. No
+# -Zshare-generics here — see the dev-profile note above.
 [profile.release]
 strip = "symbols"
 rustflags = ["-Zunstable-options", "--jobs-frontend=16"]

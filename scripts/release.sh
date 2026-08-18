@@ -11,6 +11,11 @@
 #
 # Requires: cargo install cargo-zigbuild (the Linux x86_64 musl tarball build
 # below cross-compiles via zig).
+#
+# Dist/release binaries are built on STABLE Rust (reproducible; matches the
+# crates.io/MSRV story). Each cargo build goes through scripts/build-stable.sh,
+# which temporarily strips the nightly-only profile-rustflags bits the dev
+# toolchain uses, runs the build under `cargo +stable`, then restores them.
 set -euo pipefail
 
 usage() {
@@ -49,6 +54,14 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+# Dist/release binaries are built on STABLE Rust (see the header comment), so a
+# stable toolchain is a hard prerequisite — fail fast with a clear hint instead
+# of letting `cargo +stable` fail obscurely mid-build.
+if ! rustup toolchain list 2>/dev/null | grep -q '^stable'; then
+    echo "error: a stable Rust toolchain is required for release builds — run \`rustup toolchain install stable\`" >&2
+    exit 1
+fi
 
 # Version comes from the workspace manifest — the single source of truth that
 # packaging/homebrew/choreographr.rb and packaging/aur/PKGBUILD mirror.
@@ -113,10 +126,10 @@ echo "==> building release binaries (root package)"
 # the standard solution. zlob is unaffected — its build.rs already maps the
 # triple itself.
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
-    cargo zigbuild --release -p choreographr --target x86_64-unknown-linux-musl --features pdf,metrics,mimalloc,blockchain
+    ./scripts/build-stable.sh zigbuild --release -p choreographr --target x86_64-unknown-linux-musl --features pdf,metrics,mimalloc,blockchain
     TARBALL_BIN_DIR="target/x86_64-unknown-linux-musl/release"
 else
-    cargo build --release -p choreographr --features pdf,metrics,blockchain
+    ./scripts/build-stable.sh build --release -p choreographr --features pdf,metrics,blockchain
     TARBALL_BIN_DIR="target/release"
 fi
 
@@ -151,7 +164,7 @@ tar czf "$TARBALL" -C "$STAGE" \
 # step is skipped — dpkg/rpmbuild are not present.)
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     echo "==> building host (glibc) release binaries for .deb/.rpm"
-    cargo build --release -p choreographr --features pdf,metrics,blockchain
+    ./scripts/build-stable.sh build --release -p choreographr --features pdf,metrics,blockchain
 fi
 
 # .deb/.rpm are best-effort: skip with a warning when the toolchain is absent

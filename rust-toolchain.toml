@@ -1,9 +1,19 @@
-# Pin the workspace to the nightly Rust toolchain. Nightly is required for
-# the per-profile `rustflags` in the root Cargo.toml ([unstable]
-# profile-rustflags in .cargo/config.toml) and for the nightly-only -Z flags
-# they carry (-Zshare-generics in dev, --jobs-frontend in dev and release).
+# Pin the workspace to the nightly Rust toolchain. Nightly is the DEFAULT build
+# path so that every adhoc `cargo` invocation — including per-crate commands an
+# LLM/agent or developer issues like `cargo build -p choreo-x`, `cargo check -p
+# x`, `cargo nextest run -p x` — automatically picks up the fast per-profile
+# `-Z` compiler flags wired in via the nightly-only `profile-rustflags` feature
+# (see the `[unstable]` block in .cargo/config.toml and the `rustflags` keys in
+# the root Cargo.toml). Agent/adhoc commands get the fast build for free; they
+# do not need to remember `+nightly` or RUSTFLAGS.
 #
 # `channel = "nightly"` tracks the latest nightly; if a nightly regression
 # breaks the build, pin a date instead (e.g. nightly-2026-08-14).
+#
+# Building with STABLE Rust is an explicit, supported opt-out: the sources use
+# no nightly-only features (MSRV floor is 1.92, see the root Cargo.toml), and
+# `just build-stable` / `check-stable` / `test-stable` run one command on stable
+# by temporarily stripping the nightly-only `profile-rustflags` bits that
+# otherwise hard-block stable Cargo (see scripts/build-stable.sh).
 [toolchain]
 channel = "nightly"

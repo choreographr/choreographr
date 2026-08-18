@@ -73,6 +73,29 @@ build: _require-zig
 build-debug: _require-zig
     cargo build {{ CARGO_FLAGS }} --workspace --profile debug
 
+# ── stable builds (escape hatch from the nightly default) ─────────────────────
+# The default toolchain is NIGHTLY (see rust-toolchain.toml), so every adhoc
+# `cargo` command — including per-crate `cargo build -p choreo-x` / `cargo
+# check -p x` / `cargo nextest run -p x` — automatically applies the fast
+# per-profile `-Z` flags via [unstable] profile-rustflags (see .cargo/config.toml).
+# Those same nightly-only bits HARD-BLOCK stable Cargo, so a stable build is an
+# explicit opt-out: these recipes run through scripts/build-stable.sh, which
+# temporarily strips the nightly-only config/manifest keys for one command and
+# restores them afterwards. Stable compatibility itself is guaranteed by the
+# code (no nightly features) and the CI MSRV job, independent of this config.
+
+# Stable build (the `profile` — release by default — plus any extra args)
+build-stable: _require-zig
+    ./scripts/build-stable.sh build --workspace --profile "{{ profile }}" {{ CARGO_FLAGS }}
+
+# Stable type-check (all targets, no linking)
+check-stable: _require-zig
+    ./scripts/build-stable.sh check --workspace --all-targets {{ CARGO_FLAGS }}
+
+# Stable unit tests (libtest, serialized — no nextest needed)
+test-stable: _require-zig
+    ./scripts/build-stable.sh test --workspace {{ CARGO_FLAGS }}
+
 # No linking, but zig is still required (resolution runs zlob's build script).
 # Type-check the whole workspace (all targets) — the fastest CI signal.
 check: _require-zig
