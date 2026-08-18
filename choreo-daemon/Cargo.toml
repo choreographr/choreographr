@@ -77,6 +77,7 @@ ckb-vm = { version = "0.24.14", features = ["detect-asm"] }
 tempfile.workspace = true
 postcard.workspace = true
 rmp-serde.workspace = true
+zstd.workspace = true
 # Native PDF parsing (pdf_classify / pdf_to_markdown), behind the `pdf` feature.
 #
 # This is a REGISTRY dep (`pdf-inspector = "0.1"`) — deliberately NOT a git pin,

@@ -492,6 +492,10 @@ and stored in the `redb` database. Identity keys reside in
 The socket path defaults to `/tmp/Choreographr.sock` (override with
 `CHOREOGRAPHR_SOCKET_PATH`). The database path defaults to
 `~/.local/share/choreographr/state.redb` (override with `CHOREOGRAPHR_DB_PATH`).
+Turn history (conversation text, tool output, reasoning) is stored
+zstd-compressed in the `session_turns` table (schema 2); on the first startup
+after upgrade the daemon re-encodes existing turns and keeps a `state.redb.bak-v1`
+backup.
 
 `CHOREOGRAPHR_MAX_TURNS` overrides the `max_turns` setting from `config.toml`
 (resolution chain: `CHOREOGRAPHR_MAX_TURNS` → `config.toml` → default 0; `0` =

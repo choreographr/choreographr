@@ -115,7 +115,31 @@ pub fn db_path() -> io::Result<PathBuf> {
 /// records: codec swap, key-type change, table split/merge, semantic change.
 /// Additive fields (with `#[serde(default)]`) do NOT bump it — named
 /// MessagePack tolerates those without a migration.
-pub const SCHEMA_VERSION: u64 = 1;
+///
+/// v2 (the current version): the `session_turns` value codec changed from raw
+/// MessagePack to zstd-compressed MessagePack. This IS a breaking codec change
+/// (an uncompressed legacy blob and a compressed one are mutually undecodable
+/// through the opposite reader), so it owns the 1→2 migration that re-encodes
+/// every existing row.
+pub const SCHEMA_VERSION: u64 = 2;
+
+/// zstd compression level for `session_turns` values. Level 3 (the library
+/// default) balances ratio against speed: turn text/tool-output/reasoning
+/// compresses 4–10× while encode stays hundreds of MB/s and decode is
+/// GB/s-scale. Tuning this is a constant, not a design change — the codec is
+/// concrete (zstd) and the on-disk contract is "zstd-compressed MessagePack".
+const COMPRESSION_LEVEL: i32 = 3;
+
+/// The 4-byte little-endian magic that prefixes every zstd frame
+/// (0xFD2FB528). It is zstd's *inherent* frame marker, not a wrapper tag we
+/// add — we use it purely to tell an already-compressed row from a legacy
+/// raw-MessagePack row, which is what makes the 1→2 migration safe to re-run
+/// after a crash (idempotency the migration framework requires).
+///
+/// It is unambiguous: a legacy `Turn` always serializes to a named-MessagePack
+/// map, so its first byte is a map header (0x80..0x8f, the 13-field marker is
+/// 0x8D) — never 0x28 (a positive fixint). A zstd frame starts with 0x28.
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// The version [`open_db`] stamps on a database file it creates. Fixed at 1:
 /// the 0 → 1 transition is *initialization* (a brand-new file, stamped at
@@ -153,16 +177,15 @@ struct Migration {
     run: fn(&redb::Database) -> io::Result<()>,
 }
 
-/// Ordered migration chain, empty at release: version 1 is the *initial*
-/// stamped version, reached by initialization at database creation
-/// ([`open_db`] stamps [`INITIAL_SCHEMA_VERSION`]), not by a migration. There
-/// is no v0 data worth migrating pre-release — leftover postcard-era blobs
-/// are skipped with a warning by `read_all_sessions`/`read_turns` on first
-/// read. The first real entry (`from == 1`, upgrading 1 → 2) lands with the
-/// first future breaking schema change; [`run_migrations_to`] validates that
-/// the chain is contiguous and covers every version from the first migration
-/// up to the target before applying anything.
-const MIGRATIONS: &[Migration] = &[];
+/// Ordered migration chain. The first real entry (1 → 2, the `session_turns`
+/// zstd codec change) lands here, upgrading FROM the initial stamped version.
+/// A future breaking change adds the next entry (from == 2). [`run_migrations_to`]
+/// validates that the chain is contiguous and covers every version from the
+/// first migration up to the target before applying anything.
+const MIGRATIONS: &[Migration] = &[Migration {
+    from: 1,
+    run: migrate_turn_values_to_zstd,
+}];
 
 /// Read the persisted schema version, or `0` for an unversioned database
 /// (no `meta` table yet, or the `schema_version` key absent).
@@ -215,14 +238,13 @@ fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Result<()> {
 ///
 /// The path is injected (the caller resolves [`db_path`]) so the naming
 /// behavior is unit-testable without touching the real data directory.
-/// Dormant while [`MIGRATIONS`] is empty — the 0 → 1 transition is pure
-/// stamping and rewrites nothing, so no snapshot is taken (see
-/// [`run_migrations`]). Must be correct when the first real migration lands:
-/// one backup per source schema version, taken before any write, so a failed
-/// migration can always be rolled back from disk. Safe to `fs::copy` the
-/// open file because this runs at startup, single-threaded, before any
-/// migration writes — the database is quiescent, so the on-disk image
-/// reflects the last committed transaction.
+/// Fires only before a real migration writes (never for the pure 0 → 1
+/// initialization stamp): one backup per source schema version, taken before
+/// any write, so a failed migration can always be rolled back from disk. The
+/// active 1 → 2 migration therefore snapshots a v1 file to `bak-v1`. Safe to
+/// `fs::copy` the open file because this runs at startup, single-threaded,
+/// before any migration writes — the database is quiescent, so the on-disk
+/// image reflects the last committed transaction.
 fn backup_db_file(path: &std::path::Path, from: u64) -> io::Result<()> {
     let file_name = path
         .file_name()
@@ -240,14 +262,23 @@ fn backup_db_file(path: &std::path::Path, from: u64) -> io::Result<()> {
 
 /// Bring the database up to [`SCHEMA_VERSION`]. Idempotent; safe to call on
 /// every startup, right after [`open_db`]. Delegates to [`run_migrations_to`]
-/// with the production version and chain.
+/// with the production version and chain, resolving the database file path
+/// once so the pre-migration backup targets the file that is actually being
+/// migrated (never injected from a test's tempdir).
 pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
-    run_migrations_to(db, SCHEMA_VERSION, MIGRATIONS)
+    run_migrations_to(db, SCHEMA_VERSION, MIGRATIONS, &db_path()?)
 }
 
 /// The full migration runner, parameterized by the target version and the
 /// migration chain so the future (non-empty-chain) behavior is unit-testable
 /// today. Production entry point: [`run_migrations`].
+///
+/// The path of the database file being migrated is a parameter, so a unit test
+/// can point the pre-migration backup at its own tempdir instead of leaking a
+/// copy of the *real* data-directory file (the pre-existing design called
+/// `db_path()` here, which made any run_migrations_to test with a non-empty
+/// chain silently snapshot the real `state.redb`). Production resolves it once
+/// in [`run_migrations`]; tests inject their own path.
 ///
 /// - A database at a *newer* version than the target is rejected outright
 ///   (downgrade protection — a future binary's writes would be misread by
@@ -267,7 +298,12 @@ pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
 ///   migration (see [`MIGRATIONS`]). A database still at 0 at startup is a
 ///   pre-existing unversioned file: stamped to 1 with a warning while the
 ///   target is 1, refused once the chain grows past 1.
-fn run_migrations_to(db: &redb::Database, target: u64, migrations: &[Migration]) -> io::Result<()> {
+fn run_migrations_to(
+    db: &redb::Database,
+    target: u64,
+    migrations: &[Migration],
+    db_path: &std::path::Path,
+) -> io::Result<()> {
     let current = current_schema_version(db)?;
     if current > target {
         error!(
@@ -321,8 +357,7 @@ fn run_migrations_to(db: &redb::Database, target: u64, migrations: &[Migration])
     // named after the version being migrated FROM: `current` is the schema
     // version of the file on disk right now.
     if !migrations.is_empty() {
-        let path = db_path()?;
-        backup_db_file(&path, current)?; // state.redb → state.redb.bak-v{current}
+        backup_db_file(db_path, current)?; // state.redb → state.redb.bak-v{current}
     }
     for migration in migrations.iter().filter(|m| m.from >= current) {
         info!(
@@ -683,6 +718,108 @@ pub fn purge_tombstoned_sessions(db: &redb::Database) -> io::Result<usize> {
     Ok(purged)
 }
 
+// ── Turn value compression ────────────────────────────────────────────────────
+
+/// Encode a MessagePack-encoded `Turn` with zstd at [`COMPRESSION_LEVEL`].
+/// Compression is applied to the WHOLE serialized blob (never per-field): zstd
+/// matches redundancy across the entire buffer, so it also compresses the
+/// MessagePack framing overhead (field keys, headers) on top of the string
+/// payloads. `encode_all` wraps the slice in a `Cursor` and returns one zstd
+/// frame.
+fn zstd_encode(payload: &[u8]) -> io::Result<Vec<u8>> {
+    zstd::stream::encode_all(std::io::Cursor::new(payload), COMPRESSION_LEVEL)
+        .map_err(|e| db_err(format!("zstd encode turn: {e}")))
+}
+
+/// Recover the original MessagePack bytes from a zstd frame. The zstd frame is
+/// self-terminating (it carries the uncompressed length), so `decode_all` needs
+/// no size hint.
+fn zstd_decode(blob: &[u8]) -> io::Result<Vec<u8>> {
+    zstd::stream::decode_all(std::io::Cursor::new(blob))
+        .map_err(|e| db_err(format!("zstd decode turn: {e}")))
+}
+
+/// The 1 → 2 schema migration: re-encode every `session_turns` value from raw
+/// MessagePack (the v1 codec) to zstd-compressed MessagePack (the v2 codec).
+/// Compression is codec-orthogonal to serialization, so a legacy raw blob is
+/// re-encoded by simply wrapping the SAME MessagePack bytes in a zstd frame —
+/// no deserialize/re-serialize of the `Turn` is needed.
+///
+/// Idempotency (required by the migration framework, whose crash recovery may
+/// re-run this after the stamp was never committed): an already-compressed row
+/// is recognized by [`ZSTD_FRAME_MAGIC`] and left untouched, so re-running
+/// cannot double-compress a row.
+///
+/// Runs the rewrite in exactly one redb write transaction (the atomic-change
+/// contract: a crash mid-rewrite leaves the pre-migration state intact).
+fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
+    info!("applying 1→2 migration: re-encoding session_turns values with zstd");
+    // Read every value and compute the compressed replacement first (we cannot
+    // mutate the table while iterating it under redb's borrow rules, and
+    // doing the CPU-bound compression without holding the write lock keeps
+    // the write transaction minimal).
+    let mut rewrites: Vec<((u64, u32), Vec<u8>)> = Vec::new();
+    let mut skipped = 0usize;
+    {
+        let read_txn = db
+            .begin_read()
+            .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        let table = match read_txn.open_table(SESSION_TURNS) {
+            // A fresh database with no turns has no table yet — nothing to migrate.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Ok(t) => t,
+            Err(e) => return Err(db_err(format!("redb open turns (migration): {e}"))),
+        };
+        let iter = table
+            .iter()
+            .map_err(|e| db_err(format!("redb iter turns (migration): {e}")))?;
+        for result in iter {
+            let (key, value) =
+                result.map_err(|e| db_err(format!("redb iter item (migration): {e}")))?;
+            let (sid, idx) = key.value();
+            let bytes = value.value();
+            // Already a zstd frame ⇒ this row survived an earlier (stamp-less)
+            // run of this same migration; leave it byte-for-byte intact.
+            if bytes.starts_with(&ZSTD_FRAME_MAGIC) {
+                debug!(
+                    session_id = sid,
+                    turn_id = idx,
+                    "turn already zstd-compressed; skipping"
+                );
+                skipped += 1;
+                continue;
+            }
+            let compressed = zstd_encode(bytes)?;
+            rewrites.push(((sid, idx), compressed));
+        }
+    }
+    if rewrites.is_empty() {
+        info!(skipped, "no raw session_turns values to re-encode");
+        return Ok(());
+    }
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db_err(format!("redb write txn (migration): {e}")))?;
+    {
+        let mut table = write_txn
+            .open_table(SESSION_TURNS)
+            .map_err(|e| db_err(format!("redb open turns (migration): {e}")))?;
+        for (key, compressed) in &rewrites {
+            table
+                .insert(*key, compressed.as_slice())
+                .map_err(|e| db_err(format!("redb insert turn (migration): {e}")))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| db_err(format!("redb commit turn migration: {e}")))?;
+    info!(
+        encoded = rewrites.len(),
+        skipped, "re-encoded session_turns values with zstd"
+    );
+    Ok(())
+}
+
 pub fn write_turn(
     db: &redb::Database,
     session_id: u64,
@@ -691,6 +828,8 @@ pub fn write_turn(
 ) -> io::Result<()> {
     let payload =
         rmp_serde::to_vec_named(turn).map_err(|e| db_err(format!("codec encode turn: {e}")))?;
+    // Serialize first, then compress the whole blob (see [`zstd_encode`]).
+    let compressed = zstd_encode(&payload)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| db_err(format!("redb write txn: {e}")))?;
@@ -699,7 +838,7 @@ pub fn write_turn(
             .open_table(SESSION_TURNS)
             .map_err(|e| db_err(format!("redb open turns: {e}")))?;
         table
-            .insert((session_id, turn_id), payload.as_slice())
+            .insert((session_id, turn_id), compressed.as_slice())
             .map_err(|e| db_err(format!("redb insert turn: {e}")))?;
     }
     write_txn
@@ -723,7 +862,9 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
         let (key, value) = result.map_err(|e| db_err(format!("redb iter item: {e}")))?;
         let (sid, idx) = key.value();
         if sid == session_id {
-            match rmp_serde::from_slice::<Turn>(value.value()) {
+            match zstd_decode(value.value())
+                .and_then(|buf| rmp_serde::from_slice::<Turn>(&buf).map_err(io::Error::other))
+            {
                 Ok(turn) => turns.push((idx, turn)),
                 Err(e) => {
                     tracing::warn!(session_id, turn_id = idx, error = %e, "undecodable turn, skipping");
@@ -1330,6 +1471,19 @@ mod tests {
         let turn = dummy_turn();
         write_turn(&db, id, 0, &turn).unwrap();
 
+        // The v2 codec stores the turn as a zstd-compressed MessagePack frame,
+        // not raw MessagePack — the whole point of the schema-2 change.
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(SESSION_TURNS).unwrap();
+            let guard = table.get((id, 0u32)).unwrap().unwrap();
+            let v = guard.value();
+            assert!(
+                v.starts_with(&ZSTD_FRAME_MAGIC),
+                "turns must be stored as zstd frames in schema 2"
+            );
+        }
+
         let turns = read_turns(&db, id).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].1, turn);
@@ -1394,13 +1548,14 @@ mod tests {
         let valid_turn = dummy_turn();
         write_turn(&db, id, 0, &valid_turn).unwrap();
 
-        // Manually insert a corrupt blob at index 1 (not valid postcard)
+        // Manually insert a corrupt blob at index 1 (neither a valid zstd
+        // frame nor valid MessagePack) to exercise the skip-and-warn path.
         {
             let write_txn = db.begin_write().unwrap();
             {
                 let mut table = write_txn.open_table(SESSION_TURNS).unwrap();
                 table
-                    .insert((id, 1u32), b"not valid postcard data".as_slice())
+                    .insert((id, 1u32), b"not a zstd frame".as_slice())
                     .unwrap();
             }
             write_txn.commit().unwrap();
@@ -1602,25 +1757,59 @@ mod tests {
     }
 
     #[test]
-    fn run_migrations_stamps_fresh_database_v1() {
-        // A DB created directly with `redb::Database::create` (bypassing
-        // `open_db`, which stamps INITIAL_SCHEMA_VERSION at creation) has no
-        // meta table → unversioned (0). At target 1 that is still a valid
-        // pre-existing-unversioned database, so the runner's 0 → 1
-        // transition initializes it: stamp v1.
+    fn migrate_turn_values_to_zstd_rewrites_legacy_rows() {
+        // A v1 database stores turns as raw MessagePack. The 1→2 migration must
+        // re-encode every row to a zstd frame so `read_turns` (which now always
+        // decompresses) can read them after the upgrade. Before the migration
+        // the same rows are the OPPOSITE codec, so `read_turns` cannot decode
+        // them — that "breaking codec change" is exactly why the migration owns
+        // the 1→2 schema bump (see SCHEMA_VERSION).
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
-        assert_eq!(
-            current_schema_version(&db).unwrap(),
-            0,
-            "a database created without open_db must be unversioned"
-        );
-        run_migrations(&db).unwrap();
-        assert_eq!(
-            current_schema_version(&db).unwrap(),
-            SCHEMA_VERSION,
-            "0 → 1 initialization must stamp the current schema version"
-        );
+        let sid = 1u64;
+
+        // Write legacy raw-MessagePack turn blobs directly into SESSION_TURNS,
+        // bypassing write_turn (which now compresses) — exactly what a v1 DB
+        // has on disk.
+        let turns: Vec<Turn> = (0..3).map(|_| dummy_turn()).collect();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(SESSION_TURNS).unwrap();
+                for (i, turn) in turns.iter().enumerate() {
+                    let raw = rmp_serde::to_vec_named(turn).unwrap();
+                    table.insert((sid, i as u32), raw.as_slice()).unwrap();
+                }
+            }
+            write_txn.commit().unwrap();
+        }
+
+        // Raw (uncompressed) blobs are undecodable through the now-
+        // decompressing reader: nothing is read back yet.
+        assert_eq!(read_turns(&db, sid).unwrap().len(), 0);
+
+        migrate_turn_values_to_zstd(&db).unwrap();
+
+        // After migration every row is a zstd frame that decodes to the turn.
+        let decoded = read_turns(&db, sid).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (i, (idx, turn)) in decoded.iter().enumerate() {
+            assert_eq!(*idx as usize, i);
+            assert_eq!(turn, &turns[i]);
+        }
+        // And the stored bytes are genuinely compressed (zstd frame magic).
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(SESSION_TURNS).unwrap();
+            for i in 0..3 {
+                let guard = table.get((sid, i)).unwrap().unwrap();
+                let v = guard.value();
+                assert!(
+                    v.starts_with(&ZSTD_FRAME_MAGIC),
+                    "row {i} must be stored as a zstd frame"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1637,13 +1826,49 @@ mod tests {
     }
 
     #[test]
-    fn run_migrations_is_idempotent() {
+    fn migrate_turn_values_to_zstd_is_idempotent() {
+        // The migration framework may RE-RUN a migration when its schema stamp
+        // was never committed (crash window). Re-running/MIRRORSing must not
+        // double-compress: a row already holding a zstd frame must be left
+        // byte-for-byte intact.
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
-        run_migrations(&db).unwrap();
-        // Second run hits the fast path and must not error or rewrite.
-        run_migrations(&db).unwrap();
-        assert_eq!(current_schema_version(&db).unwrap(), SCHEMA_VERSION);
+        let sid = 1u64;
+        let turn = dummy_turn();
+        {
+            let raw = rmp_serde::to_vec_named(&turn).unwrap();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(SESSION_TURNS).unwrap();
+                table.insert((sid, 0u32), raw.as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        migrate_turn_values_to_zstd(&db).unwrap();
+        // Capture the compressed bytes after the first run.
+        let after_first: Vec<u8> = {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(SESSION_TURNS).unwrap();
+            table.get((sid, 0)).unwrap().unwrap().value().to_vec()
+        };
+        assert!(after_first.starts_with(&ZSTD_FRAME_MAGIC));
+
+        // Re-run (simulates crash recovery): the row must be unchanged (not
+        // double-compressed) and still decode to the original turn.
+        migrate_turn_values_to_zstd(&db).unwrap();
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(SESSION_TURNS).unwrap();
+            let guard = table.get((sid, 0)).unwrap().unwrap();
+            let v = guard.value();
+            assert_eq!(
+                v,
+                after_first.as_slice(),
+                "re-run must not rewrite an already-compressed row"
+            );
+        }
+        assert_eq!(read_turns(&db, sid).unwrap()[0].1, turn);
     }
 
     #[test]
@@ -1669,68 +1894,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unversioned_db_with_postcard_blobs_stamps_v1_and_skips() {
-        // Simulate a v0-era database: a session record written with the old
-        // postcard codec before schema versioning existed. postcard is still
-        // a daemon dependency (VM + credential channels), so encode an
-        // authentic legacy blob with it. Intentionally NOT write_session —
-        // that writes MessagePack and would defeat the point.
+    fn run_migrations_to_backs_up_and_stamps_for_first_real_migration() {
+        // The first real migration (1→2, the zstd codec change) must snapshot
+        // the database BEFORE the rewrite — backup named after the SOURCE
+        // version (bak-v1) — and stamp the current schema version afterwards.
+        // Exercises the real production MIGRATIONS chain with an injected temp
+        // path so no real data-directory file is ever touched (see the
+        // run_migrations_to `db_path` parameter — the pre-existing design
+        // called db_path() here and silently snapshotted the real state.redb).
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
-        let legacy_record = SessionRecord {
-            title: Some("legacy".into()),
-            selected_model: None,
-            reasoning_effort: None,
-            parent_session_id: None,
-            working_dir: None,
-            turn_count: 0,
-            created_at: 1000,
-            last_modified: 1000,
-            active_tool_groups: vec![],
-            context_config: ContextConfig::default(),
-            account_name: None,
-            last_response_id: None,
-            last_response_id_producer: None,
-        };
-        let legacy_blob = postcard::to_allocvec(&legacy_record).unwrap();
-        {
-            let write_txn = db.begin_write().unwrap();
-            {
-                let mut table = write_txn.open_table(SESSIONS).unwrap();
-                table.insert(42u64, legacy_blob.as_slice()).unwrap();
-            }
-            write_txn.commit().unwrap();
-        }
-
-        // No meta table → unversioned, exactly like a pre-release dev DB.
-        assert_eq!(current_schema_version(&db).unwrap(), 0);
-
-        // The runner stamps v1; there is no v0 → v1 migration by design, so
-        // the postcard blob stays in place.
-        run_migrations(&db).unwrap();
-        assert_eq!(current_schema_version(&db).unwrap(), SCHEMA_VERSION);
-
-        // The legacy blob is undecodable as MessagePack: read_all_sessions
-        // must skip it (with a warning) rather than fail the daemon.
-        let all = read_all_sessions(&db).unwrap();
-        assert!(
-            all.is_empty(),
-            "legacy postcard blob must be skipped, not decoded or fatal"
-        );
-    }
-
-    #[test]
-    fn run_migrations_writes_no_backup_while_chain_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.redb");
+        let db_path = dir.path().join("state.redb");
         let db = redb::Database::create(&db_path).unwrap();
-        run_migrations(&db).unwrap();
-        // With MIGRATIONS empty, the 0 → 1 transition is pure stamping and
-        // must not snapshot the file — the backup path stays dormant until
-        // the first real migration lands.
+        stamp_schema_version(&db, 1).unwrap(); // a v1 database, pre-migration
+
+        run_migrations_to(&db, SCHEMA_VERSION, MIGRATIONS, &db_path).unwrap();
+
         assert!(
-            !db_path.with_file_name("test.redb.bak-v1").exists(),
-            "no backup artifact may be produced while the migration chain is empty"
+            db_path.with_file_name("state.redb.bak-v1").exists(),
+            "the 1→2 migration must back up the source-version file"
+        );
+        assert_eq!(
+            current_schema_version(&db).unwrap(),
+            SCHEMA_VERSION,
+            "the migration must reach the current schema version"
         );
     }
 
@@ -1771,6 +1957,7 @@ mod tests {
                 from: 1,
                 run: dummy_migrate_1_to_2,
             }],
+            &dir.path().join("test.redb"),
         )
         .unwrap();
 
@@ -1824,6 +2011,7 @@ mod tests {
                 from: 0,
                 run: dummy_migrate_1_to_2,
             }],
+            &dir.path().join("test.redb"),
         )
         .unwrap_err();
 
@@ -1863,6 +2051,7 @@ mod tests {
                 from: 1,
                 run: dummy_migrate_1_to_2,
             }],
+            &dir.path().join("test.redb"),
         )
         .unwrap_err();
 

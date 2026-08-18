@@ -31,9 +31,8 @@ fn open_db_creates_migrates_and_round_trips() {
     // Create path: open_db creates the database file AND stamps the initial
     // schema version (INITIAL_SCHEMA_VERSION) at creation, so a fresh
     // database is versioned from the moment it exists. run_migrations then
-    // brings it up to SCHEMA_VERSION — a no-op fast path today, but the
-    // migrate-from-`current` path once the chain grows past 1. This mirrors
-    // main.rs's startup sequence.
+    // brings it up to SCHEMA_VERSION (now a real 1→2 migration, no-op on an
+    // empty database). This mirrors main.rs's startup sequence.
     let db = db::open_db().unwrap();
 
     // open_db itself must have stamped the initial version — a fresh file
@@ -100,13 +99,13 @@ fn open_db_creates_migrates_and_round_trips() {
     let read = db::read_session(&db, 7).unwrap().unwrap();
     assert_eq!(read.title.as_deref(), Some("integration"));
 
-    // With an empty migration chain the 0 → 1 transition is pure stamping:
-    // no backup artifact may appear next to the database file (db_path()
-    // resolves to db_file because of the env override, so this check is
-    // meaningful).
+    // The first real migration (1→2, the zstd codec change) snapshots the v1
+    // database BEFORE rewriting it, so a bak-v1 backup must appear next to the
+    // file. db_path() resolves to db_file because of the env override, so this
+    // check is meaningful — the production startup migration really backs up.
     assert!(
-        !db_file.with_file_name("state.redb.bak-v1").exists(),
-        "no backup may be written while the migration chain is empty"
+        db_file.with_file_name("state.redb.bak-v1").exists(),
+        "the 1→2 migration must back up the source-version file"
     );
 
     // Tidy: clear the override so this process falls back to the real data
@@ -146,6 +145,76 @@ fn open_db_recreates_zero_byte_corpse_and_initializes() {
     // The recreated database is a normal, usable database.
     db::run_migrations(&db).unwrap();
     assert!(db::read_all_sessions(&db).unwrap().is_empty());
+
+    unsafe {
+        std::env::remove_var("CHOREOGRAPHR_DB_PATH");
+    }
+}
+
+/// A minimal [`Turn`] used to seed a legacy (v1) turn blob.
+fn legacy_turn(user_text: &str) -> choreo_proto::Turn {
+    use choreo_proto::{TimestampMs, Turn};
+    Turn {
+        created_at: TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some(user_text.to_string()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: Vec::new(),
+        token_usage: None,
+        tool_results: Vec::new(),
+        displayed_images: Vec::new(),
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    }
+}
+
+/// Mirrors the production `session_turns` table so the test can inject a
+/// legacy raw-MessagePack turn directly (bypassing the now-compressing
+/// `write_turn`).
+const SESSION_TURNS: redb::TableDefinition<(u64, u32), &[u8]> =
+    redb::TableDefinition::new("session_turns");
+
+#[test]
+#[ignore]
+fn open_db_migrates_legacy_turns_to_zstd() {
+    // The full production startup sequence against a real file: open_db
+    // creates + stamps the initial version, a PRE-UPGRADE (v1) database holds
+    // turns as raw MessagePack, and run_migrations then re-encodes them to
+    // zstd so read_turns (which always decompresses now) recovers them.
+    let dir = tempfile::tempdir().unwrap();
+    let db_file = dir.path().join("state.redb");
+    unsafe {
+        std::env::set_var("CHOREOGRAPHR_DB_PATH", &db_file);
+    }
+
+    let db = db::open_db().unwrap();
+
+    // Inject a legacy raw-MessagePack turn directly, as a v1 database would
+    // have it on disk (bypassing write_turn, which now compresses).
+    let turn = legacy_turn("legacy user text");
+    {
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(SESSION_TURNS).unwrap();
+            let raw = rmp_serde::to_vec_named(&turn).unwrap();
+            table.insert((7u64, 0u32), raw.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Before migration the raw row is undecodable through the now-decompressing
+    // reader.
+    assert!(db::read_turns(&db, 7).unwrap().is_empty());
+
+    // The startup migration chain (1→2) rewrites it to a zstd frame.
+    db::run_migrations(&db).unwrap();
+
+    // The turn survives byte-identical: compress → decompress → MessagePack.
+    let turns = db::read_turns(&db, 7).unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].1.user_text.as_deref(), Some("legacy user text"));
 
     unsafe {
         std::env::remove_var("CHOREOGRAPHR_DB_PATH");

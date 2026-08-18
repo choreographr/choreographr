@@ -313,7 +313,10 @@ can use the cursor position as a remainder probe (rmp-serde 1.3.1 has no
 
 **Codec rule.** MessagePack (named) carries anything that crosses a language
 boundary: the client↔daemon wire and the values in `sessions`/`session_turns`.
-Postcard is retained only on Rust-only, language-isolated internal channels —
+Since schema 2, `session_turns` values are additionally zstd-compressed (see
+the DB section) — the on-disk codec is zstd frame + MessagePack named(`Turn`),
+while the wire turn stays plain MessagePack. Postcard is retained only on
+Rust-only, language-isolated internal channels —
 the RISC-V VM↔host protocol and the encrypted credential pipeline — where no
 foreign reader will ever touch the bytes.
 
@@ -2050,11 +2053,11 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 | Table | Key | Value |
 |---|---|---|
 | `sessions` | `u64` session ID | MessagePack named(`SessionRecord`) |
-| `session_turns` | `(u64, u32)` (session ID, turn ID) | MessagePack named(`Turn`) |
+| `session_turns` | `(u64, u32)` (session ID, turn ID) | zstd-compressed MessagePack named(`Turn`) — since schema 2 each value is a zstd frame around the MessagePack blob; turn text/tool-output/reasoning is the bulk of the DB and compresses 4–10× |
 | `credentials` | `&str` service name | encrypted blob |
 | `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
 | `deleted_sessions` | `u64` session ID | `()` tombstone — marks a deleted session whose still-shutting-down thread may re-create the record; written only when the delete is deferred (a live thread exists), cleared once the exit finalize re-deletes the record, purged at startup |
-| `meta` | `&str` key (e.g. `schema_version`) | `u64` — persisted schema version (currently `1`) |
+| `meta` | `&str` key (e.g. `schema_version`) | `u64` — persisted schema version (currently `2`) |
 | `catalog_state` | `&str` key | `&[u8]` — runtime catalog-refresh state (S4): `last_attempt_ms` (Unix epoch millis, 8-byte LE — the 25 h cooldown anchor, written by the maintenance thread BEFORE every fetch) and `etag` (UTF-8 — the models.dev entity-tag, written by the daemon command loop after the cache bin is persisted). Created lazily on first write; purely additive, no schema bump |
 
 `SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `working_dir`,
@@ -2063,14 +2066,22 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 ### Schema versioning & migrations
 
 The `meta` table persists the schema version under the `schema_version` key
-(`SCHEMA_VERSION`, currently `1`). A database file created by `open_db` (fresh
+(`SCHEMA_VERSION`, currently `2`). A database file created by `open_db` (fresh
 install, or a 0-byte interrupted-create corpse) is stamped immediately with
-`INITIAL_SCHEMA_VERSION` (also `1`) — the 0 → 1 transition is *initialization*
+`INITIAL_SCHEMA_VERSION` (`1`) — the 0 → 1 transition is *initialization*
 at creation, never a migration, so a fresh database is versioned from the
 moment it exists. On every startup the daemon then runs `db::run_migrations`
 right after `open_db` and before any session data is read; it is idempotent —
 a database already at the current version exits immediately, and calling it
 repeatedly is safe.
+
+Schema 2 (the current version) is the first real migration: the
+`session_turns` value codec changed from raw MessagePack to zstd-compressed
+MessagePack. The 1 → 2 migration (`migrate_turn_values_to_zstd`) re-encodes
+every existing turn row by wrapping its MessagePack bytes in a zstd frame
+(compression is codec-orthogonal to serialization, so no deserialize/
+re-serialize is needed); the stored rows are identified as already-compressed
+by the zstd frame magic so the migration is safe to re-run after a crash.
 
 - **Versioning policy (additive vs breaking).** An additive change — a new
   struct field with `#[serde(default)]`, or a new enum variant appended — needs
@@ -2083,12 +2094,13 @@ repeatedly is safe.
   structs, and each migration ships with a fixture-based unit test (build a DB
   as the old version would have written it, run the runner, assert contents +
   version stamp + idempotency + backup artifact).
-- **Migration chain.** `MIGRATIONS` is empty at release: version 1 is the
+- **Migration chain.** `MIGRATIONS` holds one entry at release — version 1 → 2
+  (the `session_turns` zstd codec change). Version 1 is the
   *initial* stamped version, reached by initialization at database creation
   (`open_db` stamps `INITIAL_SCHEMA_VERSION`), never by a migration. Each entry
   carries its source version explicitly (`from`, upgrading `from → from + 1`),
-  so an entry's position in the array is irrelevant — the first real migration
-  is `from == 1` (the 0 → 1 transition is initialization, never a migration).
+  so an entry's position in the array is irrelevant — the 0 → 1 transition is
+  initialization, never a migration, so the first real migration is `from == 1`.
   Before applying anything, the runner validates that the entries' `from`
   values form the exact contiguous sequence `1..SCHEMA_VERSION`; a gap or
   misplaced entry is a hard error, never a silent stamp over data that was not
@@ -2109,7 +2121,8 @@ repeatedly is safe.
   named after the version being migrated *from*, so a `bak-v2` file IS a v2
   database and restoring it rolls back to exactly the pre-migration state) is
   taken only *before a real migration writes* — never for the pure 0 → 1
-  initialization stamp, so no backup artifact exists while the chain is empty.
+  initialization stamp. The 1 → 2 zstd migration therefore writes a
+  `state.redb.bak-v1` backup on the first startup after upgrade.
 - **redb `UpgradeRequired` is a separate axis.** The redb file-format version
   (the library's on-disk format) is independent of the app's `schema_version`.
   If a newer redb wrote the file, `open_db` hard-errors with guidance to restore
@@ -3173,6 +3186,7 @@ cargo run -p choreographr --bin choreo-im -- telegram
 | `alloy` | choreo-blockchain | EVM blockchain tools (behind the `blockchain` feature) |
 | `subxt` | choreo-blockchain | Substrate/Polkadot blockchain tools (behind the `blockchain` feature) |
 | `serde` + `rmp-serde` | proto, daemon | Wire protocol framing and DB value encoding (MessagePack, named mode) |
+| `zstd` | daemon | Compression of `session_turns` DB values (a zstd frame around the MessagePack blob, level 3) |
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
 | `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
