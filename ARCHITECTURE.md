@@ -2082,6 +2082,9 @@ every existing turn row by wrapping its MessagePack bytes in a zstd frame
 (compression is codec-orthogonal to serialization, so no deserialize/
 re-serialize is needed); the stored rows are identified as already-compressed
 by the zstd frame magic so the migration is safe to re-run after a crash.
+The codec is implemented by `structured-zstd`, a pure-Rust library that emits
+and reads standard zstd frames (numeric levels map onto C zstd numbering, so
+`COMPRESSION_LEVEL=6` keeps its tuned meaning) and needs no libzstd C build.
 Decompression on read is **bounded** to `MAX_TURN_DECODED_BYTES` (256 MiB per
 row, far above any legitimate turn payload): `read_turns` stream-decodes
 through a `Take` cap instead of trusting the frame header's declared content
@@ -3193,7 +3196,7 @@ cargo run -p choreographr --bin choreo-im -- telegram
 | `alloy` | choreo-blockchain | EVM blockchain tools (behind the `blockchain` feature) |
 | `subxt` | choreo-blockchain | Substrate/Polkadot blockchain tools (behind the `blockchain` feature) |
 | `serde` + `rmp-serde` | proto, daemon | Wire protocol framing and DB value encoding (MessagePack, named mode) |
-| `zstd` | daemon | Compression of `session_turns` DB values (a zstd frame around the MessagePack blob, level 6 — bench-tuned against real data; see `db.rs` `COMPRESSION_LEVEL`) |
+| `structured-zstd` | daemon | Pure-Rust compression of `session_turns` DB values (a standard zstd frame around the MessagePack blob, level 6 — the tuned level maps onto C zstd numbering; see `db.rs` `COMPRESSION_LEVEL`). Apache-2.0; no libzstd C build. |
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
 | `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |

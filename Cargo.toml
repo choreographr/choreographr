@@ -109,7 +109,7 @@ resolver = "3"
 # private members opt out with `publish = false`. `readme` is resolved
 # relative to the workspace root (the file that lives at ./README.md).
 [workspace.package]
-rust-version = "1.91"
+rust-version = "1.92"
 version = "0.1.0"
 license = "Apache-2.0"
 repository = "https://github.com/choreographr/choreographr"
@@ -209,7 +209,12 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 # to the whole MessagePack-serialized turn AFTER serialization (never per-field,
 # which would fragment the compression window); the 1→2 schema migration
 # re-encodes pre-existing rows. See choreo-daemon/src/db.rs.
-zstd = "0.13.3"
+#
+# Pure-Rust implementation (no libzstd C build): emits and reads standard zstd
+# frames, so the on-disk schema-2 contract is unchanged. Numeric compression
+# levels 1–22 map to C zstd numbering (COMPRESSION_LEVEL=6 keeps the tuned
+# speed/ratio trade-off). Apache-2.0, matching the workspace license.
+structured-zstd = "0.0.49"
 # MessagePack (named mode) for anything that crosses a language boundary:
 # the client↔daemon wire and DB values. Named encoding (struct fields as map
 # keys, enum variants by name) gives JSON-grade evolution safety in a compact
