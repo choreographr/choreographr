@@ -1,13 +1,17 @@
-use super::{PreparedImage, ToolExecError, context::ToolContext, resolve_path};
+use super::{
+    ImageSlot, PreparedImage, ToolExecError, context::ToolContext, human_size, resolve_path,
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_keystore::ServiceCredential;
+use headless_chrome::Tab;
+use headless_chrome::protocol::cdp::Page;
 use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
 use headless_chrome::{Browser, LaunchOptions};
-use image::GenericImageView;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::Duration;
+use tracing::{debug, info, warn};
 use url::Url;
 
 /// What `retrieve_webpage` should produce from the rendered page.
@@ -60,6 +64,11 @@ pub struct RetrieveWebpageArgs {
 
 /// Default viewport / nav timeout used when the caller omits them.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+/// Hard cap on a single call's navigation timeout so a mistyped/malicious
+/// argument can't pin a worker thread for an unbounded stretch.
+const MAX_TIMEOUT_MS: u64 = 120_000;
+/// Hard cap on the post-load settle delay for the same reason.
+const MAX_WAIT_MS: u64 = 30_000;
 
 /// Binary names/known paths to search for, in *preference* order: chromium
 /// first, then the various chrome bundle names, so a Chromium install wins
@@ -90,7 +99,7 @@ fn resolve_browser_binary() -> Option<std::path::PathBuf> {
     for var in ["CHROMIUM_BIN", "CHROME_BIN"] {
         if let Some(p) = std::env::var_os(var) {
             let candidate = std::path::PathBuf::from(p);
-            if candidate.is_file() {
+            if is_executable(&candidate) {
                 return Some(candidate);
             }
         }
@@ -101,7 +110,7 @@ fn resolve_browser_binary() -> Option<std::path::PathBuf> {
         for dir in std::env::split_paths(&path_var) {
             for name in CANDIDATE_NAMES {
                 let candidate = dir.join(name);
-                if candidate.is_file() {
+                if is_executable(&candidate) {
                     return Some(candidate);
                 }
             }
@@ -118,7 +127,7 @@ fn resolve_browser_binary() -> Option<std::path::PathBuf> {
         ];
         for p in mac_paths {
             let candidate = std::path::PathBuf::from(p);
-            if candidate.is_file() {
+            if is_executable(&candidate) {
                 return Some(candidate);
             }
         }
@@ -132,13 +141,33 @@ fn resolve_browser_binary() -> Option<std::path::PathBuf> {
             "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
         ] {
             let candidate = std::path::PathBuf::from(base);
-            if candidate.is_file() {
+            if is_executable(&candidate) {
                 return Some(candidate);
             }
         }
     }
 
     None
+}
+
+/// True when `path` exists as a file *and* (on Unix) is executable, so we don't
+/// hand the launcher a non-executable or directory candidate that would then
+/// fail at spawn time. Windows has no executable bit; existence is enough.
+fn is_executable(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// True when `url` has an http or https scheme (the only schemes a headless
@@ -173,26 +202,112 @@ fn html_expression(selector: &str) -> String {
     format!("(() => {{ const e = document.querySelector({sel}); return e ? e.outerHTML : ''; }})()")
 }
 
-/// Decode PNG/JPEG dimensions from raw screenshot bytes so the client can
-/// render the image with a known aspect ratio.
-fn decode_image_dimensions(bytes: &[u8]) -> (u32, u32) {
-    image::load_from_memory(bytes)
-        .map(|img| img.dimensions())
-        .unwrap_or((0, 0))
+/// JS that measures the page's full scrollable content size, returned as a
+/// `"<width>x<height>"` string. It's a *string* (not an array/object) on
+/// purpose: the crate's `evaluate` hard-codes `returnByValue: false`, which
+/// always yields `.value` for primitives but not for objects, so a primitive
+/// result is the only one we can read back without a handle.
+const PAGE_SIZE_JS: &str = "(() => { const d = document.documentElement; const w = Math.max(d.scrollWidth, d.clientWidth); \
+     const h = Math.max(d.scrollHeight, d.clientHeight); return w + 'x' + h; })()";
+
+/// Measure the full scrollable content size of the rendered page.
+fn page_content_size(tab: &Tab) -> Result<(f64, f64), ToolExecError> {
+    let obj = tab
+        .evaluate(PAGE_SIZE_JS, false)
+        .map_err(|e| ToolExecError(format!("failed to measure page size: {e:#}")))?;
+    let raw = remote_text(&obj);
+    let (w, h) = raw
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.parse::<f64>().ok()?, h.parse::<f64>().ok()?)))
+        .unwrap_or((0.0, 0.0));
+    debug!(raw_width = %raw, "measured page content size");
+    Ok((w, h))
+}
+
+/// Capture a screenshot of the whole visible viewport (or a single element, via
+/// `selector`). When `full_page`, this returns the entire scrollable page.
+///
+/// headless_chrome's `Tab::capture_screenshot` maps its last boolean to the CDP
+/// `fromSurface` flag — *not* "full page" — and hard-codes
+/// `captureBeyondViewport: None`, so it can only ever capture the current
+/// viewport. For a real full-page shot we issue `Page.captureScreenshot`
+/// ourselves with `captureBeyondViewport: true` plus a clip covering the whole
+/// content area (measured in-page first).
+fn capture_screenshot(
+    tab: &Tab,
+    selector: Option<&str>,
+    full_page: bool,
+) -> Result<Vec<u8>, ToolExecError> {
+    if let Some(sel) = selector {
+        let element = tab
+            .find_element(sel)
+            .map_err(|e| ToolExecError(format!("selector '{sel}' not found: {e:#}")))?;
+        return element
+            .capture_screenshot(CaptureScreenshotFormatOption::Png)
+            .map_err(|e| ToolExecError(format!("failed to screenshot element: {e:#}")));
+    }
+
+    if full_page {
+        let (w, h) = page_content_size(tab)?;
+        // A clip of (0,0,contentW,contentH) plus captureBeyondViewport lets
+        // headless Chrome paint the regions outside the current viewport too.
+        if w > 0.0 && h > 0.0 {
+            let result = tab
+                .call_method(Page::CaptureScreenshot {
+                    format: Some(CaptureScreenshotFormatOption::Png),
+                    quality: None,
+                    clip: Some(Page::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: w,
+                        height: h,
+                        scale: 1.0,
+                    }),
+                    from_surface: Some(true),
+                    capture_beyond_viewport: Some(true),
+                    optimize_for_speed: None,
+                })
+                .map_err(|e| {
+                    ToolExecError(format!("failed to capture full-page screenshot: {e:#}"))
+                })?;
+            return BASE64
+                .decode(result.data)
+                .map_err(|e| ToolExecError(format!("full-page screenshot decode failed: {e}")));
+        }
+        debug!(width = %w, height = %h, "content size was unusable; falling back to viewport shot");
+    }
+
+    tab.capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
+        .map_err(|e| ToolExecError(format!("failed to capture screenshot: {e:#}")))
+}
+
+/// Decode PNG dimensions by reading only the 8-byte IHDR detail block, rather
+/// than decoding the entire (potentially multi-MB) image. Screenshots here are
+/// always PNG, so this is both faster and lighter than `image::load_from_memory`.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    // Signature (8) + chunk length (4) + "IHDR" (4) + width (4) + height (4).
+    const SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() >= 24 && bytes[..8] == SIGNATURE && &bytes[12..16] == b"IHDR" {
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        Some((width, height))
+    } else {
+        None
+    }
 }
 
 /// A tool that renders a URL in a local headless Chromium/Chrome and returns
 /// page content (HTML), plain text, a screenshot, or a PDF.
 pub struct RetrieveWebpage {
     /// Holds the most recent screenshot so `extract_image` can hand it to the
-    /// client as an inline image (same pattern as `DisplayImage`).
-    last_image: Mutex<Option<PreparedImage>>,
+    /// client as an inline image (same shared slot as `DisplayImage`).
+    last_image: ImageSlot,
 }
 
 impl RetrieveWebpage {
     pub fn new() -> Self {
         RetrieveWebpage {
-            last_image: Mutex::new(None),
+            last_image: ImageSlot::default(),
         }
     }
 }
@@ -246,15 +361,27 @@ impl super::Tool for RetrieveWebpage {
     ) -> Result<Self::Return, Self::Error> {
         let action = args.action.clone().unwrap_or(WebpageAction::Content);
         let url = args.url.trim();
+        let action_str = action.as_str();
         validate_url(url)?;
+        info!(url, action = action_str, "retrieve_webpage: rendering page");
 
         let binary = resolve_browser_binary().ok_or_else(|| {
+            warn!("retrieve_webpage: no chromium/chrome binary found on PATH");
             ToolExecError(
                 "no chromium or chrome binary found on PATH (or in standard locations). \
                  Install Chromium/Chrome, or set CHROMIUM_BIN / CHROME_BIN to its path"
                     .to_string(),
             )
         })?;
+        debug!(path = %binary.display(), "resolved browser binary");
+
+        // Navigation timeout is clamped so a single call can't pin a worker
+        // thread indefinitely (a mistyped or hostile argument would otherwise).
+        let timeout_ms = args
+            .timeout_ms
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .min(MAX_TIMEOUT_MS);
+        let wait_ms = args.wait_ms.map(|ms| ms.min(MAX_WAIT_MS));
 
         // Launch a private, headless, one-shot browser instance with an
         // explicit path (so it uses the resolved chromium, never auto-detect)
@@ -266,13 +393,18 @@ impl super::Tool for RetrieveWebpage {
             args.width.unwrap_or(1280),
             args.height.unwrap_or(800),
         )));
-        // Keep the DevTools socket alive well past an individual page wait so a
-        // slow page can't get torn down mid-navigation.
-        builder.idle_browser_timeout(Duration::from_secs(60));
+        // Keep the DevTools socket alive well past the resolved navigation
+        // timeout so a slow page can't get torn down mid-navigation. The idle
+        // grace is derived from (and always larger than) the timeout, rather
+        // than a fixed constant that could be shorter than a caller's timeout.
+        builder.idle_browser_timeout(Duration::from_millis(
+            timeout_ms.saturating_mul(2).max(60_000),
+        ));
         let options = builder.build().map_err(|e| ToolExecError(e.to_string()))?;
 
         let browser = Browser::new(options)
             .map_err(|e| ToolExecError(format!("failed to launch headless browser: {e:#}")))?;
+        debug!("launched headless browser");
 
         // Run the whole capture in a closure so the `Browser` (and its Chromium
         // child process) is released on every path, success or error, when it
@@ -282,8 +414,7 @@ impl super::Tool for RetrieveWebpage {
                 .new_tab()
                 .map_err(|e| ToolExecError(format!("failed to open a tab: {e:#}")))?;
 
-            let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-            tab.set_default_timeout(timeout);
+            tab.set_default_timeout(Duration::from_millis(timeout_ms));
             tab.navigate_to(url)
                 .map_err(|e| ToolExecError(format!("navigation to {url} failed: {e:#}")))?;
             tab.wait_until_navigated()
@@ -291,103 +422,20 @@ impl super::Tool for RetrieveWebpage {
 
             // Optional settle delay so client-side JS can run before capture.
             // Only reached at runtime (never in unit tests, per repo rules).
-            if let Some(ms) = args.wait_ms
+            if let Some(ms) = wait_ms
                 && ms > 0
             {
                 std::thread::sleep(Duration::from_millis(ms));
             }
+            debug!(timeout_ms, wait_ms, "page navigated; capturing");
 
-            match action {
-                WebpageAction::Content => match args.selector.as_deref() {
-                    Some(sel) => {
-                        let obj = tab
-                            .evaluate(&html_expression(sel), false)
-                            .map_err(|e| ToolExecError(format!("failed to extract HTML: {e:#}")))?;
-                        Ok(remote_text(&obj))
-                    }
-                    None => tab
-                        .get_content()
-                        .map_err(|e| ToolExecError(format!("failed to get page HTML: {e:#}"))),
-                },
-
-                WebpageAction::Text => {
-                    let expr = text_expression(args.selector.as_deref());
-                    let obj = tab
-                        .evaluate(&expr, false)
-                        .map_err(|e| ToolExecError(format!("failed to extract text: {e:#}")))?;
-                    Ok(remote_text(&obj))
-                }
-
-                WebpageAction::Screenshot => {
-                    let bytes = if let Some(sel) = args.selector.as_deref() {
-                        let element = tab.find_element(sel).map_err(|e| {
-                            ToolExecError(format!("selector '{sel}' not found: {e:#}"))
-                        })?;
-                        element
-                            .capture_screenshot(CaptureScreenshotFormatOption::Png)
-                            .map_err(|e| {
-                                ToolExecError(format!("failed to screenshot element: {e:#}"))
-                            })?
-                    } else {
-                        tab.capture_screenshot(
-                            CaptureScreenshotFormatOption::Png,
-                            None,
-                            None,
-                            args.full_page.unwrap_or(true),
-                        )
-                        .map_err(|e| {
-                            ToolExecError(format!("failed to capture screenshot: {e:#}"))
-                        })?
-                    };
-
-                    // Always offer the screenshot inline to the client.
-                    let (width, height) = decode_image_dimensions(&bytes);
-                    let alt = Some(format!("Screenshot of {url}"));
-                    *self.last_image.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(PreparedImage {
-                            mime_type: "image/png".to_string(),
-                            data: bytes.clone(),
-                            width,
-                            height,
-                            alt,
-                        });
-
-                    if let Some(out) = args.output_path.as_deref() {
-                        let path = resolve_path(out, working_dir);
-                        write_bytes_with_dirs(&path, &bytes)?;
-                        Ok(format!(
-                            "captured screenshot ({width}x{height}, PNG, {size}); saved to {path}",
-                            size = super::human_size(bytes.len() as u64),
-                            path = path.display(),
-                        ))
-                    } else {
-                        Ok(format!(
-                            "captured screenshot ({width}x{height}, PNG, {size})",
-                            size = super::human_size(bytes.len() as u64),
-                        ))
-                    }
-                }
-
-                WebpageAction::Pdf => {
-                    let out = args.output_path.as_deref().ok_or_else(|| {
-                        ToolExecError(
-                            "pdf action requires output_path so the binary can be saved"
-                                .to_string(),
-                        )
-                    })?;
-                    let bytes = tab
-                        .print_to_pdf(None)
-                        .map_err(|e| ToolExecError(format!("failed to render PDF: {e:#}")))?;
-                    let path = resolve_path(out, working_dir);
-                    write_bytes_with_dirs(&path, &bytes)?;
-                    Ok(format!(
-                        "saved PDF ({size}) to {path}",
-                        size = super::human_size(bytes.len() as u64),
-                        path = path.display(),
-                    ))
-                }
-            }
+            Self::capture(&self.last_image, &tab, &args, action, url, working_dir)
         })();
+
+        match &outcome {
+            Ok(..) => info!(url, action = action_str, "retrieve_webpage: ok"),
+            Err(e) => warn!(url, action = action_str, error = %e, "retrieve_webpage: failed"),
+        }
 
         // The `Browser` is dropped here (and its Chromium child process is
         // terminated by the transport's `Drop`), releasing the instance whether
@@ -396,10 +444,106 @@ impl super::Tool for RetrieveWebpage {
     }
 
     fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> {
-        self.last_image
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        self.last_image.take()
+    }
+}
+
+impl RetrieveWebpage {
+    /// Perform the per-action capture on an already-navigated tab. Broken out
+    /// of `execute` so each branch stays small and testable; handles the file
+    /// write + inline-image hand-off for the binary actions (screenshot/pdf).
+    fn capture(
+        image_slot: &ImageSlot,
+        tab: &Tab,
+        args: &RetrieveWebpageArgs,
+        action: WebpageAction,
+        url: &str,
+        working_dir: Option<&Path>,
+    ) -> Result<String, ToolExecError> {
+        match action {
+            WebpageAction::Content => match args.selector.as_deref() {
+                Some(sel) => {
+                    let obj = tab
+                        .evaluate(&html_expression(sel), false)
+                        .map_err(|e| ToolExecError(format!("failed to extract HTML: {e:#}")))?;
+                    Ok(remote_text(&obj))
+                }
+                None => tab
+                    .get_content()
+                    .map_err(|e| ToolExecError(format!("failed to get page HTML: {e:#}"))),
+            },
+
+            WebpageAction::Text => {
+                let expr = text_expression(args.selector.as_deref());
+                let obj = tab
+                    .evaluate(&expr, false)
+                    .map_err(|e| ToolExecError(format!("failed to extract text: {e:#}")))?;
+                Ok(remote_text(&obj))
+            }
+
+            WebpageAction::Screenshot => {
+                let bytes = capture_screenshot(
+                    tab,
+                    args.selector.as_deref(),
+                    args.full_page.unwrap_or(true),
+                )?;
+
+                // Dimensions come from a cheap PNG-header read, not a full decode.
+                let (width, height) = png_dimensions(&bytes).unwrap_or((0, 0));
+                let size = bytes.len();
+                let alt = Some(format!("Screenshot of {url}"));
+
+                // Optionally persist to output_path, then hand the buffer to the
+                // inline-image slot. The write happens *before* the buffer moves
+                // into the slot, so a potentially multi-MB screenshot is never
+                // cloned.
+                let message = match args.output_path.as_deref() {
+                    Some(out) => {
+                        let path = resolve_path(out, working_dir);
+                        write_bytes_with_dirs(&path, &bytes)?;
+                        format!(
+                            "captured screenshot ({width}x{height}, PNG, {size}); saved to {path}",
+                            size = human_size(size as u64),
+                            path = path.display(),
+                        )
+                    }
+                    None => {
+                        format!(
+                            "captured screenshot ({width}x{height}, PNG, {size})",
+                            size = human_size(size as u64),
+                        )
+                    }
+                };
+
+                // Always offer the screenshot inline to the client.
+                image_slot.store(PreparedImage {
+                    mime_type: "image/png".to_string(),
+                    data: bytes,
+                    width,
+                    height,
+                    alt,
+                });
+                Ok(message)
+            }
+
+            WebpageAction::Pdf => {
+                let out = args.output_path.as_deref().ok_or_else(|| {
+                    ToolExecError(
+                        "pdf action requires output_path so the binary can be saved".to_string(),
+                    )
+                })?;
+                let bytes = tab
+                    .print_to_pdf(None)
+                    .map_err(|e| ToolExecError(format!("failed to render PDF: {e:#}")))?;
+                let path = resolve_path(out, working_dir);
+                write_bytes_with_dirs(&path, &bytes)?;
+                Ok(format!(
+                    "saved PDF ({size}) to {path}",
+                    size = human_size(bytes.len() as u64),
+                    path = path.display(),
+                ))
+            }
+        }
     }
 }
 
@@ -508,5 +652,38 @@ mod tests {
         // Non-string / null values must degrade to an empty string.
         assert_eq!(extract_text(&serde_json::Value::Null), "");
         assert_eq!(extract_text(&serde_json::json!(42)), "");
+    }
+
+    #[test]
+    fn png_dimensions_reads_ihdr() {
+        // A minimal-but-valid-enough PNG header carrying 12x3456 dimensions.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[0, 0, 0, 13]); // IHDR chunk length
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&12u32.to_be_bytes());
+        png.extend_from_slice(&3456u32.to_be_bytes());
+        assert_eq!(png_dimensions(&png), Some((12, 3456)));
+    }
+
+    #[test]
+    fn png_dimensions_rejects_garbage() {
+        assert_eq!(png_dimensions(b"not a png"), None);
+        assert_eq!(png_dimensions(&[0u8; 32]), None);
+    }
+
+    #[test]
+    fn image_slot_round_trips() {
+        let slot = ImageSlot::default();
+        assert!(slot.take().is_none(), "empty slot should take None");
+        slot.store(PreparedImage {
+            mime_type: "image/png".to_string(),
+            data: vec![1, 2, 3],
+            width: 1,
+            height: 1,
+            alt: None,
+        });
+        let img = slot.take().expect("image should be present");
+        assert_eq!(img.data, vec![1, 2, 3]);
+        assert!(slot.take().is_none(), "slot should be empty after take");
     }
 }

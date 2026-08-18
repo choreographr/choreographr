@@ -14,6 +14,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::mpsc;
 // The shared spoofing predicates come from choreo-sanitize (the leaf crate
@@ -211,6 +212,37 @@ pub struct PreparedImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) alt: Option<String>,
+}
+
+/// Cache that lets an image-producing tool hand a `PreparedImage` to the
+/// framework's `extract_image` hook.
+///
+/// `Tool::execute` takes `&self` (a tool is registered once and shared across
+/// sessions), so an image cannot be returned as plain state — it has to be
+/// parked somewhere the immediately-following `extract_image(&self, …)` call
+/// can `take()` it. The `Mutex` is single-purpose ("the last image this tool
+/// produced") and is only contended across concurrent invocations of the same
+/// registered instance, which is rare for the display/retrieve tools and, in
+/// the common single-threaded path, not contended at all. It carries no
+/// protocol data, only a best-effort image hand-off, in the spirit of
+/// AGENTS.md's minimal shared-state allowance.
+#[derive(Default)]
+pub(crate) struct ImageSlot {
+    last: Mutex<Option<PreparedImage>>,
+}
+
+impl ImageSlot {
+    /// Park `image` as "the most recent one this tool produced".
+    pub(crate) fn store(&self, image: PreparedImage) {
+        // Recover from a poisoned lock instead of panicking (AGENTS.md).
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
+    }
+
+    /// Move out and clear the parked image, if any, for `extract_image`.
+    pub(crate) fn take(&self) -> Option<PreparedImage> {
+        // Recover from a poisoned lock instead of panicking (AGENTS.md).
+        self.last.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
 }
 
 #[derive(Debug, Clone)]

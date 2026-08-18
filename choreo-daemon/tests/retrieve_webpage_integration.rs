@@ -27,8 +27,9 @@ fn retrieve_webpage_renders_a_real_page() {
         id: "call_1".to_string(),
         name: "retrieve_webpage".to_string(),
         // Fetch the HTML (default action is "content").
-        arguments_json: r#"{"url": "https://example.com", "action": "content", "timeout_ms": 20000}"#
-            .to_string(),
+        arguments_json:
+            r#"{"url": "https://example.com", "action": "content", "timeout_ms": 20000}"#
+                .to_string(),
         caller: None,
     };
 

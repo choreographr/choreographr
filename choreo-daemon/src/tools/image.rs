@@ -1,3 +1,4 @@
+use super::ImageSlot;
 use super::{PreparedImage, ToolExecError, context::ToolContext, truncate_tool_output};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_keystore::ServiceCredential;
@@ -6,7 +7,6 @@ use resvg::usvg;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
-use std::sync::Mutex;
 use std::{io, time::Duration};
 use url::Url;
 
@@ -161,13 +161,14 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
 }
 
 pub(crate) struct DisplayImage {
-    last_image: Mutex<Option<PreparedImage>>,
+    /// Hands the prepared image to the framework's `extract_image` hook.
+    last_image: ImageSlot,
 }
 
 impl DisplayImage {
     pub(crate) fn new() -> Self {
         DisplayImage {
-            last_image: Mutex::new(None),
+            last_image: ImageSlot::default(),
         }
     }
 }
@@ -218,7 +219,7 @@ impl super::Tool for DisplayImage {
         let width = image.width;
         let height = image.height;
         let byte_len = image.data.len();
-        *self.last_image.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
+        self.last_image.store(image);
         Ok(truncate_tool_output(&format!(
             "displayed image ({mime_type}, {width}x{height}, {})",
             humfmt::bytes(byte_len as u64),
@@ -226,9 +227,6 @@ impl super::Tool for DisplayImage {
     }
 
     fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> {
-        self.last_image
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        self.last_image.take()
     }
 }
