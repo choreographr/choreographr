@@ -4,7 +4,7 @@
 # the workspace. Bare `just` lists all recipes.
 #
 # Requirements:
-#   - cargo          Rust toolchain >= 1.91 (the workspace MSRV — see Cargo.toml)
+#   - cargo          Rust toolchain >= 1.92 (the workspace MSRV — see Cargo.toml)
 #   - zig            builds `zlob`, the glob/walker dependency of choreo-daemon
 #                    (install with `brew install zig` on macOS, `apt install zig`
 #                    on Debian/Ubuntu, or from ziglang.org)

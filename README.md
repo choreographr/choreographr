@@ -323,7 +323,7 @@ Unix socket `/tmp/Choreographr.sock` and stores its data under
 
 ## Build from source
 
-Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.91** — and a [Zig toolchain](https://ziglang.org/) (`brew install zig`), which `choreographr` needs to compile the `zlob` glob/walker dependency.
+Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.92** — and a [Zig toolchain](https://ziglang.org/) (`brew install zig`), which `choreographr` needs to compile the `zlob` glob/walker dependency.
 
 The repo pins **nightly** via `rust-toolchain.toml` (needed for the per-profile compiler flags in the root `Cargo.toml`). `rustup` auto-installs the pinned channel the first time you run `cargo` in the checkout:
 
@@ -772,7 +772,7 @@ A [`justfile`](./justfile) wraps the common workflows above (and the daemon run
 commands) in one place — `just` lists every recipe, and `just help` explains the
 prerequisites. Install `just` with `cargo install just` (or `brew install just`
 on macOS); the recipes require the same toolchain as the
-[Build from source](#build-from-source) section (cargo ≥ 1.91 + zig), and
+[Build from source](#build-from-source) section (cargo ≥ 1.92 + zig), and
 nextest only where noted:
 
 ```bash

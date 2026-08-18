@@ -101,7 +101,7 @@ members = [
 resolver = "3"
 
 # Shared package metadata inherited by every member via `*.workspace = true`.
-# MSRV: the workspace builds and tests on Rust 1.91 and newer; keep code and
+# MSRV: the workspace builds and tests on Rust 1.92 and newer; keep code and
 # dependencies within this floor (see ARCHITECTURE.md).
 #
 # version/license/repository/homepage/readme/description are required by
@@ -191,7 +191,7 @@ serde_json = "1"
 schemars = { version = "1.2.1", features = ["derive"] }
 yaml_serde = "0.10"
 signal-hook = "0.4"
-# Held at 3.x (3.5.0): serial_test 4.0.1 requires Rust 1.93.1, above the workspace MSRV floor (1.91).
+# Held at 3.x (3.5.0): serial_test 4.0.1 requires Rust 1.93.1, above the workspace MSRV floor (1.92).
 serial_test = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -208,7 +208,7 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 # (conversation text, tool output, reasoning artifacts). Compression is applied
 # to the whole MessagePack-serialized turn AFTER serialization (never per-field,
 # which would fragment the compression window); the 1→2 schema migration
-# re-encodes pre-existing rows. See choreo-daemon/src/db.rs.
+# re-encodes pre-existing rows. See choreo-daemon/src/db/codec.rs.
 #
 # Pure-Rust implementation (no libzstd C build): emits and reads standard zstd
 # frames, so the on-disk schema-2 contract is unchanged. Numeric compression

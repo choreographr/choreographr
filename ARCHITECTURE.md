@@ -2089,7 +2089,9 @@ Decompression on read is **bounded** to `MAX_TURN_DECODED_BYTES` (256 MiB per
 row, far above any legitimate turn payload): `read_turns` stream-decodes
 through a `Take` cap instead of trusting the frame header's declared content
 size, so a corrupt/malicious row cannot pin the daemon's memory (a
-"decompression bomb"). Reads also use a bounded `(session_id, …)` key-range
+"decompression bomb"). The decoder also requires the row to be exactly one
+frame and consumed to EOF — trailing bytes or a second concatenated frame are
+refused, not silently truncated. Reads also use a bounded `(session_id, …)` key-range
 scan over only the target session's turns rather than decompressing the whole
 table.
 
@@ -3143,7 +3145,7 @@ cargo test -- --ignored   # libtest integration tests
 
 ## Build and run
 
-The workspace targets a minimum supported Rust version (MSRV) of **1.91**,
+The workspace targets a minimum supported Rust version (MSRV) of **1.92**,
 declared via `rust-version` in every crate manifest (inherited from
 `[workspace.package]` in the root `Cargo.toml`). Keep code and dependencies
 within this floor; the CI MSRV job enforces it.
@@ -3196,7 +3198,7 @@ cargo run -p choreographr --bin choreo-im -- telegram
 | `alloy` | choreo-blockchain | EVM blockchain tools (behind the `blockchain` feature) |
 | `subxt` | choreo-blockchain | Substrate/Polkadot blockchain tools (behind the `blockchain` feature) |
 | `serde` + `rmp-serde` | proto, daemon | Wire protocol framing and DB value encoding (MessagePack, named mode) |
-| `structured-zstd` | daemon | Pure-Rust compression of `session_turns` DB values (a standard zstd frame around the MessagePack blob, level 6 — the tuned level maps onto C zstd numbering; see `db.rs` `COMPRESSION_LEVEL`). Apache-2.0; no libzstd C build. |
+| `structured-zstd` | daemon | Pure-Rust compression of `session_turns` DB values (a standard zstd frame around the MessagePack blob, level 6 — the tuned level maps onto C zstd numbering; see `db/codec.rs` `COMPRESSION_LEVEL`). Apache-2.0; no libzstd C build. |
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
 | `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
