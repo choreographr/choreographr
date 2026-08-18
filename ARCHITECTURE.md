@@ -3193,7 +3193,7 @@ cargo run -p choreographr --bin choreo-im -- telegram
 | `alloy` | choreo-blockchain | EVM blockchain tools (behind the `blockchain` feature) |
 | `subxt` | choreo-blockchain | Substrate/Polkadot blockchain tools (behind the `blockchain` feature) |
 | `serde` + `rmp-serde` | proto, daemon | Wire protocol framing and DB value encoding (MessagePack, named mode) |
-| `zstd` | daemon | Compression of `session_turns` DB values (a zstd frame around the MessagePack blob, level 3) |
+| `zstd` | daemon | Compression of `session_turns` DB values (a zstd frame around the MessagePack blob, level 6 — bench-tuned against real data; see `db.rs` `COMPRESSION_LEVEL`) |
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
 | `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |

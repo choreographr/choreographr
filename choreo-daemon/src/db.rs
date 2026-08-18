@@ -123,12 +123,17 @@ pub fn db_path() -> io::Result<PathBuf> {
 /// every existing row.
 pub const SCHEMA_VERSION: u64 = 2;
 
-/// zstd compression level for `session_turns` values. Level 3 (the library
-/// default) balances ratio against speed: turn text/tool-output/reasoning
-/// compresses 4–10× while encode stays hundreds of MB/s and decode is
-/// GB/s-scale. Tuning this is a constant, not a design change — the codec is
+/// zstd compression level for `session_turns` values. Level 6 was chosen by
+/// benchmarking against the production database (10 k+ real turns, ~160 MB of
+/// raw MessagePack): it captures ~85% of the available compression (ratio
+/// 3.66→3.83) while keeping encode fast (~100 MB/s; a median 6 KB turn encodes
+/// in ~60 µs) and the one-time 1→2 migration quick (~1.7 s on the measured DB).
+/// Decode is flat across levels (~1.1–1.2 GB/s), so higher compression costs
+/// nothing on the read path; levels above 9 add <1% ratio while tripling
+/// encode cost (12+ is ~18× slower for ~0.01 more ratio), so 6 is the sweet
+/// spot. Tuning this is a constant, not a design change — the codec is
 /// concrete (zstd) and the on-disk contract is "zstd-compressed MessagePack".
-const COMPRESSION_LEVEL: i32 = 3;
+const COMPRESSION_LEVEL: i32 = 6;
 
 /// Maximum number of bytes a single `session_turns` value may expand to when a
 /// zstd frame is decompressed. A zstd frame advertises its uncompressed size in
