@@ -96,14 +96,13 @@ echo "==> building release binaries (root package)"
 # Build only the four shipped binaries: `-p choreographr` pulls in the daemon,
 # TUI, IM, and ACP transitively but NOT choreo-gui (its dioxus/webkit2gtk stack
 # is not shipped and must not be a build requirement of the release machine).
-# `--features pdf,metrics,blockchain` enables the native PDF tools (pdf_classify /
-# pdf_to_markdown), the Prometheus `/metrics` endpoint, and the EVM/Substrate
-# blockchain tools for the shipped binaries — all three are off by default so the
-# published crates.io manifests stay lean (the pdf-inspector dep is feature-gated
-# off by default because crates.io rejects git deps, and the security fork is
-# workspace-local; the blockchain tools live in the optional `choreo-blockchain`
-# crate, which pulls tokio/alloy/subxt into the binary). See the root Cargo.toml
-# [patch.crates-io] and choreo-daemon/Cargo.toml.
+# `--features metrics,blockchain` enables the Prometheus `/metrics` endpoint and
+# the EVM/Substrate blockchain tools for the shipped binaries — both are off by
+# default so the published crates.io manifests stay lean (the metrics machinery
+# and the optional `choreo-blockchain` crate, which pulls tokio/alloy/subxt into
+# the binary). The native PDF tools (pdf_classify / pdf_to_markdown) need no
+# feature flag: `pdf-inspector` has been an unconditional dependency since 1.15.0
+# replaced the RUSTSEC-2026-0187-vulnerable lopdf ^0.41 pin.
 
 # ── Tarball build ────────────────────────────────────────────────────────────
 # The Linux tarball is a fully static x86_64-unknown-linux-musl cross-build.
@@ -126,10 +125,10 @@ echo "==> building release binaries (root package)"
 # the standard solution. zlob is unaffected — its build.rs already maps the
 # triple itself.
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
-    ./scripts/build-stable.sh zigbuild --release -p choreographr --target x86_64-unknown-linux-musl --features pdf,metrics,mimalloc,blockchain
+    ./scripts/build-stable.sh zigbuild --release -p choreographr --target x86_64-unknown-linux-musl --features metrics,mimalloc,blockchain
     TARBALL_BIN_DIR="target/x86_64-unknown-linux-musl/release"
 else
-    ./scripts/build-stable.sh build --release -p choreographr --features pdf,metrics,blockchain
+    ./scripts/build-stable.sh build --release -p choreographr --features metrics,blockchain
     TARBALL_BIN_DIR="target/release"
 fi
 
@@ -164,7 +163,7 @@ tar czf "$TARBALL" -C "$STAGE" \
 # step is skipped — dpkg/rpmbuild are not present.)
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     echo "==> building host (glibc) release binaries for .deb/.rpm"
-    ./scripts/build-stable.sh build --release -p choreographr --features pdf,metrics,blockchain
+    ./scripts/build-stable.sh build --release -p choreographr --features metrics,blockchain
 fi
 
 # .deb/.rpm are best-effort: skip with a warning when the toolchain is absent
@@ -220,10 +219,9 @@ echo "  - AUR: bump pkgver in packaging/aur/PKGBUILD + regenerate .SRCINFO"
 echo "    (makepkg --printsrcinfo > .SRCINFO)"
 echo "  - crates.io: cargo release (version bump + tag + publish of the 13"
 echo "    publish-set members in dependency order) runs BEFORE this script;"
-echo "    the native PDF tools and the blockchain tools are feature-gated and"
-echo "    off by default on crates.io — release binaries build them via"
-echo "    --features pdf,metrics,blockchain, see the [patch.crates-io] section of"
-echo "    the root Cargo.toml)"
+echo "    the metrics and blockchain tools are feature-gated and off by default"
+echo "    on crates.io — release binaries build them via"
+echo "    --features metrics,blockchain)"
 echo "  - choreographr.com: publish scripts/install.sh and add download"
 echo "    redirects for v${VERSION}"
 

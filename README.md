@@ -706,7 +706,7 @@ enable the endpoint:
 cargo run --release -p choreographr --features metrics -- --metrics-addr 127.0.0.1:9464
 ```
 
-Release binaries enable `metrics` explicitly (alongside `pdf`) via
+Release binaries enable `metrics` explicitly via
 `scripts/release.sh`, so installed binaries keep the `/metrics` endpoint. When
 a build was made without the feature, the `--metrics-addr` flag is still
 accepted but the daemon refuses to start with a clear error telling you to
@@ -753,11 +753,11 @@ cargo fmt --all             # formatting
 ```
 
 `cargo test-lean` is the feature-off run: it compiles the workspace with every
-optional feature disabled (metrics, pdf, mimalloc), which is the only way the
-metrics no-op stub backend and the feature-off `--metrics-addr` startup refusal
-in `server/lifecycle.rs` get built — the `--all-features` aliases never compile
-that configuration, so `test-lean` guards against the stubs drifting out of
-sync with the real backend.
+optional feature disabled (metrics, blockchain, mimalloc), which is the only
+way the metrics no-op stub backend and the feature-off `--metrics-addr` startup
+refusal in `server/lifecycle.rs` get built — the `--all-features` aliases never
+compile that configuration, so `test-lean` guards against the stubs drifting
+out of sync with the real backend.
 
 The nextest profile lives in `.config/nextest.toml`: `fail-fast = false` (run
 the whole suite even after a failure) and a 120s `slow-timeout` that aborts any

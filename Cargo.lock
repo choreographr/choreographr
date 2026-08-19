@@ -8560,8 +8560,9 @@ dependencies = [
 
 [[package]]
 name = "pdf-inspector"
-version = "0.1.7"
-source = "git+https://github.com/omeileo/pdf-inspector?rev=f86decf82d72e4bc318aaf54c04f854763cbed1c#f86decf82d72e4bc318aaf54c04f854763cbed1c"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71d004766b3256499a00dc15c05d99872a24ab6d95ee34b6409eaaec4b793b3a"
 dependencies = [
  "env_logger",
  "include_dir",

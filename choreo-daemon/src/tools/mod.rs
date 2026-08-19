@@ -167,10 +167,8 @@ mod image;
 pub(crate) mod nu;
 #[cfg(feature = "blockchain")]
 pub(crate) mod subxt;
-// Native PDF tools — behind the `pdf` feature (see Cargo.toml): the parser
-// dep is a registry version patched to a security fork in the workspace root,
-// and crates.io must never see the fork in a published manifest.
-#[cfg(feature = "pdf")]
+// Native PDF tools (pdf_classify / pdf_to_markdown) — unconditional since
+// pdf-inspector 1.15.0 ships the RUSTSEC-2026-0187 fix (lopdf >= 0.42).
 pub(crate) mod pdf;
 pub(crate) mod random;
 pub(crate) mod read_file;
@@ -716,9 +714,7 @@ impl ToolRegistry {
         reg.register(exec::Exec);
         reg.register(grep::Grep);
         reg.register(find::Find);
-        #[cfg(feature = "pdf")]
         reg.register(pdf::PdfClassify);
-        #[cfg(feature = "pdf")]
         reg.register(pdf::PdfToMarkdown);
         // Blockchain tools — registered only when the `blockchain` feature is
         // enabled; the tools themselves live in the `choreo-blockchain` crate.

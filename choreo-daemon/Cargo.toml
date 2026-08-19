@@ -83,45 +83,24 @@ tempfile.workspace = true
 postcard.workspace = true
 rmp-serde.workspace = true
 structured-zstd.workspace = true
-# Native PDF parsing (pdf_classify / pdf_to_markdown), behind the `pdf` feature.
-#
-# This is a REGISTRY dep (`pdf-inspector = "0.1"`) — deliberately NOT a git pin,
-# because crates.io refuses to publish crates whose manifests reference git
-# sources. The security pin lives in the workspace root's `[patch.crates-io]`
-# (see the root Cargo.toml), which redirects this crates.io version to a
-# contributor fork for local/release builds: upstream (firecrawl/pdf-inspector)
-# still ships lopdf ^0.41.0, vulnerable to RUSTSEC-2026-0187 — a ~21 KB crafted
-# PDF with ~10,000-deep nested objects aborts the process via stack overflow,
-# a SIGABRT that `catch_unwind` CANNOT intercept. The fork bumps lopdf to 0.42.0
-# (MAX_NESTING_DEPTH), verified source-compatible with 860 green tests and a
-# clean error instead of SIGABRT on the PoC (upstream PR
-# firecrawl/pdf-inspector#198, omeileo commit f86decf).
-#
-# The feature is off by default: a `cargo install` from crates.io has no
-# `[patch]` available (patches are workspace-local and never published), so it
-# resolves the unpatched registry version — shipping the PDF tools unpatched
-# would re-introduce the RUSTSEC-2026-0187 crash surface. Re-checked 2026-08-09:
-# crates.io pdf-inspector 0.1.7 (latest, published 2026-07-31) still depends on
-# lopdf ^0.41.0, so the fork pin stays. Once upstream publishes with lopdf
-# >= 0.42: drop the `[patch.crates-io]` entry from the root Cargo.toml, turn
-# this back into a plain dependency, and remove the `pdf` feature gate.
-pdf-inspector = { version = "0.1", optional = true }
+# Native PDF parsing (pdf_classify / pdf_to_markdown) — a plain, unconditional
+# registry dependency. No security pin or feature gate: the old pin/fork existed
+# because upstream 0.1.x shipped lopdf ^0.41.0, vulnerable to RUSTSEC-2026-0187
+# (a ~21 KB crafted PDF with ~10,000-deep nested objects aborts the process via
+# stack overflow, a SIGABRT `catch_unwind` cannot intercept). 1.15.0 ships
+# lopdf >= 0.42 (MAX_NESTING_DEPTH), so the documented revert path was applied:
+# the `[patch.crates-io]` redirect and the `pdf` feature were removed.
+pdf-inspector = "1"
 
 [features]
 # Prometheus/OpenMetrics instrumentation and the `/metrics` HTTP server
-# (src/metrics.rs). Off by default (like `pdf`): a plain build compiles it
-# out entirely (no prometheus/tiny_http dependencies), and release binaries
-# opt in via `scripts/release.sh --features pdf,metrics,blockchain`. The module's public
-# API degrades to no-op stubs when disabled, so the daemon's instrumentation
-# call sites compile unchanged in both configurations — and `--metrics-addr`
-# then fails startup with a clear error instead of being silently ignored.
+# (src/metrics.rs). Off by default: a plain build compiles it out entirely
+# (no prometheus/tiny_http dependencies), and release binaries opt in via
+# `scripts/release.sh --features metrics,blockchain`. The module's public API
+# degrades to no-op stubs when disabled, so the daemon's instrumentation call
+# sites compile unchanged in both configurations — and `--metrics-addr` then
+# fails startup with a clear error instead of being silently ignored.
 metrics = ["dep:prometheus", "dep:tiny_http"]
-# Native PDF tools (pdf_classify / pdf_to_markdown). Off by default so the
-# published manifest stays free of the git-pinned fork (crates.io rejects git
-# dependencies); release binaries are built with `--features pdf,metrics,blockchain` and get the
-# fork via the workspace `[patch.crates-io]`. See the pdf-inspector comment
-# above for the security rationale and the revert path.
-pdf = ["dep:pdf-inspector"]
 # EVM (alloy) and Substrate/Polkadot (subxt) blockchain tools. Off by default:
 # enabling it pulls in the choreo-blockchain crate (tokio + alloy/subxt client
 # stacks) that a plain build has no use for. Opt in with `--features blockchain`

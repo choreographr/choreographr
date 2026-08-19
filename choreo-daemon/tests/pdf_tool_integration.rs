@@ -8,12 +8,11 @@
 //! `use` items from `src/` directly). Marked `#[ignore]` per repo
 //! conventions: `cargo test -- --ignored pdf`.
 //!
-//! The whole module is gated on the `pdf` feature: the parser dependency is a
-//! crates.io registry version patched to a security fork only in the workspace
-//! root (never published), and these tests exercise the fork's behavior (e.g.
-//! the RUSTSEC-2026-0187 regression guard below), so they only build where the
-//! patch is in effect.
-#![cfg(feature = "pdf")]
+//! The whole module used to be gated on a `pdf` feature while the parser
+//! dependency was a crates.io 0.1 version patched to a security fork in the
+//! workspace root. Since the 1.15.0 update `pdf-inspector` is unconditional
+//! and the registry version ships the RUSTSEC-2026-0187 fix (`lopdf >= 0.42`,
+//! see the regression guard below), so these tests always build and run.
 
 use choreo_ai_protocols::ChatToolCall;
 use choreo_daemon::tools::{ToolOutputFormat, ToolRegistry};

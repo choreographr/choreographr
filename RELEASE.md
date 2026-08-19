@@ -39,14 +39,6 @@ before upload (see [Phase 4](#phase-4--assemble-and-upload)).
   `cargo release` do it (Phase 1).
 - **Tag format:** `vX.Y.Z` (e.g. `v0.1.1`). Release notes are generated from
   the tag diff (`gh release create --generate-notes`).
-- **crates.io gate (pdf-inspector):** the `pdf` feature is **off by default**
-  on crates.io — `choreo-daemon` declares the registry `pdf-inspector = "0.1"`
-  and the workspace-root `[patch.crates-io]` redirect (security fork,
-  RUSTSEC-2026-0187) applies **only to local builds**, never to published
-  manifests. Publishing is therefore unblocked as long as nobody flips the
-  `pdf` feature to be non-optional. When upstream publishes a fixed
-  `pdf-inspector` (lopdf ≥ 0.42), delete the patch section, make `pdf`
-  unconditional, and re-run the full suite.
 
 ### Preflight (before Phase 1)
 
@@ -167,8 +159,6 @@ dependency order (`choreo-gui` drops out on its own via `publish = false`).
   `cargo release --help` for the installed one.
 - Push the bump commit and the `vX.Y.Z` tag created in Phase 1:
   `git push origin master --tags`.
-- **Never** publish with the `pdf` feature enabled; the published manifests
-  must stay free of the git patch (they are — patches don't propagate).
 - Verify the published suite installs cleanly from source in a scratch
   `CARGO_HOME` (needs `zig` on PATH — zlob's `build.rs`):
 
@@ -230,10 +220,10 @@ Both machines run the same dry-run flow. `scripts/release.sh`:
   story; see the README build notes),
 - reads the version from `Cargo.toml`,
 - guards against a dirty tree,
-- builds with `--features pdf,metrics,blockchain` (the workspace patch hardens
-the PDF parser for the shipped binaries even though crates.io doesn't get it,
-the `/metrics` endpoint stays available as the README advertises, and the
-EVM/Substrate blockchain tools ship in the released binaries),
+- builds with `--features metrics,blockchain` (the metrics endpoint stays
+available as the README advertises, and the EVM/Substrate blockchain tools ship
+in the released binaries; the native PDF tools are unconditional since
+`pdf-inspector` became a plain registry dependency in 1.15.0),
 - writes the tarball + `SHA256SUMS` (covering everything already in `dist/`
   for this version) into `dist/`,
 - builds `.deb`/`.rpm` best-effort (Linux only, host glibc, no mimalloc),

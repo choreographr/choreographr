@@ -12,10 +12,10 @@ incompatible-rust-versions = "fallback"
 # tests) while running every test in its own process, in parallel, across all
 # 16-ish cores. `--run-ignored only` matches libtest's `--ignored` semantics.
 #
-# `--all-features` keeps feature-gated code exercised: the native PDF tools
-# (and their tests) live behind the `pdf` feature, which resolves to a security
-# fork only via the workspace `[patch.crates-io]` — running the suite with all
-# features on is what keeps those tests in CI.
+# `--all-features` keeps feature-gated code exercised: the metrics, blockchain,
+# and mimalloc features (all off by default) get compiled and their tests run —
+# running the suite with all features on is what keeps those paths in CI. The
+# native PDF tools need no feature: pdf-inspector is an unconditional dependency.
 #
 # `test-lean` is the complement: it runs the unit suite with every optional
 # feature off (the default configuration). That is the only way the metrics
@@ -25,7 +25,7 @@ incompatible-rust-versions = "fallback"
 # from the real backend.
 [alias]
 test-fast = "nextest run --workspace --all-features"                 # unit tests
-# unit tests with every optional feature off (metrics/pdf/mimalloc stubs)
+# unit tests with every optional feature off (metrics/blockchain/mimalloc stubs)
 test-lean = "nextest run --workspace"
 # integration tests (the #[ignore] suite)
 test-integration = "nextest run --workspace --all-features --run-ignored only"

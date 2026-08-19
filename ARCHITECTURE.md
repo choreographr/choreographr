@@ -1676,29 +1676,21 @@ parser built on `lopdf`. The parser has no JavaScript engine, never renders page
 never executes embedded files or `/Launch` actions, so the classic PDF malware
 *execution* vectors are excluded by construction.
 
-> **Dependency pin — security.** `choreo-daemon` declares `pdf-inspector = "0.1"` (a
-> crates.io registry dep) behind its optional `pdf` feature, and the workspace root
-> `[patch.crates-io]` redirects that version to a contributor fork
-> (`omeileo/pdf-inspector@f86decf`, upstream PR firecrawl/pdf-inspector#198) for **local
-> builds only** — dev, tests (`--all-features`), and the release binaries
-> (`scripts/release.sh --features pdf,metrics,blockchain`). The fork exists because upstream still ships
-> `lopdf ^0.41.0`, vulnerable to RUSTSEC-2026-0187: a ~21 KB crafted PDF with ~10,000-deep
-> nested objects aborts the process via stack overflow — a SIGABRT that `catch_unwind`
-> **cannot** intercept. The fork bumps `lopdf` to 0.42.0 (MAX_NESTING_DEPTH), verified
-> source-compatible by the PR author (860 tests green; the PoC now yields `Type: SCANNED`
-> and exit 0 instead of SIGABRT). The regression guard is
-> `nested_array_poc_does_not_abort_process` in `tests/pdf_tool_integration.rs`.
->
-> The two-step arrangement (registry dep + workspace patch, feature-gated) exists because
-> crates.io **rejects git dependencies in published manifests**: the published
-> `choreo-daemon` must reference only registry versions. Patches are never published, so a
-> `cargo install choreographr` from crates.io resolves the *unpatched* registry
-> `pdf-inspector` — which is why the `pdf` feature is **off by default** on crates.io, and
-> the release binaries (built from the git tree, where the patch applies) enable it. Once
-> upstream publishes with `lopdf >= 0.42`: delete the `[patch.crates-io]` entry from the
-> root `Cargo.toml`, drop the `pdf` feature gates in `choreo-daemon/Cargo.toml` and the
-> root `Cargo.toml`, and make the dependency unconditional (see the comment in
-> `choreo-daemon/Cargo.toml`).
+> **Dependency — security.** `pdf-inspector` is an **unconditional registry dependency**
+> of `choreo-daemon` (`pdf-inspector = "1"`, version 1.x, no feature gate). The old
+> arrangement — a crates.io 0.1 dep behind the optional `pdf` feature plus a
+> workspace-root `[patch.crates-io]` redirect to a contributor fork
+> (`omeileo/pdf-inspector@f86decf`, upstream PR firecrawl/pdf-inspector#198) — was removed
+> in the 1.15.0 update: crates.io 0.1.x shipped `lopdf ^0.41.0`, vulnerable to
+> RUSTSEC-2026-0187 (a ~21 KB crafted PDF with ~10,000-deep nested objects aborts the
+> process via stack overflow — a SIGABRT that `catch_unwind` **cannot** intercept), and the
+> fork bumped `lopdf` to 0.42.0 (MAX_NESTING_DEPTH). Upstream 1.15.0 now ships
+> `lopdf >= 0.42` with `default = []`, so the pin, the `[patch.crates-io]` entry, and the
+> `pdf` feature gates in the root and `choreo-daemon` `Cargo.toml` were all deleted. The
+> regression guard `nested_array_poc_does_not_abort_process` in
+> `tests/pdf_tool_integration.rs` still covers the vuln: with `lopdf >= 0.42` the parser
+> caps nesting depth, so the PoC yields a clean parse error or a graceful `SCANNED`
+> classification (exit 0) instead of SIGABRT.
 
 - **`pdf_classify`** runs `pdf_inspector::detect_pdf_mem` (DetectOnly mode, ~10–50ms) and
   reports `pdf_type` (text_based / scanned / image_based / mixed), `confidence`,

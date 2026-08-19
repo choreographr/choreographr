@@ -123,9 +123,8 @@ check-macos: _require-zig
 # Windows cross-compile gate: type-check every library crate for
 # x86_64-pc-windows-gnu via zig (MinGW bundled — no mingw install needed).
 # Same libs-only rationale as check-macos; this is the recipe to iterate the
-# Windows port against. Until the workspace [patch.crates-io] fix lands, a
-# clean build also surfaces the zlob archive-naming quirk (zig emits
-# `zlob.lib`, the windows-gnu target wants `libzlob.a`).
+# Windows port against. A clean build also surfaces the zlob archive-naming
+# quirk (zig emits `zlob.lib`, the windows-gnu target wants `libzlob.a`).
 check-windows: _require-zig
     rustup target add x86_64-pc-windows-gnu
     cargo-zigbuild check {{ CARGO_FLAGS }} --target x86_64-pc-windows-gnu --workspace --lib
