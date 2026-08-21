@@ -3,7 +3,7 @@ use choreo_proto::{
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub enum ToolCallEvent {
@@ -107,124 +107,177 @@ pub trait TurnEventHandler {
     );
 }
 
+/// Dispatch a [`DaemonMessage`] to the [`TurnEventHandler`], splitting the
+/// two v4 families before any per-arm work:
+/// - [`DaemonMessage::Session`] — a session-scoped [`SessionEvent`] wrapped in
+///   the envelope that hoists the origin session id. `dispatch_session_event`
+///   resolves that origin exactly once (the reference is destructured in its
+///   value position there, so every arm below reads a single `session_id`)
+///   and then handles the inner event; the flat variants never appear in its
+///   match.
+/// - The 23 flat connection/reply/global variants — replies to the client's
+///   own requests (`Sessions`, `Models`, `Pong`, keystore/account replies,
+///   catalog/refresh replies, …), handled by `dispatch_flat_message`.
 pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandler) {
     debug!("dispatching daemon message: {msg:?}");
+    match msg {
+        DaemonMessage::Session { session_id, event } => {
+            dispatch_session_event(session_id, event, handler);
+        }
+        flat => dispatch_flat_message(flat, handler),
+    }
+}
 
-    // Session-scoped events all ride the `DaemonMessage::Session` envelope,
-    // which hoists the origin session id, so `session_id` is destructured
-    // exactly once here rather than per-arm. Connection-level replies (e.g.
-    // a daemon "no session attached" failure) have no origin session and
-    // carry `session_id: None`. Non-session (flat) messages take the else
-    // branch: the rest of the dispatch below handles them and returns, so
-    // the session-event match below only ever sees the envelope.
-    let DaemonMessage::Session { session_id, event } = msg else {
-        match msg {
-            DaemonMessage::Sessions { .. } => {
-                // Handled upstream by the caller before dispatch.
-            }
-            DaemonMessage::Pong => {
-                handler.handle_status_text("[daemon] pong".to_string());
-            }
-            DaemonMessage::ShuttingDown => {
-                handler.handle_status_text("[daemon] shutting down".to_string());
-            }
-            DaemonMessage::Models {
-                models,
-                selected_model,
-            } => {
-                if models.is_empty() {
-                    handler.handle_status_text("[daemon] no models available".to_string());
-                } else {
-                    let mut lines = vec![format!("[daemon] supported models ({})", models.len())];
-                    for model in models {
-                        let prefix = if selected_model.as_deref() == Some(model.as_str()) {
-                            "*"
-                        } else {
-                            "-"
-                        };
-                        lines.push(format!("{prefix} {model}"));
-                    }
-                    handler.handle_status_text(lines.join("\n"));
+/// Dispatch a flat (non-session-scoped) [`DaemonMessage`]: connection control
+/// replies (`Pong`, `ShuttingDown`, `Evicted`), request replies (`Sessions`,
+/// `Models`/`ModelsFailed`, keystore + account replies), and catalog/refresh
+/// replies. Every variant is enumerated explicitly — the variant set IS the
+/// wire contract, so a NEW `DaemonMessage` variant must be triaged here at
+/// compile time instead of being silently swallowed by a wildcard arm
+/// (matching the same rule `dispatch_session_event` applies to its
+/// `SessionEvent` match).
+fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandler) {
+    match msg {
+        DaemonMessage::Sessions { .. } => {
+            // Handled upstream by the caller before dispatch.
+        }
+        DaemonMessage::Pong => {
+            handler.handle_status_text("[daemon] pong".to_string());
+        }
+        DaemonMessage::ShuttingDown => {
+            handler.handle_status_text("[daemon] shutting down".to_string());
+        }
+        DaemonMessage::Models {
+            models,
+            selected_model,
+        } => {
+            if models.is_empty() {
+                handler.handle_status_text("[daemon] no models available".to_string());
+            } else {
+                let mut lines = vec![format!("[daemon] supported models ({})", models.len())];
+                for model in models {
+                    let prefix = if selected_model.as_deref() == Some(model.as_str()) {
+                        "*"
+                    } else {
+                        "-"
+                    };
+                    lines.push(format!("{prefix} {model}"));
                 }
-            }
-            DaemonMessage::ModelsFailed { error } => {
-                handler.handle_error(format!("[daemon] models failed: {error}"));
-            }
-            DaemonMessage::Unlocked => {
-                handler.handle_status_text(
-                    "[daemon] keystore unlocked, credentials available".to_string(),
-                );
-            }
-            DaemonMessage::Locked => {
-                handler.handle_status_text(
-                    "[daemon] keystore locked, credentials cleared".to_string(),
-                );
-            }
-            DaemonMessage::LockedError { error } => {
-                handler.handle_error(format!("[daemon] locked: {error}"));
-            }
-            DaemonMessage::CredentialAdded { service } => {
-                handler.handle_status_text(format!("[daemon] credential added: {service}"));
-            }
-            DaemonMessage::CredentialAddFailed { service, error } => {
-                handler.handle_error(format!(
-                    "[daemon] credential add failed ({service}): {error}"
-                ));
-            }
-            DaemonMessage::CredentialRemoved { service } => {
-                handler.handle_status_text(format!("[daemon] credential removed: {service}"));
-            }
-            DaemonMessage::CredentialRemoveFailed { service, error } => {
-                handler.handle_error(format!(
-                    "[daemon] credential remove failed ({service}): {error}"
-                ));
-            }
-            DaemonMessage::Credential { .. } => {}
-            DaemonMessage::AccountAdded { name } => {
-                handler.handle_status_text(format!("[daemon] account added: {name}"));
-            }
-            DaemonMessage::AccountAddFailed { name, error } => {
-                handler.handle_error(format!("[daemon] failed to add account {name}: {error}"));
-            }
-            DaemonMessage::AccountRemoved { name } => {
-                handler.handle_status_text(format!("[daemon] account removed: {name}"));
-            }
-            DaemonMessage::AccountRemoveFailed { name, error } => {
-                handler.handle_error(format!("[daemon] failed to remove account {name}: {error}"));
-            }
-            DaemonMessage::Accounts { accounts } => {
-                if accounts.is_empty() {
-                    handler.handle_status_text("[daemon] no accounts configured".to_string());
-                } else {
-                    let mut lines = vec![format!("[daemon] accounts ({})", accounts.len())];
-                    for a in accounts {
-                        lines.push(format!("  {}: {}", a.name, a.provider));
-                    }
-                    handler.handle_status_text(lines.join("\n"));
-                }
-            }
-            DaemonMessage::AccountListFailed { error } => {
-                handler.handle_error(format!("[daemon] failed to list accounts: {error}"));
-            }
-            _ => {
-                debug!("unhandled daemon message variant");
+                handler.handle_status_text(lines.join("\n"));
             }
         }
-        return;
-    };
+        DaemonMessage::ModelsFailed { error } => {
+            handler.handle_error(format!("[daemon] models failed: {error}"));
+        }
+        DaemonMessage::Unlocked => {
+            handler.handle_status_text(
+                "[daemon] keystore unlocked, credentials available".to_string(),
+            );
+        }
+        DaemonMessage::Locked => {
+            handler.handle_status_text("[daemon] keystore locked, credentials cleared".to_string());
+        }
+        DaemonMessage::LockedError { error } => {
+            handler.handle_error(format!("[daemon] locked: {error}"));
+        }
+        DaemonMessage::CredentialAdded { service } => {
+            handler.handle_status_text(format!("[daemon] credential added: {service}"));
+        }
+        DaemonMessage::CredentialAddFailed { service, error } => {
+            handler.handle_error(format!(
+                "[daemon] credential add failed ({service}): {error}"
+            ));
+        }
+        DaemonMessage::CredentialRemoved { service } => {
+            handler.handle_status_text(format!("[daemon] credential removed: {service}"));
+        }
+        DaemonMessage::CredentialRemoveFailed { service, error } => {
+            handler.handle_error(format!(
+                "[daemon] credential remove failed ({service}): {error}"
+            ));
+        }
+        DaemonMessage::Credential { .. } => {}
+        DaemonMessage::AccountAdded { name } => {
+            handler.handle_status_text(format!("[daemon] account added: {name}"));
+        }
+        DaemonMessage::AccountAddFailed { name, error } => {
+            handler.handle_error(format!("[daemon] failed to add account {name}: {error}"));
+        }
+        DaemonMessage::AccountRemoved { name } => {
+            handler.handle_status_text(format!("[daemon] account removed: {name}"));
+        }
+        DaemonMessage::AccountRemoveFailed { name, error } => {
+            handler.handle_error(format!("[daemon] failed to remove account {name}: {error}"));
+        }
+        DaemonMessage::Accounts { accounts } => {
+            if accounts.is_empty() {
+                handler.handle_status_text("[daemon] no accounts configured".to_string());
+            } else {
+                let mut lines = vec![format!("[daemon] accounts ({})", accounts.len())];
+                for a in accounts {
+                    lines.push(format!("  {}: {}", a.name, a.provider));
+                }
+                handler.handle_status_text(lines.join("\n"));
+            }
+        }
+        DaemonMessage::AccountListFailed { error } => {
+            handler.handle_error(format!("[daemon] failed to list accounts: {error}"));
+        }
+        // Explicit no-ops, enumerated so a new flat variant still forces this
+        // match to grow:
+        // - ModelsRefreshed/ModelsRefreshFailed/CatalogUpdated: catalog-level
+        //   replies surfaced by the connection layer, not by the generic text
+        //   dispatch.
+        // - Evicted: the best-effort advisory travels ahead of the
+        //   disconnect and the connection layer shows it.
+        DaemonMessage::ModelsRefreshed { .. }
+        | DaemonMessage::ModelsRefreshFailed { .. }
+        | DaemonMessage::CatalogUpdated { .. }
+        | DaemonMessage::Evicted => {
+            debug!("flat daemon message has no generic-dispatch text: {msg:?}");
+        }
+        // A `Session` envelope here is a routing bug: `dispatch_daemon_message`
+        // separates the two families before calling this function, so only
+        // non-session messages reach it. The arm exists to keep the match
+        // exhaustive (no wildcard) and fails loudly instead of silently
+        // dropping the envelope's event.
+        DaemonMessage::Session {
+            session_id, event, ..
+        } => {
+            warn!(
+                session_id,
+                "session envelope reached the flat-message dispatch; event is dropped: {event:?}"
+            );
+        }
+    }
+}
 
-    // Connection-level replies arrive without an origin session (`None`) —
-    // the daemon synthesizes them on its connection dispatch when there is
-    // no session task to supply an origin (e.g. `Failed` "no session
-    // attached"). Six events are None-capable: the two failure-shaped ones
-    // below, plus `ModelSelectionFailed`/`ReasoningEffortSet(`/`Failed`)/
-    // `SessionFailed` — which never use the origin in this generic dispatch
-    // (they surface via `handle_error`/`handle_status_text`), so the `None`
-    // case must not be dropped before them. All six can ALSO arrive with
-    // `Some` from session-task broadcasts, so they are handled here for both
-    // origins; every remaining `SessionEvent` requires `Some`. This keeps
-    // the no-origin case explicit instead of a magic `session_id: 0`
-    // leaking into handler code.
+/// Dispatch the inner [`SessionEvent`] of a [`DaemonMessage::Session`]
+/// envelope to the handler, resolving the origin session id exactly once on
+/// the envelope.
+///
+/// Connection-level replies arrive without an origin session (`None`) — the
+/// daemon synthesizes them on its connection dispatch when there is no
+/// session task to supply an origin (e.g. `Failed` "no session attached").
+/// Six events are None-capable: the two failure-shaped ones below, plus
+/// `ModelSelectionFailed`/`ReasoningEffortSet(`/`Failed`)/`SessionFailed` —
+/// which never use the origin in this generic dispatch (they surface via
+/// `handle_error`/`handle_status_text`), so the `None` case must not be
+/// dropped before them. All six can ALSO arrive with `Some` from
+/// session-task broadcasts, so they are handled here for both origins (the
+/// `Some`-origin variants fall through the pre-match's early `return`s only
+/// when the arm has nothing to do with the id). Every remaining
+/// `SessionEvent` requires `Some`, enforced by the guard below. This keeps
+/// the no-origin case explicit instead of a magic `session_id: 0` leaking
+/// into handler code.
+fn dispatch_session_event(
+    session_id: &Option<u64>,
+    event: &SessionEvent,
+    handler: &mut impl TurnEventHandler,
+) {
+    // None-capable events: their handlers take the origin as-is (`Option<u64>`
+    // for `handle_failed`, or not at all), so a `None` envelope must not be
+    // treated as "drop the event".
     match event {
         SessionEvent::Failed { request_id, error } => {
             // `session_id` is `&Option<u64>` here, so `as_ref().copied()`
@@ -262,8 +315,12 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
         _ => {}
     }
 
+    // Every event left after the pre-match needs a real origin session. A
+    // `None` here is a producer bug or a malformed frame — dropping the event
+    // would silently lose client-visible data, so this is a warn, not a
+    // debug, and the event is not dispatched.
     let Some(session_id) = session_id else {
-        debug!("session-scoped event without an origin session: {event:?}");
+        warn!("session-scoped event without an origin session, dropping it: {event:?}");
         return;
     };
 

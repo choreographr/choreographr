@@ -18,6 +18,28 @@
 use super::*;
 use crate::broadcast::fan_out_evicting;
 
+/// True when a [`DaemonCommand::BroadcastActivity`] command carries a session
+/// origin (`Some`) but a non-session message — a dedup-contract violation.
+///
+/// A `Some` origin tells the daemon to skip clients that are also direct
+/// subscribers of that origin session (they receive the event via the
+/// per-session bus instead). Only session-scoped events actually ride the
+/// per-session bus, so a non-session message forwarded with `Some(origin)`
+/// would be suppressed for those clients in the activity path AND never
+/// delivered on the per-session path — lost entirely. Every current producer
+/// satisfies the contract (the session thread forwards only
+/// `DaemonMessage::Session` envelopes with `Some(ctx.session_id)`; the
+/// daemon's catalog broadcast uses `None`); the predicate is the tripwire
+/// that keeps a future misuse from silently dropping messages. Split out as a
+/// pure function so the contract is unit-testable without capturing
+/// `tracing`.
+pub(super) fn violates_broadcast_origin_contract(
+    session_id: Option<u64>,
+    msg: &DaemonMessage,
+) -> bool {
+    session_id.is_some() && !matches!(msg, DaemonMessage::Session { .. })
+}
+
 impl DaemonState {
     /// Send a message to all summary subscribers, removing dead ones.
     ///
@@ -393,6 +415,19 @@ impl DaemonState {
         session_id: Option<u64>,
         msg: DaemonMessage,
     ) {
+        // Tripwire for the dedup contract: a `Some` origin on a non-session
+        // message would drop that message for the origin session's direct
+        // subscribers on BOTH paths (the activity path skips them via dedup,
+        // the per-session path never carries non-session messages). No
+        // current producer does this; warn loudly if one ever does.
+        if violates_broadcast_origin_contract(session_id, &msg) {
+            warn!(
+                session_id,
+                "BroadcastActivity carries a session origin for a non-session message; \
+                 direct subscribers of that origin session will miss it on both the \
+                 activity and per-session paths"
+            );
+        }
         let (evict_clients, evict_largest) = fan_out_evicting(
             &mut self.activity_subscribers,
             &msg,

@@ -1929,6 +1929,51 @@ fn handle_broadcast_activity_dedup_keyed_on_command_origin_not_message_shape() {
     assert!(state.activity_subscribers.contains_key(&10));
 }
 
+#[test]
+fn broadcast_origin_contract_rejects_non_session_message_with_some_origin() {
+    // A `Some` origin on a non-session message VIOLATES the dedup contract:
+    // the origin session's direct subscribers are skipped on the activity
+    // path (dedup) and never receive the message on the per-session path
+    // (only session events ride it) — the message would be LOST for them.
+    // The predicate is the tripwire that flags a future producer doing this.
+    assert!(
+        super::subscriber_handlers::violates_broadcast_origin_contract(
+            Some(42),
+            &DaemonMessage::Sessions { sessions: vec![] },
+        )
+    );
+    assert!(
+        super::subscriber_handlers::violates_broadcast_origin_contract(
+            Some(42),
+            &DaemonMessage::CatalogUpdated { providers: vec![] },
+        )
+    );
+
+    // Session envelopes never violate the contract: the per-session bus
+    // carries exactly these, so a `Some` origin can only suppress messages
+    // the origin's direct subscribers do receive.
+    let session_msg = DaemonMessage::Session {
+        session_id: Some(42),
+        event: SessionEvent::OutputChunk {
+            request_id: 1,
+            stream: choreo_proto::OutputStream::Answer,
+            data: vec![],
+        },
+    };
+    assert!(
+        !super::subscriber_handlers::violates_broadcast_origin_contract(Some(42), &session_msg,)
+    );
+
+    // A `None` origin is global/control provenance: no dedup runs, so there
+    // is no contract to violate (catalog updates, models refresh broadcasts).
+    assert!(
+        !super::subscriber_handlers::violates_broadcast_origin_contract(
+            None,
+            &DaemonMessage::CatalogUpdated { providers: vec![] },
+        )
+    );
+}
+
 // ── S4: /refresh-models + catalog swaps ────────────────────────────
 
 /// The bundled catalog (embedded base + bundled overlay) — what
