@@ -415,7 +415,7 @@ data model.
 | `choreo-gui` | Desktop GUI client (Dioxus) |
 | `choreo-im` | Instant messaging bridge (Telegram) |
 | `choreo-client-core` | Shared parsing, markdown, image assembly, and daemon-message dispatch for UI clients |
-| `choreo-markdown` | Markdown parser and HTML renderer (pulldown-cmark + ammonia) |
+| `choreo-markdown` | Markdown parser, HTML renderer (pulldown-cmark + ammonia), and a LaTeX-math → Unicode pretty-printer (`render_math_pretty`) |
 
 ## Concepts
 

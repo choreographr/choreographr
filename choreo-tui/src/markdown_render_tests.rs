@@ -3980,3 +3980,64 @@ fn code_block_indented_wrapping() {
         );
     }
 }
+
+// ── math rendering ───────────────────────────────────────────────────
+
+#[test]
+fn inline_math_renders_pretty_unicode() {
+    let result = markdown_lines("solve $x^2 + 1$ now", 80);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].to_string(), "solve x²+1 now");
+}
+
+#[test]
+fn inline_math_limit_keeps_arrow() {
+    // The arrow has no subscript glyph, but the partial mapping keeps the
+    // common `\lim_{x \to 0}` readable as `limₓ→₀`.
+    let result = markdown_lines("The limit $\\lim_{x \\to 0} x = 0$ holds.", 100);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].to_string(), "The limit limₓ→₀x=0 holds.");
+}
+
+#[test]
+fn display_math_renders_centered_on_its_own_line() {
+    let result = markdown_lines("$$\\sum_{i=1}^{n} i$$", 80);
+    assert_eq!(result.len(), 1);
+    let line = result[0].to_string();
+    let equation = "∑ᵢ₌₁ⁿi";
+    assert_eq!(line.trim_start(), equation);
+    // (80 − 6) / 2 = 37 columns of leading padding for a 6-wide equation.
+    assert_eq!(line.len() - line.trim_start().len(), 37);
+}
+
+#[test]
+fn display_math_breaks_out_of_flowing_text() {
+    let result = markdown_lines("left $$a+b$$ right", 80);
+    let rendered: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    assert_eq!(rendered[0], "left");
+    assert_eq!(rendered[2], "right");
+    assert_eq!(rendered[1].trim_start(), "a+b");
+}
+
+#[test]
+fn display_math_wraps_when_too_wide() {
+    let result = markdown_lines("$$\\frac{x+1}{x-1} = 2$$", 10);
+    let joined: String = result.iter().map(|l| l.to_string()).collect();
+    assert_eq!(joined, "(x+1)/(x-1)=2");
+    assert!(result.len() >= 2, "expected the equation to wrap");
+    for line in &result {
+        assert!(line.width() <= 10, "wrapped line too wide");
+    }
+}
+
+#[test]
+fn table_cells_pretty_print_math() {
+    let result = markdown_lines("| A | B |\n|---|---|\n| $x_i$ | $\\alpha$ |", 80);
+    let rendered: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let rendered = rendered.join("\n");
+    assert!(
+        rendered.contains("xᵢ"),
+        "inline math subscript in table cell: {rendered}"
+    );
+    assert!(rendered.contains("α"), "greek in table cell: {rendered}");
+}

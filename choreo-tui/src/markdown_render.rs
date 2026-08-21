@@ -1,4 +1,5 @@
 use crate::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
+use choreo_markdown::render_math_pretty;
 use choreo_proto::{ToolResultRecord, Turn};
 use choreo_sanitize::is_unsafe_unicode;
 use ratatui::style::{Color, Modifier, Style};
@@ -2014,10 +2015,13 @@ fn inline_plain_text(inlines: &[MarkdownInline]) -> String {
 fn append_inline_plain_text(inlines: &[MarkdownInline], text: &mut String) {
     for inline in inlines {
         match inline {
-            MarkdownInline::Text(value)
-            | MarkdownInline::Code(value)
-            | MarkdownInline::InlineMath(value)
-            | MarkdownInline::DisplayMath(value) => text.push_str(value),
+            MarkdownInline::Text(value) | MarkdownInline::Code(value) => text.push_str(value),
+            MarkdownInline::InlineMath(value) | MarkdownInline::DisplayMath(value) => {
+                // Table cells are rendered as plain text; pretty-print math so
+                // it reads like the surrounding cell content instead of raw
+                // LaTeX source.
+                text.push_str(&render_math_pretty(value));
+            }
             MarkdownInline::Strikethrough(content)
             | MarkdownInline::Emphasis(content)
             | MarkdownInline::Strong(content) => append_inline_plain_text(content, text),
@@ -2206,10 +2210,14 @@ fn render_inlines_to_lines(inlines: &[MarkdownInline], ctx: &mut RenderCtx) {
                 render_code_inline(text, ctx, Color::Cyan);
             }
             MarkdownInline::InlineMath(text) => {
-                render_code_inline(text, ctx, Color::Yellow);
+                // Inline math (`$...$`) is pretty-printed to Unicode and then
+                // rendered like a normal word (unbreakable, wraps as a unit).
+                let pretty = render_math_pretty(text);
+                let body: &str = if pretty.is_empty() { text } else { &pretty };
+                render_code_inline(body, ctx, Color::Yellow);
             }
             MarkdownInline::DisplayMath(text) => {
-                render_code_inline(text, ctx, Color::Magenta);
+                render_display_math(text, ctx);
             }
             MarkdownInline::Strikethrough(content) => {
                 render_style_inline(content, ctx, Modifier::CROSSED_OUT);
@@ -2367,6 +2375,67 @@ fn render_code_inline(text: &str, ctx: &mut RenderCtx, color: Color) {
     ctx.push_span(text.to_string(), ctx.base_style().fg(color));
     *ctx.current_width += word_width;
     *ctx.needs_separator = true;
+}
+
+/// Render a display-math expression (`$$...$$`) as a block on its own line:
+/// the pretty-printed equation is centred when it fits, wrapped left-aligned
+/// when too wide for the content width.
+///
+/// Display math always starts and ends its own line — any text before it is
+/// flushed with a hard break first, and the in-progress line is reset to a
+/// fresh continuation line so following text starts a new row.
+fn render_display_math(text: &str, ctx: &mut RenderCtx) {
+    let pretty = render_math_pretty(text);
+    let body: &str = if pretty.is_empty() { text } else { &pretty };
+
+    // Close out any text already on the current line so the equation starts
+    // on a fresh one.
+    if *ctx.current_width > ctx.indent {
+        ctx.flush_line_with_next(LineJoin::Break);
+    }
+    *ctx.needs_separator = false;
+
+    let available = ctx.width.saturating_sub(ctx.indent);
+    let style = ctx.base_style().fg(Color::Magenta);
+
+    if !body.is_empty() && available > 0 && display_width(body) <= available {
+        // A centred equation line.
+        let pad = (available - display_width(body)) / 2;
+        let mut spans = Vec::with_capacity(3);
+        if ctx.indent > 0 {
+            spans.push(Span::styled(" ".repeat(ctx.indent), Style::default()));
+        }
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), Style::default()));
+        }
+        spans.push(Span::styled(body.to_string(), style));
+        ctx.lines.push(Line::from(spans));
+        ctx.joins.push(LineJoin::Break);
+    } else if !body.is_empty() {
+        // Too wide for one line: wrap left-aligned at the content width.  The
+        // equation is still one visual block, so every continuation row is a
+        // fresh line.
+        for chunk in wrap_plain_line(body, available.max(1)) {
+            let mut spans = Vec::with_capacity(2);
+            if ctx.indent > 0 {
+                spans.push(Span::styled(" ".repeat(ctx.indent), Style::default()));
+            }
+            spans.push(Span::styled(chunk, style));
+            ctx.lines.push(Line::from(spans));
+            ctx.joins.push(LineJoin::Break);
+        }
+    }
+
+    // Reset the in-progress line to a fresh, empty continuation line (the
+    // same invariant `flush_line_with_next` maintains) so any text that
+    // follows the equation starts on its own row.
+    ctx.current.clear();
+    *ctx.current_width = ctx.indent;
+    if ctx.indent > 0 {
+        ctx.current
+            .push(Span::styled(" ".repeat(ctx.indent), Style::default()));
+    }
+    ctx.current_join = LineJoin::Break;
 }
 
 /// Render a styled container (bold, italic, strikethrough) by stacking its
