@@ -72,3 +72,67 @@ fn retrieve_webpage_renders_a_real_page() {
         "retrieve_webpage should be in the core group's definitions"
     );
 }
+
+/// `file://` URLs must render a local file directly in the browser (no http
+/// round-trip). Chromium resolves and loads them natively, so this needs no
+/// network and is just as suitable for the browser-boundary test suite.
+#[test]
+#[ignore]
+fn retrieve_webpage_renders_a_local_file() {
+    // Watchdog: a hung browser (or a stuck CDP prompt) would block CI forever.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(90));
+        eprintln!("retrieve_webpage_integration: exceeded 90s; aborting to avoid a hang");
+        std::process::abort();
+    });
+
+    // A distinctive marker so the test cannot false-positive on an empty page.
+    const MARKER: &str = "choreo-file-scheme-marker";
+    let dir = std::env::temp_dir().join("choreo-retrieve-webpage-file-test");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("index.html");
+    std::fs::write(
+        &path,
+        format!("<!doctype html><html><body><p>{MARKER}</p></body></html>"),
+    )
+    .expect("write temp html");
+    let url = url::Url::from_file_path(&path)
+        .expect("temp path should convert to a file:// URL")
+        .to_string();
+
+    let registry = ToolRegistry::new().build();
+    let tool_call = ChatToolCall {
+        id: "call_2".to_string(),
+        name: "retrieve_webpage".to_string(),
+        arguments_json: format!(r#"{{"url": "{url}", "action": "content", "timeout_ms": 20000}}"#),
+        caller: None,
+    };
+
+    let output = registry
+        .execute_json(
+            &tool_call,
+            ToolOutputFormat::Text,
+            None, // x_credentials
+            None, // working_dir
+            None, // ctx
+            None, // image_tx
+        )
+        .expect("tool execution should return");
+
+    // Same graceful skip policy as the http test: browser-less hosts stay green.
+    if output.is_error && output.content.contains("no chromium or chrome binary") {
+        eprintln!("retrieve_webpage_integration: skipping (no chromium/chrome installed)");
+        return;
+    }
+
+    assert!(
+        !output.is_error,
+        "file:// retrieve_webpage should succeed: {}",
+        output.content
+    );
+    assert!(
+        output.content.contains(MARKER),
+        "rendered HTML should contain the marker, got: {}",
+        output.content.chars().take(300).collect::<String>()
+    );
+}

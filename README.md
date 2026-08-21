@@ -53,7 +53,7 @@ This has 2 main purposes:
 
 ### Browsing the web
 
-The `retrieve_webpage` tool renders a URL in a **local** headless Chromium/Chrome (preferring chromium; a binary must already be installed — there is no auto-download) and returns the page's HTML, plain text, a PNG screenshot (inline or to an `output_path`), or a PDF (to `output_path`). It runs locally and offline; for cloud-hosted headless rendering, see the Cloudflare Browser Run / Kitesurf research in this project's history.
+The `retrieve_webpage` tool renders a URL in a **local** headless Chromium/Chrome (preferring chromium; a binary must already be installed — there is no auto-download) and returns the page's HTML, plain text, a PNG screenshot (inline or to an `output_path`), or a PDF (to `output_path`). URLs may use the `http`, `https`, or `file` scheme — `file://` renders a local file directly in the browser. It runs locally and offline; for cloud-hosted headless rendering, see the Cloudflare Browser Run / Kitesurf research in this project's history.
 
 ### Multiple live sessions
 

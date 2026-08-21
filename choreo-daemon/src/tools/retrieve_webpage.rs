@@ -41,7 +41,8 @@ impl WebpageAction {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct RetrieveWebpageArgs {
-    /// URL to render (http or https only).
+    /// URL to render (http, https, or file scheme; `file://` renders a local
+    /// file directly in the browser).
     url: String,
     /// What to retrieve. Defaults to "content".
     action: Option<WebpageAction>,
@@ -170,14 +171,17 @@ fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
-/// True when `url` has an http or https scheme (the only schemes a headless
-/// browser should be asked to render; guards file:// and other local schemes).
+/// True when `url` has an http, https, or file scheme — the schemes a headless
+/// browser can be asked to render. `file://` lets the browser read arbitrary
+/// local files from the daemon's host; that reach is intended and is not gated
+/// behind any option (the browser process already runs under the same OS-level
+/// sandbox as the daemon), so `file://` URLs are passed through untouched.
 fn validate_url(url: &str) -> Result<(), ToolExecError> {
     let parsed = Url::parse(url).map_err(|e| ToolExecError(format!("invalid URL '{url}': {e}")))?;
     match parsed.scheme() {
-        "http" | "https" => Ok(()),
+        "http" | "https" | "file" => Ok(()),
         other => Err(ToolExecError(format!(
-            "unsupported URL scheme '{other}'; only http/https are allowed"
+            "unsupported URL scheme '{other}'; only http/https/file are allowed"
         ))),
     }
 }
@@ -576,18 +580,24 @@ mod tests {
     use crate::tools::Tool;
 
     #[test]
-    fn validate_url_accepts_http_and_https() {
-        for u in ["https://example.com", "http://example.com/path?q=1"] {
+    fn validate_url_accepts_http_https_and_file() {
+        for u in [
+            "https://example.com",
+            "http://example.com/path?q=1",
+            "file:///etc/passwd",
+            "file:///tmp/foo.html",
+            "file://localhost/etc/passwd",
+        ] {
             assert!(validate_url(u).is_ok(), "{u} should be accepted");
         }
     }
 
     #[test]
-    fn validate_url_rejects_non_http_schemes() {
+    fn validate_url_rejects_other_schemes() {
         for u in [
-            "file:///etc/passwd",
             "javascript:alert(1)",
             "ftp://x",
+            "data:text/html,hi",
             "not a url",
         ] {
             let err = validate_url(u).unwrap_err();
