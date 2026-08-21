@@ -163,14 +163,77 @@ pub fn backoff_duration(retry_number: u32, config: &RetryConfig) -> Duration {
     Duration::from_millis((capped as f64 * jitter) as u64)
 }
 
+/// Statuses the HTTP contract defines as *potentially* transient, i.e. a
+/// retry has a chance of succeeding.  Everything in the 4xx range other than
+/// 429 (400/401/402/403/404/422/…) is absent by design: the server rejected
+/// this exact request — bad input, missing/invalid auth, no balance, missing
+/// entitlement — so resending it verbatim cannot succeed.
+///
+/// This is a status-level pre-filter only.  For 429 the full decision also
+/// needs the `Retry-After` header (see `retry_after_within_budget`): the
+/// status alone cannot distinguish a throttle that clears in seconds from a
+/// cooldown that outlives the retry budget.
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
-/// Extract the retry-after header value as seconds from an optional string
-/// value (e.g. `response.header("retry-after")`).
+/// True when a response's `Retry-After` header (if any) is compatible with
+/// the configured retry budget.
+///
+/// `Retry-After` is the server's rigid, machine-readable "come back then"
+/// signal.  RFC 7231 defines it for 429 (rate limited) and 503 (service
+/// unavailable) — the two retried statuses the header applies to.  When it
+/// exceeds the backoff ceiling (`max_backoff_ms`) the server has already
+/// told us the cooldown outlives any single delay the policy would ever make
+/// — retrying would just spam the endpoint and delay the real error — so the
+/// caller treats the status as terminal instead.
+///
+/// Other retried statuses (500/502/504) have no defined `Retry-After` per
+/// the RFC, so a stray header on them can never suppress a legitimate retry.
+fn retry_after_within_budget(
+    status: u16,
+    retry_after_secs: Option<u64>,
+    retry: &RetryConfig,
+) -> bool {
+    if !matches!(status, 429 | 503) {
+        return true;
+    }
+    !retry_after_secs
+        .is_some_and(|secs| Duration::from_secs(secs) > Duration::from_millis(retry.max_backoff_ms))
+}
+
+/// Parse a `Retry-After` header value into seconds, per RFC 7231 §7.1.3.
+/// Handles both allowed forms:
+///
+/// - delta-seconds (`Retry-After: 120`) — returned verbatim;
+/// - HTTP-date (`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`) — the
+///   remaining whole seconds from now, floored at 0 (a date already in the
+///   past means "retry now").
+///
+/// Returns `None` when the value is absent or in neither form — a malformed
+/// header is never guessed at, and the caller falls back to exponential
+/// backoff.
 pub fn parse_retry_after_secs(value: Option<&str>) -> Option<u64> {
-    value.and_then(|v| v.parse::<u64>().ok())
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // delta-seconds: the common, exact form (also rejects date strings, so
+    // trying this first is safe).
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(secs);
+    }
+    // HTTP-date: the strict IMF-fixdate form servers are required to send
+    // (chrono's RFC 2822 parser covers it).  The delta is measured against
+    // our own clock; a value in the future beyond the retry budget is
+    // handled by `retry_after_within_budget`, and one in the past retries
+    // immediately.
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let delta = when
+        .with_timezone(&chrono::Utc)
+        .signed_duration_since(chrono::Utc::now())
+        .num_seconds();
+    Some(delta.max(0) as u64)
 }
 
 /// Returns `true` when a cancellation signal is pending on `cancel_rx`.
@@ -249,17 +312,20 @@ pub fn wait_before_retry(
 
 /// Compute the delay before the next retry attempt.
 ///
-/// Honours a provider-supplied `Retry-After` for 429 responses, but caps it
-/// at `retry.max_backoff_ms` so a malicious/huge header value cannot wedge a
-/// request thread for an unbounded time.  All other statuses (and 429s
-/// without a Retry-After header) fall back to exponential backoff.
+/// Honours a provider-supplied `Retry-After` for the statuses RFC 7231
+/// defines it for — 429 and 503 — but caps it at `retry.max_backoff_ms` so a
+/// malicious/huge header value cannot wedge a request thread for an unbounded
+/// time.  All other statuses (and missing headers) fall back to exponential
+/// backoff.  The value is taken verbatim (no jitter): the server stated an
+/// exact wait and we either make it or — via the budget gate — decline to
+/// retry at all.
 fn retry_delay(
     status: u16,
     retry_after_secs: Option<u64>,
     attempt: u32,
     retry: &RetryConfig,
 ) -> Duration {
-    if status == 429 {
+    if matches!(status, 429 | 503) {
         retry_after_secs
             .map(Duration::from_secs)
             .map(|d| d.min(Duration::from_millis(retry.max_backoff_ms)))
@@ -292,8 +358,15 @@ fn status_to_error(status: u16, detail: &str, retry_after_secs: Option<u64>) -> 
     }
 }
 
-/// Core retry loop: calls `send_request`, inspects the HTTP status, and retries
-/// on retryable errors up to `retry.max_attempts` times.
+/// Core retry loop: calls `send_request`, inspects the HTTP status and
+/// `Retry-After` header, and retries transient errors up to
+/// `retry.max_attempts` times.  Transient means transport errors, 5xx
+/// (overloaded/unreachable server), and 429/503 responses whose `Retry-After`
+/// fits within the backoff budget.  Everything else — 4xx client errors, and
+/// 429/503 whose cooldown outlives the budget — fails immediately.
+///
+/// The decision deliberately never consults the response body: status codes
+/// and `Retry-After` are the HTTP contract, prose is not.
 ///
 /// The agent must be created with `http_status_as_error(false)` so that 4xx/5xx
 /// arrive as `Ok(response)` rather than `Err`.  Only transport errors
@@ -360,7 +433,14 @@ where
                 .and_then(|v| v.to_str().ok()),
         );
 
-        if is_retryable_status(status) && attempt < retry.max_attempts {
+        // The retry decision is status + Retry-After only.  A 429/503 whose
+        // Retry-After exceeds the backoff ceiling is terminal: the server
+        // already told us the wait outlives any delay we would make, so
+        // retrying is pure waste.
+        if is_retryable_status(status)
+            && attempt < retry.max_attempts
+            && retry_after_within_budget(status, retry_after_secs, retry)
+        {
             let delay = retry_delay(status, retry_after_secs, attempt, retry);
             let body_text = response.into_body().read_to_string().unwrap_or_default();
             tracing::warn!(
@@ -490,11 +570,13 @@ mod tests {
     }
 
     #[test]
-    fn non_429_status_uses_backoff() {
-        // Retry-After is only honoured for 429; a 503 with a huge header still
-        // backs off exponentially (jittered), ignoring the header.
+    fn status_without_defined_retry_after_uses_backoff() {
+        // 500/502/504 have no Retry-After per RFC 7231 (it is only defined
+        // for 429 and 503); a header on them — even a huge one — must not
+        // influence the delay, so the request still backs off exponentially
+        // (jittered).
         let retry = test_config();
-        let delay = retry_delay(503, Some(u64::MAX), 1, &retry);
+        let delay = retry_delay(500, Some(u64::MAX), 1, &retry);
         let millis = delay.as_millis() as f64;
         let base = retry.initial_backoff_ms as f64;
         assert!(millis >= base * 0.75, "delay {millis}ms below jitter floor");
@@ -502,6 +584,116 @@ mod tests {
             millis <= base * 1.25,
             "delay {millis}ms above jitter ceiling"
         );
+        // Even a plausible-looking header on a 504 is ignored (500 vs 504
+        // makes no difference — neither honors the header).
+        let delay = retry_delay(504, Some(2), 1, &retry);
+        let millis = delay.as_millis() as f64;
+        assert!(millis >= base * 0.75);
+        assert!(millis <= base * 1.25);
+    }
+
+    #[test]
+    fn retry_delay_honors_retry_after_on_503() {
+        // RFC 7231 defines Retry-After for 503 just as it does for 429: a
+        // small value is waited verbatim, a huge one is capped at the
+        // ceiling (the same behavior as 429, pinned here for 503).
+        let retry = test_config();
+        let delay = retry_delay(503, Some(2), 1, &retry);
+        assert_eq!(
+            delay,
+            Duration::from_secs(2),
+            "small 503 Retry-After verbatim"
+        );
+        let delay = retry_delay(503, Some(u64::MAX), 1, &retry);
+        assert_eq!(
+            delay,
+            Duration::from_millis(retry.max_backoff_ms),
+            "huge 503 Retry-After capped"
+        );
+    }
+
+    // ── parse_retry_after_secs (HTTP-date form) ───────────────────────
+
+    #[test]
+    fn parse_retry_after_rejects_unknown_values() {
+        // Absent, empty, whitespace-only, and non-date garbage stay None
+        // (the caller falls back to exponential backoff) — a malformed
+        // header is never guessed at.
+        assert_eq!(parse_retry_after_secs(None), None);
+        assert_eq!(parse_retry_after_secs(Some("")), None);
+        assert_eq!(parse_retry_after_secs(Some("  \t ")), None);
+        assert_eq!(parse_retry_after_secs(Some("abc")), None);
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_in_the_past_means_retry_now() {
+        // An HTTP-date already in the past floors to 0 ("retry now") — never
+        // None, and never a negative wait.
+        let secs = parse_retry_after_secs(Some("Wed, 21 Oct 2015 07:28:00 GMT"))
+            .expect("IMF-fixdate must parse");
+        assert_eq!(secs, 0, "past date must floor to 0, got {secs}");
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_in_the_future_returns_remaining_seconds() {
+        // An HTTP-date well in the future maps to the remaining whole
+        // seconds — far longer than any backoff window we use.
+        let secs = parse_retry_after_secs(Some("Wed, 21 Oct 2099 07:28:00 GMT"))
+            .expect("IMF-fixdate must parse");
+        assert!(secs > 365 * 24 * 60 * 60, "delta was only {secs}s");
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_formats() {
+        // The exact IMF-fixdate form servers are required to send per RFC
+        // 7231 must parse, as must whitespace-padded delta-seconds.
+        assert!(parse_retry_after_secs(Some("Sun, 06 Nov 1994 08:49:37 GMT")).is_some());
+        assert!(parse_retry_after_secs(Some("  120  ")).is_some());
+    }
+
+    // ── retry_after_within_budget ─────────────────────────────────────
+
+    #[test]
+    fn retry_after_within_budget_when_429_fits_the_ceiling() {
+        // Retry-After is honored for 429 when it fits within the backoff
+        // ceiling: the server said "come back in ≤ 30 s", and we would wait
+        // that long anyway.
+        let retry = test_config(); // max_backoff_ms = 30000 → 30 s ceiling
+        assert!(retry_after_within_budget(429, None, &retry));
+        assert!(retry_after_within_budget(429, Some(0), &retry));
+        assert!(retry_after_within_budget(429, Some(30), &retry));
+    }
+
+    #[test]
+    fn retry_after_beyond_the_ceiling_is_terminal() {
+        // The server's Retry-After outlives any delay we would ever make —
+        // retrying is pure waste, so the 429 is treated as terminal.
+        let retry = test_config();
+        assert!(!retry_after_within_budget(429, Some(31), &retry));
+        assert!(!retry_after_within_budget(429, Some(172_800), &retry)); // 2 days
+        assert!(!retry_after_within_budget(429, Some(u64::MAX), &retry));
+    }
+
+    #[test]
+    fn retry_after_budget_applies_equally_to_503() {
+        // 503 honors Retry-After exactly like 429: in-budget is retried,
+        // beyond the ceiling is terminal.
+        let retry = test_config();
+        assert!(retry_after_within_budget(503, Some(30), &retry));
+        assert!(!retry_after_within_budget(503, Some(31), &retry));
+        assert!(!retry_after_within_budget(503, Some(172_800), &retry));
+    }
+
+    #[test]
+    fn retry_after_is_ignored_for_statuses_without_defined_retry_after() {
+        // Retry-After is defined only for 429/503 per RFC 7231; a stray
+        // header on the other retried 5xx (or any 4xx) must never suppress a
+        // legitimate retry.
+        let retry = test_config();
+        assert!(retry_after_within_budget(500, Some(u64::MAX), &retry));
+        assert!(retry_after_within_budget(502, Some(u64::MAX), &retry));
+        assert!(retry_after_within_budget(504, Some(u64::MAX), &retry));
+        assert!(retry_after_within_budget(400, Some(1), &retry));
     }
 
     // ── extract_error_message ────────────────────────────────────────────

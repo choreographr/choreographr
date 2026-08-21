@@ -26,6 +26,23 @@ fn http_response(status_line: &str, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Build an HTTP response byte buffer with extra headers.
+///
+/// `extra_headers` is spliced between the fixed headers and the blank line
+/// (e.g. `"Retry-After: 172800\r\n"`).
+fn http_response_with_headers(status_line: &str, extra_headers: &str, body: &str) -> Vec<u8> {
+    format!(
+        "{status_line}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         {extra_headers}\r\n\
+         {body}",
+        body.len(),
+    )
+    .into_bytes()
+}
+
 /// A 200 chat-completion response containing `text`.
 fn ok_body(text: &str) -> String {
     format!(r#"{{"choices":[{{"message":{{"content":"{text}","tool_calls":[]}}}}]}}"#)
@@ -172,6 +189,202 @@ fn retry_cancelled_during_backoff() {
     assert!(
         matches!(result, Err(OpenAiError::Cancelled)),
         "expected Cancelled, got {result:?}"
+    );
+}
+
+#[test]
+#[ignore]
+fn hard_rate_limit_fails_without_retrying() {
+    // A 429 whose Retry-After exceeds the backoff budget must fail on the
+    // FIRST attempt: the server sees exactly one connection and the retry
+    // callback never fires.  Retrying here would just spam an endpoint that
+    // cannot succeed and delay the real error.
+    //
+    // The hard-vs-transient decision is driven by the Retry-After header (the
+    // HTTP contract) — not by the message text, which is display-only.
+    let (port, _server) = spawn_http_server(vec![http_response_with_headers(
+        "HTTP/1.1 429 Too Many Requests",
+        "Retry-After: 172800\r\n",
+        r#"{"error":{"message":"Weekly usage limit reached. Resets in 2 days."}}"#,
+    )]);
+
+    let config = ServiceConfig {
+        base_url: format!("http://127.0.0.1:{port}"),
+        // Generous retry budget — a misclassified hard failure would show up
+        // as additional connections / callback fires.
+        retry_max_attempts: 6,
+        retry_initial_backoff_ms: 10,
+        retry_max_backoff_ms: 100,
+        default_request_format: choreo_ai_protocols::openai::RequestFormat::ChatCompletions,
+        streaming: false,
+        ..ServiceConfig::default()
+    };
+    let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let count = call_count.clone();
+    let mut cb: Option<RetryCallback> = Some(Box::new(move |_attempt, _max, _delay| {
+        count.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let messages = [ChatRequestMessage::simple("user", "hello".into())];
+
+    let result = client.chat_completion_turn(ChatTurnRequest {
+        model: "retry-model",
+        messages: &messages,
+        tools: &[], // no tools
+        thinking_effort: "off".to_string(),
+        on_retry: &mut cb,
+        cancel_rx: Some(&cancel_rx),
+        previous_response_id: None,
+        tool_results: &[],
+        programmatic_tool_calling: false,
+    });
+
+    // The error surfaces the provider's message — the same terminal path
+    // that renders `rate limited (429): …` for the user.
+    let err = match result {
+        Err(e @ OpenAiError::RateLimited { .. }) => e,
+        other => panic!("expected RateLimited error, got {other:?}"),
+    };
+    assert!(
+        err.to_string()
+            .contains("Weekly usage limit reached. Resets in 2 days."),
+        "detail must carry the provider message, got: {err}"
+    );
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        0,
+        "hard failure must never trigger the retry callback"
+    );
+}
+
+#[test]
+#[ignore]
+fn server_503_with_long_retry_after_fails_without_retrying() {
+    // RFC 7231 defines Retry-After for 503 just as for 429.  A 503 whose
+    // Retry-After exceeds the backoff budget must fail on the FIRST attempt
+    // (one connection, zero callback fires) instead of backoff-hammering an
+    // endpoint the server said to leave alone.
+    let (port, _server) = spawn_http_server(vec![http_response_with_headers(
+        "HTTP/1.1 503 Service Unavailable",
+        "Retry-After: 172800\r\n",
+        r#"{"error":{"message":"Scheduled maintenance, back in two days."}}"#,
+    )]);
+
+    let config = ServiceConfig {
+        base_url: format!("http://127.0.0.1:{port}"),
+        retry_max_attempts: 6,
+        retry_initial_backoff_ms: 10,
+        retry_max_backoff_ms: 100,
+        default_request_format: choreo_ai_protocols::openai::RequestFormat::ChatCompletions,
+        streaming: false,
+        ..ServiceConfig::default()
+    };
+    let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let count = call_count.clone();
+    let mut cb: Option<RetryCallback> = Some(Box::new(move |_attempt, _max, _delay| {
+        count.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let messages = [ChatRequestMessage::simple("user", "hello".into())];
+
+    let result = client.chat_completion_turn(ChatTurnRequest {
+        model: "retry-model",
+        messages: &messages,
+        tools: &[],
+        thinking_effort: "off".to_string(),
+        on_retry: &mut cb,
+        cancel_rx: Some(&cancel_rx),
+        previous_response_id: None,
+        tool_results: &[],
+        programmatic_tool_calling: false,
+    });
+
+    assert!(
+        matches!(result, Err(OpenAiError::ServerError { .. })),
+        "expected ServerError, got {result:?}"
+    );
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        0,
+        "hard 503 must never trigger the retry callback"
+    );
+}
+
+#[test]
+#[ignore]
+fn retry_after_within_budget_is_honored_on_503() {
+    // A 503 whose Retry-After fits the budget is retried exactly once,
+    // waiting the server's stated duration — not a shorter exponential
+    // backoff.  The elapsed-time check proves the wait was the server's 1 s,
+    // not the 10 ms initial backoff.
+    let (port, _server) = spawn_http_server(vec![
+        http_response_with_headers(
+            "HTTP/1.1 503 Service Unavailable",
+            "Retry-After: 1\r\n",
+            r#"{"error":{"message":"Restarting in a second."}}"#,
+        ),
+        http_response("HTTP/1.1 200 OK", &ok_body("hello from retry")),
+    ]);
+
+    let config = ServiceConfig {
+        base_url: format!("http://127.0.0.1:{port}"),
+        // Ceiling well above the 1 s Retry-After so the header fits the
+        // budget and is honored verbatim.
+        retry_max_attempts: 3,
+        retry_initial_backoff_ms: 10,
+        retry_max_backoff_ms: 30000,
+        default_request_format: choreo_ai_protocols::openai::RequestFormat::ChatCompletions,
+        streaming: false,
+        ..ServiceConfig::default()
+    };
+    let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let count = call_count.clone();
+    let mut cb: Option<RetryCallback> = Some(Box::new(move |_attempt, _max, _delay| {
+        count.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let messages = [ChatRequestMessage::simple("user", "hello".into())];
+
+    let started = std::time::Instant::now();
+    let result = client.chat_completion_turn(ChatTurnRequest {
+        model: "retry-model",
+        messages: &messages,
+        tools: &[],
+        thinking_effort: "off".to_string(),
+        on_retry: &mut cb,
+        cancel_rx: Some(&cancel_rx),
+        previous_response_id: None,
+        tool_results: &[],
+        programmatic_tool_calling: false,
+    });
+
+    match result {
+        Ok(ChatTurnResult::FinalText(final_text)) => {
+            assert!(final_text.content.contains("hello from retry"));
+        }
+        Ok(other) => panic!("unexpected Ok variant: {other:?}"),
+        Err(e) => panic!("expected Ok, got {e:?}"),
+    }
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "exactly one retry after the 503"
+    );
+    // The wait must have been the server's Retry-After (1 s), not the 10 ms
+    // initial backoff.  Generous lower floor to bound CI variance.
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "retry must honor the server's 1 s Retry-After, took {:?}",
+        started.elapsed()
     );
 }
 

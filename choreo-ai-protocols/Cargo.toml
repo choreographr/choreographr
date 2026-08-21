@@ -23,6 +23,11 @@ name = "choreo_ai_protocols"
 anyhow.workspace = true
 arc-swap = "1.9.2"
 choreo-proto.workspace = true
+# RFC 7231 Retry-After headers arrive in two forms: delta-seconds (the
+# common one) or an HTTP-date (`Wed, 21 Oct 2015 07:28:00 GMT`).  chrono is
+# already a workspace dependency (daemon + TUI) and parses the strict
+# IMF-fixdate form the spec requires servers to send.
+chrono.workspace = true
 crossbeam-channel.workspace = true
 # Ordered maps for the models.dev normalization: the snapshot's JSON object
 # order is load-bearing (the `default_model` is the FIRST model in a

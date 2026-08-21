@@ -2162,6 +2162,7 @@ dependencies = [
  "arc-swap",
  "choreo-ai-protocols",
  "choreo-proto",
+ "chrono",
  "crossbeam-channel",
  "indexmap 2.14.0",
  "postcard",
