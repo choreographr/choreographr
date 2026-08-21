@@ -318,7 +318,7 @@ fn server_503_with_long_retry_after_fails_without_retrying() {
 
 #[test]
 #[ignore]
-fn retry_after_within_budget_is_honored_on_503() {
+fn retry_after_in_budget_is_honored_on_503() {
     // A 503 whose Retry-After fits the budget is retried exactly once,
     // waiting the server's stated duration — not a shorter exponential
     // backoff.  The elapsed-time check proves the wait was the server's 1 s,

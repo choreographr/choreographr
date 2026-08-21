@@ -1,6 +1,25 @@
+use std::collections::HashSet;
 use std::io;
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
+
+/// Raw `(initial_backoff_ms, max_backoff_ms)` pairs [`RetryConfig::new`] has
+/// already warned about in this process.
+///
+/// [`RetryConfig::new`] runs on every provider request, so a misconfigured
+/// programmatic caller (a hand-built `ServiceConfig` with over-ceiling or
+/// inverted backoff knobs — the daemon rejects those at accounts load) would
+/// otherwise emit one `warn!` per request, forever.  Inserting the raw pair
+/// here makes the warning fire once per distinct misconfiguration instead.
+/// This is logging-only bookkeeping, not cross-thread communication (it
+/// carries no protocol data), and the mutex is cold: it is touched only on
+/// the clamped (misconfigured) path, and each bad config inserts once — a
+/// `HashSet` lookup after that.  The poisoned-mutex recovery below follows
+/// AGENTS.md's rule (`.into_inner()`), and losing the warning entirely on a
+/// poisoned mutex is an acceptable failure mode for a log-dedup registry.
+static WARNED_CLAMPS: LazyLock<Mutex<HashSet<(u64, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Called before each retry attempt with (current_attempt, max_attempts, delay).
 pub type RetryCallback = Box<dyn FnMut(u32, u32, Duration) + Send>;
@@ -43,13 +62,22 @@ impl RetryConfig {
         let initial_backoff_ms = initial_backoff_ms.min(MAX_BACKOFF_MS);
         let max_backoff_ms = max_backoff_ms.min(MAX_BACKOFF_MS).max(initial_backoff_ms);
         if initial_backoff_ms != raw_initial || max_backoff_ms != raw_max {
-            tracing::warn!(
-                raw_initial_backoff_ms = raw_initial,
-                raw_max_backoff_ms = raw_max,
-                clamped_initial_backoff_ms = initial_backoff_ms,
-                clamped_max_backoff_ms = max_backoff_ms,
-                "retry backoff outside sane bounds — clamped"
-            );
+            // Warn once per distinct raw pair per process (see WARNED_CLAMPS):
+            // this constructor runs per provider request, so a permanently
+            // misconfigured caller must not spam the log for its whole life.
+            let fresh = WARNED_CLAMPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((raw_initial, raw_max));
+            if fresh {
+                tracing::warn!(
+                    raw_initial_backoff_ms = raw_initial,
+                    raw_max_backoff_ms = raw_max,
+                    clamped_initial_backoff_ms = initial_backoff_ms,
+                    clamped_max_backoff_ms = max_backoff_ms,
+                    "retry backoff outside sane bounds — clamped"
+                );
+            }
         }
         Self {
             max_attempts,
@@ -245,9 +273,13 @@ pub fn is_retryable_status(status: u16) -> bool {
 /// the RFC, so a stray header on them can never suppress a legitimate retry;
 /// they always back off exponentially.
 ///
-/// The ceiling is `retry.max_backoff_ms`, clamped to [`MAX_BACKOFF_MS`] by
-/// [`RetryConfig::new`] — so the budget test here and the waited delay can
-/// never disagree (no separate cap is needed).
+/// The ceiling is [`MAX_BACKOFF_MS`], enforced at two points so the budget
+/// test and the waited delay can never disagree: [`RetryConfig::new`] clamps
+/// `max_backoff_ms` for constructor-built configs, and the gate below clamps
+/// it again at compare time for hand-built ones (the fields are `pub`, so a
+/// struct literal bypasses the constructor).  `wait_before_retry`'s cap
+/// remains the backstop for the exponential-backoff path (whose delay is
+/// bounded by `max_backoff_ms`, not by this gate).
 fn retry_decision(
     status: u16,
     retry_after_secs: Option<u64>,
@@ -261,9 +293,15 @@ fn retry_decision(
         return Some(backoff_duration(attempt, retry));
     };
     let wait = Duration::from_secs(secs);
-    // `Duration` comparison is precise here: a sub-second ceiling is not
-    // truncated to whole seconds (max_backoff_ms may be < 1000).
-    (wait <= Duration::from_millis(retry.max_backoff_ms)).then_some(wait)
+    // Clamp the ceiling to the hard bound at compare time: `max_backoff_ms`
+    // is pub, so a struct literal can bypass the `RetryConfig::new` clamp.
+    // Without this, a `u64::MAX` ceiling would make the gate tautological
+    // again — every cooldown "fits" — voiding the fail-fast property (the
+    // whole point of the gate) for hand-built configs.  The `Duration`
+    // comparison is precise: a sub-second ceiling is not truncated to whole
+    // seconds (max_backoff_ms may be < 1000).
+    let ceiling = Duration::from_millis(retry.max_backoff_ms.min(MAX_BACKOFF_MS));
+    (wait <= ceiling).then_some(wait)
 }
 
 /// Parse a `Retry-After` header value into seconds, per RFC 7231 §7.1.3.
@@ -290,8 +328,7 @@ pub fn parse_retry_after_secs(value: Option<&str>) -> Option<u64> {
     // HTTP-date: the strict IMF-fixdate form servers are required to send
     // (chrono's RFC 2822 parser covers it).  The delta is measured against
     // our own clock; a value in the future beyond the retry budget is
-    // handled by `retry_after_within_budget`, and one in the past retries
-    // immediately.
+    // handled by `retry_decision`, and one in the past retries immediately.
     let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
     let delta = when
         .with_timezone(&chrono::Utc)
@@ -723,6 +760,37 @@ mod tests {
             retry_decision(429, Some(ceiling_secs + 1), 1, &retry),
             None,
             "a Retry-After 1 s past the ceiling outlives the hard ceiling"
+        );
+    }
+
+    #[test]
+    fn retry_decision_gate_cannot_be_voided_by_hand_built_config() {
+        // The RetryConfig fields are pub, so a struct literal bypasses the
+        // RetryConfig::new clamp.  The gate must clamp to MAX_BACKOFF_MS at
+        // compare time itself — otherwise a u64::MAX ceiling would make every
+        // provider cooldown "fit" and silently void the fail-fast property
+        // (a 2-day Retry-After would be retried, sleeping 1 h between
+        // attempts, instead of failing on the first).
+        let retry = RetryConfig {
+            max_attempts: 5,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: u64::MAX, // raw struct literal — no constructor clamp
+        };
+        let ceiling_secs = MAX_BACKOFF_MS / 1000; // 1 h in Retry-After units
+        assert_eq!(
+            retry_decision(429, Some(ceiling_secs), 1, &retry),
+            Some(Duration::from_secs(ceiling_secs)),
+            "exactly-at-ceiling Retry-After is still in budget"
+        );
+        assert_eq!(
+            retry_decision(429, Some(ceiling_secs + 1), 1, &retry),
+            None,
+            "a Retry-After past the hard ceiling is terminal even for a u64::MAX config"
+        );
+        assert_eq!(
+            retry_decision(503, Some(u64::MAX), 1, &retry),
+            None,
+            "503 honors the same unvoidable ceiling"
         );
     }
 

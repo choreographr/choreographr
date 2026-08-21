@@ -103,10 +103,24 @@ impl AccountConfig {
     /// budget (see `choreo_ai_protocols::retry::retry_decision`), so the
     /// daemon rejects values that would void the budget gate *before* they
     /// reach the client — a clear config error beats a silent library clamp.
-    /// The library still clamps in `RetryConfig::new` for callers that
-    /// construct `ServiceConfig` directly; this is the UX layer that tells
-    /// the daemon user exactly what to fix.
+    /// `retry_initial_backoff_ms` is checked against the ceiling
+    /// independently of `max` too: when `max` is unset the library clamp in
+    /// `RetryConfig::new` would otherwise "lift" the 30 s default `max` up to
+    /// whatever the initial got clamped to — silently widening the budget
+    /// gate the user never asked to change.  The library still clamps in
+    /// `RetryConfig::new` for callers that construct `ServiceConfig`
+    /// directly; this is the UX layer that tells the daemon user exactly
+    /// what to fix.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(initial) = self.retry_initial_backoff_ms
+            && initial > MAX_BACKOFF_MS
+        {
+            return Err(format!(
+                "account '{}': retry_initial_backoff_ms ({initial} ms) exceeds the maximum \
+                 supported retry delay ({} ms); lower it or leave it unset to use the default",
+                self.name, MAX_BACKOFF_MS
+            ));
+        }
         if let Some(max) = self.retry_max_backoff_ms {
             if max > MAX_BACKOFF_MS {
                 return Err(format!(
@@ -666,6 +680,30 @@ model = "claude-4"
         };
         let err = cfg.validate().expect_err("must reject inverted backoff");
         assert!(err.contains("retry_initial_backoff_ms"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_initial_over_ceiling_without_max() {
+        // An over-ceiling initial with max unset used to slip through: the
+        // library clamp in RetryConfig::new would then also LIFT the default
+        // 30 s max up to the clamped initial, silently widening the
+        // Retry-After budget gate the user never asked to change.  The daemon
+        // must refuse it up front like the max knob.
+        let cfg = AccountConfig {
+            retry_initial_backoff_ms: Some(choreo_ai_protocols::retry::MAX_BACKOFF_MS + 1),
+            ..AccountConfig::simple("ovr", "openai")
+        };
+        let err = cfg
+            .validate()
+            .expect_err("must reject over-ceiling initial");
+        assert!(err.contains("retry_initial_backoff_ms"), "{err}");
+        assert!(err.contains("ovr"), "error must name the account: {err}");
+        // Exactly at the ceiling is a legitimate configuration.
+        let cfg = AccountConfig {
+            retry_initial_backoff_ms: Some(choreo_ai_protocols::retry::MAX_BACKOFF_MS),
+            ..AccountConfig::simple("ovr", "openai")
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
