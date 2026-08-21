@@ -29,11 +29,11 @@ pub(super) fn list_models_request(
 ) -> Result<Vec<String>, GoogleError> {
     let base = config.base_url.trim_end_matches('/');
     let url = format!("{}/models", base);
-    let retry_cfg = retry::RetryConfig {
-        max_attempts: config.retry_max_attempts,
-        initial_backoff_ms: config.retry_initial_backoff_ms,
-        max_backoff_ms: config.retry_max_backoff_ms,
-    };
+    let retry_cfg = retry::RetryConfig::new(
+        config.retry_max_attempts,
+        config.retry_initial_backoff_ms,
+        config.retry_max_backoff_ms,
+    );
 
     // `api_key` borrows from the client's `Zeroizing<String>` (see
     // `GoogleClient::api_key`), so the key already lives in wipe-on-drop
@@ -91,11 +91,11 @@ pub(super) fn generate_content_request(
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<ChatTurnResult, GoogleError> {
     let url = model_url(&config.base_url, model, GENERATE_CONTENT)?;
-    let retry_cfg = retry::RetryConfig {
-        max_attempts: config.retry_max_attempts,
-        initial_backoff_ms: config.retry_initial_backoff_ms,
-        max_backoff_ms: config.retry_max_backoff_ms,
-    };
+    let retry_cfg = retry::RetryConfig::new(
+        config.retry_max_attempts,
+        config.retry_initial_backoff_ms,
+        config.retry_max_backoff_ms,
+    );
 
     let (payloads, system_instruction) = build_message_payloads(messages)?;
     let tool_payloads = if tools.is_empty() {
@@ -166,11 +166,11 @@ where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let url = model_url(&config.base_url, model, STREAM_GENERATE_CONTENT)?;
-    let retry_cfg = retry::RetryConfig {
-        max_attempts: config.retry_max_attempts,
-        initial_backoff_ms: config.retry_initial_backoff_ms,
-        max_backoff_ms: config.retry_max_backoff_ms,
-    };
+    let retry_cfg = retry::RetryConfig::new(
+        config.retry_max_attempts,
+        config.retry_initial_backoff_ms,
+        config.retry_max_backoff_ms,
+    );
 
     let (payloads, system_instruction) = build_message_payloads(messages)?;
     let tool_payloads = if tools.is_empty() {

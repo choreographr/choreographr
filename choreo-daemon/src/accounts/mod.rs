@@ -6,6 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use choreo_ai_protocols::openai::{MaxTokensField, RequestFormat};
+use choreo_ai_protocols::retry::MAX_BACKOFF_MS;
 
 /// Configuration for a single inference account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +95,37 @@ impl AccountConfig {
             context_window: None,
             model_context_windows: None,
         }
+    }
+
+    /// Validate the retry-knob invariants this crate can reason about.
+    ///
+    /// Layer 3 of the retry budgeting: `retry_max_backoff_ms` *is* the retry
+    /// budget (see `choreo_ai_protocols::retry::retry_decision`), so the
+    /// daemon rejects values that would void the budget gate *before* they
+    /// reach the client — a clear config error beats a silent library clamp.
+    /// The library still clamps in `RetryConfig::new` for callers that
+    /// construct `ServiceConfig` directly; this is the UX layer that tells
+    /// the daemon user exactly what to fix.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(max) = self.retry_max_backoff_ms {
+            if max > MAX_BACKOFF_MS {
+                return Err(format!(
+                    "account '{}': retry_max_backoff_ms ({max} ms) exceeds the maximum \
+                     supported retry delay ({} ms); lower it or leave it unset to use the default",
+                    self.name, MAX_BACKOFF_MS
+                ));
+            }
+            if let Some(initial) = self.retry_initial_backoff_ms
+                && initial > max
+            {
+                return Err(format!(
+                    "account '{}': retry_initial_backoff_ms ({initial} ms) must not exceed \
+                     retry_max_backoff_ms ({max} ms)",
+                    self.name
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Apply this account's config overrides to a ServiceConfig.
@@ -252,6 +284,16 @@ impl AccountManager {
         }
         let file: AccountsFile =
             toml::from_str(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // Validate the retry knobs of every account at load time (not lazily
+        // at first use): a typo'd retry_max_backoff_ms would otherwise slip
+        // into the client and silently void the retry budget gate.  The file
+        // is rejected as a whole, matching the behavior of a TOML parse
+        // error above, so the user sees a pinpointed message instead of a
+        // silently-clamped config.
+        for cfg in &file.account {
+            cfg.validate()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        }
         let accounts: HashMap<String, AccountConfig> = file
             .account
             .into_iter()
@@ -285,6 +327,9 @@ impl AccountManager {
 
     /// Add an account. Errors if the name already exists.
     pub fn add(&mut self, config: AccountConfig) -> Result<(), String> {
+        // Reject invalid retry knobs before they are persisted (the CLI add
+        // path surfaces the error to the user).
+        config.validate()?;
         if self.accounts.contains_key(&config.name) {
             return Err(format!("account '{}' already exists", config.name));
         }
@@ -588,5 +633,51 @@ model = "claude-4"
         assert_eq!(overrides.connect_timeout_secs, Some(15));
         assert_eq!(overrides.request_timeout_secs, Some(60));
         assert_eq!(overrides.total_timeout_secs, Some(7200));
+    }
+
+    #[test]
+    fn validate_rejects_max_backoff_exceeding_the_ceiling() {
+        // A retry_max_backoff_ms past the hard ceiling would void the retry
+        // budget gate (every provider cooldown would "fit"); the daemon must
+        // reject it with a pinpointed message instead of silently clamping.
+        let cfg = AccountConfig {
+            retry_max_backoff_ms: Some(choreo_ai_protocols::retry::MAX_BACKOFF_MS + 1),
+            ..AccountConfig::simple("ovr", "openai")
+        };
+        let err = cfg.validate().expect_err("must reject over-ceiling max");
+        assert!(err.contains("retry_max_backoff_ms"), "{err}");
+        assert!(err.contains("ovr"), "error must name the account: {err}");
+        // Exactly at the ceiling is a legitimate configuration.
+        let cfg = AccountConfig {
+            retry_max_backoff_ms: Some(choreo_ai_protocols::retry::MAX_BACKOFF_MS),
+            ..AccountConfig::simple("ovr", "openai")
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_initial_above_max() {
+        // initial > max would collapse the exponential backoff to its cap on
+        // the first attempt — a config mistake the daemon refuses up front.
+        let cfg = AccountConfig {
+            retry_initial_backoff_ms: Some(2000),
+            retry_max_backoff_ms: Some(1000),
+            ..AccountConfig::simple("ovr", "openai")
+        };
+        let err = cfg.validate().expect_err("must reject inverted backoff");
+        assert!(err.contains("retry_initial_backoff_ms"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_defaults_and_in_budget_knobs() {
+        // Unset knobs (provider defaults) and a normal range both validate.
+        let cfg = AccountConfig::simple("ovr", "openai");
+        assert!(cfg.validate().is_ok());
+        let cfg = AccountConfig {
+            retry_initial_backoff_ms: Some(500),
+            retry_max_backoff_ms: Some(60000),
+            ..AccountConfig::simple("ovr", "openai")
+        };
+        assert!(cfg.validate().is_ok());
     }
 }

@@ -5,11 +5,58 @@ use std::time::Duration;
 /// Called before each retry attempt with (current_attempt, max_attempts, delay).
 pub type RetryCallback = Box<dyn FnMut(u32, u32, Duration) + Send>;
 
+/// Hard ceiling on a single retry delay, in milliseconds.
+///
+/// `retry_max_backoff_ms` is user-facing configuration with no upper bound of
+/// its own, and it doubles as the Retry-After budget gate (see
+/// [`retry_decision`]): without a ceiling, a typo (or hostile config) would
+/// make that gate tautological — every provider cooldown "fits" the budget —
+/// and let a single retry sleep past every other timeout in the request path
+/// (`AttemptDeadline` bounds the send, not the wait).  1 hour is the policy
+/// bound ("no wait is ever worth more than an hour"); all defaults (30 s) sit
+/// well below it, so ordinary configs are unaffected.
+pub const MAX_BACKOFF_MS: u64 = 3_600_000;
+
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     pub max_attempts: u32,
     pub initial_backoff_ms: u64,
     pub max_backoff_ms: u64,
+}
+
+impl RetryConfig {
+    /// Build a retry config with the backoff knobs clamped to sane bounds.
+    ///
+    /// - `initial_backoff_ms` and `max_backoff_ms` are both capped at
+    ///   [`MAX_BACKOFF_MS`].  The Retry-After budget gate and the delay both
+    ///   read `max_backoff_ms`, so clamping it once here keeps them
+    ///   consistent instead of re-applying the bound at every use site.
+    /// - `max_backoff_ms` is never allowed below `initial_backoff_ms`: an
+    ///   `initial > max` config would silently collapse the exponential
+    ///   backoff to its cap on the very first attempt.
+    ///
+    /// A clamped value is surfaced with a `warn!` so silent adjustment never
+    /// hides a config mistake.
+    pub fn new(max_attempts: u32, initial_backoff_ms: u64, max_backoff_ms: u64) -> Self {
+        let raw_initial = initial_backoff_ms;
+        let raw_max = max_backoff_ms;
+        let initial_backoff_ms = initial_backoff_ms.min(MAX_BACKOFF_MS);
+        let max_backoff_ms = max_backoff_ms.min(MAX_BACKOFF_MS).max(initial_backoff_ms);
+        if initial_backoff_ms != raw_initial || max_backoff_ms != raw_max {
+            tracing::warn!(
+                raw_initial_backoff_ms = raw_initial,
+                raw_max_backoff_ms = raw_max,
+                clamped_initial_backoff_ms = initial_backoff_ms,
+                clamped_max_backoff_ms = max_backoff_ms,
+                "retry backoff outside sane bounds — clamped"
+            );
+        }
+        Self {
+            max_attempts,
+            initial_backoff_ms,
+            max_backoff_ms,
+        }
+    }
 }
 
 /// Per-attempt wall-clock deadline, re-armed by [`retry_loop`] at the start
@@ -170,36 +217,53 @@ pub fn backoff_duration(retry_number: u32, config: &RetryConfig) -> Duration {
 /// entitlement — so resending it verbatim cannot succeed.
 ///
 /// This is a status-level pre-filter only.  For 429 the full decision also
-/// needs the `Retry-After` header (see `retry_after_within_budget`): the
-/// status alone cannot distinguish a throttle that clears in seconds from a
-/// cooldown that outlives the retry budget.
+/// needs the `Retry-After` header (see [`retry_decision`]): the status alone
+/// cannot distinguish a throttle that clears in seconds from a cooldown that
+/// outlives the retry budget.
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
-/// True when a response's `Retry-After` header (if any) is compatible with
-/// the configured retry budget.
+/// Decide the wait before the next retry attempt for an already-retryable
+/// status (callers gate on [`is_retryable_status`] first).
+///
+/// Returns `Some(delay)` when the response is transient and the caller should
+/// wait `delay` then retry; `None` when the status is terminal and the caller
+/// should fail now.
 ///
 /// `Retry-After` is the server's rigid, machine-readable "come back then"
 /// signal.  RFC 7231 defines it for 429 (rate limited) and 503 (service
-/// unavailable) — the two retried statuses the header applies to.  When it
-/// exceeds the backoff ceiling (`max_backoff_ms`) the server has already
-/// told us the cooldown outlives any single delay the policy would ever make
-/// — retrying would just spam the endpoint and delay the real error — so the
-/// caller treats the status as terminal instead.
+/// unavailable) — the two retried statuses the header applies to — and it is
+/// honored verbatim (no jitter: the server stated an exact wait) when it fits
+/// within the backoff ceiling (`max_backoff_ms`).  When it exceeds the
+/// ceiling, the server has already told us the cooldown outlives any single
+/// delay the policy would ever make — retrying would just spam the endpoint
+/// and delay the real error — so the status is terminal (`None`).  A missing
+/// header falls back to exponential backoff.
 ///
 /// Other retried statuses (500/502/504) have no defined `Retry-After` per
-/// the RFC, so a stray header on them can never suppress a legitimate retry.
-fn retry_after_within_budget(
+/// the RFC, so a stray header on them can never suppress a legitimate retry;
+/// they always back off exponentially.
+///
+/// The ceiling is `retry.max_backoff_ms`, clamped to [`MAX_BACKOFF_MS`] by
+/// [`RetryConfig::new`] — so the budget test here and the waited delay can
+/// never disagree (no separate cap is needed).
+fn retry_decision(
     status: u16,
     retry_after_secs: Option<u64>,
+    attempt: u32,
     retry: &RetryConfig,
-) -> bool {
+) -> Option<Duration> {
     if !matches!(status, 429 | 503) {
-        return true;
+        return Some(backoff_duration(attempt, retry));
     }
-    !retry_after_secs
-        .is_some_and(|secs| Duration::from_secs(secs) > Duration::from_millis(retry.max_backoff_ms))
+    let Some(secs) = retry_after_secs else {
+        return Some(backoff_duration(attempt, retry));
+    };
+    let wait = Duration::from_secs(secs);
+    // `Duration` comparison is precise here: a sub-second ceiling is not
+    // truncated to whole seconds (max_backoff_ms may be < 1000).
+    (wait <= Duration::from_millis(retry.max_backoff_ms)).then_some(wait)
 }
 
 /// Parse a `Retry-After` header value into seconds, per RFC 7231 §7.1.3.
@@ -304,35 +368,19 @@ pub fn wait_before_retry(
     on_retry: &mut Option<RetryCallback>,
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<(), ProviderHttpError> {
+    // Hard cap: no retry wait may ever exceed MAX_BACKOFF_MS.  RetryConfig's
+    // fields are pub, so a caller can construct a config that bypasses the
+    // RetryConfig::new clamp (e.g. a literal `max_backoff_ms = u64::MAX`);
+    // this is the unbreakable backstop that keeps a single wait bounded even
+    // then.  Everything downstream — the callback's `delay` argument and the
+    // actual sleep — sees the capped value, so an unbounded wait can never
+    // wedge a worker past every other timeout in the request path
+    // (AttemptDeadline bounds the send, not the wait).
+    let delay = delay.min(Duration::from_millis(MAX_BACKOFF_MS));
     if let Some(cb) = on_retry.as_mut() {
         cb(attempt, max_attempts, delay);
     }
     sleep_or_cancel(delay, cancel_rx)
-}
-
-/// Compute the delay before the next retry attempt.
-///
-/// Honours a provider-supplied `Retry-After` for the statuses RFC 7231
-/// defines it for — 429 and 503 — but caps it at `retry.max_backoff_ms` so a
-/// malicious/huge header value cannot wedge a request thread for an unbounded
-/// time.  All other statuses (and missing headers) fall back to exponential
-/// backoff.  The value is taken verbatim (no jitter): the server stated an
-/// exact wait and we either make it or — via the budget gate — decline to
-/// retry at all.
-fn retry_delay(
-    status: u16,
-    retry_after_secs: Option<u64>,
-    attempt: u32,
-    retry: &RetryConfig,
-) -> Duration {
-    if matches!(status, 429 | 503) {
-        retry_after_secs
-            .map(Duration::from_secs)
-            .map(|d| d.min(Duration::from_millis(retry.max_backoff_ms)))
-            .unwrap_or_else(|| backoff_duration(attempt, retry))
-    } else {
-        backoff_duration(attempt, retry)
-    }
 }
 
 fn status_to_error(status: u16, detail: &str, retry_after_secs: Option<u64>) -> ProviderHttpError {
@@ -433,32 +481,37 @@ where
                 .and_then(|v| v.to_str().ok()),
         );
 
-        // The retry decision is status + Retry-After only.  A 429/503 whose
-        // Retry-After exceeds the backoff ceiling is terminal: the server
-        // already told us the wait outlives any delay we would make, so
-        // retrying is pure waste.
-        if is_retryable_status(status)
-            && attempt < retry.max_attempts
-            && retry_after_within_budget(status, retry_after_secs, retry)
-        {
-            let delay = retry_delay(status, retry_after_secs, attempt, retry);
-            let body_text = response.into_body().read_to_string().unwrap_or_default();
+        // The retry decision is status + Retry-After only.  `retry_decision`
+        // returns None for exactly one retryable-but-terminal case: a 429/503
+        // whose Retry-After outlives the backoff ceiling.  That decline is
+        // logged here (at the call site, with the request context) rather
+        // than inside the decision fn, so the fail-fast path is explainable.
+        if is_retryable_status(status) && attempt < retry.max_attempts {
+            if let Some(delay) = retry_decision(status, retry_after_secs, attempt, retry) {
+                let body_text = response.into_body().read_to_string().unwrap_or_default();
+                tracing::warn!(
+                    attempt,
+                    max_attempts = retry.max_attempts,
+                    status,
+                    %body_text,
+                    delay_ms = delay.as_millis(),
+                    "retrying request"
+                );
+                wait_before_retry(
+                    attempt,
+                    retry.max_attempts,
+                    delay,
+                    ctx.on_retry,
+                    ctx.cancel_rx,
+                )?;
+                continue;
+            }
             tracing::warn!(
-                attempt,
-                max_attempts = retry.max_attempts,
                 status,
-                %body_text,
-                delay_ms = delay.as_millis(),
-                "retrying request"
+                ?retry_after_secs,
+                max_backoff_ms = retry.max_backoff_ms,
+                "retry declined: server Retry-After outlives the backoff budget"
             );
-            wait_before_retry(
-                attempt,
-                retry.max_attempts,
-                delay,
-                ctx.on_retry,
-                ctx.cancel_rx,
-            )?;
-            continue;
         }
 
         let body_text = response.into_body().read_to_string().unwrap_or_default();
@@ -517,6 +570,8 @@ fn extract_error_message(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_config() -> RetryConfig {
         RetryConfig {
@@ -530,36 +585,49 @@ mod tests {
     // fine there.  The backoff path applies 0.75..=1.25 jitter, so those tests
     // assert bounds instead.
 
+    // ── retry_decision (merged budget gate + delay) ────────────────────
+
     #[test]
-    fn huge_retry_after_is_capped_at_max_backoff() {
+    fn retry_decision_huge_retry_after_is_terminal() {
         // A malicious/broken provider could send Retry-After: u64::MAX; the
-        // delay must be clamped to max_backoff_ms rather than ~584bn years.
+        // merged gate+delay treats it as terminal — ~584bn years never even
+        // becomes a wait (the old cap-then-wait behavior was only reachable
+        // from the gate anyway).
         let retry = test_config();
-        let delay = retry_delay(429, Some(u64::MAX), 1, &retry);
-        assert_eq!(delay, Duration::from_millis(retry.max_backoff_ms));
+        assert_eq!(retry_decision(429, Some(u64::MAX), 1, &retry), None);
     }
 
     #[test]
-    fn retry_after_above_max_is_capped() {
-        // A large but plausible header value is also capped.
+    fn retry_decision_large_but_plausible_retry_after_is_terminal() {
+        // A large but plausible header value (≈11.5 days) also exceeds the
+        // 30 s ceiling → terminal, no capping guesswork.
         let retry = test_config();
-        let delay = retry_delay(429, Some(1_000_000), 1, &retry);
-        assert_eq!(delay, Duration::from_millis(retry.max_backoff_ms));
+        assert_eq!(retry_decision(429, Some(1_000_000), 1, &retry), None);
     }
 
     #[test]
-    fn small_retry_after_passes_through() {
-        // A provider-honoured value below the cap is used verbatim.
+    fn retry_decision_in_budget_retry_after_passes_through() {
+        // A provider-honoured value at or below the ceiling is used verbatim.
         let retry = test_config();
-        let delay = retry_delay(429, Some(2), 1, &retry);
-        assert_eq!(delay, Duration::from_secs(2));
+        assert_eq!(
+            retry_decision(429, Some(2), 1, &retry),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_decision(429, Some(30), 1, &retry),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            retry_decision(429, Some(0), 1, &retry),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
-    fn retry_after_absent_falls_back_to_backoff() {
+    fn retry_decision_absent_retry_after_falls_back_to_backoff() {
         // 429 without a Retry-After header → exponential backoff (jittered).
         let retry = test_config();
-        let delay = retry_delay(429, None, 1, &retry);
+        let delay = retry_decision(429, None, 1, &retry).expect("backoff fallback");
         let millis = delay.as_millis() as f64;
         let base = retry.initial_backoff_ms as f64;
         assert!(millis >= base * 0.75, "delay {millis}ms below jitter floor");
@@ -570,46 +638,117 @@ mod tests {
     }
 
     #[test]
-    fn status_without_defined_retry_after_uses_backoff() {
+    fn retry_decision_statuses_without_defined_retry_after_back_off() {
         // 500/502/504 have no Retry-After per RFC 7231 (it is only defined
         // for 429 and 503); a header on them — even a huge one — must not
-        // influence the delay, so the request still backs off exponentially
-        // (jittered).
+        // influence the decision, so the request still backs off
+        // exponentially (jittered).
         let retry = test_config();
-        let delay = retry_delay(500, Some(u64::MAX), 1, &retry);
-        let millis = delay.as_millis() as f64;
-        let base = retry.initial_backoff_ms as f64;
-        assert!(millis >= base * 0.75, "delay {millis}ms below jitter floor");
-        assert!(
-            millis <= base * 1.25,
-            "delay {millis}ms above jitter ceiling"
-        );
+        for status in [500, 502, 504] {
+            let delay = retry_decision(status, Some(u64::MAX), 1, &retry)
+                .unwrap_or_else(|| panic!("{status} must back off, got None"));
+            let millis = delay.as_millis() as f64;
+            let base = retry.initial_backoff_ms as f64;
+            assert!(millis >= base * 0.75, "{status}: below jitter floor");
+            assert!(millis <= base * 1.25, "{status}: above jitter ceiling");
+        }
         // Even a plausible-looking header on a 504 is ignored (500 vs 504
         // makes no difference — neither honors the header).
-        let delay = retry_delay(504, Some(2), 1, &retry);
+        let delay = retry_decision(504, Some(2), 1, &retry).expect("504 must back off");
         let millis = delay.as_millis() as f64;
+        let base = retry.initial_backoff_ms as f64;
         assert!(millis >= base * 0.75);
         assert!(millis <= base * 1.25);
     }
 
     #[test]
-    fn retry_delay_honors_retry_after_on_503() {
-        // RFC 7231 defines Retry-After for 503 just as it does for 429: a
-        // small value is waited verbatim, a huge one is capped at the
-        // ceiling (the same behavior as 429, pinned here for 503).
+    fn retry_decision_503_behaves_exactly_like_429() {
+        // RFC 7231 defines Retry-After for 503 just as it does for 429:
+        // in-budget waited verbatim, beyond the ceiling terminal.
         let retry = test_config();
-        let delay = retry_delay(503, Some(2), 1, &retry);
         assert_eq!(
-            delay,
-            Duration::from_secs(2),
-            "small 503 Retry-After verbatim"
+            retry_decision(503, Some(2), 1, &retry),
+            Some(Duration::from_secs(2))
         );
-        let delay = retry_delay(503, Some(u64::MAX), 1, &retry);
+        assert_eq!(retry_decision(503, Some(31), 1, &retry), None);
+        assert_eq!(retry_decision(503, Some(172_800), 1, &retry), None);
+    }
+
+    // ── RetryConfig::new clamping ─────────────────────────────────────
+
+    #[test]
+    fn retry_config_new_clamps_max_backoff_to_the_ceiling() {
+        // u64::MAX ms can never become a field of a config built through the
+        // documented constructor.
+        let retry = RetryConfig::new(5, 1000, u64::MAX);
+        assert_eq!(retry.max_backoff_ms, MAX_BACKOFF_MS);
+        assert_eq!(retry.initial_backoff_ms, 1000);
+        // A default-range value is preserved untouched.
+        let retry = RetryConfig::new(5, 1000, 30000);
+        assert_eq!(retry.max_backoff_ms, 30000);
+    }
+
+    #[test]
+    fn retry_config_new_never_allows_max_below_initial() {
+        // initial > max (a common typo) would collapse the exponential
+        // backoff to its cap on the first attempt; the constructor lifts max
+        // up to initial instead of carrying the contradiction forward.
+        let retry = RetryConfig::new(5, 2000, 1000);
+        assert_eq!(retry.max_backoff_ms, 2000);
+        assert_eq!(retry.initial_backoff_ms, 2000);
+    }
+
+    #[test]
+    fn retry_config_new_clamps_initial_backoff_too() {
+        // A pathological initial backoff (u64::MAX ms) is capped to the same
+        // ceiling so the first exponential step cannot exceed it either.
+        let retry = RetryConfig::new(5, u64::MAX, u64::MAX);
+        assert_eq!(retry.initial_backoff_ms, MAX_BACKOFF_MS);
+        assert_eq!(retry.max_backoff_ms, MAX_BACKOFF_MS);
+    }
+
+    #[test]
+    fn retry_decision_budget_cannot_be_voided_by_config() {
+        // A config built through RetryConfig::new clamps max_backoff_ms to
+        // MAX_BACKOFF_MS, so a Retry-After just past the hard ceiling is
+        // terminal even though the raw config asked for an unbounded ceiling.
+        let retry = RetryConfig::new(5, 1000, u64::MAX); // clamped to 1 h
+        let ceiling_secs = MAX_BACKOFF_MS / 1000; // the 1 h ceiling in Retry-After units (s)
         assert_eq!(
-            delay,
-            Duration::from_millis(retry.max_backoff_ms),
-            "huge 503 Retry-After capped"
+            retry_decision(429, Some(ceiling_secs), 1, &retry),
+            Some(Duration::from_secs(ceiling_secs)),
+            "exactly-at-ceiling Retry-After is in budget"
         );
+        assert_eq!(
+            retry_decision(429, Some(ceiling_secs + 1), 1, &retry),
+            None,
+            "a Retry-After 1 s past the ceiling outlives the hard ceiling"
+        );
+    }
+
+    #[test]
+    fn wait_before_retry_caps_delay_beyond_the_ceiling() {
+        // Layer-2 backstop: a RetryConfig constructed with a raw struct
+        // literal (pub fields bypass RetryConfig::new) could still hand a
+        // huge delay to wait_before_retry; the cap must apply even then.  A
+        // cancel is pre-queued so the wait resolves instantly instead of
+        // sleeping (event-driven — no time-based wait in this unit test).
+        let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+        cancel_tx.send(()).ok();
+        let observed = Arc::new(AtomicU64::new(0));
+        let seen = observed.clone();
+        let mut cb: Option<RetryCallback> = Some(Box::new(move |_attempt, _max, delay| {
+            seen.store(delay.as_millis() as u64, Ordering::Relaxed);
+        }));
+        let result = wait_before_retry(
+            1,
+            5,
+            Duration::from_millis(u64::MAX),
+            &mut cb,
+            Some(&cancel_rx),
+        );
+        assert!(matches!(result, Err(ProviderHttpError::Cancelled)));
+        assert_eq!(observed.load(Ordering::Relaxed), MAX_BACKOFF_MS);
     }
 
     // ── parse_retry_after_secs (HTTP-date form) ───────────────────────
@@ -651,49 +790,17 @@ mod tests {
         assert!(parse_retry_after_secs(Some("  120  ")).is_some());
     }
 
-    // ── retry_after_within_budget ─────────────────────────────────────
+    // ── Retry-After budget (probes retry_decision boundaries) ─────────
 
     #[test]
-    fn retry_after_within_budget_when_429_fits_the_ceiling() {
-        // Retry-After is honored for 429 when it fits within the backoff
-        // ceiling: the server said "come back in ≤ 30 s", and we would wait
-        // that long anyway.
+    fn retry_decision_two_day_cooldown_is_terminal_on_429() {
+        // The motivating case for the budget gate: a 429 with a "resets in
+        // two days" Retry-After must fail now, not burn attempts the
+        // cooldown can never clear within the budget.  The other boundaries
+        // (exactly-at-ceiling, just-past-ceiling, header-free backoff) are
+        // pinned by the retry_decision tests above.
         let retry = test_config(); // max_backoff_ms = 30000 → 30 s ceiling
-        assert!(retry_after_within_budget(429, None, &retry));
-        assert!(retry_after_within_budget(429, Some(0), &retry));
-        assert!(retry_after_within_budget(429, Some(30), &retry));
-    }
-
-    #[test]
-    fn retry_after_beyond_the_ceiling_is_terminal() {
-        // The server's Retry-After outlives any delay we would ever make —
-        // retrying is pure waste, so the 429 is treated as terminal.
-        let retry = test_config();
-        assert!(!retry_after_within_budget(429, Some(31), &retry));
-        assert!(!retry_after_within_budget(429, Some(172_800), &retry)); // 2 days
-        assert!(!retry_after_within_budget(429, Some(u64::MAX), &retry));
-    }
-
-    #[test]
-    fn retry_after_budget_applies_equally_to_503() {
-        // 503 honors Retry-After exactly like 429: in-budget is retried,
-        // beyond the ceiling is terminal.
-        let retry = test_config();
-        assert!(retry_after_within_budget(503, Some(30), &retry));
-        assert!(!retry_after_within_budget(503, Some(31), &retry));
-        assert!(!retry_after_within_budget(503, Some(172_800), &retry));
-    }
-
-    #[test]
-    fn retry_after_is_ignored_for_statuses_without_defined_retry_after() {
-        // Retry-After is defined only for 429/503 per RFC 7231; a stray
-        // header on the other retried 5xx (or any 4xx) must never suppress a
-        // legitimate retry.
-        let retry = test_config();
-        assert!(retry_after_within_budget(500, Some(u64::MAX), &retry));
-        assert!(retry_after_within_budget(502, Some(u64::MAX), &retry));
-        assert!(retry_after_within_budget(504, Some(u64::MAX), &retry));
-        assert!(retry_after_within_budget(400, Some(1), &retry));
+        assert_eq!(retry_decision(429, Some(172_800), 1, &retry), None); // 2 days
     }
 
     // ── extract_error_message ────────────────────────────────────────────

@@ -6,11 +6,11 @@ use super::{OpenAiError, ServiceConfig};
 use crate::retry;
 
 pub(crate) fn retry_config_from_config(config: &ServiceConfig) -> RetryConfig {
-    RetryConfig {
-        max_attempts: config.retry_max_attempts,
-        initial_backoff_ms: config.retry_initial_backoff_ms,
-        max_backoff_ms: config.retry_max_backoff_ms,
-    }
+    RetryConfig::new(
+        config.retry_max_attempts,
+        config.retry_initial_backoff_ms,
+        config.retry_max_backoff_ms,
+    )
 }
 
 pub(crate) fn retry_send(

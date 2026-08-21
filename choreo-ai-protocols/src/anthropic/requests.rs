@@ -31,11 +31,11 @@ pub(super) fn list_models_request(
     api_key: &str,
 ) -> Result<Vec<String>, AnthropicError> {
     let url = endpoint_url(&config.base_url, MODELS_PATH)?;
-    let retry_cfg = retry::RetryConfig {
-        max_attempts: config.retry_max_attempts,
-        initial_backoff_ms: config.retry_initial_backoff_ms,
-        max_backoff_ms: config.retry_max_backoff_ms,
-    };
+    let retry_cfg = retry::RetryConfig::new(
+        config.retry_max_attempts,
+        config.retry_initial_backoff_ms,
+        config.retry_max_backoff_ms,
+    );
 
     // `api_key` borrows from the client's `Zeroizing<String>` (see
     // `AnthropicClient::api_key`), so the key already lives in wipe-on-drop
@@ -95,11 +95,11 @@ pub(super) fn messages_request(
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<ChatTurnResult, AnthropicError> {
     let url = endpoint_url(&config.base_url, MESSAGES_PATH)?;
-    let retry_cfg = retry::RetryConfig {
-        max_attempts: config.retry_max_attempts,
-        initial_backoff_ms: config.retry_initial_backoff_ms,
-        max_backoff_ms: config.retry_max_backoff_ms,
-    };
+    let retry_cfg = retry::RetryConfig::new(
+        config.retry_max_attempts,
+        config.retry_initial_backoff_ms,
+        config.retry_max_backoff_ms,
+    );
 
     // Thinking blocks are replayed from the round-trip artifact only when
     // thinking is enabled for this request (goose's `!thinking_disabled`
@@ -171,11 +171,11 @@ where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let url = endpoint_url(&config.base_url, MESSAGES_PATH)?;
-    let retry_cfg = retry::RetryConfig {
-        max_attempts: config.retry_max_attempts,
-        initial_backoff_ms: config.retry_initial_backoff_ms,
-        max_backoff_ms: config.retry_max_backoff_ms,
-    };
+    let retry_cfg = retry::RetryConfig::new(
+        config.retry_max_attempts,
+        config.retry_initial_backoff_ms,
+        config.retry_max_backoff_ms,
+    );
 
     // Thinking blocks are replayed from the round-trip artifact only when
     // thinking is enabled for this request (see the non-streaming path for

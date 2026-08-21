@@ -598,8 +598,8 @@ each requester's status reflects its own `--force` flag).
 | `streaming` | Enable/disable streaming responses |
 | `stream_options` | Include usage in stream |
 | `retry_max_attempts` | Max retry count on transient errors |
-| `retry_initial_backoff_ms` | Initial backoff between retries (ms) |
-| `retry_max_backoff_ms` | Max backoff between retries (ms) |
+| `retry_initial_backoff_ms` | Initial backoff between retries (ms); must not exceed `retry_max_backoff_ms` |
+| `retry_max_backoff_ms` | Max backoff between retries (ms). This is the Retry-After budget: a 429/503 whose `Retry-After` exceeds it fails immediately instead of retrying (see below). Capped at 3,600,000 ms (1 h) — a larger value is rejected when the accounts file loads and at `accounts add`, and the library clamps it with a warning for programmatic configs |
 | `connect_timeout_secs` | TCP connect timeout |
 | `request_timeout_secs` | HTTP request timeout |
 | `total_timeout_secs` | Wall-clock deadline for a single request attempt including the streaming body (default 3600s; 0 disables). Complements `request_timeout_secs` (idle/no-progress): armed before the request is sent and re-armed on each retry, so one attempt's budget spans DNS → connect → headers → body (ureq's `timeout_global` bounds it from DNS through the first body byte, and the SSE consumer enforces the same deadline with an exact timer, so it fires even when keep-alive bytes trickle in). Expiry surfaces as a dedicated `deadline_exceeded` error. Each retry restarts the deadline, so retries + backoff can exceed it in aggregate. |
