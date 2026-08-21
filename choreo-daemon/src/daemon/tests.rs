@@ -1930,12 +1930,13 @@ fn handle_broadcast_activity_dedup_keyed_on_command_origin_not_message_shape() {
 }
 
 #[test]
-fn broadcast_origin_contract_rejects_non_session_message_with_some_origin() {
-    // A `Some` origin on a non-session message VIOLATES the dedup contract:
-    // the origin session's direct subscribers are skipped on the activity
-    // path (dedup) and never receive the message on the per-session path
-    // (only session events ride it) — the message would be LOST for them.
-    // The predicate is the tripwire that flags a future producer doing this.
+fn broadcast_origin_contract_requires_agreeing_provenance() {
+    // ── Violations: the command provenance and the message origin disagree ──
+
+    // A `Some` origin on a non-session message: the origin session's direct
+    // subscribers are skipped on the activity path (dedup) and never receive
+    // the message on the per-session path (only session events ride it) — the
+    // message would be LOST for them.
     assert!(
         super::subscriber_handlers::violates_broadcast_origin_contract(
             Some(42),
@@ -1949,9 +1950,9 @@ fn broadcast_origin_contract_rejects_non_session_message_with_some_origin() {
         )
     );
 
-    // Session envelopes never violate the contract: the per-session bus
-    // carries exactly these, so a `Some` origin can only suppress messages
-    // the origin's direct subscribers do receive.
+    // A session-scoped message whose origin matches the test command origin
+    // (42) — the per-session bus carries it, so a `Some(42)` command origin
+    // can legitimately suppress it for session-42 subscribers.
     let session_msg = DaemonMessage::Session {
         session_id: Some(42),
         event: SessionEvent::OutputChunk {
@@ -1960,16 +1961,78 @@ fn broadcast_origin_contract_rejects_non_session_message_with_some_origin() {
             data: vec![],
         },
     };
+
+    // A `Some` command origin whose `Session` envelope carries a DIFFERENT
+    // session: the dedup suppresses the command-origin's subscribers rather
+    // than the envelope's real origin's — the real origin's direct
+    // subscribers miss the event, the command origin's receive a foreign
+    // session's event.
+    let other_session_msg = DaemonMessage::Session {
+        session_id: Some(7),
+        event: SessionEvent::OutputChunk {
+            request_id: 1,
+            stream: choreo_proto::OutputStream::Answer,
+            data: vec![],
+        },
+    };
+    assert!(
+        super::subscriber_handlers::violates_broadcast_origin_contract(
+            Some(42),
+            &other_session_msg,
+        )
+    );
+
+    // A `Some` command origin on a connection-level (`None`) envelope: the
+    // command claims an origin the envelope contradicts.
+    assert!(
+        super::subscriber_handlers::violates_broadcast_origin_contract(
+            Some(42),
+            &DaemonMessage::Session {
+                session_id: None,
+                event: SessionEvent::Failed {
+                    request_id: 1,
+                    error: "no session attached".into(),
+                },
+            },
+        )
+    );
+
+    // A `None` command origin on a session-scoped envelope: no dedup runs, so
+    // the envelope origin's direct subscribers receive the event TWICE (here
+    // and on the per-session bus).
+    assert!(super::subscriber_handlers::violates_broadcast_origin_contract(None, &session_msg,));
+
+    // ── Non-violations: the two provenance sources agree ──
+
+    // Session envelope whose origin AGREES with the command: a `Some` origin
+    // suppresses exactly the clients that receive the event via the
+    // per-session bus.
     assert!(
         !super::subscriber_handlers::violates_broadcast_origin_contract(Some(42), &session_msg,)
     );
 
-    // A `None` origin is global/control provenance: no dedup runs, so there
-    // is no contract to violate (catalog updates, models refresh broadcasts).
+    // A `None` command origin with a flat message is global/control
+    // provenance: no dedup runs, so there is no contract to violate (catalog
+    // updates, models refresh broadcasts).
     assert!(
         !super::subscriber_handlers::violates_broadcast_origin_contract(
             None,
             &DaemonMessage::CatalogUpdated { providers: vec![] },
+        )
+    );
+
+    // A `None` command origin with a `None` envelope: both say "no origin
+    // session", so they agree.
+    assert!(
+        !super::subscriber_handlers::violates_broadcast_origin_contract(
+            None,
+            &DaemonMessage::Session {
+                session_id: None,
+                event: SessionEvent::Failed {
+                    request_id: 1,
+                    error: "no session attached".into(),
+                },
+            },
         )
     );
 }

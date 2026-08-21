@@ -18,26 +18,53 @@
 use super::*;
 use crate::broadcast::fan_out_evicting;
 
-/// True when a [`DaemonCommand::BroadcastActivity`] command carries a session
-/// origin (`Some`) but a non-session message — a dedup-contract violation.
+/// True when a [`DaemonCommand::BroadcastActivity`] command's provenance and
+/// its message's origin disagree — a dedup-contract violation.
 ///
-/// A `Some` origin tells the daemon to skip clients that are also direct
-/// subscribers of that origin session (they receive the event via the
-/// per-session bus instead). Only session-scoped events actually ride the
-/// per-session bus, so a non-session message forwarded with `Some(origin)`
-/// would be suppressed for those clients in the activity path AND never
-/// delivered on the per-session path — lost entirely. Every current producer
-/// satisfies the contract (the session thread forwards only
-/// `DaemonMessage::Session` envelopes with `Some(ctx.session_id)`; the
-/// daemon's catalog broadcast uses `None`); the predicate is the tripwire
-/// that keeps a future misuse from silently dropping messages. Split out as a
-/// pure function so the contract is unit-testable without capturing
-/// `tracing`.
+/// The dedup filter reads ONLY the command field: `Some(origin)` skips
+/// clients that are also direct subscribers of that origin session (they are
+/// assumed to receive the message via the per-session bus instead, where the
+/// envelope's own `session_id` is the origin). The command and the message
+/// must therefore AGREE on the origin. Three disagreement modes:
+/// - `Some(origin)` command + non-`Session` message: the origin's direct
+///   subscribers are skipped on the activity path (dedup) yet never receive
+///   the message on the per-session path (only `Session` envelopes ride it)
+///   — lost entirely for them.
+/// - `Some(origin)` command + `Session` envelope whose own `session_id` is
+///   absent or different: the dedup suppresses against the wrong session —
+///   the envelope's REAL-origin subscribers miss the message (they are only
+///   skipped when subscribed to the command's origin), and the command
+///   origin's subscribers receive a foreign session's event that neither the
+///   per-session path nor their own subscription produced.
+/// - `None` command + a session-scoped `Session` envelope: no dedup runs, so
+///   the envelope origin's direct subscribers receive the event TWICE (here
+///   and on the per-session bus).
+///
+/// Every current producer satisfies the contract (the session thread
+/// forwards `Some(ctx.session_id)` paired with a `Session { session_id:
+/// Some(ctx.session_id), .. }` envelope; the daemon's catalog broadcast uses
+/// `None` with a flat message); the predicate is the tripwire that keeps a
+/// future misuse from silently mis-routing messages. Split out as a pure
+/// function so the contract is unit-testable without capturing `tracing`.
 pub(super) fn violates_broadcast_origin_contract(
     session_id: Option<u64>,
     msg: &DaemonMessage,
 ) -> bool {
-    session_id.is_some() && !matches!(msg, DaemonMessage::Session { .. })
+    match msg {
+        // The envelope carries its own origin — it must match the command's.
+        DaemonMessage::Session {
+            session_id: envelope_id,
+            ..
+        } => match (session_id, envelope_id) {
+            (Some(origin), Some(inner)) => origin != *inner,
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        },
+        // Flat messages have no origin of their own: a `Some` command origin
+        // is a contract violation (mode 1 above); `None` is the global/
+        // control provenance.
+        _ => session_id.is_some(),
+    }
 }
 
 impl DaemonState {
@@ -415,17 +442,20 @@ impl DaemonState {
         session_id: Option<u64>,
         msg: DaemonMessage,
     ) {
-        // Tripwire for the dedup contract: a `Some` origin on a non-session
-        // message would drop that message for the origin session's direct
-        // subscribers on BOTH paths (the activity path skips them via dedup,
-        // the per-session path never carries non-session messages). No
-        // current producer does this; warn loudly if one ever does.
+        // Tripwire for the dedup contract: the command provenance and the
+        // message origin must AGREE. A `Some` origin on a non-session message
+        // drops it for the origin session's direct subscribers on BOTH paths
+        // (the activity path skips them via dedup, the per-session path never
+        // carries non-session messages); a `Session` envelope whose own
+        // origin differs from (or contradicts) the command's ships the event
+        // to the wrong subscriber class. No current producer does this; warn
+        // loudly if one ever does.
         if violates_broadcast_origin_contract(session_id, &msg) {
             warn!(
                 session_id,
-                "BroadcastActivity carries a session origin for a non-session message; \
-                 direct subscribers of that origin session will miss it on both the \
-                 activity and per-session paths"
+                "BroadcastActivity violates the origin contract: command provenance and \
+                 message origin disagree, so some subscriber class will miss this message \
+                 or receive it twice — no current producer does this, inspect the caller"
             );
         }
         let (evict_clients, evict_largest) = fan_out_evicting(

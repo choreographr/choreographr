@@ -236,11 +236,15 @@ fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandle
         | DaemonMessage::Evicted => {
             debug!("flat daemon message has no generic-dispatch text: {msg:?}");
         }
-        // A `Session` envelope here is a routing bug: `dispatch_daemon_message`
-        // separates the two families before calling this function, so only
-        // non-session messages reach it. The arm exists to keep the match
-        // exhaustive (no wildcard) and fails loudly instead of silently
-        // dropping the envelope's event.
+        // A `Session` envelope here is a routing bug — `dispatch_daemon_message`
+        // splits the two families before calling this function, so only
+        // non-session messages can reach it at runtime. The arm is still
+        // REQUIRED at compile time: this match is on the full `DaemonMessage`
+        // enum and, with no wildcard (the variant set IS the wire contract),
+        // the `Session` variant must be named explicitly for the match to
+        // compile. That also makes the arm the tripwire: if a future refactor
+        // ever routes an envelope here, it fails loudly instead of silently
+        // dropping the event.
         DaemonMessage::Session {
             session_id, event, ..
         } => {
@@ -275,9 +279,19 @@ fn dispatch_session_event(
     event: &SessionEvent,
     handler: &mut impl TurnEventHandler,
 ) {
-    // None-capable events: their handlers take the origin as-is (`Option<u64>`
-    // for `handle_failed`, or not at all), so a `None` envelope must not be
-    // treated as "drop the event".
+    // None-capable events: their handlers take the origin as-is
+    // (`Option<u64>` for `handle_failed`, or not at all), so a `None` envelope
+    // must not be treated as "drop the event".
+    //
+    // PAIRING RULE: each event handled here MUST also be listed in the
+    // explicit dead arm at the bottom of the requires-origin match below.
+    // The compiler enforces the pairing in the direction that matters — a
+    // pre-handled event missing from the lower match leaves it non-exhaustive
+    // (compile error). The other direction is a runtime risk, so keep it in
+    // mind when extending: an event added ONLY to the lower match is treated
+    // as requires-origin, so a `None`-origin instance of it would be dropped
+    // with a warn instead of reaching its handler. New None-capable events
+    // touch BOTH sites; new requires-origin events touch only the lower match.
     match event {
         SessionEvent::Failed { request_id, error } => {
             // `session_id` is `&Option<u64>` here, so `as_ref().copied()`
@@ -488,7 +502,7 @@ fn dispatch_session_event(
         // match with a guaranteed `Some` origin. They are listed explicitly
         // instead of a wildcard so a NEW `SessionEvent` variant still fails
         // this exhaustive match at compile time (the variant set IS the wire
-        // contract).
+        // contract); see the pairing rule in the pre-match note above.
         SessionEvent::Failed { .. }
         | SessionEvent::Cancelled { .. }
         | SessionEvent::ModelSelectionFailed { .. }
