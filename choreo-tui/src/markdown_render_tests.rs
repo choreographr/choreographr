@@ -2374,6 +2374,27 @@ fn user_text_timestamp_rendered_in_milliseconds() {
         !rendered.contains("1970"),
         "epoch-looking dates indicate the millis→seconds unit bug, got {rendered:?}"
     );
+    // Position: right-aligned with a 1-column margin under the shaded
+    // block.  content_width 80 → total_width 89; the shaded area's last
+    // column is 86 and the 2-col right margin occupies 87–88, so the
+    // timestamp's right edge must sit at column 85 (total_width − 4) — not
+    // spilling into the margin or the scrollbar column.
+    let ts_width = expected.len(); // format_timestamp emits ASCII only
+    let ts_start = rendered.find(&expected).expect("timestamp position");
+    assert_eq!(
+        ts_start + ts_width,
+        86,
+        "timestamp right edge must be column total_width − 4 = 85"
+    );
+    assert_eq!(
+        rendered.len(),
+        89,
+        "separator row spans exactly content_width + 9 columns"
+    );
+    assert!(
+        rendered.ends_with("   "),
+        "3 trailing blanks: 1 under the shading + the 2-col right margin"
+    );
     // And the real render path (a user turn) must carry the same
     // timestamp into the bottom separator.
     let turn = Turn {
@@ -2403,10 +2424,11 @@ fn user_text_timestamp_rendered_in_milliseconds() {
 }
 
 #[test]
-fn margin_block_rows_start_flush_and_end_one_column_short_of_scrollbar() {
-    // The 2-column left margin was removed (gutter flush at column 0) and
-    // the right margin trimmed to a single blank column, so every
-    // message-block row spans exactly content_width + 6 columns.  With one
+fn margin_block_rows_indented_two_columns_on_both_sides() {
+    // Message blocks carry a symmetric 2-column blank margin on each side:
+    // a 2-column left margin before the `┃` gutter and a 2-column right
+    // margin after the shaded box (before the scrollbar column), so every
+    // message-block row spans exactly content_width + 9 columns.  With one
     // content line the row count is MARGIN_STRUCTURAL_ROWS(4) + 1 = 5:
     // separator, padding, content, padding, separator.
     let (lines, _rows, content_ranges, _joins) = add_margin_lines(
@@ -2420,15 +2442,58 @@ fn margin_block_rows_start_flush_and_end_one_column_short_of_scrollbar() {
     let content = &lines[2];
     assert_eq!(
         content.width(),
-        26,
-        "content_width 20 + 6 chrome (1 gutter + 2 shade left, 2 shade + 1 blank right) = 26"
+        29,
+        "content_width 20 + 9 chrome (2 margin + 1 gutter + 2 shade left, \
+         2 shade + 2 margin right) = 29"
     );
-    // The gutter is the first glyph; text starts after the `┃  ` gutter.
-    assert!(content.spans[0].content.as_ref().starts_with('┃'));
-    assert_eq!(content_ranges[2], Some((3, 8)), "text starts at column 3");
+    // The 2-column left margin precedes the gutter; the text starts after
+    // the `"  ┃  "` gutter.
+    assert_eq!(content.spans[0].content.as_ref(), "  ", "2-col left margin");
+    assert!(content.spans[1].content.as_ref().starts_with('┃'));
+    assert_eq!(content_ranges[2], Some((5, 10)), "text starts at column 5");
+    // The 2-column right margin brings the row to exactly 29 columns.
+    assert_eq!(
+        content.spans.last().unwrap().content.as_ref(),
+        "  ",
+        "2-col right margin"
+    );
     // Padding rows line up with the content rows exactly.
-    assert_eq!(lines[1].width(), 26, "padding row matches content rows");
-    assert_eq!(lines[3].width(), 26, "padding row matches content rows");
+    assert_eq!(lines[1].width(), 29, "padding row matches content rows");
+    assert_eq!(lines[3].width(), 29, "padding row matches content rows");
+}
+
+#[test]
+fn assistant_block_has_no_duplicate_timestamp() {
+    // The proto carries a single created_at per turn spanning both halves,
+    // so the assistant block deliberately renders no timestamp — a second
+    // one would duplicate the user message's time.  Only the user block's
+    // bottom separator carries it (pinned by the position assertions in
+    // `user_text_timestamp_rendered_in_milliseconds`).
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: Some("Hi there!".into()),
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+    let text = lines
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rendered_ts = format_timestamp(turn.created_at.as_millis());
+    assert!(
+        !text.contains(&rendered_ts),
+        "assistant block must not duplicate the turn timestamp: {text}"
+    );
 }
 
 #[test]

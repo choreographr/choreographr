@@ -1151,8 +1151,8 @@ type MarginLines = (
 /// background shading.
 ///
 /// Returns the wrapped lines, their total height, and a per-line content
-/// column range aligned with the returned lines: `(3, 3 + line.width())` for
-/// content rows (the text between the `"┃  "` gutter and the trailing
+/// column range aligned with the returned lines: `(5, 5 + line.width())` for
+/// content rows (the text between the `"  ┃  "` gutter and the trailing
 /// fill), `None` for the structural chrome rows (separator, padding).  The
 /// per-line [`LineJoin`] metadata is carried through unchanged: structural
 /// chrome rows are fresh lines, content rows keep the join their producer
@@ -1167,24 +1167,25 @@ fn add_margin_lines(
     let gray = Style::default().bg(BG_SHADE);
     let no_shading = Style::default().bg(Color::Reset);
     let accent_line = Style::default().fg(accent).bg(Color::Reset);
-    // Rows span `content_width + 6` columns: a flush `┃` gutter + 2-column
-    // shading on the left, the text + trailing fill, then 2 shaded + 1 blank
-    // column on the right (the blank is the 1-column margin between the
-    // viewport and the scrollbar).  The padding row grabs `content_width + 4`
-    // of shaded middle so it lines up with every content row.
-    let total_width = content_width as usize + 6;
+    // Rows span `content_width + 9` columns: a 2-column blank margin, a `┃`
+    // gutter + 2-column shading on the left, the text + trailing fill, then
+    // 2 shaded + 2 blank columns on the right (the blanks are the 2-column
+    // margin between the viewport and the scrollbar).  The padding row grabs
+    // `content_width + 4` of shaded middle so it lines up with every content
+    // row.
+    let total_width = content_width as usize + 9;
     let shaded_content = content_width as usize + 4;
 
     // Top separator: no shading
     let separator = Line::from(vec![Span::styled(" ".repeat(total_width), no_shading)]);
 
-    // Padding row: gutter flush with the left edge (the 2-column margin was
-    // removed), ending one blank column before the edge — the 1-column margin
-    // between the viewport and the scrollbar.
+    // Padding row: 2-column left margin, gutter, shaded middle, 2-column
+    // right margin ending before the scrollbar column.
     let padding = Line::from(vec![
+        Span::styled("  ", no_shading),
         Span::styled("┃", accent_line),
         Span::styled(" ".repeat(shaded_content), gray),
-        Span::styled(" ", no_shading),
+        Span::styled("  ", no_shading),
     ]);
 
     let mut result = Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
@@ -1202,8 +1203,13 @@ fn add_margin_lines(
         let text_width = line.width();
         let fill = (content_width as usize).saturating_sub(text_width);
 
-        // Gutter flush with the left edge (the 2-column margin was removed).
-        let mut spans = vec![Span::styled("┃", accent_line), Span::styled("  ", gray)];
+        // 2-column blank margin, then the gutter, then 2 shaded columns before
+        // the text (the symmetric 2-column margin layout for message blocks).
+        let mut spans = vec![
+            Span::styled("  ", no_shading),
+            Span::styled("┃", accent_line),
+            Span::styled("  ", gray),
+        ];
         // Content spans — explicitly set bg so they display correctly even without
         // a paragraph-level background.
         spans.extend(
@@ -1213,14 +1219,14 @@ fn add_margin_lines(
         );
         spans.push(Span::styled(" ".repeat(fill), gray));
         spans.push(Span::styled("  ", gray));
-        // Single blank column: the 1-column margin between the viewport and
-        // the scrollbar.
-        spans.push(Span::styled(" ", no_shading));
+        // 2-column blank margin between the shaded box and the scrollbar.
+        spans.push(Span::styled("  ", no_shading));
 
         result.push(Line::from(spans));
-        // Content occupies columns [3, 3 + text width): after the `┃  `
-        // gutter, up to where the trailing fill begins.
-        content_ranges.push(Some((3, 3 + text_width)));
+        // Content occupies columns [5, 5 + text width): after the
+        // `"  ┃  "` gutter (2-col margin + gutter + 2-col shading), up to
+        // where the trailing fill begins.
+        content_ranges.push(Some((5, 5 + text_width)));
         box_joins.push(join);
     }
 
@@ -1233,13 +1239,19 @@ fn add_margin_lines(
         // format_timestamp expects milliseconds — pass the value through
         // unchanged.  (Dividing by 1000 here rendered every user message
         // as a 1970 date after format_timestamp switched to millis.)
+        //
+        // The timestamp is right-aligned to the message's shaded block: the
+        // shaded area's last column is `total_width - 3`, so ending the text
+        // at column `total_width - 4` leaves exactly one blank column
+        // (total_width - 3) between it and the shading — the timestamp sits
+        // under the shaded area, clear of the 2-column right margin.
         let ts_text = format_timestamp(ms);
         let ts_len = ts_text.len();
-        let left_fill = total_width.saturating_sub(ts_len + 4);
+        let left_fill = total_width.saturating_sub(ts_len + 3);
         result.push(Line::from(vec![
             Span::styled(" ".repeat(left_fill), no_shading),
             Span::styled(ts_text, no_shading),
-            Span::styled(" ".repeat(4), no_shading),
+            Span::styled(" ".repeat(3), no_shading),
         ]));
     } else {
         result.push(Line::from(vec![Span::styled(

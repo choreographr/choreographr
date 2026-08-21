@@ -3478,7 +3478,7 @@ impl SessionDisplayState {
             }
             // Must stay in lockstep with render_history (render.rs) so the
             // render-cache key never drifts from what the renderer draws.
-            let content_width = viewport.width.saturating_sub(6);
+            let content_width = viewport.width.saturating_sub(9);
             let tool_content_width = viewport.width.saturating_sub(1);
 
             // Effective reasoning visibility for this turn: the per-turn
@@ -3743,7 +3743,7 @@ impl SessionDisplayState {
 
         // Must stay in lockstep with render_history (render.rs) so the
         // render-cache key never drifts from what the renderer draws.
-        let content_width = viewport.width.saturating_sub(6);
+        let content_width = viewport.width.saturating_sub(9);
         let tool_content_width = viewport.width.saturating_sub(1);
 
         // Re-render with the effective reasoning visibility so the streaming
