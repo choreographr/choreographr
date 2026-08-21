@@ -1010,6 +1010,64 @@ fn broadcast_enqueues_losslessly_and_evicts_over_lag_client() {
 }
 
 #[test]
+#[serial_test::serial(catalog)]
+fn broadcast_lifecycle_delivers_to_summary_and_activity_exactly_once_per_client() {
+    // `DaemonState::broadcast` carries daemon-generated LIFECYCLE events
+    // (SessionCreated / SessionDeleted / the exit Sleeping status). They are
+    // the one message class with NO session-thread path, so they must reach
+    // BOTH subscriber classes directly: an all-activity subscriber that never
+    // subscribed to the summary bus would otherwise miss sessions being
+    // created/deleted. A client subscribed to BOTH buses must still get
+    // exactly one copy — the summary fan-out skips all-activity clients that
+    // the activity fan-out already served (same rule as the status-change
+    // summary fan-out).
+    let (mut state, _rx) = make_daemon_state();
+    let (tx1, rx1) = test_sink();
+    let (tx2, rx2) = test_sink();
+    let (tx3, rx3) = test_sink();
+
+    // Client 1: summary-only. Client 2: activity-only. Client 3: both.
+    state.handle_command(DaemonCommand::RegisterSummarySubscriber {
+        client_id: 1,
+        writer: tx1,
+    });
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 2,
+        writer: tx2,
+    });
+    state.handle_command(DaemonCommand::RegisterSummarySubscriber {
+        client_id: 3,
+        writer: tx3.clone(),
+    });
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 3,
+        writer: tx3,
+    });
+    // Activity registration pushes the current provider list; drain it so
+    // only the lifecycle broadcast is observed below.
+    drain_send_on_subscribe(&rx2);
+    drain_send_on_subscribe(&rx3);
+
+    let msg = DaemonMessage::Session {
+        session_id: Some(42),
+        event: SessionEvent::SessionDeleted,
+    };
+    state.broadcast(msg.clone());
+
+    // Summary-only client: delivered via the summary fan-out.
+    assert_eq!(rx1.recv().unwrap(), msg);
+    // Activity-only client: delivered via the activity fan-out (the gap this
+    // pin closes — it previously received nothing).
+    assert_eq!(rx2.recv().unwrap(), msg);
+    // Both-bus client: exactly one copy (summary skipped them).
+    assert_eq!(rx3.recv().unwrap(), msg);
+    assert!(
+        rx3.try_recv().is_err(),
+        "a summary+activity client must receive the lifecycle event exactly once"
+    );
+}
+
+#[test]
 fn handle_validate_model_allows_through_when_no_session() {
     let (mut state, _rx) = make_daemon_state();
     let (reply, rx) = mpsc::channel();

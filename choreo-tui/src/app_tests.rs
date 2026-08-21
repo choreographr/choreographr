@@ -3548,11 +3548,14 @@ fn daemon_message_session_state_ignores_wrong_session() {
 fn daemon_message_done_with_token_usage_updates_progress() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
-    app.attached_session_id = Some(0);
+    // Session 42 is the hypothetical attached session — a nonzero id the
+    // daemon can actually assign (`Some(0)` would be wire-implausible: ids
+    // start at 1, and `None` — not `0` — marks a connection-level reply).
+    app.attached_session_id = Some(42);
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: Some(0),
+            session_id: Some(42),
             event: SessionEvent::Done {
                 request_id: 1,
                 token_usage: Some(TokenUsage {
@@ -3569,14 +3572,14 @@ fn daemon_message_done_with_token_usage_updates_progress() {
     .expect("handle_daemon_message should succeed");
 
     assert_eq!(
-        app.display_for(0).token_usage,
+        app.display_for(42).token_usage,
         Some(TokenUsage {
             input_tokens: 5,
             output_tokens: 10,
             total_tokens: 15,
         })
     );
-    assert!(app.display_for(0).progress_dirty);
+    assert!(app.display_for(42).progress_dirty);
 }
 
 #[test]
@@ -3584,9 +3587,11 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
+    // `Done` is a requires-origin event (the daemon always carries the real
+    // session id in `Some`), so the fixture uses a nonzero id.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: Some(0),
+            session_id: Some(42),
             event: SessionEvent::Done {
                 request_id: 1,
                 token_usage: None,
@@ -3599,8 +3604,8 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
     .expect("handle_daemon_message should succeed");
 
     // Must remain at defaults — no data written, no dirty flag set.
-    assert!(app.display_for(0).token_usage.is_none());
-    assert!(!app.display_for(0).progress_dirty);
+    assert!(app.display_for(42).token_usage.is_none());
+    assert!(!app.display_for(42).progress_dirty);
 }
 
 #[test]

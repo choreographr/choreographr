@@ -68,20 +68,53 @@ pub(super) fn violates_broadcast_origin_contract(
 }
 
 impl DaemonState {
-    /// Send a message to all summary subscribers, removing dead ones.
+    /// Send a message to all session-summary subscribers, removing dead ones.
+    ///
+    /// This is the daemon-generated LIFECYCLE broadcast — `SessionCreated`,
+    /// `SessionDeleted`, and the exit `SessionStatusChanged(Sleeping)` — the
+    /// only session-list messages NOT produced by a session thread, so unlike
+    /// `handle_broadcast_session_status` there is no per-session fan-out or
+    /// `BroadcastActivity` forward to dedup against. Delivery must therefore
+    /// reach BOTH subscriber classes directly, or a client subscribed to all
+    /// activity (but not the summary bus) would never learn of sessions being
+    /// created/updated/deleted:
+    /// - all-activity subscribers first (they receive every lifecycle event),
+    /// - then summary subscribers, SKIPPING all-activity clients (they just
+    ///   got it via the activity fan-out, exactly as the status-change summary
+    ///   fan-out skips them), so a client on both buses gets exactly one copy.
     ///
     /// Lossless + lag-eviction, shared with the activity broadcast and the
     /// per-session broadcast (see `crate::broadcast`): every message is
     /// enqueued into each subscriber's UNBOUNDED queue (never dropped, never
     /// blocking the command loop), and a subscriber whose queue crossed the
-    /// lag limits is evicted (disconnected) so the backlog stays bounded.
+    /// lag limits is evicted (disconnected) so the backlog stays bounded. The
+    /// two fan-outs run on the daemon command thread in the order written
+    /// here, so the summary skip always observes the same membership the
+    /// activity fan-out just served.
     pub(super) fn broadcast(&mut self, msg: DaemonMessage) {
+        // Lifecycle events ride the activity bus too — an all-activity
+        // subscriber must see sessions appear and disappear even though it
+        // never joined the session-list bus.
+        let (evict_activity, evict_activity_largest) = fan_out_evicting(
+            &mut self.activity_subscribers,
+            &msg,
+            &self.lag_limits,
+            &self.global_lag,
+            |_| false, // lifecycle events have no per-session dedup here
+        );
+        self.finish_evictions(evict_activity, evict_activity_largest);
+
         let (evict_clients, evict_largest) = fan_out_evicting(
             &mut self.summary_subscribers,
             &msg,
             &self.lag_limits,
             &self.global_lag,
-            |_| false, // summary subscribers are never duplicate-suppressed
+            |client_id| {
+                // All-activity subscriber — already delivered by the fan-out
+                // above; skipping keeps per-client delivery exactly-once
+                // across the two buses.
+                self.activity_subscribers.contains_key(&client_id)
+            },
         );
         self.finish_evictions(evict_clients, evict_largest);
     }
