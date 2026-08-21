@@ -4,7 +4,7 @@ use choreo_client_core::{
     dispatch_daemon_message, parse_input_line, resolve_private_key,
     run_daemon_connection_with_mode, shell_command_echo,
 };
-use choreo_proto::{ClientMessage, DaemonMessage};
+use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
 use dioxus::prelude::*;
 use futures_channel::mpsc::UnboundedSender;
 
@@ -154,8 +154,13 @@ fn handle_session_message(
     message: &DaemonMessage,
 ) -> bool {
     match message {
-        DaemonMessage::SessionCreated { session_id, .. }
-        | DaemonMessage::SessionAttached { session_id } => {
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionCreated { .. } | SessionEvent::SessionAttached,
+        } => {
+            // The `session_id` binding now comes from the shared `Session`
+            // envelope, so both moved variants match through one arm while
+            // the inner or-pattern discriminates only on the event.
             // Record the new attached session id, but let dispatch emit the
             // informational text message.
             state.attached_session_id = Some(*session_id);

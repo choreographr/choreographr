@@ -267,21 +267,26 @@ impl Default for LagLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use choreo_proto::SessionEvent;
     use choreo_proto::SessionStatus;
 
     fn status_msg(session_id: u64) -> DaemonMessage {
-        DaemonMessage::SessionStatusChanged {
+        DaemonMessage::Session {
             session_id,
-            status: SessionStatus::Inactive,
-            last_modified: 0,
+            event: SessionEvent::SessionStatusChanged {
+                status: SessionStatus::Inactive,
+                last_modified: 0,
+            },
         }
     }
 
     /// Tiny, injectable limits so a test can cross a cap with a handful of
-    /// messages instead of megabytes.
+    /// messages instead of megabytes. `per_client_cap` is sized so a single
+    /// ~180-byte `Session`-wrapped status message fits (the v4 envelope
+    /// overhead is included in `approx_wire_size`).
     fn tiny_limits() -> LagLimits {
         LagLimits {
-            per_client_cap: 128,
+            per_client_cap: 256,
             global_budget: 256,
         }
     }
@@ -318,16 +323,19 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
         let sink = SubscriberSink::new(tx);
         let global = AtomicUsize::new(0);
-        // per_client_cap = 128: a message with a ~100-byte payload + a
-        // status message both fit, a second payload message crosses it.
+        // per_client_cap = 200: the ~180-byte `Session`-wrapped status
+        // message fits, a ~276-byte wrapped `Failed` payload message crosses
+        // it (both estimates include the v4 envelope overhead).
         let limits = LagLimits {
-            per_client_cap: 128,
+            per_client_cap: 200,
             global_budget: usize::MAX, // isolate the per-client threshold
         };
-        let payload_msg = || DaemonMessage::Failed {
+        let payload_msg = || DaemonMessage::Session {
             session_id: 1,
-            request_id: 1,
-            error: "x".repeat(100),
+            event: SessionEvent::Failed {
+                request_id: 1,
+                error: "x".repeat(100),
+            },
         };
 
         // First: well under the cap → Delivered.
@@ -360,9 +368,11 @@ mod tests {
         let sink = SubscriberSink::new(tx);
         let global = AtomicUsize::new(0);
         // Global budget tiny; per-client cap huge so only the global fires.
+        // budget = 200: the ~180-byte `Session`-wrapped status message fits,
+        // the ~376-byte wrapped `Failed` payload pushes the total over.
         let limits = LagLimits {
             per_client_cap: usize::MAX,
-            global_budget: 128,
+            global_budget: 200,
         };
 
         // One status message (~small) stays under the global budget.
@@ -373,10 +383,12 @@ mod tests {
         ));
 
         // A big message pushes the daemon-wide total over the budget.
-        let m2 = DaemonMessage::Failed {
+        let m2 = DaemonMessage::Session {
             session_id: 1,
-            request_id: 2,
-            error: "y".repeat(200),
+            event: SessionEvent::Failed {
+                request_id: 2,
+                error: "y".repeat(200),
+            },
         };
         let outcome = sink.enqueue(&m2, &limits, &global);
         assert!(
@@ -459,15 +471,19 @@ mod tests {
         };
 
         // Two messages of known size: Failed with 100-byte and 50-byte errors.
-        let m1 = DaemonMessage::Failed {
+        let m1 = DaemonMessage::Session {
             session_id: 1,
-            request_id: 1,
-            error: "a".repeat(100),
+            event: SessionEvent::Failed {
+                request_id: 1,
+                error: "a".repeat(100),
+            },
         };
-        let m2 = DaemonMessage::Failed {
+        let m2 = DaemonMessage::Session {
             session_id: 2,
-            request_id: 2,
-            error: "b".repeat(50),
+            event: SessionEvent::Failed {
+                request_id: 2,
+                error: "b".repeat(50),
+            },
         };
         let s1 = m1.approx_wire_size();
         let s2 = m2.approx_wire_size();

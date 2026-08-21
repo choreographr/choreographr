@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use choreo_acp::daemon_client::{Event, spawn_daemon_io};
-use choreo_proto::{ClientMessage, DaemonMessage, read_message, write_message};
+use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, read_message, write_message};
 
 /// Create a temporary directory and return a unique socket path within it.
 fn temp_socket_path() -> (std::path::PathBuf, std::path::PathBuf) {
@@ -59,25 +59,29 @@ fn daemon_io_send_and_receive() {
                 _ => panic!("expected RunInput, got {msg2:?}"),
             };
 
-            let echo = DaemonMessage::OutputChunk {
+            let echo = DaemonMessage::Session {
                 session_id: 0,
-                request_id,
-                stream: choreo_proto::OutputStream::Answer,
-                data: b"echo".to_vec(),
+                event: SessionEvent::OutputChunk {
+                    request_id,
+                    stream: choreo_proto::OutputStream::Answer,
+                    data: b"echo".to_vec(),
+                },
             };
             write_message(&mut writer, &echo).unwrap();
             writer.flush().unwrap();
 
             // Send Done to terminate the stream.
-            let done = DaemonMessage::Done {
+            let done = DaemonMessage::Session {
                 session_id: 0,
-                request_id,
-                token_usage: Some(choreo_proto::TokenUsage {
-                    input_tokens: 5,
-                    output_tokens: 3,
-                    total_tokens: 8,
-                }),
-                last_prompt_tokens: None,
+                event: SessionEvent::Done {
+                    request_id,
+                    token_usage: Some(choreo_proto::TokenUsage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                        total_tokens: 8,
+                    }),
+                    last_prompt_tokens: None,
+                },
             };
             write_message(&mut writer, &done).unwrap();
             writer.flush().unwrap();
@@ -125,10 +129,14 @@ fn daemon_io_send_and_receive() {
     // Receive the OutputChunk.
     let chunk_event = event_rx.recv().unwrap();
     match chunk_event {
-        Event::DaemonMessage(DaemonMessage::OutputChunk {
-            request_id,
-            stream,
-            data,
+        Event::DaemonMessage(DaemonMessage::Session {
+            event:
+                SessionEvent::OutputChunk {
+                    request_id,
+                    stream,
+                    data,
+                    ..
+                },
             ..
         }) => {
             assert_eq!(request_id, 42);
@@ -141,9 +149,13 @@ fn daemon_io_send_and_receive() {
     // Receive the Done.
     let done_event = event_rx.recv().unwrap();
     match done_event {
-        Event::DaemonMessage(DaemonMessage::Done {
-            request_id,
-            token_usage,
+        Event::DaemonMessage(DaemonMessage::Session {
+            event:
+                SessionEvent::Done {
+                    request_id,
+                    token_usage,
+                    ..
+                },
             ..
         }) => {
             assert_eq!(request_id, 42);

@@ -1,7 +1,8 @@
 use crate::daemon::DaemonCommand;
 use crate::sessions::SessionCommand;
 use choreo_proto::{
-    ClientMessage, ContextConfig, DaemonMessage, ProtoError, read_message, write_message,
+    ClientMessage, ContextConfig, DaemonMessage, ProtoError, SessionEvent, read_message,
+    write_message,
 };
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::Shutdown;
@@ -327,10 +328,12 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 // TUI resolves it via `App::resolve_daemon_session`.
                 send_to_writer(
                     ctx,
-                    DaemonMessage::Failed {
+                    DaemonMessage::Session {
                         session_id: 0,
-                        request_id,
-                        error: "no session attached".to_string(),
+                        event: SessionEvent::Failed {
+                            request_id,
+                            error: "no session attached".to_string(),
+                        },
                     },
                 );
             }
@@ -371,10 +374,12 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             } else {
                 send_to_writer(
                     ctx,
-                    DaemonMessage::Failed {
+                    DaemonMessage::Session {
                         session_id: 0,
-                        request_id,
-                        error: "no session attached".to_string(),
+                        event: SessionEvent::Failed {
+                            request_id,
+                            error: "no session attached".to_string(),
+                        },
                     },
                 );
             }
@@ -395,10 +400,12 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             } else {
                 send_to_writer(
                     ctx,
-                    DaemonMessage::ModelSelectionFailed {
+                    DaemonMessage::Session {
                         session_id: 0,
-                        model,
-                        error: "no session attached".to_string(),
+                        event: SessionEvent::ModelSelectionFailed {
+                            model,
+                            error: "no session attached".to_string(),
+                        },
                     },
                 );
             }
@@ -415,10 +422,12 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             } else {
                 send_to_writer(
                     ctx,
-                    DaemonMessage::ReasoningEffortSetFailed {
+                    DaemonMessage::Session {
                         session_id: 0,
-                        effort,
-                        error: "no session attached".to_string(),
+                        event: SessionEvent::ReasoningEffortSetFailed {
+                            effort,
+                            error: "no session attached".to_string(),
+                        },
                     },
                 );
             }
@@ -430,18 +439,20 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 if let Ok(effort) = rx.recv() {
                     send_to_writer(
                         ctx,
-                        DaemonMessage::ReasoningEffortSet {
+                        DaemonMessage::Session {
                             session_id: 0,
-                            effort,
+                            event: SessionEvent::ReasoningEffortSet { effort },
                         },
                     );
                 }
             } else {
                 send_to_writer(
                     ctx,
-                    DaemonMessage::ReasoningEffortSet {
+                    DaemonMessage::Session {
                         session_id: 0,
-                        effort: "off".to_string(),
+                        event: SessionEvent::ReasoningEffortSet {
+                            effort: "off".to_string(),
+                        },
                     },
                 );
             }
@@ -788,24 +799,28 @@ fn handle_client_create_session(
             // creating from the session manager page.
             send_to_writer(
                 ctx,
-                DaemonMessage::SessionCreated {
+                DaemonMessage::Session {
                     session_id: sid,
-                    title,
-                    parent_session_id,
-                    working_dir: cwd_str,
-                    account_name,
-                    selected_model,
-                    reasoning_effort,
+                    event: SessionEvent::SessionCreated {
+                        title,
+                        parent_session_id,
+                        working_dir: cwd_str,
+                        account_name,
+                        selected_model,
+                        reasoning_effort,
+                    },
                 },
             );
         }
         Ok(Err(e)) => {
             send_to_writer(
                 ctx,
-                DaemonMessage::SessionFailed {
+                DaemonMessage::Session {
                     session_id: 0,
-                    operation: "create_session".into(),
-                    error: e.to_string(),
+                    event: SessionEvent::SessionFailed {
+                        operation: "create_session".into(),
+                        error: e.to_string(),
+                    },
                 },
             );
         }
@@ -827,16 +842,24 @@ fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
             // Send SessionAttached before SessionCommand::Attach so that
             // the TUI's attached_session_id is set before SessionState
             // arrives — otherwise SessionState is silently dropped.
-            send_to_writer(ctx, DaemonMessage::SessionAttached { session_id });
+            send_to_writer(
+                ctx,
+                DaemonMessage::Session {
+                    session_id,
+                    event: SessionEvent::SessionAttached,
+                },
+            );
             switch_attached_session(session_id, session_tx, ctx);
         }
         Ok(Err(e)) => {
             send_to_writer(
                 ctx,
-                DaemonMessage::SessionFailed {
+                DaemonMessage::Session {
                     session_id: 0,
-                    operation: "attach_session".into(),
-                    error: e.to_string(),
+                    event: SessionEvent::SessionFailed {
+                        operation: "attach_session".into(),
+                        error: e.to_string(),
+                    },
                 },
             );
         }
@@ -862,10 +885,12 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
             _ => {
                 send_to_writer(
                     ctx,
-                    DaemonMessage::SessionFailed {
+                    DaemonMessage::Session {
                         session_id: 0,
-                        operation: "set_account".into(),
-                        error: format!("account '{name}' not found"),
+                        event: SessionEvent::SessionFailed {
+                            operation: "set_account".into(),
+                            error: format!("account '{name}' not found"),
+                        },
                     },
                 );
             }
@@ -873,10 +898,12 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
     } else {
         send_to_writer(
             ctx,
-            DaemonMessage::SessionFailed {
+            DaemonMessage::Session {
                 session_id: 0,
-                operation: "set_account".into(),
-                error: "no session attached".to_string(),
+                event: SessionEvent::SessionFailed {
+                    operation: "set_account".into(),
+                    error: "no session attached".to_string(),
+                },
             },
         );
     }
@@ -997,9 +1024,11 @@ fn handle_delete_session_sync(ctx: &mut ClientCtx, session_id: u64) {
         Ok(Err(e)) => {
             send_to_writer(
                 ctx,
-                DaemonMessage::SessionDeleteFailed {
+                DaemonMessage::Session {
                     session_id,
-                    error: e.to_string(),
+                    event: SessionEvent::SessionDeleteFailed {
+                        error: e.to_string(),
+                    },
                 },
             );
         }
@@ -1244,15 +1273,19 @@ mod tests {
             move || writer_thread(writer, rx, bytes, global)
         });
 
-        let m1 = DaemonMessage::Failed {
+        let m1 = DaemonMessage::Session {
             session_id: 1,
-            request_id: 1,
-            error: "a".repeat(100),
+            event: SessionEvent::Failed {
+                request_id: 1,
+                error: "a".repeat(100),
+            },
         };
-        let m2 = DaemonMessage::Failed {
+        let m2 = DaemonMessage::Session {
             session_id: 2,
-            request_id: 2,
-            error: "b".repeat(50),
+            event: SessionEvent::Failed {
+                request_id: 2,
+                error: "b".repeat(50),
+            },
         };
         let s1 = m1.approx_wire_size();
         let s2 = m2.approx_wire_size();
@@ -1298,20 +1331,26 @@ mod tests {
             move || writer_thread(writer, rx, bytes, global)
         });
 
-        let m1 = DaemonMessage::Failed {
+        let m1 = DaemonMessage::Session {
             session_id: 1,
-            request_id: 1,
-            error: "a".repeat(100),
+            event: SessionEvent::Failed {
+                request_id: 1,
+                error: "a".repeat(100),
+            },
         };
-        let m2 = DaemonMessage::Failed {
+        let m2 = DaemonMessage::Session {
             session_id: 2,
-            request_id: 2,
-            error: "b".repeat(50),
+            event: SessionEvent::Failed {
+                request_id: 2,
+                error: "b".repeat(50),
+            },
         };
-        let m3 = DaemonMessage::Failed {
+        let m3 = DaemonMessage::Session {
             session_id: 3,
-            request_id: 3,
-            error: "c".repeat(25),
+            event: SessionEvent::Failed {
+                request_id: 3,
+                error: "c".repeat(25),
+            },
         };
         let s1 = m1.approx_wire_size();
         let s2 = m2.approx_wire_size();
@@ -1719,8 +1758,18 @@ mod tests {
         });
         handle_delete_session_sync(&mut ctx, 42);
         let msg = writer_rx.recv().unwrap();
-        assert!(matches!(msg, DaemonMessage::SessionDeleteFailed { .. }));
-        if let DaemonMessage::SessionDeleteFailed { session_id, error } = &msg {
+        assert!(matches!(
+            msg,
+            DaemonMessage::Session {
+                event: SessionEvent::SessionDeleteFailed { .. },
+                ..
+            }
+        ));
+        if let DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionDeleteFailed { error },
+        } = &msg
+        {
             assert_eq!(*session_id, 42);
             assert_eq!(error, "db error");
         }
@@ -1929,10 +1978,12 @@ mod tests {
         let msg = writer_rx.recv().expect("should receive Failed");
         assert!(matches!(
             &msg,
-            DaemonMessage::Failed {
+            DaemonMessage::Session {
                 session_id: 0,
-                request_id: 7,
-                error,
+                event: SessionEvent::Failed {
+                    request_id: 7,
+                    error,
+                },
             } if error == "no session attached"
         ));
     }

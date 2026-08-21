@@ -2,7 +2,7 @@ use std::io::{BufWriter, Write};
 use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use choreo_proto::{ClientMessage, DaemonMessage};
+use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
 
 use crate::acp_jsonrpc::{
     self, AgentCapabilities, AgentInfo, ConfigOptionValue, ContentBlock, InitializeResult,
@@ -600,14 +600,18 @@ fn handle_daemon_message(
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     match &msg {
-        DaemonMessage::OutputChunk { .. }
-        | DaemonMessage::ToolCallStarted { .. }
-        | DaemonMessage::ToolResultChunk { .. }
-        | DaemonMessage::ToolCallFinished { .. }
-        | DaemonMessage::ToolCallFailed { .. }
-        | DaemonMessage::Done { .. }
-        | DaemonMessage::Failed { .. }
-        | DaemonMessage::Cancelled { .. } => handle_streaming_message(&msg, pending, sessions, out),
+        DaemonMessage::Session {
+            event:
+                SessionEvent::OutputChunk { .. }
+                | SessionEvent::ToolCallStarted { .. }
+                | SessionEvent::ToolResultChunk { .. }
+                | SessionEvent::ToolCallFinished { .. }
+                | SessionEvent::ToolCallFailed { .. }
+                | SessionEvent::Done { .. }
+                | SessionEvent::Failed { .. }
+                | SessionEvent::Cancelled { .. },
+            ..
+        } => handle_streaming_message(&msg, pending, sessions, out),
         _ => handle_sync_message(&msg, sessions, pending, daemon_writer, out),
     }
 }
@@ -623,16 +627,22 @@ fn handle_streaming_message(
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     // All streaming messages carry request_id — extract it from whichever
-    // variant arrived.
+    // SessionEvent variant arrived. The `DaemonMessage::Session` envelope
+    // wraps every session-scoped event, so the alternation lives on the
+    // inner `event` field of one envelope arm.
     let request_id = match msg {
-        DaemonMessage::OutputChunk { request_id, .. }
-        | DaemonMessage::ToolCallStarted { request_id, .. }
-        | DaemonMessage::ToolResultChunk { request_id, .. }
-        | DaemonMessage::ToolCallFinished { request_id, .. }
-        | DaemonMessage::ToolCallFailed { request_id, .. }
-        | DaemonMessage::Done { request_id, .. }
-        | DaemonMessage::Failed { request_id, .. }
-        | DaemonMessage::Cancelled { request_id, .. } => *request_id,
+        DaemonMessage::Session {
+            event:
+                SessionEvent::OutputChunk { request_id, .. }
+                | SessionEvent::ToolCallStarted { request_id, .. }
+                | SessionEvent::ToolResultChunk { request_id, .. }
+                | SessionEvent::ToolCallFinished { request_id, .. }
+                | SessionEvent::ToolCallFailed { request_id, .. }
+                | SessionEvent::Done { request_id, .. }
+                | SessionEvent::Failed { request_id, .. }
+                | SessionEvent::Cancelled { request_id, .. },
+            ..
+        } => *request_id,
         _ => return Ok(()),
     };
 
@@ -658,9 +668,14 @@ fn handle_streaming_message(
     }
 
     // Terminal messages produce a JSON-RPC response and clean up prompt
-    // state.  Non-terminal (mid-stream) messages stop here.
-    match msg {
-        DaemonMessage::Done { token_usage, .. } => {
+    // state.  Non-terminal (mid-stream) messages stop here.  All terminal
+    // states are session-scoped events, so unwrap the envelope once and
+    // dispatch on the inner event.
+    let DaemonMessage::Session { event, .. } = msg else {
+        return Ok(());
+    };
+    match event {
+        SessionEvent::Done { token_usage, .. } => {
             send_terminal_response(
                 jsonrpc_id,
                 "end_turn",
@@ -675,7 +690,7 @@ fn handle_streaming_message(
                 out,
             )?;
         }
-        DaemonMessage::Failed { error, .. } => {
+        SessionEvent::Failed { error, .. } => {
             warn!(%error, "prompt failed");
             send_terminal_response(
                 jsonrpc_id,
@@ -687,7 +702,7 @@ fn handle_streaming_message(
                 out,
             )?;
         }
-        DaemonMessage::Cancelled { .. } => {
+        SessionEvent::Cancelled { .. } => {
             send_terminal_response(
                 jsonrpc_id,
                 "cancelled",
@@ -784,7 +799,11 @@ fn handle_sync_message(
             }
         },
 
-        DaemonMessage::SessionCreated { session_id, .. } => {
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionCreated { .. },
+            ..
+        } => {
             if let Some(entry) = pending.take_sync(&PendingKind::CreateSession) {
                 let acp_id = sessions.create(*session_id);
                 send_to_daemon(
@@ -833,7 +852,11 @@ fn handle_sync_message(
             }
         }
 
-        DaemonMessage::SessionDeleted { session_id } => {
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionDeleted,
+            ..
+        } => {
             if let Some(entry) = pending.take_sync(&PendingKind::DeleteSession(*session_id)) {
                 // Daemon confirmed deletion — safe to remove local state now.
                 // Clone the ACP ID to avoid borrow conflict with remove().
@@ -844,7 +867,11 @@ fn handle_sync_message(
             }
         }
 
-        DaemonMessage::SessionDeleteFailed { session_id, error } => {
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionDeleteFailed { error },
+            ..
+        } => {
             if let Some(entry) = pending.take_sync(&PendingKind::DeleteSession(*session_id)) {
                 // Daemon failed to delete — local state is preserved so the
                 // editor can retry the operation.
@@ -855,16 +882,25 @@ fn handle_sync_message(
         // ModelSelected is a no-op here because the SetModel sync entry
         // is consumed in the Models handler (which carries selected_model
         // for updating session state).  See the Models arm above.
-        DaemonMessage::ModelSelected { .. } => {}
+        DaemonMessage::Session {
+            event: SessionEvent::ModelSelected { .. },
+            ..
+        } => {}
 
-        DaemonMessage::ModelSelectionFailed { error, .. } => {
+        DaemonMessage::Session {
+            event: SessionEvent::ModelSelectionFailed { error, .. },
+            ..
+        } => {
             if let Some(entry) = pending.take_sync(&PendingKind::SetModel) {
                 pending.take_pending_session(&PendingKind::SetModel);
                 respond_err(entry.jsonrpc_id, -32000, error, out)?;
             }
         }
 
-        DaemonMessage::ReasoningEffortSet { effort, .. } => {
+        DaemonMessage::Session {
+            event: SessionEvent::ReasoningEffortSet { effort, .. },
+            ..
+        } => {
             if let Some(entry) = pending.take_sync(&PendingKind::SetReasoningEffort) {
                 if let Some(session_id) =
                     pending.take_pending_session(&PendingKind::SetReasoningEffort)
@@ -876,7 +912,10 @@ fn handle_sync_message(
             }
         }
 
-        DaemonMessage::ReasoningEffortSetFailed { error, .. } => {
+        DaemonMessage::Session {
+            event: SessionEvent::ReasoningEffortSetFailed { error, .. },
+            ..
+        } => {
             if let Some(entry) = pending.take_sync(&PendingKind::SetReasoningEffort) {
                 pending.take_pending_session(&PendingKind::SetReasoningEffort);
                 respond_err(entry.jsonrpc_id, -32000, error, out)?;

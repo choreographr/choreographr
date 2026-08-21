@@ -2,8 +2,8 @@ use super::*;
 use crate::client::handle_shell_command;
 use choreo_client_core::{ShellCommand, dispatch_daemon_message};
 use choreo_proto::{
-    ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream, TimestampMs,
-    TokenUsage, Turn,
+    ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream, SessionEvent,
+    TimestampMs, TokenUsage, Turn,
 };
 
 #[test]
@@ -12,11 +12,13 @@ fn app_state_stream_updates_history() {
 
     // Simulate a Started message to set up request-to-turn mapping.
     dispatch_daemon_message(
-        &DaemonMessage::Started {
+        &DaemonMessage::Session {
             session_id: 1,
-            request_id: 7,
-            turn_id: 1,
-            estimated_prompt_tokens: 0,
+            event: SessionEvent::Started {
+                request_id: 7,
+                turn_id: 1,
+                estimated_prompt_tokens: 0,
+            },
         },
         &mut state,
     );
@@ -42,31 +44,37 @@ fn app_state_stream_updates_history() {
     );
 
     dispatch_daemon_message(
-        &DaemonMessage::OutputChunk {
+        &DaemonMessage::Session {
             session_id: 1,
-            request_id: 7,
-            stream: OutputStream::Reasoning,
-            data: b"thinking".to_vec(),
+            event: SessionEvent::OutputChunk {
+                request_id: 7,
+                stream: OutputStream::Reasoning,
+                data: b"thinking".to_vec(),
+            },
         },
         &mut state,
     );
 
     dispatch_daemon_message(
-        &DaemonMessage::OutputChunk {
+        &DaemonMessage::Session {
             session_id: 1,
-            request_id: 7,
-            stream: OutputStream::Answer,
-            data: b"hello".to_vec(),
+            event: SessionEvent::OutputChunk {
+                request_id: 7,
+                stream: OutputStream::Answer,
+                data: b"hello".to_vec(),
+            },
         },
         &mut state,
     );
 
     dispatch_daemon_message(
-        &DaemonMessage::OutputChunk {
+        &DaemonMessage::Session {
             session_id: 1,
-            request_id: 7,
-            stream: OutputStream::Answer,
-            data: b" world".to_vec(),
+            event: SessionEvent::OutputChunk {
+                request_id: 7,
+                stream: OutputStream::Answer,
+                data: b" world".to_vec(),
+            },
         },
         &mut state,
     );
@@ -124,10 +132,9 @@ fn apply_daemon_turn_appended_with_image() {
     };
 
     dispatch_daemon_message(
-        &DaemonMessage::TurnAppended {
+        &DaemonMessage::Session {
             session_id: 1,
-            turn_id: 1,
-            turn,
+            event: SessionEvent::TurnAppended { turn_id: 1, turn },
         },
         &mut state,
     );

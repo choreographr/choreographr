@@ -1,5 +1,5 @@
 use choreo_proto::{
-    DaemonMessage, OutputStream, ReasoningCapability, SessionStatus, TokenUsage, Turn,
+    DaemonMessage, OutputStream, ReasoningCapability, SessionEvent, SessionStatus, TokenUsage, Turn,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -109,9 +109,110 @@ pub trait TurnEventHandler {
 
 pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandler) {
     debug!("dispatching daemon message: {msg:?}");
-    match msg {
-        DaemonMessage::SessionCreated {
-            session_id,
+
+    // Session-scoped events all ride the `DaemonMessage::Session` envelope,
+    // which hoists the origin session id, so `session_id` is destructured
+    // exactly once here rather than per-arm. Non-session (flat) messages take
+    // the else branch: the rest of the dispatch below handles them and
+    // returns, so the session-event match below only ever sees the envelope.
+    let DaemonMessage::Session { session_id, event } = msg else {
+        match msg {
+            DaemonMessage::Sessions { .. } => {
+                // Handled upstream by the caller before dispatch.
+            }
+            DaemonMessage::Pong => {
+                handler.handle_status_text("[daemon] pong".to_string());
+            }
+            DaemonMessage::ShuttingDown => {
+                handler.handle_status_text("[daemon] shutting down".to_string());
+            }
+            DaemonMessage::Models {
+                models,
+                selected_model,
+            } => {
+                if models.is_empty() {
+                    handler.handle_status_text("[daemon] no models available".to_string());
+                } else {
+                    let mut lines = vec![format!("[daemon] supported models ({})", models.len())];
+                    for model in models {
+                        let prefix = if selected_model.as_deref() == Some(model.as_str()) {
+                            "*"
+                        } else {
+                            "-"
+                        };
+                        lines.push(format!("{prefix} {model}"));
+                    }
+                    handler.handle_status_text(lines.join("\n"));
+                }
+            }
+            DaemonMessage::ModelsFailed { error } => {
+                handler.handle_error(format!("[daemon] models failed: {error}"));
+            }
+            DaemonMessage::Unlocked => {
+                handler.handle_status_text(
+                    "[daemon] keystore unlocked, credentials available".to_string(),
+                );
+            }
+            DaemonMessage::Locked => {
+                handler.handle_status_text(
+                    "[daemon] keystore locked, credentials cleared".to_string(),
+                );
+            }
+            DaemonMessage::LockedError { error } => {
+                handler.handle_error(format!("[daemon] locked: {error}"));
+            }
+            DaemonMessage::CredentialAdded { service } => {
+                handler.handle_status_text(format!("[daemon] credential added: {service}"));
+            }
+            DaemonMessage::CredentialAddFailed { service, error } => {
+                handler.handle_error(format!(
+                    "[daemon] credential add failed ({service}): {error}"
+                ));
+            }
+            DaemonMessage::CredentialRemoved { service } => {
+                handler.handle_status_text(format!("[daemon] credential removed: {service}"));
+            }
+            DaemonMessage::CredentialRemoveFailed { service, error } => {
+                handler.handle_error(format!(
+                    "[daemon] credential remove failed ({service}): {error}"
+                ));
+            }
+            DaemonMessage::Credential { .. } => {}
+            DaemonMessage::AccountAdded { name } => {
+                handler.handle_status_text(format!("[daemon] account added: {name}"));
+            }
+            DaemonMessage::AccountAddFailed { name, error } => {
+                handler.handle_error(format!("[daemon] failed to add account {name}: {error}"));
+            }
+            DaemonMessage::AccountRemoved { name } => {
+                handler.handle_status_text(format!("[daemon] account removed: {name}"));
+            }
+            DaemonMessage::AccountRemoveFailed { name, error } => {
+                handler.handle_error(format!("[daemon] failed to remove account {name}: {error}"));
+            }
+            DaemonMessage::Accounts { accounts } => {
+                if accounts.is_empty() {
+                    handler.handle_status_text("[daemon] no accounts configured".to_string());
+                } else {
+                    let mut lines = vec![format!("[daemon] accounts ({})", accounts.len())];
+                    for a in accounts {
+                        lines.push(format!("  {}: {}", a.name, a.provider));
+                    }
+                    handler.handle_status_text(lines.join("\n"));
+                }
+            }
+            DaemonMessage::AccountListFailed { error } => {
+                handler.handle_error(format!("[daemon] failed to list accounts: {error}"));
+            }
+            _ => {
+                debug!("unhandled daemon message variant");
+            }
+        }
+        return;
+    };
+
+    match event {
+        SessionEvent::SessionCreated {
             title,
             working_dir,
             account_name,
@@ -128,14 +229,10 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
                 reasoning_effort.clone(),
             );
         }
-        DaemonMessage::Sessions { .. } => {
-            // Handled upstream by the caller before dispatch.
-        }
-        DaemonMessage::SessionAttached { session_id } => {
+        SessionEvent::SessionAttached => {
             handler.handle_session_attached(*session_id);
         }
-        DaemonMessage::SessionState {
-            session_id,
+        SessionEvent::SessionState {
             title,
             selected_model,
             turns,
@@ -162,26 +259,21 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
                 reasoning_capability: reasoning_capability.clone(),
             });
         }
-        DaemonMessage::TurnAppended {
-            session_id,
-            turn_id,
-            turn,
-        } => handler.handle_turn_appended(*session_id, *turn_id, turn.clone()),
-        DaemonMessage::TurnsUndone {
-            session_id,
-            turn_ids,
-        } => handler.handle_turns_undone(*session_id, turn_ids),
-        DaemonMessage::TurnsRedone { session_id, turns } => {
+        SessionEvent::TurnAppended { turn_id, turn } => {
+            handler.handle_turn_appended(*session_id, *turn_id, turn.clone())
+        }
+        SessionEvent::TurnsUndone { turn_ids } => {
+            handler.handle_turns_undone(*session_id, turn_ids)
+        }
+        SessionEvent::TurnsRedone { turns } => {
             handler.handle_turns_redone(*session_id, turns.clone())
         }
-        DaemonMessage::Started {
-            session_id,
+        SessionEvent::Started {
             request_id,
             turn_id,
             estimated_prompt_tokens,
         } => handler.handle_started(*session_id, *request_id, *turn_id, *estimated_prompt_tokens),
-        DaemonMessage::OutputChunk {
-            session_id,
+        SessionEvent::OutputChunk {
             request_id,
             stream,
             data,
@@ -191,8 +283,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             stream.clone(),
             String::from_utf8_lossy(data),
         ),
-        DaemonMessage::ToolCallStarted {
-            session_id,
+        SessionEvent::ToolCallStarted {
             request_id,
             call_id,
             tool_name,
@@ -208,8 +299,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
                 invocation_description: invocation_description.clone(),
             },
         ),
-        DaemonMessage::ToolCallFinished {
-            session_id,
+        SessionEvent::ToolCallFinished {
             request_id,
             call_id,
             tool_name,
@@ -221,8 +311,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
                 tool_name: tool_name.clone(),
             },
         ),
-        DaemonMessage::ToolCallFailed {
-            session_id,
+        SessionEvent::ToolCallFailed {
             request_id,
             call_id,
             tool_name,
@@ -236,8 +325,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
                 error: error.clone(),
             },
         ),
-        DaemonMessage::ToolResultChunk {
-            session_id,
+        SessionEvent::ToolResultChunk {
             request_id,
             call_id,
             data,
@@ -247,146 +335,60 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             call_id.clone(),
             data.clone(),
         ),
-        DaemonMessage::Done {
-            session_id,
+        SessionEvent::Done {
             request_id,
             token_usage,
             last_prompt_tokens,
         } => handler.handle_done(*session_id, *request_id, *token_usage, *last_prompt_tokens),
-        DaemonMessage::Failed {
-            session_id,
-            request_id,
-            error,
-        } => handler.handle_failed(*session_id, *request_id, error.clone()),
-        DaemonMessage::Cancelled {
-            session_id,
-            request_id,
-        } => handler.handle_failed(*session_id, *request_id, "cancelled".to_string()),
-        DaemonMessage::SessionStatusChanged {
-            session_id,
+        SessionEvent::Failed { request_id, error } => {
+            handler.handle_failed(*session_id, *request_id, error.clone())
+        }
+        SessionEvent::Cancelled { request_id } => {
+            handler.handle_failed(*session_id, *request_id, "cancelled".to_string())
+        }
+        SessionEvent::SessionStatusChanged {
             status,
             last_modified,
         } => handler.handle_session_status_changed(*session_id, status.clone(), *last_modified),
-        DaemonMessage::SessionFailed { error, .. } => {
+        SessionEvent::SessionFailed { error, .. } => {
             handler.handle_error(error.clone());
         }
-        DaemonMessage::Pong => {
-            handler.handle_status_text("[daemon] pong".to_string());
-        }
-        DaemonMessage::ShuttingDown => {
-            handler.handle_status_text("[daemon] shutting down".to_string());
-        }
-        DaemonMessage::Models {
-            models,
-            selected_model,
-        } => {
-            if models.is_empty() {
-                handler.handle_status_text("[daemon] no models available".to_string());
-            } else {
-                let mut lines = vec![format!("[daemon] supported models ({})", models.len())];
-                for model in models {
-                    let prefix = if selected_model.as_deref() == Some(model.as_str()) {
-                        "*"
-                    } else {
-                        "-"
-                    };
-                    lines.push(format!("{prefix} {model}"));
-                }
-                handler.handle_status_text(lines.join("\n"));
-            }
-        }
-        DaemonMessage::ModelsFailed { error } => {
-            handler.handle_error(format!("[daemon] models failed: {error}"));
-        }
-        DaemonMessage::ModelSelected { model, .. } => {
+        SessionEvent::ModelSelected { model, .. } => {
             handler.handle_status_text(format!("[daemon] selected model: {model}"));
         }
-        DaemonMessage::ModelSelectionFailed { model, error, .. } => {
+        SessionEvent::ModelSelectionFailed { model, error } => {
             handler.handle_error(format!("[daemon] failed to select model {model}: {error}"));
         }
-        DaemonMessage::Unlocked => {
-            handler.handle_status_text(
-                "[daemon] keystore unlocked, credentials available".to_string(),
-            );
-        }
-        DaemonMessage::Locked => {
-            handler.handle_status_text("[daemon] keystore locked, credentials cleared".to_string());
-        }
-        DaemonMessage::LockedError { error } => {
-            handler.handle_error(format!("[daemon] locked: {error}"));
-        }
-        DaemonMessage::CredentialAdded { service } => {
-            handler.handle_status_text(format!("[daemon] credential added: {service}"));
-        }
-        DaemonMessage::CredentialAddFailed { service, error } => {
-            handler.handle_error(format!(
-                "[daemon] credential add failed ({service}): {error}"
-            ));
-        }
-        DaemonMessage::CredentialRemoved { service } => {
-            handler.handle_status_text(format!("[daemon] credential removed: {service}"));
-        }
-        DaemonMessage::CredentialRemoveFailed { service, error } => {
-            handler.handle_error(format!(
-                "[daemon] credential remove failed ({service}): {error}"
-            ));
-        }
-        DaemonMessage::Credential { .. } => {}
-        DaemonMessage::SessionDeleted { .. } => {}
-        DaemonMessage::SessionDeleteFailed { .. } => {}
-        DaemonMessage::AccountAdded { name } => {
-            handler.handle_status_text(format!("[daemon] account added: {name}"));
-        }
-        DaemonMessage::AccountAddFailed { name, error } => {
-            handler.handle_error(format!("[daemon] failed to add account {name}: {error}"));
-        }
-        DaemonMessage::AccountRemoved { name } => {
-            handler.handle_status_text(format!("[daemon] account removed: {name}"));
-        }
-        DaemonMessage::AccountRemoveFailed { name, error } => {
-            handler.handle_error(format!("[daemon] failed to remove account {name}: {error}"));
-        }
-        DaemonMessage::Accounts { accounts } => {
-            if accounts.is_empty() {
-                handler.handle_status_text("[daemon] no accounts configured".to_string());
-            } else {
-                let mut lines = vec![format!("[daemon] accounts ({})", accounts.len())];
-                for a in accounts {
-                    lines.push(format!("  {}: {}", a.name, a.provider));
-                }
-                handler.handle_status_text(lines.join("\n"));
-            }
-        }
-        DaemonMessage::AccountListFailed { error } => {
-            handler.handle_error(format!("[daemon] failed to list accounts: {error}"));
-        }
-        DaemonMessage::SessionAccountSet { account, .. } => {
+        SessionEvent::SessionDeleted => {}
+        SessionEvent::SessionDeleteFailed { .. } => {}
+        SessionEvent::SessionAccountSet { account, .. } => {
             handler.handle_status_text(format!("[daemon] session account set: {account}"));
         }
-        DaemonMessage::SessionWorkingDirSet { .. } => {}
-        DaemonMessage::SessionTitleSet { .. } => {
+        SessionEvent::SessionWorkingDirSet { .. } => {}
+        SessionEvent::SessionTitleSet { .. } => {
             // Session title changes are metadata-only (no conversation
             // content) and are handled at the TUI layer directly via
             // the connection.rs routing — no generic dispatch needed.
         }
-        DaemonMessage::ReasoningEffortSet { effort, .. } => {
+        SessionEvent::ReasoningEffortSet { effort, .. } => {
             handler.handle_status_text(format!("[daemon] reasoning effort: {effort}"));
         }
-        DaemonMessage::ReasoningEffortSetFailed { effort, error, .. } => {
+        SessionEvent::ReasoningEffortSetFailed { effort, error, .. } => {
             handler.handle_error(format!(
                 "[daemon] failed to set reasoning effort {effort}: {error}"
             ));
         }
-        DaemonMessage::TokenUsageUpdate {
-            session_id,
+        SessionEvent::TokenUsageUpdate {
             token_usage,
             last_prompt_tokens,
         } => handler.handle_token_usage_update(*session_id, *token_usage, *last_prompt_tokens),
-        DaemonMessage::LiveOutputTokenCount { .. } => {
+        SessionEvent::LiveOutputTokenCount { .. } => {
             // Handled at the TUI layer in connection.rs — no generic dispatch needed.
         }
-        _ => {
-            debug!("unhandled daemon message variant");
+        SessionEvent::ContextWindowResolved { .. } => {
+            // Context-window resolution is metadata-only (no conversation
+            // content) and is handled at the TUI layer in connection.rs — no
+            // generic dispatch needed.
         }
     }
 }

@@ -1,6 +1,6 @@
 use choreo_daemon::broadcast::{LagLimits, SubscriberSink};
 use choreo_daemon::{RequestContext, SessionCommand, db, session_main};
-use choreo_proto::DaemonMessage;
+use choreo_proto::{DaemonMessage, SessionEvent};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -58,7 +58,13 @@ fn session_starts_and_accepts_commands() {
         .unwrap();
 
     let msg = writer_rx.recv().unwrap();
-    assert!(matches!(msg, DaemonMessage::SessionState { .. }));
+    assert!(matches!(
+        msg,
+        DaemonMessage::Session {
+            event: SessionEvent::SessionState { .. },
+            ..
+        }
+    ));
 
     session_tx
         .send(SessionCommand::SetModel {

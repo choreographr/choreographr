@@ -25,7 +25,7 @@
 use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_connection;
 use choreo_client_core::run_daemon_tcp_connection;
-use choreo_proto::{ClientMessage, DaemonMessage};
+use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
 use choreo_transport::key::{ensure_transport_keypair, set_test_config_root};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -210,7 +210,10 @@ fn noise_list_sessions_round_trip() {
     // Create a session with all optional fields unset.
     client.send(create_session());
     match client.recv() {
-        DaemonMessage::SessionCreated { session_id, .. } => assert_eq!(session_id, 1),
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionCreated { .. },
+        } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
     }
 
@@ -283,7 +286,10 @@ fn noise_and_unix_share_daemon_state() {
     // The Noise client creates a session...
     noise_client.send(create_session());
     match noise_client.recv() {
-        DaemonMessage::SessionCreated { session_id, .. } => assert_eq!(session_id, 1),
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionCreated { .. },
+        } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
     }
 
@@ -368,7 +374,10 @@ fn noise_subscribe_receives_session_broadcasts() {
     // the old tests drained; the exact-one-message assert below is the pin.)
     client_b.send(create_session());
     match client_b.recv() {
-        DaemonMessage::SessionCreated { session_id, .. } => assert_eq!(session_id, 1),
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionCreated { .. },
+        } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
     }
 
@@ -381,11 +390,17 @@ fn noise_subscribe_receives_session_broadcasts() {
     let mut saw_status = false;
     for _ in 0..2 {
         match client_a.recv() {
-            DaemonMessage::SessionCreated { session_id, .. } => {
+            DaemonMessage::Session {
+                session_id,
+                event: SessionEvent::SessionCreated { .. },
+            } => {
                 assert_eq!(session_id, 1);
                 saw_created = true;
             }
-            DaemonMessage::SessionStatusChanged { session_id, .. } => {
+            DaemonMessage::Session {
+                session_id,
+                event: SessionEvent::SessionStatusChanged { .. },
+            } => {
                 assert_eq!(session_id, 1);
                 saw_status = true;
             }
@@ -412,11 +427,17 @@ fn noise_subscribe_receives_session_broadcasts() {
     let mut status_2 = 0;
     for _ in 0..3 {
         match client_a.recv() {
-            DaemonMessage::SessionCreated { session_id, .. } => {
+            DaemonMessage::Session {
+                session_id,
+                event: SessionEvent::SessionCreated { .. },
+            } => {
                 assert_eq!(session_id, 2);
                 created_2 += 1;
             }
-            DaemonMessage::SessionStatusChanged { session_id, .. } => {
+            DaemonMessage::Session {
+                session_id,
+                event: SessionEvent::SessionStatusChanged { .. },
+            } => {
                 assert_eq!(session_id, 2);
                 status_2 += 1;
             }
@@ -590,7 +611,10 @@ fn noise_large_message_daemon_to_client() {
             reasoning_effort: None,
         });
         match client.recv() {
-            DaemonMessage::SessionCreated { session_id, .. } => {
+            DaemonMessage::Session {
+                session_id,
+                event: SessionEvent::SessionCreated { .. },
+            } => {
                 assert_eq!(session_id, (i + 1) as u64)
             }
             other => panic!("expected SessionCreated, got {other:?}"),

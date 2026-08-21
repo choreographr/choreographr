@@ -131,11 +131,11 @@ fn decode_tolerates_array_encoded_struct() {
     // Named mode writes structs as maps with field-name keys, but decode also
     // accepts the array (field-order) form — that is the compatibility
     // contract that keeps a future switch to compact mode backwards-readable.
-    // Hand-build `[3, [10, 20, 30]]`: version 3, then a `TokenUsage` struct
+    // Hand-build `[4, [10, 20, 30]]`: version 4, then a `TokenUsage` struct
     // serialized WITHOUT field names as a 3-element array.
     let blob = [
         0x92, // array of 2: (version, message)
-        0x03, // PROTOCOL_VERSION = 3
+        0x04, // PROTOCOL_VERSION = 4
         0x93, // array of 3: TokenUsage { input_tokens, output_tokens, total_tokens }
         0x0a, // input_tokens = 10
         0x14, // output_tokens = 20
@@ -343,41 +343,70 @@ fn session_summary_tolerates_missing_and_unknown_fields() {
 
 #[test]
 fn done_tolerates_missing_optional_fields() {
-    // `token_usage` on Done is optional (`#[serde(default)]`): a payload that
-    // omits it must parse and default to None.
-    let json = r#"{"Done":{"session_id":1,"request_id":42}}"#;
+    // `token_usage` on the session-scoped `Done` event is optional: a payload
+    // that omits it (and the `#[serde(default)]` `last_prompt_tokens`) must
+    // parse and default to None. The wire shape is now the v4 envelope —
+    // `DaemonMessage::Session { session_id, event: SessionEvent::Done }` — so
+    // the fixture nests the event inside the envelope.
+    let json = r#"{"Session":{"session_id":1,"event":{"Done":{"request_id":42}}}}"#;
     let msg: DaemonMessage = serde_json::from_str(json).unwrap();
     match msg {
-        DaemonMessage::Done {
-            request_id,
-            token_usage,
-            ..
+        DaemonMessage::Session {
+            session_id,
+            event:
+                SessionEvent::Done {
+                    request_id,
+                    token_usage,
+                    ..
+                },
         } => {
+            assert_eq!(session_id, 1);
             assert_eq!(request_id, 42);
             assert_eq!(token_usage, None);
         }
-        _ => panic!("expected Done"),
+        _ => panic!("expected Session(Done)"),
     }
+
+    // The same shape must round-trip through the actual v4 frame codec too
+    // (the version gate stays consistent because all constants are local).
+    let msg = DaemonMessage::Session {
+        session_id: 1,
+        event: SessionEvent::Done {
+            request_id: 42,
+            token_usage: None,
+            last_prompt_tokens: None,
+        },
+    };
+    let frame = encode_frame(&msg).expect("encode");
+    let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, msg);
 }
 
 #[test]
 fn daemon_message_done_without_usage() {
-    let msg = DaemonMessage::Done {
+    let msg = DaemonMessage::Session {
         session_id: 1,
-        request_id: 7,
-        token_usage: None,
-        last_prompt_tokens: None,
+        event: SessionEvent::Done {
+            request_id: 7,
+            token_usage: None,
+            last_prompt_tokens: None,
+        },
     };
     match msg {
-        DaemonMessage::Done {
-            request_id,
-            token_usage,
-            ..
+        DaemonMessage::Session {
+            session_id,
+            event:
+                SessionEvent::Done {
+                    request_id,
+                    token_usage,
+                    ..
+                },
         } => {
+            assert_eq!(session_id, 1);
             assert_eq!(request_id, 7);
             assert_eq!(token_usage, None);
         }
-        _ => panic!("expected Done"),
+        _ => panic!("expected Session(Done)"),
     }
 }
 
@@ -388,24 +417,31 @@ fn daemon_message_done_with_usage_round_trip() {
         output_tokens: 50,
         total_tokens: 150,
     };
-    let msg = DaemonMessage::Done {
+    let msg = DaemonMessage::Session {
         session_id: 1,
-        request_id: 3,
-        token_usage: Some(usage),
-        last_prompt_tokens: None,
+        event: SessionEvent::Done {
+            request_id: 3,
+            token_usage: Some(usage),
+            last_prompt_tokens: None,
+        },
     };
     let frame = encode_frame(&msg).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
     match decoded {
-        DaemonMessage::Done {
-            request_id,
-            token_usage,
-            ..
+        DaemonMessage::Session {
+            session_id,
+            event:
+                SessionEvent::Done {
+                    request_id,
+                    token_usage,
+                    ..
+                },
         } => {
+            assert_eq!(session_id, 1);
             assert_eq!(request_id, 3);
             assert_eq!(token_usage, Some(usage));
         }
-        _ => panic!("expected Done"),
+        _ => panic!("expected Session(Done)"),
     }
 }
 
@@ -466,20 +502,22 @@ fn session_summary_some_token_usage_round_trip() {
 
 #[test]
 fn session_state_none_optionals_round_trip() {
-    let state = DaemonMessage::SessionState {
+    let state = DaemonMessage::Session {
         session_id: 1,
-        title: None,
-        selected_model: None,
-        parent_session_id: None,
-        working_dir: None,
-        turns: BTreeMap::new(),
-        active_tool_groups: vec![],
-        token_usage: None,
-        context_window: None,
-        last_prompt_tokens: None,
-        status: SessionStatus::Inactive,
-        reasoning_effort: None,
-        reasoning_capability: None,
+        event: SessionEvent::SessionState {
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            working_dir: None,
+            turns: BTreeMap::new(),
+            active_tool_groups: vec![],
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+            status: SessionStatus::Inactive,
+            reasoning_effort: None,
+            reasoning_capability: None,
+        },
     };
     let frame = encode_frame(&state).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
@@ -571,10 +609,12 @@ fn turn_appended_serde_round_trip() {
         reasoning_artifact: None,
         reasoning_producer: None,
     };
-    let msg = DaemonMessage::TurnAppended {
+    let msg = DaemonMessage::Session {
         session_id: 1,
-        turn_id: 1,
-        turn: turn.clone(),
+        event: SessionEvent::TurnAppended {
+            turn_id: 1,
+            turn: turn.clone(),
+        },
     };
     let frame = encode_frame(&msg).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
@@ -599,10 +639,12 @@ fn evicted_serde_round_trip() {
 fn approx_wire_size_scales_with_payload() {
     // A variant carrying a 100-byte String must estimate at least 100 bytes:
     // the string payload itself dominates the serialized size.
-    let msg = DaemonMessage::Failed {
+    let msg = DaemonMessage::Session {
         session_id: 1,
-        request_id: 1,
-        error: "x".repeat(100),
+        event: SessionEvent::Failed {
+            request_id: 1,
+            error: "x".repeat(100),
+        },
     };
     assert!(msg.approx_wire_size() >= 100);
 
@@ -624,17 +666,18 @@ fn approx_wire_size_scales_with_payload() {
     };
     let turn_size = turn.approx_size();
     assert!(turn_size >= 100);
-    let msg = DaemonMessage::TurnAppended {
+    let msg = DaemonMessage::Session {
         session_id: 1,
-        turn_id: 1,
-        turn: turn.clone(),
+        event: SessionEvent::TurnAppended {
+            turn_id: 1,
+            turn: turn.clone(),
+        },
     };
     assert!(msg.approx_wire_size() >= turn_size);
     // A second copy of the same turn must not change the estimate.
-    let msg2 = DaemonMessage::TurnAppended {
+    let msg2 = DaemonMessage::Session {
         session_id: 1,
-        turn_id: 1,
-        turn,
+        event: SessionEvent::TurnAppended { turn_id: 1, turn },
     };
     assert_eq!(msg.approx_wire_size(), msg2.approx_wire_size());
 }

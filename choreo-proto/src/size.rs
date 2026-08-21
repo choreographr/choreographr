@@ -19,7 +19,8 @@
 //! any under-estimate, so a drift surfaces as a test failure.
 
 use crate::{
-    DaemonMessage, OutputStream, ReasoningArtifact, ReasoningCapability, SessionStatus, Turn,
+    DaemonMessage, OutputStream, ReasoningArtifact, ReasoningCapability, SessionEvent,
+    SessionStatus, Turn,
 };
 
 impl Turn {
@@ -151,6 +152,141 @@ fn reasoning_capability_size(cap: &ReasoningCapability) -> usize {
             .sum::<usize>()
 }
 
+/// Byte length of a session-scoped [`SessionEvent`]'s serialized payload.
+///
+/// Mirrors the pre-split `DaemonMessage::approx_wire_size` arms for the 29
+/// session-scoped variants, minus the `session_id` field that now lives on
+/// the [`DaemonMessage::Session`] envelope (the envelope's own 2-field
+/// overhead is added by the `Session` arm). Same accounting style: per-field
+/// named-mode key overhead via [`named_field_overhead`], variable-size
+/// strings/byte buffers/vecs/turn maps summed, fixed-size scalars (u32/u64
+/// ids, token counts, status enums without payload) ignored, and the generous
+/// fixed [`OVERHEAD`] for fieldless variants.
+fn session_event_size(event: &SessionEvent) -> usize {
+    const OVERHEAD: usize = 96;
+    match event {
+        SessionEvent::SessionCreated {
+            title,
+            working_dir,
+            account_name,
+            selected_model,
+            reasoning_effort,
+            ..
+        } => {
+            named_field_overhead(6)
+                + option_str_len(title)
+                + option_str_len(working_dir)
+                + option_str_len(account_name)
+                + option_str_len(selected_model)
+                + option_str_len(reasoning_effort)
+        }
+        SessionEvent::SessionAttached | SessionEvent::SessionDeleted => OVERHEAD,
+        SessionEvent::SessionState {
+            title,
+            selected_model,
+            working_dir,
+            turns,
+            active_tool_groups,
+            reasoning_effort,
+            status,
+            reasoning_capability,
+            ..
+        } => {
+            named_field_overhead(12)
+                + option_str_len(title)
+                + option_str_len(selected_model)
+                + option_str_len(working_dir)
+                + option_str_len(reasoning_effort)
+                + active_tool_groups.iter().map(String::len).sum::<usize>()
+                + turns
+                    .iter()
+                    .map(|(id, turn)| 8 + *id as usize + turn.approx_size())
+                    .sum::<usize>()
+                + session_status_size(status)
+                + reasoning_capability
+                    .as_ref()
+                    .map_or(0, reasoning_capability_size)
+        }
+        SessionEvent::TurnAppended { turn, .. } => named_field_overhead(2) + turn.approx_size(),
+        SessionEvent::SessionStatusChanged { status, .. } => {
+            named_field_overhead(2) + session_status_size(status)
+        }
+        SessionEvent::SessionFailed { operation, error } => {
+            named_field_overhead(2) + operation.len() + error.len()
+        }
+        SessionEvent::Started { .. } => named_field_overhead(3),
+        SessionEvent::ToolCallStarted {
+            call_id,
+            tool_name,
+            arguments_json,
+            invocation_description,
+            ..
+        } => {
+            named_field_overhead(5)
+                + call_id.len()
+                + tool_name.len()
+                + arguments_json.len()
+                + invocation_description.len()
+        }
+        SessionEvent::ToolCallFinished {
+            call_id, tool_name, ..
+        } => named_field_overhead(3) + call_id.len() + tool_name.len(),
+        SessionEvent::ToolResultChunk { call_id, data, .. } => {
+            named_field_overhead(3) + call_id.len() + data.len()
+        }
+        SessionEvent::ToolCallFailed {
+            call_id,
+            tool_name,
+            error,
+            ..
+        } => named_field_overhead(4) + call_id.len() + tool_name.len() + error.len(),
+        SessionEvent::TokenUsageUpdate { .. } => named_field_overhead(2),
+        SessionEvent::LiveOutputTokenCount { .. } => named_field_overhead(2),
+        SessionEvent::OutputChunk { stream, data, .. } => {
+            let stream_len = match stream {
+                OutputStream::Answer | OutputStream::Reasoning => 4,
+            };
+            named_field_overhead(3) + stream_len + data.len()
+        }
+        SessionEvent::Done { .. } => named_field_overhead(3),
+        SessionEvent::Failed { error, .. } => named_field_overhead(2) + error.len(),
+        SessionEvent::Cancelled { .. } => named_field_overhead(1),
+        SessionEvent::ModelSelected {
+            model,
+            reasoning_capability,
+            ..
+        } => {
+            named_field_overhead(2)
+                + model.len()
+                + reasoning_capability
+                    .as_ref()
+                    .map_or(0, reasoning_capability_size)
+        }
+        SessionEvent::ModelSelectionFailed { model, error, .. } => {
+            named_field_overhead(2) + model.len() + error.len()
+        }
+        SessionEvent::SessionDeleteFailed { error } => named_field_overhead(1) + error.len(),
+        SessionEvent::TurnsUndone { turn_ids } => named_field_overhead(1) + turn_ids.len() * 4,
+        SessionEvent::TurnsRedone { turns } => {
+            named_field_overhead(1)
+                + turns
+                    .iter()
+                    .map(|(id, turn)| 8 + *id as usize + turn.approx_size())
+                    .sum::<usize>()
+        }
+        SessionEvent::SessionAccountSet { account } => named_field_overhead(1) + account.len(),
+        SessionEvent::ContextWindowResolved { .. } => named_field_overhead(1),
+        SessionEvent::SessionWorkingDirSet { path } => {
+            named_field_overhead(1) + option_str_len(path)
+        }
+        SessionEvent::SessionTitleSet { title } => named_field_overhead(1) + title.len(),
+        SessionEvent::ReasoningEffortSet { effort } => named_field_overhead(1) + effort.len(),
+        SessionEvent::ReasoningEffortSetFailed { effort, error } => {
+            named_field_overhead(2) + effort.len() + error.len()
+        }
+    }
+}
+
 impl DaemonMessage {
     /// Cheap, conservative estimate of this message's serialized byte size.
     ///
@@ -174,21 +310,11 @@ impl DaemonMessage {
         // overhead from `named_field_overhead` instead.
         const OVERHEAD: usize = 96;
         match self {
-            Self::SessionCreated {
-                title,
-                working_dir,
-                account_name,
-                selected_model,
-                reasoning_effort,
-                ..
-            } => {
-                named_field_overhead(6)
-                    + option_str_len(title)
-                    + option_str_len(working_dir)
-                    + option_str_len(account_name)
-                    + option_str_len(selected_model)
-                    + option_str_len(reasoning_effort)
-            }
+            // Session-scoped events ride the `Session` envelope: fixed
+            // 2-field envelope overhead (variant tag + map header + the
+            // `session_id`/`event` field keys; `session_id` is a fixed-size
+            // scalar) plus the inner event's own per-field estimate.
+            Self::Session { event, .. } => named_field_overhead(2) + session_event_size(event),
             Self::Sessions { sessions } => {
                 named_field_overhead(1)
                     + sessions
@@ -208,77 +334,6 @@ impl DaemonMessage {
                         })
                         .sum::<usize>()
             }
-            Self::SessionAttached { .. } => named_field_overhead(1),
-            Self::SessionState {
-                title,
-                selected_model,
-                working_dir,
-                turns,
-                active_tool_groups,
-                reasoning_effort,
-                status,
-                reasoning_capability,
-                ..
-            } => {
-                named_field_overhead(13)
-                    + option_str_len(title)
-                    + option_str_len(selected_model)
-                    + option_str_len(working_dir)
-                    + option_str_len(reasoning_effort)
-                    + active_tool_groups.iter().map(String::len).sum::<usize>()
-                    + turns
-                        .iter()
-                        .map(|(id, turn)| 8 + *id as usize + turn.approx_size())
-                        .sum::<usize>()
-                    + session_status_size(status)
-                    + reasoning_capability
-                        .as_ref()
-                        .map_or(0, reasoning_capability_size)
-            }
-            Self::TurnAppended { turn, .. } => named_field_overhead(3) + turn.approx_size(),
-            Self::SessionStatusChanged { status, .. } => {
-                named_field_overhead(3) + session_status_size(status)
-            }
-            Self::SessionFailed {
-                operation, error, ..
-            } => named_field_overhead(3) + operation.len() + error.len(),
-            Self::Started { .. } => named_field_overhead(4),
-            Self::ToolCallStarted {
-                call_id,
-                tool_name,
-                arguments_json,
-                invocation_description,
-                ..
-            } => {
-                named_field_overhead(6)
-                    + call_id.len()
-                    + tool_name.len()
-                    + arguments_json.len()
-                    + invocation_description.len()
-            }
-            Self::ToolCallFinished {
-                call_id, tool_name, ..
-            } => named_field_overhead(4) + call_id.len() + tool_name.len(),
-            Self::ToolResultChunk { call_id, data, .. } => {
-                named_field_overhead(4) + call_id.len() + data.len()
-            }
-            Self::ToolCallFailed {
-                call_id,
-                tool_name,
-                error,
-                ..
-            } => named_field_overhead(5) + call_id.len() + tool_name.len() + error.len(),
-            Self::TokenUsageUpdate { .. } => named_field_overhead(4),
-            Self::LiveOutputTokenCount { .. } => named_field_overhead(3),
-            Self::OutputChunk { stream, data, .. } => {
-                let stream_len = match stream {
-                    OutputStream::Answer | OutputStream::Reasoning => 4,
-                };
-                named_field_overhead(4) + stream_len + data.len()
-            }
-            Self::Done { .. } => named_field_overhead(4),
-            Self::Failed { error, .. } => named_field_overhead(3) + error.len(),
-            Self::Cancelled { .. } => named_field_overhead(2),
             Self::Pong => OVERHEAD,
             Self::Models {
                 models,
@@ -289,31 +344,6 @@ impl DaemonMessage {
                     + option_str_len(selected_model)
             }
             Self::ModelsFailed { error } => named_field_overhead(1) + error.len(),
-            // providers/models are usize COUNTS (fixed-size scalars), covered
-            // by the per-field allowance.
-            Self::ModelsRefreshed { .. } => named_field_overhead(3),
-            Self::ModelsRefreshFailed { error } => named_field_overhead(1) + error.len(),
-            Self::CatalogUpdated { providers } => {
-                named_field_overhead(1)
-                    + providers
-                        .iter()
-                        .map(|p| 32 + p.slug.len() + p.display_name.len())
-                        .sum::<usize>()
-            }
-            Self::ModelSelected {
-                model,
-                reasoning_capability,
-                ..
-            } => {
-                named_field_overhead(2)
-                    + model.len()
-                    + reasoning_capability
-                        .as_ref()
-                        .map_or(0, reasoning_capability_size)
-            }
-            Self::ModelSelectionFailed { model, error, .. } => {
-                named_field_overhead(3) + model.len() + error.len()
-            }
             Self::Unlocked | Self::Locked | Self::ShuttingDown | Self::Evicted => OVERHEAD,
             Self::LockedError { error } => named_field_overhead(1) + error.len(),
             Self::CredentialAdded { service } => named_field_overhead(1) + service.len(),
@@ -323,16 +353,6 @@ impl DaemonMessage {
             Self::CredentialRemoved { service } => named_field_overhead(1) + service.len(),
             Self::CredentialRemoveFailed { service, error } => {
                 named_field_overhead(2) + service.len() + error.len()
-            }
-            Self::SessionDeleted { .. } => named_field_overhead(1),
-            Self::SessionDeleteFailed { error, .. } => named_field_overhead(2) + error.len(),
-            Self::TurnsUndone { turn_ids, .. } => named_field_overhead(2) + turn_ids.len() * 4,
-            Self::TurnsRedone { turns, .. } => {
-                named_field_overhead(2)
-                    + turns
-                        .iter()
-                        .map(|(id, turn)| 8 + *id as usize + turn.approx_size())
-                        .sum::<usize>()
             }
             Self::Credential { service, key } => {
                 named_field_overhead(2) + service.len() + option_str_len(key)
@@ -353,15 +373,16 @@ impl DaemonMessage {
                         .sum::<usize>()
             }
             Self::AccountListFailed { error } => named_field_overhead(1) + error.len(),
-            Self::SessionAccountSet { account, .. } => named_field_overhead(2) + account.len(),
-            Self::ContextWindowResolved { .. } => named_field_overhead(2),
-            Self::SessionWorkingDirSet { path, .. } => {
-                named_field_overhead(2) + option_str_len(path)
-            }
-            Self::SessionTitleSet { title, .. } => named_field_overhead(2) + title.len(),
-            Self::ReasoningEffortSet { effort, .. } => named_field_overhead(2) + effort.len(),
-            Self::ReasoningEffortSetFailed { effort, error, .. } => {
-                named_field_overhead(3) + effort.len() + error.len()
+            // providers/models are usize COUNTS (fixed-size scalars), covered
+            // by the per-field allowance.
+            Self::ModelsRefreshed { .. } => named_field_overhead(3),
+            Self::ModelsRefreshFailed { error } => named_field_overhead(1) + error.len(),
+            Self::CatalogUpdated { providers } => {
+                named_field_overhead(1)
+                    + providers
+                        .iter()
+                        .map(|p| 32 + p.slug.len() + p.display_name.len())
+                        .sum::<usize>()
             }
         }
     }

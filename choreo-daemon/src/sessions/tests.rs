@@ -175,7 +175,11 @@ fn session_state_message_strips_artifacts_from_turns() {
         },
     );
 
-    let DaemonMessage::SessionState { turns, .. } = state.session_state_message(7) else {
+    let DaemonMessage::Session {
+        event: SessionEvent::SessionState { turns, .. },
+        ..
+    } = state.session_state_message(7)
+    else {
         panic!("expected SessionState message");
     };
     let client_turn = turns.get(&tid).expect("turn present in message");
@@ -322,11 +326,13 @@ fn broadcast_delivers_message_to_all_subscribers() {
 
     let mut shutdown = false;
     process_command(
-        SessionCommand::Broadcast(DaemonMessage::Done {
+        SessionCommand::Broadcast(DaemonMessage::Session {
             session_id: ctx.session_id,
-            request_id: 5,
-            token_usage: None,
-            last_prompt_tokens: None,
+            event: SessionEvent::Done {
+                request_id: 5,
+                token_usage: None,
+                last_prompt_tokens: None,
+            },
         }),
         &mut state,
         &mut shutdown,
@@ -335,20 +341,24 @@ fn broadcast_delivers_message_to_all_subscribers() {
 
     assert_eq!(
         rx1.recv().unwrap(),
-        DaemonMessage::Done {
+        DaemonMessage::Session {
             session_id: ctx.session_id,
-            request_id: 5,
-            token_usage: None,
-            last_prompt_tokens: None,
+            event: SessionEvent::Done {
+                request_id: 5,
+                token_usage: None,
+                last_prompt_tokens: None,
+            },
         }
     );
     assert_eq!(
         rx2.recv().unwrap(),
-        DaemonMessage::Done {
+        DaemonMessage::Session {
             session_id: ctx.session_id,
-            request_id: 5,
-            token_usage: None,
-            last_prompt_tokens: None,
+            event: SessionEvent::Done {
+                request_id: 5,
+                token_usage: None,
+                last_prompt_tokens: None,
+            },
         }
     );
     assert!(!shutdown);
@@ -359,11 +369,13 @@ fn broadcast_with_no_subscribers_does_not_panic() {
     let (mut state, ctx) = broadcast_setup();
     let mut shutdown = false;
     process_command(
-        SessionCommand::Broadcast(DaemonMessage::Done {
+        SessionCommand::Broadcast(DaemonMessage::Session {
             session_id: ctx.session_id,
-            request_id: 0,
-            token_usage: None,
-            last_prompt_tokens: None,
+            event: SessionEvent::Done {
+                request_id: 0,
+                token_usage: None,
+                last_prompt_tokens: None,
+            },
         }),
         &mut state,
         &mut shutdown,
@@ -404,10 +416,12 @@ fn broadcast_enqueues_losslessly_and_signals_eviction() {
     state.subscribers.insert(10, tx);
 
     // A message large enough to cross the tiny per-client cap.
-    let broadcast = DaemonMessage::Failed {
+    let broadcast = DaemonMessage::Session {
         session_id: ctx.session_id,
-        request_id: 5,
-        error: "x".repeat(100),
+        event: SessionEvent::Failed {
+            request_id: 5,
+            error: "x".repeat(100),
+        },
     };
     let mut shutdown = false;
     process_command(
@@ -457,7 +471,10 @@ fn set_working_dir_updates_config_and_broadcasts() {
     assert!(!shutdown);
     // Subscribers should receive the SessionWorkingDirSet broadcast.
     match rx.recv().unwrap() {
-        DaemonMessage::SessionWorkingDirSet { session_id, path } => {
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionWorkingDirSet { path },
+        } => {
             assert_eq!(session_id, ctx.session_id);
             assert_eq!(path.as_deref(), Some("/tmp/new-wd"));
         }
@@ -1004,7 +1021,10 @@ fn accumulated_usage_in_attach_snapshot() {
 
     let msg = sub_rx.recv().unwrap();
     match msg {
-        DaemonMessage::SessionState { token_usage, .. } => {
+        DaemonMessage::Session {
+            event: SessionEvent::SessionState { token_usage, .. },
+            ..
+        } => {
             let usage = token_usage.expect("token_usage in SessionState");
             assert_eq!(usage.input_tokens, 30);
             assert_eq!(usage.output_tokens, 15);
@@ -1064,10 +1084,13 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
     // ...and the update is broadcast from the authoritative state.
     let msg = sub_rx.recv().unwrap();
     match msg {
-        DaemonMessage::TokenUsageUpdate {
+        DaemonMessage::Session {
             session_id,
-            token_usage,
-            last_prompt_tokens,
+            event:
+                SessionEvent::TokenUsageUpdate {
+                    token_usage,
+                    last_prompt_tokens,
+                },
         } => {
             assert_eq!(session_id, ctx.session_id);
             assert_eq!(token_usage, synced);
@@ -1133,7 +1156,10 @@ fn attach_snapshot_carries_mid_turn_accumulated_usage() {
 
     let msg = sub_rx.recv().unwrap();
     match msg {
-        DaemonMessage::SessionState { token_usage, .. } => {
+        DaemonMessage::Session {
+            event: SessionEvent::SessionState { token_usage, .. },
+            ..
+        } => {
             let usage = token_usage.expect("token_usage in SessionState");
             assert_eq!(usage.input_tokens, 30);
             assert_eq!(usage.output_tokens, 15);
@@ -1236,27 +1262,36 @@ fn attach_with_active_requests_sends_started_to_new_subscriber() {
 
     // Expect Start messages for each active request, in insertion order.
     match sub_rx.recv().unwrap() {
-        DaemonMessage::Started {
+        DaemonMessage::Session {
             session_id: 1,
-            request_id: 10,
-            turn_id: 3,
-            estimated_prompt_tokens: 0,
+            event:
+                SessionEvent::Started {
+                    request_id: 10,
+                    turn_id: 3,
+                    estimated_prompt_tokens: 0,
+                },
         } => {}
         other => panic!("expected Started(10, turn=3), got {other:?}"),
     }
     match sub_rx.recv().unwrap() {
-        DaemonMessage::Started {
+        DaemonMessage::Session {
             session_id: 1,
-            request_id: 20,
-            turn_id: 7,
-            estimated_prompt_tokens: 0,
+            event:
+                SessionEvent::Started {
+                    request_id: 20,
+                    turn_id: 7,
+                    estimated_prompt_tokens: 0,
+                },
         } => {}
         other => panic!("expected Started(20, turn=7), got {other:?}"),
     }
 
     // Followed by SessionState.
     match sub_rx.recv().unwrap() {
-        DaemonMessage::SessionState { .. } => {}
+        DaemonMessage::Session {
+            event: SessionEvent::SessionState { .. },
+            ..
+        } => {}
         other => panic!("expected SessionState, got {other:?}"),
     }
 
@@ -1282,7 +1317,10 @@ fn attach_without_active_requests_does_not_send_started() {
 
     // Only SessionState — no Started messages.
     match sub_rx.recv().unwrap() {
-        DaemonMessage::SessionState { .. } => {}
+        DaemonMessage::Session {
+            event: SessionEvent::SessionState { .. },
+            ..
+        } => {}
         other => panic!("expected SessionState, got {other:?}"),
     }
 

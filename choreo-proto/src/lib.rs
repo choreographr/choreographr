@@ -13,7 +13,8 @@ pub use types::{
     AccountInfo, AssistantToolCallRecord, CatalogProvider, ChatReasoningField, ClientMessage,
     ContextConfig, DaemonMessage, DiscardedToolCall, DisplayedImageRecord, ImageMetadata,
     InferenceError, OutputStream, ReasoningArtifact, ReasoningCapability, ReasoningProducer,
-    RefreshStatus, SessionStatus, SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn,
+    RefreshStatus, SessionEvent, SessionStatus, SessionSummary, TimestampMs, TokenUsage,
+    ToolResultRecord, Turn,
 };
 
 #[cfg(test)]

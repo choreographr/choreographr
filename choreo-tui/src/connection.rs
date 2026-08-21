@@ -12,7 +12,7 @@ use choreo_client_core::{
     run_daemon_connection_with_mode, shell_command_echo,
 };
 use choreo_keystore::ensure_keypair;
-use choreo_proto::{ClientMessage, DaemonMessage, RefreshStatus};
+use choreo_proto::{ClientMessage, DaemonMessage, RefreshStatus, SessionEvent};
 use crossbeam::channel;
 use crossbeam::select;
 use crossterm::event::{
@@ -2178,12 +2178,16 @@ pub(crate) fn handle_daemon_message(
     // dispatch in choreo_client_core handle the rest (text notifications,
     // stream appends, image assembly, etc.).
     match &message {
-        DaemonMessage::SessionCreated {
+        DaemonMessage::Session {
             session_id,
-            parent_session_id,
-            account_name,
-            selected_model,
-            reasoning_effort,
+            event:
+                SessionEvent::SessionCreated {
+                    parent_session_id,
+                    account_name,
+                    selected_model,
+                    reasoning_effort,
+                    ..
+                },
             ..
         } => {
             // Already known — nothing to do, and skip the generic dispatch too.
@@ -2208,13 +2212,21 @@ pub(crate) fn handle_daemon_message(
             // on the Session Manager page).
             return Ok(());
         }
-        DaemonMessage::SessionAttached { session_id } => {
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionAttached,
+            ..
+        } => {
             app.handle_session_attached(*session_id);
         }
-        DaemonMessage::SessionStatusChanged {
+        DaemonMessage::Session {
             session_id,
-            status,
-            last_modified,
+            event:
+                SessionEvent::SessionStatusChanged {
+                    status,
+                    last_modified,
+                },
+            ..
         } => {
             // Detect an attached sub-session finishing BEFORE the status is
             // applied: the finish check needs the pre-transition (active)
@@ -2237,14 +2249,25 @@ pub(crate) fn handle_daemon_message(
             // the summary output).
             return app.handle_sessions(sessions, client_tx);
         }
-        DaemonMessage::SessionDeleted { session_id } => {
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionDeleted,
+            ..
+        } => {
             app.handle_session_deleted(*session_id);
         }
-        DaemonMessage::SessionDeleteFailed { session_id, error } => {
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionDeleteFailed { error },
+            ..
+        } => {
             app.handle_session_delete_failed(*session_id, error);
         }
-        DaemonMessage::SessionFailed {
-            operation, error, ..
+        DaemonMessage::Session {
+            event: SessionEvent::SessionFailed {
+                operation, error, ..
+            },
+            ..
         } => {
             app.error = Some(format!("[daemon] {operation} failed: {error}"));
             // If we're on the Session Manager page, also show the error
@@ -2295,13 +2318,17 @@ pub(crate) fn handle_daemon_message(
             let _ = client_tx.send(ClientMessage::ListAccounts);
         }
 
-        DaemonMessage::SessionState {
+        DaemonMessage::Session {
             session_id,
-            token_usage,
-            context_window,
-            last_prompt_tokens,
-            working_dir,
-            status,
+            event:
+                SessionEvent::SessionState {
+                    token_usage,
+                    context_window,
+                    last_prompt_tokens,
+                    working_dir,
+                    status,
+                    ..
+                },
             ..
         } => {
             // Only update progress data when the message is for the
@@ -2344,10 +2371,14 @@ pub(crate) fn handle_daemon_message(
             }
             // Fall through to dispatch_daemon_message for message processing.
         }
-        DaemonMessage::Done {
+        DaemonMessage::Session {
             session_id,
-            token_usage,
-            last_prompt_tokens,
+            event:
+                SessionEvent::Done {
+                    token_usage,
+                    last_prompt_tokens,
+                    ..
+                },
             ..
         } => {
             // Progress-bar updates only apply to the currently-attached
@@ -2392,10 +2423,14 @@ pub(crate) fn handle_daemon_message(
             }
             // Fall through to dispatch_daemon_message.
         }
-        DaemonMessage::ModelSelected {
+        DaemonMessage::Session {
             session_id,
-            model,
-            reasoning_capability,
+            event:
+                SessionEvent::ModelSelected {
+                    model,
+                    reasoning_capability,
+                    ..
+                },
             ..
         } => {
             // Route the per-session display update to whichever session the
@@ -2423,10 +2458,9 @@ pub(crate) fn handle_daemon_message(
                 SessionUpdateRouting::FallThrough => {}
             }
         }
-        DaemonMessage::ModelSelectionFailed {
+        DaemonMessage::Session {
             session_id,
-            model,
-            error,
+            event: SessionEvent::ModelSelectionFailed { model, error, .. },
             ..
         } => {
             // The failure counterpart of ModelSelected above.  There is no
@@ -2455,8 +2489,10 @@ pub(crate) fn handle_daemon_message(
                 SessionUpdateRouting::FallThrough => {}
             }
         }
-        DaemonMessage::ReasoningEffortSet {
-            session_id, effort, ..
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::ReasoningEffortSet { effort, .. },
+            ..
         } => {
             // Route the per-session display update to whichever session the
             // message belongs to.  The daemon replies to bare `/reasoning`
@@ -2487,10 +2523,9 @@ pub(crate) fn handle_daemon_message(
                 SessionUpdateRouting::FallThrough => {}
             }
         }
-        DaemonMessage::ReasoningEffortSetFailed {
+        DaemonMessage::Session {
             session_id,
-            effort,
-            error,
+            event: SessionEvent::ReasoningEffortSetFailed { effort, error, .. },
             ..
         } => {
             // Reset only the session the rejection belongs to — a background
@@ -2527,9 +2562,9 @@ pub(crate) fn handle_daemon_message(
             tracing::warn!(%effort, %error, "reasoning effort rejected by daemon");
             app.status = Some(format!("reasoning effort rejected: {error}"));
         }
-        DaemonMessage::SessionAccountSet {
+        DaemonMessage::Session {
             session_id,
-            account,
+            event: SessionEvent::SessionAccountSet { account, .. },
             ..
         } => {
             // Route the per-session display update to whichever session the
@@ -2559,9 +2594,10 @@ pub(crate) fn handle_daemon_message(
                 SessionUpdateRouting::FallThrough => {}
             }
         }
-        DaemonMessage::ContextWindowResolved {
+        DaemonMessage::Session {
             session_id,
-            context_window,
+            event: SessionEvent::ContextWindowResolved { context_window },
+            ..
         } => {
             if app.attached_session_id == Some(*session_id)
                 && let Some(display) = app.active_display()
@@ -2569,16 +2605,24 @@ pub(crate) fn handle_daemon_message(
                 display.context_window = Some(*context_window);
             }
         }
-        DaemonMessage::SessionWorkingDirSet { session_id, path } => {
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionWorkingDirSet { path },
+            ..
+        } => {
             app.handle_session_working_dir_set(*session_id, path);
         }
-        DaemonMessage::SessionTitleSet { session_id, title } => {
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionTitleSet { title },
+            ..
+        } => {
             app.handle_session_title_set(*session_id, title);
         }
         // TokenUsageUpdate is dispatched through the generic handler below.
-        DaemonMessage::LiveOutputTokenCount {
+        DaemonMessage::Session {
             session_id,
-            output_tokens,
+            event: SessionEvent::LiveOutputTokenCount { output_tokens, .. },
             ..
         } => {
             // Route the live count to the session the message belongs to,

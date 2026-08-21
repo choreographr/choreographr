@@ -111,10 +111,12 @@ impl DaemonState {
             // below anyway, so a default timestamp is harmless.
             None => 0,
         };
-        let msg = DaemonMessage::SessionStatusChanged {
+        let msg = DaemonMessage::Session {
             session_id,
-            status,
-            last_modified,
+            event: SessionEvent::SessionStatusChanged {
+                status,
+                last_modified,
+            },
         };
         // A deleted session's still-shutting-down thread must not emit ghost
         // status events for a session the user removed; the index is empty

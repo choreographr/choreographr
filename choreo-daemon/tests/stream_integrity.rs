@@ -36,7 +36,7 @@ use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_daemon::broadcast::{LagLimits, SubscriberSink};
 use choreo_daemon::providers::InferenceProvider;
 use choreo_daemon::{RequestContext, SessionCommand, session_main};
-use choreo_proto::{ClientMessage, DaemonMessage, OutputStream, Turn};
+use choreo_proto::{ClientMessage, DaemonMessage, OutputStream, SessionEvent, Turn};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -196,18 +196,31 @@ fn collect_answer_until_done(rx: &crossbeam_channel::Receiver<DaemonMessage>) ->
     let mut final_turn = None;
     loop {
         match recv_msg(rx) {
-            DaemonMessage::OutputChunk {
-                stream: OutputStream::Answer,
-                data,
+            DaemonMessage::Session {
+                event:
+                    SessionEvent::OutputChunk {
+                        stream: OutputStream::Answer,
+                        data,
+                        ..
+                    },
                 ..
             } => bytes.extend_from_slice(&data),
-            DaemonMessage::OutputChunk { .. } => {
+            DaemonMessage::Session {
+                event: SessionEvent::OutputChunk { .. },
+                ..
+            } => {
                 // Reasoning deltas are not part of assistant_text; skip them.
             }
-            DaemonMessage::TurnAppended { turn, .. } if turn.assistant_text.is_some() => {
+            DaemonMessage::Session {
+                event: SessionEvent::TurnAppended { turn, .. },
+                ..
+            } if turn.assistant_text.is_some() => {
                 final_turn = Some(turn);
             }
-            DaemonMessage::Done { .. } => break,
+            DaemonMessage::Session {
+                event: SessionEvent::Done { .. },
+                ..
+            } => break,
             _ => {}
         }
     }
@@ -225,14 +238,23 @@ fn collect_tool_chunks_until_done(
     let mut tool_turn = None;
     loop {
         match recv_msg(rx) {
-            DaemonMessage::ToolResultChunk { call_id, data, .. } => {
+            DaemonMessage::Session {
+                event: SessionEvent::ToolResultChunk { call_id, data, .. },
+                ..
+            } => {
                 assert_eq!(call_id, "call_1", "only the scripted sh call streams");
                 bytes.extend_from_slice(&data);
             }
-            DaemonMessage::TurnAppended { turn, .. } if !turn.tool_results.is_empty() => {
+            DaemonMessage::Session {
+                event: SessionEvent::TurnAppended { turn, .. },
+                ..
+            } if !turn.tool_results.is_empty() => {
                 tool_turn = Some(turn);
             }
-            DaemonMessage::Done { .. } => break,
+            DaemonMessage::Session {
+                event: SessionEvent::Done { .. },
+                ..
+            } => break,
             _ => {}
         }
     }
@@ -441,17 +463,26 @@ fn evicts_client_that_stops_reading() {
         },
     );
     let session_id = match read_message::<_, DaemonMessage>(&mut stream) {
-        DaemonMessage::SessionCreated { session_id, .. } => session_id,
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionCreated { .. },
+        } => session_id,
         other => panic!("expected SessionCreated, got {other:?}"),
     };
 
     write_message(&mut stream, &ClientMessage::AttachSession { session_id });
     match read_message::<_, DaemonMessage>(&mut stream) {
-        DaemonMessage::SessionAttached { session_id: sid } => assert_eq!(sid, session_id),
+        DaemonMessage::Session {
+            session_id: sid,
+            event: SessionEvent::SessionAttached,
+        } => assert_eq!(sid, session_id),
         other => panic!("expected SessionAttached, got {other:?}"),
     }
     match read_message::<_, DaemonMessage>(&mut stream) {
-        DaemonMessage::SessionState { .. } => {}
+        DaemonMessage::Session {
+            event: SessionEvent::SessionState { .. },
+            ..
+        } => {}
         other => panic!("expected SessionState, got {other:?}"),
     }
 
@@ -472,21 +503,21 @@ fn evicts_client_that_stops_reading() {
             "timed out waiting for the stream to start"
         );
         match read_message::<_, DaemonMessage>(&mut stream) {
-            DaemonMessage::Started { .. } => {}
-            DaemonMessage::OutputChunk { .. } => chunks_seen += 1,
+            DaemonMessage::Session {
+                event: SessionEvent::Started { .. },
+                ..
+            } => {}
+            DaemonMessage::Session {
+                event: SessionEvent::OutputChunk { .. },
+                ..
+            } => chunks_seen += 1,
             DaemonMessage::Evicted => {
                 panic!("client was evicted before it deliberately stopped reading")
             }
             // The seed/status/token messages that precede the first answer
             // chunk are expected noise on the wire — only Started,
             // OutputChunk, and Evicted are load-bearing here.
-            DaemonMessage::TurnAppended { .. }
-            | DaemonMessage::SessionStatusChanged { .. }
-            | DaemonMessage::TokenUsageUpdate { .. }
-            | DaemonMessage::LiveOutputTokenCount { .. }
-            | DaemonMessage::ToolCallStarted { .. }
-            | DaemonMessage::ToolCallFinished { .. }
-            | DaemonMessage::ToolResultChunk { .. } => {}
+            DaemonMessage::Session { .. } => {}
             other => panic!("unexpected message while the stream started: {other:?}"),
         }
     }

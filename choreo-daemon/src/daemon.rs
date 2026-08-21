@@ -12,8 +12,8 @@ use choreo_ai_protocols::{
 };
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
-    AccountInfo, CatalogProvider, ContextConfig, DaemonMessage, RefreshStatus, SessionStatus,
-    SessionSummary, TimestampMs, TokenUsage,
+    AccountInfo, CatalogProvider, ContextConfig, DaemonMessage, RefreshStatus, SessionEvent,
+    SessionStatus, SessionSummary, TimestampMs, TokenUsage,
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -700,21 +700,25 @@ impl DaemonState {
 
         let _ = reply.send(Ok((sid, session_tx)));
         crate::metrics::record_session_created();
-        let created_msg = DaemonMessage::SessionCreated {
+        let created_msg = DaemonMessage::Session {
             session_id: sid,
-            title,
-            parent_session_id,
-            working_dir: cwd_str,
-            account_name,
-            selected_model: selected_model_clone,
-            reasoning_effort: reasoning_effort_clone,
+            event: SessionEvent::SessionCreated {
+                title,
+                parent_session_id,
+                working_dir: cwd_str,
+                account_name,
+                selected_model: selected_model_clone,
+                reasoning_effort: reasoning_effort_clone,
+            },
         };
-        let status_msg = DaemonMessage::SessionStatusChanged {
+        let status_msg = DaemonMessage::Session {
             session_id: sid,
-            status: SessionStatus::Inactive,
-            // Copy the creation timestamp before `record` is moved into
-            // spawn_session above.
-            last_modified: created_at,
+            event: SessionEvent::SessionStatusChanged {
+                status: SessionStatus::Inactive,
+                // Copy the creation timestamp before `record` is moved into
+                // spawn_session above.
+                last_modified: created_at,
+            },
         };
         self.broadcast(created_msg);
         self.broadcast(status_msg);
@@ -885,10 +889,12 @@ impl DaemonState {
         // shutting-down thread must not emit a ghost "sleeping" status for a
         // session the user removed.
         if self.session_metadata.contains_key(&session_id) {
-            let msg = DaemonMessage::SessionStatusChanged {
+            let msg = DaemonMessage::Session {
                 session_id,
-                status: SessionStatus::Sleeping,
-                last_modified,
+                event: SessionEvent::SessionStatusChanged {
+                    status: SessionStatus::Sleeping,
+                    last_modified,
+                },
             };
             self.broadcast(msg);
         }
@@ -1469,7 +1475,10 @@ impl DaemonState {
             warn!(session_id, error = %e, "failed to clear stale session-deletion tombstone");
         }
         self.session_metadata.remove(&session_id);
-        self.broadcast(DaemonMessage::SessionDeleted { session_id });
+        self.broadcast(DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionDeleted,
+        });
         Ok(())
     }
 
@@ -1549,7 +1558,10 @@ impl DaemonState {
         // unattachable (deleted marker), even while its record is still being
         // cleaned up in the background.
         self.session_metadata.remove(&session_id);
-        self.broadcast(DaemonMessage::SessionDeleted { session_id });
+        self.broadcast(DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionDeleted,
+        });
         Ok(())
     }
 

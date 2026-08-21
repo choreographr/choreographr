@@ -137,7 +137,7 @@ impl std::fmt::Display for DiscardedToolCall {
 /// Unified error type for all inference providers.
 /// NOTE: does NOT derive Serialize/Deserialize — this error type is never
 /// sent over the wire.  Provider errors are stringified before being placed
-/// into protocol messages (e.g. `DaemonMessage::Failed { error }`).
+/// into protocol messages (e.g. `SessionEvent::Failed { error }`).
 #[derive(Debug, thiserror::Error)]
 pub enum InferenceError {
     #[error("unauthorized ({status}): {detail}")]
@@ -501,11 +501,19 @@ pub struct CatalogProvider {
     pub display_name: String,
 }
 
+/// Session-scoped events produced by the daemon for a specific session.
+///
+/// These 29 events used to be `DaemonMessage` variants that each carried
+/// their own `session_id` field. They now live inside
+/// [`DaemonMessage::Session`], whose envelope hoists the `session_id` so
+/// every event has an origin session **by construction** — it can never be
+/// forgotten, mismatched, or duplicated. Consumers that dispatch on session
+/// events match the envelope's `session_id` once and then handle the inner
+/// event; the wire format nests the event inside the envelope, so the origin
+/// is always present on the wire too.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum DaemonMessage {
+pub enum SessionEvent {
     SessionCreated {
-        session_id: u64,
         title: Option<String>,
         parent_session_id: Option<u64>,
         working_dir: Option<String>,
@@ -513,14 +521,8 @@ pub enum DaemonMessage {
         selected_model: Option<String>,
         reasoning_effort: Option<String>,
     },
-    Sessions {
-        sessions: Vec<SessionSummary>,
-    },
-    SessionAttached {
-        session_id: u64,
-    },
+    SessionAttached,
     SessionState {
-        session_id: u64,
         title: Option<String>,
         selected_model: Option<String>,
         parent_session_id: Option<u64>,
@@ -546,12 +548,10 @@ pub enum DaemonMessage {
         reasoning_capability: Option<ReasoningCapability>,
     },
     TurnAppended {
-        session_id: u64,
         turn_id: u32,
         turn: Turn,
     },
     SessionStatusChanged {
-        session_id: u64,
         status: SessionStatus,
         /// Unix-epoch-milliseconds timestamp of this status change, so the
         /// TUI can re-sort the sessions list (most recently modified first)
@@ -559,18 +559,15 @@ pub enum DaemonMessage {
         last_modified: i64,
     },
     SessionFailed {
-        session_id: u64,
         operation: String,
         error: String,
     },
     Started {
-        session_id: u64,
         request_id: u32,
         turn_id: u32,
         estimated_prompt_tokens: u32,
     },
     ToolCallStarted {
-        session_id: u64,
         request_id: u32,
         call_id: String,
         tool_name: String,
@@ -582,44 +579,37 @@ pub enum DaemonMessage {
         invocation_description: String,
     },
     ToolCallFinished {
-        session_id: u64,
         request_id: u32,
         call_id: String,
         tool_name: String,
     },
     ToolResultChunk {
-        session_id: u64,
         request_id: u32,
         call_id: String,
         data: Vec<u8>,
     },
     ToolCallFailed {
-        session_id: u64,
         request_id: u32,
         call_id: String,
         tool_name: String,
         error: String,
     },
     TokenUsageUpdate {
-        session_id: u64,
         token_usage: TokenUsage,
         last_prompt_tokens: Option<u32>,
     },
     /// Cumulative output-token estimate for the current turn, updated as
     /// each stream chunk arrives.  Used by the TUI for live token display.
     LiveOutputTokenCount {
-        session_id: u64,
         request_id: u32,
         output_tokens: u32,
     },
     OutputChunk {
-        session_id: u64,
         request_id: u32,
         stream: OutputStream,
         data: Vec<u8>,
     },
     Done {
-        session_id: u64,
         request_id: u32,
         /// Token usage for the completed request, if reported by the provider.
         token_usage: Option<TokenUsage>,
@@ -629,13 +619,87 @@ pub enum DaemonMessage {
         last_prompt_tokens: Option<u32>,
     },
     Failed {
-        session_id: u64,
         request_id: u32,
         error: String,
     },
     Cancelled {
-        session_id: u64,
         request_id: u32,
+    },
+    ModelSelected {
+        model: String,
+        #[serde(default)]
+        reasoning_capability: Option<ReasoningCapability>,
+    },
+    ModelSelectionFailed {
+        model: String,
+        error: String,
+    },
+    SessionDeleted,
+    SessionDeleteFailed {
+        error: String,
+    },
+    TurnsUndone {
+        turn_ids: Vec<u32>,
+    },
+    TurnsRedone {
+        turns: BTreeMap<u32, Turn>,
+    },
+    SessionAccountSet {
+        account: String,
+    },
+    ContextWindowResolved {
+        context_window: u32,
+    },
+    SessionWorkingDirSet {
+        path: Option<String>,
+    },
+    SessionTitleSet {
+        title: String,
+    },
+    ReasoningEffortSet {
+        effort: String,
+    },
+    ReasoningEffortSetFailed {
+        effort: String,
+        error: String,
+    },
+}
+
+/// Messages sent from the daemon to a client.
+///
+/// Split into two families:
+/// - [`DaemonMessage::Session`] carries a session-scoped [`SessionEvent`]
+///   wrapped in an envelope that supplies the origin `session_id` by
+///   construction. These events are delivered to per-session subscribers and
+///   the all-activity fan, and the all-activity dedup is keyed on the
+///   envelope's origin session.
+/// - The remaining flat variants are connection/reply/global messages
+///   (`Sessions`, `Pong`, `Models`, keystore and account replies,
+///   `ShuttingDown`, …) that have no session scope and stay flat.
+//
+// `Session` holds a `SessionEvent` by value per the agreed split design (the
+// envelope hoists `session_id`, and the event must arrive flat on the wire, not
+// behind indirection). Boxing it would shrink `DaemonMessage` past the
+// `large_enum_variant` threshold but would also change the documented public
+// shape every producer/consumer migrated to. The lint is the accepted cost of
+// the honest envelope, so it stays allowed. (No `#[non_exhaustive]`: the
+// variant set IS the wire contract — a new variant is a protocol bump, v5, the
+// same as removing one — and without the attribute every consumer match must
+// enumerate the whole set, so the compiler points at every site that needs
+// revisiting when that happens.)
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DaemonMessage {
+    /// Single home for all session-scoped events: the `session_id` that used
+    /// to ride on each of the 29 moved variants is hoisted onto this
+    /// envelope, so every inner [`SessionEvent`] has an origin session **by
+    /// construction**.
+    Session {
+        session_id: u64,
+        event: SessionEvent,
+    },
+    Sessions {
+        sessions: Vec<SessionSummary>,
     },
     Pong,
     Models {
@@ -643,34 +707,6 @@ pub enum DaemonMessage {
         selected_model: Option<String>,
     },
     ModelsFailed {
-        error: String,
-    },
-    /// Reply to `ClientMessage::RefreshModels`. `status` distinguishes
-    /// "nothing changed" (304) from a real swap (200), and a forced swap.
-    ModelsRefreshed {
-        providers: usize,
-        models: usize,
-        status: RefreshStatus,
-    },
-    /// Reply to `ClientMessage::RefreshModels` when the fetch/merge failed.
-    ModelsRefreshFailed {
-        error: String,
-    },
-    /// Broadcast whenever the daemon swaps the provider catalog (startup
-    /// refresh, user-overlay reload, `/refresh-models`). Carries the full
-    /// provider list so clients can replace their static default picker.
-    CatalogUpdated {
-        providers: Vec<CatalogProvider>,
-    },
-    ModelSelected {
-        session_id: u64,
-        model: String,
-        #[serde(default)]
-        reasoning_capability: Option<ReasoningCapability>,
-    },
-    ModelSelectionFailed {
-        session_id: u64,
-        model: String,
         error: String,
     },
     Unlocked,
@@ -691,21 +727,6 @@ pub enum DaemonMessage {
     CredentialRemoveFailed {
         service: String,
         error: String,
-    },
-    SessionDeleted {
-        session_id: u64,
-    },
-    SessionDeleteFailed {
-        session_id: u64,
-        error: String,
-    },
-    TurnsUndone {
-        session_id: u64,
-        turn_ids: Vec<u32>,
-    },
-    TurnsRedone {
-        session_id: u64,
-        turns: BTreeMap<u32, Turn>,
     },
     Credential {
         service: String,
@@ -731,30 +752,22 @@ pub enum DaemonMessage {
     AccountListFailed {
         error: String,
     },
-    SessionAccountSet {
-        session_id: u64,
-        account: String,
+    /// Reply to `ClientMessage::RefreshModels`. `status` distinguishes
+    /// "nothing changed" (304) from a real swap (200), and a forced swap.
+    ModelsRefreshed {
+        providers: usize,
+        models: usize,
+        status: RefreshStatus,
     },
-    ContextWindowResolved {
-        session_id: u64,
-        context_window: u32,
-    },
-    SessionWorkingDirSet {
-        session_id: u64,
-        path: Option<String>,
-    },
-    SessionTitleSet {
-        session_id: u64,
-        title: String,
-    },
-    ReasoningEffortSet {
-        session_id: u64,
-        effort: String,
-    },
-    ReasoningEffortSetFailed {
-        session_id: u64,
-        effort: String,
+    /// Reply to `ClientMessage::RefreshModels` when the fetch/merge failed.
+    ModelsRefreshFailed {
         error: String,
+    },
+    /// Broadcast whenever the daemon swaps the provider catalog (startup
+    /// refresh, user-overlay reload, `/refresh-models`). Carries the full
+    /// provider list so clients can replace their static default picker.
+    CatalogUpdated {
+        providers: Vec<CatalogProvider>,
     },
     ShuttingDown,
     /// Best-effort advisory, sent by the daemon immediately before it
@@ -1092,14 +1105,16 @@ mod tests {
         let samples: Vec<(&str, DaemonMessage)> = vec![
             (
                 "SessionCreated",
-                DaemonMessage::SessionCreated {
+                DaemonMessage::Session {
                     session_id: 1,
-                    title: Some("t".into()),
-                    parent_session_id: Some(2),
-                    working_dir: Some("/tmp".into()),
-                    account_name: Some("default".into()),
-                    selected_model: Some("gpt-5.6".into()),
-                    reasoning_effort: Some("high".into()),
+                    event: SessionEvent::SessionCreated {
+                        title: Some("t".into()),
+                        parent_session_id: Some(2),
+                        working_dir: Some("/tmp".into()),
+                        account_name: Some("default".into()),
+                        selected_model: Some("gpt-5.6".into()),
+                        reasoning_effort: Some("high".into()),
+                    },
                 },
             ),
             (
@@ -1110,175 +1125,208 @@ mod tests {
             ),
             (
                 "SessionAttached",
-                DaemonMessage::SessionAttached { session_id: 1 },
+                DaemonMessage::Session {
+                    session_id: 1,
+                    event: SessionEvent::SessionAttached,
+                },
             ),
             (
                 "SessionState",
-                DaemonMessage::SessionState {
+                DaemonMessage::Session {
                     session_id: 1,
-                    title: Some("t".into()),
-                    selected_model: Some("gpt-5.6".into()),
-                    parent_session_id: Some(2),
-                    working_dir: Some("/tmp".into()),
-                    turns: std::collections::BTreeMap::from([
-                        (1, dense_turn.clone()),
-                        (2, one_turn.clone()),
-                    ]),
-                    active_tool_groups: vec!["core".into(), "shell".into(), "git".into()],
-                    token_usage: Some(TokenUsage {
-                        input_tokens: 100,
-                        output_tokens: 50,
-                        total_tokens: 150,
-                    }),
-                    context_window: Some(128_000),
-                    last_prompt_tokens: Some(100),
-                    status: SessionStatus::Inference,
-                    reasoning_effort: Some("high".into()),
-                    reasoning_capability: Some(ReasoningCapability {
-                        available_effort_levels: vec![
-                            "off".into(),
-                            "low".into(),
-                            "medium".into(),
-                            "high".into(),
-                        ],
-                    }),
+                    event: SessionEvent::SessionState {
+                        title: Some("t".into()),
+                        selected_model: Some("gpt-5.6".into()),
+                        parent_session_id: Some(2),
+                        working_dir: Some("/tmp".into()),
+                        turns: std::collections::BTreeMap::from([
+                            (1, dense_turn.clone()),
+                            (2, one_turn.clone()),
+                        ]),
+                        active_tool_groups: vec!["core".into(), "shell".into(), "git".into()],
+                        token_usage: Some(TokenUsage {
+                            input_tokens: 100,
+                            output_tokens: 50,
+                            total_tokens: 150,
+                        }),
+                        context_window: Some(128_000),
+                        last_prompt_tokens: Some(100),
+                        status: SessionStatus::Inference,
+                        reasoning_effort: Some("high".into()),
+                        reasoning_capability: Some(ReasoningCapability {
+                            available_effort_levels: vec![
+                                "off".into(),
+                                "low".into(),
+                                "medium".into(),
+                                "high".into(),
+                            ],
+                        }),
+                    },
                 },
             ),
             (
                 "TurnAppended",
-                DaemonMessage::TurnAppended {
+                DaemonMessage::Session {
                     session_id: 1,
-                    turn_id: 1,
-                    turn: dense_turn.clone(),
+                    event: SessionEvent::TurnAppended {
+                        turn_id: 1,
+                        turn: dense_turn.clone(),
+                    },
                 },
             ),
             (
                 "TurnAppendedBareArtifact",
-                DaemonMessage::TurnAppended {
+                DaemonMessage::Session {
                     session_id: 1,
-                    turn_id: 2,
-                    turn: bare_artifact_turn.clone(),
+                    event: SessionEvent::TurnAppended {
+                        turn_id: 2,
+                        turn: bare_artifact_turn.clone(),
+                    },
                 },
             ),
             (
                 "SessionStatusChanged",
-                DaemonMessage::SessionStatusChanged {
+                DaemonMessage::Session {
                     session_id: 1,
-                    status: SessionStatus::ToolCall("sh".into()),
-                    last_modified: 0,
+                    event: SessionEvent::SessionStatusChanged {
+                        status: SessionStatus::ToolCall("sh".into()),
+                        last_modified: 0,
+                    },
                 },
             ),
             (
                 "SessionFailed",
-                DaemonMessage::SessionFailed {
+                DaemonMessage::Session {
                     session_id: 1,
-                    operation: "create_session".into(),
-                    error: "some failure happened here".into(),
+                    event: SessionEvent::SessionFailed {
+                        operation: "create_session".into(),
+                        error: "some failure happened here".into(),
+                    },
                 },
             ),
             (
                 "Started",
-                DaemonMessage::Started {
+                DaemonMessage::Session {
                     session_id: 1,
-                    request_id: 1,
-                    turn_id: 1,
-                    estimated_prompt_tokens: 100,
+                    event: SessionEvent::Started {
+                        request_id: 1,
+                        turn_id: 1,
+                        estimated_prompt_tokens: 100,
+                    },
                 },
             ),
             (
                 "ToolCallStarted",
-                DaemonMessage::ToolCallStarted {
+                DaemonMessage::Session {
                     session_id: 1,
-                    request_id: 1,
-                    call_id: "call_1".into(),
-                    tool_name: "sh".into(),
-                    arguments_json: r#"{"command":"echo hi"}"#.into(),
-                    invocation_description: "Running command: `echo hi`.".into(),
+                    event: SessionEvent::ToolCallStarted {
+                        request_id: 1,
+                        call_id: "call_1".into(),
+                        tool_name: "sh".into(),
+                        arguments_json: r#"{"command":"echo hi"}"#.into(),
+                        invocation_description: "Running command: `echo hi`.".into(),
+                    },
                 },
             ),
             (
                 "ToolCallFinished",
-                DaemonMessage::ToolCallFinished {
+                DaemonMessage::Session {
                     session_id: 1,
-                    request_id: 1,
-                    call_id: "call_1".into(),
-                    tool_name: "sh".into(),
+                    event: SessionEvent::ToolCallFinished {
+                        request_id: 1,
+                        call_id: "call_1".into(),
+                        tool_name: "sh".into(),
+                    },
                 },
             ),
             (
                 "ToolResultChunk",
-                DaemonMessage::ToolResultChunk {
+                DaemonMessage::Session {
                     session_id: 1,
-                    request_id: 1,
-                    call_id: "call_1".into(),
-                    data: vec![b'x'; 100],
+                    event: SessionEvent::ToolResultChunk {
+                        request_id: 1,
+                        call_id: "call_1".into(),
+                        data: vec![b'x'; 100],
+                    },
                 },
             ),
             (
                 "ToolCallFailed",
-                DaemonMessage::ToolCallFailed {
+                DaemonMessage::Session {
                     session_id: 1,
-                    request_id: 1,
-                    call_id: "call_1".into(),
-                    tool_name: "sh".into(),
-                    error: "command not found".into(),
+                    event: SessionEvent::ToolCallFailed {
+                        request_id: 1,
+                        call_id: "call_1".into(),
+                        tool_name: "sh".into(),
+                        error: "command not found".into(),
+                    },
                 },
             ),
             (
                 "TokenUsageUpdate",
-                DaemonMessage::TokenUsageUpdate {
+                DaemonMessage::Session {
                     session_id: 1,
-                    token_usage: TokenUsage {
-                        input_tokens: 100,
-                        output_tokens: 50,
-                        total_tokens: 150,
+                    event: SessionEvent::TokenUsageUpdate {
+                        token_usage: TokenUsage {
+                            input_tokens: 100,
+                            output_tokens: 50,
+                            total_tokens: 150,
+                        },
+                        last_prompt_tokens: Some(100),
                     },
-                    last_prompt_tokens: Some(100),
                 },
             ),
             (
                 "LiveOutputTokenCount",
-                DaemonMessage::LiveOutputTokenCount {
+                DaemonMessage::Session {
                     session_id: 1,
-                    request_id: 1,
-                    output_tokens: 42,
+                    event: SessionEvent::LiveOutputTokenCount {
+                        request_id: 1,
+                        output_tokens: 42,
+                    },
                 },
             ),
             (
                 "OutputChunk",
-                DaemonMessage::OutputChunk {
+                DaemonMessage::Session {
                     session_id: 1,
-                    request_id: 1,
-                    stream: OutputStream::Answer,
-                    data: vec![b'x'; 100],
+                    event: SessionEvent::OutputChunk {
+                        request_id: 1,
+                        stream: OutputStream::Answer,
+                        data: vec![b'x'; 100],
+                    },
                 },
             ),
             (
                 "Done",
-                DaemonMessage::Done {
+                DaemonMessage::Session {
                     session_id: 1,
-                    request_id: 1,
-                    token_usage: Some(TokenUsage {
-                        input_tokens: 100,
-                        output_tokens: 50,
-                        total_tokens: 150,
-                    }),
-                    last_prompt_tokens: Some(100),
+                    event: SessionEvent::Done {
+                        request_id: 1,
+                        token_usage: Some(TokenUsage {
+                            input_tokens: 100,
+                            output_tokens: 50,
+                            total_tokens: 150,
+                        }),
+                        last_prompt_tokens: Some(100),
+                    },
                 },
             ),
             (
                 "Failed",
-                DaemonMessage::Failed {
+                DaemonMessage::Session {
                     session_id: 1,
-                    request_id: 1,
-                    error: "x".repeat(100),
+                    event: SessionEvent::Failed {
+                        request_id: 1,
+                        error: "x".repeat(100),
+                    },
                 },
             ),
             (
                 "Cancelled",
-                DaemonMessage::Cancelled {
+                DaemonMessage::Session {
                     session_id: 1,
-                    request_id: 1,
+                    event: SessionEvent::Cancelled { request_id: 1 },
                 },
             ),
             ("Pong", DaemonMessage::Pong),
@@ -1322,25 +1370,29 @@ mod tests {
             ),
             (
                 "ModelSelected",
-                DaemonMessage::ModelSelected {
+                DaemonMessage::Session {
                     session_id: 1,
-                    model: "gpt-5.6".into(),
-                    reasoning_capability: Some(ReasoningCapability {
-                        available_effort_levels: vec![
-                            "off".into(),
-                            "low".into(),
-                            "medium".into(),
-                            "high".into(),
-                        ],
-                    }),
+                    event: SessionEvent::ModelSelected {
+                        model: "gpt-5.6".into(),
+                        reasoning_capability: Some(ReasoningCapability {
+                            available_effort_levels: vec![
+                                "off".into(),
+                                "low".into(),
+                                "medium".into(),
+                                "high".into(),
+                            ],
+                        }),
+                    },
                 },
             ),
             (
                 "ModelSelectionFailed",
-                DaemonMessage::ModelSelectionFailed {
+                DaemonMessage::Session {
                     session_id: 1,
-                    model: "gpt-5.6".into(),
-                    error: "model not found".into(),
+                    event: SessionEvent::ModelSelectionFailed {
+                        model: "gpt-5.6".into(),
+                        error: "model not found".into(),
+                    },
                 },
             ),
             ("Unlocked", DaemonMessage::Unlocked),
@@ -1379,27 +1431,36 @@ mod tests {
             ),
             (
                 "SessionDeleted",
-                DaemonMessage::SessionDeleted { session_id: 1 },
+                DaemonMessage::Session {
+                    session_id: 1,
+                    event: SessionEvent::SessionDeleted,
+                },
             ),
             (
                 "SessionDeleteFailed",
-                DaemonMessage::SessionDeleteFailed {
+                DaemonMessage::Session {
                     session_id: 1,
-                    error: "db error".into(),
+                    event: SessionEvent::SessionDeleteFailed {
+                        error: "db error".into(),
+                    },
                 },
             ),
             (
                 "TurnsUndone",
-                DaemonMessage::TurnsUndone {
+                DaemonMessage::Session {
                     session_id: 1,
-                    turn_ids: vec![1, 2, 3, 4, 5],
+                    event: SessionEvent::TurnsUndone {
+                        turn_ids: vec![1, 2, 3, 4, 5],
+                    },
                 },
             ),
             (
                 "TurnsRedone",
-                DaemonMessage::TurnsRedone {
+                DaemonMessage::Session {
                     session_id: 1,
-                    turns: std::collections::BTreeMap::from([(1, dense_turn), (2, one_turn)]),
+                    event: SessionEvent::TurnsRedone {
+                        turns: std::collections::BTreeMap::from([(1, dense_turn), (2, one_turn)]),
+                    },
                 },
             ),
             (
@@ -1455,45 +1516,57 @@ mod tests {
             ),
             (
                 "SessionAccountSet",
-                DaemonMessage::SessionAccountSet {
+                DaemonMessage::Session {
                     session_id: 1,
-                    account: "default".into(),
+                    event: SessionEvent::SessionAccountSet {
+                        account: "default".into(),
+                    },
                 },
             ),
             (
                 "ContextWindowResolved",
-                DaemonMessage::ContextWindowResolved {
+                DaemonMessage::Session {
                     session_id: 1,
-                    context_window: 128_000,
+                    event: SessionEvent::ContextWindowResolved {
+                        context_window: 128_000,
+                    },
                 },
             ),
             (
                 "SessionWorkingDirSet",
-                DaemonMessage::SessionWorkingDirSet {
+                DaemonMessage::Session {
                     session_id: 1,
-                    path: Some("/tmp".into()),
+                    event: SessionEvent::SessionWorkingDirSet {
+                        path: Some("/tmp".into()),
+                    },
                 },
             ),
             (
                 "SessionTitleSet",
-                DaemonMessage::SessionTitleSet {
+                DaemonMessage::Session {
                     session_id: 1,
-                    title: "hello".into(),
+                    event: SessionEvent::SessionTitleSet {
+                        title: "hello".into(),
+                    },
                 },
             ),
             (
                 "ReasoningEffortSet",
-                DaemonMessage::ReasoningEffortSet {
+                DaemonMessage::Session {
                     session_id: 1,
-                    effort: "high".into(),
+                    event: SessionEvent::ReasoningEffortSet {
+                        effort: "high".into(),
+                    },
                 },
             ),
             (
                 "ReasoningEffortSetFailed",
-                DaemonMessage::ReasoningEffortSetFailed {
+                DaemonMessage::Session {
                     session_id: 1,
-                    effort: "high".into(),
-                    error: "model does not support it".into(),
+                    event: SessionEvent::ReasoningEffortSetFailed {
+                        effort: "high".into(),
+                        error: "model does not support it".into(),
+                    },
                 },
             ),
             ("ShuttingDown", DaemonMessage::ShuttingDown),

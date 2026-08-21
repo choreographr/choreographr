@@ -1,5 +1,7 @@
 use choreo_im::bridge::{BridgeEvent, DaemonBridge};
-use choreo_proto::{ClientMessage, DaemonMessage, OutputStream, read_message, write_message};
+use choreo_proto::{
+    ClientMessage, DaemonMessage, OutputStream, SessionEvent, read_message, write_message,
+};
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
 
@@ -59,33 +61,39 @@ fn bridge_text_streaming() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::OutputChunk {
+        &DaemonMessage::Session {
             session_id: 0,
-            request_id: 1,
-            stream: OutputStream::Answer,
-            data: b"hello ".to_vec(),
+            event: SessionEvent::OutputChunk {
+                request_id: 1,
+                stream: OutputStream::Answer,
+                data: b"hello ".to_vec(),
+            },
         },
     )
     .unwrap();
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::OutputChunk {
+        &DaemonMessage::Session {
             session_id: 0,
-            request_id: 1,
-            stream: OutputStream::Answer,
-            data: b"world".to_vec(),
+            event: SessionEvent::OutputChunk {
+                request_id: 1,
+                stream: OutputStream::Answer,
+                data: b"world".to_vec(),
+            },
         },
     )
     .unwrap();
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Done {
+        &DaemonMessage::Session {
             session_id: 0,
-            request_id: 1,
-            token_usage: None,
-            last_prompt_tokens: None,
+            event: SessionEvent::Done {
+                request_id: 1,
+                token_usage: None,
+                last_prompt_tokens: None,
+            },
         },
     )
     .unwrap();
@@ -104,13 +112,15 @@ fn bridge_tool_call_events() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::ToolCallStarted {
+        &DaemonMessage::Session {
             session_id: 0,
-            request_id: 1,
-            call_id: "call_1".into(),
-            tool_name: "read_file".into(),
-            arguments_json: r#"{"path":"/tmp"}"#.into(),
-            invocation_description: String::new(),
+            event: SessionEvent::ToolCallStarted {
+                request_id: 1,
+                call_id: "call_1".into(),
+                tool_name: "read_file".into(),
+                arguments_json: r#"{"path":"/tmp"}"#.into(),
+                invocation_description: String::new(),
+            },
         },
     )
     .unwrap();
@@ -125,21 +135,25 @@ fn bridge_tool_call_events() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::ToolResultChunk {
+        &DaemonMessage::Session {
             session_id: 0,
-            request_id: 1,
-            call_id: "call_1".into(),
-            data: b"file contents".to_vec(),
+            event: SessionEvent::ToolResultChunk {
+                request_id: 1,
+                call_id: "call_1".into(),
+                data: b"file contents".to_vec(),
+            },
         },
     )
     .unwrap();
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::ToolCallFinished {
+        &DaemonMessage::Session {
             session_id: 0,
-            request_id: 1,
-            call_id: "call_1".into(),
-            tool_name: "read_file".into(),
+            event: SessionEvent::ToolCallFinished {
+                request_id: 1,
+                call_id: "call_1".into(),
+                tool_name: "read_file".into(),
+            },
         },
     )
     .unwrap();
@@ -160,12 +174,14 @@ fn bridge_tool_call_failed() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::ToolCallFailed {
+        &DaemonMessage::Session {
             session_id: 0,
-            request_id: 1,
-            call_id: "call_1".into(),
-            tool_name: "read_file".into(),
-            error: "permission denied".into(),
+            event: SessionEvent::ToolCallFailed {
+                request_id: 1,
+                call_id: "call_1".into(),
+                tool_name: "read_file".into(),
+                error: "permission denied".into(),
+            },
         },
     )
     .unwrap();
@@ -210,10 +226,9 @@ fn bridge_turn_images() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::TurnAppended {
+        &DaemonMessage::Session {
             session_id: 0,
-            turn_id: 1,
-            turn,
+            event: SessionEvent::TurnAppended { turn_id: 1, turn },
         },
     )
     .unwrap();
@@ -233,10 +248,12 @@ fn bridge_error_variants() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Failed {
+        &DaemonMessage::Session {
             session_id: 0,
-            request_id: 1,
-            error: "something went wrong".into(),
+            event: SessionEvent::Failed {
+                request_id: 1,
+                error: "something went wrong".into(),
+            },
         },
     )
     .unwrap();
@@ -287,10 +304,12 @@ fn bridge_models() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::ModelSelected {
+        &DaemonMessage::Session {
             session_id: 0,
-            model: "claude".into(),
-            reasoning_capability: None,
+            event: SessionEvent::ModelSelected {
+                model: "claude".into(),
+                reasoning_capability: None,
+            },
         },
     )
     .unwrap();
@@ -308,20 +327,22 @@ fn bridge_cancelled_clears_buffer() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::OutputChunk {
+        &DaemonMessage::Session {
             session_id: 0,
-            request_id: 42,
-            stream: OutputStream::Answer,
-            data: b"buffered data".to_vec(),
+            event: SessionEvent::OutputChunk {
+                request_id: 42,
+                stream: OutputStream::Answer,
+                data: b"buffered data".to_vec(),
+            },
         },
     )
     .unwrap();
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Cancelled {
+        &DaemonMessage::Session {
             session_id: 0,
-            request_id: 42,
+            event: SessionEvent::Cancelled { request_id: 42 },
         },
     )
     .unwrap();

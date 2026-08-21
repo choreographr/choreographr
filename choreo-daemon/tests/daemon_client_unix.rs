@@ -16,7 +16,7 @@
 
 use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_connection;
-use choreo_proto::{ClientMessage, DaemonMessage};
+use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
 use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -170,7 +170,10 @@ fn unix_list_sessions_round_trip() {
     // Create a session with all optional fields unset.
     client.send(create_session());
     match client.recv() {
-        DaemonMessage::SessionCreated { session_id, .. } => assert_eq!(session_id, 1),
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionCreated { .. },
+        } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
     }
 
@@ -198,7 +201,10 @@ fn unix_create_session_then_attach() {
 
     client.send(create_session());
     match client.recv() {
-        DaemonMessage::SessionCreated { session_id, .. } => assert_eq!(session_id, 1),
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionCreated { .. },
+        } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
     }
 
@@ -209,11 +215,17 @@ fn unix_create_session_then_attach() {
     // ordering is load-bearing, so assert it strictly in order.
     client.send(ClientMessage::AttachSession { session_id: 1 });
     match client.recv() {
-        DaemonMessage::SessionAttached { session_id } => assert_eq!(session_id, 1),
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionAttached,
+        } => assert_eq!(session_id, 1),
         other => panic!("expected SessionAttached, got {other:?}"),
     }
     match client.recv() {
-        DaemonMessage::SessionState { session_id, .. } => assert_eq!(session_id, 1),
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionState { .. },
+        } => assert_eq!(session_id, 1),
         other => panic!("expected SessionState, got {other:?}"),
     }
 
@@ -258,7 +270,10 @@ fn unix_two_clients_isolated_and_shared_state() {
     // A creates a session...
     client_a.send(create_session());
     match client_a.recv() {
-        DaemonMessage::SessionCreated { session_id, .. } => assert_eq!(session_id, 1),
+        DaemonMessage::Session {
+            session_id,
+            event: SessionEvent::SessionCreated { .. },
+        } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
     }
 

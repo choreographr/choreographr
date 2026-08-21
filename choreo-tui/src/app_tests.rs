@@ -5,7 +5,8 @@ use crate::test_util::test_app;
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{
     AccountInfo, CatalogProvider, ClientMessage, DaemonMessage, DisplayedImageRecord,
-    ImageMetadata, ReasoningCapability, RefreshStatus, SessionStatus, TokenUsage, Turn,
+    ImageMetadata, ReasoningCapability, RefreshStatus, SessionEvent, SessionStatus, TokenUsage,
+    Turn,
 };
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -3410,24 +3411,26 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
     app.attached_session_id = Some(7);
 
     handle_daemon_message(
-        DaemonMessage::SessionState {
+        DaemonMessage::Session {
             session_id: 7,
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            working_dir: None,
-            turns: std::collections::BTreeMap::new(),
-            active_tool_groups: vec![],
-            token_usage: Some(TokenUsage {
-                input_tokens: 1,
-                output_tokens: 2,
-                total_tokens: 3,
-            }),
-            context_window: Some(4096),
-            last_prompt_tokens: Some(1),
-            reasoning_effort: None,
-            reasoning_capability: None,
-            status: SessionStatus::Inactive,
+            event: SessionEvent::SessionState {
+                title: None,
+                selected_model: None,
+                parent_session_id: None,
+                working_dir: None,
+                turns: std::collections::BTreeMap::new(),
+                active_tool_groups: vec![],
+                token_usage: Some(TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    total_tokens: 3,
+                }),
+                context_window: Some(4096),
+                last_prompt_tokens: Some(1),
+                reasoning_effort: None,
+                reasoning_capability: None,
+                status: SessionStatus::Inactive,
+            },
         },
         &mut app,
         &tx,
@@ -3457,20 +3460,22 @@ fn daemon_message_session_state_sets_tool_groups() {
     app.attached_session_id = Some(7);
 
     handle_daemon_message(
-        DaemonMessage::SessionState {
+        DaemonMessage::Session {
             session_id: 7,
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            working_dir: None,
-            turns: std::collections::BTreeMap::new(),
-            active_tool_groups: vec!["core".into(), "browser".into()],
-            token_usage: None,
-            context_window: None,
-            last_prompt_tokens: None,
-            reasoning_effort: None,
-            reasoning_capability: None,
-            status: SessionStatus::Inactive,
+            event: SessionEvent::SessionState {
+                title: None,
+                selected_model: None,
+                parent_session_id: None,
+                working_dir: None,
+                turns: std::collections::BTreeMap::new(),
+                active_tool_groups: vec!["core".into(), "browser".into()],
+                token_usage: None,
+                context_window: None,
+                last_prompt_tokens: None,
+                reasoning_effort: None,
+                reasoning_capability: None,
+                status: SessionStatus::Inactive,
+            },
         },
         &mut app,
         &tx,
@@ -3487,24 +3492,26 @@ fn daemon_message_session_state_ignores_wrong_session() {
     app.attached_session_id = Some(7);
 
     handle_daemon_message(
-        DaemonMessage::SessionState {
+        DaemonMessage::Session {
             session_id: 99, // different from attached_session_id
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            working_dir: None,
-            turns: std::collections::BTreeMap::new(),
-            active_tool_groups: vec![],
-            token_usage: Some(TokenUsage {
-                input_tokens: 99,
-                output_tokens: 99,
-                total_tokens: 99,
-            }),
-            context_window: Some(1024),
-            last_prompt_tokens: None,
-            reasoning_effort: None,
-            reasoning_capability: None,
-            status: SessionStatus::Inactive,
+            event: SessionEvent::SessionState {
+                title: None,
+                selected_model: None,
+                parent_session_id: None,
+                working_dir: None,
+                turns: std::collections::BTreeMap::new(),
+                active_tool_groups: vec![],
+                token_usage: Some(TokenUsage {
+                    input_tokens: 99,
+                    output_tokens: 99,
+                    total_tokens: 99,
+                }),
+                context_window: Some(1024),
+                last_prompt_tokens: None,
+                reasoning_effort: None,
+                reasoning_capability: None,
+                status: SessionStatus::Inactive,
+            },
         },
         &mut app,
         &tx,
@@ -3544,15 +3551,17 @@ fn daemon_message_done_with_token_usage_updates_progress() {
     app.attached_session_id = Some(0);
 
     handle_daemon_message(
-        DaemonMessage::Done {
+        DaemonMessage::Session {
             session_id: 0,
-            request_id: 1,
-            token_usage: Some(TokenUsage {
-                input_tokens: 5,
-                output_tokens: 10,
-                total_tokens: 15,
-            }),
-            last_prompt_tokens: Some(5),
+            event: SessionEvent::Done {
+                request_id: 1,
+                token_usage: Some(TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 10,
+                    total_tokens: 15,
+                }),
+                last_prompt_tokens: Some(5),
+            },
         },
         &mut app,
         &tx,
@@ -3576,11 +3585,13 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     handle_daemon_message(
-        DaemonMessage::Done {
+        DaemonMessage::Session {
             session_id: 0,
-            request_id: 1,
-            token_usage: None,
-            last_prompt_tokens: None,
+            event: SessionEvent::Done {
+                request_id: 1,
+                token_usage: None,
+                last_prompt_tokens: None,
+            },
         },
         &mut app,
         &tx,
@@ -3607,10 +3618,12 @@ fn live_output_token_count_from_background_session_does_not_pollute_status_bar()
     // Session 7 (background, streamed via SubscribeAllActivity) reports its
     // live output-token count while the user keeps looking at session 0.
     handle_daemon_message(
-        DaemonMessage::LiveOutputTokenCount {
+        DaemonMessage::Session {
             session_id: 7,
-            request_id: 50,
-            output_tokens: 99,
+            event: SessionEvent::LiveOutputTokenCount {
+                request_id: 50,
+                output_tokens: 99,
+            },
         },
         &mut app,
         &tx,
@@ -3647,10 +3660,12 @@ fn live_output_token_count_updates_own_session_after_switch() {
     });
 
     handle_daemon_message(
-        DaemonMessage::LiveOutputTokenCount {
+        DaemonMessage::Session {
             session_id: 7,
-            request_id: 50,
-            output_tokens: 42,
+            event: SessionEvent::LiveOutputTokenCount {
+                request_id: 50,
+                output_tokens: 42,
+            },
         },
         &mut app,
         &tx,
@@ -3688,24 +3703,26 @@ fn session_state_snapshot_does_not_regress_fresher_token_usage() {
     // can lag the worker's live total for a mid-turn session — it must not
     // regress the status bar's token readout.
     handle_daemon_message(
-        DaemonMessage::SessionState {
+        DaemonMessage::Session {
             session_id: 7,
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            working_dir: None,
-            turns: std::collections::BTreeMap::new(),
-            active_tool_groups: vec![],
-            token_usage: Some(TokenUsage {
-                input_tokens: 1,
-                output_tokens: 2,
-                total_tokens: 3,
-            }),
-            context_window: None,
-            last_prompt_tokens: None,
-            reasoning_effort: None,
-            reasoning_capability: None,
-            status: SessionStatus::Inactive,
+            event: SessionEvent::SessionState {
+                title: None,
+                selected_model: None,
+                parent_session_id: None,
+                working_dir: None,
+                turns: std::collections::BTreeMap::new(),
+                active_tool_groups: vec![],
+                token_usage: Some(TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    total_tokens: 3,
+                }),
+                context_window: None,
+                last_prompt_tokens: None,
+                reasoning_effort: None,
+                reasoning_capability: None,
+                status: SessionStatus::Inactive,
+            },
         },
         &mut app,
         &tx,
@@ -3738,24 +3755,26 @@ fn session_state_snapshot_with_newer_larger_usage_updates_display() {
     });
 
     handle_daemon_message(
-        DaemonMessage::SessionState {
+        DaemonMessage::Session {
             session_id: 7,
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            working_dir: None,
-            turns: std::collections::BTreeMap::new(),
-            active_tool_groups: vec![],
-            token_usage: Some(TokenUsage {
-                input_tokens: 10,
-                output_tokens: 5,
-                total_tokens: 15,
-            }),
-            context_window: None,
-            last_prompt_tokens: None,
-            reasoning_effort: None,
-            reasoning_capability: None,
-            status: SessionStatus::Inactive,
+            event: SessionEvent::SessionState {
+                title: None,
+                selected_model: None,
+                parent_session_id: None,
+                working_dir: None,
+                turns: std::collections::BTreeMap::new(),
+                active_tool_groups: vec![],
+                token_usage: Some(TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                }),
+                context_window: None,
+                last_prompt_tokens: None,
+                reasoning_effort: None,
+                reasoning_capability: None,
+                status: SessionStatus::Inactive,
+            },
         },
         &mut app,
         &tx,
@@ -3788,20 +3807,22 @@ fn session_state_snapshot_does_not_regress_fresher_last_prompt_tokens() {
     app.display_for(7).last_prompt_tokens = Some(5000);
 
     handle_daemon_message(
-        DaemonMessage::SessionState {
+        DaemonMessage::Session {
             session_id: 7,
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            working_dir: None,
-            turns: std::collections::BTreeMap::new(),
-            active_tool_groups: vec![],
-            token_usage: None,
-            context_window: None,
-            last_prompt_tokens: Some(100),
-            reasoning_effort: None,
-            reasoning_capability: None,
-            status: SessionStatus::Inactive,
+            event: SessionEvent::SessionState {
+                title: None,
+                selected_model: None,
+                parent_session_id: None,
+                working_dir: None,
+                turns: std::collections::BTreeMap::new(),
+                active_tool_groups: vec![],
+                token_usage: None,
+                context_window: None,
+                last_prompt_tokens: Some(100),
+                reasoning_effort: None,
+                reasoning_capability: None,
+                status: SessionStatus::Inactive,
+            },
         },
         &mut app,
         &tx,
@@ -3826,20 +3847,22 @@ fn session_state_snapshot_fills_missing_last_prompt_tokens() {
     assert!(app.display_for(7).last_prompt_tokens.is_none());
 
     handle_daemon_message(
-        DaemonMessage::SessionState {
+        DaemonMessage::Session {
             session_id: 7,
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            working_dir: None,
-            turns: std::collections::BTreeMap::new(),
-            active_tool_groups: vec![],
-            token_usage: None,
-            context_window: None,
-            last_prompt_tokens: Some(300),
-            reasoning_effort: None,
-            reasoning_capability: None,
-            status: SessionStatus::Inactive,
+            event: SessionEvent::SessionState {
+                title: None,
+                selected_model: None,
+                parent_session_id: None,
+                working_dir: None,
+                turns: std::collections::BTreeMap::new(),
+                active_tool_groups: vec![],
+                token_usage: None,
+                context_window: None,
+                last_prompt_tokens: Some(300),
+                reasoning_effort: None,
+                reasoning_capability: None,
+                status: SessionStatus::Inactive,
+            },
         },
         &mut app,
         &tx,
@@ -3972,20 +3995,22 @@ fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() 
     snapshot_turns.insert(5, placeholder_turn("user q"));
 
     handle_daemon_message(
-        DaemonMessage::SessionState {
+        DaemonMessage::Session {
             session_id: 7,
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            working_dir: None,
-            turns: snapshot_turns,
-            active_tool_groups: vec![],
-            token_usage: None,
-            context_window: None,
-            last_prompt_tokens: None,
-            reasoning_effort: None,
-            reasoning_capability: None,
-            status: SessionStatus::Inactive,
+            event: SessionEvent::SessionState {
+                title: None,
+                selected_model: None,
+                parent_session_id: None,
+                working_dir: None,
+                turns: snapshot_turns,
+                active_tool_groups: vec![],
+                token_usage: None,
+                context_window: None,
+                last_prompt_tokens: None,
+                reasoning_effort: None,
+                reasoning_capability: None,
+                status: SessionStatus::Inactive,
+            },
         },
         &mut app,
         &tx,
@@ -4041,15 +4066,17 @@ fn done_for_background_session_does_not_pollute_attached_display() {
     }
 
     handle_daemon_message(
-        DaemonMessage::Done {
+        DaemonMessage::Session {
             session_id: 7,
-            request_id: 50,
-            token_usage: Some(TokenUsage {
-                input_tokens: 99,
-                output_tokens: 99,
-                total_tokens: 99,
-            }),
-            last_prompt_tokens: Some(99),
+            event: SessionEvent::Done {
+                request_id: 50,
+                token_usage: Some(TokenUsage {
+                    input_tokens: 99,
+                    output_tokens: 99,
+                    total_tokens: 99,
+                }),
+                last_prompt_tokens: Some(99),
+            },
         },
         &mut app,
         &tx,
@@ -4828,9 +4855,11 @@ fn reasoning_effort_set_updates_session_state() {
     app.attached_session_id = Some(42);
 
     handle_daemon_message(
-        DaemonMessage::ReasoningEffortSet {
+        DaemonMessage::Session {
             session_id: 0,
-            effort: "high".to_string(),
+            event: SessionEvent::ReasoningEffortSet {
+                effort: "high".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -4867,9 +4896,11 @@ fn reasoning_effort_set_for_background_session_does_not_touch_attached_display()
     // display — writing it to the active display would let a background
     // session's settings bleed into the status bar of the session being viewed.
     handle_daemon_message(
-        DaemonMessage::ReasoningEffortSet {
+        DaemonMessage::Session {
             session_id: 99,
-            effort: "high".to_string(),
+            event: SessionEvent::ReasoningEffortSet {
+                effort: "high".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -4902,10 +4933,12 @@ fn model_selected_for_background_session_does_not_touch_attached_display() {
     // A background session (99) changes its model.  The active display must
     // not show the background session's model in its status bar.
     handle_daemon_message(
-        DaemonMessage::ModelSelected {
+        DaemonMessage::Session {
             session_id: 99,
-            model: "gpt-other".to_string(),
-            reasoning_capability: None,
+            event: SessionEvent::ModelSelected {
+                model: "gpt-other".to_string(),
+                reasoning_capability: None,
+            },
         },
         &mut app,
         &tx,
@@ -4936,10 +4969,12 @@ fn model_selected_for_attached_session_updates_display_and_summary() {
         .set_sessions(vec![make_session(42, "a", "gpt-old", 0)]);
 
     handle_daemon_message(
-        DaemonMessage::ModelSelected {
+        DaemonMessage::Session {
             session_id: 42,
-            model: "gpt-new".to_string(),
-            reasoning_capability: None,
+            event: SessionEvent::ModelSelected {
+                model: "gpt-new".to_string(),
+                reasoning_capability: None,
+            },
         },
         &mut app,
         &tx,
@@ -4972,9 +5007,11 @@ fn reasoning_effort_set_for_attached_session_updates_display_and_summary() {
         .set_sessions(vec![make_session(42, "a", "m", 0)]);
 
     handle_daemon_message(
-        DaemonMessage::ReasoningEffortSet {
+        DaemonMessage::Session {
             session_id: 42,
-            effort: "high".to_string(),
+            event: SessionEvent::ReasoningEffortSet {
+                effort: "high".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5005,9 +5042,11 @@ fn session_account_set_for_background_session_does_not_touch_attached_display() 
     // A background session (99) changes its account — the viewed session's
     // identity fields (account, provider slug) must not change.
     handle_daemon_message(
-        DaemonMessage::SessionAccountSet {
+        DaemonMessage::Session {
             session_id: 99,
-            account: "bg-account".to_string(),
+            event: SessionEvent::SessionAccountSet {
+                account: "bg-account".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5036,10 +5075,12 @@ fn reasoning_effort_set_failed_for_background_session_does_not_touch_attached_di
     // A background session's rejection must not flip the viewed session's
     // reasoning-effort display back to "off".
     handle_daemon_message(
-        DaemonMessage::ReasoningEffortSetFailed {
+        DaemonMessage::Session {
             session_id: 99,
-            effort: "high".to_string(),
-            error: "model does not support reasoning".to_string(),
+            event: SessionEvent::ReasoningEffortSetFailed {
+                effort: "high".to_string(),
+                error: "model does not support reasoning".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5077,10 +5118,12 @@ fn model_selected_for_background_session_does_not_write_global_status() {
     // A background session (99) changes its model.  Its per-session display
     // is updated, but the global status/error line must stay untouched.
     handle_daemon_message(
-        DaemonMessage::ModelSelected {
+        DaemonMessage::Session {
             session_id: 99,
-            model: "gpt-other".to_string(),
-            reasoning_capability: None,
+            event: SessionEvent::ModelSelected {
+                model: "gpt-other".to_string(),
+                reasoning_capability: None,
+            },
         },
         &mut app,
         &tx,
@@ -5112,10 +5155,12 @@ fn model_selected_for_attached_session_writes_status_feedback() {
     // The user's own `/model` command must still print its confirmation via
     // the generic dispatch fall-through.
     handle_daemon_message(
-        DaemonMessage::ModelSelected {
+        DaemonMessage::Session {
             session_id: 42,
-            model: "gpt-new".to_string(),
-            reasoning_capability: None,
+            event: SessionEvent::ModelSelected {
+                model: "gpt-new".to_string(),
+                reasoning_capability: None,
+            },
         },
         &mut app,
         &tx,
@@ -5142,9 +5187,11 @@ fn reasoning_effort_set_for_background_session_does_not_write_global_status() {
     assert!(app.status.is_none() && app.error.is_none());
 
     handle_daemon_message(
-        DaemonMessage::ReasoningEffortSet {
+        DaemonMessage::Session {
             session_id: 99,
-            effort: "high".to_string(),
+            event: SessionEvent::ReasoningEffortSet {
+                effort: "high".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5167,9 +5214,11 @@ fn reasoning_effort_set_for_attached_session_writes_status_feedback() {
     app.active_session_id = Some(42);
 
     handle_daemon_message(
-        DaemonMessage::ReasoningEffortSet {
+        DaemonMessage::Session {
             session_id: 42,
-            effort: "high".to_string(),
+            event: SessionEvent::ReasoningEffortSet {
+                effort: "high".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5196,9 +5245,11 @@ fn session_account_set_for_background_session_does_not_write_global_status() {
     assert!(app.status.is_none() && app.error.is_none());
 
     handle_daemon_message(
-        DaemonMessage::SessionAccountSet {
+        DaemonMessage::Session {
             session_id: 99,
-            account: "bg-account".to_string(),
+            event: SessionEvent::SessionAccountSet {
+                account: "bg-account".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5221,9 +5272,11 @@ fn session_account_set_for_attached_session_writes_status_feedback() {
     app.active_session_id = Some(42);
 
     handle_daemon_message(
-        DaemonMessage::SessionAccountSet {
+        DaemonMessage::Session {
             session_id: 42,
-            account: "main".to_string(),
+            event: SessionEvent::SessionAccountSet {
+                account: "main".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5249,10 +5302,12 @@ fn reasoning_effort_set_failed_for_background_session_does_not_write_global_stat
     // A background session's rejection previously leaked through BOTH the
     // explicit `app.status` write and the generic dispatch's `app.error`.
     handle_daemon_message(
-        DaemonMessage::ReasoningEffortSetFailed {
+        DaemonMessage::Session {
             session_id: 99,
-            effort: "high".to_string(),
-            error: "model does not support reasoning".to_string(),
+            event: SessionEvent::ReasoningEffortSetFailed {
+                effort: "high".to_string(),
+                error: "model does not support reasoning".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5280,10 +5335,12 @@ fn reasoning_effort_set_failed_for_attached_session_writes_status_and_error() {
     // The user's own `/reasoning` command failed — the rejection notice stays
     // on the status line and the generic dispatch records the error.
     handle_daemon_message(
-        DaemonMessage::ReasoningEffortSetFailed {
+        DaemonMessage::Session {
             session_id: 42,
-            effort: "high".to_string(),
-            error: "model does not support reasoning".to_string(),
+            event: SessionEvent::ReasoningEffortSetFailed {
+                effort: "high".to_string(),
+                error: "model does not support reasoning".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5321,9 +5378,11 @@ fn reasoning_effort_set_with_sentinel_zero_writes_status_feedback_for_attached_s
     // with the sentinel id 0.  It must be treated as the user's own feedback,
     // not swallowed as background noise.
     handle_daemon_message(
-        DaemonMessage::ReasoningEffortSet {
+        DaemonMessage::Session {
             session_id: 0,
-            effort: "high".to_string(),
+            event: SessionEvent::ReasoningEffortSet {
+                effort: "high".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5359,10 +5418,12 @@ fn reasoning_effort_set_failed_with_sentinel_zero_writes_status_and_error() {
     // connection-level rejections ("no session attached").  The user must see
     // the rejection of their own /reasoning command.
     handle_daemon_message(
-        DaemonMessage::ReasoningEffortSetFailed {
+        DaemonMessage::Session {
             session_id: 0,
-            effort: "high".to_string(),
-            error: "no session attached".to_string(),
+            event: SessionEvent::ReasoningEffortSetFailed {
+                effort: "high".to_string(),
+                error: "no session attached".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5393,10 +5454,12 @@ fn model_selection_failed_for_background_session_does_not_write_global_error() {
     assert!(app.status.is_none() && app.error.is_none());
 
     handle_daemon_message(
-        DaemonMessage::ModelSelectionFailed {
+        DaemonMessage::Session {
             session_id: 99,
-            model: "gpt-other".to_string(),
-            error: "model not found".to_string(),
+            event: SessionEvent::ModelSelectionFailed {
+                model: "gpt-other".to_string(),
+                error: "model not found".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5420,10 +5483,12 @@ fn model_selection_failed_for_attached_session_writes_global_error() {
     // The user's own /model command failed — the rejection must still be
     // surfaced via the generic dispatch's error write.
     handle_daemon_message(
-        DaemonMessage::ModelSelectionFailed {
+        DaemonMessage::Session {
             session_id: 42,
-            model: "gpt-x".to_string(),
-            error: "model not found".to_string(),
+            event: SessionEvent::ModelSelectionFailed {
+                model: "gpt-x".to_string(),
+                error: "model not found".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5447,10 +5512,12 @@ fn model_selection_failed_with_sentinel_zero_writes_global_error() {
     // No session attached at the daemon connection level — the sentinel must
     // keep its error feedback, not be swallowed as background noise.
     handle_daemon_message(
-        DaemonMessage::ModelSelectionFailed {
+        DaemonMessage::Session {
             session_id: 0,
-            model: "gpt-x".to_string(),
-            error: "no session attached".to_string(),
+            event: SessionEvent::ModelSelectionFailed {
+                model: "gpt-x".to_string(),
+                error: "no session attached".to_string(),
+            },
         },
         &mut app,
         &tx,
@@ -5476,14 +5543,16 @@ fn session_created_for_sub_session_does_not_hijack_chat_view() {
     // spawn_subsession makes the daemon broadcast SessionCreated with
     // parent_session_id = Some(parent).  The TUI must not switch to it.
     handle_daemon_message(
-        DaemonMessage::SessionCreated {
+        DaemonMessage::Session {
             session_id: 99,
-            parent_session_id: Some(42),
-            title: None,
-            working_dir: None,
-            account_name: None,
-            selected_model: None,
-            reasoning_effort: None,
+            event: SessionEvent::SessionCreated {
+                parent_session_id: Some(42),
+                title: None,
+                working_dir: None,
+                account_name: None,
+                selected_model: None,
+                reasoning_effort: None,
+            },
         },
         &mut app,
         &tx,
@@ -5530,14 +5599,16 @@ fn session_created_for_sub_session_on_session_manager_refreshes_list() {
     app.page = Page::SessionManager;
 
     handle_daemon_message(
-        DaemonMessage::SessionCreated {
+        DaemonMessage::Session {
             session_id: 99,
-            parent_session_id: Some(42),
-            title: None,
-            working_dir: None,
-            account_name: None,
-            selected_model: None,
-            reasoning_effort: None,
+            event: SessionEvent::SessionCreated {
+                parent_session_id: Some(42),
+                title: None,
+                working_dir: None,
+                account_name: None,
+                selected_model: None,
+                reasoning_effort: None,
+            },
         },
         &mut app,
         &tx,
@@ -5572,14 +5643,16 @@ fn session_created_for_user_session_attaches_on_chat_page() {
     // A user-created session (parent_session_id = None) keeps the old
     // behavior: switch the view and attach.
     handle_daemon_message(
-        DaemonMessage::SessionCreated {
+        DaemonMessage::Session {
             session_id: 99,
-            parent_session_id: None,
-            title: None,
-            working_dir: None,
-            account_name: Some("acct".to_string()),
-            selected_model: Some("gpt-new".to_string()),
-            reasoning_effort: Some("off".to_string()),
+            event: SessionEvent::SessionCreated {
+                parent_session_id: None,
+                title: None,
+                working_dir: None,
+                account_name: Some("acct".to_string()),
+                selected_model: Some("gpt-new".to_string()),
+                reasoning_effort: Some("off".to_string()),
+            },
         },
         &mut app,
         &tx,
@@ -5701,10 +5774,12 @@ fn subsession_finish_switches_back_to_parent_with_notification() {
     ]);
 
     handle_daemon_message(
-        DaemonMessage::SessionStatusChanged {
+        DaemonMessage::Session {
             session_id: 99,
-            status: SessionStatus::Inactive,
-            last_modified: 1705315000000,
+            event: SessionEvent::SessionStatusChanged {
+                status: SessionStatus::Inactive,
+                last_modified: 1705315000000,
+            },
         },
         &mut app,
         &tx,
@@ -5756,10 +5831,12 @@ fn subsession_finish_does_not_fire_on_duplicate_idle_broadcast() {
     app.handle_session_status_changed(99, &SessionStatus::Inactive, 1705315000000);
 
     handle_daemon_message(
-        DaemonMessage::SessionStatusChanged {
+        DaemonMessage::Session {
             session_id: 99,
-            status: SessionStatus::Inactive,
-            last_modified: 1705315000000,
+            event: SessionEvent::SessionStatusChanged {
+                status: SessionStatus::Inactive,
+                last_modified: 1705315000000,
+            },
         },
         &mut app,
         &tx,
@@ -5784,10 +5861,12 @@ fn top_level_session_finish_does_not_switch() {
         .set_sessions(vec![make_session(42, "my session", "m1", 3)]);
 
     handle_daemon_message(
-        DaemonMessage::SessionStatusChanged {
+        DaemonMessage::Session {
             session_id: 42,
-            status: SessionStatus::Inactive,
-            last_modified: 1705315000000,
+            event: SessionEvent::SessionStatusChanged {
+                status: SessionStatus::Inactive,
+                last_modified: 1705315000000,
+            },
         },
         &mut app,
         &tx,
@@ -5814,10 +5893,12 @@ fn subsession_finish_with_missing_parent_does_not_switch() {
         .set_sessions(vec![make_subsession(99, "orphan task", 42)]);
 
     handle_daemon_message(
-        DaemonMessage::SessionStatusChanged {
+        DaemonMessage::Session {
             session_id: 99,
-            status: SessionStatus::Inactive,
-            last_modified: 1705315000000,
+            event: SessionEvent::SessionStatusChanged {
+                status: SessionStatus::Inactive,
+                last_modified: 1705315000000,
+            },
         },
         &mut app,
         &tx,
@@ -5867,7 +5948,10 @@ fn session_attached_does_not_regress_accumulated_live_state() {
     }
 
     handle_daemon_message(
-        DaemonMessage::SessionAttached { session_id: 42 },
+        DaemonMessage::Session {
+            session_id: 42,
+            event: SessionEvent::SessionAttached,
+        },
         &mut app,
         &tx,
     )

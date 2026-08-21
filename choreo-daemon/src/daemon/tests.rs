@@ -2,7 +2,7 @@ use super::*;
 use crate::broadcast::test_sink;
 use crate::providers::test_util::make_test_provider;
 use crate::sessions::SessionMetadata;
-use choreo_proto::{DaemonMessage, SessionStatus};
+use choreo_proto::{DaemonMessage, SessionEvent, SessionStatus};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -395,10 +395,12 @@ fn handle_broadcast_session_status() {
     let msg = rx.recv().unwrap();
     assert!(matches!(
         msg,
-        DaemonMessage::SessionStatusChanged {
+        DaemonMessage::Session {
             session_id: 42,
-            status: SessionStatus::Inference,
-            ..
+            event: SessionEvent::SessionStatusChanged {
+                status: SessionStatus::Inference,
+                ..
+            },
         }
     ));
     // The metadata index must stay in sync so a later ListSessions serves
@@ -502,10 +504,12 @@ fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribe
     let msg = rx3.recv().unwrap();
     assert!(matches!(
         msg,
-        DaemonMessage::SessionStatusChanged {
+        DaemonMessage::Session {
             session_id: 42,
-            status: SessionStatus::Inference,
-            ..
+            event: SessionEvent::SessionStatusChanged {
+                status: SessionStatus::Inference,
+                ..
+            },
         }
     ));
     assert!(
@@ -946,7 +950,10 @@ fn broadcast_sends_to_subscriber() {
     let (mut state, _rx) = make_daemon_state();
     let (tx, rx) = test_sink();
     state.summary_subscribers.insert(1, tx);
-    let msg = DaemonMessage::SessionDeleted { session_id: 42 };
+    let msg = DaemonMessage::Session {
+        session_id: 42,
+        event: SessionEvent::SessionDeleted,
+    };
     state.broadcast(msg.clone());
     let received = rx.recv().unwrap();
     assert_eq!(received, msg);
@@ -960,7 +967,10 @@ fn broadcast_removes_disconnected_subscriber() {
     let (tx, rx) = test_sink();
     state.summary_subscribers.insert(1, tx);
     drop(rx); // Disconnect the receiver
-    state.broadcast(DaemonMessage::SessionDeleted { session_id: 42 });
+    state.broadcast(DaemonMessage::Session {
+        session_id: 42,
+        event: SessionEvent::SessionDeleted,
+    });
     // Dead subscriber should be removed
     assert!(!state.summary_subscribers.contains_key(&1));
 }
@@ -980,7 +990,10 @@ fn broadcast_enqueues_losslessly_and_evicts_over_lag_client() {
     state.summary_subscribers.insert(7, sink.clone());
     state.client_writers.insert(7, sink);
 
-    let msg = DaemonMessage::SessionDeleted { session_id: 42 };
+    let msg = DaemonMessage::Session {
+        session_id: 42,
+        event: SessionEvent::SessionDeleted,
+    };
     state.broadcast(msg.clone());
 
     // Lossless: the crossing message is still delivered, never dropped.
@@ -1612,11 +1625,13 @@ fn handle_broadcast_activity_sends_to_subscriber() {
     });
     drain_send_on_subscribe(&rx);
 
-    let msg = DaemonMessage::OutputChunk {
+    let msg = DaemonMessage::Session {
         session_id: 1,
-        request_id: 5,
-        stream: choreo_proto::OutputStream::Answer,
-        data: b"hello".to_vec(),
+        event: SessionEvent::OutputChunk {
+            request_id: 5,
+            stream: choreo_proto::OutputStream::Answer,
+            data: b"hello".to_vec(),
+        },
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(1),
@@ -1650,11 +1665,13 @@ fn handle_broadcast_activity_skips_dedup_for_session_subscriber() {
 
     // Broadcast a message FROM session 1 — should be SKIPPED for client 10
     // because they're already a direct subscriber of session 1.
-    let msg = DaemonMessage::OutputChunk {
+    let msg = DaemonMessage::Session {
         session_id: 1,
-        request_id: 5,
-        stream: choreo_proto::OutputStream::Answer,
-        data: b"hello".to_vec(),
+        event: SessionEvent::OutputChunk {
+            request_id: 5,
+            stream: choreo_proto::OutputStream::Answer,
+            data: b"hello".to_vec(),
+        },
     };
     // The origin is taken from the command field (Some(1)), not derived from
     // the message — so this session-1 message is suppressed for client 10.
@@ -1692,11 +1709,13 @@ fn handle_broadcast_activity_no_dedup_for_different_session() {
 
     // Broadcast a message FROM session 2 — client 10 is NOT a subscriber
     // of session 2, so the message should be delivered.
-    let msg = DaemonMessage::OutputChunk {
+    let msg = DaemonMessage::Session {
         session_id: 2,
-        request_id: 5,
-        stream: choreo_proto::OutputStream::Answer,
-        data: b"hello".to_vec(),
+        event: SessionEvent::OutputChunk {
+            request_id: 5,
+            stream: choreo_proto::OutputStream::Answer,
+            data: b"hello".to_vec(),
+        },
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(2),
@@ -1751,10 +1770,12 @@ fn handle_broadcast_activity_removes_disconnected_subscriber() {
     drop(rx);
 
     // Broadcast should detect the dead subscriber and remove it
-    let msg = DaemonMessage::SessionStatusChanged {
+    let msg = DaemonMessage::Session {
         session_id: 1,
-        status: SessionStatus::Inactive,
-        last_modified: 0,
+        event: SessionEvent::SessionStatusChanged {
+            status: SessionStatus::Inactive,
+            last_modified: 0,
+        },
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(1),
@@ -1792,11 +1813,13 @@ fn handle_broadcast_activity_evicts_over_lag_subscriber() {
     drain_send_on_subscribe(&rx);
 
     // The message crosses the tiny cap (OutputChunk payload ~70 bytes).
-    let broadcast = DaemonMessage::OutputChunk {
+    let broadcast = DaemonMessage::Session {
         session_id: 7,
-        request_id: 99,
-        stream: choreo_proto::OutputStream::Answer,
-        data: b"hello".to_vec(),
+        event: SessionEvent::OutputChunk {
+            request_id: 99,
+            stream: choreo_proto::OutputStream::Answer,
+            data: b"hello".to_vec(),
+        },
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(7),
@@ -1840,11 +1863,13 @@ fn handle_broadcast_activity_handles_multiple_clients() {
         session_id: 1,
     });
 
-    let msg = DaemonMessage::OutputChunk {
+    let msg = DaemonMessage::Session {
         session_id: 1,
-        request_id: 5,
-        stream: choreo_proto::OutputStream::Answer,
-        data: b"data".to_vec(),
+        event: SessionEvent::OutputChunk {
+            request_id: 5,
+            stream: choreo_proto::OutputStream::Answer,
+            data: b"data".to_vec(),
+        },
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(1),

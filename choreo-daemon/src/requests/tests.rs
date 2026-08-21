@@ -964,7 +964,10 @@ fn broadcast_turn_appended_sends_when_turn_exists() {
     broadcast_turn_appended(&tx, &session, 0, turn_id);
 
     match rx.try_recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::TurnAppended { turn_id: id, .. })) => {
+        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+            event: SessionEvent::TurnAppended { turn_id: id, .. },
+            ..
+        })) => {
             assert_eq!(id, turn_id);
         }
         Ok(_) => panic!("expected TurnAppended broadcast, got different command"),
@@ -1020,8 +1023,11 @@ fn broadcast_turn_appended_strips_reasoning_artifact() {
     broadcast_turn_appended(&tx, &session, 0, turn_id);
 
     match rx.try_recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
-            turn_id: id, turn, ..
+        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+            event: SessionEvent::TurnAppended {
+                turn_id: id, turn, ..
+            },
+            ..
         })) => {
             assert_eq!(id, turn_id);
             assert_eq!(turn.reasoning_artifact, None);
@@ -1081,7 +1087,10 @@ fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
     finalize_and_broadcast_turn(&mut session, &ctx, turn_id).unwrap();
 
     match cmd_rx.try_recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::TurnAppended { turn, .. })) => {
+        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+            event: SessionEvent::TurnAppended { turn, .. },
+            ..
+        })) => {
             assert_eq!(turn.reasoning_artifact, None);
             assert_eq!(turn.reasoning_producer, None);
             assert_eq!(turn.assistant_text.as_deref(), Some("hi"));
@@ -1156,7 +1165,10 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
     // that an error-bearing TurnAppended arrived.
     let mut saw_error_appended = false;
     while let Ok(msg) = cmd_rx.try_recv() {
-        if let SessionCommand::Broadcast(DaemonMessage::TurnAppended { turn, .. }) = msg
+        if let SessionCommand::Broadcast(DaemonMessage::Session {
+            event: SessionEvent::TurnAppended { turn, .. },
+            ..
+        }) = msg
             && let Some(err) = turn.error
         {
             assert_eq!(err, "client error (402): Insufficient Balance");
@@ -1715,7 +1727,10 @@ fn execute_tool_forwards_streaming_output() {
     // rides on ToolCallStarted + the seeded placeholder); the only chunk
     // is the tool's own payload from execute_streaming.
     match cmd_rx.recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
+        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+            event: SessionEvent::ToolResultChunk { data, .. },
+            ..
+        })) => {
             assert_eq!(data, b"streamed payload");
         }
         Ok(_other) => panic!("expected ToolResultChunk, got unexpected SessionCommand"),
@@ -1748,7 +1763,10 @@ fn forwarding_thread_drains_queued_output_before_kill() {
     kill_tx.send(()).expect("send kill");
 
     match cmd_rx.recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
+        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+            event: SessionEvent::ToolResultChunk { data, .. },
+            ..
+        })) => {
             assert_eq!(data, b"queued chunk");
         }
         Ok(_other) => panic!("expected ToolResultChunk, got unexpected SessionCommand"),
@@ -1773,7 +1791,10 @@ fn forwarding_thread_exits_when_output_disconnects() {
     drop(output_tx);
 
     match cmd_rx.recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
+        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+            event: SessionEvent::ToolResultChunk { data, .. },
+            ..
+        })) => {
             assert_eq!(data, b"last chunk");
         }
         Ok(_other) => panic!("expected ToolResultChunk, got unexpected SessionCommand"),
@@ -1828,7 +1849,10 @@ fn forwarding_thread_honors_kill_while_output_is_still_alive() {
     // The first queued chunk is forwarded (FIFO) before the kill is
     // honored; the rest of the kill-time burst may be drained too.
     match cmd_rx.recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
+        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+            event: SessionEvent::ToolResultChunk { data, .. },
+            ..
+        })) => {
             assert_eq!(data, b"chunk 0", "first queued chunk should be forwarded");
         }
         Ok(_other) => panic!("expected ToolResultChunk, got unexpected SessionCommand"),

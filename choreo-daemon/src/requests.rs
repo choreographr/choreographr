@@ -23,7 +23,7 @@ use choreo_ai_protocols::{
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
-    OutputStream, ReasoningProducer, SessionStatus, TokenUsage,
+    OutputStream, ReasoningProducer, SessionEvent, SessionStatus, TokenUsage,
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -45,10 +45,12 @@ fn broadcast_turn_appended(
     turn_id: u32,
 ) {
     if let Some(turn) = session.turns.get(&turn_id)
-        && let Err(e) = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
+        && let Err(e) = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::Session {
             session_id,
-            turn_id,
-            turn: turn_for_client(turn),
+            event: SessionEvent::TurnAppended {
+                turn_id,
+                turn: turn_for_client(turn),
+            },
         }))
     {
         warn!(%turn_id, error = %e, "failed to broadcast TurnAppended");
@@ -116,11 +118,13 @@ fn spawn_forwarding_thread(
                 recv(output_rx) -> msg => match msg {
                     Ok(data) => {
                         if cmd_tx
-                            .send(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk {
+                            .send(SessionCommand::Broadcast(DaemonMessage::Session {
                                 session_id,
-                                request_id,
-                                call_id: call_id.clone(),
-                                data,
+                                event: SessionEvent::ToolResultChunk {
+                                    request_id,
+                                    call_id: call_id.clone(),
+                                    data,
+                                },
                             }))
                             .is_err()
                         {
@@ -154,11 +158,13 @@ fn spawn_forwarding_thread(
                                 };
                                 if cmd_tx
                                     .send(SessionCommand::Broadcast(
-                                        DaemonMessage::ToolResultChunk {
+                                        DaemonMessage::Session {
                                             session_id,
-                                            request_id,
-                                            call_id: call_id.clone(),
-                                            data,
+                                            event: SessionEvent::ToolResultChunk {
+                                                request_id,
+                                                call_id: call_id.clone(),
+                                                data,
+                                            },
                                         },
                                     ))
                                     .is_err()
@@ -1226,11 +1232,13 @@ pub(crate) fn run_agent_loop(
 
         let _ = ctx
             .cmd_tx
-            .send(SessionCommand::Broadcast(DaemonMessage::Started {
+            .send(SessionCommand::Broadcast(DaemonMessage::Session {
                 session_id: ctx.session_id,
-                request_id,
-                turn_id: current_turn_id,
-                estimated_prompt_tokens,
+                event: SessionEvent::Started {
+                    request_id,
+                    turn_id: current_turn_id,
+                    estimated_prompt_tokens,
+                },
             }));
 
         let mut retry_cb: Option<choreo_ai_protocols::openai::RetryCallback> = Some(Box::new({
@@ -1265,43 +1273,51 @@ pub(crate) fn run_agent_loop(
                         if let Some(enc) = &encoding {
                             output_token_count += enc.count(&text) as u32;
                         }
-                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                            DaemonMessage::OutputChunk {
-                                session_id: ctx.session_id,
-                                request_id,
-                                stream: OutputStream::Answer,
-                                data: text.into_bytes(),
-                            },
-                        ));
+                        let _ =
+                            ctx.cmd_tx
+                                .send(SessionCommand::Broadcast(DaemonMessage::Session {
+                                    session_id: ctx.session_id,
+                                    event: SessionEvent::OutputChunk {
+                                        request_id,
+                                        stream: OutputStream::Answer,
+                                        data: text.into_bytes(),
+                                    },
+                                }));
                         // Let the UI update its live token display on every
                         // chunk so the count feels responsive.
-                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                            DaemonMessage::LiveOutputTokenCount {
-                                session_id: ctx.session_id,
-                                request_id,
-                                output_tokens: output_token_count,
-                            },
-                        ));
+                        let _ =
+                            ctx.cmd_tx
+                                .send(SessionCommand::Broadcast(DaemonMessage::Session {
+                                    session_id: ctx.session_id,
+                                    event: SessionEvent::LiveOutputTokenCount {
+                                        request_id,
+                                        output_tokens: output_token_count,
+                                    },
+                                }));
                     }
                     StreamEvent::Reasoning(text) => {
                         if let Some(enc) = &encoding {
                             output_token_count += enc.count(&text) as u32;
                         }
-                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                            DaemonMessage::OutputChunk {
-                                session_id: ctx.session_id,
-                                request_id,
-                                stream: OutputStream::Reasoning,
-                                data: text.into_bytes(),
-                            },
-                        ));
-                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                            DaemonMessage::LiveOutputTokenCount {
-                                session_id: ctx.session_id,
-                                request_id,
-                                output_tokens: output_token_count,
-                            },
-                        ));
+                        let _ =
+                            ctx.cmd_tx
+                                .send(SessionCommand::Broadcast(DaemonMessage::Session {
+                                    session_id: ctx.session_id,
+                                    event: SessionEvent::OutputChunk {
+                                        request_id,
+                                        stream: OutputStream::Reasoning,
+                                        data: text.into_bytes(),
+                                    },
+                                }));
+                        let _ =
+                            ctx.cmd_tx
+                                .send(SessionCommand::Broadcast(DaemonMessage::Session {
+                                    session_id: ctx.session_id,
+                                    event: SessionEvent::LiveOutputTokenCount {
+                                        request_id,
+                                        output_tokens: output_token_count,
+                                    },
+                                }));
                     }
                     // `StreamEvent` is #[non_exhaustive] — a future event kind
                     // this loop doesn't forward should be ignored, not crash
@@ -1495,13 +1511,15 @@ pub(crate) fn run_agent_loop(
 
                     if let Err(e) =
                         ctx.cmd_tx
-                            .send(SessionCommand::Broadcast(DaemonMessage::ToolCallStarted {
+                            .send(SessionCommand::Broadcast(DaemonMessage::Session {
                                 session_id: ctx.session_id,
-                                request_id,
-                                call_id: tool_call.id.clone(),
-                                tool_name: tool_call.name.clone(),
-                                arguments_json: tool_call.arguments_json.clone(),
-                                invocation_description: invocation_description.clone(),
+                                event: SessionEvent::ToolCallStarted {
+                                    request_id,
+                                    call_id: tool_call.id.clone(),
+                                    tool_name: tool_call.name.clone(),
+                                    arguments_json: tool_call.arguments_json.clone(),
+                                    invocation_description: invocation_description.clone(),
+                                },
                             }))
                     {
                         warn!(%request_id, call_id = %tool_call.id, error = %e, "failed to broadcast ToolCallStarted");
@@ -1595,16 +1613,19 @@ pub(crate) fn run_agent_loop(
                         // queued before the tool even starts.
                         let invocation_description =
                             description_by_call.get(&tc.id).cloned().unwrap_or_default();
-                        if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                            DaemonMessage::ToolCallStarted {
-                                session_id: ctx.session_id,
-                                request_id,
-                                call_id: tc.id.clone(),
-                                tool_name: tc.name.clone(),
-                                arguments_json: tc.arguments_json.clone(),
-                                invocation_description,
-                            },
-                        )) {
+                        if let Err(e) =
+                            ctx.cmd_tx
+                                .send(SessionCommand::Broadcast(DaemonMessage::Session {
+                                    session_id: ctx.session_id,
+                                    event: SessionEvent::ToolCallStarted {
+                                        request_id,
+                                        call_id: tc.id.clone(),
+                                        tool_name: tc.name.clone(),
+                                        arguments_json: tc.arguments_json.clone(),
+                                        invocation_description,
+                                    },
+                                }))
+                        {
                             warn!(%request_id, call_id = %tc.id, error = %e, "failed to broadcast ToolCallStarted");
                         }
                     }
@@ -1985,7 +2006,7 @@ pub(crate) fn run_agent_loop(
 /// Persist the finalized turn to the database and broadcast it to all
 /// connected clients.
 ///
-/// The final snapshot rides [`DaemonMessage::TurnAppended`] — the same
+/// The final snapshot rides [`SessionEvent::TurnAppended`] — the same
 /// delivery the turn already used when it was appended mid-stream.
 /// `TurnFinalized` (a second, redundant repair snapshot repeating an already
 /// delivered turn) was removed from the protocol entirely (v3);
@@ -2001,10 +2022,12 @@ fn finalize_and_broadcast_turn(
     if let Some(turn) = session.turns.get(&current_turn_id) {
         let _ = ctx
             .cmd_tx
-            .send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
+            .send(SessionCommand::Broadcast(DaemonMessage::Session {
                 session_id: ctx.session_id,
-                turn_id: current_turn_id,
-                turn: turn_for_client(turn),
+                event: SessionEvent::TurnAppended {
+                    turn_id: current_turn_id,
+                    turn: turn_for_client(turn),
+                },
             }));
     }
     Ok(())
@@ -2034,19 +2057,23 @@ fn finish_tool_call(
     broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, turn_id);
 
     let event = if is_error {
-        DaemonMessage::ToolCallFailed {
+        DaemonMessage::Session {
             session_id: ctx.session_id,
-            request_id,
-            call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
-            error: content,
+            event: SessionEvent::ToolCallFailed {
+                request_id,
+                call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                error: content,
+            },
         }
     } else {
-        DaemonMessage::ToolCallFinished {
+        DaemonMessage::Session {
             session_id: ctx.session_id,
-            request_id,
-            call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
+            event: SessionEvent::ToolCallFinished {
+                request_id,
+                call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+            },
         }
     };
     if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(event)) {
