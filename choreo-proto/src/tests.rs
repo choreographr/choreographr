@@ -360,7 +360,7 @@ fn done_tolerates_missing_optional_fields() {
                     ..
                 },
         } => {
-            assert_eq!(session_id, 1);
+            assert_eq!(session_id, Some(1));
             assert_eq!(request_id, 42);
             assert_eq!(token_usage, None);
         }
@@ -370,7 +370,7 @@ fn done_tolerates_missing_optional_fields() {
     // The same shape must round-trip through the actual v4 frame codec too
     // (the version gate stays consistent because all constants are local).
     let msg = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::Done {
             request_id: 42,
             token_usage: None,
@@ -385,7 +385,7 @@ fn done_tolerates_missing_optional_fields() {
 #[test]
 fn daemon_message_done_without_usage() {
     let msg = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::Done {
             request_id: 7,
             token_usage: None,
@@ -402,7 +402,7 @@ fn daemon_message_done_without_usage() {
                     ..
                 },
         } => {
-            assert_eq!(session_id, 1);
+            assert_eq!(session_id, Some(1));
             assert_eq!(request_id, 7);
             assert_eq!(token_usage, None);
         }
@@ -418,7 +418,7 @@ fn daemon_message_done_with_usage_round_trip() {
         total_tokens: 150,
     };
     let msg = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::Done {
             request_id: 3,
             token_usage: Some(usage),
@@ -437,7 +437,7 @@ fn daemon_message_done_with_usage_round_trip() {
                     ..
                 },
         } => {
-            assert_eq!(session_id, 1);
+            assert_eq!(session_id, Some(1));
             assert_eq!(request_id, 3);
             assert_eq!(token_usage, Some(usage));
         }
@@ -503,7 +503,7 @@ fn session_summary_some_token_usage_round_trip() {
 #[test]
 fn session_state_none_optionals_round_trip() {
     let state = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::SessionState {
             title: None,
             selected_model: None,
@@ -610,7 +610,7 @@ fn turn_appended_serde_round_trip() {
         reasoning_producer: None,
     };
     let msg = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::TurnAppended {
             turn_id: 1,
             turn: turn.clone(),
@@ -640,7 +640,7 @@ fn approx_wire_size_scales_with_payload() {
     // A variant carrying a 100-byte String must estimate at least 100 bytes:
     // the string payload itself dominates the serialized size.
     let msg = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::Failed {
             request_id: 1,
             error: "x".repeat(100),
@@ -667,7 +667,7 @@ fn approx_wire_size_scales_with_payload() {
     let turn_size = turn.approx_size();
     assert!(turn_size >= 100);
     let msg = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::TurnAppended {
             turn_id: 1,
             turn: turn.clone(),
@@ -676,7 +676,7 @@ fn approx_wire_size_scales_with_payload() {
     assert!(msg.approx_wire_size() >= turn_size);
     // A second copy of the same turn must not change the estimate.
     let msg2 = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::TurnAppended { turn_id: 1, turn },
     };
     assert_eq!(msg.approx_wire_size(), msg2.approx_wire_size());

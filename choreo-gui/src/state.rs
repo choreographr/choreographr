@@ -99,7 +99,7 @@ impl TurnEventHandler for AppState {
         self.session_view.request_to_turn.remove(&request_id);
     }
 
-    fn handle_failed(&mut self, _session_id: u64, request_id: u32, error: String) {
+    fn handle_failed(&mut self, _session_id: Option<u64>, request_id: u32, error: String) {
         trace!(%request_id, %error, "handle_failed");
         // A failed request never re-broadcasts its turn, so `insert_or_replace`
         // won't clean the description map — clear it here (before the

@@ -339,7 +339,7 @@ mod tests {
 
         let events1 = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::OutputChunk {
                     request_id: 1,
                     stream: OutputStream::Answer,
@@ -353,7 +353,7 @@ mod tests {
 
         let events2 = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::OutputChunk {
                     request_id: 1,
                     stream: OutputStream::Answer,
@@ -367,7 +367,7 @@ mod tests {
 
         let events3 = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::Done {
                     request_id: 1,
                     token_usage: None,
@@ -391,7 +391,7 @@ mod tests {
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::Done {
                     request_id: 999,
                     token_usage: None,
@@ -411,7 +411,7 @@ mod tests {
 
         daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::OutputChunk {
                     request_id: 1,
                     stream: OutputStream::Answer,
@@ -424,7 +424,7 @@ mod tests {
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::Failed {
                     request_id: 1,
                     error: "oops".into(),
@@ -438,7 +438,7 @@ mod tests {
 
         let events2 = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::Done {
                     request_id: 1,
                     token_usage: None,
@@ -458,7 +458,7 @@ mod tests {
 
         daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::OutputChunk {
                     request_id: 2,
                     stream: OutputStream::Answer,
@@ -471,7 +471,7 @@ mod tests {
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::Cancelled { request_id: 2 },
             },
             &mut buffers,
@@ -482,7 +482,7 @@ mod tests {
 
         let events2 = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::Done {
                     request_id: 2,
                     token_usage: None,
@@ -502,7 +502,7 @@ mod tests {
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::ToolCallStarted {
                     request_id: 1,
                     call_id: "call_1".into(),
@@ -535,7 +535,7 @@ mod tests {
         // First send a chunk so the buffer has content
         daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::ToolResultChunk {
                     request_id: 1,
                     call_id: "call_1".into(),
@@ -548,7 +548,7 @@ mod tests {
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::ToolCallFinished {
                     request_id: 1,
                     call_id: "call_1".into(),
@@ -575,7 +575,7 @@ mod tests {
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::ToolCallFailed {
                     request_id: 1,
                     call_id: "call_1".into(),
@@ -607,7 +607,7 @@ mod tests {
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::TurnAppended {
                     turn_id: 1,
                     turn: choreo_proto::Turn {
@@ -703,7 +703,7 @@ mod tests {
 
         let cases = vec![
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::SessionFailed {
                     operation: "attach".into(),
                     error: "session error".into(),
@@ -713,7 +713,7 @@ mod tests {
                 error: "already locked".into(),
             },
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::ModelSelectionFailed {
                     model: "gpt-4".into(),
                     error: "not available".into(),

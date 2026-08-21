@@ -2170,26 +2170,27 @@ impl App {
     /// Whether a daemon message carrying the given wire session id is
     /// background noise that must not write the global status/error line.
     ///
-    /// The daemon reports the attached session's own replies with the
-    /// sentinel id 0 (GetReasoningEffort replies, "no session attached"
-    /// errors), so the sentinel — like the attached session itself — keeps
-    /// its fall-through feedback.  Only a message about a real session that
-    /// is not the attached session is suppressed.
-    pub(crate) fn is_background_session_message(&self, reported_session_id: u64) -> bool {
-        reported_session_id != 0 && self.attached_session_id != Some(reported_session_id)
+    /// A connection-level reply (`None` — no origin session, e.g. a "no
+    /// session attached" failure) resolves to the attached session, so it —
+    /// like the attached session itself — keeps its fall-through feedback.
+    /// Only a message about a real session that is not the attached session
+    /// is suppressed.
+    pub(crate) fn is_background_session_message(&self, reported_session_id: Option<u64>) -> bool {
+        matches!(reported_session_id, Some(id) if self.attached_session_id != Some(id))
     }
 
     /// Resolve a daemon-reported session id to the session whose display it
-    /// should update.  The daemon uses id 0 as a sentinel for "the attached
-    /// session" (GetReasoningEffort replies, connection-level errors), which
-    /// would otherwise land in a phantom session-0 display and defeat the
-    /// attached-session routing in `is_background_session_message`.  Returns
-    /// `None` when the sentinel cannot be resolved — there is no session to
-    /// update.
-    pub(crate) fn resolve_daemon_session(&self, session_id: u64) -> Option<u64> {
+    /// should update.  A connection-level reply carries `None` (no origin
+    /// session — e.g. a "no session attached" failure, or a bare
+    /// `GetReasoningEffort` reply without an attachment) and resolves to the
+    /// attached session, so it never lands in a phantom display and defeats
+    /// the attached-session routing in `is_background_session_message`.
+    /// Returns `None` when there is no session to update — a `None` envelope
+    /// with nothing attached.
+    pub(crate) fn resolve_daemon_session(&self, session_id: Option<u64>) -> Option<u64> {
         match session_id {
-            0 => self.attached_session_id,
-            id => Some(id),
+            None => self.attached_session_id,
+            Some(id) => Some(id),
         }
     }
 
@@ -4214,11 +4215,10 @@ impl TurnEventHandler for App {
         last_prompt_tokens: Option<u32>,
     ) {
         tracing::trace!(%request_id, "handle_done");
-        // The daemon only ever reports a real session id here (Done always
-        // comes from the session task, which knows its id), but resolve the
-        // 0-sentinel anyway so this choke point can never write a phantom
-        // session-0 display if a connection-level path is ever added.
-        let Some(session_id) = self.resolve_daemon_session(session_id) else {
+        // Done always arrives with `Some` (the session task knows its id), but
+        // resolve defensively anyway so this choke point can never write to an
+        // unintended display if a connection-level path is ever added.
+        let Some(session_id) = self.resolve_daemon_session(Some(session_id)) else {
             return;
         };
         let display = self.display_for(session_id);
@@ -4247,17 +4247,16 @@ impl TurnEventHandler for App {
         display.mark_content_changed();
     }
 
-    fn handle_failed(&mut self, session_id: u64, request_id: u32, error: String) {
+    fn handle_failed(&mut self, session_id: Option<u64>, request_id: u32, error: String) {
         tracing::trace!(%request_id, %error, "handle_failed");
-        // The daemon uses id 0 as a sentinel for connection-level failures
-        // (e.g. "no session attached" from RunInput/SetModel/
-        // SetReasoningEffort) meaning "the attached session".  Resolve it so
-        // the failure lands in the session the user is actually attached to
-        // rather than a phantom session-0 display.
-        let reported = session_id;
-        let is_connection_level = reported == 0;
-        let Some(session_id) = self.resolve_daemon_session(reported) else {
-            tracing::debug!(%request_id, %error, "dropping failure: no attached session to route the 0-sentinel to");
+        // A connection-level failure (e.g. "no session attached" from
+        // RunInput/SetModel/SetReasoningEffort) arrives with `session_id:
+        // None` — no origin session — meaning "the attached session".  Resolve
+        // it so the failure lands in the session the user is actually attached
+        // to rather than a phantom display.
+        let is_connection_level = session_id.is_none();
+        let Some(session_id) = self.resolve_daemon_session(session_id) else {
+            tracing::debug!(%request_id, %error, "dropping failure: no attached session to route the connection-level failure to");
             // No display to update, but a connection-level rejection (e.g.
             // "no session attached") is exactly what the user needs to see
             // on the status line.
@@ -7785,8 +7784,8 @@ mod tests {
     #[test]
     fn handle_done_fires_full_rebuild() {
         let mut app = test_app();
-        // test_app's default display lives on session 0; treat it as attached
-        // so the 0-sentinel resolution keeps routing to it.
+        // test_app's default display lives on session 0; treat it as the
+        // attached session so `handle_done` routes to it.
         app.attached_session_id = Some(0);
         app.history_viewport.width = 80;
         app.history_viewport.height = 200;
@@ -7819,7 +7818,7 @@ mod tests {
     fn handle_failed_clears_streaming() {
         let mut app = test_app();
         // test_app's default display lives on session 0; treat it as attached
-        // so the 0-sentinel resolution keeps routing to it.
+        // so the connection-level (`None`) resolution keeps routing to it.
         app.attached_session_id = Some(0);
         {
             let display = app.active_display().unwrap();
@@ -7829,7 +7828,7 @@ mod tests {
             display.markers_dirty = false;
         }
 
-        app.handle_failed(0, 1, "oops".into());
+        app.handle_failed(None, 1, "oops".into());
 
         let display = app.active_display_ref().unwrap();
         assert!(display.streaming_turn_index.is_none());
@@ -7839,21 +7838,21 @@ mod tests {
     }
 
     #[test]
-    fn handle_failed_sentinel_zero_resolves_to_attached_session_without_phantom_display() {
-        // A connection-level "no session attached" failure arrives with the
-        // sentinel id 0.  It must land in the attached session's display and
-        // must NOT create a phantom session-0 display entry.
+    fn handle_failed_connection_level_resolves_to_attached_session_without_phantom_display() {
+        // A connection-level "no session attached" failure arrives with
+        // `session_id: None`.  It must land in the attached session's display
+        // and must NOT create a phantom display entry.
         let mut app = App::new();
         app.attached_session_id = Some(42);
         app.active_session_id = Some(42);
 
-        app.handle_failed(0, 7, "no session attached".into());
+        app.handle_failed(None, 7, "no session attached".into());
 
         let display = app.display_for(42);
         assert_eq!(display.error.as_deref(), Some("no session attached"));
         assert!(
             !app.session_displays.contains_key(&0),
-            "the 0-sentinel must not create a phantom session-0 display"
+            "a connection-level failure must not create a phantom session-0 display"
         );
     }
 
@@ -7868,7 +7867,11 @@ mod tests {
         app.active_session_id = Some(42);
         assert!(app.error.is_none());
 
-        app.handle_failed(42, 1, "client error (402): Insufficient Balance".into());
+        app.handle_failed(
+            Some(42),
+            1,
+            "client error (402): Insufficient Balance".into(),
+        );
 
         assert_eq!(
             app.error, None,
@@ -7883,15 +7886,15 @@ mod tests {
 
     #[test]
     fn handle_failed_connection_level_writes_global_error_for_attached_session() {
-        // The daemon's 0-sentinel marks a connection-level failure (e.g. "no
-        // session attached"), which has no turn to render an error block in:
-        // the global status/error bar is its only surface.
+        // A `session_id: None` envelope marks a connection-level failure (e.g.
+        // "no session attached"), which has no turn to render an error block
+        // in: the global status/error bar is its only surface.
         let mut app = App::new();
         app.attached_session_id = Some(42);
         app.active_session_id = Some(42);
         assert!(app.error.is_none());
 
-        app.handle_failed(0, 7, "no session attached".into());
+        app.handle_failed(None, 7, "no session attached".into());
 
         assert_eq!(app.error.as_deref(), Some("no session attached"));
         assert_eq!(
@@ -7900,20 +7903,20 @@ mod tests {
         );
         assert!(
             !app.session_displays.contains_key(&0),
-            "the 0-sentinel must not create a phantom session-0 display"
+            "a connection-level failure must not create a phantom session-0 display"
         );
     }
 
     #[test]
     fn handle_failed_connection_level_without_attached_session_still_writes_global_error() {
-        // A connection-level rejection with no session to route the sentinel
-        // to has no display to update, but the user must still see it on the
+        // A connection-level rejection with no attached session to resolve to
+        // has no display to update, but the user must still see it on the
         // status line — there is no transcript block for it.
         let mut app = test_app();
         app.attached_session_id = None;
         assert!(app.error.is_none());
 
-        app.handle_failed(0, 9, "no session attached".into());
+        app.handle_failed(None, 9, "no session attached".into());
 
         assert_eq!(app.error.as_deref(), Some("no session attached"));
     }
@@ -7930,7 +7933,7 @@ mod tests {
         app.active_session_id = Some(42);
         assert!(app.error.is_none());
 
-        app.handle_failed(99, 3, "background failure".into());
+        app.handle_failed(Some(99), 3, "background failure".into());
 
         assert_eq!(
             app.error, None,

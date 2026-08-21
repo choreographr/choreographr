@@ -800,7 +800,7 @@ fn handle_sync_message(
         },
 
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionCreated { .. },
             ..
         } => {
@@ -853,7 +853,7 @@ fn handle_sync_message(
         }
 
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionDeleted,
             ..
         } => {
@@ -868,7 +868,7 @@ fn handle_sync_message(
         }
 
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionDeleteFailed { error },
             ..
         } => {

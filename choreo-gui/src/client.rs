@@ -155,14 +155,14 @@ fn handle_session_message(
 ) -> bool {
     match message {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionCreated { .. } | SessionEvent::SessionAttached,
         } => {
-            // The `session_id` binding now comes from the shared `Session`
-            // envelope, so both moved variants match through one arm while
-            // the inner or-pattern discriminates only on the event.
-            // Record the new attached session id, but let dispatch emit the
-            // informational text message.
+            // The envelope's `session_id` is now `Option<u64>`; these two
+            // events are always session-scoped (the daemon never emits them
+            // with `None`), so binding `Some(session_id)` gives us the origin
+            // session id directly. Record the new attached session id, but
+            // let dispatch emit the informational text message.
             state.attached_session_id = Some(*session_id);
             false
         }

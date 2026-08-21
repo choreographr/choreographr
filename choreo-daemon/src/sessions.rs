@@ -574,7 +574,7 @@ impl SessionState {
                 &mut self.subscribers,
                 ctx,
                 DaemonMessage::Session {
-                    session_id: ctx.session_id,
+                    session_id: Some(ctx.session_id),
                     event: SessionEvent::ContextWindowResolved { context_window: cw },
                 },
             );
@@ -616,7 +616,7 @@ impl SessionState {
             Some(model_reasoning_capability(slug, model))
         });
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionState {
                 title: self.config.title.clone(),
                 selected_model: self.config.selected_model.clone(),
@@ -912,7 +912,7 @@ fn fail_request(
         subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::Started {
                 request_id,
                 turn_id: 0,
@@ -924,7 +924,7 @@ fn fail_request(
         subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::Failed {
                 request_id,
                 error: error.into(),
@@ -1230,7 +1230,7 @@ fn handle_run_input(
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::Started {
                 request_id,
                 turn_id: state.next_turn_id,
@@ -1300,7 +1300,7 @@ fn handle_run_child_input(
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::Started {
                 request_id,
                 turn_id: state.next_turn_id,
@@ -1358,7 +1358,7 @@ fn handle_cancel(request_id: u32, state: &mut SessionState, ctx: &RequestContext
                 &mut state.subscribers,
                 ctx,
                 DaemonMessage::Session {
-                    session_id: ctx.session_id,
+                    session_id: Some(ctx.session_id),
                     event: SessionEvent::Cancelled { request_id: rid },
                 },
             );
@@ -1383,7 +1383,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
             &mut state.subscribers,
             ctx,
             DaemonMessage::Session {
-                session_id: ctx.session_id,
+                session_id: Some(ctx.session_id),
                 event: SessionEvent::ModelSelectionFailed { model, error: msg },
             },
         );
@@ -1405,7 +1405,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
             &mut state.subscribers,
             ctx,
             DaemonMessage::Session {
-                session_id: ctx.session_id,
+                session_id: Some(ctx.session_id),
                 event: SessionEvent::ContextWindowResolved { context_window: cw },
             },
         );
@@ -1433,7 +1433,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
             &mut state.subscribers,
             ctx,
             DaemonMessage::Session {
-                session_id: ctx.session_id,
+                session_id: Some(ctx.session_id),
                 event: SessionEvent::ReasoningEffortSet {
                     effort: "off".to_string(),
                 },
@@ -1449,7 +1449,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::ModelSelected {
                 model: model.clone(),
                 reasoning_capability: capability,
@@ -1517,7 +1517,7 @@ fn handle_status_changed(
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::SessionStatusChanged {
                 status: new_status.clone(),
                 last_modified,
@@ -1577,7 +1577,7 @@ fn handle_attach(
         for (&request_id, active) in &state.active_requests {
             tx.send_unchecked(
                 &DaemonMessage::Session {
-                    session_id: ctx.session_id,
+                    session_id: Some(ctx.session_id),
                     event: SessionEvent::Started {
                         request_id,
                         turn_id: active.turn_id,
@@ -1776,7 +1776,7 @@ fn handle_request_finished(
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified,
@@ -1833,7 +1833,7 @@ fn handle_sync_accumulated_usage(
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::TokenUsageUpdate {
                 token_usage: state.config.accumulated_usage,
                 last_prompt_tokens: state.config.last_prompt_tokens,
@@ -1884,7 +1884,7 @@ fn handle_set_title(title: String, state: &mut SessionState, ctx: &RequestContex
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::SessionTitleSet {
                 title: title.clone(),
             },
@@ -1931,7 +1931,7 @@ fn handle_set_working_dir(
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::SessionWorkingDirSet {
                 path: Some(path.to_string_lossy().into_owned()),
             },
@@ -2042,7 +2042,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
                     &mut state.subscribers,
                     ctx,
                     DaemonMessage::Session {
-                        session_id: ctx.session_id,
+                        session_id: Some(ctx.session_id),
                         event: SessionEvent::ContextWindowResolved { context_window: cw },
                     },
                 );
@@ -2060,7 +2060,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::SessionAccountSet { account: name },
         },
     );
@@ -2082,7 +2082,7 @@ fn handle_set_reasoning_effort(
             &mut state.subscribers,
             ctx,
             DaemonMessage::Session {
-                session_id: ctx.session_id,
+                session_id: Some(ctx.session_id),
                 event: SessionEvent::ReasoningEffortSetFailed { effort, error: msg },
             },
         );
@@ -2119,7 +2119,7 @@ fn handle_set_reasoning_effort(
             &mut state.subscribers,
             ctx,
             DaemonMessage::Session {
-                session_id: ctx.session_id,
+                session_id: Some(ctx.session_id),
                 event: SessionEvent::ReasoningEffortSet { effort },
             },
         );
@@ -2132,7 +2132,7 @@ fn handle_set_reasoning_effort(
             &mut state.subscribers,
             ctx,
             DaemonMessage::Session {
-                session_id: ctx.session_id,
+                session_id: Some(ctx.session_id),
                 event: SessionEvent::ReasoningEffortSetFailed { effort, error: msg },
             },
         );
@@ -2205,7 +2205,7 @@ fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::TurnsUndone { turn_ids },
         },
     );
@@ -2236,7 +2236,7 @@ fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
         &mut state.subscribers,
         ctx,
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::TurnsRedone {
                 turns: turns
                     .iter()
@@ -2261,7 +2261,7 @@ fn handle_shutdown(
             &mut state.subscribers,
             ctx,
             DaemonMessage::Session {
-                session_id: ctx.session_id,
+                session_id: Some(ctx.session_id),
                 event: SessionEvent::Cancelled { request_id },
             },
         );
@@ -2324,7 +2324,7 @@ fn run_request_worker(
             let _ = ctx
                 .cmd_tx
                 .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                    session_id: ctx.session_id,
+                    session_id: Some(ctx.session_id),
                     event: SessionEvent::Done {
                         request_id,
                         token_usage: Some(*usage),
@@ -2338,7 +2338,7 @@ fn run_request_worker(
             let _ = ctx
                 .cmd_tx
                 .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                    session_id: ctx.session_id,
+                    session_id: Some(ctx.session_id),
                     event: SessionEvent::Failed {
                         request_id,
                         error: error.to_string(),

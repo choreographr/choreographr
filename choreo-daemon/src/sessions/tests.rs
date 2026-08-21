@@ -327,7 +327,7 @@ fn broadcast_delivers_message_to_all_subscribers() {
     let mut shutdown = false;
     process_command(
         SessionCommand::Broadcast(DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::Done {
                 request_id: 5,
                 token_usage: None,
@@ -342,7 +342,7 @@ fn broadcast_delivers_message_to_all_subscribers() {
     assert_eq!(
         rx1.recv().unwrap(),
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::Done {
                 request_id: 5,
                 token_usage: None,
@@ -353,7 +353,7 @@ fn broadcast_delivers_message_to_all_subscribers() {
     assert_eq!(
         rx2.recv().unwrap(),
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::Done {
                 request_id: 5,
                 token_usage: None,
@@ -370,7 +370,7 @@ fn broadcast_with_no_subscribers_does_not_panic() {
     let mut shutdown = false;
     process_command(
         SessionCommand::Broadcast(DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::Done {
                 request_id: 0,
                 token_usage: None,
@@ -417,7 +417,7 @@ fn broadcast_enqueues_losslessly_and_signals_eviction() {
 
     // A message large enough to cross the tiny per-client cap.
     let broadcast = DaemonMessage::Session {
-        session_id: ctx.session_id,
+        session_id: Some(ctx.session_id),
         event: SessionEvent::Failed {
             request_id: 5,
             error: "x".repeat(100),
@@ -472,7 +472,7 @@ fn set_working_dir_updates_config_and_broadcasts() {
     // Subscribers should receive the SessionWorkingDirSet broadcast.
     match rx.recv().unwrap() {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionWorkingDirSet { path },
         } => {
             assert_eq!(session_id, ctx.session_id);
@@ -1085,7 +1085,7 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
     let msg = sub_rx.recv().unwrap();
     match msg {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event:
                 SessionEvent::TokenUsageUpdate {
                     token_usage,
@@ -1263,7 +1263,7 @@ fn attach_with_active_requests_sends_started_to_new_subscriber() {
     // Expect Start messages for each active request, in insertion order.
     match sub_rx.recv().unwrap() {
         DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event:
                 SessionEvent::Started {
                     request_id: 10,
@@ -1275,7 +1275,7 @@ fn attach_with_active_requests_sends_started_to_new_subscriber() {
     }
     match sub_rx.recv().unwrap() {
         DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event:
                 SessionEvent::Started {
                     request_id: 20,

@@ -3412,7 +3412,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 7,
+            session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
                 selected_model: None,
@@ -3461,7 +3461,7 @@ fn daemon_message_session_state_sets_tool_groups() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 7,
+            session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
                 selected_model: None,
@@ -3493,7 +3493,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99, // different from attached_session_id
+            session_id: Some(99), // different from attached_session_id
             event: SessionEvent::SessionState {
                 title: None,
                 selected_model: None,
@@ -3552,7 +3552,7 @@ fn daemon_message_done_with_token_usage_updates_progress() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: Some(0),
             event: SessionEvent::Done {
                 request_id: 1,
                 token_usage: Some(TokenUsage {
@@ -3586,7 +3586,7 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: Some(0),
             event: SessionEvent::Done {
                 request_id: 1,
                 token_usage: None,
@@ -3619,7 +3619,7 @@ fn live_output_token_count_from_background_session_does_not_pollute_status_bar()
     // live output-token count while the user keeps looking at session 0.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 7,
+            session_id: Some(7),
             event: SessionEvent::LiveOutputTokenCount {
                 request_id: 50,
                 output_tokens: 99,
@@ -3661,7 +3661,7 @@ fn live_output_token_count_updates_own_session_after_switch() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 7,
+            session_id: Some(7),
             event: SessionEvent::LiveOutputTokenCount {
                 request_id: 50,
                 output_tokens: 42,
@@ -3704,7 +3704,7 @@ fn session_state_snapshot_does_not_regress_fresher_token_usage() {
     // regress the status bar's token readout.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 7,
+            session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
                 selected_model: None,
@@ -3756,7 +3756,7 @@ fn session_state_snapshot_with_newer_larger_usage_updates_display() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 7,
+            session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
                 selected_model: None,
@@ -3808,7 +3808,7 @@ fn session_state_snapshot_does_not_regress_fresher_last_prompt_tokens() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 7,
+            session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
                 selected_model: None,
@@ -3848,7 +3848,7 @@ fn session_state_snapshot_fills_missing_last_prompt_tokens() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 7,
+            session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
                 selected_model: None,
@@ -3996,7 +3996,7 @@ fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() 
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 7,
+            session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
                 selected_model: None,
@@ -4067,7 +4067,7 @@ fn done_for_background_session_does_not_pollute_attached_display() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 7,
+            session_id: Some(7),
             event: SessionEvent::Done {
                 request_id: 50,
                 token_usage: Some(TokenUsage {
@@ -4856,7 +4856,7 @@ fn reasoning_effort_set_updates_session_state() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
@@ -4866,9 +4866,9 @@ fn reasoning_effort_set_updates_session_state() {
     )
     .expect("handle ReasoningEffortSet");
 
-    // The daemon reports the attached session's effort (bare `/reasoning`)
-    // with the sentinel id 0 — it must resolve to the attached session's
-    // display rather than a phantom session-0 entry.
+    // A connection-level ReasoningEffortSet reply (bare `/reasoning` without
+    // an attachment) arrives with `session_id: None` — it must resolve to the
+    // attached session's display rather than a phantom entry.
     assert_eq!(
         app.display_for(42).reasoning_effort.as_deref(),
         Some("high")
@@ -4876,7 +4876,7 @@ fn reasoning_effort_set_updates_session_state() {
     assert_eq!(
         app.display_for(0).reasoning_effort.as_deref(),
         None,
-        "the 0-sentinel must resolve to the attached session, not a phantom display"
+        "a connection-level reply must resolve to the attached session, not a phantom display"
     );
 }
 
@@ -4897,7 +4897,7 @@ fn reasoning_effort_set_for_background_session_does_not_touch_attached_display()
     // session's settings bleed into the status bar of the session being viewed.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
@@ -4934,7 +4934,7 @@ fn model_selected_for_background_session_does_not_touch_attached_display() {
     // not show the background session's model in its status bar.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::ModelSelected {
                 model: "gpt-other".to_string(),
                 reasoning_capability: None,
@@ -4970,7 +4970,7 @@ fn model_selected_for_attached_session_updates_display_and_summary() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::ModelSelected {
                 model: "gpt-new".to_string(),
                 reasoning_capability: None,
@@ -5008,7 +5008,7 @@ fn reasoning_effort_set_for_attached_session_updates_display_and_summary() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
@@ -5043,7 +5043,7 @@ fn session_account_set_for_background_session_does_not_touch_attached_display() 
     // identity fields (account, provider slug) must not change.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::SessionAccountSet {
                 account: "bg-account".to_string(),
             },
@@ -5076,7 +5076,7 @@ fn reasoning_effort_set_failed_for_background_session_does_not_touch_attached_di
     // reasoning-effort display back to "off".
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::ReasoningEffortSetFailed {
                 effort: "high".to_string(),
                 error: "model does not support reasoning".to_string(),
@@ -5119,7 +5119,7 @@ fn model_selected_for_background_session_does_not_write_global_status() {
     // is updated, but the global status/error line must stay untouched.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::ModelSelected {
                 model: "gpt-other".to_string(),
                 reasoning_capability: None,
@@ -5156,7 +5156,7 @@ fn model_selected_for_attached_session_writes_status_feedback() {
     // the generic dispatch fall-through.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::ModelSelected {
                 model: "gpt-new".to_string(),
                 reasoning_capability: None,
@@ -5188,7 +5188,7 @@ fn reasoning_effort_set_for_background_session_does_not_write_global_status() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
@@ -5215,7 +5215,7 @@ fn reasoning_effort_set_for_attached_session_writes_status_feedback() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
@@ -5246,7 +5246,7 @@ fn session_account_set_for_background_session_does_not_write_global_status() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::SessionAccountSet {
                 account: "bg-account".to_string(),
             },
@@ -5273,7 +5273,7 @@ fn session_account_set_for_attached_session_writes_status_feedback() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::SessionAccountSet {
                 account: "main".to_string(),
             },
@@ -5303,7 +5303,7 @@ fn reasoning_effort_set_failed_for_background_session_does_not_write_global_stat
     // explicit `app.status` write and the generic dispatch's `app.error`.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::ReasoningEffortSetFailed {
                 effort: "high".to_string(),
                 error: "model does not support reasoning".to_string(),
@@ -5336,7 +5336,7 @@ fn reasoning_effort_set_failed_for_attached_session_writes_status_and_error() {
     // on the status line and the generic dispatch records the error.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::ReasoningEffortSetFailed {
                 effort: "high".to_string(),
                 error: "model does not support reasoning".to_string(),
@@ -5358,28 +5358,29 @@ fn reasoning_effort_set_failed_for_attached_session_writes_status_and_error() {
     assert_eq!(app.display_for(42).reasoning_effort.as_deref(), Some("off"));
 }
 
-// ── Daemon 0-sentinel ("attached session") and ModelSelectionFailed gating ──
+// ── Connection-level `session_id: None` and ModelSelectionFailed gating ──
 //
-// The daemon replies to bare `/reasoning` (GetReasoningEffort) and sends some
-// connection-level errors with session_id = 0 meaning "the attached session".
-// Those must keep their fall-through feedback — they are the user's own
-// command replies, not background noise.  ModelSelectionFailed is the failure
-// counterpart of ModelSelected and must be gated the same way for background
-// sessions.
+// The daemon replies to bare `/reasoning` (GetReasoningEffort) without an
+// attachment, and sends other connection-level errors, with `session_id: None`
+// meaning "resolve to the attached session".  Those must keep their
+// fall-through feedback — they are the user's own command replies, not
+// background noise.  ModelSelectionFailed is the failure counterpart of
+// ModelSelected and must be gated the same way for background sessions.
 
 #[test]
-fn reasoning_effort_set_with_sentinel_zero_writes_status_feedback_for_attached_session() {
+fn reasoning_effort_set_connection_level_writes_status_feedback_for_attached_session() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
-    // The daemon reports the attached session's effort (bare `/reasoning`)
-    // with the sentinel id 0.  It must be treated as the user's own feedback,
-    // not swallowed as background noise.
+    // A connection-level ReasoningEffortSet (bare `/reasoning` without an
+    // attachment) arrives with `session_id: None` and resolves to the
+    // attached session.  It must be treated as the user's own feedback, not
+    // swallowed as background noise.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
@@ -5392,7 +5393,7 @@ fn reasoning_effort_set_with_sentinel_zero_writes_status_feedback_for_attached_s
     assert_eq!(
         app.status.as_deref(),
         Some("[daemon] reasoning effort: high"),
-        "bare /reasoning feedback must be preserved for the sentinel id"
+        "bare /reasoning feedback must be preserved for a connection-level reply"
     );
     assert_eq!(
         app.display_for(42).reasoning_effort.as_deref(),
@@ -5402,24 +5403,24 @@ fn reasoning_effort_set_with_sentinel_zero_writes_status_feedback_for_attached_s
     assert_eq!(
         app.display_for(0).reasoning_effort.as_deref(),
         None,
-        "the sentinel must not write a phantom session-0 display"
+        "a connection-level reply must not write a phantom session-0 display"
     );
     assert_eq!(app.error, None);
 }
 
 #[test]
-fn reasoning_effort_set_failed_with_sentinel_zero_writes_status_and_error() {
+fn reasoning_effort_set_failed_connection_level_writes_status_and_error() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
-    // The daemon sends ReasoningEffortSetFailed with the sentinel id 0 for
+    // The daemon sends ReasoningEffortSetFailed with `session_id: None` for
     // connection-level rejections ("no session attached").  The user must see
     // the rejection of their own /reasoning command.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ReasoningEffortSetFailed {
                 effort: "high".to_string(),
                 error: "no session attached".to_string(),
@@ -5455,7 +5456,7 @@ fn model_selection_failed_for_background_session_does_not_write_global_error() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::ModelSelectionFailed {
                 model: "gpt-other".to_string(),
                 error: "model not found".to_string(),
@@ -5484,7 +5485,7 @@ fn model_selection_failed_for_attached_session_writes_global_error() {
     // surfaced via the generic dispatch's error write.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::ModelSelectionFailed {
                 model: "gpt-x".to_string(),
                 error: "model not found".to_string(),
@@ -5503,17 +5504,17 @@ fn model_selection_failed_for_attached_session_writes_global_error() {
 }
 
 #[test]
-fn model_selection_failed_with_sentinel_zero_writes_global_error() {
+fn model_selection_failed_connection_level_writes_global_error() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
-    // No session attached at the daemon connection level — the sentinel must
-    // keep its error feedback, not be swallowed as background noise.
+    // No session attached at the daemon connection level — the `None` reply
+    // must keep its error feedback, not be swallowed as background noise.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ModelSelectionFailed {
                 model: "gpt-x".to_string(),
                 error: "no session attached".to_string(),
@@ -5544,7 +5545,7 @@ fn session_created_for_sub_session_does_not_hijack_chat_view() {
     // parent_session_id = Some(parent).  The TUI must not switch to it.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::SessionCreated {
                 parent_session_id: Some(42),
                 title: None,
@@ -5600,7 +5601,7 @@ fn session_created_for_sub_session_on_session_manager_refreshes_list() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::SessionCreated {
                 parent_session_id: Some(42),
                 title: None,
@@ -5644,7 +5645,7 @@ fn session_created_for_user_session_attaches_on_chat_page() {
     // behavior: switch the view and attach.
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::SessionCreated {
                 parent_session_id: None,
                 title: None,
@@ -5775,7 +5776,7 @@ fn subsession_finish_switches_back_to_parent_with_notification() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified: 1705315000000,
@@ -5832,7 +5833,7 @@ fn subsession_finish_does_not_fire_on_duplicate_idle_broadcast() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified: 1705315000000,
@@ -5862,7 +5863,7 @@ fn top_level_session_finish_does_not_switch() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified: 1705315000000,
@@ -5894,7 +5895,7 @@ fn subsession_finish_with_missing_parent_does_not_switch() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 99,
+            session_id: Some(99),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified: 1705315000000,
@@ -5949,7 +5950,7 @@ fn session_attached_does_not_regress_accumulated_live_state() {
 
     handle_daemon_message(
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::SessionAttached,
         },
         &mut app,

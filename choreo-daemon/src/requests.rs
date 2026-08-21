@@ -46,7 +46,7 @@ fn broadcast_turn_appended(
 ) {
     if let Some(turn) = session.turns.get(&turn_id)
         && let Err(e) = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::TurnAppended {
                 turn_id,
                 turn: turn_for_client(turn),
@@ -119,7 +119,7 @@ fn spawn_forwarding_thread(
                     Ok(data) => {
                         if cmd_tx
                             .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                session_id,
+                                session_id: Some(session_id),
                                 event: SessionEvent::ToolResultChunk {
                                     request_id,
                                     call_id: call_id.clone(),
@@ -159,7 +159,7 @@ fn spawn_forwarding_thread(
                                 if cmd_tx
                                     .send(SessionCommand::Broadcast(
                                         DaemonMessage::Session {
-                                            session_id,
+                                            session_id: Some(session_id),
                                             event: SessionEvent::ToolResultChunk {
                                                 request_id,
                                                 call_id: call_id.clone(),
@@ -1233,7 +1233,7 @@ pub(crate) fn run_agent_loop(
         let _ = ctx
             .cmd_tx
             .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                session_id: ctx.session_id,
+                session_id: Some(ctx.session_id),
                 event: SessionEvent::Started {
                     request_id,
                     turn_id: current_turn_id,
@@ -1276,7 +1276,7 @@ pub(crate) fn run_agent_loop(
                         let _ =
                             ctx.cmd_tx
                                 .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                    session_id: ctx.session_id,
+                                    session_id: Some(ctx.session_id),
                                     event: SessionEvent::OutputChunk {
                                         request_id,
                                         stream: OutputStream::Answer,
@@ -1288,7 +1288,7 @@ pub(crate) fn run_agent_loop(
                         let _ =
                             ctx.cmd_tx
                                 .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                    session_id: ctx.session_id,
+                                    session_id: Some(ctx.session_id),
                                     event: SessionEvent::LiveOutputTokenCount {
                                         request_id,
                                         output_tokens: output_token_count,
@@ -1302,7 +1302,7 @@ pub(crate) fn run_agent_loop(
                         let _ =
                             ctx.cmd_tx
                                 .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                    session_id: ctx.session_id,
+                                    session_id: Some(ctx.session_id),
                                     event: SessionEvent::OutputChunk {
                                         request_id,
                                         stream: OutputStream::Reasoning,
@@ -1312,7 +1312,7 @@ pub(crate) fn run_agent_loop(
                         let _ =
                             ctx.cmd_tx
                                 .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                    session_id: ctx.session_id,
+                                    session_id: Some(ctx.session_id),
                                     event: SessionEvent::LiveOutputTokenCount {
                                         request_id,
                                         output_tokens: output_token_count,
@@ -1512,7 +1512,7 @@ pub(crate) fn run_agent_loop(
                     if let Err(e) =
                         ctx.cmd_tx
                             .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                session_id: ctx.session_id,
+                                session_id: Some(ctx.session_id),
                                 event: SessionEvent::ToolCallStarted {
                                     request_id,
                                     call_id: tool_call.id.clone(),
@@ -1616,7 +1616,7 @@ pub(crate) fn run_agent_loop(
                         if let Err(e) =
                             ctx.cmd_tx
                                 .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                    session_id: ctx.session_id,
+                                    session_id: Some(ctx.session_id),
                                     event: SessionEvent::ToolCallStarted {
                                         request_id,
                                         call_id: tc.id.clone(),
@@ -2023,7 +2023,7 @@ fn finalize_and_broadcast_turn(
         let _ = ctx
             .cmd_tx
             .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                session_id: ctx.session_id,
+                session_id: Some(ctx.session_id),
                 event: SessionEvent::TurnAppended {
                     turn_id: current_turn_id,
                     turn: turn_for_client(turn),
@@ -2058,7 +2058,7 @@ fn finish_tool_call(
 
     let event = if is_error {
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::ToolCallFailed {
                 request_id,
                 call_id: tool_call.id.clone(),
@@ -2068,7 +2068,7 @@ fn finish_tool_call(
         }
     } else {
         DaemonMessage::Session {
-            session_id: ctx.session_id,
+            session_id: Some(ctx.session_id),
             event: SessionEvent::ToolCallFinished {
                 request_id,
                 call_id: tool_call.id.clone(),

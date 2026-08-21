@@ -701,7 +701,7 @@ impl DaemonState {
         let _ = reply.send(Ok((sid, session_tx)));
         crate::metrics::record_session_created();
         let created_msg = DaemonMessage::Session {
-            session_id: sid,
+            session_id: Some(sid),
             event: SessionEvent::SessionCreated {
                 title,
                 parent_session_id,
@@ -712,7 +712,7 @@ impl DaemonState {
             },
         };
         let status_msg = DaemonMessage::Session {
-            session_id: sid,
+            session_id: Some(sid),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 // Copy the creation timestamp before `record` is moved into
@@ -890,7 +890,7 @@ impl DaemonState {
         // session the user removed.
         if self.session_metadata.contains_key(&session_id) {
             let msg = DaemonMessage::Session {
-                session_id,
+                session_id: Some(session_id),
                 event: SessionEvent::SessionStatusChanged {
                     status: SessionStatus::Sleeping,
                     last_modified,
@@ -1476,7 +1476,7 @@ impl DaemonState {
         }
         self.session_metadata.remove(&session_id);
         self.broadcast(DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionDeleted,
         });
         Ok(())
@@ -1559,7 +1559,7 @@ impl DaemonState {
         // cleaned up in the background.
         self.session_metadata.remove(&session_id);
         self.broadcast(DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionDeleted,
         });
         Ok(())

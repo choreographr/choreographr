@@ -272,7 +272,7 @@ mod tests {
 
     fn status_msg(session_id: u64) -> DaemonMessage {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified: 0,
@@ -331,7 +331,7 @@ mod tests {
             global_budget: usize::MAX, // isolate the per-client threshold
         };
         let payload_msg = || DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event: SessionEvent::Failed {
                 request_id: 1,
                 error: "x".repeat(100),
@@ -384,7 +384,7 @@ mod tests {
 
         // A big message pushes the daemon-wide total over the budget.
         let m2 = DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event: SessionEvent::Failed {
                 request_id: 2,
                 error: "y".repeat(200),
@@ -472,14 +472,14 @@ mod tests {
 
         // Two messages of known size: Failed with 100-byte and 50-byte errors.
         let m1 = DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event: SessionEvent::Failed {
                 request_id: 1,
                 error: "a".repeat(100),
             },
         };
         let m2 = DaemonMessage::Session {
-            session_id: 2,
+            session_id: Some(2),
             event: SessionEvent::Failed {
                 request_id: 2,
                 error: "b".repeat(50),

@@ -211,7 +211,7 @@ fn noise_list_sessions_round_trip() {
     client.send(create_session());
     match client.recv() {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionCreated { .. },
         } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
@@ -287,7 +287,7 @@ fn noise_and_unix_share_daemon_state() {
     noise_client.send(create_session());
     match noise_client.recv() {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionCreated { .. },
         } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
@@ -375,7 +375,7 @@ fn noise_subscribe_receives_session_broadcasts() {
     client_b.send(create_session());
     match client_b.recv() {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionCreated { .. },
         } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
@@ -391,14 +391,14 @@ fn noise_subscribe_receives_session_broadcasts() {
     for _ in 0..2 {
         match client_a.recv() {
             DaemonMessage::Session {
-                session_id,
+                session_id: Some(session_id),
                 event: SessionEvent::SessionCreated { .. },
             } => {
                 assert_eq!(session_id, 1);
                 saw_created = true;
             }
             DaemonMessage::Session {
-                session_id,
+                session_id: Some(session_id),
                 event: SessionEvent::SessionStatusChanged { .. },
             } => {
                 assert_eq!(session_id, 1);
@@ -428,14 +428,14 @@ fn noise_subscribe_receives_session_broadcasts() {
     for _ in 0..3 {
         match client_a.recv() {
             DaemonMessage::Session {
-                session_id,
+                session_id: Some(session_id),
                 event: SessionEvent::SessionCreated { .. },
             } => {
                 assert_eq!(session_id, 2);
                 created_2 += 1;
             }
             DaemonMessage::Session {
-                session_id,
+                session_id: Some(session_id),
                 event: SessionEvent::SessionStatusChanged { .. },
             } => {
                 assert_eq!(session_id, 2);
@@ -612,7 +612,7 @@ fn noise_large_message_daemon_to_client() {
         });
         match client.recv() {
             DaemonMessage::Session {
-                session_id,
+                session_id: Some(session_id),
                 event: SessionEvent::SessionCreated { .. },
             } => {
                 assert_eq!(session_id, (i + 1) as u64)

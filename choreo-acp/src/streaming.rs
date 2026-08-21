@@ -231,7 +231,7 @@ mod tests {
 
     fn output_chunk(stream: choreo_proto::OutputStream, data: &str) -> DaemonMessage {
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::OutputChunk {
                 request_id: 1,
                 stream,
@@ -242,7 +242,7 @@ mod tests {
 
     fn tool_call_started(call_id: &str, tool_name: &str, args: &str) -> DaemonMessage {
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ToolCallStarted {
                 request_id: 1,
                 call_id: call_id.into(),
@@ -255,7 +255,7 @@ mod tests {
 
     fn tool_result_chunk(call_id: &str, data: &str) -> DaemonMessage {
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ToolResultChunk {
                 request_id: 1,
                 call_id: call_id.into(),
@@ -266,7 +266,7 @@ mod tests {
 
     fn tool_call_finished(call_id: &str, tool_name: &str) -> DaemonMessage {
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ToolCallFinished {
                 request_id: 1,
                 call_id: call_id.into(),
@@ -277,7 +277,7 @@ mod tests {
 
     fn tool_call_failed(call_id: &str, tool_name: &str, error: &str) -> DaemonMessage {
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ToolCallFailed {
                 request_id: 1,
                 call_id: call_id.into(),
@@ -289,7 +289,7 @@ mod tests {
 
     fn done() -> DaemonMessage {
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::Done {
                 request_id: 1,
                 token_usage: Some(choreo_proto::TokenUsage {
@@ -304,7 +304,7 @@ mod tests {
 
     fn failed() -> DaemonMessage {
         DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::Failed {
                 request_id: 1,
                 error: "model refused".into(),
@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn done_without_token_usage_omits_usage_update() {
         let msg = DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::Done {
                 request_id: 1,
                 token_usage: None,
@@ -489,7 +489,7 @@ mod tests {
     fn non_streaming_message_returns_none() {
         let msgs = [
             DaemonMessage::Session {
-                session_id: 1,
+                session_id: Some(1),
                 event: SessionEvent::SessionCreated {
                     title: None,
                     parent_session_id: None,

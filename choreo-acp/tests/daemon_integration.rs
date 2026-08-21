@@ -60,7 +60,7 @@ fn daemon_io_send_and_receive() {
             };
 
             let echo = DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::OutputChunk {
                     request_id,
                     stream: choreo_proto::OutputStream::Answer,
@@ -72,7 +72,7 @@ fn daemon_io_send_and_receive() {
 
             // Send Done to terminate the stream.
             let done = DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::Done {
                     request_id,
                     token_usage: Some(choreo_proto::TokenUsage {

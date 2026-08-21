@@ -13,7 +13,7 @@ fn app_state_stream_updates_history() {
     // Simulate a Started message to set up request-to-turn mapping.
     dispatch_daemon_message(
         &DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event: SessionEvent::Started {
                 request_id: 7,
                 turn_id: 1,
@@ -45,7 +45,7 @@ fn app_state_stream_updates_history() {
 
     dispatch_daemon_message(
         &DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event: SessionEvent::OutputChunk {
                 request_id: 7,
                 stream: OutputStream::Reasoning,
@@ -57,7 +57,7 @@ fn app_state_stream_updates_history() {
 
     dispatch_daemon_message(
         &DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event: SessionEvent::OutputChunk {
                 request_id: 7,
                 stream: OutputStream::Answer,
@@ -69,7 +69,7 @@ fn app_state_stream_updates_history() {
 
     dispatch_daemon_message(
         &DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event: SessionEvent::OutputChunk {
                 request_id: 7,
                 stream: OutputStream::Answer,
@@ -133,7 +133,7 @@ fn apply_daemon_turn_appended_with_image() {
 
     dispatch_daemon_message(
         &DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event: SessionEvent::TurnAppended { turn_id: 1, turn },
         },
         &mut state,

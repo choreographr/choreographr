@@ -312,8 +312,11 @@ impl DaemonMessage {
         match self {
             // Session-scoped events ride the `Session` envelope: fixed
             // 2-field envelope overhead (variant tag + map header + the
-            // `session_id`/`event` field keys; `session_id` is a fixed-size
-            // scalar) plus the inner event's own per-field estimate.
+            // `session_id`/`event` field keys) plus the inner event's own
+            // per-field estimate. The `Option<u64>` `session_id` payload
+            // (1 byte for nil, up to ~9 for `Some(u64)`) is comfortably
+            // covered by the fixed 88-byte envelope allowance (40 + 2×24),
+            // so both encodings fit without per-arm accounting.
             Self::Session { event, .. } => named_field_overhead(2) + session_event_size(event),
             Self::Sessions { sessions } => {
                 named_field_overhead(1)

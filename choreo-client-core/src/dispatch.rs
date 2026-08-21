@@ -68,7 +68,7 @@ pub trait TurnEventHandler {
         token_usage: Option<TokenUsage>,
         last_prompt_tokens: Option<u32>,
     );
-    fn handle_failed(&mut self, session_id: u64, request_id: u32, error: String);
+    fn handle_failed(&mut self, session_id: Option<u64>, request_id: u32, error: String);
     fn handle_tool_call_event(&mut self, session_id: u64, request_id: u32, event: ToolCallEvent);
     fn handle_tool_result_chunk(
         &mut self,
@@ -112,9 +112,11 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
 
     // Session-scoped events all ride the `DaemonMessage::Session` envelope,
     // which hoists the origin session id, so `session_id` is destructured
-    // exactly once here rather than per-arm. Non-session (flat) messages take
-    // the else branch: the rest of the dispatch below handles them and
-    // returns, so the session-event match below only ever sees the envelope.
+    // exactly once here rather than per-arm. Connection-level replies (e.g.
+    // a daemon "no session attached" failure) have no origin session and
+    // carry `session_id: None`. Non-session (flat) messages take the else
+    // branch: the rest of the dispatch below handles them and returns, so
+    // the session-event match below only ever sees the envelope.
     let DaemonMessage::Session { session_id, event } = msg else {
         match msg {
             DaemonMessage::Sessions { .. } => {
@@ -208,6 +210,60 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
                 debug!("unhandled daemon message variant");
             }
         }
+        return;
+    };
+
+    // Connection-level replies arrive without an origin session (`None`) —
+    // the daemon synthesizes them on its connection dispatch when there is
+    // no session task to supply an origin (e.g. `Failed` "no session
+    // attached"). Six events are None-capable: the two failure-shaped ones
+    // below, plus `ModelSelectionFailed`/`ReasoningEffortSet(`/`Failed`)/
+    // `SessionFailed` — which never use the origin in this generic dispatch
+    // (they surface via `handle_error`/`handle_status_text`), so the `None`
+    // case must not be dropped before them. All six can ALSO arrive with
+    // `Some` from session-task broadcasts, so they are handled here for both
+    // origins; every remaining `SessionEvent` requires `Some`. This keeps
+    // the no-origin case explicit instead of a magic `session_id: 0`
+    // leaking into handler code.
+    match event {
+        SessionEvent::Failed { request_id, error } => {
+            // `session_id` is `&Option<u64>` here, so `as_ref().copied()`
+            // yields the `Option<u64>` the handler wants (`copied()` itself
+            // only exists on `Option<&T>`).
+            handler.handle_failed(session_id.as_ref().copied(), *request_id, error.clone());
+            return;
+        }
+        SessionEvent::Cancelled { request_id } => {
+            handler.handle_failed(
+                session_id.as_ref().copied(),
+                *request_id,
+                "cancelled".to_string(),
+            );
+            return;
+        }
+        SessionEvent::ModelSelectionFailed { model, error } => {
+            handler.handle_error(format!("[daemon] failed to select model {model}: {error}"));
+            return;
+        }
+        SessionEvent::ReasoningEffortSet { effort, .. } => {
+            handler.handle_status_text(format!("[daemon] reasoning effort: {effort}"));
+            return;
+        }
+        SessionEvent::ReasoningEffortSetFailed { effort, error, .. } => {
+            handler.handle_error(format!(
+                "[daemon] failed to set reasoning effort {effort}: {error}"
+            ));
+            return;
+        }
+        SessionEvent::SessionFailed { error, .. } => {
+            handler.handle_error(error.clone());
+            return;
+        }
+        _ => {}
+    }
+
+    let Some(session_id) = session_id else {
+        debug!("session-scoped event without an origin session: {event:?}");
         return;
     };
 
@@ -340,24 +396,12 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             token_usage,
             last_prompt_tokens,
         } => handler.handle_done(*session_id, *request_id, *token_usage, *last_prompt_tokens),
-        SessionEvent::Failed { request_id, error } => {
-            handler.handle_failed(*session_id, *request_id, error.clone())
-        }
-        SessionEvent::Cancelled { request_id } => {
-            handler.handle_failed(*session_id, *request_id, "cancelled".to_string())
-        }
         SessionEvent::SessionStatusChanged {
             status,
             last_modified,
         } => handler.handle_session_status_changed(*session_id, status.clone(), *last_modified),
-        SessionEvent::SessionFailed { error, .. } => {
-            handler.handle_error(error.clone());
-        }
         SessionEvent::ModelSelected { model, .. } => {
             handler.handle_status_text(format!("[daemon] selected model: {model}"));
-        }
-        SessionEvent::ModelSelectionFailed { model, error } => {
-            handler.handle_error(format!("[daemon] failed to select model {model}: {error}"));
         }
         SessionEvent::SessionDeleted => {}
         SessionEvent::SessionDeleteFailed { .. } => {}
@@ -369,14 +413,6 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             // Session title changes are metadata-only (no conversation
             // content) and are handled at the TUI layer directly via
             // the connection.rs routing — no generic dispatch needed.
-        }
-        SessionEvent::ReasoningEffortSet { effort, .. } => {
-            handler.handle_status_text(format!("[daemon] reasoning effort: {effort}"));
-        }
-        SessionEvent::ReasoningEffortSetFailed { effort, error, .. } => {
-            handler.handle_error(format!(
-                "[daemon] failed to set reasoning effort {effort}: {error}"
-            ));
         }
         SessionEvent::TokenUsageUpdate {
             token_usage,
@@ -390,5 +426,17 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             // content) and is handled at the TUI layer in connection.rs — no
             // generic dispatch needed.
         }
+        // The six None-capable events were already handled (and returned) by
+        // the pre-match block above — every other `SessionEvent` reaches this
+        // match with a guaranteed `Some` origin. They are listed explicitly
+        // instead of a wildcard so a NEW `SessionEvent` variant still fails
+        // this exhaustive match at compile time (the variant set IS the wire
+        // contract).
+        SessionEvent::Failed { .. }
+        | SessionEvent::Cancelled { .. }
+        | SessionEvent::ModelSelectionFailed { .. }
+        | SessionEvent::ReasoningEffortSet { .. }
+        | SessionEvent::ReasoningEffortSetFailed { .. }
+        | SessionEvent::SessionFailed { .. } => {}
     }
 }

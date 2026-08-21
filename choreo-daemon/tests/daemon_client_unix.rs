@@ -171,7 +171,7 @@ fn unix_list_sessions_round_trip() {
     client.send(create_session());
     match client.recv() {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionCreated { .. },
         } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
@@ -202,7 +202,7 @@ fn unix_create_session_then_attach() {
     client.send(create_session());
     match client.recv() {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionCreated { .. },
         } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),
@@ -216,14 +216,14 @@ fn unix_create_session_then_attach() {
     client.send(ClientMessage::AttachSession { session_id: 1 });
     match client.recv() {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionAttached,
         } => assert_eq!(session_id, 1),
         other => panic!("expected SessionAttached, got {other:?}"),
     }
     match client.recv() {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionState { .. },
         } => assert_eq!(session_id, 1),
         other => panic!("expected SessionState, got {other:?}"),
@@ -271,7 +271,7 @@ fn unix_two_clients_isolated_and_shared_state() {
     client_a.send(create_session());
     match client_a.recv() {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionCreated { .. },
         } => assert_eq!(session_id, 1),
         other => panic!("expected SessionCreated, got {other:?}"),

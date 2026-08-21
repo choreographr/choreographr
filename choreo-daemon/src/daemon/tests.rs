@@ -396,7 +396,7 @@ fn handle_broadcast_session_status() {
     assert!(matches!(
         msg,
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inference,
                 ..
@@ -505,7 +505,7 @@ fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribe
     assert!(matches!(
         msg,
         DaemonMessage::Session {
-            session_id: 42,
+            session_id: Some(42),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inference,
                 ..
@@ -951,7 +951,7 @@ fn broadcast_sends_to_subscriber() {
     let (tx, rx) = test_sink();
     state.summary_subscribers.insert(1, tx);
     let msg = DaemonMessage::Session {
-        session_id: 42,
+        session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     };
     state.broadcast(msg.clone());
@@ -968,7 +968,7 @@ fn broadcast_removes_disconnected_subscriber() {
     state.summary_subscribers.insert(1, tx);
     drop(rx); // Disconnect the receiver
     state.broadcast(DaemonMessage::Session {
-        session_id: 42,
+        session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     });
     // Dead subscriber should be removed
@@ -991,7 +991,7 @@ fn broadcast_enqueues_losslessly_and_evicts_over_lag_client() {
     state.client_writers.insert(7, sink);
 
     let msg = DaemonMessage::Session {
-        session_id: 42,
+        session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     };
     state.broadcast(msg.clone());
@@ -1626,7 +1626,7 @@ fn handle_broadcast_activity_sends_to_subscriber() {
     drain_send_on_subscribe(&rx);
 
     let msg = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::OutputChunk {
             request_id: 5,
             stream: choreo_proto::OutputStream::Answer,
@@ -1666,7 +1666,7 @@ fn handle_broadcast_activity_skips_dedup_for_session_subscriber() {
     // Broadcast a message FROM session 1 — should be SKIPPED for client 10
     // because they're already a direct subscriber of session 1.
     let msg = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::OutputChunk {
             request_id: 5,
             stream: choreo_proto::OutputStream::Answer,
@@ -1710,7 +1710,7 @@ fn handle_broadcast_activity_no_dedup_for_different_session() {
     // Broadcast a message FROM session 2 — client 10 is NOT a subscriber
     // of session 2, so the message should be delivered.
     let msg = DaemonMessage::Session {
-        session_id: 2,
+        session_id: Some(2),
         event: SessionEvent::OutputChunk {
             request_id: 5,
             stream: choreo_proto::OutputStream::Answer,
@@ -1771,7 +1771,7 @@ fn handle_broadcast_activity_removes_disconnected_subscriber() {
 
     // Broadcast should detect the dead subscriber and remove it
     let msg = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::SessionStatusChanged {
             status: SessionStatus::Inactive,
             last_modified: 0,
@@ -1814,7 +1814,7 @@ fn handle_broadcast_activity_evicts_over_lag_subscriber() {
 
     // The message crosses the tiny cap (OutputChunk payload ~70 bytes).
     let broadcast = DaemonMessage::Session {
-        session_id: 7,
+        session_id: Some(7),
         event: SessionEvent::OutputChunk {
             request_id: 99,
             stream: choreo_proto::OutputStream::Answer,
@@ -1864,7 +1864,7 @@ fn handle_broadcast_activity_handles_multiple_clients() {
     });
 
     let msg = DaemonMessage::Session {
-        session_id: 1,
+        session_id: Some(1),
         event: SessionEvent::OutputChunk {
             request_id: 5,
             stream: choreo_proto::OutputStream::Answer,

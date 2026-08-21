@@ -505,12 +505,16 @@ pub struct CatalogProvider {
 ///
 /// These 29 events used to be `DaemonMessage` variants that each carried
 /// their own `session_id` field. They now live inside
-/// [`DaemonMessage::Session`], whose envelope hoists the `session_id` so
-/// every event has an origin session **by construction** — it can never be
-/// forgotten, mismatched, or duplicated. Consumers that dispatch on session
-/// events match the envelope's `session_id` once and then handle the inner
-/// event; the wire format nests the event inside the envelope, so the origin
-/// is always present on the wire too.
+/// [`DaemonMessage::Session`], whose envelope supplies the origin session
+/// for every session-scoped event: `session_id: Some(id)`, present on the
+/// wire as `Some(id)`, so every event has an origin session **by
+/// construction** — it can never be forgotten, mismatched, or duplicated.
+/// Consumers that dispatch on session events match the envelope's
+/// `session_id` once and then handle the inner event; the wire format nests
+/// the event inside the envelope, so the origin is always present on the
+/// wire too. The `None` case is reserved for connection-level replies that
+/// have no origin session (e.g. daemon "no session attached" failures); on
+/// the wire the origin is absent as `null`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionEvent {
     SessionCreated {
@@ -669,13 +673,17 @@ pub enum SessionEvent {
 ///
 /// Split into two families:
 /// - [`DaemonMessage::Session`] carries a session-scoped [`SessionEvent`]
-///   wrapped in an envelope that supplies the origin `session_id` by
-///   construction. These events are delivered to per-session subscribers and
-///   the all-activity fan, and the all-activity dedup is keyed on the
-///   envelope's origin session.
+///   wrapped in an envelope that supplies the origin session — always
+///   `session_id: Some(id)` for session-scoped events, present on the wire
+///   as `Some(id)` — by construction. These events are delivered to
+///   per-session subscribers and the all-activity fan, and the all-activity
+///   dedup is keyed on the envelope's origin session.
 /// - The remaining flat variants are connection/reply/global messages
 ///   (`Sessions`, `Pong`, `Models`, keystore and account replies,
-///   `ShuttingDown`, …) that have no session scope and stay flat.
+///   `ShuttingDown`, …) that have no session scope and stay flat. A
+///   connection-level reply with NO origin session (e.g. a daemon "no
+///   session attached" failure) carries `session_id: None`, absent on the
+///   wire as `null`.
 //
 // `Session` holds a `SessionEvent` by value per the agreed split design (the
 // envelope hoists `session_id`, and the event must arrive flat on the wire, not
@@ -690,12 +698,15 @@ pub enum SessionEvent {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonMessage {
-    /// Single home for all session-scoped events: the `session_id` that used
-    /// to ride on each of the 29 moved variants is hoisted onto this
-    /// envelope, so every inner [`SessionEvent`] has an origin session **by
-    /// construction**.
+    /// Single home for all session-scoped events. The envelope supplies the
+    /// origin `session_id` that used to ride on each of the 29 moved
+    /// variants, so every inner [`SessionEvent`] has an origin session **by
+    /// construction** when `session_id` is `Some(id)` (present on the wire
+    /// as `Some(id)`). Connection-level replies with no origin session (e.g.
+    /// daemon "no session attached" failures) carry `session_id: None`,
+    /// absent on the wire as `null`.
     Session {
-        session_id: u64,
+        session_id: Option<u64>,
         event: SessionEvent,
     },
     Sessions {
@@ -1106,7 +1117,7 @@ mod tests {
             (
                 "SessionCreated",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::SessionCreated {
                         title: Some("t".into()),
                         parent_session_id: Some(2),
@@ -1126,14 +1137,14 @@ mod tests {
             (
                 "SessionAttached",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::SessionAttached,
                 },
             ),
             (
                 "SessionState",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::SessionState {
                         title: Some("t".into()),
                         selected_model: Some("gpt-5.6".into()),
@@ -1167,7 +1178,7 @@ mod tests {
             (
                 "TurnAppended",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::TurnAppended {
                         turn_id: 1,
                         turn: dense_turn.clone(),
@@ -1177,7 +1188,7 @@ mod tests {
             (
                 "TurnAppendedBareArtifact",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::TurnAppended {
                         turn_id: 2,
                         turn: bare_artifact_turn.clone(),
@@ -1187,7 +1198,7 @@ mod tests {
             (
                 "SessionStatusChanged",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::SessionStatusChanged {
                         status: SessionStatus::ToolCall("sh".into()),
                         last_modified: 0,
@@ -1197,7 +1208,7 @@ mod tests {
             (
                 "SessionFailed",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::SessionFailed {
                         operation: "create_session".into(),
                         error: "some failure happened here".into(),
@@ -1207,7 +1218,7 @@ mod tests {
             (
                 "Started",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::Started {
                         request_id: 1,
                         turn_id: 1,
@@ -1218,7 +1229,7 @@ mod tests {
             (
                 "ToolCallStarted",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::ToolCallStarted {
                         request_id: 1,
                         call_id: "call_1".into(),
@@ -1231,7 +1242,7 @@ mod tests {
             (
                 "ToolCallFinished",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::ToolCallFinished {
                         request_id: 1,
                         call_id: "call_1".into(),
@@ -1242,7 +1253,7 @@ mod tests {
             (
                 "ToolResultChunk",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::ToolResultChunk {
                         request_id: 1,
                         call_id: "call_1".into(),
@@ -1253,7 +1264,7 @@ mod tests {
             (
                 "ToolCallFailed",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::ToolCallFailed {
                         request_id: 1,
                         call_id: "call_1".into(),
@@ -1265,7 +1276,7 @@ mod tests {
             (
                 "TokenUsageUpdate",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::TokenUsageUpdate {
                         token_usage: TokenUsage {
                             input_tokens: 100,
@@ -1279,7 +1290,7 @@ mod tests {
             (
                 "LiveOutputTokenCount",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::LiveOutputTokenCount {
                         request_id: 1,
                         output_tokens: 42,
@@ -1289,7 +1300,7 @@ mod tests {
             (
                 "OutputChunk",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::OutputChunk {
                         request_id: 1,
                         stream: OutputStream::Answer,
@@ -1300,7 +1311,7 @@ mod tests {
             (
                 "Done",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::Done {
                         request_id: 1,
                         token_usage: Some(TokenUsage {
@@ -1315,7 +1326,7 @@ mod tests {
             (
                 "Failed",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::Failed {
                         request_id: 1,
                         error: "x".repeat(100),
@@ -1325,7 +1336,7 @@ mod tests {
             (
                 "Cancelled",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::Cancelled { request_id: 1 },
                 },
             ),
@@ -1371,7 +1382,7 @@ mod tests {
             (
                 "ModelSelected",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::ModelSelected {
                         model: "gpt-5.6".into(),
                         reasoning_capability: Some(ReasoningCapability {
@@ -1388,7 +1399,7 @@ mod tests {
             (
                 "ModelSelectionFailed",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::ModelSelectionFailed {
                         model: "gpt-5.6".into(),
                         error: "model not found".into(),
@@ -1432,14 +1443,14 @@ mod tests {
             (
                 "SessionDeleted",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::SessionDeleted,
                 },
             ),
             (
                 "SessionDeleteFailed",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::SessionDeleteFailed {
                         error: "db error".into(),
                     },
@@ -1448,7 +1459,7 @@ mod tests {
             (
                 "TurnsUndone",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::TurnsUndone {
                         turn_ids: vec![1, 2, 3, 4, 5],
                     },
@@ -1457,7 +1468,7 @@ mod tests {
             (
                 "TurnsRedone",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::TurnsRedone {
                         turns: std::collections::BTreeMap::from([(1, dense_turn), (2, one_turn)]),
                     },
@@ -1517,7 +1528,7 @@ mod tests {
             (
                 "SessionAccountSet",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::SessionAccountSet {
                         account: "default".into(),
                     },
@@ -1526,7 +1537,7 @@ mod tests {
             (
                 "ContextWindowResolved",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::ContextWindowResolved {
                         context_window: 128_000,
                     },
@@ -1535,7 +1546,7 @@ mod tests {
             (
                 "SessionWorkingDirSet",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::SessionWorkingDirSet {
                         path: Some("/tmp".into()),
                     },
@@ -1544,7 +1555,7 @@ mod tests {
             (
                 "SessionTitleSet",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::SessionTitleSet {
                         title: "hello".into(),
                     },
@@ -1553,7 +1564,7 @@ mod tests {
             (
                 "ReasoningEffortSet",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::ReasoningEffortSet {
                         effort: "high".into(),
                     },
@@ -1562,7 +1573,7 @@ mod tests {
             (
                 "ReasoningEffortSetFailed",
                 DaemonMessage::Session {
-                    session_id: 1,
+                    session_id: Some(1),
                     event: SessionEvent::ReasoningEffortSetFailed {
                         effort: "high".into(),
                         error: "model does not support it".into(),

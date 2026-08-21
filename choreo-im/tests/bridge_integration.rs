@@ -62,7 +62,7 @@ fn bridge_text_streaming() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::OutputChunk {
                 request_id: 1,
                 stream: OutputStream::Answer,
@@ -75,7 +75,7 @@ fn bridge_text_streaming() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::OutputChunk {
                 request_id: 1,
                 stream: OutputStream::Answer,
@@ -88,7 +88,7 @@ fn bridge_text_streaming() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::Done {
                 request_id: 1,
                 token_usage: None,
@@ -113,7 +113,7 @@ fn bridge_tool_call_events() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ToolCallStarted {
                 request_id: 1,
                 call_id: "call_1".into(),
@@ -136,7 +136,7 @@ fn bridge_tool_call_events() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ToolResultChunk {
                 request_id: 1,
                 call_id: "call_1".into(),
@@ -148,7 +148,7 @@ fn bridge_tool_call_events() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ToolCallFinished {
                 request_id: 1,
                 call_id: "call_1".into(),
@@ -175,7 +175,7 @@ fn bridge_tool_call_failed() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ToolCallFailed {
                 request_id: 1,
                 call_id: "call_1".into(),
@@ -227,7 +227,7 @@ fn bridge_turn_images() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::TurnAppended { turn_id: 1, turn },
         },
     )
@@ -249,7 +249,7 @@ fn bridge_error_variants() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::Failed {
                 request_id: 1,
                 error: "something went wrong".into(),
@@ -305,7 +305,7 @@ fn bridge_models() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::ModelSelected {
                 model: "claude".into(),
                 reasoning_capability: None,
@@ -328,7 +328,7 @@ fn bridge_cancelled_clears_buffer() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::OutputChunk {
                 request_id: 42,
                 stream: OutputStream::Answer,
@@ -341,7 +341,7 @@ fn bridge_cancelled_clears_buffer() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Session {
-            session_id: 0,
+            session_id: None,
             event: SessionEvent::Cancelled { request_id: 42 },
         },
     )

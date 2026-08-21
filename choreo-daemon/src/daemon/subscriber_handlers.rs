@@ -112,7 +112,7 @@ impl DaemonState {
             None => 0,
         };
         let msg = DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionStatusChanged {
                 status,
                 last_modified,

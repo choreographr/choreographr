@@ -2131,9 +2131,9 @@ fn handle_ui_event(
 /// after `route_session_update` has applied the display update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionUpdateRouting {
-    /// The message belongs to the attached session (or the 0-sentinel) — the
-    /// caller should fall through to the generic dispatch so the user sees
-    /// the status/error feedback for their own command.
+    /// The message belongs to the attached session (or a connection-level
+    /// `None` reply) — the caller should fall through to the generic dispatch
+    /// so the user sees the status/error feedback for their own command.
     FallThrough,
     /// The message belongs to a background session — the per-session display
     /// was already updated, but the caller must not fall through: the generic
@@ -2145,18 +2145,20 @@ enum SessionUpdateRouting {
 /// Route a per-session display update for a daemon-reported session id and
 /// report whether the message must also fall through to the generic dispatch.
 ///
-/// The daemon uses `session_id == 0` as a sentinel for "the attached
-/// session", so `resolve_daemon_session` maps it (and every real id) to the
-/// session whose display `update` mutates — never a phantom session-0 entry.
-/// Background messages (a real session that is not the attached one) still
-/// get their display updated, so the per-session state is already correct
-/// when the user switches to it, but they must not fall through.  Returns
-/// [`SessionUpdateRouting::Suppress`] for background noise — the caller
-/// should log and return early — or [`SessionUpdateRouting::FallThrough`]
-/// for the attached session / 0-sentinel.
+/// Connection-level replies carry `session_id: None` (no origin session —
+/// e.g. a "no session attached" failure or a bare `GetReasoningEffort` reply
+/// without an attachment), so `resolve_daemon_session` maps them (and every
+/// real id) to the session whose display `update` mutates — never a phantom
+/// entry.  Background messages (a real session that is not the attached one)
+/// still get their display updated, so the per-session state is already
+/// correct when the user switches to it, but they must not fall through.
+/// Returns [`SessionUpdateRouting::Suppress`] for background noise — the
+/// caller should log and return early — or
+/// [`SessionUpdateRouting::FallThrough`] for the attached session /
+/// connection-level (`None`) replies.
 fn route_session_update(
     app: &mut App,
-    reported: u64,
+    reported: Option<u64>,
     update: impl FnOnce(&mut App, u64),
 ) -> SessionUpdateRouting {
     if let Some(session_id) = app.resolve_daemon_session(reported) {
@@ -2179,7 +2181,7 @@ pub(crate) fn handle_daemon_message(
     // stream appends, image assembly, etc.).
     match &message {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event:
                 SessionEvent::SessionCreated {
                     parent_session_id,
@@ -2213,14 +2215,14 @@ pub(crate) fn handle_daemon_message(
             return Ok(());
         }
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionAttached,
             ..
         } => {
             app.handle_session_attached(*session_id);
         }
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event:
                 SessionEvent::SessionStatusChanged {
                     status,
@@ -2250,14 +2252,14 @@ pub(crate) fn handle_daemon_message(
             return app.handle_sessions(sessions, client_tx);
         }
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionDeleted,
             ..
         } => {
             app.handle_session_deleted(*session_id);
         }
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionDeleteFailed { error },
             ..
         } => {
@@ -2319,7 +2321,7 @@ pub(crate) fn handle_daemon_message(
         }
 
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event:
                 SessionEvent::SessionState {
                     token_usage,
@@ -2372,7 +2374,7 @@ pub(crate) fn handle_daemon_message(
             // Fall through to dispatch_daemon_message for message processing.
         }
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event:
                 SessionEvent::Done {
                     token_usage,
@@ -2452,9 +2454,9 @@ pub(crate) fn handle_daemon_message(
                     );
                     return Ok(());
                 }
-                // Attached session (or the 0-sentinel): fall through so the
-                // user's own `/model` command still prints its confirmation
-                // to the status line.
+                // Attached session (or a connection-level `None` reply): fall
+                // through so the user's own `/model` command still prints its
+                // confirmation to the status line.
                 SessionUpdateRouting::FallThrough => {}
             }
         }
@@ -2468,10 +2470,10 @@ pub(crate) fn handle_daemon_message(
             // recorded — but routing through the shared helper keeps
             // "resolved and gated as one operation" for every arm; the empty
             // update closure is deliberate.  A background session's rejected
-            // selection must not clobber the global error line, while the
-            // sentinel 0 ("no session attached") and the attached session
-            // fall through so the user sees the rejection of their own
-            // `/model` command.
+            // selection must not clobber the global error line, while a
+            // connection-level `None` ("no session attached") and the
+            // attached session fall through so the user sees the rejection of
+            // their own `/model` command.
             let reported = *session_id;
             match route_session_update(app, reported, |_, _| {}) {
                 SessionUpdateRouting::Suppress => {
@@ -2483,9 +2485,9 @@ pub(crate) fn handle_daemon_message(
                     );
                     return Ok(());
                 }
-                // Attached session (or the 0-sentinel): fall through so the
-                // generic dispatch writes the `[daemon] failed to select
-                // model …` error line.
+                // Attached session (or a connection-level `None` reply): fall
+                // through so the generic dispatch writes the `[daemon] failed
+                // to select model …` error line.
                 SessionUpdateRouting::FallThrough => {}
             }
         }
@@ -2495,11 +2497,11 @@ pub(crate) fn handle_daemon_message(
             ..
         } => {
             // Route the per-session display update to whichever session the
-            // message belongs to.  The daemon replies to bare `/reasoning`
-            // (GetReasoningEffort) with the sentinel id 0 meaning "the
-            // attached session" — `route_session_update` resolves it so the
-            // effort lands in the attached session's display (not a phantom
-            // session 0) and the gate does not swallow the user's own
+            // message belongs to.  The daemon replies to a bare `/reasoning`
+            // (GetReasoningEffort) with no attachment at the connection level
+            // (`session_id: None`), which `route_session_update` resolves to
+            // the attached session — so the effort lands in the attached
+            // session's display and the gate does not swallow the user's own
             // feedback.
             let reported = *session_id;
             match route_session_update(app, reported, |app, session_id| {
@@ -2517,9 +2519,9 @@ pub(crate) fn handle_daemon_message(
                     );
                     return Ok(());
                 }
-                // Attached session (or the 0-sentinel): fall through so the
-                // user's own `/reasoning` command still prints its
-                // confirmation to the status line.
+                // Attached session (or a connection-level `None` reply): fall
+                // through so the user's own `/reasoning` command still prints
+                // its confirmation to the status line.
                 SessionUpdateRouting::FallThrough => {}
             }
         }
@@ -2531,9 +2533,9 @@ pub(crate) fn handle_daemon_message(
             // Reset only the session the rejection belongs to — a background
             // session's rejection must not flip the attached session's effort,
             // though its own display is still reset to match the daemon (the
-            // daemon has already forced the effort back to "off").  The
-            // 0-sentinel ("no session attached") resolves to the attached
-            // session, matching ReasoningEffortSet above.
+            // daemon has already forced the effort back to "off").  A
+            // connection-level `None` ("no session attached") resolves to
+            // the attached session, matching ReasoningEffortSet above.
             let reported = *session_id;
             match route_session_update(app, reported, |app, session_id| {
                 app.display_for(session_id).reasoning_effort = Some("off".to_string());
@@ -2553,10 +2555,10 @@ pub(crate) fn handle_daemon_message(
                     );
                     return Ok(());
                 }
-                // Attached session (or the 0-sentinel): the user's own
-                // `/reasoning` command failed — surface the rejection notice
-                // and fall through so the generic dispatch records the error
-                // as well.
+                // Attached session (or a connection-level `None` reply): the
+                // user's own `/reasoning` command failed — surface the
+                // rejection notice and fall through so the generic dispatch
+                // records the error as well.
                 SessionUpdateRouting::FallThrough => {}
             }
             tracing::warn!(%effort, %error, "reasoning effort rejected by daemon");
@@ -2571,7 +2573,7 @@ pub(crate) fn handle_daemon_message(
             // message belongs to (never the attached one when they differ).
             // The daemon only ever reports a real session id here (a
             // no-session account change goes through SessionFailed), so the
-            // 0-sentinel resolution is defensive but harmless.
+            // connection-level `None` resolution is defensive but harmless.
             let reported = *session_id;
             match route_session_update(app, reported, |app, session_id| {
                 app.handle_session_account_set(session_id, account);
@@ -2588,14 +2590,14 @@ pub(crate) fn handle_daemon_message(
                     );
                     return Ok(());
                 }
-                // Attached session (or the 0-sentinel): fall through so the
-                // user's own `/account` command still prints its confirmation
-                // to the status line.
+                // Attached session (or a connection-level `None` reply): fall
+                // through so the user's own `/account` command still prints
+                // its confirmation to the status line.
                 SessionUpdateRouting::FallThrough => {}
             }
         }
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::ContextWindowResolved { context_window },
             ..
         } => {
@@ -2606,14 +2608,14 @@ pub(crate) fn handle_daemon_message(
             }
         }
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionWorkingDirSet { path },
             ..
         } => {
             app.handle_session_working_dir_set(*session_id, path);
         }
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionTitleSet { title },
             ..
         } => {
@@ -2621,7 +2623,7 @@ pub(crate) fn handle_daemon_message(
         }
         // TokenUsageUpdate is dispatched through the generic handler below.
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::LiveOutputTokenCount { output_tokens, .. },
             ..
         } => {

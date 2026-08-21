@@ -464,7 +464,7 @@ fn evicts_client_that_stops_reading() {
     );
     let session_id = match read_message::<_, DaemonMessage>(&mut stream) {
         DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionCreated { .. },
         } => session_id,
         other => panic!("expected SessionCreated, got {other:?}"),
@@ -473,7 +473,7 @@ fn evicts_client_that_stops_reading() {
     write_message(&mut stream, &ClientMessage::AttachSession { session_id });
     match read_message::<_, DaemonMessage>(&mut stream) {
         DaemonMessage::Session {
-            session_id: sid,
+            session_id: Some(sid),
             event: SessionEvent::SessionAttached,
         } => assert_eq!(sid, session_id),
         other => panic!("expected SessionAttached, got {other:?}"),

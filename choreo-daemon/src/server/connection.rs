@@ -321,15 +321,15 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             if let Some(tx) = ctx.attached_session_tx {
                 let _ = tx.send(SessionCommand::RunInput { request_id, input });
             } else {
-                // The sentinel `session_id == 0` (used in every "no session
-                // attached" arm in this dispatch) means "the attached
-                // session" to the client: it lets a connection-level failure
-                // be routed to whatever session the user is viewing.  The
-                // TUI resolves it via `App::resolve_daemon_session`.
+                // This connection-level reply has no origin session, so the
+                // envelope carries `session_id: None` (used in every "no
+                // session attached" arm in this dispatch). The TUI resolves
+                // it as a connection-level failure via
+                // `App::resolve_daemon_session`.
                 send_to_writer(
                     ctx,
                     DaemonMessage::Session {
-                        session_id: 0,
+                        session_id: None,
                         event: SessionEvent::Failed {
                             request_id,
                             error: "no session attached".to_string(),
@@ -375,7 +375,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 send_to_writer(
                     ctx,
                     DaemonMessage::Session {
-                        session_id: 0,
+                        session_id: None,
                         event: SessionEvent::Failed {
                             request_id,
                             error: "no session attached".to_string(),
@@ -401,7 +401,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 send_to_writer(
                     ctx,
                     DaemonMessage::Session {
-                        session_id: 0,
+                        session_id: None,
                         event: SessionEvent::ModelSelectionFailed {
                             model,
                             error: "no session attached".to_string(),
@@ -423,7 +423,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 send_to_writer(
                     ctx,
                     DaemonMessage::Session {
-                        session_id: 0,
+                        session_id: None,
                         event: SessionEvent::ReasoningEffortSetFailed {
                             effort,
                             error: "no session attached".to_string(),
@@ -437,10 +437,12 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let (reply, rx) = mpsc::channel();
                 let _ = tx.send(SessionCommand::GetReasoningEffort { reply });
                 if let Ok(effort) = rx.recv() {
+                    // Session-scoped reply to the attached session: carry its
+                    // real id (do NOT fall back to the None sentinel).
                     send_to_writer(
                         ctx,
                         DaemonMessage::Session {
-                            session_id: 0,
+                            session_id: *ctx.attached_session_id,
                             event: SessionEvent::ReasoningEffortSet { effort },
                         },
                     );
@@ -449,7 +451,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 send_to_writer(
                     ctx,
                     DaemonMessage::Session {
-                        session_id: 0,
+                        session_id: None,
                         event: SessionEvent::ReasoningEffortSet {
                             effort: "off".to_string(),
                         },
@@ -800,7 +802,7 @@ fn handle_client_create_session(
             send_to_writer(
                 ctx,
                 DaemonMessage::Session {
-                    session_id: sid,
+                    session_id: Some(sid),
                     event: SessionEvent::SessionCreated {
                         title,
                         parent_session_id,
@@ -816,7 +818,7 @@ fn handle_client_create_session(
             send_to_writer(
                 ctx,
                 DaemonMessage::Session {
-                    session_id: 0,
+                    session_id: None,
                     event: SessionEvent::SessionFailed {
                         operation: "create_session".into(),
                         error: e.to_string(),
@@ -845,7 +847,7 @@ fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
             send_to_writer(
                 ctx,
                 DaemonMessage::Session {
-                    session_id,
+                    session_id: Some(session_id),
                     event: SessionEvent::SessionAttached,
                 },
             );
@@ -855,7 +857,7 @@ fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
             send_to_writer(
                 ctx,
                 DaemonMessage::Session {
-                    session_id: 0,
+                    session_id: None,
                     event: SessionEvent::SessionFailed {
                         operation: "attach_session".into(),
                         error: e.to_string(),
@@ -883,10 +885,12 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
                 let _ = tx.send(SessionCommand::SetAccount { name });
             }
             _ => {
+                // Session-scoped reply to the attached session: carry its
+                // real id (do NOT fall back to the None sentinel).
                 send_to_writer(
                     ctx,
                     DaemonMessage::Session {
-                        session_id: 0,
+                        session_id: *ctx.attached_session_id,
                         event: SessionEvent::SessionFailed {
                             operation: "set_account".into(),
                             error: format!("account '{name}' not found"),
@@ -899,7 +903,7 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
         send_to_writer(
             ctx,
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::SessionFailed {
                     operation: "set_account".into(),
                     error: "no session attached".to_string(),
@@ -1025,7 +1029,7 @@ fn handle_delete_session_sync(ctx: &mut ClientCtx, session_id: u64) {
             send_to_writer(
                 ctx,
                 DaemonMessage::Session {
-                    session_id,
+                    session_id: Some(session_id),
                     event: SessionEvent::SessionDeleteFailed {
                         error: e.to_string(),
                     },
@@ -1274,14 +1278,14 @@ mod tests {
         });
 
         let m1 = DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event: SessionEvent::Failed {
                 request_id: 1,
                 error: "a".repeat(100),
             },
         };
         let m2 = DaemonMessage::Session {
-            session_id: 2,
+            session_id: Some(2),
             event: SessionEvent::Failed {
                 request_id: 2,
                 error: "b".repeat(50),
@@ -1332,21 +1336,21 @@ mod tests {
         });
 
         let m1 = DaemonMessage::Session {
-            session_id: 1,
+            session_id: Some(1),
             event: SessionEvent::Failed {
                 request_id: 1,
                 error: "a".repeat(100),
             },
         };
         let m2 = DaemonMessage::Session {
-            session_id: 2,
+            session_id: Some(2),
             event: SessionEvent::Failed {
                 request_id: 2,
                 error: "b".repeat(50),
             },
         };
         let m3 = DaemonMessage::Session {
-            session_id: 3,
+            session_id: Some(3),
             event: SessionEvent::Failed {
                 request_id: 3,
                 error: "c".repeat(25),
@@ -1766,7 +1770,7 @@ mod tests {
             }
         ));
         if let DaemonMessage::Session {
-            session_id,
+            session_id: Some(session_id),
             event: SessionEvent::SessionDeleteFailed { error },
         } = &msg
         {
@@ -1979,7 +1983,7 @@ mod tests {
         assert!(matches!(
             &msg,
             DaemonMessage::Session {
-                session_id: 0,
+                session_id: None,
                 event: SessionEvent::Failed {
                     request_id: 7,
                     error,

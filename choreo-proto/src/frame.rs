@@ -13,9 +13,11 @@ use std::io::Cursor;
 /// 3 = removed `TurnFinalized` (the final-turn snapshot now rides
 /// `TurnAppended`), added `Evicted` (best-effort lag-eviction advisory);
 /// 4 = session-scoped messages are now wrapped in
-/// `DaemonMessage::Session { session_id, event }` (the `SessionEvent`
-/// envelope). Mixed-version peers still fail fast at the version gate,
-/// unchanged.
+/// `DaemonMessage::Session { session_id: Option<u64>, event }` (the
+/// `SessionEvent` envelope). Mixed-version peers still fail fast at the
+/// version gate, unchanged. The v4 shape was amended in place — the
+/// envelope's `session_id` became `Option<u64>` before first release, so it
+/// stays version 4 with no bump (mixed-version peers do not exist yet).
 pub const PROTOCOL_VERSION: u8 = 4;
 /// Max serialised *payload* size, enforced identically on encode (before the
 /// 4-byte length prefix is added — [`encode_inner`]) and on decode
