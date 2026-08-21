@@ -866,10 +866,14 @@ fn broadcast(
     // Forward to daemon-level activity subscribers so clients subscribed
     // to all session activity (e.g. the TUI after SubscribeAllActivity)
     // receive every session-scoped event without having to attach to every
-    // session individually.
-    let _ = ctx
-        .daemon_tx
-        .send(DaemonCommand::BroadcastActivity(message.clone()));
+    // session individually. The session thread KNOWS its own id, so the
+    // origin is carried explicitly on the command for the daemon's
+    // duplicate-suppression (it no longer re-derives the origin from the
+    // message shape).
+    let _ = ctx.daemon_tx.send(DaemonCommand::BroadcastActivity {
+        session_id: Some(ctx.session_id),
+        msg: message.clone(),
+    });
 
     // Lossless + lag-eviction via the ONE shared policy — the same
     // [`crate::broadcast::fan_out_evicting`] the daemon's summary/activity

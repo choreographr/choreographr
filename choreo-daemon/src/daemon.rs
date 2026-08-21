@@ -237,7 +237,20 @@ pub enum DaemonCommand {
     /// writer channel; each connection's writer thread then closes its own
     /// socket, so clients observe the notification before EOF.
     BroadcastShuttingDown,
-    BroadcastActivity(DaemonMessage),
+    /// Fan a session-scoped or global `DaemonMessage` out to all activity
+    /// subscribers with lossless + lag-eviction.
+    ///
+    /// `session_id` is the ORIGIN session for duplicate suppression: `Some`
+    /// for session-originated broadcasts (the session thread that produced
+    /// the message knows its own id), `None` for global/control broadcasts
+    /// (catalog updates, models refresh, ...). The daemon consumes this
+    /// field directly to skip clients that are also direct subscribers of
+    /// the origin session — it no longer reverse-engineers the origin from
+    /// the message shape.
+    BroadcastActivity {
+        session_id: Option<u64>,
+        msg: DaemonMessage,
+    },
     BroadcastSessionStatus {
         session_id: u64,
         status: SessionStatus,
@@ -448,7 +461,9 @@ impl DaemonState {
             DaemonCommand::EvictClient { client_id } => self.handle_evict_client(client_id),
             DaemonCommand::EvictLargestLagging => self.handle_evict_largest_lagging(),
             DaemonCommand::BroadcastShuttingDown => self.handle_broadcast_shutting_down(),
-            DaemonCommand::BroadcastActivity(msg) => self.handle_broadcast_activity(msg),
+            DaemonCommand::BroadcastActivity { session_id, msg } => {
+                self.handle_broadcast_activity(session_id, msg)
+            }
             DaemonCommand::BroadcastSessionStatus { session_id, status } => {
                 self.handle_broadcast_session_status(session_id, status)
             }
@@ -1077,7 +1092,7 @@ impl DaemonState {
         // Broadcast the new provider list to all activity subscribers so the
         // TUI's provider picker tracks the live catalog.
         let providers = catalog_provider_pairs();
-        self.handle_broadcast_activity(DaemonMessage::CatalogUpdated { providers });
+        self.handle_broadcast_activity(None, DaemonMessage::CatalogUpdated { providers });
 
         let models: usize = effective.iter().map(|e| e.models.len()).sum();
         info!(providers = effective.len(), models, "catalog updated",);

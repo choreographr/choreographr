@@ -2,8 +2,8 @@ use super::*;
 use crate::broadcast::test_sink;
 use crate::providers::test_util::make_test_provider;
 use crate::sessions::SessionMetadata;
-use choreo_proto::{DaemonMessage, SessionStatus, TimestampMs, Turn};
-use std::collections::{BTreeMap, HashMap};
+use choreo_proto::{DaemonMessage, SessionStatus};
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -1618,7 +1618,10 @@ fn handle_broadcast_activity_sends_to_subscriber() {
         stream: choreo_proto::OutputStream::Answer,
         data: b"hello".to_vec(),
     };
-    state.handle_command(DaemonCommand::BroadcastActivity(msg.clone()));
+    state.handle_command(DaemonCommand::BroadcastActivity {
+        session_id: Some(1),
+        msg: msg.clone(),
+    });
 
     let received = rx.recv().unwrap();
     assert_eq!(received, msg);
@@ -1653,7 +1656,12 @@ fn handle_broadcast_activity_skips_dedup_for_session_subscriber() {
         stream: choreo_proto::OutputStream::Answer,
         data: b"hello".to_vec(),
     };
-    state.handle_command(DaemonCommand::BroadcastActivity(msg));
+    // The origin is taken from the command field (Some(1)), not derived from
+    // the message — so this session-1 message is suppressed for client 10.
+    state.handle_command(DaemonCommand::BroadcastActivity {
+        session_id: Some(1),
+        msg,
+    });
 
     // The client should NOT have received the message (it was suppressed
     // by the dedup filter).  The retain closure returned true, so the
@@ -1690,7 +1698,10 @@ fn handle_broadcast_activity_no_dedup_for_different_session() {
         stream: choreo_proto::OutputStream::Answer,
         data: b"hello".to_vec(),
     };
-    state.handle_command(DaemonCommand::BroadcastActivity(msg.clone()));
+    state.handle_command(DaemonCommand::BroadcastActivity {
+        session_id: Some(2),
+        msg: msg.clone(),
+    });
 
     let received = rx.recv().unwrap();
     assert_eq!(received, msg);
@@ -1699,8 +1710,9 @@ fn handle_broadcast_activity_no_dedup_for_different_session() {
 #[test]
 #[serial_test::serial(catalog)]
 fn handle_broadcast_activity_sends_when_no_session_id() {
-    // Messages without a session_id (Models, Pong, etc.) should always
-    // be delivered to all activity subscribers.
+    // A broadcast carrying `session_id: None` is global/control provenance:
+    // nothing can be duplicate-suppressed for it, so the message always
+    // reaches every activity subscriber (e.g. Models, catalog updates, ...).
     let (mut state, _rx) = make_daemon_state();
     let (tx, rx) = test_sink();
 
@@ -1714,7 +1726,10 @@ fn handle_broadcast_activity_sends_when_no_session_id() {
         models: vec!["gpt-4".into()],
         selected_model: Some("gpt-4".into()),
     };
-    state.handle_command(DaemonCommand::BroadcastActivity(msg.clone()));
+    state.handle_command(DaemonCommand::BroadcastActivity {
+        session_id: None,
+        msg: msg.clone(),
+    });
 
     let received = rx.recv().unwrap();
     assert_eq!(received, msg);
@@ -1741,7 +1756,10 @@ fn handle_broadcast_activity_removes_disconnected_subscriber() {
         status: SessionStatus::Inactive,
         last_modified: 0,
     };
-    state.handle_command(DaemonCommand::BroadcastActivity(msg));
+    state.handle_command(DaemonCommand::BroadcastActivity {
+        session_id: Some(1),
+        msg,
+    });
 
     // Dead subscriber should be removed
     assert!(!state.activity_subscribers.contains_key(&10));
@@ -1780,7 +1798,10 @@ fn handle_broadcast_activity_evicts_over_lag_subscriber() {
         stream: choreo_proto::OutputStream::Answer,
         data: b"hello".to_vec(),
     };
-    state.handle_command(DaemonCommand::BroadcastActivity(broadcast.clone()));
+    state.handle_command(DaemonCommand::BroadcastActivity {
+        session_id: Some(7),
+        msg: broadcast.clone(),
+    });
 
     // Lossless: the crossing message was delivered, not dropped.
     assert_eq!(rx.recv().unwrap(), broadcast);
@@ -1825,7 +1846,10 @@ fn handle_broadcast_activity_handles_multiple_clients() {
         stream: choreo_proto::OutputStream::Answer,
         data: b"data".to_vec(),
     };
-    state.handle_command(DaemonCommand::BroadcastActivity(msg.clone()));
+    state.handle_command(DaemonCommand::BroadcastActivity {
+        session_id: Some(1),
+        msg: msg.clone(),
+    });
 
     // Client 10 (session subscriber) should be skipped
     assert!(
@@ -1837,182 +1861,47 @@ fn handle_broadcast_activity_handles_multiple_clients() {
     assert_eq!(received, msg);
 }
 
-// ── DaemonMessage::session_id() tests ───────────────────────────────
+// ── Explicit-origin broadcast dedup tests ─────────────────────────
 
 #[test]
-fn session_id_returns_some_for_session_scoped_variants() {
-    let cases: Vec<DaemonMessage> = vec![
-        DaemonMessage::SessionCreated {
-            session_id: 42,
-            title: None,
-            parent_session_id: None,
-            working_dir: None,
-            account_name: None,
-            selected_model: None,
-            reasoning_effort: None,
-        },
-        DaemonMessage::SessionAttached { session_id: 42 },
-        DaemonMessage::SessionState {
-            session_id: 42,
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            working_dir: None,
-            turns: BTreeMap::new(),
-            active_tool_groups: vec![],
-            token_usage: None,
-            context_window: None,
-            last_prompt_tokens: None,
-            status: SessionStatus::Inactive,
-            reasoning_effort: None,
-            reasoning_capability: None,
-        },
-        DaemonMessage::SessionStatusChanged {
-            session_id: 42,
-            status: SessionStatus::Inactive,
-            last_modified: 0,
-        },
-        DaemonMessage::SessionFailed {
-            session_id: 42,
-            operation: "test".into(),
-            error: "err".into(),
-        },
-        DaemonMessage::SessionDeleted { session_id: 42 },
-        DaemonMessage::SessionDeleteFailed {
-            session_id: 42,
-            error: "err".into(),
-        },
-        DaemonMessage::TurnAppended {
-            session_id: 42,
-            turn_id: 1,
-            turn: Turn {
-                created_at: TimestampMs::now(),
-                undone: false,
-                error: None,
-                user_text: None,
-                assistant_text: None,
-                assistant_reasoning: None,
-                tool_calls: vec![],
-                token_usage: None,
-                tool_results: vec![],
-                displayed_images: vec![],
-                reasoning_artifact: None,
-                reasoning_producer: None,
-            },
-        },
-        DaemonMessage::Started {
-            session_id: 42,
-            request_id: 1,
-            turn_id: 0,
-            estimated_prompt_tokens: 0,
-        },
-        DaemonMessage::OutputChunk {
-            session_id: 42,
-            request_id: 1,
-            stream: choreo_proto::OutputStream::Answer,
-            data: vec![],
-        },
-        DaemonMessage::Done {
-            session_id: 42,
-            request_id: 1,
-            token_usage: None,
-            last_prompt_tokens: None,
-        },
-        DaemonMessage::Failed {
-            session_id: 42,
-            request_id: 1,
-            error: "e".into(),
-        },
-        DaemonMessage::Cancelled {
-            session_id: 42,
-            request_id: 1,
-        },
-        DaemonMessage::ModelSelected {
-            session_id: 42,
-            model: "gpt-4".into(),
-            reasoning_capability: None,
-        },
-        DaemonMessage::ModelSelectionFailed {
-            session_id: 42,
-            model: "gpt-4".into(),
-            error: "e".into(),
-        },
-        DaemonMessage::ReasoningEffortSet {
-            session_id: 42,
-            effort: "off".into(),
-        },
-        DaemonMessage::SessionAccountSet {
-            session_id: 42,
-            account: "test".into(),
-        },
-        DaemonMessage::ContextWindowResolved {
-            session_id: 42,
-            context_window: 128000,
-        },
-        DaemonMessage::SessionTitleSet {
-            session_id: 42,
-            title: "test".into(),
-        },
-    ];
+#[serial_test::serial(catalog)]
+fn handle_broadcast_activity_dedup_keyed_on_command_origin_not_message_shape() {
+    // The dedup filter must be SHAPE-INDEPENDENT: the origin session comes
+    // exclusively from the `session_id` field on the broadcast command, so a
+    // message whose variant cannot possibly carry a session-scoped origin
+    // (`Sessions` is a global list payload) is STILL suppressed for a client
+    // that subscribes to the origin session named on the command.
+    let (mut state, _rx) = make_daemon_state();
+    let (tx, rx) = test_sink();
 
-    for msg in cases {
-        assert_eq!(
-            msg.session_id(),
-            Some(42),
-            "expected session_id=42 for {:?}",
-            std::mem::discriminant(&msg)
-        );
-    }
-}
+    // Client 10 is both an activity subscriber AND a subscriber of session
+    // 42 — exactly the profile the duplicate-suppression targets.
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 10,
+        writer: tx,
+    });
+    drain_send_on_subscribe(&rx);
+    state.handle_command(DaemonCommand::TrackSessionSubscription {
+        client_id: 10,
+        session_id: 42,
+    });
 
-#[test]
-fn session_id_returns_none_for_non_session_variants() {
-    let cases: Vec<DaemonMessage> = vec![
-        DaemonMessage::Sessions { sessions: vec![] },
-        DaemonMessage::Pong,
-        DaemonMessage::Models {
-            models: vec![],
-            selected_model: None,
-        },
-        DaemonMessage::ModelsFailed { error: "e".into() },
-        DaemonMessage::Unlocked,
-        DaemonMessage::Locked,
-        DaemonMessage::LockedError { error: "e".into() },
-        DaemonMessage::CredentialAdded {
-            service: "s".into(),
-        },
-        DaemonMessage::CredentialAddFailed {
-            service: "s".into(),
-            error: "e".into(),
-        },
-        DaemonMessage::Credential {
-            service: "s".into(),
-            key: None,
-        },
-        DaemonMessage::AccountAdded { name: "a".into() },
-        DaemonMessage::Accounts { accounts: vec![] },
-        DaemonMessage::ShuttingDown,
-        DaemonMessage::Evicted,
-    ];
+    // `Sessions` has no session_id inside its payload: the Some(42) origin
+    // below exists ONLY on the command, so a delivery (or suppression)
+    // proves the filter reads the provenance field, not the message shape.
+    let msg = DaemonMessage::Sessions { sessions: vec![] };
+    state.handle_command(DaemonCommand::BroadcastActivity {
+        session_id: Some(42),
+        msg,
+    });
 
-    for msg in cases {
-        assert!(
-            msg.session_id().is_none(),
-            "expected no session_id for {:?}",
-            std::mem::discriminant(&msg)
-        );
-    }
-}
-
-#[test]
-fn session_id_extracts_correct_value() {
-    let msg = DaemonMessage::OutputChunk {
-        session_id: 12345,
-        request_id: 1,
-        stream: choreo_proto::OutputStream::Answer,
-        data: vec![],
-    };
-    assert_eq!(msg.session_id(), Some(12345));
+    // Suppressed: the client received nothing through the activity path
+    // (the origin came purely from the command field, not the payload).
+    assert!(
+        rx.try_recv().is_err(),
+        "message should have been suppressed: origin came from the command, not the payload"
+    );
+    assert!(state.activity_subscribers.contains_key(&10));
 }
 
 // ── S4: /refresh-models + catalog swaps ────────────────────────────

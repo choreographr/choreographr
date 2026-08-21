@@ -1080,7 +1080,7 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
     // handler refreshes the session-metadata index — both on the same
     // thread, so ordering is deterministic.
     match daemon_rx.recv().unwrap() {
-        DaemonCommand::BroadcastActivity(_) => {}
+        DaemonCommand::BroadcastActivity { .. } => {}
         _ => panic!("expected BroadcastActivity forward before UpdateMetadata"),
     }
     match daemon_rx.recv().unwrap() {

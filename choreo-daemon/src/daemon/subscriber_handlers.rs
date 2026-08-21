@@ -377,11 +377,20 @@ impl DaemonState {
     /// blocking the command loop), and a subscriber whose queue crossed the
     /// lag limits is evicted so the backlog stays bounded.
     ///
-    /// Skips delivery to clients that are also direct session subscribers of
-    /// the originating session — those clients receive the message through
-    /// the per-session subscriber path, avoiding duplicate delivery.
-    pub(super) fn handle_broadcast_activity(&mut self, msg: DaemonMessage) {
-        let origin_session_id = msg.session_id();
+    /// Duplicate-suppression is keyed on the EXPLICIT origin session carried
+    /// by the broadcast command (`session_id`), not on the message shape —
+    /// mirroring the sibling `BroadcastSessionStatus { session_id, status }`
+    /// command, which likewise carries its provenance explicitly. `Some` for
+    /// session-originated broadcasts (the sending session thread knows its
+    /// own id), `None` for global/control broadcasts. Clients that are also
+    /// direct subscribers of the origin session are skipped: they receive
+    /// the message through the per-session subscriber path, avoiding
+    /// duplicate delivery.
+    pub(super) fn handle_broadcast_activity(
+        &mut self,
+        session_id: Option<u64>,
+        msg: DaemonMessage,
+    ) {
         let (evict_clients, evict_largest) = fan_out_evicting(
             &mut self.activity_subscribers,
             &msg,
@@ -389,12 +398,13 @@ impl DaemonState {
             &self.global_lag,
             |client_id| {
                 // Skip if this client is also a direct subscriber of the
-                // session that originated this message — they'll receive it
-                // through the per-session broadcast path, avoiding duplicate
-                // delivery.
-                if let Some(ref sid) = origin_session_id
+                // origin session — they'll receive it through the per-session
+                // broadcast path, avoiding duplicate delivery. `Option<u64>`
+                // is Copy, so `session_id` moves into the closure by copy and
+                // needs no clone.
+                if let Some(sid) = session_id
                     && let Some(sessions) = self.client_subscribed_sessions.get(&client_id)
-                    && sessions.contains(sid)
+                    && sessions.contains(&sid)
                 {
                     return true;
                 }

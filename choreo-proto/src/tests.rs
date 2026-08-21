@@ -90,35 +90,6 @@ fn refresh_messages_serde_round_trip() {
 }
 
 #[test]
-fn refresh_messages_have_no_session_id() {
-    // These variants are connection/catalog-level, not session-scoped: the
-    // activity-broadcast dedup logic must treat them as origin-less.
-    assert_eq!(
-        DaemonMessage::ModelsRefreshed {
-            providers: 0,
-            models: 0,
-            status: RefreshStatus::Updated,
-        }
-        .session_id(),
-        None
-    );
-    assert_eq!(
-        DaemonMessage::ModelsRefreshFailed {
-            error: "x".to_string(),
-        }
-        .session_id(),
-        None
-    );
-    assert_eq!(
-        DaemonMessage::CatalogUpdated {
-            providers: Vec::new(),
-        }
-        .session_id(),
-        None
-    );
-}
-
-#[test]
 fn decode_rejects_trailing_bytes() {
     let message = ClientMessage::Ping;
     let mut frame = encode_frame(&message).expect("encode");
@@ -611,15 +582,15 @@ fn turn_appended_serde_round_trip() {
 }
 
 #[test]
-fn evicted_serde_round_trip_and_no_session_id() {
+fn evicted_serde_round_trip() {
     // Evicted is a unit variant (best-effort lag-eviction advisory): it must
-    // round-trip through the wire format and carry no session_id, so the
-    // daemon's activity-broadcast dedup treats it as origin-less.
+    // round-trip through the wire format. Origin-session attribution for the
+    // activity-broadcast dedup is now carried explicitly on the broadcast
+    // command, not derived from the message, so no session_id assertion here.
     let msg = DaemonMessage::Evicted;
     let frame = encode_frame(&msg).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
     assert_eq!(decoded, DaemonMessage::Evicted);
-    assert_eq!(decoded.session_id(), None);
 }
 
 // ── approx_wire_size tests ─────────────────────────────────────
