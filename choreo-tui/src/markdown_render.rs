@@ -1077,24 +1077,23 @@ pub(crate) fn render_turn_lines(
             }
         }
 
-        // Apply 2-column left/right indent so every row spans the full
-        // area width with exactly 2 columns of right margin.
+        // No left indent (the 2-column margin was removed); every row spans
+        // the full area width with exactly 1 column of right margin.
         for (line, join) in body.into_iter().zip(body_joins) {
             let mut line = line;
-            line.spans.insert(0, Span::styled("  ", Style::default()));
-            let content_sum: usize = line.spans.iter().skip(1).map(|s| s.width()).sum();
+            let content_sum: usize = line.spans.iter().map(|s| s.width()).sum();
             let fill = (tool_content_width as usize).saturating_sub(content_sum);
             line.spans
                 .push(Span::styled(" ".repeat(fill), Style::default()));
-            line.spans.push(Span::styled("  ", Style::default()));
-            // Unboxed rows: content starts after the 2-column indent and ends
-            // where the fill begins.  Blank body rows (the renderer's spacer
-            // rows and genuinely blank tool-output lines) carry no characters
-            // but are *content*, not chrome: they keep an empty `(2, 2)`
-            // range so the selection copies the source's blank lines, while
-            // the turn-edge separators/padding stay `None` and are dropped.
-            let end = (2 + content_sum).min(2 + tool_content_width as usize);
-            all_content_ranges.push(Some((2, end)));
+            line.spans.push(Span::styled(" ", Style::default()));
+            // Unboxed rows: content starts at column 0 and ends where the
+            // fill begins.  Blank body rows (the renderer's spacer rows and
+            // genuinely blank tool-output lines) carry no characters but are
+            // *content*, not chrome: they keep an empty `(0, 0)` range so the
+            // selection copies the source's blank lines, while the
+            // turn-edge separators/padding stay `None` and are dropped.
+            let end = content_sum.min(tool_content_width as usize);
+            all_content_ranges.push(Some((0, end)));
             all_joins.push(join);
             all_lines.push(line);
         }
@@ -1152,8 +1151,8 @@ type MarginLines = (
 /// background shading.
 ///
 /// Returns the wrapped lines, their total height, and a per-line content
-/// column range aligned with the returned lines: `(5, 5 + line.width())` for
-/// content rows (the text between the `"  ┃  "` gutter and the trailing
+/// column range aligned with the returned lines: `(3, 3 + line.width())` for
+/// content rows (the text between the `"┃  "` gutter and the trailing
 /// fill), `None` for the structural chrome rows (separator, padding).  The
 /// per-line [`LineJoin`] metadata is carried through unchanged: structural
 /// chrome rows are fresh lines, content rows keep the join their producer
@@ -1168,18 +1167,24 @@ fn add_margin_lines(
     let gray = Style::default().bg(BG_SHADE);
     let no_shading = Style::default().bg(Color::Reset);
     let accent_line = Style::default().fg(accent).bg(Color::Reset);
-    let total_width = content_width as usize + 9;
+    // Rows span `content_width + 6` columns: a flush `┃` gutter + 2-column
+    // shading on the left, the text + trailing fill, then 2 shaded + 1 blank
+    // column on the right (the blank is the 1-column margin between the
+    // viewport and the scrollbar).  The padding row grabs `content_width + 4`
+    // of shaded middle so it lines up with every content row.
+    let total_width = content_width as usize + 6;
     let shaded_content = content_width as usize + 4;
 
     // Top separator: no shading
     let separator = Line::from(vec![Span::styled(" ".repeat(total_width), no_shading)]);
 
-    // Padding row: shading on cols 3..W-3, no text
+    // Padding row: gutter flush with the left edge (the 2-column margin was
+    // removed), ending one blank column before the edge — the 1-column margin
+    // between the viewport and the scrollbar.
     let padding = Line::from(vec![
-        Span::styled("  ", no_shading),
         Span::styled("┃", accent_line),
         Span::styled(" ".repeat(shaded_content), gray),
-        Span::styled("  ", no_shading),
+        Span::styled(" ", no_shading),
     ]);
 
     let mut result = Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
@@ -1197,11 +1202,8 @@ fn add_margin_lines(
         let text_width = line.width();
         let fill = (content_width as usize).saturating_sub(text_width);
 
-        let mut spans = vec![
-            Span::styled("  ", no_shading),
-            Span::styled("┃", accent_line),
-            Span::styled("  ", gray),
-        ];
+        // Gutter flush with the left edge (the 2-column margin was removed).
+        let mut spans = vec![Span::styled("┃", accent_line), Span::styled("  ", gray)];
         // Content spans — explicitly set bg so they display correctly even without
         // a paragraph-level background.
         spans.extend(
@@ -1211,12 +1213,14 @@ fn add_margin_lines(
         );
         spans.push(Span::styled(" ".repeat(fill), gray));
         spans.push(Span::styled("  ", gray));
-        spans.push(Span::styled("  ", no_shading));
+        // Single blank column: the 1-column margin between the viewport and
+        // the scrollbar.
+        spans.push(Span::styled(" ", no_shading));
 
         result.push(Line::from(spans));
-        // Content occupies columns [5, 5 + text width): after the fixed
-        // `"  ┃  "` gutter, up to where the trailing fill begins.
-        content_ranges.push(Some((5, 5 + text_width)));
+        // Content occupies columns [3, 3 + text width): after the `┃  `
+        // gutter, up to where the trailing fill begins.
+        content_ranges.push(Some((3, 3 + text_width)));
         box_joins.push(join);
     }
 

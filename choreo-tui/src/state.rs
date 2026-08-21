@@ -3476,8 +3476,10 @@ impl SessionDisplayState {
             if turn.undone {
                 continue;
             }
-            let content_width = viewport.width.saturating_sub(9);
-            let tool_content_width = viewport.width.saturating_sub(4);
+            // Must stay in lockstep with render_history (render.rs) so the
+            // render-cache key never drifts from what the renderer draws.
+            let content_width = viewport.width.saturating_sub(6);
+            let tool_content_width = viewport.width.saturating_sub(1);
 
             // Effective reasoning visibility for this turn: the per-turn
             // user override (from clicking the header), falling back to the
@@ -3739,8 +3741,10 @@ impl SessionDisplayState {
             return self.rebuild_height_prefix_preserving_scroll(viewport);
         };
 
-        let content_width = viewport.width.saturating_sub(9);
-        let tool_content_width = viewport.width.saturating_sub(4);
+        // Must stay in lockstep with render_history (render.rs) so the
+        // render-cache key never drifts from what the renderer draws.
+        let content_width = viewport.width.saturating_sub(6);
+        let tool_content_width = viewport.width.saturating_sub(1);
 
         // Re-render with the effective reasoning visibility so the streaming
         // fast path stays consistent with the collapsed/expanded state.  The

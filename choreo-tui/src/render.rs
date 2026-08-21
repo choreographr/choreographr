@@ -421,8 +421,13 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    let content_width = area.width.saturating_sub(9);
-    let tool_content_width = area.width.saturating_sub(4);
+    // Text-wrap budgets: message blocks lose 6 columns of chrome (a flush
+    // `┃` gutter + 2-col shading on the left; 2 shaded + 1 blank on the
+    // right) and tool rows lose 1 (their single right-margin column).  These
+    // must stay in lockstep with add_margin_lines / the tool-result row loop
+    // in markdown_render.rs so rows fill exactly the viewport width.
+    let content_width = area.width.saturating_sub(6);
+    let tool_content_width = area.width.saturating_sub(1);
 
     app.ensure_cache_synced();
 

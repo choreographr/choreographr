@@ -23,7 +23,7 @@
 //! corrupt the result: each row maps to whatever content is current then.
 //!
 //! Coordinates: the history pane's lines are pre-wrapped at `content_width`
-//! (viewport width − 9) and drawn in a non-wrapping `Paragraph`, so every
+//! (viewport width − 6) and drawn in a non-wrapping `Paragraph`, so every
 //! semantic line occupies exactly one visual row; the code still walks the
 //! cached `visual_offsets` so a hypothetical multi-row line maps correctly.
 
@@ -581,7 +581,7 @@ fn cached_rendered_turn(
     let cached = display.render_cache.get(turn_idx)?.as_ref()?;
     let turn_id = display.visible_turn_ids.get(turn_idx).copied()?;
     if cached.key.turn_id != turn_id
-        || cached.key.width as usize != vp_width.saturating_sub(9)
+        || cached.key.width as usize != vp_width.saturating_sub(6)
         || cached.key.viewport_width as usize != vp_width
     {
         return None;

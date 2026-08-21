@@ -1469,10 +1469,10 @@ fn render_turn_lines_description_header_fits_content_width() {
         reasoning_producer: None,
     };
     let lines = render_turn_lines(&turn, 40, 45, false, &[true]).lines;
-    // tool_content_width = 45 → rows are padded to exactly 49 columns;
+    // tool_content_width = 45 → rows are padded to exactly 46 columns;
     // the header must never exceed that.
     assert!(
-        lines[0].width() <= 49,
+        lines[0].width() <= 46,
         "header row must fit the viewport width: {}",
         lines[0].width()
     );
@@ -2091,12 +2091,12 @@ fn render_turn_lines_plain_text_result_wraps_to_content_width() {
     };
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     // tool_content_width = 85; each body line is wrapped to it, then gets
-    // a 2-col left indent + right margin, so the full line is ≤ 85 + 4.
-    // Before the fix the single 213-char span produced one 213+4-wide
-    // line that the non-wrapping Paragraph clipped.
+    // a 1-col right margin, so the full line is ≤ 85 + 1.  Before the fix
+    // the single 213-char span produced one 213+4-wide line (the old 2+2
+    // indent + margin) that the non-wrapping Paragraph clipped.
     for line in &lines {
         assert!(
-            line.width() <= 85 + 4,
+            line.width() <= 85 + 1,
             "rendered line width {} exceeds tool content width + margins",
             line.width()
         );
@@ -2169,7 +2169,7 @@ fn render_turn_lines_tab_indented_content_renders_as_spaces() {
     }
     for line in &lines {
         assert!(
-            line.width() <= 85 + 4,
+            line.width() <= 85 + 1,
             "rendered line width {} exceeds tool content width + margins",
             line.width()
         );
@@ -2399,6 +2399,84 @@ fn user_text_timestamp_rendered_in_milliseconds() {
     assert!(
         !text.contains("1970"),
         "rendered turn must not contain an epoch date:\n{text}"
+    );
+}
+
+#[test]
+fn margin_block_rows_start_flush_and_end_one_column_short_of_scrollbar() {
+    // The 2-column left margin was removed (gutter flush at column 0) and
+    // the right margin trimmed to a single blank column, so every
+    // message-block row spans exactly content_width + 6 columns.  With one
+    // content line the row count is MARGIN_STRUCTURAL_ROWS(4) + 1 = 5:
+    // separator, padding, content, padding, separator.
+    let (lines, _rows, content_ranges, _joins) = add_margin_lines(
+        vec![Line::from("hello")],
+        vec![LineJoin::Break],
+        20,
+        Color::Blue,
+        None,
+    );
+    assert_eq!(lines.len(), 5, "sep + pad + content + pad + sep");
+    let content = &lines[2];
+    assert_eq!(
+        content.width(),
+        26,
+        "content_width 20 + 6 chrome (1 gutter + 2 shade left, 2 shade + 1 blank right) = 26"
+    );
+    // The gutter is the first glyph; text starts after the `┃  ` gutter.
+    assert!(content.spans[0].content.as_ref().starts_with('┃'));
+    assert_eq!(content_ranges[2], Some((3, 8)), "text starts at column 3");
+    // Padding rows line up with the content rows exactly.
+    assert_eq!(lines[1].width(), 26, "padding row matches content rows");
+    assert_eq!(lines[3].width(), 26, "padding row matches content rows");
+}
+
+#[test]
+fn tool_result_rows_start_flush_and_end_one_column_short_of_scrollbar() {
+    // Tool-result rows lost their 2-column left indent and now end with a
+    // single blank column: every row is padded to exactly tool_content_width
+    // + 1 columns and body content starts at column 0.
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![choreo_proto::ToolResultRecord {
+            call_id: "call1".into(),
+            name: "sh".into(),
+            content: "hello world".into(),
+            is_error: false,
+            invocation_description: "Running `echo hello`.".into(),
+        }],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
+    for line in &rendered.lines {
+        assert!(
+            line.width() <= 86,
+            "no row may exceed tool_content_width + 1 = 86, got {}",
+            line.width()
+        );
+    }
+    // Body rows are padded to the full row width (content + fill + margin).
+    assert!(
+        rendered.lines.iter().any(|l| l.width() == 86),
+        "filled rows must span exactly tool_content_width + 1 = 86 columns"
+    );
+    // Content starts at column 0 (the 2-column left indent was removed).
+    assert!(
+        rendered
+            .content_ranges
+            .iter()
+            .any(|r| matches!(r, Some((0, _)))),
+        "tool content must start at column 0, got {:#?}",
+        rendered.content_ranges
     );
 }
 
