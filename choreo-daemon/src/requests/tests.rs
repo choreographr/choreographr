@@ -333,6 +333,141 @@ fn builder_does_not_inject_empty_reasoning_content_for_non_deepseek() {
 }
 
 #[test]
+fn builder_requires_rc_empty_content_turn_echoes_artifact() {
+    // A DeepSeek/Kimi turn recorded as reasoning-only — same-model artifact,
+    // but empty content and no tool calls. ToolLoop alone would skip the
+    // echo (no tool involvement), leaving the wire assistant message wholly
+    // empty (`content: ""` + injected empty `reasoning_content`) — the exact
+    // shape upstream rejects with "the message ... with role 'assistant'
+    // must not be empty". The builder's empty-message fallback must echo the
+    // artifact's real reasoning text instead.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "continue",
+        "",
+        Some(artifact(b"long reasoning text")),
+        Some(deepseek_producer()),
+        vec![],
+    );
+
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(
+        assistants[0].reasoning_artifact,
+        Some(artifact(b"long reasoning text")),
+        "empty-message fallback echoes the same-model artifact",
+    );
+    // The injected empty string must NOT shadow the artifact: leave the
+    // explicit field None so the Serialize impl re-emits the real text.
+    assert_eq!(assistants[0].reasoning_content, None);
+    assert_eq!(assistants[0].content.as_deref(), Some(""));
+
+    // The wire the provider actually receives carries the non-empty echo.
+    let body = serde_json::to_value(&result[1]).unwrap();
+    assert_eq!(body["content"], "");
+    assert_eq!(body["reasoning_content"], "long reasoning text");
+}
+
+#[test]
+fn builder_requires_rc_empty_content_turn_keeps_content_turn_bare() {
+    // The fallback must NOT change plain-text turns: a non-empty assistant
+    // message with a same-model artifact but no tool involvement is still
+    // sent bare under ToolLoop (no echo needed — the message is valid).
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "hello",
+        "hi",
+        Some(artifact(b"plain")),
+        Some(deepseek_producer()),
+        vec![],
+    );
+
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(assistants[0].reasoning_artifact, None);
+    assert_eq!(assistants[0].reasoning_content, Some(String::new()));
+}
+
+#[test]
+fn builder_requires_rc_empty_content_turn_foreign_artifact_not_replayed() {
+    // Same reasoning-only shape, but the artifact was produced by a DIFFERENT
+    // model (mid-session switch scenario): the payload is model-bound and
+    // must never be replayed, so the message stays empty on the wire — that
+    // is the unfixable case the daemon guard flags as a "must not be empty"
+    // risk rather than a silent corruption.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "continue",
+        "",
+        Some(artifact(b"claude thinking")),
+        Some(anthropic_producer()),
+        vec![],
+    );
+
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(assistants[0].reasoning_artifact, None);
+    assert_eq!(assistants[0].reasoning_content, Some(String::new()));
+
+    // And the guard must flag it: wire-empty + requires_rc + nothing
+    // replayable.
+    assert_eq!(
+        warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
+        1,
+        "foreign-producer artifact on a wire-empty requires_rc turn is flagged",
+    );
+}
+
+#[test]
+fn guard_requires_rc_empty_content_turn_with_replayable_artifact_is_clean() {
+    // Wire-empty turn whose same-model artifact the builder echoes via the
+    // empty-message fallback: the request self-heals, so the guard must NOT
+    // count it as a problem.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "continue",
+        "",
+        Some(artifact(b"thinking")),
+        Some(deepseek_producer()),
+        vec![],
+    );
+    assert_eq!(
+        warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
+        0,
+        "empty-message fallback already echoes the same-model artifact",
+    );
+}
+
+#[test]
+fn guard_requires_rc_empty_content_turn_missing_artifact_is_flagged() {
+    // Wire-empty turn with NO artifact at all (e.g. reasoning-only response
+    // captured before the artifact feature, or a producer that never sent
+    // reasoning): nothing can fill the message, so the provider's "must not
+    // be empty" 400 is certain — the guard must surface it.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "continue",
+        "",
+        None,
+        Some(deepseek_producer()),
+        vec![],
+    );
+    assert_eq!(
+        warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
+        1,
+        "wire-empty requires_rc turn with no artifact to fill it is flagged",
+    );
+}
+
+#[test]
 fn builder_all_turns_attaches_always() {
     let mut session = SessionState::empty();
     // Unknown model under the anthropic slug → protocol default AllTurns

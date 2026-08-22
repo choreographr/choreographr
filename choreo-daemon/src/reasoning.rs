@@ -59,12 +59,14 @@ pub fn build_chat_request_messages(
         }
         // Assistant message (text or tool calls).
         //
-        // Reasoning round-trip (phase 4b): the artifact is replayed only when
-        // BOTH gates pass — (1) same-model provenance (artifacts are
-        // model-bound; a turn produced by a different model must not have its
-        // encrypted payload replayed into this request, matching pi's
-        // isSameModel and Anthropic's strip-on-model-change rule) and (2) the
-        // provider's passback policy for this request:
+        // Reasoning round-trip (phase 4b): the artifact is replayed when BOTH
+        // gates pass — (1) same-model provenance (artifacts are model-bound; a
+        // turn produced by a different model must not have its encrypted
+        // payload replayed into this request, matching pi's isSameModel and
+        // Anthropic's strip-on-model-change rule) and (2) the provider's
+        // passback policy for this request — OR the empty-message fallback
+        // applies (see the reasoning_content comment below; `requires_rc`
+        // models must never ship a content-less, tool-less turn bare):
         //   ToolLoop  → only tool-involving turns (assistant tool_calls or
         //               tool results attached) — DeepSeek/Kimi reject a tool
         //               loop whose assistant message drops reasoning_content
@@ -75,24 +77,12 @@ pub fn build_chat_request_messages(
         //   None      → display-only providers, never replay
         // The three legacy string fields (reasoning_content/reasoning/
         // reasoning_text) stay None: the adapter re-emits the artifact in its
-        // own wire format (phase 4a), so the daemon never interprets it.
-        //
-        // The provenance check compares `(slug, model)` string pairs directly
-        // instead of constructing a temporary `ReasoningProducer` (which
-        // would allocate two Strings per turn).
-        let same_model = turn
-            .reasoning_producer
-            .as_ref()
-            .map(|p| (p.provider_slug.as_str(), p.model.as_str()))
-            == Some((provider_slug, model));
-        let include_artifact = same_model
-            && match passback {
-                ReasoningPassback::None => false,
-                ReasoningPassback::ToolLoop => turn_has_tool_involvement(turn),
-                ReasoningPassback::AllTurns => true,
-                ReasoningPassback::Signature => true,
-                ReasoningPassback::ResponseId => false,
-            };
+        // own wire format (phase 4a), so the daemon never interprets it. The
+        // whole decision (policy + provenance + empty-fill) lives in
+        // `include_reasoning_artifact`, shared with the precondition guard
+        // and `session_inspect` so the three can never drift.
+        let include_artifact =
+            include_reasoning_artifact(turn, provider_slug, model, passback, requires_rc);
         let has_tool_calls = !turn.tool_calls.is_empty();
         if turn.assistant_text.is_some() || has_tool_calls {
             let tool_calls = if has_tool_calls {
@@ -123,9 +113,11 @@ pub fn build_chat_request_messages(
                 // and where nothing will be echoed, inject an EMPTY string so
                 // the wire always carries it (mirrors opencode's transform of
                 // `{type:"reasoning", text:""}` on every assistant message).
-                reasoning_content: if requires_rc
-                    && !(include_artifact && turn.reasoning_artifact.is_some())
-                {
+                // `include_reasoning_artifact` already forces the artifact
+                // in for a content-less, tool-less turn (the "empty assistant
+                // message" 400), so the injected empty string only appears
+                // when nothing real can be echoed.
+                reasoning_content: if requires_rc && !include_artifact {
                     Some(String::new())
                 } else {
                     None
@@ -163,6 +155,67 @@ pub fn build_chat_request_messages(
 /// turns.
 fn turn_has_tool_involvement(turn: &Turn) -> bool {
     !turn.tool_calls.is_empty() || !turn.tool_results.is_empty()
+}
+
+/// Single source of truth for whether a turn's opaque reasoning artifact is
+/// replayed on the wire for the current `(provider_slug, model)` request.
+/// The request builder, the precondition guard, and the `session_inspect`
+/// dry-run all compute the same decision through this one helper so the
+/// three can never drift.
+///
+/// Two gates, both required:
+/// 1. **Same-model provenance** — artifacts are model-bound; a turn produced
+///    by a different model (or with an unrecorded producer) must not have
+///    its payload replayed, matching pi's isSameModel and Anthropic's
+///    strip-on-model-change rule.
+/// 2. **The passback policy** for the request:
+///    ToolLoop  → tool-involving turns only
+///    AllTurns / Signature → every turn
+///    None / ResponseId → never via the message
+///
+/// PLUS the `requires_rc` **empty-message fallback**: on DeepSeek/Kimi chat
+/// models the builder must never ship a provably-invalid assistant message —
+/// a turn recorded with empty content and no tool calls (e.g. a reasoning-
+/// only response) would serialize as `content: ""` + an injected empty
+/// `reasoning_content`, which the provider rejects with "the message ...
+/// with role 'assistant' must not be empty". If such a turn carries a
+/// same-model artifact, the artifact's real reasoning text is the only
+/// non-empty payload available, so it is included even though the policy
+/// alone would skip it. Artifacts always carry non-empty bytes (the capture
+/// path filters empty reasoning), so including one guarantees the wire
+/// message is non-empty.
+pub(crate) fn include_reasoning_artifact(
+    turn: &Turn,
+    provider_slug: &str,
+    model: &str,
+    passback: ReasoningPassback,
+    requires_rc: bool,
+) -> bool {
+    // Same-model provenance: compare `(slug, model)` string pairs directly
+    // instead of constructing a temporary `ReasoningProducer` (which would
+    // allocate two Strings per turn). An unrecorded producer fails this too
+    // (None != Some(..)), so a pre-migration artifact is never replayed.
+    let same_model = turn
+        .reasoning_producer
+        .as_ref()
+        .map(|p| (p.provider_slug.as_str(), p.model.as_str()))
+        == Some((provider_slug, model));
+    if !same_model || turn.reasoning_artifact.is_none() {
+        return false;
+    }
+    let policy_echo = match passback {
+        ReasoningPassback::None | ReasoningPassback::ResponseId => false,
+        ReasoningPassback::ToolLoop => turn_has_tool_involvement(turn),
+        ReasoningPassback::AllTurns | ReasoningPassback::Signature => true,
+    };
+    // Empty-message fallback: a content-less, tool-less turn on a model that
+    // requires `reasoning_content` would otherwise ship an empty assistant
+    // message; the artifact's reasoning text is the only payload that can
+    // keep it valid.
+    policy_echo
+        || (requires_rc
+            && turn.tool_calls.is_empty()
+            && turn.assistant_text.as_deref().is_none_or(str::is_empty))
 }
 
 /// Resolve the starting `previous_response_id` for a new agent-loop
@@ -222,13 +275,22 @@ pub(crate) fn initial_prev_resp_id(
 /// Scope: `ToolLoop` cares only about tool-involving turns (that is where the
 /// provider demands the echo); `AllTurns`/`Signature` echo on every assistant
 /// message, so any assistant turn missing its artifact is a violation there.
+/// Additionally, on DeepSeek/Kimi chat models (`requires_rc`), an assistant
+/// message that would be **empty on the wire** (no content, no tool calls —
+/// e.g. a reasoning-only response) is flagged when the builder has no
+/// same-model artifact to fill it: the empty `reasoning_content` injection
+/// cannot make it non-empty, so the provider's "message ... must not be
+/// empty" 400 is the certain outcome rather than a guess.
 ///
 /// Provenance is checked exactly like the builder: an artifact is only
 /// replayed when its producer matches the current (provider_slug, model), so
 /// after a deliberate mid-session model switch every pre-switch turn is
 /// flagged on each request. That is the intended diagnostic signal — the
 /// built request genuinely omits those echoes; if the provider accepts the
-/// switch, the warnings are informational rather than a blocker.
+/// switch, the warnings are informational rather than a blocker. The replay
+/// decision (including the empty-message fallback) comes from
+/// [`include_reasoning_artifact`], the same helper the builder uses, so the
+/// guard can never disagree with the request that is actually sent.
 pub(crate) fn warn_on_missing_reasoning_artifacts(
     session: &SessionState,
     session_id: u64,
@@ -242,6 +304,10 @@ pub(crate) fn warn_on_missing_reasoning_artifacts(
     ) {
         return 0;
     }
+    // Mirror the builder's `requires_reasoning_content` resolution so the
+    // empty-message fallback (and the wire-empty hazard it fixes) is judged
+    // against exactly the models the builder injects the empty string for.
+    let requires_rc = requires_reasoning_content(provider_slug, model);
     // AllTurns/Signature echo on every assistant message; ToolLoop only on
     // tool-involving turns.
     let check_all_turns = matches!(
@@ -259,29 +325,44 @@ pub(crate) fn warn_on_missing_reasoning_artifacts(
         if !has_assistant_message {
             continue;
         }
-        if !check_all_turns && !turn_has_tool_involvement(turn) {
+        // The artifact is on the wire exactly when the builder (and the
+        // `session_inspect` dry-run) replay it — one helper, no drift. When
+        // it is echoed the message is non-empty (artifacts always carry
+        // non-empty bytes) and the required echo is present: clean.
+        if include_reasoning_artifact(turn, provider_slug, model, passback, requires_rc) {
+            continue;
+        }
+        // Nothing was echoed. That is a problem when the passback policy
+        // demands the echo on this turn (AllTurns/Signature everywhere,
+        // ToolLoop on tool-involving turns), OR when omitting it leaves a
+        // wire-EMPTY assistant message on a model that requires
+        // `reasoning_content` — the provider's "must not be empty" 400 is
+        // then certain, because the empty-string injection is no substitute
+        // for a real payload.
+        let wire_empty =
+            turn.tool_calls.is_empty() && turn.assistant_text.as_deref().is_none_or(str::is_empty);
+        let policy_demands_echo = check_all_turns || turn_has_tool_involvement(turn);
+        if !policy_demands_echo && !(requires_rc && wire_empty) {
             continue;
         }
         // Mirror the builder's provenance gate exactly: an artifact is
         // replayed only when its producer matches the current (provider_slug,
-        // model), so a turn recorded under a different model (mid-session
-        // switch) omits its echo on the wire even though the artifact bytes
-        // exist — flag it like a missing artifact, or the provider 400 after
-        // the switch stays a mystery.
-        let same_producer = turn
-            .reasoning_producer
-            .as_ref()
-            .map(|p| (p.provider_slug.as_str(), p.model.as_str()))
-            == Some((provider_slug, model));
+        // model), so every turn that reaches the classification below has a
+        // producer mismatch (or none) — the `include_reasoning_artifact`
+        // early-return above already skipped every replayable same-model
+        // turn. Flagging it like a missing artifact keeps the provider 400
+        // after a model switch diagnosable.
+        problems += 1;
         match (&turn.reasoning_artifact, turn.reasoning_producer.as_ref()) {
             (None, _) => {
-                problems += 1;
                 warn!(
                     session_id,
                     turn_id,
                     provider_slug,
                     model,
                     passback = ?passback,
+                    requires_rc,
+                    wire_empty,
                     "reasoning artifact missing for turn; provider may reject this request",
                 );
             }
@@ -290,30 +371,29 @@ pub(crate) fn warn_on_missing_reasoning_artifacts(
             // same-model provenance, so the payload is dropped — flag it like
             // a missing artifact rather than claiming a model mismatch.
             (Some(_), None) => {
-                problems += 1;
                 warn!(
                     session_id,
                     turn_id,
                     provider_slug,
                     model,
                     passback = ?passback,
+                    requires_rc,
+                    wire_empty,
                     "reasoning artifact present but its producer is unrecorded; it will not be replayed and the provider may reject this request",
                 );
             }
-            (Some(_), Some(_)) if !same_producer => {
-                problems += 1;
+            (Some(_), Some(_)) => {
                 warn!(
                     session_id,
                     turn_id,
                     provider_slug,
                     model,
                     passback = ?passback,
+                    requires_rc,
+                    wire_empty,
                     "reasoning artifact produced by a different model; it will not be replayed and the provider may reject this request",
                 );
             }
-            // Artifact present and produced by the current model — the
-            // builder will replay it; clean.
-            (Some(_), Some(_)) => {}
         }
     }
     problems

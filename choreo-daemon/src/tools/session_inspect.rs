@@ -26,7 +26,9 @@
 
 use super::ToolExecError;
 use crate::db::{read_session, read_turns};
-use crate::reasoning::{build_chat_request_messages, warn_on_missing_reasoning_artifacts};
+use crate::reasoning::{
+    build_chat_request_messages, include_reasoning_artifact, warn_on_missing_reasoning_artifacts,
+};
 use crate::sessions::SessionState;
 use crate::tools::Tool;
 use crate::tools::context::ToolContext;
@@ -208,7 +210,8 @@ fn build_report(
     let mut assistant_count = 0usize;
     let mut wire_rc_count = 0usize;
     let mut wire_tool_no_rc = 0usize;
-    for m in &messages {
+    let mut wire_empty: Vec<String> = Vec::new();
+    for (msg_index, m) in messages.iter().enumerate() {
         if m.role != "assistant" {
             continue;
         }
@@ -226,6 +229,24 @@ fn build_report(
         }
         if has_tools && !has_rc {
             wire_tool_no_rc += 1;
+        }
+        // "must not be empty" hazard: an assistant message with no content,
+        // no tool calls, and no non-empty reasoning echo is exactly what
+        // OpenAI-compatible providers reject with a 400. Any turn reaching
+        // this state on the wire is a hard failure candidate regardless of
+        // the passback accounting.
+        let content_empty = value
+            .get("content")
+            .and_then(|c| c.as_str())
+            .is_none_or(str::is_empty);
+        let reasoning_non_empty = ["reasoning_content", "reasoning", "reasoning_text"]
+            .iter()
+            .filter_map(|k| value.get(*k).and_then(|v| v.as_str()))
+            .any(|s| !s.is_empty());
+        if content_empty && !has_tools && !reasoning_non_empty {
+            wire_empty.push(format!(
+                "  position {msg_index}: \"must not be empty\" 400 candidate"
+            ));
         }
     }
 
@@ -255,12 +276,12 @@ fn build_report(
         let same_model = producer.map(|p| (p.provider_slug.as_str(), p.model.as_str()))
             == Some((provider.as_str(), model.as_str()));
         let tool_involvement = !turn.tool_calls.is_empty() || !turn.tool_results.is_empty();
-        let include_artifact = same_model
-            && match passback {
-                ReasoningPassback::None | ReasoningPassback::ResponseId => false,
-                ReasoningPassback::ToolLoop => tool_involvement,
-                ReasoningPassback::AllTurns | ReasoningPassback::Signature => true,
-            };
+        // Same helper the builder uses — the empty-message fallback (a
+        // content-less, tool-less turn on a requires_rc model echoes its
+        // same-model artifact so the wire message is never empty) is applied
+        // here automatically, keeping the ledger and the wire in lockstep.
+        let include_artifact =
+            include_reasoning_artifact(turn, &provider, &model, passback, requires_rc);
         let echo_has_artifact = include_artifact && turn.reasoning_artifact.is_some();
         // Whether this turn's assistant message carries SOME
         // `reasoning_content` on the wire: the real artifact text, or (on
@@ -420,6 +441,14 @@ fn build_report(
     out.push_str(&format!(
         "  {wire_tool_no_rc} assistant tool-call message(s) carry NONE (provider-reject risk); ledger vs wire: {mismatch}\n"
     ));
+    if wire_empty.is_empty() {
+        out.push_str("  empty assistant message(s) on the wire: none\n");
+    } else {
+        out.push_str(&format!(
+            "  empty assistant message(s) on the wire (\"must not be empty\" 400 candidates):\n{}\n",
+            wire_empty.join("\n"),
+        ));
+    }
     out.push('\n');
 
     if risks.is_empty() {
@@ -809,6 +838,69 @@ mod tests {
             out.contains("RISK (tool-call turns with reasoning evidence but no wire echo): none"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn requires_rc_empty_content_turn_echoes_artifact_on_wire() {
+        // The reported bug shape (opencode-go deepseek→kimi mid-session
+        // switch): a turn recorded as reasoning-only — empty content, no tool
+        // calls, but a same-model artifact. ToolLoop alone would skip the
+        // echo and the injected empty `reasoning_content` cannot make the
+        // message non-empty, so upstream 400s with "the message ... must not
+        // be empty". The empty-message fallback must echo the artifact: the
+        // report shows echo=yes (real text, not the empty injection), NO
+        // empty-message candidates on the wire dry-run, and the daemon guard
+        // counts 0 problems.
+        let (_dir, ctx) = seed(
+            42,
+            42,
+            "deepseek-v4-flash",
+            vec![(
+                0,
+                text_turn(
+                    "",
+                    Some(chat_artifact("real reasoning text")),
+                    Some(ds_producer()),
+                ),
+            )],
+        );
+        let out = run(&ctx, inspect_args(None));
+        assert!(out.contains("echo=yes"), "artifact echoed: {out}");
+        assert!(
+            out.contains("empty assistant message(s) on the wire: none"),
+            "no empty assistant message on the wire: {out}"
+        );
+        assert!(
+            out.contains("daemon guard warn_on_missing_reasoning_artifacts: 0 problem(s)"),
+            "guard clean: {out}"
+        );
+        assert!(out.contains("ledger vs wire: OK"), "{out}");
+    }
+
+    #[test]
+    fn requires_rc_empty_content_turn_without_artifact_is_reported() {
+        // Same reasoning-only shape but NO artifact available to fill the
+        // message: the builder cannot self-heal, so the report must surface
+        // the wire-empty candidate (the provider's "must not be empty" 400)
+        // and the daemon guard must count it as a problem.
+        let (_dir, ctx) = seed(
+            42,
+            42,
+            "deepseek-v4-flash",
+            vec![(0, text_turn("", None, Some(ds_producer())))],
+        );
+        let out = run(&ctx, inspect_args(None));
+        assert!(
+            out.contains(
+                "empty assistant message(s) on the wire (\"must not be empty\" 400 candidates)"
+            ),
+            "wire-empty candidate surfaced: {out}"
+        );
+        assert!(
+            out.contains("daemon guard warn_on_missing_reasoning_artifacts: 1 problem(s)"),
+            "guard flags the unfixable turn: {out}"
+        );
+        assert!(out.contains("ledger vs wire: OK"), "{out}");
     }
 
     #[test]
