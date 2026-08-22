@@ -803,8 +803,10 @@ just test-crate choreo-proto   # a single crate via nextest
 
 just fmt                  # cargo fmt --all
 just clippy               # cargo clippy --workspace --all-targets
-just pre-commit           # AGENTS.md gate: fmt-check + clippy + test-all
-just ci                   # CI gate: fmt-check + clippy-strict + test-all
+just check-supply-chain   # dependency gate: deny.toml bans + RustSec advisories + cache scan
+just install-cargo-deny   # install the policy tool (cargo-deny) that check-supply-chain prefers
+just pre-commit           # AGENTS.md gate: fmt-check + clippy + test-all + check-supply-chain
+just ci                   # CI gate: fmt-check + clippy-strict + test-all + check-supply-chain
 
 just daemon -v            # run the daemon with debug logging
 just tui / gui / im / acp # run the other clients (im takes e.g. `just im telegram`)
@@ -815,6 +817,42 @@ just tui / gui / im / acp # run the other clients (im takes e.g. `just im telegr
 recipes (`test`, `test-fast`, `test-lean`, `test-integration`, `test-all`,
 `test-crate`, `shard`, `retry`) fail with an install hint until `cargo-nextest`
 is on `PATH`.
+
+### Supply-chain security
+
+The workspace depends on `arrayref` (pinned at `0.3.9`) transitively — through
+`tiny-skia` → `usvg`/`resvg` for SVG rendering in the daemon and TUI, and
+`blake2b_simd` → `subxt` (blockchain feature). On 2026-08-20 the `arrayref`
+maintainer's crates.io account was compromised and `arrayref@0.3.10` was
+republished with a dependency on payload-downloading build scripts (RUSTSEC-2026-0260,
+[Rust blog](https://blog.rust-lang.org/2026/08/20/supply-chain-attack-on-arrayref/));
+it was live for ~86 minutes before deletion. The defenses below make that class
+of attack fail loudly instead of landing silently:
+
+- **Committed `Cargo.lock`** with package checksums is the first line: builds
+  resolve exactly what the lockfile pins. `just test-all`, `just clippy`, and
+  `scripts/release.sh` all pass `--locked`, so the committed lockfile is
+  authoritative and a silent regeneration fails instead of re-resolving against
+  the live registry.
+- **`deny.toml`** (enforced by `cargo-deny` via `just check-supply-chain`)
+  hard-bans every version from the 2026-08-20 attack (`arrayref@0.3.10`,
+  `internment@0.8.7`, `append-only-vec@0.1.9`, and the six deleted payload
+  crates `proc-macro1`/`proc-macro-en`/`aovine`/`arone`/`aronenao`/`tinymember`
+  by name), fails on any RustSec vulnerability or "malicious" advisory, and
+  restricts all sources to crates.io.
+- **`scripts/check-supply-chain.sh`** runs three layers: a scan of the local
+  `~/.cargo/registry` cache for the deleted malicious `.crate` files (the Rust
+  blog's own remediation `find` — neither cargo-deny nor cargo-audit can see
+  idle cache files), then `cargo-deny` (preferred) or, as a fallback,
+  `cargo-audit` plus a literal lockfile scan. It is part of `just pre-commit`
+  and `just ci`.
+
+RustSec advisories for the attack (`RUSTSEC-2026-0260` and friends) are in the
+advisory database cargo-deny/cargo-audit fetch automatically, so any future
+introduction of a flagged crate also fails the gate. For the strongest — and
+heaviest — hardening, `cargo vendor` + a `[source]` replacement in
+`.cargo/config.toml` would make builds bit-for-bit reproducible from a checked-in
+dependency snapshot; it is intentionally not enabled (repo size).
 
 ## Packaging & releases
 

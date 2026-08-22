@@ -149,9 +149,12 @@ test-lean: _require-nextest _require-zig
 test-integration: _require-nextest _require-zig
     cargo test-integration
 
-# Everything: unit + integration via nextest in one pass
+# Everything: unit + integration via nextest in one pass.
+# `--locked` keeps the committed Cargo.lock authoritative on the gate path (CI
+# and pre-commit): a stale/regenerated lockfile fails instead of silently
+# re-resolving against the live registry (see release.sh for the same control).
 test-all: _require-nextest _require-zig
-    cargo test-all
+    cargo test-all {{ CARGO_FLAGS }} --locked
 
 # Unit tests via libtest (serialized across binaries; no nextest required)
 test-libtest: _require-zig
@@ -189,20 +192,34 @@ fmt:
 fmt-check:
     cargo fmt {{ CARGO_FLAGS }} --all -- --check
 
-# Lint the whole workspace, all targets
+# Lint the whole workspace, all targets. `--locked` = no silent lockfile reuse.
 clippy: _require-zig
-    cargo clippy {{ CARGO_FLAGS }} --workspace --all-targets
+    cargo clippy {{ CARGO_FLAGS }} --locked --workspace --all-targets
 
 # Lint with warnings denied — the CI-grade gate (stricter than `clippy`)
 clippy-strict: _require-zig
-    cargo clippy {{ CARGO_FLAGS }} --workspace --all-targets -- -D warnings
+    cargo clippy {{ CARGO_FLAGS }} --locked --workspace --all-targets -- -D warnings
+
+# Supply-chain gate: deny.toml bans (the 2026-08-20 arrayref@0.3.10 attacker
+# versions — RUSTSEC-2026-0260 — plus the six deleted payload crates), RustSec
+# advisories, crates.io-only sources, and a local registry-cache scan for the
+# deleted malicious .crate files. See scripts/check-supply-chain.sh.
+check-supply-chain:
+    ./scripts/check-supply-chain.sh
+
+# Install the dependency-policy tool cargo-deny (the authoritative layer of
+# check-supply-chain). Without it the script falls back to cargo-audit + a
+# literal lockfile scan, which covers advisories but not hard version bans.
+install-cargo-deny:
+    cargo install cargo-deny
 
 # Run this before `git commit` — it must pass green.
-# The pre-commit gate from AGENTS.md: formatting, lints, and the full suite.
-pre-commit: fmt-check clippy test-all
+# The pre-commit gate from AGENTS.md: formatting, lints, the full suite, and
+# the supply-chain checks (deny.toml bans + RustSec advisories + cache scan).
+pre-commit: fmt-check clippy test-all check-supply-chain
 
-# CI gate: format check + warnings-denied lints + full suite
-ci: fmt-check clippy-strict test-all
+# CI gate: format check + warnings-denied lints + full suite + supply chain
+ci: fmt-check clippy-strict test-all check-supply-chain
 
 # ── running ───────────────────────────────────────────────────────────────────
 

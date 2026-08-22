@@ -1,0 +1,69 @@
+# cargo-deny configuration — the workspace's dependency-policy gate.
+#
+# Enforcement: `cargo deny check advisories bans sources` (see
+# scripts/check-supply-chain.sh, wired into `just check-supply-chain`,
+# `just pre-commit`, and `just ci`). Install with `cargo install cargo-deny`.
+#
+# This policy exists because of the 2026-08-20 `arrayref` supply-chain attack
+# (https://blog.rust-lang.org/2026/08/20/supply-chain-attack-on-arrayref/):
+# a popular crate was republished with a dependency on a payload-downloading
+# build script (RUSTSEC-2026-0260). The controls below make that class of
+# compromise fail the gate HARD even if the lockfile is regenerated, `cargo
+# update` is run, or a fresh clone resolves against the live registry:
+# the attacker's versions are banned by name, the RustSec "malicious"
+# advisories fail unconditionally, and only crates.io is an allowed source.
+
+[advisories]
+# cargo-deny 0.20 removed the severity knobs: every vulnerability and
+# "malicious" advisory (the category that flagged the arrayref attack)
+# hard-fails the check no matter what. The remaining scopes are:
+#
+#   unmaintained = "workspace" — an unmaintained advisory only fails when the
+#       crate is a DIRECT dependency. The tree's unmaintained crates
+#       (ttf-parser, yaml-rust, …) are all transitive and stay amber, matching
+#       the existing `cargo audit` posture; adding a new direct dependency
+#       that is unmaintained now fails the gate.
+#   yanked = "warn" — a yanked version (e.g. an MSRV-driven retract) warns but
+#       does not block, so legitimate yanks don't wedge the gate.
+unmaintained = "workspace"
+yanked = "warn"
+
+[bans]
+# 126 crates legitimately appear at multiple versions in this tree (e.g. aes
+# 0.8/0.9, bitflags 1.x/2.x) because deep transitive chains depend on different
+# semver lines. `multiple-versions` stays permissive; the committed lockfile
+# plus the explicit `deny` list below are the actual controls. Do not flip
+# this to "deny" without first curating a `skip` list, or the gate will fail
+# on benign duplicates.
+multiple-versions = "warn"
+
+# Explicit blocklist. Each version was part of the 2026-08-20 attack; the
+# six deleted attacker crates are banned by name, ALL versions — nothing
+# legitimate ever shipped under those names, their crates.io entries were
+# removed, and any reappearance is malicious by definition:
+#
+#   arrayref@0.3.10        — the republished, compromised flagship crate
+#   internment@0.8.7       — same author's account, same payload dependency
+#   append-only-vec@0.1.9  — same author's account, same payload dependency
+#   proc-macro1 / proc-macro-en / aovine / arone / aronenao / tinymember
+#                          — the payload's vehicle crates; all deleted
+deny = [
+    { name = "arrayref", version = "=0.3.10" },
+    { name = "internment", version = "=0.8.7" },
+    { name = "append-only-vec", version = "=0.1.9" },
+    { name = "proc-macro1" },
+    { name = "proc-macro-en" },
+    { name = "aovine" },
+    { name = "arone" },
+    { name = "aronenao" },
+    { name = "tinymember" },
+]
+
+[sources]
+# crates.io only. Every one of the 1261 locked packages resolves from
+# registry+https://github.com/rust-lang/crates.io-index (verified), so this is
+# a pure restriction: any git/path/other-registry dependency — accidental or
+# malicious — fails the gate instead of silently entering the tree.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

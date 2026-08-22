@@ -194,6 +194,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 | `smoke-test.sh` | Extracts a release tarball, checks the four binaries exist and are executable, asserts each binary's `--version` reports the release version, and runs `--help` on all four clap clients |
 | `release.sh` | The release orchestrator — local builds only, no CI; dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard |
 | `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine instead of GitHub Actions (no CI by design) |
+| `check-supply-chain.sh` | The dependency supply-chain gate — runs `cargo deny check advisories bans sources` against `deny.toml` (falling back to `cargo-audit` + a literal lockfile scan when cargo-deny is absent), after scanning the local `~/.cargo/registry` cache for the `.crate` files deleted during the 2026-08-20 `arrayref` attack (RUSTSEC-2026-0260). Wired into `just pre-commit` / `just ci`; see the **Dependency supply chain** subsection under **Security model** |
 
 ### Distribution channels (0.1)
 
@@ -1261,6 +1262,40 @@ startup                    /unlock [passphrase]
 - There is no global "default account". Each session carries its own `account_name: Option<String>`
   field. When RunInput is issued, the daemon resolves the provider from the session's own account name.
   This avoids a global mutable fallback and lets different sessions use different accounts.
+
+### Dependency supply chain
+
+The workspace ships Rust that must trust its third-party dependencies, so the dependency
+graph is treated as part of the security surface. On 2026-08-20 `arrayref` — a transitive
+dependency here via `tiny-skia` → `usvg`/`resvg` (SVG rendering in the daemon and TUI) and
+`blake2b_simd` → `subxt` (blockchain feature, off by default) — was republished as `0.3.10`
+from a compromised maintainer account with a dependency on payload-downloading crates
+(RUSTSEC-2026-0260); the malicious versions were deleted from crates.io ~1.5–2h later.
+Four layered controls make a repeat fail loudly instead of landing silently:
+
+1. **Committed `Cargo.lock`** — every locked package carries its checksum, so builds resolve
+exactly what the lockfile pins. `just test-all`, `just clippy`, and `scripts/release.sh`
+(the release build path, incl. the musl cross-build) pass `--locked`, making the committed
+lockfile authoritative: a silent regeneration fails the command rather than silently
+re-resolving against the live registry.
+2. **`deny.toml`** (`cargo-deny`) — hard bans on every version from the 2026-08-20 attack
+(`arrayref =0.3.10`, `internment =0.8.7`, `append-only-vec =0.1.9`, plus the six deleted
+payload crates by name: `proc-macro1`, `proc-macro-en`, `aovine`, `arone`, `aronenao`,
+`tinymember`), RustSec advisory checking (vulnerability and "malicious" advisories always
+fail in cargo-deny 0.20; unmaintained only for direct deps), and a crates.io-only source
+restriction (all 1261 locked packages currently resolve from the crates.io index).
+3. **`scripts/check-supply-chain.sh`** — a first scan of the local `~/.cargo/registry` cache
+for the DELETED malicious `.crate` files (neither cargo-deny nor cargo-audit inspects idle
+cache files; this is the Rust Security Response Team's own remediation `find`, run fresh on
+every gate), then the cargo-deny policy check, with a `cargo-audit` + literal lockfile-scan
+fallback when cargo-deny isn't installed.
+4. **RustSec advisory database** — the RUSTSEC-2026-0259..0266 series covering the attack is
+in the DB both tools fetch, so re-introducing any attacker crate fails the gate even without
+the explicit bans in `deny.toml`.
+
+The strongest remaining option — bit-for-bit reproducible builds from a checked-in
+dependency snapshot via `cargo vendor` + a `[source]` replacement in `.cargo/config.toml` —
+is intentionally not enabled (repository size).
 
 
 ---

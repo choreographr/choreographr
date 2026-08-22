@@ -124,11 +124,17 @@ echo "==> building release binaries (root package)"
 # zig's grammar (`x86_64-linux-musl`) for both cc-rs and the linker, which is
 # the standard solution. zlob is unaffected — its build.rs already maps the
 # triple itself.
+# `--locked` on every release build is a supply-chain control: it makes the
+# committed Cargo.lock authoritative, so a silent lockfile regeneration during
+# a release can never pick up a freshly republished (potentially compromised)
+# semver-compatible version like the 2026-08-20 arrayref@0.3.10 attack
+# (RUSTSEC-2026-0260). The lockfile itself is also checked by
+# scripts/check-supply-chain.sh (deny.toml bans) in `just pre-commit`/`ci`.
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
-    ./scripts/build-stable.sh zigbuild --release -p choreographr --target x86_64-unknown-linux-musl --features metrics,mimalloc,blockchain
+    ./scripts/build-stable.sh zigbuild --locked --release -p choreographr --target x86_64-unknown-linux-musl --features metrics,mimalloc,blockchain
     TARBALL_BIN_DIR="target/x86_64-unknown-linux-musl/release"
 else
-    ./scripts/build-stable.sh build --release -p choreographr --features metrics,blockchain
+    ./scripts/build-stable.sh build --locked --release -p choreographr --features metrics,blockchain
     TARBALL_BIN_DIR="target/release"
 fi
 
@@ -163,7 +169,7 @@ tar czf "$TARBALL" -C "$STAGE" \
 # step is skipped — dpkg/rpmbuild are not present.)
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     echo "==> building host (glibc) release binaries for .deb/.rpm"
-    ./scripts/build-stable.sh build --release -p choreographr --features metrics,blockchain
+    ./scripts/build-stable.sh build --locked --release -p choreographr --features metrics,blockchain
 fi
 
 # .deb/.rpm are best-effort: skip with a warning when the toolchain is absent
