@@ -34,7 +34,7 @@ test-all = "nextest run --workspace --all-features --run-ignored all"
 
 # Per-profile rustflags (unstable Cargo feature, nightly-only). This opt-in is
 # what lets the root Cargo.toml scope `-Z` compiler flags by profile —
-# `-Zshare-generics=yes` in [profile.dev] only, `--jobs-frontend=16` in dev and
+# `-Zshare-generics=yes` in [profile.dev] only, `--jobs-frontend=0` in dev and
 # release — so EVERY adhoc `cargo` command (including per-crate `-p x` builds
 # and `cargo test` / `cargo nextest run`) automatically builds fast under the
 # nightly default toolchain (see rust-toolchain.toml). An LLM/agent issuing raw

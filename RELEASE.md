@@ -5,7 +5,7 @@ phases in order; each phase has a **gate** that must pass before moving on.
 
 A release ships three things:
 
-1. **13 crates to crates.io** (everything except `choreo-gui`, in dependency
+1. **14 crates to crates.io** (everything except `choreo-gui`, in dependency
    order) — enables `cargo install choreographr` / `cargo binstall`.
 2. **GitHub release `vX.Y.Z`** on `choreographr/choreographr` with prebuilt
    artifacts (tarballs, `.deb`, `.rpm`, `SHA256SUMS`) — enables Homebrew,
@@ -93,7 +93,7 @@ just preflight               # checks cargo + zig, notes nextest
    needs to know the decision: `cargo release publish` takes no level, and
    there is no config flag — the level is this one argument. The command
    makes the single `[workspace.package] version` edit (plus `Cargo.lock`);
-   all 13 members inherit it. Dry-run first (the default); `-x` applies it:
+   all members inherit it. Dry-run first (the default); `-x` applies it:
 
    ```bash
    cargo release version <level>    # dry-run: preview the bump plan
@@ -137,20 +137,55 @@ bump, and `cargo install` must resolve the published crates). From either
 machine, on the clean tree:
 
 ```bash
-cargo release publish --workspace  # publishes the Phase-1-bumped version in
-                                   # topological order — publish does NOT bump
-                                   # or tag (that was `cargo release version`
-                                   # and `cargo release tag` in Phase 1)
+./scripts/publish-stable.sh publish --workspace  # publishes the Phase-1-bumped version in
+                                                 # topological order — publish does NOT bump
+                                                 # or tag (that was `cargo release version`
+                                                 # and `cargo release tag` in Phase 1)
 ```
+
+Publishing runs through `scripts/publish-stable.sh` (or `just publish-stable`),
+not bare `cargo release`: the per-profile `rustflags` keys in the root
+`Cargo.toml` (the `-Z…` frontend flags plus the repo-wide `-C target-cpu=native`)
+require the nightly-only `profile-rustflags` cargo feature, and they ride along
+into the uploaded `.crate`. A published manifest that still contains
+`[profile.*] rustflags` **hard-breaks stable `cargo install`** (verified: stable
+cargo errors with "The package requires the Cargo feature called
+`profile-rustflags`") — which would kill the crates.io install route this SOP
+verifies in Phase 6. The wrapper strips exactly those keys (plus the
+`[unstable]` config opt-in) while `cargo release` runs and restores them on
+exit, so the published source builds at the target's default CPU on stable,
+exactly like the dist binaries.
+
+The wrapper always appends `--exclude choreo-gui`: cargo-release 1.1.5 does
+not honor the GUI crate's `publish = false` when selecting with
+`--workspace` (verified: its plan includes `choreo-gui`, and a real publish
+would then fail on cargo's own refusal for a publish=false crate). The wrapper
+also owns the dirty-tree gate for the publish: it refuses to
+start on an uncommitted tree by default — the `.crate` is built from the
+working tree (cargo package), so unreviewed uncommitted code must never ship.
+Pass `--allow-dirty` to skip that gate (e.g. to dry-run a plan from a dirty
+tree; it does NOT make an execute-publish work on a dirty tree — see below).
+The strip itself dirties the tree, but cargo-release 1.1.5 enforces an
+**unconditional** clean-tree check on the publish step (there is no
+`--allow-dirty` flag or config key in this version — `verify_git_is_clean` in
+cargo-release's `src/steps/mod.rs` hard-fails on any dirty tree in execute
+mode), so the wrapper masks exactly the two files it modifies with
+`git update-index --skip-worktree` for the duration of the run (libgit2 then
+reports them clean), and clears the masks on exit. Net effect: an actual
+(non-dry-run) publish still requires a clean — committed — tree for every
+file except the wrapper's own two masked files, which is exactly the hygiene
+the gate exists for.
 
 `--workspace` is **mandatory**. cargo-release ≥ 1.0 selects only the current
 package by default: a bare `cargo release publish` plans just `choreographr`,
 marks every workspace member as `disabled by user, skipping`, and then dies
 with `error: choreographr 0.1.0 depends on unpublished workspace package
 choreo-*` — the root's deps are neither in the publish set nor on crates.io
-yet. `--workspace` puts all 13 publish-set members in the set; cargo-release
+yet. `--workspace` puts all 14 publish-set members in the set; cargo-release
 hands them to a single `cargo publish` call and cargo uploads them in
-dependency order (`choreo-gui` drops out on its own via `publish = false`).
+dependency order. `choreo-gui` is kept out by the wrapper's explicit
+`--exclude choreo-gui` — cargo-release 1.1.5 does *not* honor `publish = false`
+in `--workspace` selection, despite the GUI crate's manifest flag.
 
 - `[workspace.metadata.release]` sets `dependent-version = "fix"`, so
   cross-crate requirements (`choreo-tui = "0.1"`, …) stay in lockstep across
@@ -182,10 +217,13 @@ error: dry-run failed, resolve the above errors and try again.
 ```
 
 The 0.1.0 first release had **12 new crates** (see the batched staging plan
-below for how that was done). The next release publishes **12 updates plus one
-new crate — `choreo-blockchain`** (the blockchain-tools crate added since
-0.1.0, referenced by `choreo-daemon`'s optional `blockchain` feature). One
-new crate fits easily in the burst, so no batching is needed; if a future
+below for how that was done). The next release publishes **12 updates plus two
+new crates — `choreo-blockchain`** (the blockchain-tools crate added since
+0.1.0, referenced by `choreo-daemon`'s optional `blockchain` feature) **and
+`choreo-sanitize`** (the shared string-safety leaf, previously unpublished —
+it must ship because `choreo-blockchain` and the other members depend on it,
+and cargo-release's verification rejects unpublished workspace deps). Two
+new crates fit easily in the burst, so no batching is needed; if a future
 release ever introduces several new crates at once, stage them in
 ≤ 5-crate batches:
 
@@ -197,16 +235,16 @@ release ever introduces several new crates at once, stage them in
    using `-p` selection, waiting ~10 minutes (one token refill) between
    batches. Every workspace dependency of a batched crate is either in the
    batch or already published:
-   - Batch 1: `cargo release publish -p choreo-proto -p choreo-keystore -p choreo-markdown -p choreo-mcp -p choreo-transport -x`
-   - Batch 2: `cargo release publish -p choreo-blockchain -p choreo-acp -p choreo-ai-protocols -p choreo-client-core -x`
-   - Batch 3: `cargo release publish -p choreo-daemon -p choreo-im -p choreo-tui -x`
-   - Batch 4: `cargo release publish -p choreographr -x`
+   - Batch 1: `./scripts/publish-stable.sh publish -p choreo-proto -p choreo-keystore -p choreo-markdown -p choreo-mcp -p choreo-transport -x`
+   - Batch 2: `./scripts/publish-stable.sh publish -p choreo-blockchain -p choreo-acp -p choreo-ai-protocols -p choreo-client-core -x`
+   - Batch 3: `./scripts/publish-stable.sh publish -p choreo-daemon -p choreo-im -p choreo-tui -x`
+   - Batch 4: `./scripts/publish-stable.sh publish -p choreographr -x`
 
    Dry-run each batch first (omit `-x`) and confirm it plans only that
-   batch's crates. Once all 13 exist on crates.io, later releases are
-   *updates* and go in a single `cargo release publish --workspace -x`.
+   batch's crates. Once all 14 exist on crates.io, later releases are
+   *updates* and go in a single `./scripts/publish-stable.sh publish --workspace -x`.
 
-**Gate:** 13 crates published, `cargo install choreographr --locked` works in
+**Gate:** 14 crates published, `cargo install choreographr --locked` works in
 a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
 
 ---
@@ -218,6 +256,11 @@ Both machines run the same dry-run flow. `scripts/release.sh`:
 - builds the shipped binaries on **stable** Rust (each cargo build runs through
   `scripts/build-stable.sh`, reproducible and matching the crates.io/MSRV
   story; see the README build notes),
+- builds every artifact at the target's **default CPU**: the local
+  `-C target-cpu=native` profile flags (and the nightly `-Z…` flags) are
+  stripped by `scripts/build-stable.sh` before each stable build, so the static
+  musl tarball keeps its "runs on any Linux" portability promise and the
+  `.deb`/`.rpm` stay baseline — never bake in the build machine's CPU,
 - reads the version from `Cargo.toml`,
 - guards against a dirty tree,
 - builds with `--features metrics,blockchain` (the metrics endpoint stays
@@ -409,8 +452,8 @@ repo and push.
 
 - [ ] `just ci` green; tree clean; master pulled
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
-- [ ] `cargo release publish --workspace` → 13 crates on crates.io; `cargo install --locked` verified
-- [ ] First release only: 13 new crates staged in ≤5-crate batches (or crates.io burst override) — see Phase 2; the next release adds just `choreo-blockchain` as a new crate
+- [ ] `./scripts/publish-stable.sh publish --workspace` → 14 crates on crates.io; `cargo install --locked` verified
+- [ ] First release only: 12 new crates staged in ≤5-crate batches (or crates.io burst override) — see Phase 2; the next release adds `choreo-blockchain` and `choreo-sanitize` as new crates
 - [ ] Linux box: `just release` + `just smoke-test` → musl tarball, `.deb`, `.rpm`, `SHA256SUMS`
 - [ ] MacBook: `just release` + `just smoke-test` + daemon/keystore/plist/TUI smoke test
 - [ ] macOS tarball copied to Linux box; combined `SHA256SUMS` regenerated

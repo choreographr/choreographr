@@ -8,7 +8,11 @@ homepage.workspace = true
 readme.workspace = true
 edition = "2024"
 rust-version.workspace = true
-# Internal leaf crate — never published to crates.io. It is the single source
+# Internal leaf crate, but published to crates.io (`publish = true`): the
+# workspace members that depend on it (daemon, TUI, blockchain, client-core)
+# must be able to resolve it in released form, and cargo-release's publish
+# verification rejects unpublished workspace deps — keeping this crate
+# unpublished blocked Phase 2. It is the single source
 # of truth for the Unicode "spoofing" predicates (which chars may reorder,
 # hide, or fake text in rendered output) and the shared tool-output byte
 # budget, used by the daemon (line/transcript sanitizers + streaming caps),
@@ -17,7 +21,7 @@ rust-version.workspace = true
 # crate means a Unicode table bump (via `unicode-general-category`) or a
 # budget change is applied everywhere at once, and the code-space sweep test
 # that guards the predicate lives next to it.
-publish = false
+publish = true
 
 [dependencies]
 unicode-general-category.workspace = true

@@ -36,7 +36,7 @@ Choreographr (workspace)
 │                       binaries (choreographr choreo-tui choreo-im choreo-acp;
 │                       the desktop GUI is a separate crate, choreo-gui)
 ├── choreo-proto           Wire protocol (shared types + framing)
-├── choreo-sanitize        Internal leaf crate — shared Unicode "spoofing" predicates
+├── choreo-sanitize        Leaf crate — shared Unicode "spoofing" predicates
 │                       and the tool-output byte budget + truncation marker
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── choreo-transport       Noise IK encrypted TCP transport abstraction
@@ -160,6 +160,13 @@ request-worker panics with `catch_unwind` (sessions.rs), which abort would
 defeat. The RPM spec keeps `__os_install_post %{nil}` so rpm's brp scripts
 never re-process the already-stripped binaries.
 
+All shipped binaries also build at the target's **default CPU**: the
+workspace's `-C target-cpu=native` profile flags (and the nightly `-Z…` flags)
+are stripped by `scripts/build-stable.sh` before every stable release build, so
+the static musl tarball runs on any x86-64 Linux (never just the build
+machine's microarchitecture), the `.deb`/`.rpm` stay baseline, and the macOS
+tarball keeps the generic aarch64 feature set.
+
 The desktop-notify tool (`notify_send`, backed by notify-rust) was removed
 from the daemon, so the shipped binaries link no C libraries on the glibc
 targets — and the only C component on the musl tarball is the mimalloc
@@ -193,6 +200,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 | `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing all four binaries plus the systemd user unit, from existing `target/release/` artifacts |
 | `smoke-test.sh` | Extracts a release tarball, checks the four binaries exist and are executable, asserts each binary's `--version` reports the release version, and runs `--help` on all four clap clients |
 | `release.sh` | The release orchestrator — local builds only, no CI; dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard |
+| `publish-stable.sh` | The crates.io publish wrapper (RELEASE.md Phase 2) — strips the nightly-only per-profile `rustflags` and the `[unstable]` config opt-in for the duration of `cargo release publish` (masking the two edited files from cargo-release's clean-tree gate via `git update-index --skip-worktree`, and always passing `--exclude choreo-gui`, which cargo-release 1.1.5 won't drop on its own via `publish = false`), so published manifests stay buildable by stable `cargo install`, then restores both files and clears the masks |
 | `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine instead of GitHub Actions (no CI by design) |
 | `check-supply-chain.sh` | The dependency supply-chain gate — runs `cargo deny check advisories bans sources` against `deny.toml` (falling back to `cargo-audit` + a literal lockfile scan when cargo-deny is absent), after scanning the local `~/.cargo/registry` cache for the `.crate` files deleted during the 2026-08-20 `arrayref` attack (RUSTSEC-2026-0260). Wired into `just pre-commit` / `just ci`; see the **Dependency supply chain** subsection under **Security model** |
 
@@ -209,28 +217,37 @@ with `systemctl --user enable --now choreographr` (Linux) or
 The workspace inherits crates.io-required fields from `[workspace.package]`
 in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
 `readme`, `description`), and members opt into publishing by *not* setting
-`publish = false`. The **publish set** is therefore thirteen of the fifteen
-workspace members — everything except `choreo-gui` and `choreo-sanitize`
-(both private: the GUI is a non-shipped stub, and `choreo-sanitize` is an
-internal leaf whose exact contents are not a published API):
+`publish = false`. The **publish set** is therefore fourteen of the fifteen
+workspace members — everything except `choreo-gui` (a non-shipped stub).
+`choreo-sanitize` is published too (previously private): the members that
+depend on it must resolve it from crates.io after a release, and
+cargo-release's publish verification rejects unpublished workspace deps:
 
 `choreographr` (root), `choreo-daemon`, `choreo-blockchain`, `choreo-tui`,
 `choreo-im`, `choreo-acp`, `choreo-proto`, `choreo-keystore`, `choreo-transport`,
-`choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`, `choreo-markdown`
+`choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`, `choreo-sanitize`,
+`choreo-markdown`
 
 `choreo-gui` sets `publish = false`: it is a stub that drags in the
 dioxus/webkit2gtk native-widget tree and is not part of the shipped suite, so
 it is neither published to crates.io (`cargo install choreo-gui` does not
 exist) nor included in the prebuilt release artifacts (tarball/.deb/.rpm/
-Homebrew/AUR), which carry the daemon, TUI, and bridges only. The root
-`choreographr` package transitively depends on the other 12 publish-set
-members, so releasing the suite publishes 13 crates in dependency order.
+Homebrew/AUR), which carry the daemon, TUI, and bridges only. The GUI is kept
+out of the publish selection explicitly — `scripts/publish-stable.sh` always
+passes `--exclude choreo-gui` because cargo-release 1.1.5 does not honor
+`publish = false` in `--workspace` selection (verified: its plan lists the
+GUI crate, and a real publish would then fail on cargo's own refusal). The
+root `choreographr` package transitively depends on the other 13 publish-set
+members, so releasing the suite publishes 14 crates in dependency order.
 
 Releases are driven by **cargo-release** (`[workspace.metadata.release]` in
-the root `Cargo.toml`): it bumps versions, tags, and publishes the 13 crates
+the root `Cargo.toml`): it bumps versions, tags, and publishes the 14 crates
 to crates.io topologically. With `dependent-version = "fix"`, published
 manifest requirements (e.g. `choreo-tui = "0.1"`) stay in lockstep across
-minor/major bumps. The crates.io publish runs before `scripts/release.sh`
+minor/major bumps. The crates.io publish runs through `scripts/publish-stable.sh`
+(which strips the nightly-only per-profile rustflags so the shipped manifests
+stay buildable by stable `cargo install` — profile rustflags in a published
+manifest hard-break stable cargo) and it runs before `scripts/release.sh`
 builds the prebuilt artifacts.
 
 The root package declares `[package.metadata.binstall]`, so
@@ -318,7 +335,7 @@ foreign reader will ever touch the bytes.
 
 ### `choreo-sanitize` — Shared string-safety primitives
 
-An internal leaf crate (`publish = false`, no workspace deps beyond
+An internal leaf crate (`publish = true`, no workspace deps beyond
 `unicode-general-category`) that is the single source of truth for two things
 every consumer of tool output must agree on:
 
@@ -3185,13 +3202,21 @@ choreo-x` / `cargo check -p x` / `cargo nextest run -p x` — automatically
 applies the fast per-profile `-Z` compiler flags. Nightly enables the
 per-profile `rustflags` in the root `Cargo.toml` via the unstable
 `profile-rustflags` feature (opted in under `[unstable]` in `.cargo/config.toml`):
-`-Zshare-generics=yes` in `[profile.dev]` only, and `-Zunstable-options
---jobs-frontend=16` (parallel rustc frontend, the replacement for the
-deprecated `-Zthreads`) in both dev and release. An LLM/agent issuing raw
-`cargo` commands gets the fast build with no extra ceremony. Profile rustflags
-replace `[build]` rustflags but concatenate with `[target.'cfg(...)']`
-rustflags, so per-machine linker flags (e.g. the wild linker in
-`~/.cargo/config.toml`) still apply.
+`-Zshare-generics=yes` in `[profile.dev]` only, `-Zunstable-options
+--jobs-frontend=0` (parallel rustc frontend — `0` = one thread per logical
+core via `available_parallelism`, the replacement for the deprecated
+`-Zthreads`) in both dev and release, and `-C target-cpu=native`
+(build for the local machine's CPU — AVX2/BMI2 on x86-64, the M-chip on
+Apple Silicon) in both. An LLM/agent issuing raw `cargo` commands gets the
+fast, native-tuned build with no extra ceremony. Profile rustflags replace
+`[build]` rustflags but concatenate with `[target.'cfg(...)']` rustflags, so
+per-machine linker flags (e.g. the wild linker in `~/.cargo/config.toml`)
+still apply. `-C target-cpu=native` is a repo-wide local-build default that
+NEVER reaches a shipped artifact: both `scripts/build-stable.sh` (dist
+binaries) and `scripts/publish-stable.sh` (crates.io) strip the per-profile
+rustflags keys, so dist and published-source builds stay on each target's
+baseline CPU, and the RISC-V guest compiles (`tools/vm.rs`) are direct
+`rustc +stable` calls that never see cargo rustflags at all.
 
 **Stable builds are a supported opt-out.** The sources use no nightly-only
 features, so the code targets a stable MSRV floor (`rust-version = "1.94.1"`,
@@ -3201,6 +3226,13 @@ enables require that unstable feature), so a stable build is run through
 `scripts/build-stable.sh` (`just build-stable` / `check-stable` /
 `test-stable`): it temporarily strips the nightly-only `rustflags` keys and the
 `[unstable]` block, runs `cargo +stable ...`, and restores them on exit.
+
+The publish step has the identical constraint from the consumer side: per-
+profile rustflags that ship inside a published `.crate` hard-break stable
+`cargo install` (stable cargo errors on the `profile-rustflags` feature), so
+crates.io publishing runs through the sibling `scripts/publish-stable.sh`
+(`just publish-stable`), which strips the same keys before `cargo release
+publish` and restores them on exit — see RELEASE.md Phase 2.
 
 The `choreo-daemon` crate depends on `zlob` (a Zig-implemented glob and
 gitignore-aware directory walker used by `grep`, `find`, `delete_files`, and

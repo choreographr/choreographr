@@ -14,6 +14,10 @@
 # itself never depended on this config: the sources use no nightly features, so
 # this is purely about un-blocking stable *Cargo* from the manifest/config.
 #
+# (Publishing has the same problem from the other side — a published manifest
+# that still carries per-profile `rustflags` breaks stable `cargo install` — so
+# the crates.io publish step has a sibling: scripts/publish-stable.sh.)
+#
 # Single-authored only (not safe under concurrent runs).
 set -euo pipefail
 cd "$(dirname "$0")/.."

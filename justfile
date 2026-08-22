@@ -96,6 +96,15 @@ check-stable: _require-zig
 test-stable: _require-zig
     ./scripts/build-stable.sh test --workspace {{ CARGO_FLAGS }}
 
+# Publish the 14 crates to crates.io (RELEASE.md Phase 2) with the nightly-only
+# per-profile rustflags stripped, so published manifests stay buildable by
+# stable consumers (`cargo install choreographr --locked`). Runs
+# `cargo release publish --workspace` (dry-run by default; add `-- -x` to
+# execute, or pass any other cargo-release args after `--`; add `-- --allow-dirty`
+# to skip the wrapper's clean-tree gate — see scripts/publish-stable.sh).
+publish-stable args="publish --workspace":
+    ./scripts/publish-stable.sh {{ args }}
+
 # No linking, but zig is still required (resolution runs zlob's build script).
 # Type-check the whole workspace (all targets) — the fastest CI signal.
 check: _require-zig

@@ -139,11 +139,27 @@ dependent-version = "fix"
 #   graph instead of once per using crate — the big dev-build win. Deliberately
 #   dev-ONLY: it has a history of codegen bugs under optimization, and with no
 #   LTO in the release profile there is no link-time dedup to compare against.
-# - -Zunstable-options + --jobs-frontend=16: parallelize the rustc query
-#   frontend across 16 threads (replaces the deprecated -Zthreads).
+# - -Zunstable-options + --jobs-frontend=0: parallelize the rustc query
+#   frontend across one thread per logical core (0 = available_parallelism —
+#   rustc's "auto"; replaces the deprecated -Zthreads). Self-tuning: a 2-core
+#   laptop and a 64-core box each get the right pool size with no edit.
+# - -C target-cpu=native: build for the LOCAL machine's CPU (AVX2/BMI2 on
+#   x86-64, the M-chip on Apple Silicon) so every local build — dev, test, and
+#   release — is tuned for the box it runs on. This is the repo-wide default
+#   and deliberately NEVER reaches a shipped artifact: dist binaries are built
+#   on STABLE via scripts/build-stable.sh, which strips these per-profile
+#   rustflags keys (so they stay on the target's baseline CPU), and
+#   scripts/publish-stable.sh strips them for crates.io (profile rustflags in
+#   a published manifest hard-break stable `cargo install` — the
+#   profile-rustflags feature is nightly-only). The RISC-V guest compiles in
+#   choreo-daemon/src/tools/vm.rs are direct `rustc +stable` calls and never
+#   see cargo rustflags at all.
+#   KEEP THE ARRAY ON ONE LINE: build-stable.sh / publish-stable.sh strip
+#   `^rustflags = [` lines exactly; a multi-line array would leave dangling
+#   entries in the stripped manifest and break the stable build.
 [profile.dev]
 debug = "line-tables-only"
-rustflags = ["-Zunstable-options", "--jobs-frontend=16", "-Zshare-generics=yes"]
+rustflags = ["-Zunstable-options", "--jobs-frontend=0", "-Zshare-generics=yes", "-C", "target-cpu=native"]
 
 # Release profile for shipped binaries (all four artifact types build with
 # `cargo build --release`). One deliberate setting, one deliberate omission:
@@ -158,12 +174,15 @@ rustflags = ["-Zunstable-options", "--jobs-frontend=16", "-Zshare-generics=yes"]
 #   catch_unwind (sessions.rs) — abort would turn any single request panic
 #   into a whole-daemon crash.
 #
-# rustflags: -Zunstable-options + --jobs-frontend=16 (same parallel-frontend
-# flag as dev), auto-applied under the nightly default toolchain. No
-# -Zshare-generics here — see the dev-profile note above.
+# rustflags: -Zunstable-options + --jobs-frontend=0 (same parallel-frontend
+# flag as dev — 0 = available_parallelism, the self-tuning "auto"),
+# auto-applied under the nightly default toolchain, plus
+# -C target-cpu=native (local-machine tuning — same rationale and the same
+# dist/publish exclusion as the dev profile; see the dev-profile note above).
+# No -Zshare-generics here — see the dev-profile note above.
 [profile.release]
 strip = "symbols"
-rustflags = ["-Zunstable-options", "--jobs-frontend=16"]
+rustflags = ["-Zunstable-options", "--jobs-frontend=0", "-C", "target-cpu=native"]
 
 [workspace.dependencies]
 anyhow = "1"

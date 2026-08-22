@@ -897,6 +897,14 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
     }
 }
 
+// Guest builds MUST stay a direct `rustc +stable` invocation: cargo config,
+// per-profile rustflags, and RUSTFLAGS can never reach them (rustc itself does
+// not read RUSTFLAGS or any cargo config — only cargo does). This is what
+// keeps the workspace's local `-C target-cpu=native` and nightly `-Z…` profile
+// flags (root Cargo.toml) away from guest code, which must stay on the
+// riscv64imac baseline. If this ever moves to `cargo build --target
+// riscv64imac-unknown-none-elf`, the per-profile rustflags WOULD apply to the
+// guest and this needs revisiting — see the Cargo.toml dev-profile note.
 fn compile(source: &str) -> Result<Vec<u8>, String> {
     let target = "riscv64imac-unknown-none-elf";
 
