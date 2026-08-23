@@ -528,9 +528,9 @@ names must be lowercase alphanumeric with hyphens or underscores (`[a-z0-9_-]`).
 Each session may have its own account, set via `/account <name>`; there is no
 global default account. The file is watched and **reloads automatically** when
 edited externally (the daemon re-reads, applies the change, drops cached
-providers for accounts that disappeared, and pushes the fresh list to connected
-clients); the daemon's own `/add-key` writes are detected and ignored as
-no-ops.
+providers for accounts that disappeared and rebuilds them for ones whose config
+changed, and pushes the fresh list to connected clients); the daemon's own
+`/add-key` writes are detected and ignored as no-ops.
 
 ```toml
 [[account]]

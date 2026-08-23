@@ -1670,6 +1670,8 @@ impl DaemonState {
     /// on the daemon's own rewrites, whose serialization order the deterministic
     /// [`AccountManager::save`] now keeps stable). Removed accounts drop their
     /// cached provider (a stale provider for a gone account is dead weight);
+    /// accounts whose config *changed* drop and **rebuild** their provider so
+    /// the cache reflects the new config instead of serving a stale one.
     /// credentials are left intact — a credential with no account is inert, and
     /// pruning it automatically could surprise a user who is mid-migration.
     /// A successful apply broadcasts the fresh account list so connected
@@ -1703,18 +1705,78 @@ impl DaemonState {
             debug!(path = %path.display(), "accounts.toml changed but accounts are unchanged");
             return;
         }
-        let old_names: HashSet<String> = self.accounts.names().into_iter().collect();
-        let new_names: HashSet<String> = fresh.names().into_iter().collect();
-        for removed in old_names.difference(&new_names) {
-            if self.providers.remove(removed).is_some() {
+        // Snapshot the OLD configs by name BEFORE `self.accounts` is reassigned
+        // below, so removed accounts can be told apart from merely modified ones.
+        // Owned values (not references) so the snapshot survives the reload.
+        let old_by_name: HashMap<String, AccountConfig> = self
+            .accounts
+            .all_configs()
+            .into_iter()
+            .map(|c| (c.name.clone(), c))
+            .collect();
+        let fresh_by_name: HashMap<String, AccountConfig> = fresh
+            .all_configs()
+            .into_iter()
+            .map(|c| (c.name.clone(), c))
+            .collect();
+
+        // Split the diff into removed vs changed accounts.
+        let mut removed: Vec<String> = Vec::new();
+        let mut changed: Vec<String> = Vec::new();
+        for (name, old_cfg) in &old_by_name {
+            match fresh_by_name.get(name) {
+                None => removed.push(name.clone()),
+                Some(new_cfg) if new_cfg != old_cfg => changed.push(name.clone()),
+                Some(_) => {}
+            }
+        }
+
+        // Accounts that vanished: drop the cached provider (dead weight) and
+        // leave credentials intact (a credential with no account is inert).
+        for name in &removed {
+            if self.providers.remove(name).is_some() {
                 warn!(
-                    account = removed,
+                    account = name,
                     "account removed from accounts.toml externally; dropped its cached provider",
                 );
             }
         }
+        // A non-empty → empty transition (the file was deleted or emptied
+        // externally) drops every account; warn loudly, since this is
+        // destructive and likely accidental.
+        if !old_by_name.is_empty() && fresh.is_empty() {
+            warn!(
+                path = %path.display(),
+                "accounts.toml became empty/missing externally; all accounts were removed",
+            );
+        }
         self.accounts = fresh;
         info!(path = %path.display(), "accounts reloaded from disk");
+        // Accounts present in BOTH files but with a different config (e.g. the
+        // provider protocol or an override changed): drop the stale cached
+        // provider and rebuild it against the NEW config + still-held
+        // credential. This mirrors the unlock-time bulk resolve and the
+        // /add-key path; without it the next session would capture a provider
+        // built from the old file forever. A failed resolve just leaves the
+        // account uncached; the next explicit resolve retries it.
+        for name in &changed {
+            if self.providers.remove(name).is_some() {
+                warn!(
+                    account = name,
+                    "account config changed externally; rebuilding its provider",
+                );
+            }
+            let api_key = self.credentials.get(name).and_then(|c| match c {
+                ServiceCredential::ApiKey { key } => Some(key.clone()),
+                _ => None,
+            });
+            if self.resolve_account_provider(name, api_key) {
+                info!(
+                    account = name,
+                    "provider rebuilt for externally-modified account",
+                );
+            }
+        }
         // Push the fresh list to activity subscribers (global/control
         // provenance — a flat, non-session message — so no origin-contract
         // dedup runs). Clients can refresh their account pickers live.

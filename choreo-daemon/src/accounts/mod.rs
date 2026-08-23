@@ -291,7 +291,14 @@ pub fn spawn_accounts_watcher(
     let _ = std::thread::Builder::new()
         .name("accounts-config-watch".into())
         .spawn(move || {
-            for _change in accounts_rx.iter() {
+            for _first in accounts_rx.iter() {
+                // Coalesce: an editor save (temp + rename) can fan out several
+                // Create/Modify/Remove events for one logical edit. Drain any
+                // already-queued changes so a burst becomes ONE AccountsReload —
+                // the command loop re-reads + parse-compares anyway, so later
+                // events in the same burst would only be redundant work. A
+                // steady trickle still reloads per event, which is correct.
+                while accounts_rx.try_recv().is_ok() {}
                 if daemon_tx
                     .send(crate::daemon::DaemonCommand::AccountsReload)
                     .is_err()

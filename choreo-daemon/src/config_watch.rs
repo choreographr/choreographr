@@ -142,6 +142,14 @@ fn route(
         .collect()
 }
 
+/// Whether a raw event signals that the watched directory itself was removed
+/// (deleted or moved away at runtime). The watch on a removed directory is
+/// dead; detecting this lets the transport drop `armed` and re-arm once the
+/// directory is recreated, instead of never firing again.
+fn dir_was_removed(dir: &Path, event: &notify::Event) -> bool {
+    matches!(event.kind, notify::EventKind::Remove(_)) && event.paths.iter().any(|p| p == dir)
+}
+
 /// Deliver one change to every sender subscribed to `basename`. A dead
 /// receiver is dropped silently — the consumer went away, its interest is
 /// moot. `try_send` never blocks: subscriber channels are unbounded, so a
@@ -234,18 +242,10 @@ fn transport_loop(subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir:
         // timeout so the re-arm retry cadence paces without burning CPU. The
         // two recv calls have different error types (RecvError vs
         // RecvTimeoutError), so they are handled in separate arms that both
-        // route an event through the same closure.
-        let route_raw = |msg: Result<notify::Event, notify::Error>| match msg {
-            Ok(event) => {
-                for (basename, kind) in route(&subscribers, &event) {
-                    deliver(&subscribers, &dir, &basename, kind);
-                }
-            }
-            Err(e) => warn!(error = %e, "config watcher error"),
-        };
-        if armed {
+        // fall through to the same routing below.
+        let raw = if armed {
             match raw_rx.recv() {
-                Ok(raw) => route_raw(raw),
+                Ok(raw) => raw,
                 Err(_) => {
                     info!("config watch raw channel closed; exiting");
                     break;
@@ -253,15 +253,35 @@ fn transport_loop(subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir:
             }
         } else {
             match raw_rx.recv_timeout(REARM_INTERVAL) {
-                Ok(raw) => route_raw(raw),
+                Ok(raw) => raw,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     // Re-arm retry cadence; loop to attempt the watch again.
+                    continue;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     info!("config watch raw channel closed; exiting");
                     break;
                 }
             }
+        };
+        match raw {
+            Ok(event) => {
+                // If the watched directory itself was removed (deleted/moved at
+                // runtime), the inotify/kqueue watch is now dead — drop `armed`
+                // so the loop re-arms once the directory comes back, instead of
+                // sitting on a stale watch that never fires again.
+                if armed && dir_was_removed(&dir, &event) {
+                    armed = false;
+                    info!(
+                        dir = %dir.display(),
+                        "config directory removed; watch will re-arm on the next retry",
+                    );
+                }
+                for (basename, kind) in route(&subscribers, &event) {
+                    deliver(&subscribers, &dir, &basename, kind);
+                }
+            }
+            Err(e) => warn!(error = %e, "config watcher error"),
         }
     }
 }
@@ -301,6 +321,37 @@ mod tests {
             classify(&notify::EventKind::Remove(notify::event::RemoveKind::File)),
             Some(ChangeKind::Remove)
         );
+    }
+
+    #[test]
+    fn dir_was_removed_detects_only_the_watched_directory() {
+        let dir = Path::new("/cfg");
+        // A Remove event whose path IS the watched dir signals the dir is gone.
+        assert!(dir_was_removed(
+            dir,
+            &event(
+                dir,
+                notify::EventKind::Remove(notify::event::RemoveKind::Folder)
+            )
+        ));
+        // Removing a file *inside* the dir is not the dir going away.
+        assert!(!dir_was_removed(
+            dir,
+            &event(
+                &dir.join("accounts.toml"),
+                notify::EventKind::Remove(notify::event::RemoveKind::File)
+            )
+        ));
+        // A non-Remove event (e.g. Modify) is never a dir removal.
+        assert!(!dir_was_removed(
+            dir,
+            &event(
+                dir,
+                notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::To
+                ))
+            )
+        ));
     }
 
     #[test]

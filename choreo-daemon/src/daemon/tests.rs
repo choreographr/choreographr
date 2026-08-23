@@ -1552,6 +1552,46 @@ fn handle_accounts_reload_prunes_removed_account_providers() {
 }
 
 #[test]
+fn handle_accounts_reload_drops_stale_provider_for_modified_account() {
+    // The external edit that was a real bug: an account whose CONFIG changed
+    // (not removed) kept serving its old cached provider forever. The reload
+    // must drop the stale provider. We use a config whose client construction
+    // fails fast (unknown provider slug) so the deterministic assertion is
+    // "the stale provider is gone," not a network-dependent rebuild.
+    let (mut state, _rx) = make_daemon_state();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("accounts.toml");
+    std::fs::write(
+        &path,
+        "[[account]]\nname = \"keep\"\nprovider = \"openai\"\n",
+    )
+    .unwrap();
+    state.accounts = AccountManager::load(&path).unwrap();
+    // Simulate a cached provider built from the OLD (openai) config.
+    state
+        .providers
+        .insert("keep".to_string(), make_test_provider());
+
+    // The account is edited externally: provider protocol changes.
+    std::fs::write(
+        &path,
+        "[[account]]\nname = \"keep\"\nprovider = \"bogus\"\n",
+    )
+    .unwrap();
+    state.handle_command(DaemonCommand::AccountsReload);
+
+    // The new config is applied...
+    assert_eq!(state.accounts.get("keep").unwrap().provider, "bogus");
+    // ...and the stale cached provider built from the old config is GONE (it
+    // fails to rebuild for the unknown slug, so it must not linger and keep
+    // serving the old protocol).
+    assert!(
+        !state.providers.contains_key("keep"),
+        "modified account's stale cached provider is dropped"
+    );
+}
+
+#[test]
 fn handle_accounts_reload_noops_without_a_real_path() {
     // An un-unlocked daemon has an empty manager with no path; a reload signal
     // must be a safe no-op (the watcher runs regardless of unlock state).

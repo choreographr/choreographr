@@ -11,9 +11,17 @@ use crossbeam_channel::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Poll `cond` every 10 ms until it returns true, panicking after ~5 s.
+/// Upper bound for a single poll/wait. Generous (30 s) because these tests run
+/// inside the full workspace suite in parallel with ~2700 others under
+/// `--all-features`: under that load a `notify` event can be delayed well past
+/// the few-ms it takes in isolation, so a tight 5 s deadline makes the suite
+/// flaky, not faster (normal-case latency is still milliseconds — the deadline
+/// only bounds the worst case).
+const WAIT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Poll `cond` every 10 ms until it returns true, panicking after `WAIT_DEADLINE`.
 fn wait_for(what: &str, cond: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT_DEADLINE;
     while Instant::now() < deadline {
         if cond() {
             return;
@@ -27,7 +35,7 @@ fn wait_for(what: &str, cond: impl Fn() -> bool) {
 /// bounded window, tolerating extra/noise events the platform may interleave
 /// (e.g. macOS FSEvents emits extra events around the one we care about).
 fn recv_kind(rx: &Receiver<ConfigChange>, expected: ChangeKind) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT_DEADLINE;
     while Instant::now() < deadline {
         match rx.try_recv() {
             Ok(c) if c.kind == expected => return,
@@ -88,16 +96,22 @@ fn config_watcher_delivers_only_registered_basenames() {
     drain_all(&rx);
 
     // An unregistered file in the same directory must NOT be delivered: the
-    // transport filters by basename, so the consumer hears nothing.
+    // transport filters by basename, so the consumer hears nothing about it.
+    // Crucially, the assertion is specifically that nothing for `accounts.toml`
+    // leaks through — a late-arriving trailing event for the REGISTERED
+    // basename (a platform's extra Modify around the earlier Create, delayed by
+    // parallel-suite load) is legitimate and must not fail the test.
     let unregistered = cfg_dir.join("accounts.toml");
     std::fs::write(&unregistered, "x = 1\n").unwrap();
-    let deadline = Instant::now() + Duration::from_millis(300);
+    let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
-        assert!(
-            rx.try_recv().is_err(),
-            "an unregistered basename must not be delivered to this subscriber"
-        );
-        thread::sleep(Duration::from_millis(10));
+        match rx.try_recv() {
+            Ok(c) => assert!(
+                c.path != unregistered,
+                "an unregistered basename must not be delivered to this subscriber"
+            ),
+            Err(_) => thread::sleep(Duration::from_millis(10)),
+        }
     }
 }
 
