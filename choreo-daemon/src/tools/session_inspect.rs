@@ -277,11 +277,11 @@ fn build_report(
             == Some((provider.as_str(), model.as_str()));
         let tool_involvement = !turn.tool_calls.is_empty() || !turn.tool_results.is_empty();
         // Same helper the builder uses — the empty-message fallback (a
-        // content-less, tool-less turn on a requires_rc model echoes its
-        // same-model artifact so the wire message is never empty) is applied
-        // here automatically, keeping the ledger and the wire in lockstep.
-        let include_artifact =
-            include_reasoning_artifact(turn, &provider, &model, passback, requires_rc);
+        // content-less, tool-less turn under an echo-capable passback echoes
+        // its same-model artifact so the wire message is never empty) is
+        // applied here automatically, keeping the ledger and the wire in
+        // lockstep.
+        let include_artifact = include_reasoning_artifact(turn, &provider, &model, passback);
         let echo_has_artifact = include_artifact && turn.reasoning_artifact.is_some();
         // Whether this turn's assistant message carries SOME
         // `reasoning_content` on the wire: the real artifact text, or (on
@@ -888,6 +888,64 @@ mod tests {
             42,
             "deepseek-v4-flash",
             vec![(0, text_turn("", None, Some(ds_producer())))],
+        );
+        let out = run(&ctx, inspect_args(None));
+        assert!(
+            out.contains(
+                "empty assistant message(s) on the wire (\"must not be empty\" 400 candidates)"
+            ),
+            "wire-empty candidate surfaced: {out}"
+        );
+        assert!(
+            out.contains("daemon guard warn_on_missing_reasoning_artifacts: 1 problem(s)"),
+            "guard flags the unfixable turn: {out}"
+        );
+        assert!(out.contains("ledger vs wire: OK"), "{out}");
+    }
+
+    #[test]
+    fn wire_empty_turn_echoes_artifact_on_non_requires_rc_provider() {
+        // The empty-message fallback is provider-agnostic: a groq (ToolLoop,
+        // no `reasoning_content` injection) reasoning-only turn with a
+        // same-model artifact echoes it, so the report shows echo=yes and no
+        // empty-message candidates — same self-heal as the DeepSeek shape.
+        let (_dir, ctx) = seed(
+            42,
+            42,
+            GROQ_MODEL,
+            vec![(
+                0,
+                text_turn(
+                    "",
+                    Some(chat_artifact("groq reasoning")),
+                    Some(groq_producer(GROQ_MODEL)),
+                ),
+            )],
+        );
+        let out = run(&ctx, inspect_args(None));
+        assert!(out.contains("echo=yes"), "artifact echoed: {out}");
+        assert!(
+            out.contains("empty assistant message(s) on the wire: none"),
+            "no empty assistant message on the wire: {out}"
+        );
+        assert!(
+            out.contains("daemon guard warn_on_missing_reasoning_artifacts: 0 problem(s)"),
+            "guard clean: {out}"
+        );
+        assert!(out.contains("ledger vs wire: OK"), "{out}");
+    }
+
+    #[test]
+    fn wire_empty_turn_without_artifact_reported_on_non_requires_rc_provider() {
+        // Same reasoning-only shape on groq but NO artifact: the builder
+        // cannot self-heal and the guard must flag it — the generalization of
+        // the DeepSeek-only wire-empty flag to every echo-capable chat
+        // provider.
+        let (_dir, ctx) = seed(
+            42,
+            42,
+            GROQ_MODEL,
+            vec![(0, text_turn("", None, Some(groq_producer(GROQ_MODEL))))],
         );
         let out = run(&ctx, inspect_args(None));
         assert!(

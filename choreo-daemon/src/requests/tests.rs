@@ -149,6 +149,26 @@ fn anthropic_producer() -> ReasoningProducer {
     }
 }
 
+/// Non-DeepSeek OpenAI-compat chat provider: ToolLoop passback but no
+/// `reasoning_content` injection — the generalized fallback must cover it.
+const GROQ_MODEL: &str = "groq/llama-3.3-70b-versatile";
+
+fn groq_producer() -> ReasoningProducer {
+    ReasoningProducer {
+        provider_slug: "groq".into(),
+        model: GROQ_MODEL.into(),
+    }
+}
+
+/// Pinned to `reasoning_passback = none` by the bundled overlay (the gateway
+/// rejects replayed `reasoning_content`) — the fallback must respect it.
+fn cerebras_producer() -> ReasoningProducer {
+    ReasoningProducer {
+        provider_slug: "cerebras".into(),
+        model: "gpt-oss-120b".into(),
+    }
+}
+
 fn artifact(bytes: &[u8]) -> ReasoningArtifact {
     ReasoningArtifact::ChatReasoning {
         field: ChatReasoningField::ReasoningContent,
@@ -464,6 +484,98 @@ fn guard_requires_rc_empty_content_turn_missing_artifact_is_flagged() {
         warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
         1,
         "wire-empty requires_rc turn with no artifact to fill it is flagged",
+    );
+}
+
+#[test]
+fn builder_wire_empty_turn_echoes_artifact_on_non_requires_rc_provider() {
+    // The empty-message fallback is provider-agnostic: a content-less,
+    // tool-less turn with a same-model artifact must echo it on ANY
+    // echo-capable chat provider (here groq — ToolLoop passback, no
+    // `reasoning_content` injection) because a wholly empty assistant
+    // message is the "must not be empty" 400 on any OpenAI-compatible
+    // endpoint, not just DeepSeek/Kimi.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "continue",
+        "",
+        Some(artifact(b"reasoned but silent")),
+        Some(groq_producer()),
+        vec![],
+    );
+
+    let result = build_chat_request_messages(&session, None, "groq", GROQ_MODEL);
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(
+        assistants[0].reasoning_artifact,
+        Some(artifact(b"reasoned but silent")),
+        "empty-message fallback echoes the same-model artifact on any echo-capable chat provider",
+    );
+    // No empty-string injection on non-requires_rc models: the artifact
+    // re-emits its text directly.
+    assert_eq!(assistants[0].reasoning_content, None);
+
+    let body = serde_json::to_value(&result[1]).unwrap();
+    assert_eq!(body["content"], "");
+    assert_eq!(body["reasoning_content"], "reasoned but silent");
+}
+
+#[test]
+fn guard_wire_empty_turn_without_artifact_flagged_on_non_requires_rc() {
+    // Wire-empty turn with nothing replayable is flagged on a non-requires_rc
+    // ToolLoop provider too — the pre-generalization guard only caught
+    // DeepSeek/Kimi turns (the missing-artifact `requires_rc` gate), leaving
+    // an equally invalid empty message unflagged on e.g. groq.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "continue",
+        "",
+        None,
+        Some(groq_producer()),
+        vec![],
+    );
+    assert_eq!(
+        warn_on_missing_reasoning_artifacts(&session, 7, "groq", GROQ_MODEL),
+        1,
+        "wire-empty turn with no artifact to fill it is flagged on any echo-capable chat provider",
+    );
+    let result = build_chat_request_messages(&session, None, "groq", GROQ_MODEL);
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(assistants[0].reasoning_artifact, None);
+    assert_eq!(assistants[0].reasoning_content, None);
+}
+
+#[test]
+fn builder_wire_empty_turn_never_echoes_under_none_passback() {
+    // Cerebras gpt-oss-120b is pinned to `reasoning_passback = none` by the
+    // bundled overlay ("the gateway rejects replayed reasoning_content"): the
+    // empty-message fallback must NOT override that explicit never-replay
+    // policy — echoing would swap the "must not be empty" 400 for a "must
+    // not replay" 400. The guard skips None-passback requests entirely
+    // (documented policy), so this stays a session_inspect-visible hazard.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "continue",
+        "",
+        Some(artifact(b"gpt-oss thinking")),
+        Some(cerebras_producer()),
+        vec![],
+    );
+
+    let result = build_chat_request_messages(&session, None, "cerebras", "gpt-oss-120b");
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(assistants[0].reasoning_artifact, None);
+    assert_eq!(assistants[0].reasoning_content, None);
+    assert_eq!(
+        warn_on_missing_reasoning_artifacts(&session, 7, "cerebras", "gpt-oss-120b"),
+        0,
+        "None-passback requests skip the artifact guard entirely",
     );
 }
 

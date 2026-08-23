@@ -65,8 +65,8 @@ pub fn build_chat_request_messages(
         // payload replayed into this request, matching pi's isSameModel and
         // Anthropic's strip-on-model-change rule) and (2) the provider's
         // passback policy for this request — OR the empty-message fallback
-        // applies (see the reasoning_content comment below; `requires_rc`
-        // models must never ship a content-less, tool-less turn bare):
+        // applies (see the reasoning_content comment below: a content-less,
+        // tool-less turn must never ship bare under an echo-capable policy):
         //   ToolLoop  → only tool-involving turns (assistant tool_calls or
         //               tool results attached) — DeepSeek/Kimi reject a tool
         //               loop whose assistant message drops reasoning_content
@@ -81,8 +81,7 @@ pub fn build_chat_request_messages(
         // whole decision (policy + provenance + empty-fill) lives in
         // `include_reasoning_artifact`, shared with the precondition guard
         // and `session_inspect` so the three can never drift.
-        let include_artifact =
-            include_reasoning_artifact(turn, provider_slug, model, passback, requires_rc);
+        let include_artifact = include_reasoning_artifact(turn, provider_slug, model, passback);
         let has_tool_calls = !turn.tool_calls.is_empty();
         if turn.assistant_text.is_some() || has_tool_calls {
             let tool_calls = if has_tool_calls {
@@ -114,9 +113,9 @@ pub fn build_chat_request_messages(
                 // the wire always carries it (mirrors opencode's transform of
                 // `{type:"reasoning", text:""}` on every assistant message).
                 // `include_reasoning_artifact` already forces the artifact
-                // in for a content-less, tool-less turn (the "empty assistant
-                // message" 400), so the injected empty string only appears
-                // when nothing real can be echoed.
+                // in for a content-less, tool-less turn under an echo-capable
+                // policy (the "empty assistant message" 400), so the injected
+                // empty string only appears when nothing real can be echoed.
                 reasoning_content: if requires_rc && !include_artifact {
                     Some(String::new())
                 } else {
@@ -173,23 +172,33 @@ fn turn_has_tool_involvement(turn: &Turn) -> bool {
 ///    AllTurns / Signature → every turn
 ///    None / ResponseId → never via the message
 ///
-/// PLUS the `requires_rc` **empty-message fallback**: on DeepSeek/Kimi chat
-/// models the builder must never ship a provably-invalid assistant message —
-/// a turn recorded with empty content and no tool calls (e.g. a reasoning-
-/// only response) would serialize as `content: ""` + an injected empty
-/// `reasoning_content`, which the provider rejects with "the message ...
-/// with role 'assistant' must not be empty". If such a turn carries a
-/// same-model artifact, the artifact's real reasoning text is the only
-/// non-empty payload available, so it is included even though the policy
-/// alone would skip it. Artifacts always carry non-empty bytes (the capture
-/// path filters empty reasoning), so including one guarantees the wire
-/// message is non-empty.
+/// `passback` must be the resolved policy for `(provider_slug, model)`
+/// ([`model_reasoning_passback`]); callers that also need the value for
+/// their own logic resolve it once per request and pass it in, so the helper
+/// never re-scans the catalog per turn.
+///
+/// PLUS the **empty-message fallback**: the builder must never ship a
+/// provably-invalid assistant message — a turn recorded with empty content
+/// and no tool calls (e.g. a reasoning-only response) would serialize as a
+/// wholly empty message, which OpenAI-compatible chat providers reject with
+/// "the message ... with role 'assistant' must not be empty". If such a turn
+/// carries a same-model artifact, the artifact's real reasoning text is the
+/// only non-empty payload available, so it is included even though the
+/// policy alone would skip it. Artifacts always carry non-empty bytes (the
+/// capture path filters empty reasoning), so including one guarantees the
+/// wire message is non-empty. The fallback is provider-agnostic — it fires
+/// on every passback that may legally echo (`ToolLoop`/`AllTurns`/
+/// `Signature`), not only the DeepSeek/Kimi `requires_rc` models — but
+/// deliberately does NOT fire under `None` (an explicit never-replay
+/// override — the gateway may itself reject replayed reasoning, e.g.
+/// Cerebras gpt-oss) or `ResponseId` (continuity flows through
+/// `previous_response_id`/input items, not the message reasoning field);
+/// those stay flag-only.
 pub(crate) fn include_reasoning_artifact(
     turn: &Turn,
     provider_slug: &str,
     model: &str,
     passback: ReasoningPassback,
-    requires_rc: bool,
 ) -> bool {
     // Same-model provenance: compare `(slug, model)` string pairs directly
     // instead of constructing a temporary `ReasoningProducer` (which would
@@ -208,14 +217,27 @@ pub(crate) fn include_reasoning_artifact(
         ReasoningPassback::ToolLoop => turn_has_tool_involvement(turn),
         ReasoningPassback::AllTurns | ReasoningPassback::Signature => true,
     };
-    // Empty-message fallback: a content-less, tool-less turn on a model that
-    // requires `reasoning_content` would otherwise ship an empty assistant
-    // message; the artifact's reasoning text is the only payload that can
-    // keep it valid.
-    policy_echo
-        || (requires_rc
-            && turn.tool_calls.is_empty()
-            && turn.assistant_text.as_deref().is_none_or(str::is_empty))
+    // Empty-message fallback: a content-less, tool-less turn would otherwise
+    // ship a wholly empty assistant message (the "must not be empty" 400);
+    // the artifact's real reasoning text is the only payload that can keep
+    // it valid. `None`/`ResponseId` cannot use it (see the doc comment).
+    let can_echo = !matches!(
+        passback,
+        ReasoningPassback::None | ReasoningPassback::ResponseId
+    );
+    policy_echo || (can_echo && turn_is_wire_empty(turn))
+}
+
+/// Whether the turn's assistant message would be EMPTY on the wire (no
+/// content and no tool calls) — the shape OpenAI-compatible chat providers
+/// reject with "the message ... with role 'assistant' must not be empty".
+/// Tool-call turns always serialize a non-empty `tool_calls` array, and text
+/// with only whitespace still serializes a non-empty string, so the only way
+/// to reach this state is a recorded `assistant_text` of `""` (or `None`,
+/// which emits no assistant message at all — callers guard with
+/// `has_assistant_message` first).
+fn turn_is_wire_empty(turn: &Turn) -> bool {
+    turn.tool_calls.is_empty() && turn.assistant_text.as_deref().is_none_or(str::is_empty)
 }
 
 /// Resolve the starting `previous_response_id` for a new agent-loop
@@ -275,12 +297,15 @@ pub(crate) fn initial_prev_resp_id(
 /// Scope: `ToolLoop` cares only about tool-involving turns (that is where the
 /// provider demands the echo); `AllTurns`/`Signature` echo on every assistant
 /// message, so any assistant turn missing its artifact is a violation there.
-/// Additionally, on DeepSeek/Kimi chat models (`requires_rc`), an assistant
-/// message that would be **empty on the wire** (no content, no tool calls —
-/// e.g. a reasoning-only response) is flagged when the builder has no
-/// same-model artifact to fill it: the empty `reasoning_content` injection
-/// cannot make it non-empty, so the provider's "message ... must not be
-/// empty" 400 is the certain outcome rather than a guess.
+/// Additionally, an assistant message that would be **empty on the wire** (no
+/// content, no tool calls — e.g. a reasoning-only response) is flagged when
+/// the builder has no replayable same-model artifact to fill it: the
+/// provider's "message ... must not be empty" 400 is then the certain outcome
+/// on ANY OpenAI-compatible chat provider, not just the DeepSeek/Kimi
+/// (`requires_rc`) ones — the empty `reasoning_content` injection those
+/// models get is no substitute for a real payload. Whether the turn is on a
+/// `requires_rc` model is logged alongside so the two hazards stay
+/// distinguishable.
 ///
 /// Provenance is checked exactly like the builder: an artifact is only
 /// replayed when its producer matches the current (provider_slug, model), so
@@ -305,8 +330,9 @@ pub(crate) fn warn_on_missing_reasoning_artifacts(
         return 0;
     }
     // Mirror the builder's `requires_reasoning_content` resolution so the
-    // empty-message fallback (and the wire-empty hazard it fixes) is judged
-    // against exactly the models the builder injects the empty string for.
+    // wire-empty hazard is logged with the same injection the builder will
+    // apply (a requires_rc turn that is unfixable still ships the empty
+    // string, distinguishable from a plain empty message).
     let requires_rc = requires_reasoning_content(provider_slug, model);
     // AllTurns/Signature echo on every assistant message; ToolLoop only on
     // tool-involving turns.
@@ -329,20 +355,20 @@ pub(crate) fn warn_on_missing_reasoning_artifacts(
         // `session_inspect` dry-run) replay it — one helper, no drift. When
         // it is echoed the message is non-empty (artifacts always carry
         // non-empty bytes) and the required echo is present: clean.
-        if include_reasoning_artifact(turn, provider_slug, model, passback, requires_rc) {
+        if include_reasoning_artifact(turn, provider_slug, model, passback) {
             continue;
         }
         // Nothing was echoed. That is a problem when the passback policy
         // demands the echo on this turn (AllTurns/Signature everywhere,
         // ToolLoop on tool-involving turns), OR when omitting it leaves a
-        // wire-EMPTY assistant message on a model that requires
-        // `reasoning_content` — the provider's "must not be empty" 400 is
-        // then certain, because the empty-string injection is no substitute
-        // for a real payload.
-        let wire_empty =
-            turn.tool_calls.is_empty() && turn.assistant_text.as_deref().is_none_or(str::is_empty);
+        // wire-EMPTY assistant message — the "must not be empty" 400 is then
+        // certain on ANY OpenAI-compatible chat provider (the `requires_rc`
+        // empty-string injection is no substitute for a real payload), so
+        // the unfixable turns are flagged wherever the guard has
+        // jurisdiction.
+        let wire_empty = turn_is_wire_empty(turn);
         let policy_demands_echo = check_all_turns || turn_has_tool_involvement(turn);
-        if !policy_demands_echo && !(requires_rc && wire_empty) {
+        if !policy_demands_echo && !wire_empty {
             continue;
         }
         // Mirror the builder's provenance gate exactly: an artifact is
