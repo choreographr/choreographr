@@ -893,6 +893,9 @@ fn ai_providers_wizard_click_row_maps_scroll_offset() {
     app.page = Page::AIProviders;
     app.ai_providers.wizard.open();
     app.last_terminal_size = Some((100, 40));
+    // Cache the LIST-popup body height the way the event loop does, so the
+    // rendered window start (what `window()` reports) matches the drawn rows.
+    app.update_viewport_from_terminal_size();
     // The visible window starts at row 5, so the click maps to 5 + local row.
     app.ai_providers.wizard.scroll = 5;
     app.ai_providers.wizard.focused = 5;
@@ -903,7 +906,8 @@ fn ai_providers_wizard_click_row_maps_scroll_offset() {
         width: 100,
         height: 40,
     });
-    // Click the third visible row → filtered index 5 + 2 = 7.
+    // Click the third visible row → filtered index 5 + 2 = 7 (resolved
+    // through the rendered window, not the stored `scroll`).
     send_mouse(
         &mut app,
         MouseEventKind::Down(MouseButton::Left),

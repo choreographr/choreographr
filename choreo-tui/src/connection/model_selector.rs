@@ -1,10 +1,7 @@
-use crate::state::{
-    App, selector_list_layout, selector_local_row, selector_position_filter_cursor,
-};
+use crate::state::{App, SelectorClick, selector_click_target, selector_position_filter_cursor};
 use choreo_client_core::{ClientError, broken_pipe};
 use choreo_proto::ClientMessage;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
-use ratatui::layout::Rect;
 
 /// Handle events while the model selector overlay is open (Chat page).
 ///
@@ -70,44 +67,51 @@ pub(super) fn handle_model_selector_event(
                 MouseEventKind::ScrollDown => app.model_selector.move_down(),
                 MouseEventKind::ScrollUp => app.model_selector.move_up(),
                 MouseEventKind::Down(MouseButton::Left) => {
-                    // The popup geometry is derived from the last known
-                    // terminal size; before the first frame it is unknown, so
-                    // there is nothing to hit-test against.
-                    if let Some((width, height)) = app.last_terminal_size {
-                        let layout = selector_list_layout(Rect {
-                            x: 0,
-                            y: 0,
-                            width,
-                            height,
-                        });
-                        if let Some(local) = selector_local_row(&layout, mouse.column, mouse.row) {
+                    // Resolve the click against the RENDERED window start
+                    // (`window()`, the same function the renderer draws with),
+                    // never the stored `scroll`: a filter narrowing or a
+                    // PgUp/PgDn jump can leave `scroll` stale (past the new
+                    // max_scroll), and the raw value would map the click onto
+                    // a different row than the one drawn.  The popup geometry
+                    // is derived from the last known terminal size; before
+                    // the first frame it is unknown, so every click is a
+                    // no-op (`selector_click_target` returns `Noop` then).
+                    let filtered = app.model_selector.filtered();
+                    let (start, _) = app
+                        .model_selector
+                        .window(&filtered, app.model_selector.viewport_height);
+                    match selector_click_target(
+                        app.last_terminal_size,
+                        mouse.column,
+                        mouse.row,
+                        filtered.len(),
+                        start,
+                    ) {
+                        SelectorClick::Row(idx) => {
                             // Click in the list body: move the highlight to
-                            // the clicked row (scroll + local row, clamped to
-                            // the filtered-list length) and select it, exactly
-                            // like Enter.
-                            let filtered_len = app.model_selector.filtered().len();
-                            let idx = app.model_selector.scroll.saturating_add(local);
-                            if idx < filtered_len {
-                                app.model_selector.focused = idx;
-                                if let Some(model) = app.model_selector.submit() {
-                                    tracing::info!(%model, "model selector: selecting model");
-                                    client_tx
-                                        .send(ClientMessage::SetModel { model })
-                                        .map_err(broken_pipe)?;
-                                }
+                            // the clicked row and select it, exactly like
+                            // Enter.
+                            app.model_selector.focused = idx;
+                            if let Some(model) = app.model_selector.submit() {
+                                tracing::info!(%model, "model selector: selecting model");
+                                client_tx
+                                    .send(ClientMessage::SetModel { model })
+                                    .map_err(broken_pipe)?;
                             }
-                        } else if mouse.row == layout.filter_row.y
-                            && mouse.column >= layout.filter_row.x
-                            && mouse.column < layout.filter_row.x + layout.filter_row.width
-                        {
+                        }
+                        SelectorClick::FilterRow {
+                            column,
+                            filter_row_x,
+                        } => {
                             // Click in the filter row: position the input
                             // cursor at the clicked column.
                             selector_position_filter_cursor(
                                 &mut app.model_selector.filter,
-                                &layout,
-                                mouse.column,
+                                filter_row_x,
+                                column,
                             );
                         }
+                        SelectorClick::Noop => {}
                     }
                 }
                 _ => {}

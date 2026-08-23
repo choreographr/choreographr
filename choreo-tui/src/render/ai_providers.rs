@@ -2,7 +2,7 @@
 // new-account-wizard modals, extracted from the former monolithic render.rs.
 // Shared helpers (cursor positioning, the scrollbar widget) live in the
 // parent render/mod.rs; popup sizing/centering and the LIST-popup 3-band
-// layout live in `state/pages.rs` (`centered_popup`, `selector_list_layout`).
+// layout live in `state/layout.rs` (`centered_popup`, `selector_list_layout`).
 use crate::markdown_render::display_width;
 use crate::scrollbar::SmoothScrollbarState;
 use crate::state::{

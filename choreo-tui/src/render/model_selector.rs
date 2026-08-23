@@ -1,6 +1,6 @@
 // The model-selector overlay, extracted from the former monolithic render.rs.
 // Drawn last over the Chat page when `app.model_selector` is open.  Popup
-// sizing/centering and the LIST-popup 3-band layout live in `state/pages.rs`
+// sizing/centering and the LIST-popup 3-band layout live in `state/layout.rs`
 // (`centered_popup`, `selector_list_layout`), shared with the wizard's
 // provider picker and the connection-layer mouse handlers.
 use crate::markdown_render::display_width;

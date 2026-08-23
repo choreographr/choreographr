@@ -1,9 +1,9 @@
 //! The TUI's full application state: the `App` struct, per-session display
 //! state and render cache, history/input viewport plumbing, and the
-//! page/overlay states.  The provider catalog, text-input machinery, and
-//! page states live in sibling modules (`providers`, `input`, `pages`) and
-//! are re-exported here so the rest of the crate keeps referring to
-//! `crate::state::*` unchanged.
+//! page/overlay states.  The provider catalog, text-input machinery, page
+//! states, and picker geometry live in sibling modules (`providers`, `input`,
+//! `pages`, `layout`) and are re-exported here so the rest of the crate keeps
+//! referring to `crate::state::*` unchanged.
 
 use crate::RenderedImage;
 use crate::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
@@ -32,6 +32,7 @@ use crate::markdown_render::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 mod input;
+mod layout;
 mod pages;
 mod providers;
 
@@ -39,6 +40,7 @@ mod providers;
 // re-exported here so `crate::state::X` references (in this crate and in
 // `app_tests.rs`/`render_tests.rs`) keep resolving exactly as before.
 pub(crate) use input::*;
+pub(crate) use layout::*;
 pub(crate) use pages::*;
 pub(crate) use providers::*;
 
@@ -735,18 +737,23 @@ impl App {
         // that body height so arrow/wheel navigation can pin the highlight at
         // the middle row and scroll the list under it.  Same layout math as
         // the renderers and the mouse hit-testers (`selector_list_layout`),
-        // so the cache can never drift from what is drawn.  Both stay 0 until
-        // the first frame (viewport unknown), mirroring
-        // `session_mgr.viewport_height` — navigation falls back to focus-only
-        // moves then and `picker_window` clamps at render time.
-        let selector_layout = selector_list_layout(Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        });
-        self.ai_providers.wizard.viewport_height = selector_layout.body.height as usize;
-        self.model_selector.viewport_height = selector_layout.body.height as usize;
+        // so the cache can never drift from what is drawn.  Only computed
+        // while a picker is actually open: the value is consumed solely by
+        // open-picker navigation/click handling, and building the layout (a
+        // `Block` + `Layout::split`) every frame when no picker is up is
+        // pure waste.  Both stay 0 until the first frame (viewport unknown),
+        // mirroring `session_mgr.viewport_height` — navigation falls back to
+        // focus-only moves then and `picker_window` clamps at render time.
+        if self.model_selector.is_open() || self.ai_providers.wizard.is_open() {
+            let selector_layout = selector_list_layout(Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            });
+            self.ai_providers.wizard.viewport_height = selector_layout.body.height as usize;
+            self.model_selector.viewport_height = selector_layout.body.height as usize;
+        }
     }
 
     pub(crate) fn mark_terminal_resized(&mut self) {
