@@ -1,7 +1,4 @@
-use crate::state::{
-    AccountWizardStep, App, Page, SelectorClick, selector_click_target,
-    selector_position_filter_cursor,
-};
+use crate::state::{AccountWizardStep, App, Page, apply_selector_left_click};
 use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name};
 use choreo_proto::ClientMessage;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
@@ -296,47 +293,38 @@ pub(super) fn handle_account_wizard_event(
                 MouseEventKind::Down(MouseButton::Left) => {
                     // Resolve the click against the RENDERED window start
                     // (`window()`, the same function the renderer draws with),
-                    // never the stored `scroll`: a filter narrowing or a
-                    // PgUp/PgDn jump can leave `scroll` stale (past the new
-                    // max_scroll), and the raw value would map the click onto
-                    // a different row than the one drawn.  The popup geometry
-                    // is derived from the last known terminal size; before
-                    // the first frame it is unknown, so every click is a
-                    // no-op (`selector_click_target` returns `Noop` then).
+                    // never the stored `scroll`: a PgUp/PgDn jump moves
+                    // `focused` without touching `scroll`, and `picker_window`
+                    // then pushes the drawn window to keep the jumped focus
+                    // visible — the raw value would map the click onto a
+                    // different row than the one drawn.  The popup geometry is
+                    // derived from the last known terminal size; before the
+                    // first frame it is unknown, so every click is a no-op
+                    // (`apply_selector_left_click` returns `None` then).
                     let filtered = app.ai_providers.wizard.filtered(&app.providers);
                     let (start, _) = app
                         .ai_providers
                         .wizard
                         .window(&filtered, app.ai_providers.wizard.viewport_height);
-                    match selector_click_target(
+                    // Copy the length out first so the filtered borrow of
+                    // `app.ai_providers.wizard` (the `&ProviderInfo` refs)
+                    // ends before the mutable borrow of the filter below.
+                    let filtered_len = filtered.len();
+                    if let Some(idx) = apply_selector_left_click(
                         app.last_terminal_size,
                         mouse.column,
                         mouse.row,
-                        filtered.len(),
+                        filtered_len,
                         start,
+                        &mut app.ai_providers.wizard.filter,
                     ) {
-                        SelectorClick::Row(idx) => {
-                            // Click in the list body: move the highlight to
-                            // the clicked row and pick it, exactly like Enter.
-                            app.ai_providers.wizard.focused = idx;
-                            app.ai_providers.wizard.confirm_provider(&app.providers);
-                            if let Some(slug) = app.ai_providers.wizard.picked_slug.as_deref() {
-                                tracing::debug!(slug, "provider picked in account wizard");
-                            }
+                        // Click in the list body: move the highlight to
+                        // the clicked row and pick it, exactly like Enter.
+                        app.ai_providers.wizard.focused = idx;
+                        app.ai_providers.wizard.confirm_provider(&app.providers);
+                        if let Some(slug) = app.ai_providers.wizard.picked_slug.as_deref() {
+                            tracing::debug!(slug, "provider picked in account wizard");
                         }
-                        SelectorClick::FilterRow {
-                            column,
-                            filter_row_x,
-                        } => {
-                            // Click in the filter row: position the input
-                            // cursor at the clicked column.
-                            selector_position_filter_cursor(
-                                &mut app.ai_providers.wizard.filter,
-                                filter_row_x,
-                                column,
-                            );
-                        }
-                        SelectorClick::Noop => {}
                     }
                 }
                 _ => {}

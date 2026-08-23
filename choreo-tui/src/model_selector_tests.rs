@@ -517,7 +517,7 @@ fn model_selector_click_footer_is_noop() {
 }
 
 #[test]
-fn model_selector_click_after_filter_narrowing_maps_to_drawn_row() {
+fn model_selector_click_after_page_jump_maps_to_drawn_row() {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut app = test_app();
     app.model_selector.open();
@@ -525,21 +525,30 @@ fn model_selector_click_after_filter_narrowing_maps_to_drawn_row() {
     app.model_selector.viewport_height = 10;
     app.model_selector
         .apply_models((0..30).map(|i| format!("model-{i}")).collect(), None);
-    // Park the window at max_scroll for the 30-model list, then narrow the
-    // list with a filter: `clamp_focus` clamps `scroll` to `len - 1` (not the
-    // new max_scroll), leaving it stale exactly as happens in real use.
-    app.model_selector.focused = 20;
-    app.model_selector.scroll = 20;
-    app.model_selector.filter.text = "model-2".to_string();
-    app.model_selector.clamp_focus();
+    // PgDn jumps the highlight without touching `scroll`: `picker_window`
+    // then pushes the drawn window down to keep the jumped focus visible, so
+    // the stored `scroll` (still 0) no longer equals the rendered window
+    // start — a click resolved against the raw `scroll` would select the row
+    // above the one drawn.  (The filter-narrowing path used to leave `scroll`
+    // stale the same way, but `clamp_focus` now clamps it to the true
+    // max_scroll at every mutation; the page jump is the remaining path that
+    // moves `focused` without touching `scroll`.)
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("page down");
 
-    // filtered = [model-2, model-20..model-29] (11 items): max_scroll is 1,
-    // but the stored scroll is 10.  The renderer draws the window starting at
-    // row 1, so the first visible body row is filtered[1] = "model-20".
+    // focused = 10 after the jump; the renderer draws rows 1..11, so the
+    // first visible body row is filtered[1] = "model-1".
     let filtered = app.model_selector.filtered();
-    assert_eq!(filtered.len(), 11);
     let (start, _) = app.model_selector.window(&filtered, 10);
     assert_eq!(start, 1, "renderer shows rows 1..11");
+    assert_eq!(
+        app.model_selector.scroll, 0,
+        "the stored anchor is untouched"
+    );
 
     let layout = selector_list_layout(Rect {
         x: 0,
@@ -547,9 +556,9 @@ fn model_selector_click_after_filter_narrowing_maps_to_drawn_row() {
         width: 100,
         height: 40,
     });
-    // Click the FIRST visible body row — what the user sees at the top of the
-    // list.  The pick must land on the drawn row, not on a stale-scroll
-    // offset.
+    // Click the FIRST visible body row — what the user sees at the top of
+    // the list.  The pick must land on the drawn row (filtered[1]), not on a
+    // stale-scroll offset (filtered[0]).
     send_mouse(
         &mut app,
         MouseEventKind::Down(MouseButton::Left),
@@ -566,8 +575,111 @@ fn model_selector_click_after_filter_narrowing_maps_to_drawn_row() {
     assert_eq!(
         msg,
         ClientMessage::SetModel {
-            model: "model-20".to_string()
+            model: "model-1".to_string()
         },
         "click maps to the row that was actually drawn (window start 1)"
     );
+}
+
+#[test]
+fn model_selector_click_while_loading_is_noop() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.model_selector.open();
+    app.last_terminal_size = Some((100, 40));
+    app.model_selector
+        .apply_models(vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()], None);
+    // Re-open: `open()` keeps the previous `all_models` (so a re-open shows
+    // results immediately once the fresh reply lands) and sets `loading` back
+    // to true — the popup draws "Loading models…", not the stale list, so a
+    // click must not select a model that is not drawn.
+    app.model_selector.open();
+    assert!(app.model_selector.loading);
+
+    let layout = selector_list_layout(Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 40,
+    });
+    send_mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        layout.body.x + 3,
+        layout.body.y,
+        &tx,
+    );
+
+    assert!(
+        app.model_selector.is_open(),
+        "a click while loading must not select"
+    );
+    assert_eq!(app.model_selector.focused, 0);
+    assert!(rx.try_recv().is_err(), "no message sent");
+}
+
+#[test]
+fn model_selector_click_after_failed_refresh_is_noop() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.model_selector.open();
+    app.last_terminal_size = Some((100, 40));
+    app.model_selector
+        .apply_models(vec!["gpt-4o".to_string()], None);
+    // A failed refresh leaves the stale list in place but replaces the body
+    // with the error text — no rows are drawn, so a click must not select one.
+    app.model_selector.apply_error("daemon unreachable");
+
+    let layout = selector_list_layout(Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 40,
+    });
+    send_mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        layout.body.x + 3,
+        layout.body.y,
+        &tx,
+    );
+
+    assert!(
+        app.model_selector.is_open(),
+        "a click after a failed refresh must not select"
+    );
+    assert!(rx.try_recv().is_err(), "no message sent");
+}
+
+#[test]
+fn model_selector_filter_row_click_while_loading_positions_cursor() {
+    // The guard only skips *row* selection while the popup shows no list;
+    // the filter row is still drawn, so clicking it must keep positioning
+    // the cursor.
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.model_selector.open();
+    app.last_terminal_size = Some((100, 40));
+    app.model_selector.filter.text = "gpt".to_string();
+    app.model_selector.filter.cursor = 0;
+
+    let layout = selector_list_layout(Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 40,
+    });
+    send_mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        layout.filter_row.x + 3,
+        layout.filter_row.y,
+        &tx,
+    );
+
+    assert_eq!(
+        app.model_selector.filter.cursor, 1,
+        "filter-row clicks still position the cursor while loading"
+    );
+    assert!(app.model_selector.is_open());
 }

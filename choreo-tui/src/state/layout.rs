@@ -3,7 +3,8 @@
 //! (`PopupSize`/`centered_popup`), the 3-band filter-row/body/footer layout
 //! (`SelectorLayout`/`selector_list_layout`), and the mouse hit-testing that
 //! maps a left-click onto a list row or the filter cursor
-//! (`selector_click_target`/`selector_position_filter_cursor`).
+//! (`selector_click_target`/`apply_selector_left_click`/
+//! `selector_position_filter_cursor`).
 //!
 //! Everything here is pure geometry — the renderers, the connection-layer
 //! mouse handlers, and the viewport cache all consume the *same* functions,
@@ -211,6 +212,37 @@ pub(crate) fn selector_click_target(
     }
 }
 
+/// Apply a left-click to the LIST popup, shared by the wizard's provider
+/// picker and the model selector: a click on a visible list row returns the
+/// filtered-list index to select, a click on the filter row positions the
+/// input cursor (grapheme-aware, via [`selector_position_filter_cursor`]),
+/// and every other click (footer, borders, the dimmed area, below the
+/// visible tail) is a no-op.  `filtered_len` is the current filtered-list
+/// length and `window_start` the first *drawn* row (`window()`'s start — see
+/// [`selector_click_target`]); the caller performs the row-selection action
+/// itself, because the two pickers confirm differently (the model selector
+/// sends `SetModel` and closes; the wizard advances to the slug step).
+pub(crate) fn apply_selector_left_click(
+    last_terminal_size: Option<(u16, u16)>,
+    column: u16,
+    row: u16,
+    filtered_len: usize,
+    window_start: usize,
+    filter: &mut InputBuffer,
+) -> Option<usize> {
+    match selector_click_target(last_terminal_size, column, row, filtered_len, window_start) {
+        SelectorClick::Row(idx) => Some(idx),
+        SelectorClick::FilterRow {
+            column,
+            filter_row_x,
+        } => {
+            selector_position_filter_cursor(filter, filter_row_x, column);
+            None
+        }
+        SelectorClick::Noop => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +404,63 @@ mod tests {
             selector_click_target(None, 5, 5, 10, 0),
             SelectorClick::Noop
         ));
+    }
+
+    // ── apply_selector_left_click (shared click application) ─────────────
+
+    #[test]
+    fn apply_selector_left_click_reports_row_and_positions_cursor() {
+        let layout = selector_list_layout(Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        });
+        let mut filter = InputBuffer::new();
+        filter.text = "abc".to_string();
+        filter.cursor = 0;
+
+        // A body-row click returns the filtered index (window start + local
+        // row) and must not disturb the filter cursor.
+        let row_click = apply_selector_left_click(
+            Some((100, 40)),
+            layout.body.x + 3,
+            layout.body.y + 2,
+            15,
+            5,
+            &mut filter,
+        );
+        assert_eq!(row_click, Some(7), "window start 5 + local row 2");
+        assert_eq!(filter.cursor, 0, "a row click must not move the cursor");
+
+        // A filter-row click positions the cursor (the click column minus the
+        // "> " prefix) and reports no row.
+        let row_click = apply_selector_left_click(
+            Some((100, 40)),
+            layout.filter_row.x + 4,
+            layout.filter_row.y,
+            10,
+            0,
+            &mut filter,
+        );
+        assert_eq!(row_click, None, "a filter-row click selects nothing");
+        assert_eq!(filter.cursor, 2, "the click column minus the prefix");
+
+        // Below the visible tail, outside the popup, and before the first
+        // frame: no row and no cursor move.
+        let below = apply_selector_left_click(
+            Some((100, 40)),
+            layout.body.x + 3,
+            layout.body.y + 5,
+            3,
+            0,
+            &mut filter,
+        );
+        assert_eq!(below, None);
+        let outside = apply_selector_left_click(Some((100, 40)), 0, 0, 10, 0, &mut filter);
+        assert_eq!(outside, None);
+        let unknown = apply_selector_left_click(None, 5, 5, 10, 0, &mut filter);
+        assert_eq!(unknown, None);
+        assert_eq!(filter.cursor, 2, "non-row clicks must not move the cursor");
     }
 }

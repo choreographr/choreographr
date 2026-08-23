@@ -12,6 +12,15 @@ use zeroize::Zeroize;
 
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
 
+/// The two pickers' shared case-insensitive substring predicate: does `s`
+/// contain the already-lowercased `needle`?  Both `filtered()` methods and
+/// their `filtered_len()` count helpers apply the same predicate, so a
+/// filter change can never behave differently between rendering and
+/// navigation.
+fn filter_matches(s: &str, needle: &str) -> bool {
+    s.to_lowercase().contains(needle)
+}
+
 /// Rows a single PgUp/PgDn press jumps in the new-account wizard's provider
 /// picker (step 1).  The render window always follows the focus, so paging the
 /// focus is what actually scrolls the list.
@@ -60,7 +69,8 @@ fn picker_window(scroll: usize, focused: usize, len: usize, height: usize) -> (u
 /// navigation; when the list fits the window (`len <= height`, so
 /// `max_scroll == 0`) the plain `picker_window` behavior applies (highlight
 /// walks edge to edge, window static).  `focused`/`scroll` are hints only — a
-/// stale pair is clamped locally, exactly like `picker_window`.
+/// stale pair is clamped locally, exactly like `picker_window` (`scroll` to
+/// the true `max_scroll`, symmetrically for both directions).
 fn step_focus(
     focused: usize,
     scroll: usize,
@@ -90,9 +100,14 @@ fn step_focus(
     }
     // Clamp a stale pair before stepping (a filter can narrow the list under
     // a highlight that pointed past the end; `clamp_focus` normally does this
-    // at mutation time, this is the pure-function safety net).
+    // at mutation time, this is the pure-function safety net).  `scroll` is
+    // clamped to the true max_scroll *symmetrically* for both directions: a
+    // hint left past the bottom edge must not make ↑ decrement it one press
+    // at a time while ↓ clamps it in one step — both treat the window as
+    // already pinned at the edge the hint points past.
     let focused = focused.min(len - 1);
     let max_scroll = len.saturating_sub(height);
+    let scroll = scroll.min(max_scroll);
     let middle = height / 2;
     if down {
         if focused + 1 >= len {
@@ -336,15 +351,31 @@ impl AccountWizardState {
         }
         providers
             .iter()
-            .filter(|p| p.display_name.to_lowercase().contains(&needle))
+            .filter(|p| filter_matches(&p.display_name, &needle))
             .collect()
+    }
+
+    /// Number of providers matching the current filter — the count only,
+    /// without building the filtered list.  Navigation (arrows/wheel) and
+    /// clamping need just the length, so they skip the per-press Vec that
+    /// `filtered()` would allocate (the renderer and click handler still use
+    /// `filtered()` because they need the rows).
+    pub(crate) fn filtered_len(&self, providers: &[ProviderInfo]) -> usize {
+        let needle = self.filter.text.to_lowercase();
+        if needle.is_empty() {
+            return providers.len();
+        }
+        providers
+            .iter()
+            .filter(|p| filter_matches(&p.display_name, &needle))
+            .count()
     }
 
     /// Clamp `focused` and `scroll` against the filtered provider list length.
     /// Called after every filter mutation so the highlight never points past
     /// the end of a narrowed list.
     pub(crate) fn clamp_focus(&mut self, providers: &[ProviderInfo]) {
-        let len = self.filtered(providers).len();
+        let len = self.filtered_len(providers);
         if len == 0 {
             self.focused = 0;
             self.scroll = 0;
@@ -353,7 +384,16 @@ impl AccountWizardState {
         if self.focused >= len {
             self.focused = len - 1;
         }
-        self.scroll = self.scroll.min(len - 1);
+        // Clamp `scroll` to the true max_scroll (`len - viewport height`),
+        // not `len - 1`: a hint left past the bottom of the window used to
+        // make the click handler select a different row than the renderer
+        // drew (a filter narrowing or a PgUp/PgDn jump left it stale past the
+        // new max_scroll).  `.max(1)` keeps the pre-first-frame fallback
+        // (viewport height unknown, 0) at the old `len - 1` behaviour so the
+        // hint can never index past the last row.
+        self.scroll = self
+            .scroll
+            .min(len.saturating_sub(self.viewport_height.max(1)));
     }
 
     pub(crate) fn move_up(&mut self, providers: &[ProviderInfo]) {
@@ -364,13 +404,13 @@ impl AccountWizardState {
         // height is 0 (before the first frame) it degrades to today's
         // focus-only move.  `providers` is the live list, used to compute the
         // filtered length (mirroring `move_down`).
-        let len = self.filtered(providers).len();
+        let len = self.filtered_len(providers);
         (self.focused, self.scroll) =
             step_focus(self.focused, self.scroll, len, self.viewport_height, false);
     }
 
     pub(crate) fn move_down(&mut self, providers: &[ProviderInfo]) {
-        let len = self.filtered(providers).len();
+        let len = self.filtered_len(providers);
         (self.focused, self.scroll) =
             step_focus(self.focused, self.scroll, len, self.viewport_height, true);
     }
@@ -383,7 +423,7 @@ impl AccountWizardState {
     }
 
     pub(crate) fn page_down(&mut self, providers: &[ProviderInfo]) {
-        let len = self.filtered(providers).len();
+        let len = self.filtered_len(providers);
         if len == 0 {
             return;
         }
@@ -666,16 +706,32 @@ impl ModelSelectorState {
         }
         self.all_models
             .iter()
-            .filter(|m| m.to_lowercase().contains(&needle))
+            .filter(|m| filter_matches(m, &needle))
             .map(String::as_str)
             .collect()
+    }
+
+    /// Number of models matching the current filter — the count only,
+    /// without building the filtered list.  Navigation (arrows/wheel) and
+    /// clamping need just the length, so they skip the per-press Vec that
+    /// `filtered()` would allocate (the renderer and click handler still use
+    /// `filtered()` because they need the rows).
+    pub(crate) fn filtered_len(&self) -> usize {
+        let needle = self.filter.text.to_lowercase();
+        if needle.is_empty() {
+            return self.all_models.len();
+        }
+        self.all_models
+            .iter()
+            .filter(|m| filter_matches(m, &needle))
+            .count()
     }
 
     /// Clamp `focused` and `scroll` against the filtered list length.
     /// Called after every filter mutation so the highlight never points
     /// past the end of a narrowed list.
     pub(crate) fn clamp_focus(&mut self) {
-        let len = self.filtered().len();
+        let len = self.filtered_len();
         if len == 0 {
             self.focused = 0;
             self.scroll = 0;
@@ -684,7 +740,16 @@ impl ModelSelectorState {
         if self.focused >= len {
             self.focused = len - 1;
         }
-        self.scroll = self.scroll.min(len - 1);
+        // Clamp `scroll` to the true max_scroll (`len - viewport height`),
+        // not `len - 1`: a hint left past the bottom of the window used to
+        // make the click handler select a different row than the renderer
+        // drew (a filter narrowing or a PgUp/PgDn jump left it stale past the
+        // new max_scroll).  `.max(1)` keeps the pre-first-frame fallback
+        // (viewport height unknown, 0) at the old `len - 1` behaviour so the
+        // hint can never index past the last row.
+        self.scroll = self
+            .scroll
+            .min(len.saturating_sub(self.viewport_height.max(1)));
     }
 
     pub(crate) fn move_up(&mut self) {
@@ -694,13 +759,13 @@ impl ModelSelectorState {
         // scrolls under it; at the top edge it un-pins and walks to row 0.
         // When the height is 0 (before the first frame) it degrades to a
         // focus-only move.
-        let len = self.filtered().len();
+        let len = self.filtered_len();
         (self.focused, self.scroll) =
             step_focus(self.focused, self.scroll, len, self.viewport_height, false);
     }
 
     pub(crate) fn move_down(&mut self) {
-        let len = self.filtered().len();
+        let len = self.filtered_len();
         (self.focused, self.scroll) =
             step_focus(self.focused, self.scroll, len, self.viewport_height, true);
     }
@@ -713,7 +778,7 @@ impl ModelSelectorState {
     }
 
     pub(crate) fn page_down(&mut self) {
-        let len = self.filtered().len();
+        let len = self.filtered_len();
         if len == 0 {
             return;
         }
@@ -1026,7 +1091,7 @@ impl SessionManagerState {
 
 #[cfg(test)]
 mod tests {
-    use super::{picker_window, step_focus};
+    use super::{AccountWizardState, ModelSelectorState, ProviderInfo, picker_window, step_focus};
 
     #[test]
     fn picker_window_empty_list_or_zero_height_returns_zero() {
@@ -1242,5 +1307,79 @@ mod tests {
         // stale highlight cannot linger.
         assert_eq!(step_focus(3, 5, 0, 10, true), (0, 0));
         assert_eq!(step_focus(3, 5, 0, 10, false), (0, 0));
+    }
+
+    #[test]
+    fn step_focus_stale_scroll_is_clamped_symmetrically() {
+        // A stale scroll hint (past the new max_scroll after a filter
+        // narrowing) is clamped to the valid range before stepping, so ↑ and
+        // ↓ treat the window identically: both clamp in one step instead of
+        // the old ↑ behaviour of decrementing the stale hint one press at a
+        // time.  len=11 in a 10-row window → max_scroll=1; scroll=10 is stale.
+        assert_eq!(
+            step_focus(10, 10, 11, 10, false),
+            (9, 1),
+            "↑ clamps scroll and walks the highlight up"
+        );
+        assert_eq!(
+            step_focus(5, 10, 11, 10, true),
+            (6, 1),
+            "↓ clamps scroll and walks the highlight down"
+        );
+    }
+
+    // ── filtered_len (count without building the list) ──────────────────
+
+    #[test]
+    fn filtered_len_matches_filtered_count() {
+        // The count-only helper must agree with building the full filtered
+        // list (they share `filter_matches`), so navigation and rendering
+        // can never disagree about the list length.
+        let mut sel = ModelSelectorState::new();
+        sel.apply_models(
+            vec![
+                "gpt-4o".to_string(),
+                "gpt-4o-mini".to_string(),
+                "claude-3".to_string(),
+            ],
+            None,
+        );
+        assert_eq!(sel.filtered_len(), 3, "empty filter returns every model");
+        sel.filter.text = "gpt".to_string();
+        assert_eq!(sel.filtered_len(), 2, "case-insensitive substring");
+        assert_eq!(sel.filtered().len(), 2, "agrees with the built list");
+        sel.filter.text = "nope".to_string();
+        assert_eq!(sel.filtered_len(), 0);
+    }
+
+    #[test]
+    fn wizard_filtered_len_matches_filtered_count() {
+        let providers = vec![
+            ProviderInfo {
+                slug: "a".into(),
+                display_name: "Alpha".into(),
+            },
+            ProviderInfo {
+                slug: "b".into(),
+                display_name: "Beta".into(),
+            },
+            ProviderInfo {
+                slug: "c".into(),
+                display_name: "Alphabet Soup".into(),
+            },
+        ];
+        let mut wizard = AccountWizardState::new();
+        assert_eq!(wizard.filtered_len(&providers), 3);
+        wizard.filter.text = "alp".to_string();
+        assert_eq!(
+            wizard.filtered_len(&providers),
+            2,
+            "case-insensitive substring"
+        );
+        assert_eq!(
+            wizard.filtered(&providers).len(),
+            2,
+            "agrees with the built list"
+        );
     }
 }
