@@ -4,7 +4,7 @@ use crate::markdown_render::{display_width, reasoning_expanded_default, render_t
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::selection;
 use crate::state::{
-    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, CTRL_HELP_LINE1, CTRL_HELP_LINE2, INPUT_PAD,
+    AI_PROVIDER_ITEM_LINES, AccountWizardStep, App, CTRL_HELP_LINE1, CTRL_HELP_LINE2, INPUT_PAD,
     Page, RenderCacheKey, SessionManagerView, cached_or_compute_lines, cached_visual_lines,
     input_inner_width,
 };
@@ -1051,14 +1051,18 @@ pub(crate) fn format_timestamp(ts_ms: i64) -> String {
 // ── AI Provider Accounts ──────────────────────────────────
 
 fn render_ai_providers(frame: &mut Frame<'_>, app: &mut App) {
-    if app.ai_providers.credential_target.is_some() {
-        render_ai_providers_credential(frame, app);
-        return;
-    }
-    match app.ai_providers.view {
-        AIProvidersView::List => render_ai_providers_list(frame, app),
-        AIProvidersView::SelectProvider => render_ai_providers_select_provider(frame, app),
-        AIProvidersView::SetSlug => render_ai_providers_set_slug(frame, app),
+    render_ai_providers_list(frame, app);
+    // The wizard and credential modals overlay the list (drawn last), exactly
+    // like the model selector overlays the chat page.  The credential modal
+    // wins when both are open — the wizard closes before the credential modal
+    // auto-opens after account creation, so this is belt-and-braces.
+    if app.ai_providers.credential.is_open() {
+        render_credential_modal(frame, app);
+    } else if app.ai_providers.wizard.is_open() {
+        match app.ai_providers.wizard.step {
+            AccountWizardStep::Provider => render_wizard_provider(frame, app),
+            AccountWizardStep::Slug => render_wizard_slug(frame, app),
+        }
     }
 }
 
@@ -1167,39 +1171,66 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(status, chunks[1]);
 }
 
-fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
+/// Centered popup for entering an API key: `c` on an existing account, or
+/// auto-opened right after the new-account wizard creates one.  The key is
+/// masked on screen; Enter encrypts and sends it (connection.rs), Esc cancels.
+fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
+    // A compact popup — there is a single input field, so it only needs to
+    // be tall enough for the prompt, the masked input, the error row, and the
+    // footer hint.
+    let popup = centered_popup(
+        area,
+        PopupSize {
+            w_num: 2,
+            w_den: 3,
+            h_num: 2,
+            h_den: 5,
+            min_w: 40,
+            min_h: 9,
+            max_w: 80,
+            max_h: 13,
+        },
+    );
+    frame.render_widget(Clear, popup);
 
     let account_name = app
         .ai_providers
-        .credential_target
+        .credential
+        .target
         .as_deref()
         .unwrap_or("(unknown)");
 
     let block = Block::default()
         .title(format!(" API Key for \"{account_name}\" "))
-        .borders(Borders::ALL);
-    let inner = block.inner(chunks[0]);
-    frame.render_widget(block, chunks[0]);
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
 
     let dim = Style::default().fg(Color::DarkGray);
     let input_style = Style::default().fg(Color::Cyan);
 
-    lines.push(Line::from(Span::styled(String::new(), Style::default())));
-    lines.push(Line::from(Span::styled(
-        "  Paste the API key for this account:",
-        dim,
-    )));
-    lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  Paste the API key for this account:",
+            dim,
+        ))),
+        rows[0],
+    );
 
-    let text = &app.ai_providers.credential_input.text;
-    let cursor = app.ai_providers.credential_input.cursor;
+    let text = &app.ai_providers.credential.input.text;
+    let cursor = app.ai_providers.credential.input.cursor;
     let masked = if text.is_empty() {
         String::new()
     } else if text.len() > 12 {
@@ -1212,20 +1243,14 @@ fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         format!("> {masked}")
     };
-    lines.push(Line::from(Span::styled(display, input_style)));
-    let input_line = lines.len() as u16 - 1;
-    lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(display, input_style))),
+        rows[1],
+    );
 
-    if let Some(ref err) = app.ai_providers.add_error {
-        lines.push(Line::from(Span::styled(
-            format!("  Error: {err}"),
-            Style::default().fg(Color::Red),
-        )));
-    }
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, inner);
-
+    // Park the terminal cursor at the same proportional position inside the
+    // masked text (InputBuffer's cursor is a byte offset; the mask is a
+    // shortened rendering of the same key).
     let masked_before = if text.is_empty() {
         ""
     } else if cursor >= text.len() {
@@ -1235,152 +1260,9 @@ fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
         let pos = pos.min(masked.len());
         &masked[..pos]
     };
-    set_input_cursor(frame, inner, input_line, 2, masked_before);
+    set_input_cursor(frame, rows[1], 0, 2, masked_before);
 
-    let status = Paragraph::new(Line::from(" <Enter save>  <Esc cancel>"));
-    frame.render_widget(status, chunks[1]);
-}
-
-/// Phase 1 of the new-account wizard: browse `PROVIDER_OPTIONS` and pick
-/// one.  Rendered as a compact scrollable one-line-per-provider list of
-/// display names (the canonical slug is not shown), matching the accounts
-/// list's look.
-fn render_ai_providers_select_provider(frame: &mut Frame<'_>, app: &mut App) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
-
-    let block = Block::default()
-        .title(" Select AI Provider (1/2) ")
-        .borders(Borders::ALL);
-    let inner = block.inner(chunks[0]);
-    frame.render_widget(block, chunks[0]);
-
-    let list_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-
-    let max_rows = list_chunks[0].height as usize;
-    let total = app.providers.len();
-    let mut lines: Vec<Line> = Vec::new();
-
-    // One line per provider, so the visible window holds max_rows entries.
-    // `provider_window` keeps the highlighted row on screen regardless of
-    // how far the user scrolled.
-    let items_per_page = max_rows.max(1);
-    let (win_start, win_count) = app
-        .ai_providers
-        .provider_window(&app.providers, items_per_page);
-    let win_end = (win_start + win_count).min(total);
-
-    for (i, provider) in app
-        .providers
-        .iter()
-        .enumerate()
-        .take(win_end)
-        .skip(win_start)
-    {
-        let is_selected = i == app.ai_providers.provider_selection;
-        let sel = if is_selected { ">" } else { " " };
-
-        let style = if is_selected {
-            Style::default().bg(Color::Blue).fg(Color::White)
-        } else {
-            Style::default()
-        };
-
-        lines.push(Line::from(vec![Span::styled(
-            format!("{sel} {} ", provider.display_name),
-            style,
-        )]));
-    }
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, list_chunks[0]);
-
-    if total > items_per_page {
-        frame.render_stateful_widget(
-            vertical_scrollbar(),
-            list_chunks[1],
-            &mut SmoothScrollbarState::new(total)
-                .position(win_start)
-                .viewport_content_length(items_per_page),
-        );
-    }
-
-    let status = Paragraph::new(Line::from(format!(
-        " <j/k nav>  <PgUp/PgDn page>  <Enter select>  <Esc back>  —  {} providers",
-        total
-    )));
-    frame.render_widget(status, chunks[1]);
-}
-
-/// Phase 2 of the new-account wizard: enter a slug (the account name).
-/// Explains what a slug is, shows the provider picked in phase 1, and
-/// submits `AddAccount` on Enter (handled in connection.rs), after which
-/// the flow redirects to the credential page.
-fn render_ai_providers_set_slug(frame: &mut Frame<'_>, app: &mut App) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
-
-    let block = Block::default()
-        .title(" Set Account Slug (2/2) ")
-        .borders(Borders::ALL);
-    let inner = block.inner(chunks[0]);
-    frame.render_widget(block, chunks[0]);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
-        .split(inner);
-
-    let dim = Style::default().fg(Color::DarkGray);
-    let accent = Style::default().fg(Color::Cyan);
-
-    // Provider picked in phase 1, shown for context.
-    let provider_name = app
-        .ai_providers
-        .selected_provider_slug(&app.providers)
-        .and_then(|slug| app.providers.iter().find(|p| p.slug == slug))
-        .map(|p| p.display_name.as_str())
-        .unwrap_or("(none)");
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(String::new(), Style::default()))];
-    lines.push(Line::from(Span::styled(
-        format!("  Provider: {provider_name}"),
-        accent,
-    )));
-    lines.push(Line::from(Span::styled(String::new(), Style::default())));
-    lines.push(Line::from(Span::styled(
-        "  A slug is the unique name this account is stored under.",
-        dim,
-    )));
-    lines.push(Line::from(Span::styled(
-        "  You'll use it to refer to the account, e.g. /account <slug>.",
-        dim,
-    )));
-    lines.push(Line::from(Span::styled(
-        "  Lowercase letters, numbers, hyphens, and underscores only.",
-        dim,
-    )));
-    frame.render_widget(Paragraph::new(lines), rows[0]);
-
-    let border_style = Style::default().fg(Color::Cyan);
-    let slug_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("Slug:"))
-        .with_block(Block::bordered().border_style(border_style));
-    (&slug_prompt).draw(frame, rows[1], &mut app.ai_providers.slug_state);
-
-    if let Some(ref err) = app.ai_providers.add_error {
+    if let Some(ref err) = app.ai_providers.credential.error {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("  Error: {err}"),
@@ -1390,8 +1272,194 @@ fn render_ai_providers_set_slug(frame: &mut Frame<'_>, app: &mut App) {
         );
     }
 
-    let status = Paragraph::new(Line::from(" <Enter create account>  <Esc back>"));
-    frame.render_widget(status, chunks[1]);
+    let status = Paragraph::new(Line::from(Span::styled(
+        " enter save · esc cancel ",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(status, rows[3]);
+}
+
+/// Step 1 of the new-account wizard: a centered, searchable provider picker.
+/// Mirrors the model selector — filter row on top, scrollable list of display
+/// names, footer hint.  The canonical slug is deliberately NOT shown (it is
+/// easily confused with the account slug entered in step 2).  Key handling
+/// lives in `handle_account_wizard_event` (connection.rs).
+fn render_wizard_provider(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    // Same footprint as the model selector: ~60% width, ~2/3 height, so the
+    // 200+ provider names get a comfortable list.
+    let popup = centered_popup(area, PopupSize::LIST);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Select Provider ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // ── Filter row ──────────────────────────────────────────────
+    let filter_row = chunks[0];
+    let filter_prefix = "> ";
+    let filter_display = format!("{filter_prefix}{}", app.ai_providers.wizard.filter.text);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            filter_display,
+            Style::default().fg(Color::White),
+        ))),
+        filter_row,
+    );
+    // Park the terminal cursor right after the filter text.  `cursor` is a
+    // byte offset (InputBuffer's convention); clamp the column so a long
+    // filter never pushes the cursor off-screen.
+    let before_cursor = app
+        .ai_providers
+        .wizard
+        .filter
+        .text
+        .get(..app.ai_providers.wizard.filter.cursor)
+        .unwrap_or(&app.ai_providers.wizard.filter.text);
+    let cursor_col =
+        filter_row.x + filter_prefix.len() as u16 + display_width(before_cursor) as u16;
+    let cursor_col = cursor_col.min(filter_row.x + filter_row.width.saturating_sub(1));
+    frame.set_cursor_position((cursor_col, filter_row.y));
+
+    // ── Body: list / empty state ────────────────────────────────
+    let body = chunks[1];
+    let list_height = body.height as usize;
+    // Compute the visible window (pure — `window` never mutates state, so
+    // drawing the popup cannot disturb scroll/focus state mid-frame).
+    let (scroll, count) = app.ai_providers.wizard.window(&app.providers, list_height);
+    let filtered = app.ai_providers.wizard.filtered(&app.providers);
+    let focused = app.ai_providers.wizard.focused;
+
+    if filtered.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " No providers match the filter.",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            body,
+        );
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(count);
+    for (i, provider) in filtered.iter().enumerate().skip(scroll).take(count) {
+        let is_focused = i == focused;
+        let prefix = if is_focused { "> " } else { "  " };
+        let style = if is_focused {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{}", provider.display_name),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+
+    // ── Footer hint ─────────────────────────────────────────────
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " esc cancel · enter select · type to filter",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[2],
+    );
+}
+
+/// Step 2 of the new-account wizard: a separate centered modal to enter the
+/// account slug (the name the account is stored under, used by `/account`).
+/// Shows the provider picked in step 1 for context.  Enter creates the account
+/// (connection.rs), Esc returns to the provider picker.
+fn render_wizard_slug(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    // A compact popup — just the provider context, the slug input, and the
+    // error/footer rows.
+    let popup = centered_popup(
+        area,
+        PopupSize {
+            w_num: 2,
+            w_den: 3,
+            h_num: 2,
+            h_den: 5,
+            min_w: 40,
+            min_h: 9,
+            max_w: 80,
+            max_h: 14,
+        },
+    );
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Add Account ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let accent = Style::default().fg(Color::Cyan);
+
+    // Provider picked in step 1, shown for context.
+    let provider_name = app
+        .ai_providers
+        .wizard
+        .picked_name
+        .as_deref()
+        .unwrap_or("(none)");
+    let lines: Vec<Line> = vec![
+        Line::from(Span::styled(format!("  Provider: {provider_name}"), accent)),
+        Line::from(Span::styled(
+            "  Slug is the account name, e.g. /account <slug>.",
+            dim,
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), rows[0]);
+
+    let border_style = Style::default().fg(Color::Cyan);
+    let slug_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("Slug:"))
+        .with_block(Block::bordered().border_style(border_style));
+    (&slug_prompt).draw(frame, rows[1], &mut app.ai_providers.wizard.slug);
+
+    if let Some(ref err) = app.ai_providers.wizard.error {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  Error: {err}"),
+                Style::default().fg(Color::Red),
+            ))),
+            rows[2],
+        );
+    }
+
+    let status = Paragraph::new(Line::from(Span::styled(
+        " enter create account · esc back to provider ",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(status, rows[3]);
 }
 
 fn set_input_cursor(
@@ -1460,30 +1528,67 @@ pub(crate) fn session_detail_tokens_line(usage: &TokenUsage) -> String {
     )
 }
 
+/// Sizing parameters for [`centered_popup`]: width/height as fractions of the
+/// terminal size (numerators over denominators), floored at the minimums,
+/// capped at the maximums, and clipped so the popup never touches the screen
+/// edges.
+struct PopupSize {
+    w_num: u32,
+    w_den: u32,
+    h_num: u32,
+    h_den: u32,
+    min_w: u16,
+    min_h: u16,
+    max_w: u16,
+    max_h: u16,
+}
+
+impl PopupSize {
+    /// The large list-popup sizing shared by the model selector and the
+    /// wizard's provider picker: ~60% of the width, ~2/3 of the height.
+    const LIST: PopupSize = PopupSize {
+        w_num: 3,
+        w_den: 5,
+        h_num: 2,
+        h_den: 3,
+        min_w: 24,
+        min_h: 8,
+        max_w: 100,
+        max_h: 40,
+    };
+}
+
+/// Compute a centered popup rect for a modal overlay from a [`PopupSize`].
+/// The `.min(area…)` guards keep the arithmetic panic-free on tiny terminals
+/// (clamp panics if its bounds are inverted).  Shared by the model selector
+/// and the account/credential modals so every overlay uses the same centering
+/// + clamping rules.
+fn centered_popup(area: Rect, size: PopupSize) -> Rect {
+    let width = ((area.width as u32 * size.w_num / size.w_den) as u16)
+        .clamp(size.min_w, size.max_w)
+        .min(area.width.saturating_sub(4))
+        .max(1);
+    let height = ((area.height as u32 * size.h_num / size.h_den) as u16)
+        .clamp(size.min_h, size.max_h)
+        .min(area.height.saturating_sub(2))
+        .max(1);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
 /// Centered popup listing the models available on the attached session's
 /// account.  Drawn last so it covers the Chat page content.  The filter box
 /// reuses `InputBuffer` editing semantics; key handling lives in
 /// `handle_model_selector_event` (connection.rs).
 fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
-    // Target ~60% of the terminal width and ~2/3 of the height, floored at a
-    // sane minimum and capped so the popup never touches the screen edges.
-    // The `.min(area…)` guards keep the arithmetic panic-free on tiny
-    // terminals (clamp panics if its bounds are inverted).
-    let width = ((area.width as u32 * 3 / 5) as u16)
-        .clamp(24, 100)
-        .min(area.width.saturating_sub(4))
-        .max(1);
-    let height = ((area.height as u32 * 2 / 3) as u16)
-        .clamp(8, 40)
-        .min(area.height.saturating_sub(2))
-        .max(1);
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
+    // ~60% of the terminal width and ~2/3 of the height, floored at a sane
+    // minimum and capped so the popup never touches the screen edges.
+    let popup = centered_popup(area, PopupSize::LIST);
     // Erase the region beneath so the popup reads as a solid overlay rather
     // than text drawn on top of the chat history.
     frame.render_widget(Clear, popup);

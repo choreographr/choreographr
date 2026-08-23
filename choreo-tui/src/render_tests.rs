@@ -173,6 +173,137 @@ fn render_model_selector_loading_and_error_states() {
     assert!(content.contains("no credential"), "error row is drawn");
 }
 
+// ── Account wizard + credential modal rendering ─────────────────────────
+
+#[test]
+fn render_wizard_provider_shows_filter_and_providers() {
+    use crate::test_util::test_app;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = test_app();
+    app.page = crate::state::Page::AIProviders;
+    app.ai_providers.wizard.open();
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render wizard provider picker");
+
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(content.contains("Select Provider"), "popup title is drawn");
+    // The picker is alphabetical by display name, so the first provider is
+    // shown.  The canonical slug must NOT appear (it is easily confused with
+    // the account slug entered in step 2).
+    assert!(
+        content.contains(&app.providers[0].display_name),
+        "provider display names are listed"
+    );
+    assert!(
+        !content.contains(&app.providers[0].slug),
+        "the provider slug is deliberately not shown"
+    );
+    assert!(content.contains("type to filter"), "footer hint is drawn");
+
+    // A filter with no matches renders the empty state (not a panic).
+    app.ai_providers.wizard.filter.text = "zzzz-no-such-provider".to_string();
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render empty filter state");
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        content.contains("No providers match the filter."),
+        "empty filter message is drawn"
+    );
+}
+
+#[test]
+fn render_wizard_slug_shows_picked_provider_and_slug_prompt() {
+    use crate::state::AccountWizardStep;
+    use crate::test_util::test_app;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = test_app();
+    app.page = crate::state::Page::AIProviders;
+    app.ai_providers.wizard.open();
+    // Drive to step 2 with a picked provider (mirrors confirm_provider).
+    app.ai_providers.wizard.picked_slug = Some("openai".to_string());
+    app.ai_providers.wizard.picked_name = Some("OpenAI".to_string());
+    app.ai_providers.wizard.step = AccountWizardStep::Slug;
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render wizard slug modal");
+
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(content.contains("Add Account"), "popup title is drawn");
+    assert!(
+        content.contains("OpenAI"),
+        "picked provider is shown for context"
+    );
+    assert!(content.contains("Slug:"), "slug prompt is drawn");
+    assert!(content.contains("create account"), "footer hint is drawn");
+}
+
+#[test]
+fn render_credential_modal_shows_title_and_masked_key() {
+    use crate::test_util::test_app;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = test_app();
+    app.page = crate::state::Page::AIProviders;
+    app.ai_providers.credential.open("my-account".to_string());
+    app.ai_providers.credential.input.text = "sk-abcdefghijklmnop".to_string();
+    app.ai_providers.credential.input.cursor = app.ai_providers.credential.input.text.len();
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render credential modal");
+
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        content.contains("API Key for \"my-account\""),
+        "popup title names the account"
+    );
+    // The key is masked: the full plaintext never reaches the buffer.
+    assert!(
+        !content.contains("sk-abcdefghijklmnop"),
+        "the plaintext API key is never drawn"
+    );
+    assert!(content.contains("save"), "footer hint is drawn");
+}
+
 // ── Session list table ────────────────────────────────────────────────
 
 #[test]

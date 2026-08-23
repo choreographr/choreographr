@@ -656,8 +656,8 @@ In `choreo-tui`:
 - `/account list` — list configured AI provider accounts
 - `/account remove <name>` — remove an AI provider account
 - `/account <name>` — set the session's AI provider account
-- `Ctrl+A` — open the AI provider accounts page (list accounts; `Enter` sets the highlighted account on the active session and returns to chat, `r` removes, `c` sets an API key, `n` starts the new-account wizard)
-- New-account wizard (`n` on the accounts page) — a two-phase flow: pick a provider (`j`/`k` navigate, `PgUp`/`PgDn` page), then enter a slug (the account's unique name, e.g. `/account <slug>`); Enter creates the account and jumps straight to the API-key page
+- `Ctrl+A` — open the AI provider accounts page (list accounts; `Enter` sets the highlighted account on the active session and returns to chat, `r` removes, `c` opens the API-key modal, `n` starts the new-account wizard)
+- New-account wizard (`n` on the accounts page) — centered modal windows: a **searchable provider picker** (type to filter by provider name, `↑`/`↓`/`PgUp`/`PgDn` navigate, `Enter` picks — the list is alphabetical), then a separate **slug modal** (enter the account's unique name, e.g. `/account <slug>`); `Enter` creates the account and jumps straight to the **API-key modal**
 - `/reasoning` — show current reasoning effort slug
 - `/reasoning <slug>` — set reasoning effort (e.g. `off`, `low`, `medium`, `high`, `on`, `xhigh`, `max`; available values depend on the model)
 - `Ctrl+R` — cycle reasoning effort through available slugs for the attached session's model (status message states: model reports no effort levels → "model does not support reasoning"; no model selected → "no model selected — pick one with Ctrl+M"; model selected but capability not yet reported → "reasoning capability not yet available")

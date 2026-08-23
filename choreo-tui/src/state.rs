@@ -49,9 +49,9 @@ pub(crate) const CTRL_HELP_LINE2: &str =
 
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
 
-/// Rows a single PgUp/PgDn press jumps in the new-account provider picker
-/// (phase 1).  The render window always follows the selection, so paging the
-/// selection is what actually scrolls the list.
+/// Rows a single PgUp/PgDn press jumps in the new-account wizard's provider
+/// picker (step 1).  The render window always follows the focus, so paging the
+/// focus is what actually scrolls the list.
 pub(crate) const PROVIDER_PAGE_LINES: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,15 +67,13 @@ pub(crate) enum SessionManagerView {
     Detail,
 }
 
+/// Steps of the new-account wizard modal (AI providers page, `n`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AIProvidersView {
-    List,
-    /// Phase 1 of the new-account wizard: pick a provider from
-    /// `PROVIDER_OPTIONS`.
-    SelectProvider,
-    /// Phase 2 of the new-account wizard: enter a slug (account name).
-    /// Submitting creates the account and redirects to the credential page.
-    SetSlug,
+pub(crate) enum AccountWizardStep {
+    /// Step 1: pick a provider from the searchable list.
+    Provider,
+    /// Step 2: enter the account slug (a separate modal).
+    Slug,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,13 +82,33 @@ pub(crate) struct ProviderInfo {
     pub(crate) display_name: String,
 }
 
+/// Sort a provider list for the new-account wizard's picker (step 1):
+/// alphabetical by display name. The picker shows display names only (the
+/// canonical slug is deliberately hidden — it is easily confused with the
+/// account slug entered in step 2), so display-name order is what the user
+/// perceives. Case-insensitive so mixed-case names ("abliteration.ai",
+/// "Alibaba Coding Plan", "NEAR AI Cloud") sit next to their letter peers
+/// instead of being split by ASCII case. Applied wherever a provider list
+/// enters `App` (the static `PROVIDER_OPTIONS` default and every daemon
+/// `CatalogUpdated`), because the catalog itself is deliberately ordered by
+/// provenance, not alphabetically.
+fn sort_providers(providers: &mut [ProviderInfo]) {
+    providers.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+    });
+}
+
 /// The static default provider picker list for the new-account wizard
 /// (phase 1) — 208 entries.
 ///
 /// Generated from the merged catalog (models.dev base + bundled overlay) by
 /// `cargo run --bin catalog-gen` — regenerate and paste the printed list when
-/// the catalog changes. Order matches the catalog (models.dev snapshot order
-/// for covered providers, then overlay-only providers).
+/// the catalog changes. Entry order simply mirrors the catalog's provenance
+/// order (models.dev snapshot order, then overlay-only providers) — it is not
+/// what the user sees: `App` sorts the list alphabetically when it builds the
+/// picker (`sort_providers`).
 ///
 /// This is the DEFAULT/fallback: `App.providers` starts from it and is
 /// replaced wholesale whenever the daemon broadcasts `CatalogUpdated` (S4),
@@ -315,37 +333,25 @@ pub(crate) const PROVIDER_OPTIONS: &[(&str, &str)] = &[
 
 pub(crate) struct AIProvidersState {
     pub(crate) accounts: Vec<AccountInfo>,
-    pub(crate) view: AIProvidersView,
     pub(crate) selection: Option<usize>,
     pub(crate) scroll: usize,
     pub(crate) confirm_remove: Option<String>,
-    // ── New-account wizard state ───────────────────────────────
-    // Phase 1 (provider picker): index into PROVIDER_OPTIONS.  The list is
-    // browsed by moving the selection (j/k one row, PgUp/PgDn one page);
-    // the render window always follows the selection, so no separate scroll
-    // offset is needed.
-    pub(crate) provider_selection: usize,
-    // Phase 2 (slug entry): the account name, which doubles as the
-    // account's slug used in commands like `/account <name>`.
-    pub(crate) slug_state: TextState<'static>,
-    pub(crate) credential_target: Option<String>,
-    pub(crate) credential_input: InputBuffer,
-    pub(crate) add_error: Option<String>,
+    /// The new-account wizard modal (`n`): searchable provider picker, then
+    /// slug entry.
+    pub(crate) wizard: AccountWizardState,
+    /// The API-key modal (`c`, or auto-opened right after account creation).
+    pub(crate) credential: CredentialModalState,
 }
 
 impl AIProvidersState {
     pub(crate) fn new() -> Self {
         Self {
             accounts: Vec::new(),
-            view: AIProvidersView::List,
             selection: None,
             scroll: 0,
             confirm_remove: None,
-            provider_selection: 0,
-            slug_state: TextState::default(),
-            credential_target: None,
-            credential_input: InputBuffer::new(),
-            add_error: None,
+            wizard: AccountWizardState::new(),
+            credential: CredentialModalState::new(),
         }
     }
 
@@ -416,123 +422,244 @@ impl AIProvidersState {
             self.confirm_remove = None;
         }
     }
+}
 
-    /// Enter phase 1 of the new-account wizard: provider selection.
-    /// Resets all wizard state so a fresh flow always starts at the top.
-    pub(crate) fn enter_new_account(&mut self) {
-        self.view = AIProvidersView::SelectProvider;
-        self.provider_selection = 0;
-        self.slug_state = TextState::default();
-        self.add_error = None;
-    }
+/// The new-account wizard modal (AI providers page, `n`).  Mirrors the model
+/// selector's modal pattern: step 1 is a centered, searchable provider picker
+/// (case-insensitive substring over display names — the canonical slug is
+/// deliberately NOT shown, since it is easily confused with the account slug
+/// entered in step 2); step 2 is a separate slug-entry modal.
+pub(crate) struct AccountWizardState {
+    pub(crate) open: bool,
+    pub(crate) step: AccountWizardStep,
+    /// Filter text for the provider picker (step 1).
+    pub(crate) filter: InputBuffer,
+    /// Index into the *filtered* provider list of the highlighted row.
+    pub(crate) focused: usize,
+    /// First row of the visible window into the filtered list.
+    pub(crate) scroll: usize,
+    /// Provider chosen in step 1 (slug + display-name snapshot).  A catalog
+    /// refresh arriving mid-wizard cannot shift the pick, because it is an
+    /// owned snapshot rather than an index into the live list.
+    pub(crate) picked_slug: Option<String>,
+    pub(crate) picked_name: Option<String>,
+    /// Slug (account name) entry field (step 2).
+    pub(crate) slug: TextState<'static>,
+    /// Wizard-scoped error text (e.g. slug validation failures).
+    pub(crate) error: Option<String>,
+}
 
-    pub(crate) fn provider_up(&mut self) {
-        self.provider_selection = self.provider_selection.saturating_sub(1);
-    }
-
-    pub(crate) fn provider_down(&mut self, providers: &[ProviderInfo]) {
-        let max = providers.len().saturating_sub(1);
-        if self.provider_selection < max {
-            self.provider_selection += 1;
+impl AccountWizardState {
+    pub(crate) fn new() -> Self {
+        Self {
+            open: false,
+            step: AccountWizardStep::Provider,
+            filter: InputBuffer::new(),
+            focused: 0,
+            scroll: 0,
+            picked_slug: None,
+            picked_name: None,
+            slug: TextState::default(),
+            error: None,
         }
     }
 
-    /// Move the selection up by a page (PgUp).  The render window always
-    /// follows the selection, so paging the selection is what actually
-    /// scrolls the list.
-    pub(crate) fn provider_page_up(&mut self) {
-        self.provider_selection = self.provider_selection.saturating_sub(PROVIDER_PAGE_LINES);
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
     }
 
-    /// Move the selection down by a page (PgDn), clamped to the last
-    /// provider.
-    pub(crate) fn provider_page_down(&mut self, providers: &[ProviderInfo]) {
-        let max = providers.len().saturating_sub(1);
-        self.provider_selection = (self.provider_selection + PROVIDER_PAGE_LINES).min(max);
+    /// Open the wizard fresh: step 1 (provider picker), filter/focus/scroll
+    /// and the slug field reset, nothing picked yet.
+    pub(crate) fn open(&mut self) {
+        self.open = true;
+        self.step = AccountWizardStep::Provider;
+        self.filter = InputBuffer::new();
+        self.focused = 0;
+        self.scroll = 0;
+        self.picked_slug = None;
+        self.picked_name = None;
+        self.slug = TextState::default();
+        self.error = None;
     }
 
-    /// Compute the `(start, count)` slice of the provider list to render
-    /// for a window of `height` provider rows, keeping the highlighted row
-    /// visible.  Pure (`&self`): the renderer must not mutate focus state
-    /// during `draw()`, so repeated calls with the same inputs return
-    /// identical results.  The selection is the only scroll input — the
-    /// window anchors the highlighted row at the bottom once it passes the
-    /// fold, and at the top otherwise.
-    pub(crate) fn provider_window(
-        &self,
-        providers: &[ProviderInfo],
-        height: usize,
-    ) -> (usize, usize) {
-        let len = providers.len();
+    /// Dismiss the wizard entirely (Esc on the provider step), discarding any
+    /// partial state.
+    pub(crate) fn close(&mut self) {
+        self.open = false;
+        self.step = AccountWizardStep::Provider;
+        self.filter = InputBuffer::new();
+        self.focused = 0;
+        self.scroll = 0;
+        self.picked_slug = None;
+        self.picked_name = None;
+        self.slug = TextState::default();
+        self.error = None;
+    }
+
+    /// Providers matching the current filter (case-insensitive substring over
+    /// display names).  Borrows from `providers` (the live list on `App`); an
+    /// empty query returns every provider.
+    pub(crate) fn filtered<'a>(&self, providers: &'a [ProviderInfo]) -> Vec<&'a ProviderInfo> {
+        let needle = self.filter.text.to_lowercase();
+        if needle.is_empty() {
+            return providers.iter().collect();
+        }
+        providers
+            .iter()
+            .filter(|p| p.display_name.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// Clamp `focused` and `scroll` against the filtered provider list length.
+    /// Called after every filter mutation so the highlight never points past
+    /// the end of a narrowed list.
+    pub(crate) fn clamp_focus(&mut self, providers: &[ProviderInfo]) {
+        let len = self.filtered(providers).len();
+        if len == 0 {
+            self.focused = 0;
+            self.scroll = 0;
+            return;
+        }
+        if self.focused >= len {
+            self.focused = len - 1;
+        }
+        self.scroll = self.scroll.min(len - 1);
+    }
+
+    pub(crate) fn move_up(&mut self, providers: &[ProviderInfo]) {
+        if self.focused > 0 {
+            self.focused -= 1;
+        }
+        self.clamp_focus(providers);
+    }
+
+    pub(crate) fn move_down(&mut self, providers: &[ProviderInfo]) {
+        let len = self.filtered(providers).len();
+        if len > 0 && self.focused + 1 < len {
+            self.focused += 1;
+        }
+        self.clamp_focus(providers);
+    }
+
+    /// Page the highlight up/down by `PROVIDER_PAGE_LINES` rows (PgUp/PgDn);
+    /// the render window follows the focus.
+    pub(crate) fn page_up(&mut self, providers: &[ProviderInfo]) {
+        self.focused = self.focused.saturating_sub(PROVIDER_PAGE_LINES);
+        self.clamp_focus(providers);
+    }
+
+    pub(crate) fn page_down(&mut self, providers: &[ProviderInfo]) {
+        let len = self.filtered(providers).len();
+        if len == 0 {
+            return;
+        }
+        self.focused = (self.focused + PROVIDER_PAGE_LINES).min(len - 1);
+        self.clamp_focus(providers);
+    }
+
+    /// Route a key to the filter input and re-clamp focus against the
+    /// narrowed/expanded filtered list.  Returns whether the key was consumed
+    /// (Enter/Esc are handled by the modal event handler instead).
+    pub(crate) fn filter_key(&mut self, key: KeyEvent, providers: &[ProviderInfo]) -> bool {
+        let consumed = self.filter.handle_key(key);
+        if consumed {
+            self.clamp_focus(providers);
+        }
+        consumed
+    }
+
+    /// Compute the `(start, count)` slice of the filtered provider list to
+    /// render for a window of `height` rows, keeping the focused row visible.
+    /// Pure (`&self`): render must never mutate focus state during `draw()`, so
+    /// repeated calls with the same inputs return identical results.
+    pub(crate) fn window(&self, providers: &[ProviderInfo], height: usize) -> (usize, usize) {
+        let len = self.filtered(providers).len();
         if len == 0 || height == 0 {
             return (0, 0);
         }
-        let focused = self.provider_selection.min(len - 1);
-        let start = focused.saturating_add(1).saturating_sub(height);
-        (start, height.min(len - start))
+        let focused = self.focused.min(len - 1);
+        let max_scroll = len.saturating_sub(height);
+        let mut scroll = self.scroll.min(max_scroll);
+        if focused < scroll {
+            // Focus drifted above the window (e.g. after a filter that
+            // shrunk the list) — pull the window up.
+            scroll = focused;
+        } else if focused >= scroll + height {
+            // Focus is below the fold — push the window down.
+            scroll = focused + 1 - height;
+        }
+        (scroll, height.min(len - scroll))
     }
 
-    /// Confirm the highlighted provider and move to phase 2 (slug entry).
-    /// The chosen slug lives in `slug_state`, which starts focused.
-    pub(crate) fn confirm_provider(&mut self) {
-        self.view = AIProvidersView::SetSlug;
-        self.slug_state = TextState::default();
-        self.add_error = None;
-        self.slug_state.focus();
-    }
-
-    /// The currently selected provider's canonical slug, or None when no
-    /// provider has been picked yet (should not happen while in the wizard).
-    pub(crate) fn selected_provider_slug<'a>(
+    /// The highlighted provider, if the filtered list is non-empty.
+    pub(crate) fn highlighted<'a>(
         &self,
         providers: &'a [ProviderInfo],
-    ) -> Option<&'a str> {
-        providers
-            .get(self.provider_selection)
-            .map(|p| p.slug.as_str())
+    ) -> Option<&'a ProviderInfo> {
+        self.filtered(providers).get(self.focused).copied()
     }
 
-    pub(crate) fn enter_credential(&mut self, account_name: String) {
-        self.credential_target = Some(account_name);
-        self.credential_input = InputBuffer::new();
-        self.add_error = None;
+    /// Pick the highlighted provider and advance to step 2 (slug entry).
+    /// Snapshot the slug + display name so later steps don't depend on the
+    /// live list.
+    pub(crate) fn confirm_provider(&mut self, providers: &[ProviderInfo]) {
+        let Some(picked) = self.highlighted(providers) else {
+            return;
+        };
+        self.picked_slug = Some(picked.slug.clone());
+        self.picked_name = Some(picked.display_name.clone());
+        self.step = AccountWizardStep::Slug;
+        self.slug = TextState::default();
+        self.error = None;
+        self.slug.focus();
     }
 
-    pub(crate) fn leave_credential(&mut self) {
-        self.credential_target = None;
-        self.credential_input = InputBuffer::new();
-        self.add_error = None;
+    /// Back out of step 2 (slug entry) to step 1 (provider picker), keeping
+    /// the previously picked provider highlighted (re-clamped in case a
+    /// catalog refresh changed the list while the slug modal was up).
+    pub(crate) fn back_to_provider(&mut self, providers: &[ProviderInfo]) {
+        self.step = AccountWizardStep::Provider;
+        self.slug = TextState::default();
+        self.error = None;
+        self.clamp_focus(providers);
+    }
+}
+
+/// The API-key modal (AI providers page).  Open ⇔ `target` is `Some(account
+/// name)`.  Reached from `c` on an existing account or auto-opened right after
+/// the new-account wizard creates one.  The key is masked while typing and
+/// encrypted with the daemon's identity key on save (see
+/// `build_add_credential_message`).
+pub(crate) struct CredentialModalState {
+    /// The account the key is for; `Some` means the modal is open.
+    pub(crate) target: Option<String>,
+    pub(crate) input: InputBuffer,
+    pub(crate) error: Option<String>,
+}
+
+impl CredentialModalState {
+    pub(crate) fn new() -> Self {
+        Self {
+            target: None,
+            input: InputBuffer::new(),
+            error: None,
+        }
     }
 
-    /// Abort the wizard and return to the account list, discarding any
-    /// partial input.
-    pub(crate) fn leave_new_account(&mut self) {
-        self.reset_wizard_to_list();
+    pub(crate) fn is_open(&self) -> bool {
+        self.target.is_some()
     }
 
-    /// Back out of phase 2 (slug entry) to phase 1 (provider selection),
-    /// keeping the previously picked provider highlighted.
-    pub(crate) fn back_to_provider(&mut self) {
-        self.view = AIProvidersView::SelectProvider;
-        self.slug_state = TextState::default();
-        self.add_error = None;
+    pub(crate) fn open(&mut self, account_name: String) {
+        self.target = Some(account_name);
+        self.input = InputBuffer::new();
+        self.error = None;
     }
 
-    /// Reset wizard state after the account was submitted; the credential
-    /// page (driven by `credential_target`) takes over from here.
-    pub(crate) fn finish_new_account(&mut self) {
-        self.reset_wizard_to_list();
-    }
-
-    /// Reset all wizard state back to the account list.  Shared by the
-    /// abort path (`leave_new_account`) and the post-submit path
-    /// (`finish_new_account`), which differ only in what the caller does
-    /// next (nothing vs. jumping to the credential page).
-    fn reset_wizard_to_list(&mut self) {
-        self.view = AIProvidersView::List;
-        self.provider_selection = 0;
-        self.slug_state = TextState::default();
-        self.add_error = None;
+    pub(crate) fn close(&mut self) {
+        self.target = None;
+        self.input = InputBuffer::new();
+        self.error = None;
     }
 }
 
@@ -2116,14 +2243,20 @@ impl App {
             ai_providers: AIProvidersState::new(),
             model_selector: ModelSelectorState::new(),
             // Start from the static default; the daemon's CatalogUpdated
-            // broadcast replaces it with the live list.
-            providers: PROVIDER_OPTIONS
-                .iter()
-                .map(|(slug, display_name)| ProviderInfo {
-                    slug: (*slug).to_string(),
-                    display_name: (*display_name).to_string(),
-                })
-                .collect(),
+            // broadcast replaces it with the live list.  The picker must be
+            // alphabetical, so sort the default here too (see `sort_providers`
+            // and `set_providers`).
+            providers: {
+                let mut providers: Vec<ProviderInfo> = PROVIDER_OPTIONS
+                    .iter()
+                    .map(|(slug, display_name)| ProviderInfo {
+                        slug: (*slug).to_string(),
+                        display_name: (*display_name).to_string(),
+                    })
+                    .collect();
+                sort_providers(&mut providers);
+                providers
+            },
             scroll_accumulator: 0,
             scrollbar_dragging: false,
             text_selection: None,
@@ -2151,13 +2284,20 @@ impl App {
     /// selection pointing past the end of the list. Returns whether the list
     /// actually changed (identical payloads — e.g. the send-on-subscribe
     /// welcome — do not churn the status line).
-    pub(crate) fn set_providers(&mut self, providers: Vec<ProviderInfo>) -> bool {
+    pub(crate) fn set_providers(&mut self, mut providers: Vec<ProviderInfo>) -> bool {
+        // The wizard's picker is a flat alphabetical list; the daemon sends
+        // the catalog in provenance order (see `sort_providers`), so re-sort
+        // every incoming list before comparing/storing. Sorting first also
+        // means a provider reorder alone never registers as a "change".
+        sort_providers(&mut providers);
         if self.providers == providers {
             return false;
         }
         self.providers = providers;
-        let max = self.providers.len().saturating_sub(1);
-        self.ai_providers.provider_selection = self.ai_providers.provider_selection.min(max);
+        // Clamp the wizard's picker highlight when the list changed, so a
+        // catalog refresh that drops providers can never leave the highlight
+        // (or the scroll offset) pointing past the end of the narrowed list.
+        self.ai_providers.wizard.clamp_focus(&self.providers);
         true
     }
     pub(crate) fn active_display(&mut self) -> Option<&mut SessionDisplayState> {

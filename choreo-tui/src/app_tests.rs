@@ -646,11 +646,11 @@ fn paste_event_inserts_into_credential_input() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.page = Page::AIProviders;
-    app.ai_providers.credential_target = Some("my-account".to_string());
+    app.ai_providers.credential.open("my-account".to_string());
     handle_terminal_event(Event::Paste("sk-abc123".to_string()), &mut app, &tx)
         .expect("handle paste into credential input");
-    assert_eq!(app.ai_providers.credential_input.text, "sk-abc123");
-    assert_eq!(app.ai_providers.credential_input.cursor, 9);
+    assert_eq!(app.ai_providers.credential.input.text, "sk-abc123");
+    assert_eq!(app.ai_providers.credential.input.cursor, 9);
 }
 
 #[test]
@@ -659,26 +659,39 @@ fn paste_event_inserts_into_new_account_slug_field() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.page = Page::AIProviders;
-    app.ai_providers.view = AIProvidersView::SetSlug;
-    app.ai_providers.slug_state.focus();
+    app.ai_providers.wizard.open();
+    app.ai_providers.wizard.step = AccountWizardStep::Slug;
+    app.ai_providers.wizard.slug.focus();
     handle_terminal_event(Event::Paste("my-account".to_string()), &mut app, &tx)
         .expect("handle paste into slug field");
-    assert_eq!(app.ai_providers.slug_state.value(), "my-account");
-    assert_eq!(app.ai_providers.slug_state.position(), 10);
+    assert_eq!(app.ai_providers.wizard.slug.value(), "my-account");
+    assert_eq!(app.ai_providers.wizard.slug.position(), 10);
 }
 
 #[test]
-fn paste_event_ignored_on_provider_selection_page() {
+fn paste_event_goes_into_provider_filter() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
-    // Phase 1 (provider picker) has no text field — paste is a no-op.
+    // Step 1 (provider picker) has a search filter — a paste lands there and
+    // re-clamps the highlight against the narrowed list.
     app.page = Page::AIProviders;
-    app.ai_providers.view = AIProvidersView::SelectProvider;
-    handle_terminal_event(Event::Paste("sk-secret".to_string()), &mut app, &tx)
-        .expect("handle paste on provider selection page");
-    assert_eq!(app.ai_providers.slug_state.value(), "");
-    assert!(app.ai_providers.credential_input.text.is_empty());
+    app.ai_providers.wizard.open();
+    app.ai_providers.wizard.focused = app.providers.len() - 1;
+    handle_terminal_event(Event::Paste("friendli".to_string()), &mut app, &tx)
+        .expect("handle paste on provider filter");
+    assert_eq!(app.ai_providers.wizard.filter.text, "friendli");
+    assert_eq!(
+        app.ai_providers.wizard.filtered(&app.providers).len(),
+        1,
+        "paste narrows the list to the matching provider"
+    );
+    assert_eq!(
+        app.ai_providers.wizard.focused, 0,
+        "highlight re-clamped to the sole match"
+    );
+    assert_eq!(app.ai_providers.wizard.slug.value(), "");
+    assert!(app.ai_providers.credential.input.text.is_empty());
 }
 
 #[test]
@@ -2957,15 +2970,15 @@ fn mouse_click_in_input_box_wrapped_line() {
     assert_eq!(app.input.cursor, 77 + 8);
 }
 
-// ── AI Providers new-account wizard (2-phase) ─────────────
+// ── AI Providers new-account wizard (modal) ────────────────
 
 fn setup_providers_new_account(app: &mut App) {
     app.page = Page::AIProviders;
-    app.ai_providers.enter_new_account();
+    app.ai_providers.wizard.open();
 }
 
-/// Drive the wizard to phase 2 (slug entry) with the given provider
-/// highlighted, returning nothing.  `provider` is matched by slug.
+/// Drive the wizard to step 2 (slug entry) with the given provider picked,
+/// returning nothing.  `provider` is matched by slug.
 fn advance_to_slug_phase(
     app: &mut App,
     tx: &std::sync::mpsc::Sender<ClientMessage>,
@@ -2977,7 +2990,7 @@ fn advance_to_slug_phase(
         .iter()
         .position(|p| p.slug == provider)
         .expect("provider in options");
-    app.ai_providers.provider_selection = idx;
+    app.ai_providers.wizard.focused = idx;
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         app,
@@ -2990,10 +3003,12 @@ fn advance_to_slug_phase(
 fn ai_providers_new_account_starts_at_provider_selection() {
     let mut app = test_app();
     setup_providers_new_account(&mut app);
-    assert_eq!(app.ai_providers.view, AIProvidersView::SelectProvider);
-    assert_eq!(app.ai_providers.provider_selection, 0);
-    assert!(!app.ai_providers.slug_state.is_focused());
-    assert!(app.ai_providers.add_error.is_none());
+    assert!(app.ai_providers.wizard.is_open());
+    assert_eq!(app.ai_providers.wizard.step, AccountWizardStep::Provider);
+    assert_eq!(app.ai_providers.wizard.focused, 0);
+    assert!(app.ai_providers.wizard.filter.text.is_empty());
+    assert!(!app.ai_providers.wizard.slug.is_focused());
+    assert!(app.ai_providers.wizard.error.is_none());
 }
 
 #[test]
@@ -3009,9 +3024,14 @@ fn ai_providers_new_account_enter_advances_to_slug() {
     )
     .expect("enter selects first provider");
 
-    assert_eq!(app.ai_providers.view, AIProvidersView::SetSlug);
-    assert!(app.ai_providers.slug_state.is_focused());
-    assert!(app.ai_providers.add_error.is_none());
+    assert_eq!(app.ai_providers.wizard.step, AccountWizardStep::Slug);
+    assert!(app.ai_providers.wizard.slug.is_focused());
+    assert!(app.ai_providers.wizard.error.is_none());
+    assert_eq!(
+        app.ai_providers.wizard.picked_name.as_deref(),
+        Some(app.providers[0].display_name.as_str()),
+        "the first (alphabetical) provider is picked"
+    );
 }
 
 #[test]
@@ -3027,24 +3047,25 @@ fn ai_providers_new_account_jk_navigates_provider_list() {
         &tx,
     )
     .expect("j down");
-    assert_eq!(app.ai_providers.provider_selection, 1);
+    assert_eq!(app.ai_providers.wizard.focused, 1);
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
     .expect("j down again");
-    assert_eq!(app.ai_providers.provider_selection, 2);
+    assert_eq!(app.ai_providers.wizard.focused, 2);
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
     .expect("k up");
-    assert_eq!(app.ai_providers.provider_selection, 1);
+    assert_eq!(app.ai_providers.wizard.focused, 1);
 
     // j/k must not leak into any text buffer.
-    assert_eq!(app.ai_providers.slug_state.value(), "");
+    assert!(app.ai_providers.wizard.filter.text.is_empty());
+    assert_eq!(app.ai_providers.wizard.slug.value(), "");
 }
 
 #[test]
@@ -3060,17 +3081,17 @@ fn ai_providers_new_account_provider_selection_clamps_at_edges() {
         &tx,
     )
     .expect("up at top");
-    assert_eq!(app.ai_providers.provider_selection, 0);
+    assert_eq!(app.ai_providers.wizard.focused, 0);
 
     // Jump to the last provider and try to go past it.
-    app.ai_providers.provider_selection = app.providers.len() - 1;
+    app.ai_providers.wizard.focused = app.providers.len() - 1;
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
     .expect("down at bottom");
-    assert_eq!(app.ai_providers.provider_selection, app.providers.len() - 1);
+    assert_eq!(app.ai_providers.wizard.focused, app.providers.len() - 1);
 }
 
 #[test]
@@ -3079,14 +3100,14 @@ fn ai_providers_new_account_provider_page_keys_move_selection_by_page() {
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_account(&mut app);
 
-    // PgDn moves the selection by a page…
+    // PgDn moves the highlight by a page…
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
     .expect("page down");
-    assert_eq!(app.ai_providers.provider_selection, PROVIDER_PAGE_LINES);
+    assert_eq!(app.ai_providers.wizard.focused, PROVIDER_PAGE_LINES);
 
     // …and PgUp moves it back.
     handle_terminal_event(
@@ -3095,7 +3116,7 @@ fn ai_providers_new_account_provider_page_keys_move_selection_by_page() {
         &tx,
     )
     .expect("page up");
-    assert_eq!(app.ai_providers.provider_selection, 0);
+    assert_eq!(app.ai_providers.wizard.focused, 0);
 
     // PgUp at the top clamps to 0.
     handle_terminal_event(
@@ -3104,20 +3125,21 @@ fn ai_providers_new_account_provider_page_keys_move_selection_by_page() {
         &tx,
     )
     .expect("page up at top");
-    assert_eq!(app.ai_providers.provider_selection, 0);
+    assert_eq!(app.ai_providers.wizard.focused, 0);
 
     // PgDn past the last provider clamps to it.
-    app.ai_providers.provider_selection = app.providers.len() - 1;
+    app.ai_providers.wizard.focused = app.providers.len() - 1;
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
     .expect("page down at bottom");
-    assert_eq!(app.ai_providers.provider_selection, app.providers.len() - 1);
+    assert_eq!(app.ai_providers.wizard.focused, app.providers.len() - 1);
 
-    // Paging must not leak into the slug buffer.
-    assert_eq!(app.ai_providers.slug_state.value(), "");
+    // Paging must not leak into the filter or slug buffers.
+    assert!(app.ai_providers.wizard.filter.text.is_empty());
+    assert_eq!(app.ai_providers.wizard.slug.value(), "");
 }
 
 #[test]
@@ -3125,24 +3147,24 @@ fn ai_providers_new_account_provider_window_keeps_selection_visible() {
     let mut app = test_app();
     setup_providers_new_account(&mut app);
 
-    // The render window (pure) always contains the selection, anchoring it
-    // at the bottom row once it passes the fold.
-    let window = |app: &App| app.ai_providers.provider_window(&app.providers, 10);
-    app.ai_providers.provider_selection = 50;
+    // The render window (pure) always contains the focus, anchoring it at the
+    // bottom row once it passes the fold.
+    let window = |app: &App| app.ai_providers.wizard.window(&app.providers, 10);
+    app.ai_providers.wizard.focused = 50;
     let (start, count) = window(&app);
     assert!(
         (start..start + count).contains(&50),
-        "window {start}..{} must contain selection 50",
+        "window {start}..{} must contain focus 50",
         start + count
     );
 
-    // A selection near the top anchors the window at row 0.
-    app.ai_providers.provider_selection = 1;
+    // A focus near the top anchors the window at row 0.
+    app.ai_providers.wizard.focused = 1;
     let (start, _count) = window(&app);
     assert_eq!(start, 0, "window should start at the top for row 1");
 
     // The window never exceeds the list bounds at the bottom edge.
-    app.ai_providers.provider_selection = app.providers.len() - 1;
+    app.ai_providers.wizard.focused = app.providers.len() - 1;
     let (start, count) = window(&app);
     assert_eq!(
         start + count,
@@ -3152,12 +3174,88 @@ fn ai_providers_new_account_provider_window_keeps_selection_visible() {
 }
 
 #[test]
+fn ai_providers_new_account_filter_narrows_provider_list() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_account(&mut app);
+
+    // Typing filters by case-insensitive substring over display names.
+    for c in "open".chars() {
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("filter char");
+    }
+    let filtered = app.ai_providers.wizard.filtered(&app.providers);
+    assert!(
+        !filtered.is_empty(),
+        "'open' must match at least one provider"
+    );
+    assert!(
+        filtered
+            .iter()
+            .all(|p| p.display_name.to_lowercase().contains("open")),
+        "every match contains 'open' in its display name"
+    );
+
+    // Enter now picks the *highlighted filtered* provider, and the picked
+    // slug is the one at the (clamped) focus position.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter picks filtered provider");
+    assert_eq!(app.ai_providers.wizard.step, AccountWizardStep::Slug);
+    let filtered = app.ai_providers.wizard.filtered(&app.providers);
+    let picked = filtered.get(app.ai_providers.wizard.focused);
+    assert_eq!(
+        app.ai_providers.wizard.picked_slug.as_deref(),
+        picked.map(|p| p.slug.as_str()),
+        "the picked provider matches the highlighted filtered row"
+    );
+}
+
+#[test]
+fn ai_providers_new_account_filter_no_match_blocks_enter() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_account(&mut app);
+
+    // A filter with no matches empties the list; Enter must be a no-op (stay
+    // on the provider step) rather than picking nothing.
+    for c in "zzzz-no-such-provider".chars() {
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("filter char");
+    }
+    assert!(app.ai_providers.wizard.filtered(&app.providers).is_empty());
+    assert_eq!(app.ai_providers.wizard.focused, 0);
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter on empty filtered list");
+
+    assert_eq!(app.ai_providers.wizard.step, AccountWizardStep::Provider);
+    assert!(app.ai_providers.wizard.is_open());
+    assert!(app.ai_providers.wizard.picked_slug.is_none());
+}
+
+#[test]
 fn ai_providers_new_account_slug_validation_empty() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     advance_to_slug_phase(&mut app, &tx, "openai");
 
-    // Enter on an empty slug should show an error and stay on the page.
+    // Enter on an empty slug should show an error and stay on the step.
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         &mut app,
@@ -3165,13 +3263,13 @@ fn ai_providers_new_account_slug_validation_empty() {
     )
     .expect("enter empty slug");
 
-    assert_eq!(app.ai_providers.view, AIProvidersView::SetSlug);
+    assert_eq!(app.ai_providers.wizard.step, AccountWizardStep::Slug);
     assert!(
-        app.ai_providers.slug_state.is_focused(),
+        app.ai_providers.wizard.slug.is_focused(),
         "should stay on slug field when slug is empty"
     );
     assert_eq!(
-        app.ai_providers.add_error.as_deref(),
+        app.ai_providers.wizard.error.as_deref(),
         Some("Account slug is required"),
     );
 }
@@ -3196,13 +3294,13 @@ fn ai_providers_new_account_slug_validation_invalid() {
     )
     .expect("enter invalid slug");
 
-    assert_eq!(app.ai_providers.view, AIProvidersView::SetSlug);
+    assert_eq!(app.ai_providers.wizard.step, AccountWizardStep::Slug);
     assert!(
-        app.ai_providers.slug_state.is_focused(),
+        app.ai_providers.wizard.slug.is_focused(),
         "should stay on slug field when slug is invalid"
     );
     assert_eq!(
-        app.ai_providers.add_error.as_deref(),
+        app.ai_providers.wizard.error.as_deref(),
         Some("slug must be lowercase alphanumeric, hyphens, or underscores"),
     );
 }
@@ -3213,7 +3311,8 @@ fn ai_providers_new_account_esc_aborts_wizard() {
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_account(&mut app);
 
-    assert_eq!(app.ai_providers.view, AIProvidersView::SelectProvider);
+    assert!(app.ai_providers.wizard.is_open());
+    assert_eq!(app.ai_providers.wizard.step, AccountWizardStep::Provider);
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -3222,8 +3321,8 @@ fn ai_providers_new_account_esc_aborts_wizard() {
     )
     .expect("esc cancels wizard");
 
-    assert_eq!(app.ai_providers.view, AIProvidersView::List);
-    assert_eq!(app.ai_providers.provider_selection, 0);
+    assert!(!app.ai_providers.wizard.is_open());
+    assert_eq!(app.ai_providers.wizard.focused, 0);
 }
 
 #[test]
@@ -3237,7 +3336,7 @@ fn ai_providers_new_account_esc_backs_to_provider_from_slug() {
         .iter()
         .position(|p| p.slug == "anthropic")
         .expect("anthropic in options");
-    assert_eq!(app.ai_providers.provider_selection, anthro_idx);
+    assert_eq!(app.ai_providers.wizard.focused, anthro_idx);
 
     // Type a partial slug, then Esc should return to the provider picker
     // while keeping the previously chosen provider highlighted.
@@ -3254,9 +3353,9 @@ fn ai_providers_new_account_esc_backs_to_provider_from_slug() {
     )
     .expect("esc back to provider");
 
-    assert_eq!(app.ai_providers.view, AIProvidersView::SelectProvider);
-    assert_eq!(app.ai_providers.provider_selection, anthro_idx);
-    assert_eq!(app.ai_providers.slug_state.value(), "");
+    assert_eq!(app.ai_providers.wizard.step, AccountWizardStep::Provider);
+    assert_eq!(app.ai_providers.wizard.focused, anthro_idx);
+    assert_eq!(app.ai_providers.wizard.slug.value(), "");
 }
 
 #[test]
@@ -3299,15 +3398,15 @@ fn ai_providers_new_account_submit_creates_account_and_redirects_to_credential()
         }
     );
 
-    // The wizard resets to the list view and the flow lands on the
-    // add-credential page for the freshly created account.
-    assert_eq!(app.ai_providers.view, AIProvidersView::List);
+    // The wizard closes and the flow lands on the credential modal for the
+    // freshly created account.
+    assert!(!app.ai_providers.wizard.is_open());
     assert_eq!(
-        app.ai_providers.credential_target.as_deref(),
+        app.ai_providers.credential.target.as_deref(),
         Some("my-account")
     );
-    assert_eq!(app.ai_providers.provider_selection, 0);
-    assert_eq!(app.ai_providers.slug_state.value(), "");
+    assert_eq!(app.ai_providers.wizard.focused, 0);
+    assert_eq!(app.ai_providers.wizard.slug.value(), "");
 
     // A key now goes to the credential input, not the slug field.
     handle_terminal_event(
@@ -3316,8 +3415,8 @@ fn ai_providers_new_account_submit_creates_account_and_redirects_to_credential()
         &tx,
     )
     .expect("char s on credential");
-    assert_eq!(app.ai_providers.credential_input.text, "s");
-    assert_eq!(app.ai_providers.slug_state.value(), "");
+    assert_eq!(app.ai_providers.credential.input.text, "s");
+    assert_eq!(app.ai_providers.wizard.slug.value(), "");
 }
 
 #[test]
@@ -3333,8 +3432,8 @@ fn ai_providers_new_account_typing_goes_to_slug_field() {
         &tx,
     )
     .expect("char x on slug");
-    assert_eq!(app.ai_providers.slug_state.value(), "x");
-    assert!(app.ai_providers.credential_input.text.is_empty());
+    assert_eq!(app.ai_providers.wizard.slug.value(), "x");
+    assert!(app.ai_providers.credential.input.text.is_empty());
 }
 
 #[test]
@@ -3344,7 +3443,7 @@ fn ai_providers_new_account_escaped_slug_input_not_leaked_to_credential() {
     advance_to_slug_phase(&mut app, &tx, "openai");
 
     // 'k' on the slug page types into the slug field (it is not a nav key
-    // in phase 2).
+    // in step 2).
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
         &mut app,
@@ -3352,9 +3451,9 @@ fn ai_providers_new_account_escaped_slug_input_not_leaked_to_credential() {
     )
     .expect("k on slug");
     assert_eq!(
-        app.ai_providers.slug_state.value(),
+        app.ai_providers.wizard.slug.value(),
         "k",
-        "k should type into slug field in phase 2"
+        "k should type into slug field in step 2"
     );
 }
 
@@ -6854,10 +6953,10 @@ mod unsent_draft_tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         // The default list starts from PROVIDER_OPTIONS (208 entries); park
-        // the wizard selection deep in the list.
+        // the wizard highlight deep in the list.
         let default_len = app.providers.len();
         assert!(default_len > 10, "default provider list is large");
-        app.ai_providers.provider_selection = default_len - 1;
+        app.ai_providers.wizard.focused = default_len - 1;
 
         // A catalog update with a small list replaces it and clamps.
         handle_daemon_message(
@@ -6879,10 +6978,13 @@ mod unsent_draft_tests {
         .expect("handle CatalogUpdated");
 
         assert_eq!(app.providers.len(), 2);
-        assert_eq!(app.providers[0].slug, "openai");
-        assert_eq!(app.providers[0].display_name, "OpenAI");
-        // Selection was beyond the new list's end → clamped to the last row.
-        assert_eq!(app.ai_providers.provider_selection, 1);
+        // The picker is always alphabetical, so the daemon's provenance order
+        // is re-sorted: Anthropic leads.
+        assert_eq!(app.providers[0].slug, "anthropic");
+        assert_eq!(app.providers[0].display_name, "Anthropic");
+        assert_eq!(app.providers[1].slug, "openai");
+        // Highlight was beyond the new list's end → clamped to the last row.
+        assert_eq!(app.ai_providers.wizard.focused, 1);
         assert_eq!(app.status.as_deref(), Some("catalog updated (2 providers)"));
     }
 
@@ -6929,7 +7031,171 @@ mod unsent_draft_tests {
             }]),
             "different list → change"
         );
-        assert_eq!(app.ai_providers.provider_selection, 0);
+        assert_eq!(app.ai_providers.wizard.focused, 0);
+    }
+
+    #[test]
+    fn provider_picker_is_always_alphabetical() {
+        // The static PROVIDER_OPTIONS default is in catalog (provenance)
+        // order, not alphabetical; App::new must sort it by display name so
+        // the wizard's picker reads A→Z from the very first frame.
+        let app = test_app();
+        let display_names = app
+            .providers
+            .iter()
+            .map(|p| p.display_name.to_lowercase())
+            .collect::<Vec<_>>();
+        let mut sorted = display_names.clone();
+        sorted.sort();
+        assert_eq!(
+            display_names, sorted,
+            "default provider list must be alphabetical by display name"
+        );
+
+        // Live catalog updates arrive in provenance order too; set_providers
+        // must re-sort them.  Feed deliberately shuffled, case-mixed input and
+        // check the stored list comes back alphabetical.
+        let mut app = test_app();
+        app.set_providers(vec![
+            ProviderInfo {
+                slug: "z".into(),
+                display_name: "zebra".into(),
+            },
+            ProviderInfo {
+                slug: "n".into(),
+                display_name: "NEAR AI Cloud".into(),
+            },
+            ProviderInfo {
+                slug: "a".into(),
+                display_name: "Alibaba Coding Plan".into(),
+            },
+            ProviderInfo {
+                slug: "ab".into(),
+                display_name: "abliteration.ai".into(),
+            },
+        ]);
+        let got = app
+            .providers
+            .iter()
+            .map(|p| p.display_name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            vec![
+                // Case-insensitive: 'a'-'b' precedes 'a'-'l', and 'n'/'z'
+                // follow regardless of ASCII case folding.
+                "abliteration.ai",
+                "Alibaba Coding Plan",
+                "NEAR AI Cloud",
+                "zebra",
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_refresh_clamps_wizard_highlight() {
+        let mut app = test_app();
+        // Open the wizard and park the highlight deep in the (208-entry)
+        // list.
+        app.ai_providers.wizard.open();
+        app.ai_providers.wizard.focused = app.providers.len() - 1;
+        app.ai_providers.wizard.scroll = app.providers.len() - 1;
+
+        // A catalog refresh drops most providers.
+        app.set_providers(vec![
+            ProviderInfo {
+                slug: "openai".into(),
+                display_name: "OpenAI".into(),
+            },
+            ProviderInfo {
+                slug: "anthropic".into(),
+                display_name: "Anthropic".into(),
+            },
+        ]);
+
+        // The highlight is clamped to the last row and the scroll hint stays
+        // in range, so the picker never points past the end.
+        assert_eq!(app.ai_providers.wizard.focused, 1);
+        assert_eq!(app.ai_providers.wizard.scroll, 1);
+        let (start, count) = app.ai_providers.wizard.window(&app.providers, 10);
+        assert!(start + count <= app.providers.len());
+    }
+
+    #[test]
+    fn credential_modal_c_opens_and_esc_cancels() {
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.page = Page::AIProviders;
+        app.ai_providers.set_accounts(vec![AccountInfo {
+            name: "main".to_string(),
+            provider: "openai".to_string(),
+            has_credential: false,
+        }]);
+
+        // 'c' on the selected account opens the credential modal.
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("c opens credential modal");
+        assert_eq!(app.ai_providers.credential.target.as_deref(), Some("main"));
+
+        // Esc cancels and returns to the list (nothing sent).
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("esc closes credential modal");
+        assert!(!app.ai_providers.credential.is_open());
+    }
+
+    #[test]
+    fn credential_modal_empty_key_shows_error() {
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.ai_providers.credential.open("main".to_string());
+
+        // Enter with no key pasted shows the error and keeps the modal open.
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("enter empty key");
+        assert!(app.ai_providers.credential.is_open());
+        assert_eq!(
+            app.ai_providers.credential.error.as_deref(),
+            Some("API key cannot be empty")
+        );
+    }
+
+    #[test]
+    fn account_add_failed_closes_credential_modal() {
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // The credential modal auto-opens right after submit; the daemon then
+        // rejects the account.
+        app.ai_providers.credential.open("my-account".to_string());
+
+        handle_daemon_message(
+            DaemonMessage::AccountAddFailed {
+                name: "my-account".to_string(),
+                error: "duplicate slug".to_string(),
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle AccountAddFailed");
+
+        // No phantom account: the credential modal is dropped and the failure
+        // is on the global error line.
+        assert!(!app.ai_providers.credential.is_open());
+        assert_eq!(
+            app.error.as_deref(),
+            Some("[daemon] failed to add account my-account: duplicate slug")
+        );
     }
 
     // ── Connection-level termination (eviction / server shutdown) ───────
