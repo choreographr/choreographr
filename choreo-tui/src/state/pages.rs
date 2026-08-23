@@ -17,6 +17,32 @@ pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
 /// focus is what actually scrolls the list.
 pub(crate) const PROVIDER_PAGE_LINES: usize = 10;
 
+/// Shared pure window arithmetic for the two picker popups (the wizard's
+/// provider picker and the model selector): compute the `(start, count)` slice
+/// of a `len`-item list to render in a window of `height` rows, keeping the
+/// `focused` row visible.  `scroll` is a hint only and is corrected locally
+/// (clamped to the valid range, pulled up when focus drifts above the window,
+/// pushed down when focus falls below the fold), so repeated calls with the
+/// same inputs return identical results — render can never mutate focus/scroll
+/// state during `draw()`.
+fn picker_window(scroll: usize, focused: usize, len: usize, height: usize) -> (usize, usize) {
+    if len == 0 || height == 0 {
+        return (0, 0);
+    }
+    let focused = focused.min(len - 1);
+    let max_scroll = len.saturating_sub(height);
+    let mut scroll = scroll.min(max_scroll);
+    if focused < scroll {
+        // Focus drifted above the window (e.g. after a filter that shrunk
+        // the list) — pull the window up.
+        scroll = focused;
+    } else if focused >= scroll + height {
+        // Focus is below the fold — push the window down.
+        scroll = focused + 1 - height;
+    }
+    (scroll, height.min(len - scroll))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Page {
     Chat,
@@ -233,11 +259,15 @@ impl AccountWizardState {
         self.scroll = self.scroll.min(len - 1);
     }
 
-    pub(crate) fn move_up(&mut self, providers: &[ProviderInfo]) {
+    pub(crate) fn move_up(&mut self) {
+        // Focus only ever decreases here, so it cannot drift past the top of
+        // the (possibly narrowed) filtered list; `scroll` is a render hint
+        // corrected by `picker_window`, so navigation needs no clamping — every
+        // path that changes the list size (`filter_key`, paste, `set_providers`)
+        // re-clamps via `clamp_focus`.
         if self.focused > 0 {
             self.focused -= 1;
         }
-        self.clamp_focus(providers);
     }
 
     pub(crate) fn move_down(&mut self, providers: &[ProviderInfo]) {
@@ -245,14 +275,13 @@ impl AccountWizardState {
         if len > 0 && self.focused + 1 < len {
             self.focused += 1;
         }
-        self.clamp_focus(providers);
     }
 
     /// Page the highlight up/down by `PROVIDER_PAGE_LINES` rows (PgUp/PgDn);
-    /// the render window follows the focus.
-    pub(crate) fn page_up(&mut self, providers: &[ProviderInfo]) {
+    /// the render window follows the focus.  Like `move_up`, paging up cannot
+    /// drift past the top of the list, so no clamp is needed.
+    pub(crate) fn page_up(&mut self) {
         self.focused = self.focused.saturating_sub(PROVIDER_PAGE_LINES);
-        self.clamp_focus(providers);
     }
 
     pub(crate) fn page_down(&mut self, providers: &[ProviderInfo]) {
@@ -261,7 +290,6 @@ impl AccountWizardState {
             return;
         }
         self.focused = (self.focused + PROVIDER_PAGE_LINES).min(len - 1);
-        self.clamp_focus(providers);
     }
 
     /// Route a key to the filter input and re-clamp focus against the
@@ -283,22 +311,9 @@ impl AccountWizardState {
     /// the slice for both the window and the row loop, so filtering is not
     /// repeated per call.
     pub(crate) fn window(&self, filtered: &[&ProviderInfo], height: usize) -> (usize, usize) {
-        let len = filtered.len();
-        if len == 0 || height == 0 {
-            return (0, 0);
-        }
-        let focused = self.focused.min(len - 1);
-        let max_scroll = len.saturating_sub(height);
-        let mut scroll = self.scroll.min(max_scroll);
-        if focused < scroll {
-            // Focus drifted above the window (e.g. after a filter that
-            // shrunk the list) — pull the window up.
-            scroll = focused;
-        } else if focused >= scroll + height {
-            // Focus is below the fold — push the window down.
-            scroll = focused + 1 - height;
-        }
-        (scroll, height.min(len - scroll))
+        // The window arithmetic is shared with the model selector
+        // (`picker_window`); both pickers use identical focus-tracking rules.
+        picker_window(self.scroll, self.focused, filtered.len(), height)
     }
 
     /// The highlighted provider, if the filtered list is non-empty.
@@ -380,7 +395,16 @@ impl CredentialModalState {
     /// which the daemon never sees.  Called by the modal's own open/close and
     /// by the connection layer's Enter handler.
     pub(crate) fn wipe_input(&mut self) {
-        self.input.text.zeroize();
+        // Take the typed key's String out and convert it to its backing
+        // `Vec<u8>` so the WHOLE heap allocation can be zeroized — including
+        // the spare capacity beyond `len`, which may hold remnants of a longer
+        // key deleted while editing (`String::zeroize()` only covers the
+        // current length).  Growing to `capacity` with zeros first makes the
+        // subsequent `zeroize()` reach every byte, so the freed allocation is
+        // all zeros rather than a mix of zeros and stale key material.
+        let mut bytes = std::mem::take(&mut self.input.text).into_bytes();
+        bytes.resize(bytes.capacity(), 0);
+        bytes.zeroize();
         self.input = InputBuffer::new();
     }
 }
@@ -571,48 +595,33 @@ impl ModelSelectorState {
     }
 
     /// Route a key to the filter input and re-clamp focus against the
-    /// narrowed/expanded filtered list.  Returns whether the key was
-    /// consumed (Enter/Esc are handled by the modal event handler instead).
-    pub(crate) fn filter_key(&mut self, key: KeyEvent) -> bool {
-        let consumed = self.filter.handle_key(key);
-        if consumed {
+    /// narrowed/expanded filtered list.  Enter/Esc are handled by the modal
+    /// event handler before this is reached, so the key either edits the
+    /// filter or is ignored — nothing needs to be returned to the caller.
+    pub(crate) fn filter_key(&mut self, key: KeyEvent) {
+        if self.filter.handle_key(key) {
             self.clamp_focus();
         }
-        consumed
     }
 
     /// Compute the `(start, count)` slice of the filtered list to render for
     /// a window of `height` rows, keeping the focused row visible.
     ///
-    /// This is the single place window arithmetic lives; the renderer just
-    /// draws `filtered[start..start + count]`.  It is deliberately **pure**
-    /// (takes `&self`): render must never mutate scroll/focus state — that
-    /// happens in the event loop before `terminal.draw()` (see the module
-    /// docs in render.rs).  `scroll` is used only as a hint and is corrected
+    /// The arithmetic itself lives in the shared `picker_window` helper (both
+    /// pickers use identical focus-tracking rules); the renderer just draws
+    /// `filtered[start..start + count]`.  It is deliberately **pure** (takes
+    /// `&self`): render must never mutate scroll/focus state — that happens in
+    /// the event loop before `terminal.draw()` (see the module docs in
+    /// render/mod.rs).  `scroll` is used only as a hint and is corrected
     /// locally, so repeated calls return identical results.
     ///
     /// Takes the already-filtered list — the renderer filters once and reuses
     /// the slice for both the window and the row loop, so the filter is not
     /// re-applied per call.
     pub(crate) fn window(&self, filtered: &[&str], height: usize) -> (usize, usize) {
-        let len = filtered.len();
-        if len == 0 || height == 0 {
-            return (0, 0);
-        }
-        // Clamp on local copies; `clamp_focus()` keeps the stored fields in
-        // range, and render must not write them back.
-        let focused = self.focused.min(len - 1);
-        let max_scroll = len.saturating_sub(height);
-        let mut scroll = self.scroll.min(max_scroll);
-        if focused < scroll {
-            // Focus drifted above the window (e.g. after a filter that
-            // shrunk the list) — pull the window up.
-            scroll = focused;
-        } else if focused >= scroll + height {
-            // Focus is below the fold — push the window down.
-            scroll = focused + 1 - height;
-        }
-        (scroll, height.min(len - scroll))
+        // The window arithmetic is shared with the wizard's provider picker
+        // (`picker_window`); both pickers use identical focus-tracking rules.
+        picker_window(self.scroll, self.focused, filtered.len(), height)
     }
 
     /// The highlighted model ID, if the filtered list is non-empty.
@@ -886,5 +895,65 @@ impl SessionManagerState {
 
     pub(crate) fn set_error(&mut self, msg: impl Into<String>) {
         self.error = Some(msg.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::picker_window;
+
+    #[test]
+    fn picker_window_empty_list_or_zero_height_returns_zero() {
+        // No rows to show and/or no room to show them: the window is empty.
+        assert_eq!(picker_window(0, 0, 0, 10), (0, 0), "empty list");
+        assert_eq!(picker_window(0, 0, 5, 0), (0, 0), "zero height");
+    }
+
+    #[test]
+    fn picker_window_focus_below_the_fold_pushes_window_down() {
+        // 5 rows in a 3-row window: focus 4 must be the last visible row.
+        assert_eq!(picker_window(0, 4, 5, 3), (2, 3));
+    }
+
+    #[test]
+    fn picker_window_focus_above_the_window_pulls_it_up() {
+        // A stale scroll hint points past the focused row — the window snaps
+        // up so the focus is the first visible row.
+        assert_eq!(picker_window(4, 1, 5, 3), (1, 3));
+    }
+
+    #[test]
+    fn picker_window_stale_scroll_hint_is_clamped() {
+        // `scroll` is a hint only: past the valid range it is clamped locally
+        // (the stored field is never written back by render).
+        assert_eq!(picker_window(10, 4, 5, 3), (2, 3));
+    }
+
+    #[test]
+    fn picker_window_count_never_exceeds_the_list_tail() {
+        // A window taller than the list renders the whole list.
+        assert_eq!(picker_window(0, 0, 2, 10), (0, 2));
+        assert_eq!(picker_window(0, 1, 2, 10), (0, 2));
+    }
+
+    #[test]
+    fn picker_window_focus_is_always_inside_the_window() {
+        // The invariant the two pickers rely on: the focused row is always
+        // visible for any (scroll, focused, len, height) combination.
+        for &(scroll, focused, len, height) in &[
+            (0, 0, 1, 1),
+            (3, 4, 5, 3),
+            (1, 4, 5, 3),
+            (2, 0, 5, 3),
+            (4, 4, 5, 3),
+            (9, 9, 10, 4),
+        ] {
+            let (start, count) = picker_window(scroll, focused, len, height);
+            assert!(count > 0, "non-empty list must render rows");
+            assert!(
+                (start..start + count).contains(&focused.min(len - 1)),
+                "focus must stay visible for ({scroll}, {focused}, {len}, {height})"
+            );
+        }
     }
 }

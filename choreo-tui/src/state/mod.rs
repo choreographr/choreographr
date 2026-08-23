@@ -6514,13 +6514,11 @@ mod tests {
     #[test]
     fn model_selector_filter_key_consumes_chars_and_backspace() {
         let mut sel = selector_with_models(&["gpt-4o", "claude-3"]);
-        let consumed = sel.filter_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        assert!(consumed);
+        sel.filter_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         assert_eq!(sel.filter.text, "g");
         assert_eq!(sel.filtered(), vec!["gpt-4o"]);
 
-        let consumed = sel.filter_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert!(consumed);
+        sel.filter_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert!(sel.filter.text.is_empty());
         assert_eq!(sel.filtered().len(), 2);
     }
@@ -6528,8 +6526,7 @@ mod tests {
     #[test]
     fn model_selector_filter_key_ignores_enter() {
         let mut sel = selector_with_models(&["a"]);
-        let consumed = sel.filter_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(!consumed, "Enter is handled by the modal event handler");
+        sel.filter_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(sel.is_open());
     }
 

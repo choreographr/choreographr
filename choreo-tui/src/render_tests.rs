@@ -206,8 +206,14 @@ fn render_wizard_provider_shows_filter_and_providers() {
         content.contains(&app.providers[0].display_name),
         "provider display names are listed"
     );
+    // The canonical slug must not appear as a picker row.  A bare substring
+    // check would be fragile: some display name could legitimately contain
+    // another provider's slug verbatim, so match whole trimmed rows instead.
     assert!(
-        !content.contains(&app.providers[0].slug),
+        !content.lines().any(|line| {
+            let row = line.trim().trim_start_matches(['>', ' ']);
+            row == app.providers[0].slug
+        }),
         "the provider slug is deliberately not shown"
     );
     assert!(content.contains("type to filter"), "footer hint is drawn");

@@ -1,6 +1,7 @@
 use choreo_keystore::ServiceCredential;
 use choreo_proto::ClientMessage;
 use tracing::{debug, info, warn};
+use zeroize::Zeroize;
 
 use crate::error::ClientError;
 use crate::shell::UnlockMethod;
@@ -144,18 +145,29 @@ fn parse_credential(
 pub fn build_add_credential_message(
     service: String,
     credential_type: String,
-    fields: Vec<String>,
+    mut fields: Vec<String>,
     unlock: bool,
 ) -> Result<ClientMessage, ClientError> {
     debug!("building add credential message for service: {service}, type: {credential_type}");
     let pub_key = read_public_key_bytes()?;
     let credential = parse_credential(&credential_type, &fields)?;
 
-    let plaintext =
+    let mut plaintext =
         postcard::to_allocvec(&credential).map_err(|e| ClientError::Postcard(e.to_string()))?;
 
     let encrypted_payload = choreo_keystore::crypto::encrypt_with_public_key(&pub_key, &plaintext)
         .map_err(|e| ClientError::Encryption(e.to_string()))?;
+
+    // Wipe every plaintext copy of the credential before the message leaves
+    // this function: the serialised bytes and the caller-supplied field
+    // strings (e.g. the TUI's typed API key, which was moved into `fields`).
+    // The intermediate `credential` ServiceCredential zeroizes itself on drop
+    // via `#[zeroize(drop)]` in choreo-keystore, and the daemon zeroizes its
+    // own stored copy, so this closes the remaining gap on the send path.
+    plaintext.zeroize();
+    for field in &mut fields {
+        field.zeroize();
+    }
 
     let unlock_key = if unlock {
         choreo_keystore::paths::private_key_path()

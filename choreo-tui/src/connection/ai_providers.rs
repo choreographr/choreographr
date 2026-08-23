@@ -226,12 +226,12 @@ pub(super) fn handle_account_wizard_event(
                 // contain 'j' or 'k' (dozens: "Kimi For Coding", "Jiekou.AI",
                 // "Sakana AI", "Amazon Bedrock", …).  This mirrors the model
                 // selector, which also reserves just Up/Down.
-                KeyCode::Up => app.ai_providers.wizard.move_up(&app.providers),
+                KeyCode::Up => app.ai_providers.wizard.move_up(),
                 KeyCode::Down => app.ai_providers.wizard.move_down(&app.providers),
                 // PgUp/PgDn page the highlight (the render window follows
                 // it), so browsing ~200 providers takes a few keypresses,
                 // not a row-by-row walk.
-                KeyCode::PageUp => app.ai_providers.wizard.page_up(&app.providers),
+                KeyCode::PageUp => app.ai_providers.wizard.page_up(),
                 KeyCode::PageDown => app.ai_providers.wizard.page_down(&app.providers),
                 // Everything else goes to the filter input (characters,
                 // backspace, word deletes, cursor movement).  `filter_key`
