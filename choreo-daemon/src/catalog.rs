@@ -1,17 +1,18 @@
 //! Runtime catalog maintenance (S4): cache persistence, the background
-//! models.dev refresh thread, and the user-overlay `notify` watcher.
+//! models.dev refresh thread, and the user-overlay reload.
 //!
 //! **Threading.** One background thread owns the whole runtime pipeline. It
 //! loads the base (disk cache → embedded `catalog.bin`), applies the user
-//! overlay, does the conditional GET against models.dev, and watches the
-//! config directory for `models-overlay.toml` edits — but it NEVER mutates
-//! the catalog itself. Every change is sent to the daemon command loop as a
+//! overlay, does the conditional GET against models.dev, and reacts to
+//! `models-overlay.toml` edits surfaced by the unified config-watching
+//! transport ([`crate::config_watch`]) — but it NEVER mutates the catalog
+//! itself. Every change is sent to the daemon command loop as a
 //! [`DaemonCommand::CatalogBaseChanged`], which is the single writer of the
 //! [`choreo_ai_protocols::PROVIDER_CATALOG`] `ArcSwap` (the documented
 //! thread-communication exception). All cross-thread communication here is
 //! channel-based: the daemon hands `/refresh-models` requests to this thread
-//! over a channel (never the command loop doing HTTP), and the notify
-//! callback forwards filesystem events over the same channel.
+//! over a channel (never the command loop doing HTTP), and the config
+//! transport forwards overlay events over another channel.
 //!
 //! **Refresh pacing (S4).** A models.dev fetch is attempted at most once per
 //! [`REFRESH_ATTEMPT_INTERVAL`] (25 h), regardless of whether the last attempt
@@ -41,10 +42,10 @@ use choreo_ai_protocols::{
     normalize_modelsdev, write_file_atomic,
 };
 use choreo_proto::RefreshStatus;
-use crossbeam_channel::{Receiver, Sender};
-use notify::{RecursiveMode, Watcher};
+use crossbeam_channel::{Receiver, Sender, after, select};
 use tracing::{debug, info, warn};
 
+use crate::config_watch::ConfigChange;
 use crate::daemon::DaemonCommand;
 use crate::db::{get_catalog_etag, get_catalog_last_attempt_ms, set_catalog_last_attempt_ms};
 
@@ -64,8 +65,9 @@ const REFRESH_ATTEMPT_INTERVAL: Duration = Duration::from_secs(25 * 60 * 60);
 
 /// Postcard cache filename under the data dir.
 const CATALOG_BIN_NAME: &str = "catalog.bin";
-/// User overlay filename under the config dir.
-const USER_OVERLAY_NAME: &str = "models-overlay.toml";
+/// User overlay filename under the config dir. `pub` so the shared config
+/// transport's subscription (in `run_server`) registers the same basename.
+pub const USER_OVERLAY_NAME: &str = "models-overlay.toml";
 
 /// Reply payload for a `/refresh-models` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,9 +90,9 @@ pub struct RefreshRequester {
 }
 
 /// Messages on the maintenance thread's single channel: requests from the
-/// daemon command loop and filesystem events forwarded by the notify
-/// callback. One channel for both so the thread waits on a single receiver
-/// (whose recv timeout drives the retry timer).
+/// daemon command loop. The thread waits on this channel AND the config
+/// transport's overlay-event channel (via `select!`), whose recv timeout
+/// drives the retry timer.
 #[derive(Debug)]
 pub enum MaintenanceEvent {
     /// A `/refresh-models` request. The HTTP fetch happens HERE (never in the
@@ -100,9 +102,6 @@ pub enum MaintenanceEvent {
         force: bool,
         reply: mpsc::Sender<Result<RefreshReport, String>>,
     },
-    /// A raw notify event about the watched config directory. Filtered and
-    /// re-read (fingerprint-gated) by the maintenance thread.
-    OverlayFsEvent(Result<notify::Event, notify::Error>),
 }
 
 /// Filesystem locations the runtime catalog pipeline touches. Kept in one
@@ -116,7 +115,8 @@ pub struct CatalogPaths {
     /// (`$XDG_DATA_HOME/choreographr/catalog.bin`).
     pub bin: PathBuf,
     /// User overlay TOML (`$XDG_CONFIG_HOME/choreographr/models-overlay.toml`),
-    /// watched for changes.
+    /// read for the user policy layer (the config transport watches its
+    /// basename).
     pub overlay: PathBuf,
 }
 
@@ -206,56 +206,49 @@ pub(crate) fn write_catalog_cache(base: &[ProviderEntry], bin_path: &Path) -> io
     write_file_atomic(bin_path, &bytes)
 }
 
-/// Ensure the runtime directories exist before the maintenance pipeline
-/// starts. The **config dir** (the user overlay's parent) is the critical
-/// one: nothing ever creates it until the user writes an overlay, and
-/// `notify` cannot watch a directory that does not exist — so on a fresh
-/// system the initial watch would fail and (previously) only be retried on
-/// the revalidation cadence, leaving a later-created overlay unwatched for a
-/// day. Creating it up front makes the first watch install succeed.
-/// The **data dir** (cache parent) is created for symmetry; `write_file_atomic`
-/// would create it on first persist anyway. A creation failure is logged,
-/// never fatal — the daemon degrades to the embedded catalog and manual
-/// `/refresh-models` reloads, and the loop's watch retry remains as a
-/// last-resort fallback.
+/// Ensure the catalog **data dir** (cache parent) exists before the
+/// maintenance pipeline starts. `write_file_atomic` would create it on first
+/// persist anyway; creating it up front means the cache survives a run even if
+/// the first fetch is skipped (a fresh cache). The **config dir** is no longer
+/// created here — the unified config transport ([`crate::config_watch`])
+/// owns that, since it is shared across all watched files. A creation failure
+/// is logged, never fatal — the daemon degrades to the embedded catalog and
+/// manual `/refresh-models` reloads.
 fn ensure_runtime_dirs(paths: &CatalogPaths) {
-    for dir in [paths.overlay.parent(), paths.bin.parent()]
-        .into_iter()
-        .flatten()
-    {
-        match std::fs::create_dir_all(dir) {
-            Ok(()) => debug!(dir = %dir.display(), "catalog runtime dir ready"),
-            Err(e) => warn!(
-                dir = %dir.display(),
-                error = %e,
-                "failed to create catalog runtime dir; overlay auto-reload and cache \
-                 persistence may be unavailable",
-            ),
-        }
+    let Some(dir) = paths.bin.parent() else {
+        return;
+    };
+    match std::fs::create_dir_all(dir) {
+        Ok(()) => debug!(dir = %dir.display(), "catalog data dir ready"),
+        Err(e) => warn!(
+            dir = %dir.display(),
+            error = %e,
+            "failed to create the catalog data dir; cache persistence may be unavailable",
+        ),
     }
 }
 
 /// Spawn the ONE background catalog-maintenance thread. Returns the channel
 /// sender the daemon command loop uses to hand `/refresh-models` requests to
-/// it. The DB is handed in because the thread is the single writer of the
-/// catalog refresh state (`catalog_state`: last-attempt timestamp — it
-/// observes every fetch outcome, unlike the command loop, which only sees
-/// accepted swaps). The thread is detached (the process exits after
-/// `run_server` returns; a lingering maintenance thread cannot outlive main,
-/// and its sends to the daemon channel fail harmlessly once the command loop
-/// is gone).
+/// it. `overlay_rx` is the config transport's subscription for
+/// `models-overlay.toml` edits — the thread reacts to them in its event loop
+/// and re-reads the overlay. The DB is handed in because the thread is the
+/// single writer of the catalog refresh state (`catalog_state`: last-attempt
+/// timestamp — it observes every fetch outcome, unlike the command loop,
+/// which only sees accepted swaps). The thread is detached (the process exits
+/// after `run_server` returns; a lingering maintenance thread cannot outlive
+/// main, and its sends to the daemon channel fail harmlessly once the command
+/// loop is gone).
 pub(crate) fn spawn_catalog_maintenance(
     daemon_tx: mpsc::Sender<DaemonCommand>,
     db: Arc<redb::Database>,
     paths: CatalogPaths,
+    overlay_rx: Receiver<ConfigChange>,
 ) -> Sender<MaintenanceEvent> {
     let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceEvent>();
-    // The notify callback needs its own sender clone; the daemon keeps the
-    // original for RefreshNow requests.
-    let notify_tx = tx.clone();
     let _ = std::thread::Builder::new()
         .name("catalog-maintenance".into())
-        .spawn(move || maintenance_loop(daemon_tx, db, paths, rx, notify_tx));
+        .spawn(move || maintenance_loop(daemon_tx, db, paths, rx, overlay_rx));
     tx
 }
 
@@ -279,12 +272,10 @@ fn maintenance_loop(
     db: Arc<redb::Database>,
     paths: CatalogPaths,
     rx: Receiver<MaintenanceEvent>,
-    notify_tx: Sender<MaintenanceEvent>,
+    overlay_rx: Receiver<ConfigChange>,
 ) {
-    // ── 0. Ensure the runtime dirs exist (config dir for the overlay watch,
-    // data dir for the cache) so the notify watch below installs on the FIRST
-    // attempt even on a fresh system — see `ensure_runtime_dirs` for why this
-    // ordering matters.
+    // ── 0. Ensure the catalog data dir exists so the cache can be written.
+    // (The config dir is created by the shared config transport, not here.)
     ensure_runtime_dirs(&paths);
 
     // ── 1. Load the base: valid cache file first, embedded catalog.bin as
@@ -367,48 +358,6 @@ fn maintenance_loop(
         reply: Vec::new(),
     });
 
-    // ── 4. Register the notify watcher on the config DIRECTORY (rename-safe:
-    // an editor that writes temp + rename fires events for the directory, and
-    // we filter by basename below). The callback only forwards raw events —
-    // all policy (filter, re-read, fingerprint gate) lives here on the
-    // maintenance thread, keeping the notify-owned thread trivially small.
-    let mut watcher: Option<notify::RecommendedWatcher> =
-        match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            let _ = notify_tx.send(MaintenanceEvent::OverlayFsEvent(res));
-        }) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "failed to create the filesystem watcher; user overlay changes \
-                     will not reload automatically",
-                );
-                None
-            }
-        };
-    // The watch targets the config DIRECTORY, not the file itself. The dirs
-    // were created in step 0, so the initial watch normally succeeds even on
-    // a fresh system. The re-arm below is a last-resort fallback for a
-    // directory that is deleted at runtime or whose creation/permission
-    // failed at startup — the `/refresh-models` path remains the documented
-    // manual reload. The watcher is kept alive either way — a failed watch
-    // simply never fires until re-armed.
-    let watch_dir = paths.overlay.parent().map(Path::to_path_buf);
-    let mut watch_armed = false;
-    if let (Some(w), Some(dir)) = (watcher.as_mut(), watch_dir.as_deref()) {
-        match w.watch(dir, RecursiveMode::NonRecursive) {
-            Ok(()) => watch_armed = true,
-            Err(e) => {
-                warn!(
-                    dir = %dir.display(),
-                    error = %e,
-                    "failed to watch the config directory; retrying in the \
-                     maintenance loop (overlay changes also reload on `/refresh-models`)",
-                );
-            }
-        }
-    }
-
     // ── 5. Initial conditional GET — gated on cache freshness. Fetch
     // immediately iff there is no valid cache, no recorded attempt (first
     // run / upgrade), or the last attempt is stale (≥ REFRESH_ATTEMPT_INTERVAL
@@ -431,72 +380,57 @@ fn maintenance_loop(
         );
     }
 
-    // ── 6. Event loop: wait on the channel (requests + overlay events) with
-    // the retry timer as the recv timeout.
+    // ── 6. Event loop: wait on the maintenance channel, the config
+    // transport's overlay channel, and the retry timer — multiplexed with
+    // `select!`. The timer (`after(timeout)`) fires when a revalidation is
+    // due; the two channels wake the loop on requests and overlay edits.
     loop {
-        // Last-resort re-arm of the config-dir watch if the initial attempt
-        // failed (a dir deleted at runtime, or a creation failure in step 0
-        // that has since been fixed). This runs on the loop's natural cadence
-        // (channel events + the revalidation timeout); the step-0 dir
-        // creation is the primary fix, so this path is rarely taken. Cheap
-        // while unarmed (a failed watch is a quick syscall); a no-op once
-        // armed.
-        if !watch_armed && let (Some(w), Some(dir)) = (watcher.as_mut(), watch_dir.as_deref()) {
-            match w.watch(dir, RecursiveMode::NonRecursive) {
-                Ok(()) => {
-                    info!(
-                        dir = %dir.display(),
-                        "config directory is now watchable; overlay auto-reload armed",
-                    );
-                    watch_armed = true;
-                }
-                Err(e) => {
-                    // Debug, not warn: this retries on every loop iteration
-                    // until the dir exists, so a warn would spam the log.
-                    tracing::debug!(
-                        dir = %dir.display(),
-                        error = %e,
-                        "config directory still not watchable; will retry",
-                    );
-                }
-            }
-        }
         let timeout = state
             .next_retry_at
             .map(|at| at.saturating_duration_since(Instant::now()))
             .unwrap_or(REFRESH_ATTEMPT_INTERVAL);
-        match rx.recv_timeout(timeout) {
-            Ok(MaintenanceEvent::RefreshNow { force, reply }) => {
-                // /refresh-models is the documented fallback for overlay
-                // reloads (e.g. when the notify watch could not start). Re-read
-                // the file so the command re-syncs the user layer too, not
-                // just the models.dev base — and so an overlay edit is applied
-                // even when the conditional GET below returns 304 (a 304 sends
-                // no CatalogBaseChanged, so without this the reload is lost).
-                reload_user_overlay(&daemon_tx, &mut state, &paths.overlay);
-                // Coalesce: drain any RefreshNows queued while we were idle so
-                // a burst of /refresh-models becomes ONE fetch. Fold the force
-                // flag (a --force anywhere in the burst forces) and keep every
-                // reply sender so no requester is left hanging. The whole
-                // burst is ONE attempt (one timestamp write below).
-                let (any_force, replies) = fold_refresh_nows(&rx, force, reply);
-                // Explicit user intent bypasses the cooldown, but the attempt
-                // is still recorded (and the timer re-armed by run_refresh) so
-                // the DB anchor reflects reality — otherwise the next startup
-                // would re-fetch immediately.
-                record_attempt(&db, &mut state);
-                run_refresh(&daemon_tx, &mut state, any_force, replies);
-            }
-            Ok(MaintenanceEvent::OverlayFsEvent(Ok(event))) => {
-                if is_overlay_event(&event, &paths.overlay) {
+        select! {
+            recv(rx) -> msg => match msg {
+                Ok(MaintenanceEvent::RefreshNow { force, reply }) => {
+                    // /refresh-models is the documented fallback for overlay
+                    // reloads (e.g. when the config transport could not start).
+                    // Re-read the file so the command re-syncs the user layer
+                    // too, not just the models.dev base — and so an overlay
+                    // edit is applied even when the conditional GET below
+                    // returns 304 (a 304 sends no CatalogBaseChanged, so
+                    // without this the reload is lost).
+                    reload_user_overlay(&daemon_tx, &mut state, &paths.overlay);
+                    // Coalesce: drain any RefreshNows queued while idle so a
+                    // burst of /refresh-models becomes ONE fetch. Fold the
+                    // force flag (a --force anywhere in the burst forces) and
+                    // keep every reply sender. The whole burst is ONE attempt.
+                    let (any_force, replies) = fold_refresh_nows(&rx, force, reply);
+                    // Explicit user intent bypasses the cooldown, but the
+                    // attempt is still recorded (and the timer re-armed by
+                    // run_refresh) so the DB anchor reflects reality.
+                    record_attempt(&db, &mut state);
+                    run_refresh(&daemon_tx, &mut state, any_force, replies);
+                }
+                Err(_) => {
+                    info!("catalog maintenance channel closed; exiting");
+                    break;
+                }
+            },
+            recv(overlay_rx) -> evt => match evt {
+                Ok(_change) => {
+                    // The transport already filtered to this basename and a
+                    // create/modify/remove kind; re-read + fingerprint-gate.
                     reload_user_overlay(&daemon_tx, &mut state, &paths.overlay);
                 }
-            }
-            Ok(MaintenanceEvent::OverlayFsEvent(Err(e))) => {
-                warn!(error = %e, "filesystem watcher error");
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                // The recv timeout fired. If a retry was scheduled and is due,
+                Err(_) => {
+                    // The config transport died; continue on the maintenance
+                    // channel and timer alone (overlay reloads fall back to
+                    // /refresh-models).
+                    warn!("config transport channel closed; overlay auto-reload unavailable");
+                }
+            },
+            recv(after(timeout)) -> _ => {
+                // The retry timer fired. If a retry was scheduled and is due,
                 // revalidate; otherwise (no retry pending) just loop.
                 if let Some(at) = state.next_retry_at
                     && Instant::now() >= at
@@ -505,11 +439,7 @@ fn maintenance_loop(
                     record_attempt(&db, &mut state);
                     run_refresh(&daemon_tx, &mut state, false, Vec::new());
                 }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                info!("catalog maintenance channel closed; exiting");
-                break;
-            }
+            },
         }
     }
 }
@@ -769,24 +699,6 @@ fn reload_user_overlay(
     }
 }
 
-/// Whether a notify event concerns the user overlay file. The watch is on the
-/// config *directory* (rename-safe), so unrelated files' events arrive too —
-/// filter by basename and by event kind (ignore pure `Access`/`Other` noise,
-/// e.g. macOS FSEvents access reports).
-fn is_overlay_event(event: &notify::Event, overlay_path: &Path) -> bool {
-    use notify::EventKind;
-    if !matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    ) {
-        return false;
-    }
-    let Some(name) = overlay_path.file_name() else {
-        return false;
-    };
-    event.paths.iter().any(|p| p.file_name() == Some(name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,64 +787,6 @@ mod tests {
             read_user_overlay(&path).unwrap().as_deref(),
             Some("[provider.acme]\nbase_url = \"x\"\n")
         );
-    }
-
-    #[test]
-    fn overlay_event_filter_matches_basename_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let overlay = dir.path().join("models-overlay.toml");
-        let other = dir.path().join("accounts.toml");
-
-        let mk = |path: &Path, kind: notify::EventKind| notify::Event {
-            kind,
-            paths: vec![path.to_path_buf()],
-            attrs: notify::event::EventAttributes::default(),
-        };
-
-        // Our file: Create/Modify/Remove all qualify.
-        assert!(is_overlay_event(
-            &mk(
-                &overlay,
-                notify::EventKind::Create(notify::event::CreateKind::File)
-            ),
-            &overlay
-        ));
-        assert!(is_overlay_event(
-            &mk(
-                &overlay,
-                notify::EventKind::Modify(notify::event::ModifyKind::Data(
-                    notify::event::DataChange::Any
-                )),
-            ),
-            &overlay
-        ));
-        assert!(is_overlay_event(
-            &mk(
-                &overlay,
-                notify::EventKind::Remove(notify::event::RemoveKind::File)
-            ),
-            &overlay
-        ));
-        // A different file in the same directory does not.
-        assert!(!is_overlay_event(
-            &mk(
-                &other,
-                notify::EventKind::Create(notify::event::CreateKind::File)
-            ),
-            &overlay
-        ));
-        // Pure access/other noise never qualifies.
-        assert!(!is_overlay_event(
-            &mk(
-                &overlay,
-                notify::EventKind::Access(notify::event::AccessKind::Read)
-            ),
-            &overlay
-        ));
-        assert!(!is_overlay_event(
-            &mk(&overlay, notify::EventKind::Other),
-            &overlay
-        ));
     }
 
     #[test]
@@ -1419,11 +1273,10 @@ mod tests {
     }
 
     #[test]
-    fn ensure_runtime_dirs_creates_overlay_and_data_dirs() {
-        // The dir-creation fix: the config dir (overlay parent) must exist
-        // before the notify watch is installed, so `ensure_runtime_dirs`
-        // creates it (and the cache data dir) up front — even on a fresh
-        // system where neither exists yet.
+    fn ensure_runtime_dirs_creates_the_data_dir() {
+        // The cache data dir (bin parent) is created up front so the cache can
+        // be written even if the first fetch is skipped. The config dir is NOT
+        // created here anymore — the unified config transport owns that.
         let dir = tempfile::tempdir().unwrap();
         let paths = CatalogPaths {
             bin: dir.path().join("data/choreographr/catalog.bin"),
@@ -1435,9 +1288,12 @@ mod tests {
             paths.bin.parent().unwrap().is_dir(),
             "data dir must exist after ensure_runtime_dirs"
         );
+
+        // The config dir (overlay parent) is deliberately left for the config
+        // transport to create — this function must not create it.
         assert!(
-            paths.overlay.parent().unwrap().is_dir(),
-            "config dir must exist after ensure_runtime_dirs"
+            !paths.overlay.parent().unwrap().exists(),
+            "ensure_runtime_dirs must not create the config dir (the transport owns it)"
         );
 
         // Idempotent: a second pass must not error.

@@ -209,18 +209,45 @@ pub fn run_server(
     let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
     state.daemon_tx = daemon_tx.clone();
 
+    // Shared config-file watching transport: ONE notify watcher on the config
+    // directory, fanned out per-basename to consumers (the catalog overlay,
+    // accounts, and future files). Spawned before the consumers that react to
+    // its events. Degrades gracefully to no transport (and no auto-reload)
+    // when the config dir cannot be resolved.
+    let overlay_rx = match state.catalog_paths.overlay.parent().map(Path::to_path_buf) {
+        Some(config_dir) => {
+            let mut config_watcher = crate::config_watch::ConfigWatcher::new(config_dir);
+            // The catalog maintenance thread reacts to overlay edits; the
+            // accounts watcher reacts to accounts.toml edits. Each consumer
+            // owns its reload policy (see `handle_accounts_reload` and the
+            // maintenance loop's overlay arm).
+            let overlay_rx = config_watcher.subscribe(crate::catalog::USER_OVERLAY_NAME);
+            let accounts_rx = config_watcher.subscribe(crate::accounts::ACCOUNTS_TOML_NAME);
+            config_watcher.spawn();
+            crate::accounts::spawn_accounts_watcher(daemon_tx.clone(), accounts_rx);
+            overlay_rx
+        }
+        None => {
+            warn!("config directory not resolvable; config-file auto-reload disabled");
+            // A never-delivering receiver so the maintenance thread still runs
+            // (it just has no overlay events to react to).
+            crossbeam_channel::never()
+        }
+    };
+
     // Spawn the ONE background catalog-maintenance thread (S4) before the
     // command loop is moved into its own thread: it loads the cache, does the
-    // startup models.dev conditional GET, watches the user overlay, and serves
-    // `/refresh-models` requests — all over channels, and never mutating the
-    // catalog itself (every change goes through
-    // `DaemonCommand::CatalogBaseChanged` back to the command loop, the single
-    // writer of the catalog ArcSwap). Spawned before the accept loop so the
-    // startup swap lands promptly.
+    // startup models.dev conditional GET, reacts to user-overlay edits from
+    // the config transport, and serves `/refresh-models` requests — all over
+    // channels, and never mutating the catalog itself (every change goes
+    // through `DaemonCommand::CatalogBaseChanged` back to the command loop,
+    // the single writer of the catalog ArcSwap). Spawned before the accept
+    // loop so the startup swap lands promptly.
     let maintenance_tx = crate::catalog::spawn_catalog_maintenance(
         daemon_tx.clone(),
         state.db.clone(),
         state.catalog_paths.clone(),
+        overlay_rx,
     );
     state.maintenance_tx = Some(maintenance_tx);
 

@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod cli;
 pub use cli::main;
 pub mod config;
+pub mod config_watch;
 pub mod context;
 pub mod daemon;
 pub mod db;

@@ -277,6 +277,13 @@ pub enum DaemonCommand {
     ListAccountsCmd {
         reply: std::sync::mpsc::Sender<Result<Vec<AccountInfo>, String>>,
     },
+    /// The config watcher detected an `accounts.toml` edit (or the daemon's
+    /// own `add`/`remove` rewrote the file). The command loop — the single
+    /// writer of `state.accounts` — re-reads, parse-compares against the
+    /// in-memory manager, and applies only a real change. No reply: this is a
+    /// fire-and-forget reload signal, and the sender may be absent entirely
+    /// (an un-unlocked daemon has no loaded accounts to reload).
+    AccountsReload,
     ResolveProviderCmd {
         account: String,
         reply: std::sync::mpsc::Sender<Option<InferenceProvider>>,
@@ -495,6 +502,7 @@ impl DaemonState {
                 self.handle_remove_account(name, reply)
             }
             DaemonCommand::ListAccountsCmd { reply } => self.handle_list_accounts(reply),
+            DaemonCommand::AccountsReload => self.handle_accounts_reload(),
             DaemonCommand::ResolveProviderCmd { account, reply } => {
                 self.handle_resolve_provider(account, reply)
             }
@@ -1636,17 +1644,82 @@ impl DaemonState {
         &mut self,
         reply: std::sync::mpsc::Sender<Result<Vec<AccountInfo>, String>>,
     ) {
-        // Collect the set of account names that have credentials
-        // (either decrypted in memory or stored as encrypted blobs
-        // in the DB) so the TUI can show whether each account has
-        // had a credential supplied, regardless of unlock state.
+        let _ = reply.send(Ok(self.account_infos()));
+    }
+
+    /// Build the credential-aware `AccountInfo` list. Shared by
+    /// [`DaemonCommand::ListAccountsCmd`] (pull) and the external-edit reload
+    /// broadcast (push) so both carry the identical payload shape.
+    fn account_infos(&self) -> Vec<AccountInfo> {
+        // Credential status: decrypted in-memory credentials plus encrypted
+        // blobs stored in the DB, so the TUI shows whether each account has
+        // had a credential supplied regardless of unlock state.
         let mut credentialed: std::collections::HashSet<String> =
             self.credentials.keys().cloned().collect();
-        // Also check the DB for stored-but-not-yet-decrypted blobs.
         if let Ok(blobs) = db::get_all_credential_blobs(&self.db) {
             credentialed.extend(blobs.into_keys());
         }
-        let _ = reply.send(Ok(self.accounts.list(&credentialed)));
+        self.accounts.list(&credentialed)
+    }
+
+    /// Re-read `accounts.toml` after a watcher event and apply a real change.
+    ///
+    /// This is the single writer of `state.accounts`, so all reload policy
+    /// lives here: re-read, **parse-compare** against the in-memory manager,
+    /// and apply only a logical difference (a byte compare would false-positive
+    /// on the daemon's own rewrites, whose serialization order the deterministic
+    /// [`AccountManager::save`] now keeps stable). Removed accounts drop their
+    /// cached provider (a stale provider for a gone account is dead weight);
+    /// credentials are left intact — a credential with no account is inert, and
+    /// pruning it automatically could surprise a user who is mid-migration.
+    /// A successful apply broadcasts the fresh account list so connected
+    /// clients can refresh their pickers live. A read/parse failure keeps the
+    /// current accounts rather than churn on a transient error.
+    fn handle_accounts_reload(&mut self) {
+        // Only meaningful after unlock, when the manager holds a real path.
+        // Before that the in-memory manager is empty and there is nothing to
+        // reload (the watcher runs regardless of unlock state). The path is
+        // copied to an owned value so no borrow of `self.accounts` outlives
+        // the reassignment below.
+        let path = self.accounts.path().to_path_buf();
+        if path.as_os_str().is_empty() {
+            debug!("accounts reload requested before unlock; ignoring");
+            return;
+        }
+        let fresh = match AccountManager::load(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to reload accounts from disk; keeping the current accounts",
+                );
+                return;
+            }
+        };
+        if fresh.all_configs() == self.accounts.all_configs() {
+            // A no-op edit (the daemon's own save, or a rewrite with identical
+            // logical content) must not broadcast or churn.
+            debug!(path = %path.display(), "accounts.toml changed but accounts are unchanged");
+            return;
+        }
+        let old_names: HashSet<String> = self.accounts.names().into_iter().collect();
+        let new_names: HashSet<String> = fresh.names().into_iter().collect();
+        for removed in old_names.difference(&new_names) {
+            if self.providers.remove(removed).is_some() {
+                warn!(
+                    account = removed,
+                    "account removed from accounts.toml externally; dropped its cached provider",
+                );
+            }
+        }
+        self.accounts = fresh;
+        info!(path = %path.display(), "accounts reloaded from disk");
+        // Push the fresh list to activity subscribers (global/control
+        // provenance — a flat, non-session message — so no origin-contract
+        // dedup runs). Clients can refresh their account pickers live.
+        let accounts = self.account_infos();
+        self.handle_broadcast_activity(None, DaemonMessage::Accounts { accounts });
     }
 
     /// Resolve a cached provider for the given account name.

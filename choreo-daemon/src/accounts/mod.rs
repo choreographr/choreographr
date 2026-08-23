@@ -9,7 +9,12 @@ use choreo_ai_protocols::openai::{MaxTokensField, RequestFormat};
 use choreo_ai_protocols::retry::MAX_BACKOFF_MS;
 
 /// Configuration for a single inference account.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq`/`Eq` are derived so two managers can be compared for *logical*
+/// equality — the external-edit reload gate uses this instead of a byte
+/// compare (see [`AccountManager::save`] for why bytes can differ between
+/// identical logical states).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountConfig {
     pub name: String,
     pub provider: String,
@@ -254,6 +259,10 @@ impl From<&AccountConfig> for choreo_ai_protocols::ProviderOverrides {
     }
 }
 
+/// Filename of the accounts config under the config dir, shared by the path
+/// resolver and the unified config watcher's subscription.
+pub const ACCOUNTS_TOML_NAME: &str = "accounts.toml";
+
 /// Resolve the accounts.toml path (e.g. ~/.config/choreographr/accounts.toml).
 pub fn accounts_config_path() -> io::Result<PathBuf> {
     let config_dir = dirs::config_dir().ok_or_else(|| {
@@ -263,6 +272,35 @@ pub fn accounts_config_path() -> io::Result<PathBuf> {
         )
     })?;
     Ok(config_dir.join("choreographr").join("accounts.toml"))
+}
+
+/// Spawn the thin consumer that watches `accounts.toml` edits surfaced by the
+/// unified config transport and forwards them to the daemon command loop.
+///
+/// This thread does NO reading or comparing — the transport has already
+/// classified the event to create/modify/remove, and the daemon command loop
+/// is the single writer of `state.accounts`, so it is the one that re-reads,
+/// parse-compares, and applies. Self-writes (from `AccountManager::add`/
+/// `remove`) arrive here too; the parse-compare in the command loop is what
+/// makes them no-ops. The thread is detached and lives until the process
+/// exits.
+pub fn spawn_accounts_watcher(
+    daemon_tx: std::sync::mpsc::Sender<crate::daemon::DaemonCommand>,
+    accounts_rx: crossbeam_channel::Receiver<crate::config_watch::ConfigChange>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("accounts-config-watch".into())
+        .spawn(move || {
+            for _change in accounts_rx.iter() {
+                if daemon_tx
+                    .send(crate::daemon::DaemonCommand::AccountsReload)
+                    .is_err()
+                {
+                    tracing::info!("daemon command loop gone; stopping accounts config watcher");
+                    break;
+                }
+            }
+        });
 }
 
 /// Manages a collection of accounts backed by a TOML file.
@@ -321,22 +359,24 @@ impl AccountManager {
 
     /// Save all accounts to the TOML file, creating the parent directory if
     /// needed.
+    ///
+    /// The file is written **deterministically** (accounts sorted by name) and
+    /// **atomically** (temp + fsync + rename via `write_file_atomic`). The
+    /// deterministic ordering makes the on-disk file stable and diff-friendly;
+    /// the atomic write means the config-file watcher can never observe a torn
+    /// file mid-write (the daemon and an editor can race on this file).
     pub fn save(&self) -> io::Result<()> {
         #[derive(Serialize)]
         struct AccountsFile<'a> {
             #[serde(rename = "account")]
             accounts: Vec<&'a AccountConfig>,
         }
-        let file = AccountsFile {
-            accounts: self.accounts.values().collect(),
-        };
+        let mut configs: Vec<&AccountConfig> = self.accounts.values().collect();
+        configs.sort_by(|a, b| a.name.cmp(&b.name));
+        let file = AccountsFile { accounts: configs };
         let toml_str =
             toml::to_string(&file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if let Some(parent) = self.config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&self.config_path, toml_str)?;
-        Ok(())
+        choreo_ai_protocols::write_file_atomic(&self.config_path, toml_str.as_bytes())
     }
 
     /// Add an account. Errors if the name already exists.
@@ -389,6 +429,21 @@ impl AccountManager {
 
     pub fn contains(&self, name: &str) -> bool {
         self.accounts.contains_key(name)
+    }
+
+    /// The on-disk path this manager loads from / saves to. Empty for an
+    /// un-initialized manager (`AccountManager::empty`), which the daemon uses
+    /// to gate the external-edit reload until unlock has loaded a real path.
+    pub fn path(&self) -> &Path {
+        &self.config_path
+    }
+
+    /// The account names, sorted for deterministic iteration. Used by the
+    /// external-edit reload to compute which accounts were removed.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.accounts.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     pub fn first(&self) -> Option<&AccountConfig> {
@@ -567,6 +622,56 @@ model = "claude-4"
         }
         let mgr = manager(&path);
         assert!(mgr.contains("persist"));
+    }
+
+    #[test]
+    fn save_is_deterministic_across_rewrites() {
+        // The external-edit reload gate is a parse-compare, but a deterministic
+        // on-disk file is still valuable: identical logical state must produce
+        // identical bytes, so an editor diffing the file sees stable content and
+        // the daemon's own rewrites never churn the file needlessly. The old
+        // HashMap-order serialization produced a different byte order on each
+        // save; sorting by name makes it stable.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("accounts.toml");
+        let mut mgr = manager(&path);
+        mgr.add(AccountConfig::simple("zebra", "openai")).unwrap();
+        mgr.add(AccountConfig::simple("alpha", "anthropic"))
+            .unwrap();
+        mgr.add(AccountConfig::simple("mango", "ollama")).unwrap();
+
+        let first = std::fs::read_to_string(&path).unwrap();
+        // A no-op save (same logical accounts) rewrites identical bytes.
+        mgr.save().unwrap();
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            first, second,
+            "identical logical state must serialize identically"
+        );
+
+        // The on-disk order is sorted by account name, not insertion order.
+        let alpha = first.find("name = \"alpha\"").unwrap();
+        let mango = first.find("name = \"mango\"").unwrap();
+        let zebra = first.find("name = \"zebra\"").unwrap();
+        assert!(
+            alpha < mango && mango < zebra,
+            "accounts sorted by name on disk"
+        );
+    }
+
+    #[test]
+    fn path_and_names_accessors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("accounts.toml");
+        let mut mgr = manager(&path);
+        // An un-initialized manager has an empty path and no names.
+        assert!(AccountManager::empty().path().as_os_str().is_empty());
+        assert!(AccountManager::empty().names().is_empty());
+
+        assert_eq!(mgr.path(), path);
+        mgr.add(AccountConfig::simple("z", "openai")).unwrap();
+        mgr.add(AccountConfig::simple("a", "anthropic")).unwrap();
+        assert_eq!(mgr.names(), vec!["a".to_string(), "z".to_string()]);
     }
 
     #[test]

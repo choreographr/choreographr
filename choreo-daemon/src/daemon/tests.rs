@@ -1435,6 +1435,132 @@ fn drain_send_on_subscribe(rx: &crossbeam_channel::Receiver<DaemonMessage>) {
     );
 }
 
+// ── AccountsReload (the external-edit watcher consumer) ───────────────────
+
+#[test]
+fn handle_accounts_reload_applies_external_change_and_broadcasts() {
+    // An external editor rewrites accounts.toml behind the daemon's back; the
+    // watcher consumer forwards an AccountsReload and the command loop — the
+    // single writer of state.accounts — applies the new accounts and pushes
+    // the fresh list to activity subscribers.
+    let (mut state, _rx) = make_daemon_state();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("accounts.toml");
+    state.accounts = AccountManager::load(&path).unwrap();
+    assert!(state.accounts.is_empty(), "fresh manager starts empty");
+
+    let (writer, writer_rx) = test_sink();
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 1,
+        writer,
+    });
+    drain_send_on_subscribe(&writer_rx);
+
+    std::fs::write(
+        &path,
+        "[[account]]\nname = \"alpha\"\nprovider = \"openai\"\n\n[[account]]\nname = \"beta\"\nprovider = \"anthropic\"\n",
+    )
+    .unwrap();
+
+    state.handle_command(DaemonCommand::AccountsReload);
+
+    assert!(state.accounts.contains("alpha"));
+    assert!(state.accounts.contains("beta"));
+    match writer_rx.recv().unwrap() {
+        DaemonMessage::Accounts { accounts } => {
+            let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+            assert!(names.contains(&"alpha"), "broadcast carries alpha");
+            assert!(names.contains(&"beta"), "broadcast carries beta");
+        }
+        other => panic!("expected Accounts broadcast, got {other:?}"),
+    }
+}
+
+#[test]
+fn handle_accounts_reload_noops_when_logically_unchanged() {
+    // The daemon rewrites its OWN file on add/remove; that self-write arrives
+    // as an AccountsReload too. The parse-compare (not a byte compare) must
+    // make it a no-op: no state churn, no broadcast.
+    let (mut state, _rx) = make_daemon_state();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("accounts.toml");
+    std::fs::write(
+        &path,
+        "[[account]]\nname = \"alpha\"\nprovider = \"openai\"\n",
+    )
+    .unwrap();
+    state.accounts = AccountManager::load(&path).unwrap();
+
+    let (writer, writer_rx) = test_sink();
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 1,
+        writer,
+    });
+    drain_send_on_subscribe(&writer_rx);
+
+    // Simulate the daemon rewriting its own file (deterministic save).
+    state.accounts.save().unwrap();
+    state.handle_command(DaemonCommand::AccountsReload);
+
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "no broadcast for a logically-unchanged reload"
+    );
+    assert_eq!(state.accounts.names(), vec!["alpha".to_string()]);
+}
+
+#[test]
+fn handle_accounts_reload_prunes_removed_account_providers() {
+    // When an external edit drops an account, the daemon drops its cached
+    // provider (a stale provider for a gone account is dead weight) while
+    // keeping the providers for accounts that still exist.
+    let (mut state, _rx) = make_daemon_state();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("accounts.toml");
+    state.accounts = AccountManager::load(&path).unwrap();
+    std::fs::write(
+        &path,
+        "[[account]]\nname = \"keep\"\nprovider = \"openai\"\n\n[[account]]\nname = \"gone\"\nprovider = \"anthropic\"\n",
+    )
+    .unwrap();
+
+    state
+        .providers
+        .insert("keep".to_string(), make_test_provider());
+    state
+        .providers
+        .insert("gone".to_string(), make_test_provider());
+
+    state.handle_command(DaemonCommand::AccountsReload);
+    assert!(state.accounts.contains("keep"));
+    assert!(state.accounts.contains("gone"));
+
+    // Now remove "gone" externally.
+    std::fs::write(
+        &path,
+        "[[account]]\nname = \"keep\"\nprovider = \"openai\"\n",
+    )
+    .unwrap();
+    state.handle_command(DaemonCommand::AccountsReload);
+
+    assert!(!state.accounts.contains("gone"));
+    assert!(
+        !state.providers.contains_key("gone"),
+        "removed account's cached provider is dropped"
+    );
+    assert!(state.providers.contains_key("keep"));
+}
+
+#[test]
+fn handle_accounts_reload_noops_without_a_real_path() {
+    // An un-unlocked daemon has an empty manager with no path; a reload signal
+    // must be a safe no-op (the watcher runs regardless of unlock state).
+    let (mut state, _rx) = make_daemon_state();
+    state.accounts = AccountManager::empty();
+    state.handle_command(DaemonCommand::AccountsReload);
+    assert!(state.accounts.is_empty());
+}
+
 #[test]
 #[serial_test::serial(catalog)]
 fn handle_register_activity_subscriber_adds_to_map() {
@@ -2199,9 +2325,10 @@ fn refresh_models_forwards_to_maintenance_thread() {
     state.handle_command(DaemonCommand::RefreshModels { force: true, reply });
 
     let msg = maintenance_rx.recv().unwrap();
+    // MaintenanceEvent has exactly one variant now (the config transport owns
+    // FS events), so a single-arm match suffices.
     match msg {
         MaintenanceEvent::RefreshNow { force, .. } => assert!(force),
-        other => panic!("expected RefreshNow, got {other:?}"),
     }
 }
 

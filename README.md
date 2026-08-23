@@ -526,7 +526,11 @@ longer carry their own `max_turns`.
 Accounts are configured via `~/.config/choreographr/accounts.toml`. Account
 names must be lowercase alphanumeric with hyphens or underscores (`[a-z0-9_-]`).
 Each session may have its own account, set via `/account <name>`; there is no
-global default account.
+global default account. The file is watched and **reloads automatically** when
+edited externally (the daemon re-reads, applies the change, drops cached
+providers for accounts that disappeared, and pushes the fresh list to connected
+clients); the daemon's own `/add-key` writes are detected and ignored as
+no-ops.
 
 ```toml
 [[account]]
@@ -591,9 +595,10 @@ bundled overlay with the same schema — provider scalars (`protocol`,
 entries (`[provider.<slug>.models."<model>"]` with `context_window`,
 `reasoning_supported`, `reasoning_levels`, `responses`, `reasoning_passback`),
 plus wholesale provider definitions for anything models.dev doesn't list. The
-file is watched and reloads automatically on change (deleting it falls back to
-the bundled overlay; the daemon creates the config dir at startup so the watch
-installs even on a fresh system);
+file is watched (via a shared config-file watcher, together with
+`accounts.toml`) and reloads automatically on change (deleting it falls back to
+the bundled overlay; the config dir is created at startup so the watch installs
+even on a fresh system);
 `/refresh-models [--force]` re-fetches the upstream catalog on demand and also
 re-reads the user overlay (a burst of requests is coalesced into one fetch;
 each requester's status reflects its own `--force` flag).
