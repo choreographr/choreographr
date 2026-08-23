@@ -4,9 +4,12 @@
 //! and the model-selector popup (`ModelSelectorState`), plus the page-layout
 //! constants they share.
 
+use super::input::grapheme_offset_at_column;
 use super::{InputBuffer, PAGE_SCROLL_LINES, ProviderInfo};
 use choreo_proto::{AccountInfo, SessionStatus, SessionSummary, TokenUsage};
 use crossterm::event::KeyEvent;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::widgets::{Block, Borders};
 use tui_prompts::{State, TextState};
 use zeroize::Zeroize;
 
@@ -41,6 +44,223 @@ fn picker_window(scroll: usize, focused: usize, len: usize, height: usize) -> (u
         scroll = focused + 1 - height;
     }
     (scroll, height.min(len - scroll))
+}
+
+/// Shared pin-at-middle arrow/wheel navigation for the two picker popups (the
+/// wizard's provider picker and the model selector): move the highlight one
+/// row toward the top/bottom of a `len`-item list rendered in a window of
+/// `height` rows, returning the new `(focused, scroll)` pair.
+///
+/// ↓ walks the highlight down through a static window; once it reaches the
+/// middle row (`height / 2`) further presses keep it pinned there while
+/// `scroll` increments — the list slides under the highlight.  At the bottom
+/// edge (`scroll == max_scroll = len.saturating_sub(height)`) it un-pins and
+/// the highlight walks the rest of the way to the last item.  ↑ is the exact
+/// mirror: pinned at the middle while `scroll > 0` (decrementing `scroll`),
+/// un-pinned at `scroll == 0` to walk up to row 0.  When `height == 0`
+/// (viewport unknown — 0 until the first frame) it falls back to focus-only
+/// moves with the render-time `picker_window` clamp, preserving the original
+/// navigation; when the list fits the window (`len <= height`, so
+/// `max_scroll == 0`) the plain `picker_window` behavior applies (highlight
+/// walks edge to edge, window static).  `focused`/`scroll` are hints only — a
+/// stale pair is clamped locally, exactly like `picker_window`.
+fn step_focus(
+    focused: usize,
+    scroll: usize,
+    len: usize,
+    height: usize,
+    down: bool,
+) -> (usize, usize) {
+    if len == 0 {
+        // Nothing to focus: reset the pair so a stale highlight cannot linger
+        // on a list the filter just emptied.
+        return (0, 0);
+    }
+    if height == 0 {
+        // Viewport unknown: focus-only moves, `picker_window` keeps the
+        // highlight visible at render time.
+        return if down {
+            if focused + 1 < len {
+                (focused + 1, scroll)
+            } else {
+                (focused, scroll)
+            }
+        } else if focused > 0 {
+            (focused - 1, scroll)
+        } else {
+            (focused, scroll)
+        };
+    }
+    // Clamp a stale pair before stepping (a filter can narrow the list under
+    // a highlight that pointed past the end; `clamp_focus` normally does this
+    // at mutation time, this is the pure-function safety net).
+    let focused = focused.min(len - 1);
+    let max_scroll = len.saturating_sub(height);
+    let middle = height / 2;
+    if down {
+        if focused + 1 >= len {
+            // Already at the last item.
+            return (focused, scroll);
+        }
+        if scroll >= max_scroll {
+            // Window pinned at the bottom edge: un-pin and walk the highlight
+            // down (clamping a stale scroll hint to the valid range).
+            (focused + 1, max_scroll)
+        } else if focused < scroll + middle {
+            // Highlight above the middle row: walk down inside the static
+            // window.
+            (focused + 1, scroll)
+        } else {
+            // Pinned at (or below) the middle row: the list slides under the
+            // highlight, which stays at the same visual offset.
+            (focused + 1, scroll + 1)
+        }
+    } else {
+        if focused == 0 {
+            // Already at the first item.
+            return (focused, scroll);
+        }
+        if scroll == 0 {
+            // Window pinned at the top edge: un-pin and walk the highlight up.
+            (focused - 1, scroll)
+        } else if focused > scroll + middle {
+            // Highlight below the middle row: walk up inside the static
+            // window.
+            (focused - 1, scroll)
+        } else {
+            // Pinned at (or above) the middle row: the list slides under the
+            // highlight, which stays at the same visual offset.
+            (focused - 1, scroll - 1)
+        }
+    }
+}
+
+/// Sizing parameters for [`centered_popup`]: width/height as fractions of the
+/// terminal size (numerators over denominators), floored at the minimums,
+/// capped at the maximums, and clipped so the popup never touches the screen
+/// edges.
+pub(crate) struct PopupSize {
+    pub(crate) w_num: u32,
+    pub(crate) w_den: u32,
+    pub(crate) h_num: u32,
+    pub(crate) h_den: u32,
+    pub(crate) min_w: u16,
+    pub(crate) min_h: u16,
+    pub(crate) max_w: u16,
+    pub(crate) max_h: u16,
+}
+
+impl PopupSize {
+    /// The large list-popup sizing shared by the model selector and the
+    /// wizard's provider picker: ~60% of the width, ~2/3 of the height.
+    pub(crate) const LIST: PopupSize = PopupSize {
+        w_num: 3,
+        w_den: 5,
+        h_num: 2,
+        h_den: 3,
+        min_w: 24,
+        min_h: 8,
+        max_w: 100,
+        max_h: 40,
+    };
+}
+
+/// Compute a centered popup rect for a modal overlay from a [`PopupSize`].
+/// The `.min(area…)` guards keep the arithmetic panic-free on tiny terminals
+/// (clamp panics if its bounds are inverted).  Shared by the model selector
+/// and the account/credential modals so every overlay uses the same centering
+/// and clamping rules.  Lives here (state/pages.rs) so both the renderers and
+/// the connection-layer mouse handlers can use it without an import cycle.
+pub(crate) fn centered_popup(area: Rect, size: PopupSize) -> Rect {
+    let width = ((area.width as u32 * size.w_num / size.w_den) as u16)
+        .clamp(size.min_w, size.max_w)
+        .min(area.width.saturating_sub(4))
+        .max(1);
+    let height = ((area.height as u32 * size.h_num / size.h_den) as u16)
+        .clamp(size.min_h, size.max_h)
+        .min(area.height.saturating_sub(2))
+        .max(1);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
+/// The three vertical bands of the LIST-popup layout (shared by the wizard's
+/// provider picker and the model selector): the filter row on top, the
+/// scrollable list body, and the footer hint row.  Computed by
+/// [`selector_list_layout`] — the single source of truth for rendering, mouse
+/// hit-testing, and viewport caching, so the three can never drift apart
+/// (mirroring the `chat_page_layout` pattern).
+pub(crate) struct SelectorLayout {
+    pub(crate) filter_row: Rect,
+    pub(crate) body: Rect,
+    pub(crate) footer: Rect,
+}
+
+/// Compute the LIST-popup layout over `area` (the terminal frame): the
+/// centered popup, its bordered inner area, then the vertical 3-way split
+/// (filter row / body / footer).  Replicates exactly what
+/// `render_wizard_provider`/`render_model_selector` draw, so the mouse
+/// handlers and the viewport cache reuse the same geometry.  The renderers
+/// still call [`centered_popup`] themselves for the popup rect (used by
+/// `Clear` and the bordered `Block`); both paths share that pure function, so
+/// the derived bands are always the ones drawn.
+pub(crate) fn selector_list_layout(area: Rect) -> SelectorLayout {
+    let popup = centered_popup(area, PopupSize::LIST);
+    // The bordered block shrinks the inner area by one cell on every side,
+    // exactly like the renderers' `Block::borders(Borders::ALL).inner(popup)`.
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    SelectorLayout {
+        filter_row: chunks[0],
+        body: chunks[1],
+        footer: chunks[2],
+    }
+}
+
+/// Map a terminal `(column, row)` click onto the visible rows of the LIST
+/// popup's list body.  Returns the 0-based local row index within the body
+/// (0 == the first rendered list row) when the click falls inside the body
+/// area, or `None` when it lands outside the body — the filter row, the
+/// footer, the popup's borders, or past the popup entirely — where a click is
+/// a no-op for row selection.  The caller combines the local row with the
+/// current `scroll` offset and clamps against the filtered-list length (the
+/// body may extend past the visible tail when the list is shorter than the
+/// window).
+pub(crate) fn selector_local_row(layout: &SelectorLayout, column: u16, row: u16) -> Option<usize> {
+    if column < layout.body.x || column >= layout.body.x + layout.body.width {
+        return None;
+    }
+    if row < layout.body.y || row >= layout.body.y + layout.body.height {
+        return None;
+    }
+    Some((row - layout.body.y) as usize)
+}
+
+/// Position `filter`'s cursor from a left-click in the popup's filter row:
+/// the click column minus the `"> "` prefix and the popup's left border/
+/// padding maps (grapheme-aware, clamped to the text) to a byte offset in the
+/// filter text.  Shared by the wizard's provider picker and the model
+/// selector so both modals position the cursor identically.  A click at or
+/// before the prefix clamps to the start of the text; a click past the end
+/// clamps to the end (`grapheme_offset_at_column` returns `s.len()`).
+pub(crate) fn selector_position_filter_cursor(
+    filter: &mut InputBuffer,
+    layout: &SelectorLayout,
+    column: u16,
+) {
+    let col = column.saturating_sub(layout.filter_row.x + 2) as usize;
+    filter.cursor = grapheme_offset_at_column(&filter.text, col);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +392,13 @@ pub(crate) struct AccountWizardState {
     pub(crate) focused: usize,
     /// First row of the visible window into the filtered list.
     pub(crate) scroll: usize,
+    /// List-body viewport height, cached by
+    /// `update_viewport_from_terminal_size` (outside the draw closure) so
+    /// arrow/wheel navigation can pin the highlight at the middle row and
+    /// scroll the list under it.  0 until the first frame; navigation then
+    /// falls back to focus-only moves with a render-time clamp (mirrors
+    /// `SessionManagerState::viewport_height`).
+    pub(crate) viewport_height: usize,
     /// Provider chosen in step 1 (slug + display-name snapshot).  A catalog
     /// refresh arriving mid-wizard cannot shift the pick, because it is an
     /// owned snapshot rather than an index into the live list.
@@ -191,6 +418,7 @@ impl AccountWizardState {
             filter: InputBuffer::new(),
             focused: 0,
             scroll: 0,
+            viewport_height: 0,
             picked_slug: None,
             picked_name: None,
             slug: TextState::default(),
@@ -259,22 +487,23 @@ impl AccountWizardState {
         self.scroll = self.scroll.min(len - 1);
     }
 
-    pub(crate) fn move_up(&mut self) {
-        // Focus only ever decreases here, so it cannot drift past the top of
-        // the (possibly narrowed) filtered list; `scroll` is a render hint
-        // corrected by `picker_window`, so navigation needs no clamping — every
-        // path that changes the list size (`filter_key`, paste, `set_providers`)
-        // re-clamps via `clamp_focus`.
-        if self.focused > 0 {
-            self.focused -= 1;
-        }
+    pub(crate) fn move_up(&mut self, providers: &[ProviderInfo]) {
+        // Arrow/↑ and wheel-up share the pin-at-middle scroll behavior with
+        // the model selector (see `step_focus`): while the viewport height is
+        // known the highlight pins at the middle row and the list scrolls
+        // under it; at the top edge it un-pins and walks to row 0.  When the
+        // height is 0 (before the first frame) it degrades to today's
+        // focus-only move.  `providers` is the live list, used to compute the
+        // filtered length (mirroring `move_down`).
+        let len = self.filtered(providers).len();
+        (self.focused, self.scroll) =
+            step_focus(self.focused, self.scroll, len, self.viewport_height, false);
     }
 
     pub(crate) fn move_down(&mut self, providers: &[ProviderInfo]) {
         let len = self.filtered(providers).len();
-        if len > 0 && self.focused + 1 < len {
-            self.focused += 1;
-        }
+        (self.focused, self.scroll) =
+            step_focus(self.focused, self.scroll, len, self.viewport_height, true);
     }
 
     /// Page the highlight up/down by `PROVIDER_PAGE_LINES` rows (PgUp/PgDn);
@@ -482,6 +711,13 @@ pub(crate) struct ModelSelectorState {
     pub(crate) focused: usize,
     /// First row of the visible window into the filtered list.
     pub(crate) scroll: usize,
+    /// List-body viewport height, cached by
+    /// `update_viewport_from_terminal_size` (outside the draw closure) so
+    /// arrow/wheel navigation can pin the highlight at the middle row and
+    /// scroll the list under it.  0 until the first frame; navigation then
+    /// falls back to focus-only moves with a render-time clamp (mirrors
+    /// `SessionManagerState::viewport_height`).
+    pub(crate) viewport_height: usize,
     /// Popup-scoped error text (e.g. the daemon failed to list models).
     pub(crate) error: Option<String>,
 }
@@ -496,6 +732,7 @@ impl ModelSelectorState {
             filter: InputBuffer::new(),
             focused: 0,
             scroll: 0,
+            viewport_height: 0,
             error: None,
         }
     }
@@ -582,16 +819,36 @@ impl ModelSelectorState {
     }
 
     pub(crate) fn move_up(&mut self) {
-        if self.focused > 0 {
-            self.focused -= 1;
-        }
+        // Arrow/↑ and wheel-up share the pin-at-middle scroll behavior with
+        // the wizard's provider picker (see `step_focus`): while the viewport
+        // height is known the highlight pins at the middle row and the list
+        // scrolls under it; at the top edge it un-pins and walks to row 0.
+        // When the height is 0 (before the first frame) it degrades to a
+        // focus-only move.
+        let len = self.filtered().len();
+        (self.focused, self.scroll) =
+            step_focus(self.focused, self.scroll, len, self.viewport_height, false);
     }
 
     pub(crate) fn move_down(&mut self) {
         let len = self.filtered().len();
-        if len > 0 && self.focused + 1 < len {
-            self.focused += 1;
+        (self.focused, self.scroll) =
+            step_focus(self.focused, self.scroll, len, self.viewport_height, true);
+    }
+
+    /// Page the highlight up by `PROVIDER_PAGE_LINES` rows (PgUp); the render
+    /// window follows the focus.  Like `move_up`, paging up cannot drift past
+    /// the top of the list, so no clamp is needed.
+    pub(crate) fn page_up(&mut self) {
+        self.focused = self.focused.saturating_sub(PROVIDER_PAGE_LINES);
+    }
+
+    pub(crate) fn page_down(&mut self) {
+        let len = self.filtered().len();
+        if len == 0 {
+            return;
         }
+        self.focused = (self.focused + PROVIDER_PAGE_LINES).min(len - 1);
     }
 
     /// Route a key to the filter input and re-clamp focus against the
@@ -900,7 +1157,8 @@ impl SessionManagerState {
 
 #[cfg(test)]
 mod tests {
-    use super::picker_window;
+    use super::{SelectorLayout, picker_window, selector_local_row, step_focus};
+    use ratatui::layout::Rect;
 
     #[test]
     fn picker_window_empty_list_or_zero_height_returns_zero() {
@@ -955,5 +1213,231 @@ mod tests {
                 "focus must stay visible for ({scroll}, {focused}, {len}, {height})"
             );
         }
+    }
+
+    // ── step_focus (pin-at-middle arrow/wheel navigation) ───────────────
+
+    #[test]
+    fn step_focus_pins_at_middle_going_down() {
+        // 20 items in a 10-row window: the middle row is 5.  The first five
+        // ↓ presses walk the highlight down through the static window…
+        let mut focused = 0usize;
+        let mut scroll = 0usize;
+        for _ in 0..5 {
+            (focused, scroll) = step_focus(focused, scroll, 20, 10, true);
+        }
+        assert_eq!(
+            (focused, scroll),
+            (5, 0),
+            "highlight reaches the middle row"
+        );
+
+        // …the next five keep it pinned there while the list slides under it
+        // (focused − scroll stays 5).
+        for _ in 0..5 {
+            (focused, scroll) = step_focus(focused, scroll, 20, 10, true);
+        }
+        assert_eq!(
+            (focused, scroll),
+            (10, 5),
+            "pinned at the middle while scrolling"
+        );
+
+        // Still pinned when scroll reaches max_scroll (20 − 10 = 10).
+        for _ in 0..5 {
+            (focused, scroll) = step_focus(focused, scroll, 20, 10, true);
+        }
+        assert_eq!(
+            (focused, scroll),
+            (15, 10),
+            "max_scroll reached, still pinned"
+        );
+
+        // At the bottom edge it un-pins and walks to the last item.
+        for _ in 0..4 {
+            (focused, scroll) = step_focus(focused, scroll, 20, 10, true);
+        }
+        assert_eq!((focused, scroll), (19, 10), "walked to the last item");
+
+        // Further presses are no-ops.
+        (focused, scroll) = step_focus(focused, scroll, 20, 10, true);
+        assert_eq!((focused, scroll), (19, 10), "no-op at the last item");
+    }
+
+    #[test]
+    fn step_focus_un_pins_at_bottom_edge() {
+        // When the window is already pinned at max_scroll, ↓ moves the
+        // highlight without scrolling — walking from the middle row to the
+        // last item.
+        let mut focused = 5usize;
+        let mut scroll = 10usize; // max_scroll for 20 items in 10 rows
+        for _ in 0..14 {
+            (focused, scroll) = step_focus(focused, scroll, 20, 10, true);
+        }
+        assert_eq!((focused, scroll), (19, 10));
+    }
+
+    #[test]
+    fn step_focus_mirror_going_up() {
+        // Mirror of the down walk: start at the last item with the window at
+        // max_scroll.  The first presses walk the highlight up through the
+        // static window to the middle…
+        let mut focused = 19usize;
+        let mut scroll = 10usize;
+        for _ in 0..4 {
+            (focused, scroll) = step_focus(focused, scroll, 20, 10, false);
+        }
+        assert_eq!((focused, scroll), (15, 10), "walked up to the middle row");
+
+        // …then it pins at the middle while the list scrolls up until
+        // scroll reaches 0…
+        for _ in 0..10 {
+            (focused, scroll) = step_focus(focused, scroll, 20, 10, false);
+        }
+        assert_eq!(
+            (focused, scroll),
+            (5, 0),
+            "pinned at the middle while scrolling up"
+        );
+
+        // …and finally un-pins at the top edge to walk to row 0.
+        for _ in 0..5 {
+            (focused, scroll) = step_focus(focused, scroll, 20, 10, false);
+        }
+        assert_eq!((focused, scroll), (0, 0), "walked to the first row");
+
+        // Further presses are no-ops.
+        (focused, scroll) = step_focus(focused, scroll, 20, 10, false);
+        assert_eq!((focused, scroll), (0, 0), "no-op at the first row");
+    }
+
+    #[test]
+    fn step_focus_list_fits_in_window() {
+        // 3 items in a 10-row window: max_scroll == 0, so the plain
+        // picker_window behavior applies — the highlight walks edge to edge
+        // while the window stays at row 0.
+        assert_eq!(step_focus(0, 0, 3, 10, true), (1, 0));
+        assert_eq!(step_focus(1, 0, 3, 10, true), (2, 0));
+        assert_eq!(
+            step_focus(2, 0, 3, 10, true),
+            (2, 0),
+            "no-op at the last item"
+        );
+
+        assert_eq!(step_focus(2, 0, 3, 10, false), (1, 0));
+        assert_eq!(step_focus(1, 0, 3, 10, false), (0, 0));
+        assert_eq!(
+            step_focus(0, 0, 3, 10, false),
+            (0, 0),
+            "no-op at the first item"
+        );
+    }
+
+    #[test]
+    fn step_focus_height_zero_falls_back_to_focus_only() {
+        // Viewport unknown (0 until the first frame): focus-only moves with
+        // the render-time clamp — scroll is never touched.
+        assert_eq!(step_focus(0, 7, 20, 0, true), (1, 7));
+        assert_eq!(step_focus(5, 7, 20, 0, false), (4, 7));
+        assert_eq!(step_focus(0, 7, 20, 0, false), (0, 7), "no-op at the top");
+        assert_eq!(
+            step_focus(19, 7, 20, 0, true),
+            (19, 7),
+            "no-op at the bottom"
+        );
+    }
+
+    #[test]
+    fn step_focus_height_one() {
+        // A 1-row window pins at row 0 (height / 2): every press scrolls by
+        // one row.
+        assert_eq!(step_focus(0, 0, 3, 1, true), (1, 1));
+        assert_eq!(step_focus(1, 1, 3, 1, true), (2, 2));
+        assert_eq!(
+            step_focus(2, 2, 3, 1, true),
+            (2, 2),
+            "no-op at the last item"
+        );
+
+        assert_eq!(step_focus(2, 2, 3, 1, false), (1, 1));
+        assert_eq!(step_focus(1, 1, 3, 1, false), (0, 0));
+        assert_eq!(
+            step_focus(0, 0, 3, 1, false),
+            (0, 0),
+            "no-op at the first item"
+        );
+    }
+
+    #[test]
+    fn step_focus_empty_list_resets_pair() {
+        // An empty list (e.g. a filter with no matches) resets the pair so a
+        // stale highlight cannot linger.
+        assert_eq!(step_focus(3, 5, 0, 10, true), (0, 0));
+        assert_eq!(step_focus(3, 5, 0, 10, false), (0, 0));
+    }
+
+    // ── selector_local_row (click → list-row mapping) ───────────────────
+
+    /// A hand-built layout for the row-mapping tests (geometry-only, so the
+    /// numbers are picked for clarity rather than derived from a popup).
+    fn test_layout() -> SelectorLayout {
+        SelectorLayout {
+            filter_row: Rect {
+                x: 2,
+                y: 2,
+                width: 40,
+                height: 1,
+            },
+            body: Rect {
+                x: 2,
+                y: 3,
+                width: 40,
+                height: 10,
+            },
+            footer: Rect {
+                x: 2,
+                y: 13,
+                width: 40,
+                height: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn selector_local_row_maps_body_clicks_to_local_index() {
+        let layout = test_layout();
+        assert_eq!(selector_local_row(&layout, 5, 3), Some(0), "first body row");
+        assert_eq!(selector_local_row(&layout, 5, 7), Some(4));
+        assert_eq!(
+            selector_local_row(&layout, 41, 12),
+            Some(9),
+            "last body row"
+        );
+    }
+
+    #[test]
+    fn selector_local_row_below_tail_is_none() {
+        let layout = test_layout();
+        // Below the body's bottom edge: the footer row, the popup border, and
+        // the dimmed area past the popup all map to None.
+        assert_eq!(selector_local_row(&layout, 5, 13), None, "footer row");
+        assert_eq!(selector_local_row(&layout, 5, 14), None, "past the popup");
+        assert_eq!(
+            selector_local_row(&layout, 5, 2),
+            None,
+            "filter row is not body"
+        );
+    }
+
+    #[test]
+    fn selector_local_row_outside_body_is_none() {
+        let layout = test_layout();
+        // Outside the body horizontally (popup border / dimmed area).
+        assert_eq!(selector_local_row(&layout, 1, 5), None, "left of the body");
+        assert_eq!(
+            selector_local_row(&layout, 42, 5),
+            None,
+            "right of the body"
+        );
     }
 }

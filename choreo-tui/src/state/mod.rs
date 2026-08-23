@@ -730,6 +730,23 @@ impl App {
         // Computed here (outside the draw closure) because the renderer
         // never mutates app state.
         self.session_mgr.viewport_height = height.saturating_sub(4) as usize;
+        // The picker popups (the wizard's provider picker and the model
+        // selector) both render their lists in the LIST-popup body; cache
+        // that body height so arrow/wheel navigation can pin the highlight at
+        // the middle row and scroll the list under it.  Same layout math as
+        // the renderers and the mouse hit-testers (`selector_list_layout`),
+        // so the cache can never drift from what is drawn.  Both stay 0 until
+        // the first frame (viewport unknown), mirroring
+        // `session_mgr.viewport_height` — navigation falls back to focus-only
+        // moves then and `picker_window` clamps at render time.
+        let selector_layout = selector_list_layout(Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        });
+        self.ai_providers.wizard.viewport_height = selector_layout.body.height as usize;
+        self.model_selector.viewport_height = selector_layout.body.height as usize;
     }
 
     pub(crate) fn mark_terminal_resized(&mut self) {

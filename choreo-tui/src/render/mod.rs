@@ -19,11 +19,15 @@ use std::sync::Arc;
 
 // The former monolithic render.rs was split into a render/ module.  This file
 // keeps the chat/fullscreen/history drawing plus the helpers shared by several
-// pages (popup centering, cursor positioning, status/timestamp formatting),
-// while each page's dedicated rendering moved to its own submodule so every
-// frame draws exactly what it did before the split.  The submodules reach back
-// into this file via `super::` for those shared helpers, and the top-level
+// pages (cursor positioning, status/timestamp formatting, the scrollbar
+// widget), while each page's dedicated rendering moved to its own submodule so
+// every frame draws exactly what it did before the split.  The submodules reach
+// back into this file via `super::` for those shared helpers, and the top-level
 // `render()` dispatches into them through the `use self::…` imports below.
+// Popup sizing/centering and the LIST-popup 3-band layout now live in
+// `state/pages.rs` (`centered_popup`, `selector_list_layout`) so the renderers,
+// the connection-layer mouse handlers, and the viewport cache share one
+// geometry.
 mod ai_providers;
 mod model_selector;
 mod session_manager;
@@ -849,58 +853,6 @@ pub(crate) fn session_detail_tokens_line(usage: &TokenUsage) -> String {
         humfmt::number(usage.output_tokens),
         humfmt::number(usage.total_tokens),
     )
-}
-
-/// Sizing parameters for [`centered_popup`]: width/height as fractions of the
-/// terminal size (numerators over denominators), floored at the minimums,
-/// capped at the maximums, and clipped so the popup never touches the screen
-/// edges.
-struct PopupSize {
-    w_num: u32,
-    w_den: u32,
-    h_num: u32,
-    h_den: u32,
-    min_w: u16,
-    min_h: u16,
-    max_w: u16,
-    max_h: u16,
-}
-
-impl PopupSize {
-    /// The large list-popup sizing shared by the model selector and the
-    /// wizard's provider picker: ~60% of the width, ~2/3 of the height.
-    const LIST: PopupSize = PopupSize {
-        w_num: 3,
-        w_den: 5,
-        h_num: 2,
-        h_den: 3,
-        min_w: 24,
-        min_h: 8,
-        max_w: 100,
-        max_h: 40,
-    };
-}
-
-/// Compute a centered popup rect for a modal overlay from a [`PopupSize`].
-/// The `.min(area…)` guards keep the arithmetic panic-free on tiny terminals
-/// (clamp panics if its bounds are inverted).  Shared by the model selector
-/// and the account/credential modals so every overlay uses the same centering
-/// + clamping rules.
-fn centered_popup(area: Rect, size: PopupSize) -> Rect {
-    let width = ((area.width as u32 * size.w_num / size.w_den) as u16)
-        .clamp(size.min_w, size.max_w)
-        .min(area.width.saturating_sub(4))
-        .max(1);
-    let height = ((area.height as u32 * size.h_num / size.h_den) as u16)
-        .clamp(size.min_h, size.max_h)
-        .min(area.height.saturating_sub(2))
-        .max(1);
-    Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    }
 }
 
 #[cfg(test)]

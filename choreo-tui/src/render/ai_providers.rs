@@ -1,10 +1,13 @@
 // The AI-provider accounts page: the account list plus the credential and
 // new-account-wizard modals, extracted from the former monolithic render.rs.
-// Shared helpers (popup sizing/centering, cursor positioning, the scrollbar
-// widget) live in the parent render/mod.rs and are imported below.
+// Shared helpers (cursor positioning, the scrollbar widget) live in the
+// parent render/mod.rs; popup sizing/centering and the LIST-popup 3-band
+// layout live in `state/pages.rs` (`centered_popup`, `selector_list_layout`).
 use crate::markdown_render::display_width;
 use crate::scrollbar::SmoothScrollbarState;
-use crate::state::{AI_PROVIDER_ITEM_LINES, AccountWizardStep, App};
+use crate::state::{
+    AI_PROVIDER_ITEM_LINES, AccountWizardStep, App, PopupSize, centered_popup, selector_list_layout,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
@@ -14,7 +17,7 @@ use ratatui::{
 };
 use tui_prompts::{Prompt, TextPrompt};
 
-use super::{PopupSize, centered_popup, set_input_cursor, vertical_scrollbar};
+use super::{set_input_cursor, vertical_scrollbar};
 
 // ── AI Provider Accounts ──────────────────────────────────
 
@@ -259,28 +262,22 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
 fn render_wizard_provider(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     // Same footprint as the model selector: ~60% width, ~2/3 height, so the
-    // 200+ provider names get a comfortable list.
+    // 200+ provider names get a comfortable list.  The 3-band split (filter
+    // row / body / footer) comes from the shared `selector_list_layout` — the
+    // single geometry used by rendering, the mouse handlers, and the viewport
+    // cache, so a click can never land on a row the renderer did not draw.
     let popup = centered_popup(area, PopupSize::LIST);
+    let layout = selector_list_layout(area);
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
         .title(" Select Provider ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
     // ── Filter row ──────────────────────────────────────────────
-    let filter_row = chunks[0];
+    let filter_row = layout.filter_row;
     let filter_prefix = "> ";
     let filter_display = format!("{filter_prefix}{}", app.ai_providers.wizard.filter.text);
     frame.render_widget(
@@ -306,7 +303,7 @@ fn render_wizard_provider(frame: &mut Frame<'_>, app: &mut App) {
     frame.set_cursor_position((cursor_col, filter_row.y));
 
     // ── Body: list / empty state ────────────────────────────────
-    let body = chunks[1];
+    let body = layout.body;
     let list_height = body.height as usize;
     // Filter once and reuse the slice for both the window and the row loop —
     // `window` takes the already-filtered list, so the per-frame draw path
@@ -352,7 +349,7 @@ fn render_wizard_provider(frame: &mut Frame<'_>, app: &mut App) {
             " esc cancel · enter select · type to filter",
             Style::default().fg(Color::DarkGray),
         ))),
-        chunks[2],
+        layout.footer,
     );
 }
 

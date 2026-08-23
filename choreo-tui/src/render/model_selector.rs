@@ -1,17 +1,16 @@
 // The model-selector overlay, extracted from the former monolithic render.rs.
-// Drawn last over the Chat page when `app.model_selector` is open.  The popup
-// sizing/centering helpers live in the parent render/mod.rs.
+// Drawn last over the Chat page when `app.model_selector` is open.  Popup
+// sizing/centering and the LIST-popup 3-band layout live in `state/pages.rs`
+// (`centered_popup`, `selector_list_layout`), shared with the wizard's
+// provider picker and the connection-layer mouse handlers.
 use crate::markdown_render::display_width;
-use crate::state::App;
+use crate::state::{App, PopupSize, centered_popup, selector_list_layout};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
-
-use super::{PopupSize, centered_popup};
 
 /// Centered popup listing the models available on the attached session's
 /// account.  Drawn last so it covers the Chat page content.  The filter box
@@ -21,8 +20,13 @@ use super::{PopupSize, centered_popup};
 pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     // ~60% of the terminal width and ~2/3 of the height, floored at a sane
-    // minimum and capped so the popup never touches the screen edges.
+    // minimum and capped so the popup never touches the screen edges.  The
+    // 3-band split (filter row / body / footer) comes from the shared
+    // `selector_list_layout` — the single geometry used by rendering, the
+    // mouse handlers, and the viewport cache, so a click can never land on a
+    // row the renderer did not draw.
     let popup = centered_popup(area, PopupSize::LIST);
+    let layout = selector_list_layout(area);
     // Erase the region beneath so the popup reads as a solid overlay rather
     // than text drawn on top of the chat history.
     frame.render_widget(Clear, popup);
@@ -31,20 +35,10 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
         .title(" Select Model ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
     // ── Filter row ──────────────────────────────────────────────
-    let filter_row = chunks[0];
+    let filter_row = layout.filter_row;
     let filter_prefix = "> ";
     let filter_display = format!("{filter_prefix}{}", app.model_selector.filter.text);
     frame.render_widget(
@@ -70,7 +64,7 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
     frame.set_cursor_position((cursor_col, filter_row.y));
 
     // ── Body: error / loading / empty / list ───────────────────
-    let body = chunks[1];
+    let body = layout.body;
     if let Some(ref err) = app.model_selector.error {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -143,6 +137,6 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
             " esc close · enter select",
             Style::default().fg(Color::DarkGray),
         ))),
-        chunks[2],
+        layout.footer,
     );
 }

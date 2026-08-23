@@ -1,7 +1,11 @@
-use crate::state::{AccountWizardStep, App, Page};
+use crate::state::{
+    AccountWizardStep, App, Page, selector_list_layout, selector_local_row,
+    selector_position_filter_cursor,
+};
 use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name};
 use choreo_proto::ClientMessage;
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
+use ratatui::layout::Rect;
 use tui_prompts::State;
 
 pub(super) fn handle_ai_providers_event(
@@ -186,92 +190,156 @@ pub(super) fn handle_credential_modal_event(
 }
 
 /// Handle keys while the new-account wizard modal is open.  Step 1 (Provider):
-/// ↑/↓/PgUp/PgDn move the highlight, typing filters the provider list by
-/// display name, Enter picks the highlighted provider and advances to step 2,
-/// Esc cancels the whole flow.  Step 2 (Slug): typing edits the slug field,
-/// Enter validates and submits `AddAccount` (then auto-opens the credential
-/// modal), Esc returns to the provider picker.
+/// ↑/↓/PgUp/PgDn move the highlight, the mouse scroll wheel navigates like
+/// the arrows, typing filters the provider list by display name, Enter (or a
+/// left-click on a list row) picks the highlighted provider and advances to
+/// step 2, a left-click on the filter row positions the cursor, Esc cancels
+/// the whole flow.  Step 2 (Slug): typing edits the slug field, Enter
+/// validates and submits `AddAccount` (then auto-opens the credential modal),
+/// Esc returns to the provider picker.
 pub(super) fn handle_account_wizard_event(
     event: Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    let Event::Key(key) = event else {
-        return Ok(());
-    };
-    if key.kind != KeyEventKind::Press {
-        return Ok(());
-    }
+    match event {
+        Event::Key(key) => {
+            if key.kind != KeyEventKind::Press {
+                return Ok(());
+            }
 
-    match app.ai_providers.wizard.step {
-        AccountWizardStep::Provider => {
-            // Esc cancels the whole wizard back to the account list.
-            if key.code == KeyCode::Esc {
-                tracing::debug!("account wizard cancelled from provider picker");
-                app.ai_providers.wizard.close();
-                return Ok(());
-            }
-            // Enter picks the highlighted provider and advances to the slug
-            // modal (a no-op when the filtered list is empty).
-            if key.code == KeyCode::Enter {
-                app.ai_providers.wizard.confirm_provider(&app.providers);
-                if let Some(slug) = app.ai_providers.wizard.picked_slug.as_deref() {
-                    tracing::debug!(slug, "provider picked in account wizard");
+            match app.ai_providers.wizard.step {
+                AccountWizardStep::Provider => {
+                    // Esc cancels the whole wizard back to the account list.
+                    if key.code == KeyCode::Esc {
+                        tracing::debug!("account wizard cancelled from provider picker");
+                        app.ai_providers.wizard.close();
+                        return Ok(());
+                    }
+                    // Enter picks the highlighted provider and advances to the slug
+                    // modal (a no-op when the filtered list is empty).
+                    if key.code == KeyCode::Enter {
+                        app.ai_providers.wizard.confirm_provider(&app.providers);
+                        if let Some(slug) = app.ai_providers.wizard.picked_slug.as_deref() {
+                            tracing::debug!(slug, "provider picked in account wizard");
+                        }
+                        return Ok(());
+                    }
+                    match key.code {
+                        // Only arrow/paging keys navigate here — j/k MUST reach the
+                        // filter so the user can search for providers whose names
+                        // contain 'j' or 'k' (dozens: "Kimi For Coding", "Jiekou.AI",
+                        // "Sakana AI", "Amazon Bedrock", …).  This mirrors the model
+                        // selector, which also reserves just Up/Down.
+                        KeyCode::Up => app.ai_providers.wizard.move_up(&app.providers),
+                        KeyCode::Down => app.ai_providers.wizard.move_down(&app.providers),
+                        // PgUp/PgDn page the highlight (the render window follows
+                        // it), so browsing ~200 providers takes a few keypresses,
+                        // not a row-by-row walk.
+                        KeyCode::PageUp => app.ai_providers.wizard.page_up(),
+                        KeyCode::PageDown => app.ai_providers.wizard.page_down(&app.providers),
+                        // Everything else goes to the filter input (characters,
+                        // backspace, word deletes, cursor movement).  `filter_key`
+                        // returns false for Enter/Esc, which are handled above.
+                        _ => {
+                            app.ai_providers.wizard.filter_key(key, &app.providers);
+                        }
+                    }
                 }
-                return Ok(());
-            }
-            match key.code {
-                // Only arrow/paging keys navigate here — j/k MUST reach the
-                // filter so the user can search for providers whose names
-                // contain 'j' or 'k' (dozens: "Kimi For Coding", "Jiekou.AI",
-                // "Sakana AI", "Amazon Bedrock", …).  This mirrors the model
-                // selector, which also reserves just Up/Down.
-                KeyCode::Up => app.ai_providers.wizard.move_up(),
-                KeyCode::Down => app.ai_providers.wizard.move_down(&app.providers),
-                // PgUp/PgDn page the highlight (the render window follows
-                // it), so browsing ~200 providers takes a few keypresses,
-                // not a row-by-row walk.
-                KeyCode::PageUp => app.ai_providers.wizard.page_up(),
-                KeyCode::PageDown => app.ai_providers.wizard.page_down(&app.providers),
-                // Everything else goes to the filter input (characters,
-                // backspace, word deletes, cursor movement).  `filter_key`
-                // returns false for Enter/Esc, which are handled above.
-                _ => {
-                    app.ai_providers.wizard.filter_key(key, &app.providers);
+                AccountWizardStep::Slug => {
+                    // Esc backs out to the provider picker, keeping the pick.
+                    if key.code == KeyCode::Esc {
+                        tracing::debug!("account wizard backed out of slug step");
+                        app.ai_providers.wizard.back_to_provider(&app.providers);
+                        return Ok(());
+                    }
+                    // Enter validates the slug and creates the account.
+                    if key.code == KeyCode::Enter {
+                        let slug = app.ai_providers.wizard.slug.value().trim().to_string();
+                        if slug.is_empty() {
+                            tracing::debug!("slug rejected: empty");
+                            app.ai_providers.wizard.error =
+                                Some("Account slug is required".to_string());
+                            return Ok(());
+                        }
+                        if !is_valid_account_name(&slug) {
+                            tracing::debug!(%slug, "slug rejected: invalid characters");
+                            app.ai_providers.wizard.error = Some(
+                                "slug must be lowercase alphanumeric, hyphens, or underscores"
+                                    .to_string(),
+                            );
+                            return Ok(());
+                        }
+                        app.ai_providers.wizard.error = None;
+                        submit_new_account(app, client_tx)?;
+                    } else {
+                        // All other keys go to the slug input buffer.
+                        app.ai_providers.wizard.slug.handle_key_event(key);
+                    }
                 }
             }
+            Ok(())
         }
-        AccountWizardStep::Slug => {
-            // Esc backs out to the provider picker, keeping the pick.
-            if key.code == KeyCode::Esc {
-                tracing::debug!("account wizard backed out of slug step");
-                app.ai_providers.wizard.back_to_provider(&app.providers);
+        Event::Mouse(mouse) => {
+            // Mouse interaction applies only to the provider picker (step 1):
+            // the wheel scrolls the highlight (1 row per notch, same
+            // pin-at-middle behavior as the arrows), a click on a visible list
+            // row selects it (like Enter), a click on the filter row positions
+            // the cursor, and clicks anywhere else (dimmed area, outside the
+            // popup) are no-ops.  Step 2 (slug entry) has no list to interact
+            // with, so its mouse events stay ignored.
+            if app.ai_providers.wizard.step != AccountWizardStep::Provider {
                 return Ok(());
             }
-            // Enter validates the slug and creates the account.
-            if key.code == KeyCode::Enter {
-                let slug = app.ai_providers.wizard.slug.value().trim().to_string();
-                if slug.is_empty() {
-                    tracing::debug!("slug rejected: empty");
-                    app.ai_providers.wizard.error = Some("Account slug is required".to_string());
-                    return Ok(());
+            match mouse.kind {
+                MouseEventKind::ScrollDown => app.ai_providers.wizard.move_down(&app.providers),
+                MouseEventKind::ScrollUp => app.ai_providers.wizard.move_up(&app.providers),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // The popup geometry is derived from the last known
+                    // terminal size; before the first frame it is unknown, so
+                    // there is nothing to hit-test against.
+                    if let Some((width, height)) = app.last_terminal_size {
+                        let layout = selector_list_layout(Rect {
+                            x: 0,
+                            y: 0,
+                            width,
+                            height,
+                        });
+                        if let Some(local) = selector_local_row(&layout, mouse.column, mouse.row) {
+                            // Click in the list body: move the highlight to
+                            // the clicked row (scroll + local row, clamped to
+                            // the filtered-list length) and pick it, exactly
+                            // like Enter.
+                            let filtered_len =
+                                app.ai_providers.wizard.filtered(&app.providers).len();
+                            let idx = app.ai_providers.wizard.scroll.saturating_add(local);
+                            if idx < filtered_len {
+                                app.ai_providers.wizard.focused = idx;
+                                app.ai_providers.wizard.confirm_provider(&app.providers);
+                                if let Some(slug) = app.ai_providers.wizard.picked_slug.as_deref() {
+                                    tracing::debug!(slug, "provider picked in account wizard");
+                                }
+                            }
+                        } else if mouse.row == layout.filter_row.y
+                            && mouse.column >= layout.filter_row.x
+                            && mouse.column < layout.filter_row.x + layout.filter_row.width
+                        {
+                            // Click in the filter row: position the input
+                            // cursor at the clicked column.
+                            selector_position_filter_cursor(
+                                &mut app.ai_providers.wizard.filter,
+                                &layout,
+                                mouse.column,
+                            );
+                        }
+                    }
                 }
-                if !is_valid_account_name(&slug) {
-                    tracing::debug!(%slug, "slug rejected: invalid characters");
-                    app.ai_providers.wizard.error = Some(
-                        "slug must be lowercase alphanumeric, hyphens, or underscores".to_string(),
-                    );
-                    return Ok(());
-                }
-                app.ai_providers.wizard.error = None;
-                submit_new_account(app, client_tx)?;
-            } else {
-                // All other keys go to the slug input buffer.
-                app.ai_providers.wizard.slug.handle_key_event(key);
+                _ => {}
             }
+            Ok(())
         }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Send AddAccount for the slug entered in step 2, then close the wizard and
