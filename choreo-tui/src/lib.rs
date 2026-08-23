@@ -182,10 +182,20 @@ mod cli_tests {
 }
 
 #[cfg(test)]
+mod ai_providers_tests;
+#[cfg(test)]
 mod app_tests;
+#[cfg(test)]
+mod daemon_tests;
+#[cfg(test)]
+mod input_tests;
 #[cfg(test)]
 mod lib_tests;
 #[cfg(test)]
+mod model_selector_tests;
+#[cfg(test)]
 mod render_tests;
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod test_util;

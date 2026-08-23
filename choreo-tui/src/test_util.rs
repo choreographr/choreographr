@@ -1,4 +1,5 @@
 use crate::state::App;
+use choreo_proto::Turn;
 
 /// Create an `App` for testing.
 pub fn test_app() -> App {
@@ -12,4 +13,49 @@ pub fn test_app() -> App {
     app.active_session_id = Some(0);
     app.session_displays.entry(0).or_default();
     app
+}
+
+/// Add a UserText turn to the session, mimicking what the daemon sends after
+/// processing a RunInput.
+pub fn add_user_text(app: &mut App, content: &str) {
+    let turn_id = app.next_request_id;
+    app.next_request_id += 1;
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some(content.to_string()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    app.display_for(0).view.insert_or_replace(turn_id, turn);
+    app.rebuild_height_prefix();
+}
+
+/// Build a session-summary fixture for tests that seed the session manager
+/// (or drive `set_sessions` / auto-attach logic).
+pub fn make_session(id: u64, title: &str, model: &str, count: u32) -> choreo_proto::SessionSummary {
+    choreo_proto::SessionSummary {
+        session_id: id,
+        title: Some(title.to_string()),
+        selected_model: Some(model.to_string()),
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir: None,
+        created_at: 1705314000000,
+        last_modified: 1705314000000,
+        turn_count: count,
+        status: choreo_proto::SessionStatus::Inactive,
+        active_tool_groups: Vec::new(),
+        account_name: None,
+        token_usage: None,
+        context_window: None,
+        last_prompt_tokens: None,
+    }
 }

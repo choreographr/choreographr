@@ -296,12 +296,59 @@ fn render_credential_modal_shows_title_and_masked_key() {
         content.contains("API Key for \"my-account\""),
         "popup title names the account"
     );
-    // The key is masked: the full plaintext never reaches the buffer.
+    // The key is masked: neither the full plaintext nor the first-4/last-4
+    // slices a proportional mask used to expose reach the buffer.
     assert!(
         !content.contains("sk-abcdefghijklmnop"),
         "the plaintext API key is never drawn"
     );
+    assert!(
+        !content.contains("sk-ab") && !content.contains("mnop"),
+        "no 4-char prefix/suffix of the key leaks"
+    );
     assert!(content.contains("save"), "footer hint is drawn");
+}
+
+#[test]
+fn render_credential_modal_short_key_mid_cursor_does_not_panic() {
+    use crate::test_util::test_app;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = test_app();
+    app.page = crate::state::Page::AIProviders;
+    app.ai_providers.credential.open("my-account".to_string());
+    // Bug 1 regression: a short ASCII key with the cursor mid-string used to
+    // panic because the proportional byte-offset cursor landed inside a
+    // multi-byte bullet when slicing the mask.  (2 is a byte offset into
+    // "abcde" — safely between chars, but proportional math placed the cursor
+    // on a bullet boundary.)
+    app.ai_providers.credential.input.text = "abcde".to_string();
+    app.ai_providers.credential.input.cursor = 2;
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render credential modal with mid-cursor short key");
+
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        content.contains("API Key for \"my-account\""),
+        "popup title names the account"
+    );
+    // No plaintext leaks, not even a 4-char prefix/suffix slice.
+    assert!(!content.contains("abcde"), "plaintext key is never drawn");
+    assert!(
+        !content.contains("abcd") && !content.contains("bcde"),
+        "no 4-char prefix/suffix of the short key leaks"
+    );
 }
 
 // ── Session list table ────────────────────────────────────────────────
