@@ -2448,6 +2448,7 @@ dependencies = [
  "tui-prompts",
  "unicode-segmentation",
  "unicode-width",
+ "zeroize",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ use super::{InputBuffer, PAGE_SCROLL_LINES, ProviderInfo};
 use choreo_proto::{AccountInfo, SessionStatus, SessionSummary, TokenUsage};
 use crossterm::event::KeyEvent;
 use tui_prompts::{State, TextState};
+use zeroize::Zeroize;
 
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
 
@@ -179,20 +180,19 @@ impl AccountWizardState {
     /// and the slug field reset, nothing picked yet.
     pub(crate) fn open(&mut self) {
         self.open = true;
-        self.step = AccountWizardStep::Provider;
-        self.filter = InputBuffer::new();
-        self.focused = 0;
-        self.scroll = 0;
-        self.picked_slug = None;
-        self.picked_name = None;
-        self.slug = TextState::default();
-        self.error = None;
+        self.reset();
     }
 
     /// Dismiss the wizard entirely (Esc on the provider step), discarding any
     /// partial state.
     pub(crate) fn close(&mut self) {
         self.open = false;
+        self.reset();
+    }
+
+    /// Reset every field the wizard owns.  Shared by the open (fresh start)
+    /// and close (discard) paths so the two can never drift apart.
+    fn reset(&mut self) {
         self.step = AccountWizardStep::Provider;
         self.filter = InputBuffer::new();
         self.focused = 0;
@@ -265,22 +265,25 @@ impl AccountWizardState {
     }
 
     /// Route a key to the filter input and re-clamp focus against the
-    /// narrowed/expanded filtered list.  Returns whether the key was consumed
-    /// (Enter/Esc are handled by the modal event handler instead).
-    pub(crate) fn filter_key(&mut self, key: KeyEvent, providers: &[ProviderInfo]) -> bool {
-        let consumed = self.filter.handle_key(key);
-        if consumed {
+    /// narrowed/expanded filtered list.  Enter/Esc are handled by the modal
+    /// event handler before this is reached, so the key either edits the
+    /// filter or is ignored — nothing needs to be returned to the caller.
+    pub(crate) fn filter_key(&mut self, key: KeyEvent, providers: &[ProviderInfo]) {
+        if self.filter.handle_key(key) {
             self.clamp_focus(providers);
         }
-        consumed
     }
 
     /// Compute the `(start, count)` slice of the filtered provider list to
     /// render for a window of `height` rows, keeping the focused row visible.
     /// Pure (`&self`): render must never mutate focus state during `draw()`, so
     /// repeated calls with the same inputs return identical results.
-    pub(crate) fn window(&self, providers: &[ProviderInfo], height: usize) -> (usize, usize) {
-        let len = self.filtered(providers).len();
+    ///
+    /// Takes the already-filtered list — the renderer filters once and reuses
+    /// the slice for both the window and the row loop, so filtering is not
+    /// repeated per call.
+    pub(crate) fn window(&self, filtered: &[&ProviderInfo], height: usize) -> (usize, usize) {
+        let len = filtered.len();
         if len == 0 || height == 0 {
             return (0, 0);
         }
@@ -359,14 +362,26 @@ impl CredentialModalState {
 
     pub(crate) fn open(&mut self, account_name: String) {
         self.target = Some(account_name);
-        self.input = InputBuffer::new();
+        self.wipe_input();
         self.error = None;
     }
 
     pub(crate) fn close(&mut self) {
         self.target = None;
-        self.input = InputBuffer::new();
+        self.wipe_input();
         self.error = None;
+    }
+
+    /// Discard the typed key and wipe its bytes from the input buffer's heap
+    /// allocation before the `String` is dropped.  The daemon already zeroizes
+    /// its own stored `ServiceCredential` copies (choreo-keystore's
+    /// `#[zeroize(drop)]` on `ServiceCredential` plus the daemon's explicit key
+    /// wipes); this covers the TUI's transient copy of a pasted/typed API key,
+    /// which the daemon never sees.  Called by the modal's own open/close and
+    /// by the connection layer's Enter handler.
+    pub(crate) fn wipe_input(&mut self) {
+        self.input.text.zeroize();
+        self.input = InputBuffer::new();
     }
 }
 
@@ -570,13 +585,17 @@ impl ModelSelectorState {
     /// a window of `height` rows, keeping the focused row visible.
     ///
     /// This is the single place window arithmetic lives; the renderer just
-    /// draws `filtered()[start..start + count]`.  It is deliberately **pure**
+    /// draws `filtered[start..start + count]`.  It is deliberately **pure**
     /// (takes `&self`): render must never mutate scroll/focus state — that
     /// happens in the event loop before `terminal.draw()` (see the module
     /// docs in render.rs).  `scroll` is used only as a hint and is corrected
     /// locally, so repeated calls return identical results.
-    pub(crate) fn window(&self, height: usize) -> (usize, usize) {
-        let len = self.filtered().len();
+    ///
+    /// Takes the already-filtered list — the renderer filters once and reuses
+    /// the slice for both the window and the row loop, so the filter is not
+    /// re-applied per call.
+    pub(crate) fn window(&self, filtered: &[&str], height: usize) -> (usize, usize) {
+        let len = filtered.len();
         if len == 0 || height == 0 {
             return (0, 0);
         }

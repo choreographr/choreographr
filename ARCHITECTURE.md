@@ -847,9 +847,9 @@ models.dev:
   subscribed client is sent the current list immediately, so the TUI's
   new-account wizard provider picker tracks the live catalog instead of the
   static default.  The TUI sorts the incoming list alphabetically by display
-  name (`sort_providers` in `choreo-tui/src/state.rs`, applied at both the
-  static-default and broadcast entry points) because the catalog is ordered
-  by provenance, not name.
+  name (`sort_providers` in `choreo-tui/src/state/providers.rs`, applied at
+  both the static-default and broadcast entry points) because the catalog is
+  ordered by provenance, not name.
 
 ### Slug renames (one-time migration)
 

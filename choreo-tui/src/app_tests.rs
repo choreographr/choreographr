@@ -1010,7 +1010,8 @@ mod unsent_draft_tests {
         // in range, so the picker never points past the end.
         assert_eq!(app.ai_providers.wizard.focused, 1);
         assert_eq!(app.ai_providers.wizard.scroll, 1);
-        let (start, count) = app.ai_providers.wizard.window(&app.providers, 10);
+        let filtered = app.ai_providers.wizard.filtered(&app.providers);
+        let (start, count) = app.ai_providers.wizard.window(&filtered, 10);
         assert!(start + count <= app.providers.len());
     }
 

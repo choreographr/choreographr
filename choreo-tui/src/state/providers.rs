@@ -20,11 +20,11 @@ pub(crate) struct ProviderInfo {
 /// `CatalogUpdated`), because the catalog itself is deliberately ordered by
 /// provenance, not alphabetically.
 pub(crate) fn sort_providers(providers: &mut [ProviderInfo]) {
-    providers.sort_by(|a, b| {
-        a.display_name
-            .to_lowercase()
-            .cmp(&b.display_name.to_lowercase())
-    });
+    // `sort_by_cached_key` lowercases each display name once (O(n) allocations)
+    // instead of per comparison (O(n log n)).  The list is re-sorted at
+    // `App::new` and on every `CatalogUpdated`, so the one-time key cache is
+    // the cheaper path at both call sites.  Stable, like `sort_by`.
+    providers.sort_by_cached_key(|p| p.display_name.to_lowercase());
 }
 
 /// The static default provider picker list for the new-account wizard

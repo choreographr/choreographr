@@ -73,7 +73,7 @@ fn ai_providers_enter_without_selection_stays_on_page() {
 }
 
 #[test]
-fn paste_event_inserts_into_credential_input() {
+fn paste_event_inserts_into_credential_modal() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
@@ -156,7 +156,7 @@ fn advance_to_slug_phase(
 }
 
 #[test]
-fn ai_providers_new_account_starts_at_provider_selection() {
+fn ai_providers_new_account_starts_at_provider_step() {
     let mut app = test_app();
     setup_providers_new_account(&mut app);
     assert!(app.ai_providers.wizard.is_open());
@@ -288,7 +288,7 @@ fn ai_providers_new_account_arrows_navigate_provider_list() {
 }
 
 #[test]
-fn ai_providers_new_account_provider_selection_clamps_at_edges() {
+fn ai_providers_new_account_provider_focus_clamps_at_edges() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_account(&mut app);
@@ -368,7 +368,10 @@ fn ai_providers_new_account_provider_window_keeps_selection_visible() {
 
     // The render window (pure) always contains the focus, anchoring it at the
     // bottom row once it passes the fold.
-    let window = |app: &App| app.ai_providers.wizard.window(&app.providers, 10);
+    let window = |app: &App| {
+        let filtered = app.ai_providers.wizard.filtered(&app.providers);
+        app.ai_providers.wizard.window(&filtered, 10)
+    };
     app.ai_providers.wizard.focused = 50;
     let (start, count) = window(&app);
     assert!(

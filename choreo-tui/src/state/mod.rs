@@ -6452,7 +6452,8 @@ mod tests {
     fn model_selector_window_keeps_focus_visible() {
         let mut sel = selector_with_models(&["a", "b", "c", "d", "e"]);
         sel.focused = 4;
-        let (start, count) = sel.window(3);
+        let filtered = sel.filtered();
+        let (start, count) = sel.window(&filtered, 3);
         assert_eq!((start, count), (2, 3), "window slides down to reveal focus");
         assert!(sel.focused >= start && sel.focused < start + count);
     }
@@ -6462,14 +6463,15 @@ mod tests {
         let mut sel = selector_with_models(&["a", "b", "c", "d", "e"]);
         sel.scroll = 4;
         sel.focused = 1;
-        let (start, _) = sel.window(3);
+        let filtered = sel.filtered();
+        let (start, _) = sel.window(&filtered, 3);
         assert_eq!(start, 1, "window pulls up so focus is visible");
     }
 
     #[test]
     fn model_selector_window_empty_list_returns_zero() {
         let sel = selector_with_models(&[]);
-        assert_eq!(sel.window(5), (0, 0));
+        assert_eq!(sel.window(&sel.filtered(), 5), (0, 0));
         assert!(sel.highlighted().is_none());
     }
 
@@ -6484,8 +6486,9 @@ mod tests {
         let before_scroll = sel.scroll;
         let before_focused = sel.focused;
 
-        let first = sel.window(3);
-        let second = sel.window(3);
+        let filtered = sel.filtered();
+        let first = sel.window(&filtered, 3);
+        let second = sel.window(&filtered, 3);
 
         assert_eq!(first, second, "window must be deterministic");
         assert_eq!(sel.scroll, before_scroll, "window must not mutate scroll");

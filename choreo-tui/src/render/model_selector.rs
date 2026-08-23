@@ -94,10 +94,11 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
 
     // Compute the visible window (pure — `window` never mutates state, so
     // drawing the popup cannot disturb scroll/focus state mid-frame) and
-    // build the visible rows from the filtered view.
+    // build the visible rows from the filtered view.  Filter once and reuse
+    // the slice for both the window and the row loop.
     let list_height = body.height as usize;
-    let (scroll, count) = app.model_selector.window(list_height);
     let filtered = app.model_selector.filtered();
+    let (scroll, count) = app.model_selector.window(&filtered, list_height);
     let selected = app.model_selector.selected.clone();
     let focused = app.model_selector.focused;
 

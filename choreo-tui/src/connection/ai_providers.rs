@@ -1,4 +1,4 @@
-use crate::state::{AccountWizardStep, App, InputBuffer, Page};
+use crate::state::{AccountWizardStep, App, Page};
 use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name};
 use choreo_proto::ClientMessage;
 use crossterm::event::{Event, KeyCode, KeyEventKind};
@@ -31,6 +31,7 @@ fn handle_ai_providers_list_key(
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(name) = app.ai_providers.confirm_remove.take() {
+                    tracing::info!(name, "sending RemoveAccount");
                     client_tx
                         .send(ClientMessage::RemoveAccount { name: name.clone() })
                         .map_err(broken_pipe)?;
@@ -67,6 +68,7 @@ fn handle_ai_providers_list_key(
                 // pipe), the error propagates and the user stays on the
                 // accounts page instead of being stranded on Chat with an
                 // un-sent selection.
+                tracing::debug!(name, "selecting account for the active session");
                 client_tx
                     .send(ClientMessage::SetSessionAccount { name })
                     .map_err(broken_pipe)?;
@@ -79,12 +81,14 @@ fn handle_ai_providers_list_key(
             if let Some(sel) = app.ai_providers.selection
                 && let Some(account) = app.ai_providers.accounts.get(sel)
             {
+                tracing::debug!(name = %account.name, "account removal confirmation armed");
                 app.ai_providers.confirm_remove = Some(account.name.clone());
             }
         }
         // New account: open the wizard modal (searchable provider picker,
         // then slug entry, then the credential modal).
         KeyCode::Char('n') => {
+            tracing::debug!("opening new-account wizard");
             app.ai_providers.wizard.open();
         }
         // Set credential (API key) for the selected account: open the
@@ -93,6 +97,7 @@ fn handle_ai_providers_list_key(
             if let Some(sel) = app.ai_providers.selection
                 && let Some(account) = app.ai_providers.accounts.get(sel)
             {
+                tracing::debug!(name = %account.name, "opening credential modal");
                 app.ai_providers.credential.open(account.name.clone());
             }
         }
@@ -127,9 +132,14 @@ pub(super) fn handle_credential_modal_event(
                 None => return Ok(()),
             };
             let api_key = app.ai_providers.credential.input.text.trim().to_string();
-            app.ai_providers.credential.input = InputBuffer::new();
+            // Wipe the typed key from the input buffer before it is dropped
+            // (the daemon zeroizes its stored `ServiceCredential` copies; this
+            // covers the TUI's transient copy).  `api_key` is a trimmed copy
+            // moved into the encrypted message below.
+            app.ai_providers.credential.wipe_input();
 
             if api_key.is_empty() {
+                tracing::debug!(account_name, "credential save rejected: empty key");
                 app.ai_providers.credential.error = Some("API key cannot be empty".to_string());
                 app.ai_providers.credential.target = Some(account_name);
                 return Ok(());
@@ -146,12 +156,14 @@ pub(super) fn handle_credential_modal_event(
                 true,
             ) {
                 Ok(msg) => {
+                    tracing::info!(account_name, "credential encrypted and sent");
                     let _ = client_tx.send(msg);
                     app.status = Some(format!(
                         "[daemon] credential stored for account: {account_name}"
                     ));
                 }
                 Err(e) => {
+                    tracing::warn!(account_name, %e, "failed to encrypt API key");
                     app.status = Some(format!(
                         "[warning] failed to encrypt API key for {account_name}: {e}"
                     ));
@@ -160,6 +172,9 @@ pub(super) fn handle_credential_modal_event(
         }
         // Esc cancels (the account stays, the key is skipped).
         KeyCode::Esc => {
+            if let Some(target) = app.ai_providers.credential.target.as_deref() {
+                tracing::debug!(target, "credential modal cancelled");
+            }
             app.ai_providers.credential.close();
         }
         // All other keys go to the credential input buffer.
@@ -192,6 +207,7 @@ pub(super) fn handle_account_wizard_event(
         AccountWizardStep::Provider => {
             // Esc cancels the whole wizard back to the account list.
             if key.code == KeyCode::Esc {
+                tracing::debug!("account wizard cancelled from provider picker");
                 app.ai_providers.wizard.close();
                 return Ok(());
             }
@@ -199,6 +215,9 @@ pub(super) fn handle_account_wizard_event(
             // modal (a no-op when the filtered list is empty).
             if key.code == KeyCode::Enter {
                 app.ai_providers.wizard.confirm_provider(&app.providers);
+                if let Some(slug) = app.ai_providers.wizard.picked_slug.as_deref() {
+                    tracing::debug!(slug, "provider picked in account wizard");
+                }
                 return Ok(());
             }
             match key.code {
@@ -225,6 +244,7 @@ pub(super) fn handle_account_wizard_event(
         AccountWizardStep::Slug => {
             // Esc backs out to the provider picker, keeping the pick.
             if key.code == KeyCode::Esc {
+                tracing::debug!("account wizard backed out of slug step");
                 app.ai_providers.wizard.back_to_provider(&app.providers);
                 return Ok(());
             }
@@ -232,10 +252,12 @@ pub(super) fn handle_account_wizard_event(
             if key.code == KeyCode::Enter {
                 let slug = app.ai_providers.wizard.slug.value().trim().to_string();
                 if slug.is_empty() {
+                    tracing::debug!("slug rejected: empty");
                     app.ai_providers.wizard.error = Some("Account slug is required".to_string());
                     return Ok(());
                 }
                 if !is_valid_account_name(&slug) {
+                    tracing::debug!(%slug, "slug rejected: invalid characters");
                     app.ai_providers.wizard.error = Some(
                         "slug must be lowercase alphanumeric, hyphens, or underscores".to_string(),
                     );
@@ -274,6 +296,8 @@ fn submit_new_account(
         .unwrap_or_default();
 
     app.ai_providers.wizard.error = None;
+
+    tracing::info!(%slug, %provider_str, "sending AddAccount");
 
     // Create the account (no credential yet — the credential modal handles
     // that next).

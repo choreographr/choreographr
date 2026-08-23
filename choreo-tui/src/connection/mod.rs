@@ -899,9 +899,10 @@ pub(crate) fn handle_terminal_event(
 /// Insert pasted text into whichever input buffer is currently active.
 ///
 /// Routes the paste to the appropriate field based on the current page
-/// and sub-view.  On the Chat page the command input receives the paste;
-/// on the AI Providers page either the credential input or a form field
-/// (account name / API key) receives it.
+/// and overlay state.  On the Chat page the command input (or the model
+/// selector's filter, when it is open) receives the paste; on the AI
+/// Providers page the credential modal's key input, or the wizard's
+/// provider filter / slug field, receives it.
 fn handle_paste_event(data: &str, app: &mut App) -> Result<(), ClientError> {
     match app.page {
         Page::Chat => {

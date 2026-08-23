@@ -308,10 +308,13 @@ fn render_wizard_provider(frame: &mut Frame<'_>, app: &mut App) {
     // ── Body: list / empty state ────────────────────────────────
     let body = chunks[1];
     let list_height = body.height as usize;
+    // Filter once and reuse the slice for both the window and the row loop —
+    // `window` takes the already-filtered list, so the per-frame draw path
+    // does not re-scan (and re-lowercase) every provider name.
+    let filtered = app.ai_providers.wizard.filtered(&app.providers);
     // Compute the visible window (pure — `window` never mutates state, so
     // drawing the popup cannot disturb scroll/focus state mid-frame).
-    let (scroll, count) = app.ai_providers.wizard.window(&app.providers, list_height);
-    let filtered = app.ai_providers.wizard.filtered(&app.providers);
+    let (scroll, count) = app.ai_providers.wizard.window(&filtered, list_height);
     let focused = app.ai_providers.wizard.focused;
 
     if filtered.is_empty() {
