@@ -37,6 +37,7 @@ gix = { version = "0.86", features = ["tree-editor", "revision"] }
 gix-imara-diff = { version = "0.2", features = ["unified_diff"] }
 hmac = "0.13"
 image.workspace = true
+heif-oxide.workspace = true
 rand.workspace = true
 redb.workspace = true
 tiktoken = "4"
@@ -106,6 +107,13 @@ metrics = ["dep:prometheus", "dep:tiny_http"]
 # stacks) that a plain build has no use for. Opt in with `--features blockchain`
 # (or the root package's `blockchain` feature, which forwards here).
 blockchain = ["dep:choreo-blockchain"]
+# Opt-in AVIF decode via `image/avif-native` (dav1d, a C library). OFF by
+# default so the default/release build stays C-free (see the release.sh
+# static-musl rationale and the workspace `image` comment). A source build with
+# `--features avif` needs a built `libdav1d` (system pkg-config or a compiled
+# static lib) — see the dav1d crate's README for per-OS provisioning
+# (Linux pkg-config, brew on macOS, vcpkg on Windows).
+avif = ["image/avif-native"]
 # Test-only: exposes the bounded-shutdown seam (`join_session_shutdown_with_grace_for_test`)
 # used by tests/session_shutdown.rs.  Enabled for test builds via the self
 # dev-dependency below, so it never leaks into the published public API.

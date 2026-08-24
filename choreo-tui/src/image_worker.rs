@@ -1,9 +1,11 @@
 use choreo_proto::ImageMetadata;
 use crossbeam::channel;
-use image::{DynamicImage, RgbaImage, load_from_memory};
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 use ratatui::layout::Size;
 use ratatui_image::{Resize, ResizeEncodeRender, picker::Picker, protocol::StatefulProtocol};
 use resvg::{tiny_skia, usvg};
+use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -132,18 +134,50 @@ fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: I
 /// Decode raw image bytes into a [`DynamicImage`].
 ///
 /// SVG data is rasterised directly at `target_px_w × target_px_h`
-/// (preserving aspect ratio).  Raster formats use `image::load_from_memory`.
+/// (preserving aspect ratio). HEIC/HEIF goes through the pure-Rust
+/// `heif-oxide` decoder (which applies the container's orientation). Raster
+/// formats use the `image` crate and have their EXIF orientation baked in, so
+/// phone/camera photos render upright.
 fn decode_image(
     metadata: &ImageMetadata,
     data: &[u8],
     target_px_w: u32,
     target_px_h: u32,
 ) -> Result<DynamicImage, String> {
-    if metadata.mime_type == "image/svg+xml" {
-        rasterize_svg_at_size(data, target_px_w, target_px_h)
-    } else {
-        load_from_memory(data).map_err(|e| format!("failed to decode raster image: {e}"))
+    match metadata.mime_type.as_str() {
+        "image/svg+xml" => rasterize_svg_at_size(data, target_px_w, target_px_h),
+        "image/heic" | "image/heif" => decode_heic(data),
+        _ => decode_raster_oriented(data),
     }
+}
+
+/// Decode a raster image via the `image` crate, baking EXIF orientation.
+fn decode_raster_oriented(data: &[u8]) -> Result<DynamicImage, String> {
+    let reader = ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| format!("failed to guess raster format: {e}"))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| format!("failed to open raster decoder: {e}"))?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("failed to decode raster image: {e}"))?;
+    if orientation != Orientation::NoTransforms {
+        img.apply_orientation(orientation);
+    }
+    Ok(img)
+}
+
+/// Decode a HEIC/HEIF image to an RGBA [`DynamicImage`].
+///
+/// `heif-oxide` applies the container's orientation transforms and delivers
+/// display-ready sRGB, so no further rotation is needed.
+fn decode_heic(data: &[u8]) -> Result<DynamicImage, String> {
+    let decoded =
+        heif_oxide::decode_bytes(data).map_err(|e| format!("failed to decode heic: {e}"))?;
+    let rgba = RgbaImage::from_raw(decoded.width, decoded.height, decoded.to_rgba8())
+        .ok_or_else(|| "heic decoded to a buffer that does not match its size".to_string())?;
+    Ok(DynamicImage::ImageRgba8(rgba))
 }
 
 /// Parse SVG bytes into a `usvg::Tree` with system fonts loaded.
@@ -237,6 +271,43 @@ mod tests {
         };
         let result = decode_image(&metadata, &[1, 2, 3], 1, 1);
         assert!(result.is_err(), "invalid PNG bytes should fail");
+    }
+
+    #[test]
+    fn decode_image_routes_heic_mime_to_heif_decoder() {
+        // An `image/heic` mime must route to the heif-oxide path (which rejects
+        // non-HEIF bytes), NOT the image-crate raster path.
+        let metadata = ImageMetadata {
+            mime_type: "image/heic".to_string(),
+            width: 1,
+            height: 1,
+            byte_len: 3,
+            alt: None,
+        };
+        let result = decode_image(&metadata, &[1, 2, 3], 1, 1);
+        assert!(
+            result.is_err(),
+            "non-HEIF bytes should fail via the heif path"
+        );
+        assert!(
+            result.unwrap_err().contains("heic"),
+            "error should come from the heif decoder"
+        );
+    }
+
+    #[test]
+    fn decode_raster_oriented_accepts_raster_and_preserves_dimensions() {
+        // A valid PNG with no EXIF orientation decodes to the same dimensions
+        // (the orientation path must be a no-op for default orientation).
+        let buf = image::RgbaImage::from_fn(4, 3, |x, y| {
+            image::Rgba([x as u8 * 60, y as u8 * 80, 0, 255])
+        });
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(buf)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let img = decode_raster_oriented(&png.into_inner()).expect("valid PNG should decode");
+        assert_eq!(img.dimensions(), (4, 3));
     }
 
     #[test]

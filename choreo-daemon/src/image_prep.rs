@@ -8,22 +8,33 @@
 //! re-normalized on every request). Keeping both paths on one function means
 //! the handle text reports the same dimensions the model actually sees.
 //!
+//! Supported sources, all normalized to provider-allowlisted PNG (alpha) or
+//! JPEG (opaque):
+//!   - every raster format the `image` crate decodes (JPEG, PNG, GIF, WebP,
+//!     BMP, TIFF, TGA, DDS, ICO, PNM, HDR/Radiance, OpenEXR, Farbfeld, QOI);
+//!   - AVIF — only when the gated `avif` feature is enabled (`image/avif-native`,
+//!     dav1d). Recognized but rejected otherwise.
+//!   - HEIC/HEIF — decoded via the pure-Rust `heif-oxide` crate (built in);
+//!   - SVG — rasterized via `resvg`.
+//!
+//! EXIF orientation baking: raster formats (JPEG, WebP, and PNG's `eXIf`
+//! chunk) are rotated/flipped in place to the orientation the header declares,
+//! so phone/camera photos reach the model upright. HEIC carries its own
+//! orientation and is already applied by `heif-oxide`; SVG has no orientation.
+//!
 //! Fixed constants (the vision plan chose fixed limits over configurable
 //! ones): images are downscaled to fit within [`MAX_IMAGE_DIMENSION`] px on
 //! the longest edge, decoded under a decompression-bomb [`image::Limits`],
 //! and re-encoded to PNG (when the image has alpha) or JPEG (opaque) so the
 //! wire bytes are always in a provider-allowlisted format.
-//!
-//! EXIF orientation baking is deliberately **deferred** (a future
-//! enhancement): the `image` crate exposes `ImageDecoder::orientation` and
-//! `DynamicImage::apply_orientation`, but applying it would require a second
-//! decode pass; the common case (images without an EXIF orientation tag) is
-//! a no-op, and providers tolerate untransposed EXIF for most inputs.
 
 use std::io::{Cursor, Read};
 use std::path::Path;
+use std::sync::Arc;
 
-use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
+use image::metadata::Orientation;
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
+use resvg::{tiny_skia, usvg};
 use tracing::{debug, warn};
 
 /// Longest-edge cap after normalization (px). Matches the common 2000px
@@ -99,15 +110,44 @@ fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
 /// Normalize raw image bytes: sniff the format, decode under limits, resize
 /// to [`MAX_IMAGE_DIMENSION`], and re-encode to PNG (alpha) or JPEG (opaque).
 pub fn normalize_bytes(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
+    if is_heic(bytes) {
+        normalize_heic(bytes)
+    } else if is_svg(bytes) {
+        normalize_svg(bytes)
+    } else {
+        normalize_raster(bytes)
+    }
+}
+
+/// The raster formats the `image` crate can decode in this build.
+///
+/// AVIF is gated behind the `avif` feature (`image/avif-native`): recognized
+/// by magic even without it, but only decodable/rejected-there-after when on.
+fn is_supported_raster(format: ImageFormat) -> bool {
+    matches!(
+        format,
+        ImageFormat::Jpeg
+            | ImageFormat::Png
+            | ImageFormat::Gif
+            | ImageFormat::WebP
+            | ImageFormat::Pnm
+            | ImageFormat::Tiff
+            | ImageFormat::Tga
+            | ImageFormat::Dds
+            | ImageFormat::Bmp
+            | ImageFormat::Ico
+            | ImageFormat::Hdr
+            | ImageFormat::OpenExr
+            | ImageFormat::Farbfeld
+            | ImageFormat::Qoi
+    ) || (format == ImageFormat::Avif && cfg!(feature = "avif"))
+}
+
+/// Normalize a raster image via the `image` crate, baking EXIF orientation.
+fn normalize_raster(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
     let format = image::guess_format(bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    // Restrict to the vision-capable raster formats (JPEG/PNG/GIF/WebP). The
-    // animated GIF/WebP first-frame fallback is acceptable for v1; the
-    // decoder reads only the first frame.
-    if !matches!(
-        format,
-        ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Gif | ImageFormat::WebP
-    ) {
+    if !is_supported_raster(format) {
         warn!(?format, "unsupported image format");
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -124,17 +164,58 @@ pub fn normalize_bytes(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
     limits.max_image_height = Some(MAX_SOURCE_DIMENSION);
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
-    let img = reader.decode().map_err(|e| {
+
+    let mut decoder = reader.into_decoder().map_err(|e| {
+        warn!(error = %e, "failed to open raster decoder");
+        io_err(e)
+    })?;
+    // Read the EXIF orientation from the header (JPEG/WebP/PNG-eXIf) before
+    // decoding pixels, then rotate/flip in place. One decode pass total.
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| {
         // Decode failure here covers both a genuinely undecodable source and
         // the decompression-bomb guard firing (oversized source dimensions /
         // allocation), so log it as one rejection path.
         warn!(error = %e, "failed to decode image (unsupported or decompression-bomb source)");
         io_err(e)
     })?;
-    let (width, height) = img.dimensions();
+    if orientation != Orientation::NoTransforms {
+        img.apply_orientation(orientation);
+    }
+    finalize(img, format)
+}
+
+/// Normalize a HEIC/HEIF image via the pure-Rust `heif-oxide` decoder.
+///
+/// `heif-oxide` applies the container's orientation transforms and outputs
+/// display-ready sRGB, so nothing further is needed before resize/re-encode.
+fn normalize_heic(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
+    let decoded = heif_oxide::decode_bytes(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let width = decoded.width;
+    let height = decoded.height;
+    let rgba = RgbaImage::from_raw(width, height, decoded.to_rgba8()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HEIC decoded to a buffer that does not match its declared size",
+        )
+    })?;
+    finalize(DynamicImage::ImageRgba8(rgba), ImageFormat::Png)
+}
+
+/// Normalize an SVG by rasterizing it to an RGBA bitmap via `resvg`.
+fn normalize_svg(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
+    let img = rasterize_svg(bytes)?;
+    finalize(img, ImageFormat::Png)
+}
+
+/// Resize to [`MAX_IMAGE_DIMENSION`] and re-encode to PNG (alpha) or JPEG
+/// (opaque). Shared by every source so the wire bytes are consistent.
+fn finalize(img: DynamicImage, format: ImageFormat) -> std::io::Result<PreparedVisionImage> {
+    let (source_width, source_height) = img.dimensions();
 
     // Resize the longest edge down to MAX_IMAGE_DIMENSION, preserving aspect.
-    let resized = if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+    let resized = if source_width > MAX_IMAGE_DIMENSION || source_height > MAX_IMAGE_DIMENSION {
         img.resize(
             MAX_IMAGE_DIMENSION,
             MAX_IMAGE_DIMENSION,
@@ -151,8 +232,8 @@ pub fn normalize_bytes(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
     };
     debug!(
         format = ?format,
-        source_width = width,
-        source_height = height,
+        source_width,
+        source_height,
         mime = mime_type,
         output_bytes = data.len(),
         "normalized image",
@@ -165,6 +246,101 @@ pub fn normalize_bytes(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
         width,
         height,
     })
+}
+
+/// Rasterize SVG bytes to an RGBA bitmap. Faces are rendered at the SVG's
+/// intrinsic size, capped to [`MAX_IMAGE_DIMENSION`]; `finalize` downscales
+/// anything larger with Lanczos3.
+fn rasterize_svg(bytes: &[u8]) -> std::io::Result<DynamicImage> {
+    let mut options = usvg::Options::default();
+    // Load system fonts so `<text>` elements render (matching the TUI's SVG
+    // rasterizer). Failure to load is non-fatal — missing glyphs are skipped.
+    Arc::make_mut(&mut options.fontdb).load_system_fonts();
+    let tree = usvg::Tree::from_data(bytes, &options)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let size = tree.size();
+    let intrinsic_w = size.width();
+    let intrinsic_h = size.height();
+    let longest = intrinsic_w.max(intrinsic_h);
+    let scale = if longest > MAX_IMAGE_DIMENSION as f32 {
+        MAX_IMAGE_DIMENSION as f32 / longest
+    } else {
+        1.0
+    };
+    let out_w = (intrinsic_w * scale).ceil().max(1.0) as u32;
+    let out_h = (intrinsic_h * scale).ceil().max(1.0) as u32;
+
+    let mut pixmap = tiny_skia::Pixmap::new(out_w, out_h).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "svg dimensions are too large to rasterize",
+        )
+    })?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let rgba = RgbaImage::from_raw(out_w, out_h, pixmap.take()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "failed to build raster image from svg",
+        )
+    })?;
+    Ok(DynamicImage::ImageRgba8(rgba))
+}
+
+/// Detect the HEIC/HEIF `ftyp` container: an ISO-BMFF file whose major or
+/// compatible brand is an HEVC/HEIF brand. An explicit AVIF brand (`avif`/`avis`)
+/// disqualifies the file so AVIF routes to the (gated) `image` decoder instead
+/// — AVIF and HEIC are both HEIF container brands, so the generic `mif1`/`msf1`
+/// brands alone are ambiguous and cannot be trusted to pick the HEIC path.
+fn is_heic(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    // The first four bytes are the box size (big-endian). 0 = to EOF; 1 =
+    // extended size (size in a following 8-byte field) — both mean "scan to
+    // the end of what we have" for brand detection.
+    let size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let box_end = match size {
+        0 | 1 => bytes.len(),
+        n => (n as usize).min(bytes.len()),
+    };
+    let mut has_heif_brand = false;
+    let mut off = 8;
+    while off + 4 <= box_end {
+        let brand = &bytes[off..off + 4];
+        if matches!(brand, b"avif" | b"avis") {
+            return false;
+        }
+        if matches!(
+            brand,
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"heif" | b"heim" | b"heis" | b"mif1" | b"msf1"
+        ) {
+            has_heif_brand = true;
+        }
+        off += 4;
+    }
+    has_heif_brand
+}
+
+/// Detect SVG by content: leading whitespace/XML declaration, then an `<svg`
+/// root element. `resvg` does full validation on parse; this is only a cheap
+/// pre-routing heuristic so SVG never goes through the raster sniff.
+fn is_svg(bytes: &[u8]) -> bool {
+    let trimmed = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map(|i| &bytes[i..])
+        .unwrap_or(bytes);
+    if trimmed.first() != Some(&b'<') {
+        return false;
+    }
+    let window = &trimmed[..trimmed.len().min(512)];
+    let lower = window.to_ascii_lowercase();
+    lower.windows(4).any(|w| w == b"<svg")
 }
 
 /// Re-encode a `DynamicImage` as PNG (lossless — used when the image has an
@@ -196,7 +372,7 @@ fn io_err(e: image::ImageError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
+    use image::{ImageBuffer, Rgb, Rgba};
 
     /// A tiny opaque image (3×2) to exercise the JPEG re-encode path.
     fn opaque_rgb() -> DynamicImage {
@@ -251,16 +427,49 @@ mod tests {
         assert_eq!(out.height, 1000);
     }
 
+    #[cfg(not(feature = "avif"))]
     #[test]
-    fn unsupported_format_is_rejected() {
-        // BMP is a guessable format but not in the vision allowlist → rejected
-        // with the dedicated message (not a guess failure).
+    fn gated_avif_is_rejected_when_feature_disabled() {
+        // An AVIF `ftyp` header is recognized by magic regardless, but is only
+        // accepted when the gated `avif` feature is enabled.
+        let err = normalize_bytes(b"\0\0\0\x18ftypavif").unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported image format"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bmp_is_now_supported() {
+        // BMP is a guessable raster format and is in the supported set.
+        // (This is a decode that will fail on truncation, not an unsupported
+        // format — assert it is *not* the unsupported-format rejection.)
         let err = normalize_bytes(b"BM\0\0\0\0\0\0\0\0").unwrap_err();
-        assert!(err.to_string().contains("unsupported image format"));
+        assert!(
+            !err.to_string().contains("unsupported image format"),
+            "{err}"
+        );
     }
 
     #[test]
     fn empty_bytes_are_rejected() {
         assert!(normalize_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn heic_is_detected_by_ftyp_brand() {
+        assert!(is_heic(b"\0\0\0\x18ftypheic\x00\x00\x00\x00heicmif1"));
+        assert!(is_heic(b"\0\0\0\x18ftypheix\x00\x00\x00\x00mif1heix"));
+        // AVIF must NOT be routed to the HEIC decoder.
+        assert!(!is_heic(b"\0\0\0\x18ftypavif\x00\x00\x00\x00avifmif1"));
+        assert!(!is_heic(b"not a box at all"));
+    }
+
+    #[test]
+    fn svg_is_detected_by_content() {
+        assert!(is_svg(b"<svg xmlns='http://www.w3.org/2000/svg'></svg>"));
+        assert!(is_svg(b"  \n<?xml version='1.0'?><svg></svg>"));
+        assert!(!is_svg(b"\x89PNG\r\n\x1a\n"));
+        assert!(!is_svg(b"plain text"));
     }
 }

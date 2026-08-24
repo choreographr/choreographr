@@ -30,6 +30,11 @@ metrics = ["choreo-daemon/metrics"]
 # Blockchain tools (EVM / Substrate-Polkadot) from choreo-daemon. Off by
 # default; opt in with `--features blockchain`.
 blockchain = ["choreo-daemon/blockchain"]
+# Opt-in AVIF decode via `image/avif-native` (dav1d, a C library). Off by
+# default so the default/release build stays C-free (see the release.sh
+# static-musl rationale); a source build with `--features avif` enables it for
+# both the daemon (read_image / display_image) and the TUI (display decode).
+avif = ["choreo-daemon/avif", "choreo-tui/avif"]
 # mimalloc — process-wide allocator, enabled ONLY by the static musl tarball
 # build in scripts/release.sh (musl's default malloc is weaker; mimalloc's
 # per-thread heaps replace it). Off by default so crates.io / `cargo install`
@@ -205,7 +210,18 @@ ammonia = "4"
 base64 = "0.23"
 dirs = "6"
 redb = "4"
-image = "0.25"
+# Raster image codecs. Trimmed from default (which would pull the AVIF
+# *encoder* `ravif` — dead weight, since we only ever re-encode to PNG/JPEG).
+# `avif-native` (dav1d decode) is NOT enabled here: it is gated behind the
+# `avif` feature on each consumer, so the default/release build stays C-free
+# (see the release.sh static-musl rationale).
+image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp", "rayon"] }
+# Pure-Rust HEIC/HEIF still-image decoder (ISOBMFF container + HEVC via
+# rust_h265). Built in unconditionally: no C dependencies, so it does NOT
+# threaten the static-musl release build. Used by both choreo-daemon (read_img
+# normalization + display_image dimension inspection) and choreo-tui (client
+# display decode).
+heif-oxide = "0.1"
 rand = "0.10"
 resvg = "0.48"
 serde_json = "1"

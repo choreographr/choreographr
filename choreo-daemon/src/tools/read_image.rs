@@ -252,6 +252,17 @@ mod tests {
     }
 
     #[test]
+    fn svg_is_rasterized_and_reencoded_to_png() {
+        // An SVG source is rasterized to RGBA (alpha → PNG), not rejected.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='20'><rect width='10' height='20' fill='blue'/></svg>")
+            .unwrap();
+        let out = run(&file.path().display().to_string()).unwrap();
+        assert!(out.contains("10x20"), "{out}");
+        assert!(out.contains("image/png"), "{out}");
+    }
+
+    #[test]
     fn rejects_missing_path() {
         let err = run("  ").unwrap_err();
         assert!(err.to_string().contains("missing required"));

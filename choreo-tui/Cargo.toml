@@ -18,9 +18,10 @@ clap.workspace = true
 crossterm = "0.29"
 dirs.workspace = true
 image.workspace = true
+heif-oxide.workspace = true
 serde.workspace = true
 ratatui = "0.30"
-ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 signal-hook.workspace = true
 resvg.workspace = true
 syntect = "5.3"
@@ -47,6 +48,14 @@ humfmt.workspace = true
 # its `mio::unix` module is cfg-gated internally.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "fs"] }
+
+[features]
+# Opt-in AVIF decode via `image/avif-native` (dav1d, a C library). Off by
+# default so the default/release build stays C-free (see the release.sh
+# static-musl rationale and the workspace `image` comment). Forwarded from the
+# root `avif` feature so `--features avif` turns it on for the client display
+# decode path too (image_worker.rs must be able to decode AVIF it receives).
+avif = ["image/avif-native"]
 
 [dev-dependencies]
 tempfile.workspace = true

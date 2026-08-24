@@ -441,10 +441,17 @@ Markdown, query blockchains, post to X, etc.). Tools implement the `Tool` trait
 (name, group, description, JSON Schema, `fn execute`) and are registered in a
 `ToolRegistry` at daemon startup.
 
-**Vision input.** Choreographr can send images *to* the model: the `read_image`
-tool reads an image file from disk, normalizes it (resize to ≤2000px, MIME sniff,
-re-encode to PNG/JPEG under a decompression-bomb guard), and feeds it to a
-vision-capable model as image input on the next request. The normalized bytes are
+**Vision input & images.** Choreographr decodes and normalizes images for both the
+model (`read_image`) and the client UI (`display_image`): every raster format the
+`image` crate decodes (PNG, JPEG, WebP, GIF, BMP, TIFF, TGA, DDS, ICO, PNM, HDR,
+OpenEXR, Farbfeld, QOI) plus SVG (`resvg`) and HEIC/HEIF (`heif-oxide`, pure Rust).
+AVIF is gated behind the `avif` feature (`image/avif-native`/dav1d, a C library) so
+the default/release build stays C-free — see the static-musl rationale. EXIF
+orientation is baked in for raster sources (and applied by `heif-oxide` for HEIC),
+so phone/camera photos are not rotated. `read_image` reads a file from disk,
+normalizes it (resize to ≤2000px, re-encode to PNG/JPEG under a decompression-bomb
+guard), and feeds it to a vision-capable model as image input on the next request.
+The normalized bytes are
 stored durably in the `session_attachments` DB table (kept out of the compressed
 turn blob, so the source file can disappear without breaking later turns), and the
 request builder attaches those stored bytes directly on every request — no re-read

@@ -27,8 +27,46 @@ pub struct DisplayImageArgs {
 }
 
 const MAX_DISPLAY_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-const SUPPORTED_IMAGE_MIME_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/svg+xml"];
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
+
+/// The image MIME types `display_image` accepts. Covers every raster format the
+/// `image` crate decodes, plus SVG (`resvg`), plus HEIC/HEIF (`heif-oxide`), and
+/// AVIF (gated behind the `avif` feature — see `normalize_image_mime_type`).
+/// The gate is intentionally broad: the client's decoder sniffs the bytes, and
+/// `inspect_image_dimensions` validates it can actually decode the payload.
+fn is_supported_image_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png"
+            | "image/jpeg"
+            | "image/webp"
+            | "image/gif"
+            | "image/bmp"
+            | "image/x-bmp"
+            | "image/x-ms-bmp"
+            | "image/tiff"
+            | "image/tif"
+            | "image/targa"
+            | "image/x-tga"
+            | "image/x-targa"
+            | "image/vnd.microsoft.icon"
+            | "image/x-icon"
+            | "image/x-portable-anymap"
+            | "image/x-portable-pixmap"
+            | "image/x-portable-graymap"
+            | "image/x-portable-bitmap"
+            | "image/vnd.radiance"
+            | "image/x-hdr"
+            | "image/hdr"
+            | "image/x-exr"
+            | "image/openexr"
+            | "image/qoi"
+            | "image/avif"
+            | "image/heic"
+            | "image/heif"
+            | "image/svg+xml"
+    )
+}
 
 /// The `display_image` tool's return value: a human-readable text handle plus
 /// the prepared image, so the framework's `extract_image` hook reads the image
@@ -118,14 +156,22 @@ fn prepare_image(args: &DisplayImageArgs) -> io::Result<PreparedImage> {
 
 fn normalize_image_mime_type(mime_type: &str) -> io::Result<&str> {
     let normalized = mime_type.trim();
-    if SUPPORTED_IMAGE_MIME_TYPES.contains(&normalized) {
-        Ok(normalized)
-    } else {
-        Err(io::Error::new(
+    if !is_supported_image_mime(normalized) {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unsupported image mime type: {normalized}"),
-        ))
+        ));
     }
+    // AVIF is gated behind the `avif` feature (`image/avif-native`, a C
+    // library). Recognized but rejected when the feature is off, keeping the
+    // default/release build C-free.
+    if normalized == "image/avif" && !cfg!(feature = "avif") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "image/avif is gated behind the `avif` feature ".to_string(),
+        ));
+    }
+    Ok(normalized)
 }
 
 fn fetch_image_bytes(url_str: &str, expected_mime_type: &str) -> io::Result<Vec<u8>> {
@@ -174,7 +220,35 @@ fn fetch_image_bytes(url_str: &str, expected_mime_type: &str) -> io::Result<Vec<
 
 fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u32)> {
     match mime_type {
-        "image/png" | "image/jpeg" => {
+        // All raster formats the `image` crate decodes (PNG, JPEG, WebP, GIF,
+        // BMP, TIFF, TGA, DDS, ICO, PNM, HDR, OpenEXR, Farbfeld, QOI) — plus
+        // AVIF when the gated `avif` feature is on. `load_from_memory` sniffs
+        // the bytes, so the MIME is largely advisory here.
+        "image/png"
+        | "image/jpeg"
+        | "image/webp"
+        | "image/gif"
+        | "image/bmp"
+        | "image/x-bmp"
+        | "image/x-ms-bmp"
+        | "image/tiff"
+        | "image/tif"
+        | "image/targa"
+        | "image/x-tga"
+        | "image/x-targa"
+        | "image/vnd.microsoft.icon"
+        | "image/x-icon"
+        | "image/x-portable-anymap"
+        | "image/x-portable-pixmap"
+        | "image/x-portable-graymap"
+        | "image/x-portable-bitmap"
+        | "image/vnd.radiance"
+        | "image/x-hdr"
+        | "image/hdr"
+        | "image/x-exr"
+        | "image/openexr"
+        | "image/qoi"
+        | "image/avif" => {
             let image = image::load_from_memory(data).map_err(io::Error::other)?;
             Ok(image.dimensions())
         }
@@ -183,6 +257,10 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
             let tree = usvg::Tree::from_data(data, &options).map_err(io::Error::other)?;
             let size = tree.size().to_int_size();
             Ok((size.width(), size.height()))
+        }
+        "image/heic" | "image/heif" => {
+            let decoded = heif_oxide::decode_bytes(data).map_err(io::Error::other)?;
+            Ok((decoded.width, decoded.height))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -208,7 +286,7 @@ impl super::Tool for DisplayImage {
         "display_image"
     }
     fn description(&self) -> &'static str {
-        "Display a PNG, JPEG, or SVG image in the client UI."
+        "Display an image (PNG, JPEG, WebP, GIF, BMP, TIFF, SVG, HEIC/HEIF, and more; AVIF behind the `avif` feature) in the client UI."
     }
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Displaying image ({}).", args.mime_type)];
