@@ -24,6 +24,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
+use tracing::{debug, warn};
 
 /// Longest-edge cap after normalization (px). Matches the common 2000px
 /// default across the surveyed agents and comfortably fits every provider's
@@ -37,7 +38,14 @@ pub const MAX_SOURCE_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_SOURCE_DIMENSION: u32 = 8192;
 /// Cap on total decoder allocation (bytes) — the decompression-bomb guard
 /// that fires before a hostile image can allocate gigabytes.
-pub const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+///
+/// Derived from [`MAX_SOURCE_DIMENSION`] so the two cannot drift: the worst
+/// case for an in-limits source is an RGBA8 image (4 bytes per pixel) at the
+/// source dimension, i.e. `MAX_SOURCE_DIMENSION^2 * 4`. Because the guard is
+/// derived from (rather than independent of) the dimension cap, a source
+/// that passes the dimension limit always fits the allocation guard, so a
+/// legitimately in-limits decode is never rejected by decoder headroom.
+pub const MAX_DECODE_ALLOC: u64 = (MAX_SOURCE_DIMENSION as u64).pow(2) * 4;
 /// JPEG re-encode quality for opaque images.
 const JPEG_QUALITY: u8 = 85;
 
@@ -72,6 +80,11 @@ fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut capped = file.take((MAX_SOURCE_BYTES + 1) as u64);
     capped.read_to_end(&mut buf)?;
     if buf.len() > MAX_SOURCE_BYTES {
+        warn!(
+            len = buf.len(),
+            max = MAX_SOURCE_BYTES,
+            "image exceeds the maximum source size",
+        );
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -95,6 +108,7 @@ pub fn normalize_bytes(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
         format,
         ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Gif | ImageFormat::WebP
     ) {
+        warn!(?format, "unsupported image format");
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unsupported image format: {format:?}"),
@@ -110,7 +124,13 @@ pub fn normalize_bytes(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
     limits.max_image_height = Some(MAX_SOURCE_DIMENSION);
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
-    let img = reader.decode().map_err(io_err)?;
+    let img = reader.decode().map_err(|e| {
+        // Decode failure here covers both a genuinely undecodable source and
+        // the decompression-bomb guard firing (oversized source dimensions /
+        // allocation), so log it as one rejection path.
+        warn!(error = %e, "failed to decode image (unsupported or decompression-bomb source)");
+        io_err(e)
+    })?;
     let (width, height) = img.dimensions();
 
     // Resize the longest edge down to MAX_IMAGE_DIMENSION, preserving aspect.
@@ -129,6 +149,14 @@ pub fn normalize_bytes(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
     } else {
         (encode_jpeg(&resized)?, "image/jpeg")
     };
+    debug!(
+        format = ?format,
+        source_width = width,
+        source_height = height,
+        mime = mime_type,
+        output_bytes = data.len(),
+        "normalized image",
+    );
     let (width, height) = resized.dimensions();
 
     Ok(PreparedVisionImage {

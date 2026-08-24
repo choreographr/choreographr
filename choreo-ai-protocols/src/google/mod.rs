@@ -587,9 +587,11 @@ fn attach_thought_signatures(
 /// Gemini's `inline_data` is the user-role image carrier; `data` is the
 /// base64 payload (owned), `mime_type` borrows from the message.
 fn google_inline_image<'a>(image: &'a ChatImagePart) -> Option<PartPayload<'a>> {
-    // Gemini accepts PNG/JPEG/WEBP/GIF/HEIC/HEIF inline; we restrict to the
-    // four our normalization can produce (re-encode to PNG/JPEG/WEBP), so an
-    // exotic blob never reaches the provider.
+    // Gemini accepts PNG/JPEG/WEBP/GIF/HEIC/HEIF inline. The allowlist below is
+    // a superset of what the daemon's `image_prep` normalization can produce
+    // (it only ever re-encodes to PNG or JPEG, never WEBP), kept permissive so
+    // GIF/WEBP could pass through should they ever arrive, while still
+    // rejecting unsupported blobs before they reach the provider.
     const SUPPORTED: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
     if !SUPPORTED.contains(&image.mime_type.as_str()) {
         return None;

@@ -26,13 +26,6 @@ use choreo_proto::{
     OutputStream, ReasoningProducer, SessionEvent, SessionStatus, TokenUsage,
 };
 
-/// Fixed per-image token estimate for prompt-token accounting. Providers bill
-/// image input as tokens derived from (resized) dimensions, with no portable
-/// way to compute the exact count client-side; the surveyed agents converge on
-/// ~1000 tokens/image, which is a good middle estimate (DeepSeek caps at 384,
-/// Anthropic/OpenAI high-detail run higher). This feeds the context-window
-/// display and compaction weighting, not billing (which uses provider usage).
-pub const IMAGE_TOKEN_ESTIMATE: u32 = 1000;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -2426,6 +2419,13 @@ fn execute_tool_with_timeout(
     (output, cancelled, image)
 }
 
+/// Fixed per-image token estimate for prompt-token accounting. Providers bill
+/// image input as tokens derived from (resized) dimensions, with no portable
+/// way to compute the exact count client-side; the surveyed agents converge on
+/// ~1000 tokens/image, which is a good middle estimate (DeepSeek caps at 384,
+/// Anthropic/OpenAI high-detail run higher). This feeds the context-window
+/// display and compaction weighting, not billing (which uses provider usage).
+pub const IMAGE_TOKEN_ESTIMATE: u32 = 1000;
 pub const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
 pub const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
 pub const REQUEST_IMAGE_WIDTH: u32 = 640;
