@@ -570,6 +570,72 @@ fn session_range_end(session_id: u64) -> u64 {
     session_id.saturating_add(1)
 }
 
+/// Remove every attachment row belonging to `session_id` (all of its turns).
+///
+/// Shared by the session-wide delete paths ([`delete_session`] and
+/// [`delete_session_turns`]) so no orphaned image bytes survive a session or
+/// turn purge. Range-removes rows keyed by `(session_id, turn_id, slot)` using
+/// the same `(session_id, 0, "")..(session_range_end(session_id), 0, "")` bound
+/// the turns/KV deletes use, so the whole session's attachments go in one pass.
+fn delete_session_attachments(
+    write_txn: &redb::WriteTransaction,
+    session_id: u64,
+) -> io::Result<()> {
+    let mut att_table = write_txn
+        .open_table(SESSION_ATTACHMENTS)
+        .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
+    let att_keys: Vec<(u64, u32, String)> = att_table
+        .range::<(u64, u32, String)>(
+            (session_id, 0u32, String::new())..(session_range_end(session_id), 0u32, String::new()),
+        )
+        .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
+        .filter_map(|result| result.ok())
+        .map(|(k, _)| k.value())
+        .collect();
+    for key in att_keys {
+        att_table
+            .remove(key)
+            .map_err(|e| db_err(format!("redb remove session_attachment: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Remove every attachment row belonging to one turn of `session_id`.
+///
+/// Called at the start of [`write_turn`] so a re-persisted turn can never
+/// leave stale attachment rows behind: if a turn is rewritten with a shifted
+/// image layout (e.g. a display image dropped and another appended), a stale
+/// `d{i}`/`r<call_id>` row from a previous write would otherwise be re-attached
+/// to the wrong slot by [`read_turns`]. The per-turn range bound mirrors
+/// [`delete_session_attachments`] but scoped to a single `turn_id`.
+fn delete_turn_attachments(
+    write_txn: &redb::WriteTransaction,
+    session_id: u64,
+    turn_id: u32,
+) -> io::Result<()> {
+    let mut att_table = write_txn
+        .open_table(SESSION_ATTACHMENTS)
+        .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
+    // `saturating_add` mirrors `session_range_end`: at the theoretical
+    // `turn_id == u32::MAX` the bound equals the start, so the range is empty
+    // (removes nothing) instead of overflowing in debug / wrapping in release.
+    let att_keys: Vec<(u64, u32, String)> = att_table
+        .range::<(u64, u32, String)>(
+            (session_id, turn_id, String::new())
+                ..(session_id, turn_id.saturating_add(1), String::new()),
+        )
+        .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
+        .filter_map(|result| result.ok())
+        .map(|(k, _)| k.value())
+        .collect();
+    for key in att_keys {
+        att_table
+            .remove(key)
+            .map_err(|e| db_err(format!("redb remove session_attachment: {e}")))?;
+    }
+    Ok(())
+}
+
 pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
     debug!("delete_session: id={}", session_id);
     let write_txn = db
@@ -620,28 +686,10 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
                 .map_err(|e| db_err(format!("redb remove session_kv: {e}")))?;
         }
     }
-    {
-        let mut att_table = write_txn
-            .open_table(SESSION_ATTACHMENTS)
-            .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
-        // Range-remove this session's attachment rows too — the same
-        // (session_id, …)..(session_range_end(session_id), …) bound as the
-        // turns/KV deletes above, so no orphaned image bytes survive a delete.
-        let att_keys: Vec<(u64, u32, String)> = att_table
-            .range::<(u64, u32, String)>(
-                (session_id, 0u32, String::new())
-                    ..(session_range_end(session_id), 0u32, String::new()),
-            )
-            .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
-            .filter_map(|result| result.ok())
-            .map(|(k, _)| k.value())
-            .collect();
-        for key in att_keys {
-            att_table
-                .remove(key)
-                .map_err(|e| db_err(format!("redb remove session_attachment: {e}")))?;
-        }
-    }
+    // Range-remove this session's attachment rows too — the same
+    // (session_id, …)..(session_range_end(session_id), …) bound as the
+    // turns/KV deletes above, so no orphaned image bytes survive a delete.
+    delete_session_attachments(&write_txn, session_id)?;
     write_txn
         .commit()
         .map_err(|e| db_err(format!("redb commit delete: {e}")))?;
@@ -869,6 +917,13 @@ pub fn write_turn(
         // SAME write transaction so they can never diverge: a crash leaves
         // either both written or neither (the blob and its attachments are
         // atomic as a set).
+        //
+        // First drop any attachment rows left over from a previous write of
+        // this turn, so a re-persisted turn with a shifted image layout cannot
+        // re-attach stale bytes to the wrong slot on read (see
+        // [`delete_turn_attachments`]). The inserts below then persist exactly
+        // the current image set — write_turn stays idempotent.
+        delete_turn_attachments(&write_txn, session_id, turn_id)?;
         let mut attachments = write_txn
             .open_table(SESSION_ATTACHMENTS)
             .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
@@ -1045,28 +1100,10 @@ pub fn delete_session_turns(db: &redb::Database, session_id: u64) -> io::Result<
                 .map_err(|e| db_err(format!("redb remove turn: {e}")))?;
         }
     }
-    {
-        let mut att_table = write_txn
-            .open_table(SESSION_ATTACHMENTS)
-            .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
-        // Deleting all of a session's turns must also remove that session's
-        // attachment rows, so no orphaned image bytes accumulate when turns are
-        // cleared without deleting the whole session.
-        let att_keys: Vec<(u64, u32, String)> = att_table
-            .range::<(u64, u32, String)>(
-                (session_id, 0u32, String::new())
-                    ..(session_range_end(session_id), 0u32, String::new()),
-            )
-            .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
-            .filter_map(|result| result.ok())
-            .map(|(k, _)| k.value())
-            .collect();
-        for key in att_keys {
-            att_table
-                .remove(key)
-                .map_err(|e| db_err(format!("redb remove session_attachment: {e}")))?;
-        }
-    }
+    // Deleting all of a session's turns must also remove that session's
+    // attachment rows, so no orphaned image bytes accumulate when turns are
+    // cleared without deleting the whole session.
+    delete_session_attachments(&write_txn, session_id)?;
     write_txn
         .commit()
         .map_err(|e| db_err(format!("redb commit delete turns: {e}")))?;
@@ -1750,6 +1787,103 @@ mod tests {
                 "delete_session must remove the result attachment"
             );
         }
+        drop(db);
+    }
+
+    #[test]
+    fn turn_rewrite_clears_stale_attachment_slots() {
+        // A re-persisted turn must not leave stale attachment rows behind: if
+        // the image layout shifts between writes (a display image at index 0
+        // emptied and a new one appended at index 1), the stale `d0`/`r<call_id>`
+        // rows from the first write would otherwise be re-attached by
+        // `read_turns` to the wrong slots. write_turn now clears the turn's
+        // attachment range first, so only the current image set survives.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let id = 1u64;
+
+        // First write: image at display index 0 (`d0`) and a tool-result vision
+        // image (`rcall_v`) both carry bytes.
+        let mut turn = dummy_turn();
+        turn.displayed_images = vec![DisplayedImageRecord {
+            metadata: ImageMetadata {
+                mime_type: "image/png".into(),
+                width: 1,
+                height: 1,
+                byte_len: 4,
+                alt: None,
+            },
+            data: b"AAAA".to_vec(),
+            tool_call_id: Some("c0".into()),
+        }];
+        turn.tool_results = vec![ToolResultRecord {
+            call_id: "call_v".into(),
+            name: "read_image".into(),
+            content: "image".into(),
+            is_error: false,
+            invocation_description: "read_image".into(),
+            image: Some(ImageReference {
+                path: "/tmp/a.png".into(),
+                mime_type: "image/png".into(),
+                width: 1,
+                height: 1,
+                data: b"BBBB".to_vec(),
+            }),
+        }];
+        write_turn(&db, id, 0, &turn).unwrap();
+
+        // Rewrite with a shifted layout: display index 0 is now empty and a new
+        // display image with bytes is appended at index 1; the tool-result
+        // vision image has no bytes. The stale `d0`/`rcall_v` rows must be
+        // removed, leaving only `d1`.
+        let mut shifted = turn.clone();
+        shifted.displayed_images[0].data.clear();
+        shifted.displayed_images.push(DisplayedImageRecord {
+            metadata: ImageMetadata {
+                mime_type: "image/png".into(),
+                width: 2,
+                height: 2,
+                byte_len: 4,
+                alt: None,
+            },
+            data: b"CCCC".to_vec(),
+            tool_call_id: Some("c1".into()),
+        });
+        shifted.tool_results[0].image.as_mut().unwrap().data.clear();
+        write_turn(&db, id, 0, &shifted).unwrap();
+
+        // Only the current image (`d1`) may persist — the stale `d0` and
+        // `rcall_v` rows must be gone.
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(SESSION_ATTACHMENTS).unwrap();
+            assert!(
+                table.get((id, 0u32, "d0".to_string())).unwrap().is_none(),
+                "stale d0 from the first write must be cleared on rewrite"
+            );
+            assert!(
+                table
+                    .get((id, 0u32, "rcall_v".to_string()))
+                    .unwrap()
+                    .is_none(),
+                "stale rcall_v from the first write must be cleared on rewrite"
+            );
+            let d1 = table.get((id, 0u32, "d1".to_string())).unwrap().unwrap();
+            assert_eq!(d1.value(), b"CCCC");
+        }
+
+        // read_turns re-attaches exactly the current set: display index 0 stays
+        // empty (no stale bytes leak in), index 1 gets its bytes, and the
+        // tool-result image stays byte-less.
+        let turns = read_turns(&db, id).unwrap();
+        assert_eq!(turns.len(), 1);
+        let read = &turns[0].1;
+        assert_eq!(read.displayed_images[0].data, Vec::<u8>::new());
+        assert_eq!(read.displayed_images[1].data, b"CCCC");
+        assert_eq!(
+            read.tool_results[0].image.as_ref().unwrap().data,
+            Vec::<u8>::new()
+        );
         drop(db);
     }
 
