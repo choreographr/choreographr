@@ -1,4 +1,5 @@
 use super::*;
+use crate::context::LoadedSkill;
 use crate::daemon::DaemonCommand;
 use crate::providers::InferenceProvider;
 use crate::providers::test_util::{make_failing_provider, make_test_provider};
@@ -6,8 +7,9 @@ use crate::reasoning::{
     build_chat_request_messages, initial_prev_resp_id, warn_on_missing_reasoning_artifacts,
 };
 use crate::tools::context::ToolContext;
-use crate::tools::{Tool, ToolExecError, ToolRegistry};
+use crate::tools::{Tool, ToolError, ToolExecError, ToolRegistry};
 use choreo_ai_protocols::openai::{AssistantToolCall, AssistantToolFunction};
+use choreo_keystore::ServiceCredential;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 use std::sync::mpsc;
 

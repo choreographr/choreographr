@@ -1046,7 +1046,7 @@ LLM provider (API response)
 The request worker accumulates usage on a **private clone** of the session
 state and only merges it back at `RequestFinished`.  To keep every consumer
 fresh *mid-turn* (attach `SessionState` snapshots, session summaries, and
-`TokenUsageUpdate` broadcasts), `broadcast_token_usage` (requests.rs) routes the
+`TokenUsageUpdate` broadcasts), `broadcast_token_usage` (requests/tool_execution.rs) routes the
 worker's cumulative total through `SessionCommand::SyncAccumulatedUsage` to the
 session's main thread, which (1) applies it to the authoritative
 `config.accumulated_usage` — as a per-field **max** (`TokenUsage::merge_max`,
@@ -1644,7 +1644,7 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   terminal escapes or bidi-spoof the model no matter which tool delivers it.
 - **Transcript.** `sanitize_transcript` escapes only the Cf format chars (the spoofing
   class — bidi overrides, ZWSP, invisible operators, …) at the single point where every
-  tool result is recorded (`record_tool_completion` in `requests.rs`), preserving
+  tool result is recorded (`record_tool_completion` in `requests/tool_execution.rs`), preserving
   ESC/ANSI, newlines, and tabs so shell/VM colors survive. Because escaping *expands*
   (a Cf char becomes `\u{202e}`), the choke point re-applies the byte cap **after**
   sanitizing (`truncate_tool_output(&sanitize_transcript(…))`), so content that was
@@ -1903,6 +1903,14 @@ Implementation details:
 - Group metadata is appended to the system prompt in `context::build_base_prompt()`
 
 ### Concurrent tool dispatch
+
+The tool-dispatch and execution machinery (channel wiring, the wait-loop,
+streaming forwarder, timeout resolution, and per-tool result recording) lives in
+`requests/tool_execution.rs`, and the system-prompt / tool-result-collection
+helpers (`build_system_content`, `collect_tool_result`, `persist_loaded_skill`, …)
+live in `requests/system_content.rs`; both are re-exported from `requests.rs`
+via `pub(crate) use <mod>::*;` so every existing `crate::requests::X` reference
+keeps resolving unchanged. `run_agent_loop` stays in `requests.rs`.
 
 `run_agent_loop` in `requests.rs` partitions tool calls into two groups before execution:
 
@@ -2406,7 +2414,7 @@ the daemon shuts down.
 | `server/lifecycle.rs` — accept loop | `record_connection_accepted` | `choreo_connections_total +1` |
 | `sessions.rs` — `run_request_worker` | `record_request_total`, `record_request_duration` | request status + latency |
 | `requests.rs` — `run_agent_loop` turn | `record_turn` | turn count per model |
-| `requests.rs` — `execute_tool_with_timeout` | `record_tool_execution` | tool duration + status |
+| `requests/tool_execution.rs` — `execute_tool_with_timeout` | `record_tool_execution` | tool duration + status |
 | `providers/shared.rs` — `timed_result` | `record_api_call`, `record_api_error` | API latency + errors (all providers) |
 
 ---
