@@ -386,15 +386,20 @@ the model path and the UI path can never drift apart:
 **HEIC decompression-bomb guard.** `heif-oxide` exposes no decoder limit and
 allocates its YUV/RGB/RGBA buffers from file-declared geometry, so an
 untrusted HEIC could otherwise drive a huge allocation before resize. The
-crate scans the ISOBMFF box tree (`heic_declared_geometry` / `scan_boxes`)
-for the `ispe` (ImageSpatialExtentsProperty) boxes that every conformant
-still-image item carries, and rejects any container whose declared extent
-exceeds [`MAX_SOURCE_DIMENSION`] before `heif-oxide` runs. The scan descends
-only into a whitelist of container boxes (`meta`/`iprp`/`ipco`/…), never
+crate pre-parses the container (`heif::heif_geometry`, in
+`choreo-image/src/heif.rs`) for the geometry it allocates, without decoding
+any pixels: every `ispe` (ImageSpatialExtentsProperty) extent — the per-item
+frame size a single coded image or grid tile is decoded from — and every
+`grid` derived item's canvas, read from the grid item payload located via
+`iinf`/`iloc` (`rows`/`cols` × tile extent), which is the amplification
+vector a per-item cap alone does not close. Any container whose declared
+extent or canvas exceeds [`MAX_SOURCE_DIMENSION`] (or whose geometry cannot be
+proved — no `ispe`, an unlocatable/unsupported grid payload) is rejected
+before `heif-oxide` runs, the safe default. The box walk descends only into
+the `meta`/`iinf`/`iprp`/`ipco` containers and is careful about **full boxes**
+(`meta`/`iinf` carry a version/flags prefix + count), never descending into
 `mdat` raw media data, so arbitrary payload bytes cannot cause a false
-rejection. Residual risk — a grid's *tile count* amplification — is bounded by
-`choreo-daemon`'s 20 MiB source cap (each tile is a real referenced codestream
-that must decode).
+rejection.
 
 ### `choreo-keystore` — Identity keypair & credential crypto
 
