@@ -95,7 +95,8 @@ it owns the Unicode "spoofing" predicates and the shared tool-output byte
 budget / `...[truncated]` marker, so every sanitizer and streaming cap in the
 workspace agrees on the same policy and budget.
 
-`choreo-image` is a leaf crate (only `image` + `heif-oxide`) consumed by
+`choreo-image` is a leaf crate (only `image` + `heif-oxide` + `tracing`)
+consumed by
 `choreo-daemon` and `choreo-tui` — it owns the single decode path for raster
 formats (with EXIF orientation baked in) and for HEIC/HEIF (with a pre-decode
 allocation guard), so the model path and the UI path cannot drift apart.
@@ -373,15 +374,18 @@ once, and the guard tests live next to the code they protect.
 
 ### `choreo-image` — Shared image decode helpers
 
-A leaf crate (`publish = true`, depends only on `image` + `heif-oxide`) that
+A leaf crate (`publish = true`, depends only on `image` + `heif-oxide` +
+`tracing`) that
 owns the two decode paths shared by `choreo-daemon` (vision normalization for
 `read_image`, and `display_image`) and `choreo-tui` (client display decode), so
-the model path and the UI path can never drift apart:
+the model path and the UI path can never drift apart. Its only log emission is
+a `warn!`-level `tracing` event when the HEIC guard rejects a container, so a
+rejected hostile input is observable without the crate owning any state:
 
 | Function | Purpose |
 |---|---|
 | `decode_raster_oriented` | `image`-crate raster decode with EXIF orientation baked in (JPEG/WebP/PNG-`eXIf`), in one pass, under a decompression-bomb `image::Limits` guard (`MAX_SOURCE_DIMENSION` x-side, `MAX_DECODE_ALLOC`). |
-| `decode_heic` | Pure-Rust `heif-oxide` HEIC/HEIF decode. Applies the container's orientation, delivers display-ready sRGB, and runs a **pre-decode allocation guard** (see below). |
+| `decode_heic` | Pure-Rust `heif-oxide` HEIC/HEIF decode. Applies the container's orientation, delivers display-ready sRGB, and runs a **pre-decode allocation guard** (see below) — a rejection is logged via `tracing`. |
 
 **HEIC decompression-bomb guard.** `heif-oxide` exposes no decoder limit and
 allocates its YUV/RGB/RGBA buffers from file-declared geometry, so an
@@ -2525,7 +2529,11 @@ library) so the default/release build stays C-free. Raster EXIF orientation is b
 phone/camera photos reach the model upright; `heif-oxide` applies HEIC's own orientation.
 The raster-decode and HEIC-decode paths (and the HEIC pre-decode allocation guard) live
 in the shared [`choreo-image`](#choreo-image--shared-image-decode-helpers) leaf crate, so
-the model path and the TUI display path use the same guarded decoder.
+the model path and the TUI display path use the same guarded decoder. The `display_image`
+dimension probe (`tools/image.rs::inspect_image_dimensions`) also routes through the
+shared guarded decoders for *every* source — raster (via `decode_raster_oriented`'s
+`image::Limits` guard) and HEIC (via its pre-decode guard) — so a hostile image cannot
+drive a huge allocation during the probe, not just during the display/model decode.
 All sources are resized to ≤2000px, and re-encoded to PNG (alpha) or JPEG (opaque) under
 a decompression-bomb guard. The tool reports a text handle (path, dimensions, MIME,
 bytes), and returns an `ImageReference` that carries the **normalized bytes**

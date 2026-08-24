@@ -19,6 +19,7 @@ mod heif;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 use std::io::Cursor;
+use tracing::warn;
 
 /// Cap on source image dimensions for the decompression-bomb guard (px per
 /// side). Matched by the raster decode's `image::Limits` and the HEIC
@@ -33,6 +34,15 @@ pub const MAX_SOURCE_DIMENSION: u32 = 8192;
 /// from (rather than independent of) the dimension cap, a source that passes
 /// the dimension limit always fits the allocation guard.
 pub const MAX_DECODE_ALLOC: u64 = (MAX_SOURCE_DIMENSION as u64).pow(2) * 4;
+
+/// Cap on total decoded pixels — the pixel budget passed to the HEIC pre-decode
+/// geometry guard. Derived from [`MAX_SOURCE_DIMENSION`] the same way
+/// [`MAX_DECODE_ALLOC`] is derived (an in-limits source is at most
+/// [`MAX_SOURCE_DIMENSION`]² pixels), so the raster `image::Limits` guard and
+/// the HEIC geometry guard enforce the *same* allocation ceiling: a square
+/// image at the source dimension is exactly at the cap, and pixel = 4 bytes
+/// for the RGBA output `heif-oxide` produces.
+pub const MAX_DECODE_PIXELS: u64 = (MAX_SOURCE_DIMENSION as u64).pow(2);
 
 /// Decode a raster image via the `image` crate, baking EXIF orientation.
 ///
@@ -74,6 +84,10 @@ pub fn decode_raster_oriented(data: &[u8]) -> Result<DynamicImage, String> {
 /// (see [`heic_geometry_within_limits`]).
 pub fn decode_heic(data: &[u8]) -> Result<DynamicImage, String> {
     if !heic_geometry_within_limits(data) {
+        warn!(
+            size = data.len(),
+            "rejecting heic: declared geometry exceeds the decompression-bomb guard"
+        );
         return Err(
             "heic image declares dimensions beyond the decompression-bomb guard".to_string(),
         );
@@ -98,7 +112,7 @@ pub fn decode_heic(data: &[u8]) -> Result<DynamicImage, String> {
 /// whose size we cannot prove is rejected rather than decoded (the safe
 /// default — a valid HEIF still image always carries `ispe` geometry).
 fn heic_geometry_within_limits(data: &[u8]) -> bool {
-    heif::geometry_within_limits(data, MAX_SOURCE_DIMENSION, MAX_DECODE_ALLOC)
+    heif::geometry_within_limits(data, MAX_SOURCE_DIMENSION, MAX_DECODE_PIXELS)
 }
 
 #[cfg(test)]

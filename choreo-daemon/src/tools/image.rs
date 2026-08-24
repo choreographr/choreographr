@@ -226,8 +226,11 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
     match mime_type {
         // All raster formats the `image` crate decodes (PNG, JPEG, WebP, GIF,
         // BMP, TIFF, TGA, DDS, ICO, PNM, HDR, OpenEXR, Farbfeld, QOI) — plus
-        // AVIF when the gated `avif` feature is on. `load_from_memory` sniffs
-        // the bytes, so the MIME is largely advisory here.
+        // AVIF when the gated `avif` feature is on. `decode_raster_oriented`
+        // sniffs the bytes (so the MIME is largely advisory) *and* applies the
+        // decompression-bomb `image::Limits` guard, so a hostile raster can't
+        // drive a huge allocation during the dimension probe either — not just
+        // the display decode.
         "image/png"
         | "image/jpeg"
         | "image/webp"
@@ -257,8 +260,10 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
         | "image/farbfeld"
         | "image/x-farbfeld"
         | "image/avif" => {
-            let image = image::load_from_memory(data).map_err(io::Error::other)?;
-            Ok(image.dimensions())
+            // Route through the shared guarded decoder (with EXIF orientation
+            // baked in), so a hostile raster is bounded before it allocates.
+            let img = choreo_image::decode_raster_oriented(data).map_err(io::Error::other)?;
+            Ok(img.dimensions())
         }
         "image/svg+xml" => {
             let options = usvg::Options::default();
@@ -365,5 +370,41 @@ impl super::Tool for DisplayImage {
 
     fn extract_image(&self, ret: &Self::Return) -> Option<PreparedImage> {
         Some(ret.image.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::ImageFormat;
+    use std::io::Cursor;
+
+    #[test]
+    fn raster_dimension_probe_reports_dimensions() {
+        // A valid PNG goes through the guarded decoder and reports its size.
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(4, 3, |x, y| {
+            image::Rgba([x as u8 * 60, y as u8 * 80, 0, 255])
+        }));
+        let mut png = Cursor::new(Vec::new());
+        img.write_to(&mut png, ImageFormat::Png).unwrap();
+        assert_eq!(
+            inspect_image_dimensions("image/png", &png.into_inner()).unwrap(),
+            (4, 3)
+        );
+    }
+
+    #[test]
+    fn raster_dimension_probe_is_guard_limited() {
+        // A raster whose declared width is one pixel over the source cap must be
+        // rejected by the probe's decompression-bomb guard, not decoded. Encodes
+        // a real image so the rejection is attributable to `image::Limits` (the
+        // width cap) rather than to malformed bytes.
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(
+            choreo_image::MAX_SOURCE_DIMENSION + 1,
+            1,
+        ));
+        let mut png = Cursor::new(Vec::new());
+        img.write_to(&mut png, ImageFormat::Png).unwrap();
+        assert!(inspect_image_dimensions("image/png", &png.into_inner()).is_err());
     }
 }

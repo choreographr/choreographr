@@ -19,3 +19,4 @@ publish = true
 [dependencies]
 heif-oxide.workspace = true
 image.workspace = true
+tracing.workspace = true
