@@ -94,6 +94,7 @@ members = [
     "choreo-sanitize",
     "choreo-tui",
     "choreo-gui",
+    "choreo-image",
     "choreo-im",
     "choreo-transport",
 ]
@@ -201,6 +202,7 @@ choreo-client-core = { path = "choreo-client-core", version = "0.1" }
 choreo-keystore = { path = "choreo-keystore", version = "0.1" }
 choreo-proto = { path = "choreo-proto", version = "0.1" }
 choreo-sanitize = { path = "choreo-sanitize", version = "0.1" }
+choreo-image = { path = "choreo-image", version = "0.1" }
 choreo-im = { path = "choreo-im", version = "0.1" }
 choreo-markdown = { path = "choreo-markdown", version = "0.1" }
 choreo-mcp = { path = "choreo-mcp", version = "0.1" }

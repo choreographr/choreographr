@@ -59,6 +59,7 @@ choreo-keystore.workspace = true
 choreo-mcp.workspace = true
 choreo-proto.workspace = true
 choreo-sanitize.workspace = true
+choreo-image.workspace = true
 choreo-transport.workspace = true
 choreo-ai-protocols.workspace = true
 signal-hook.workspace = true

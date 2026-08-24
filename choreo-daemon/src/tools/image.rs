@@ -61,6 +61,10 @@ fn is_supported_image_mime(mime: &str) -> bool {
             | "image/x-exr"
             | "image/openexr"
             | "image/qoi"
+            | "image/x-dds"
+            | "image/vnd.ms-dds"
+            | "image/farbfeld"
+            | "image/x-farbfeld"
             | "image/avif"
             | "image/heic"
             | "image/heif"
@@ -248,6 +252,10 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
         | "image/x-exr"
         | "image/openexr"
         | "image/qoi"
+        | "image/x-dds"
+        | "image/vnd.ms-dds"
+        | "image/farbfeld"
+        | "image/x-farbfeld"
         | "image/avif" => {
             let image = image::load_from_memory(data).map_err(io::Error::other)?;
             Ok(image.dimensions())
@@ -259,8 +267,11 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
             Ok((size.width(), size.height()))
         }
         "image/heic" | "image/heif" => {
-            let decoded = heif_oxide::decode_bytes(data).map_err(io::Error::other)?;
-            Ok((decoded.width, decoded.height))
+            // Route through the shared guarded decoder so a hostile HEIC's
+            // declared geometry can't drive a huge allocation during the
+            // dimension probe either (not just the client display decode).
+            let img = choreo_image::decode_heic(data).map_err(io::Error::other)?;
+            Ok(img.dimensions())
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,

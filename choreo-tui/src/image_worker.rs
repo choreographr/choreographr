@@ -1,11 +1,9 @@
 use choreo_proto::ImageMetadata;
 use crossbeam::channel;
-use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
+use image::{DynamicImage, RgbaImage};
 use ratatui::layout::Size;
 use ratatui_image::{Resize, ResizeEncodeRender, picker::Picker, protocol::StatefulProtocol};
 use resvg::{tiny_skia, usvg};
-use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -134,10 +132,11 @@ fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: I
 /// Decode raw image bytes into a [`DynamicImage`].
 ///
 /// SVG data is rasterised directly at `target_px_w × target_px_h`
-/// (preserving aspect ratio). HEIC/HEIF goes through the pure-Rust
-/// `heif-oxide` decoder (which applies the container's orientation). Raster
-/// formats use the `image` crate and have their EXIF orientation baked in, so
-/// phone/camera photos render upright.
+/// (preserving aspect ratio). HEIC/HEIF goes through the shared pure-Rust
+/// `heif-oxide` decoder (which applies the container's orientation and gates
+/// hostile declared geometry pre-decode). Raster formats use the shared
+/// `image`-crate decoder with EXIF orientation baked in, so phone/camera
+/// photos render upright.
 fn decode_image(
     metadata: &ImageMetadata,
     data: &[u8],
@@ -146,38 +145,9 @@ fn decode_image(
 ) -> Result<DynamicImage, String> {
     match metadata.mime_type.as_str() {
         "image/svg+xml" => rasterize_svg_at_size(data, target_px_w, target_px_h),
-        "image/heic" | "image/heif" => decode_heic(data),
-        _ => decode_raster_oriented(data),
+        "image/heic" | "image/heif" => choreo_image::decode_heic(data),
+        _ => choreo_image::decode_raster_oriented(data),
     }
-}
-
-/// Decode a raster image via the `image` crate, baking EXIF orientation.
-fn decode_raster_oriented(data: &[u8]) -> Result<DynamicImage, String> {
-    let reader = ImageReader::new(Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|e| format!("failed to guess raster format: {e}"))?;
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|e| format!("failed to open raster decoder: {e}"))?;
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder)
-        .map_err(|e| format!("failed to decode raster image: {e}"))?;
-    if orientation != Orientation::NoTransforms {
-        img.apply_orientation(orientation);
-    }
-    Ok(img)
-}
-
-/// Decode a HEIC/HEIF image to an RGBA [`DynamicImage`].
-///
-/// `heif-oxide` applies the container's orientation transforms and delivers
-/// display-ready sRGB, so no further rotation is needed.
-fn decode_heic(data: &[u8]) -> Result<DynamicImage, String> {
-    let decoded =
-        heif_oxide::decode_bytes(data).map_err(|e| format!("failed to decode heic: {e}"))?;
-    let rgba = RgbaImage::from_raw(decoded.width, decoded.height, decoded.to_rgba8())
-        .ok_or_else(|| "heic decoded to a buffer that does not match its size".to_string())?;
-    Ok(DynamicImage::ImageRgba8(rgba))
 }
 
 /// Parse SVG bytes into a `usvg::Tree` with system fonts loaded.
@@ -227,6 +197,7 @@ mod tests {
     use image::GenericImageView;
     use image::imageops::FilterType;
     use ratatui_image::Resize;
+    use std::io::Cursor;
 
     #[test]
     fn rasterize_svg_at_size_produces_correct_dimensions() {
@@ -306,7 +277,8 @@ mod tests {
         image::DynamicImage::ImageRgba8(buf)
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
-        let img = decode_raster_oriented(&png.into_inner()).expect("valid PNG should decode");
+        let img = choreo_image::decode_raster_oriented(&png.into_inner())
+            .expect("valid PNG should decode");
         assert_eq!(img.dimensions(), (4, 3));
     }
 

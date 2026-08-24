@@ -24,7 +24,9 @@
 //!
 //! Fixed constants (the vision plan chose fixed limits over configurable
 //! ones): images are downscaled to fit within [`MAX_IMAGE_DIMENSION`] px on
-//! the longest edge, decoded under a decompression-bomb [`image::Limits`],
+//! the longest edge, decoded under a decompression-bomb guard (the shared
+//! [`choreo_image::decode_raster_oriented`] uses [`image::Limits`];
+//! [`choreo_image::decode_heic`] gates hostile declared geometry pre-decode),
 //! and re-encoded to PNG (when the image has alpha) or JPEG (opaque) so the
 //! wire bytes are always in a provider-allowlisted format.
 
@@ -32,8 +34,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
-use image::metadata::Orientation;
-use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
+use image::{DynamicImage, GenericImageView, ImageFormat, RgbaImage};
 use resvg::{tiny_skia, usvg};
 use tracing::{debug, warn};
 
@@ -44,19 +45,6 @@ pub const MAX_IMAGE_DIMENSION: u32 = 2000;
 /// Hard cap on the source file size we are willing to read (MiB). Larger
 /// inputs are rejected before any decode attempt.
 pub const MAX_SOURCE_BYTES: usize = 20 * 1024 * 1024;
-/// Cap on the source image dimensions used to size the decoder's
-/// decompression-bomb guard (px per side).
-pub const MAX_SOURCE_DIMENSION: u32 = 8192;
-/// Cap on total decoder allocation (bytes) — the decompression-bomb guard
-/// that fires before a hostile image can allocate gigabytes.
-///
-/// Derived from [`MAX_SOURCE_DIMENSION`] so the two cannot drift: the worst
-/// case for an in-limits source is an RGBA8 image (4 bytes per pixel) at the
-/// source dimension, i.e. `MAX_SOURCE_DIMENSION^2 * 4`. Because the guard is
-/// derived from (rather than independent of) the dimension cap, a source
-/// that passes the dimension limit always fits the allocation guard, so a
-/// legitimately in-limits decode is never rejected by decoder headroom.
-pub const MAX_DECODE_ALLOC: u64 = (MAX_SOURCE_DIMENSION as u64).pow(2) * 4;
 /// JPEG re-encode quality for opaque images.
 const JPEG_QUALITY: u8 = 85;
 
@@ -155,63 +143,37 @@ fn normalize_raster(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
         ));
     }
 
-    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
-    // Decompression-bomb guard: bound the decode before any large allocation.
-    // `Limits` is `#[non_exhaustive]`, so start from the default and set the
-    // public fields via mutation (construction is forbidden).
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_SOURCE_DIMENSION);
-    limits.max_image_height = Some(MAX_SOURCE_DIMENSION);
-    limits.max_alloc = Some(MAX_DECODE_ALLOC);
-    reader.limits(limits);
-
-    let mut decoder = reader.into_decoder().map_err(|e| {
-        warn!(error = %e, "failed to open raster decoder");
-        io_err(e)
-    })?;
-    // Read the EXIF orientation from the header (JPEG/WebP/PNG-eXIf) before
-    // decoding pixels, then rotate/flip in place. One decode pass total.
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| {
-        // Decode failure here covers both a genuinely undecodable source and
-        // the decompression-bomb guard firing (oversized source dimensions /
-        // allocation), so log it as one rejection path.
+    // The shared decoder applies the decompression-bomb `image::Limits` guard,
+    // bakes EXIF orientation (JPEG/WebP/PNG-eXIf) in one pass, and rejects the
+    // source on failure (genuinely undecodable, or the guard firing).
+    let img = choreo_image::decode_raster_oriented(bytes).map_err(|e| {
         warn!(error = %e, "failed to decode image (unsupported or decompression-bomb source)");
-        io_err(e)
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
-    if orientation != Orientation::NoTransforms {
-        img.apply_orientation(orientation);
-    }
-    finalize(img, format)
+    finalize(img, &format!("{format:?}"))
 }
 
-/// Normalize a HEIC/HEIF image via the pure-Rust `heif-oxide` decoder.
+/// Normalize a HEIC/HEIF image via the shared pure-Rust decoder.
 ///
-/// `heif-oxide` applies the container's orientation transforms and outputs
-/// display-ready sRGB, so nothing further is needed before resize/re-encode.
+/// [`choreo_image::decode_heic`] applies a pre-decode allocation guard (the
+/// container's declared `ispe` extents) so a hostile HEIC cannot drive a huge
+/// allocation, then applies the container's orientation and delivers
+/// display-ready sRGB.
 fn normalize_heic(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
-    let decoded = heif_oxide::decode_bytes(bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let width = decoded.width;
-    let height = decoded.height;
-    let rgba = RgbaImage::from_raw(width, height, decoded.to_rgba8()).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "HEIC decoded to a buffer that does not match its declared size",
-        )
-    })?;
-    finalize(DynamicImage::ImageRgba8(rgba), ImageFormat::Png)
+    let img = choreo_image::decode_heic(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    finalize(img, "heic")
 }
 
 /// Normalize an SVG by rasterizing it to an RGBA bitmap via `resvg`.
 fn normalize_svg(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
     let img = rasterize_svg(bytes)?;
-    finalize(img, ImageFormat::Png)
+    finalize(img, "svg")
 }
 
 /// Resize to [`MAX_IMAGE_DIMENSION`] and re-encode to PNG (alpha) or JPEG
 /// (opaque). Shared by every source so the wire bytes are consistent.
-fn finalize(img: DynamicImage, format: ImageFormat) -> std::io::Result<PreparedVisionImage> {
+fn finalize(img: DynamicImage, source_label: &str) -> std::io::Result<PreparedVisionImage> {
     let (source_width, source_height) = img.dimensions();
 
     // Resize the longest edge down to MAX_IMAGE_DIMENSION, preserving aspect.
@@ -231,7 +193,7 @@ fn finalize(img: DynamicImage, format: ImageFormat) -> std::io::Result<PreparedV
         (encode_jpeg(&resized)?, "image/jpeg")
     };
     debug!(
-        format = ?format,
+        source = source_label,
         source_width,
         source_height,
         mime = mime_type,
@@ -326,9 +288,12 @@ fn is_heic(bytes: &[u8]) -> bool {
     has_heif_brand
 }
 
-/// Detect SVG by content: leading whitespace/XML declaration, then an `<svg`
-/// root element. `resvg` does full validation on parse; this is only a cheap
-/// pre-routing heuristic so SVG never goes through the raster sniff.
+/// Detect SVG by content: skip leading whitespace (and any XML declaration),
+/// then look for an `<svg` root tag within the first 512 bytes. `resvg` does
+/// full validation on parse; this is only a cheap pre-routing heuristic so
+/// SVG never goes through the raster sniff. The search window is bounded and
+/// case-insensitive, and a genuine raster never starts with `<`, so real
+/// images are never misrouted here.
 fn is_svg(bytes: &[u8]) -> bool {
     let trimmed = bytes
         .iter()

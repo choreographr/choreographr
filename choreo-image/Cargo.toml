@@ -1,0 +1,21 @@
+[package]
+name = "choreo-image"
+version.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+edition = "2024"
+rust-version.workspace = true
+# Shared image decode helpers (EXIF-orientation baking, HEIC/HEIF via
+# heif-oxide with a decompression-bomb guard). Used by both choreo-daemon
+# (vision normalization, read_image / display_image) and choreo-tui (client
+# display decode). Keeping them in one leaf crate means the decode-once
+# orientation path — and the HEIC allocation guard — is applied everywhere at
+# once and cannot drift between the model path and the UI path.
+publish = true
+
+[dependencies]
+heif-oxide.workspace = true
+image.workspace = true

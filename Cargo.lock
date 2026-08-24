@@ -2280,6 +2280,7 @@ dependencies = [
  "choreo-blockchain",
  "choreo-client-core",
  "choreo-daemon",
+ "choreo-image",
  "choreo-keystore",
  "choreo-mcp",
  "choreo-proto",
@@ -2375,6 +2376,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "choreo-image"
+version = "0.1.0"
+dependencies = [
+ "heif-oxide",
+ "image",
+]
+
+[[package]]
 name = "choreo-keystore"
 version = "0.1.0"
 dependencies = [
@@ -2457,6 +2466,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "choreo-client-core",
+ "choreo-image",
  "choreo-keystore",
  "choreo-markdown",
  "choreo-proto",

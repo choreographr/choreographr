@@ -27,8 +27,8 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 
 ## Workspace topology
 
-Fifteen crates in a single Cargo workspace (resolver = "3") — the root
-package plus fourteen members:
+Sixteen crates in a single Cargo workspace (resolver = "3") — the root
+package plus fifteen members:
 
 ```
 Choreographr (workspace)
@@ -38,6 +38,8 @@ Choreographr (workspace)
 ├── choreo-proto           Wire protocol (shared types + framing)
 ├── choreo-sanitize        Leaf crate — shared Unicode "spoofing" predicates
 │                       and the tool-output byte budget + truncation marker
+├── choreo-image          Leaf crate — shared image decode (EXIF-orientation
+│                       baking, HEIC/HEIF with a pre-decode allocation guard)
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── choreo-transport       Noise IK encrypted TCP transport abstraction
 ├── choreo-client-core     Shared client logic (parsing, images, history, credentials)
@@ -92,6 +94,11 @@ Choreographr (workspace)
 it owns the Unicode "spoofing" predicates and the shared tool-output byte
 budget / `...[truncated]` marker, so every sanitizer and streaming cap in the
 workspace agrees on the same policy and budget.
+
+`choreo-image` is a leaf crate (only `image` + `heif-oxide`) consumed by
+`choreo-daemon` and `choreo-tui` — it owns the single decode path for raster
+formats (with EXIF orientation baked in) and for HEIC/HEIF (with a pre-decode
+allocation guard), so the model path and the UI path cannot drift apart.
 
 ---
 
@@ -217,7 +224,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 The workspace inherits crates.io-required fields from `[workspace.package]`
 in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
 `readme`, `description`), and members opt into publishing by *not* setting
-`publish = false`. The **publish set** is therefore fourteen of the fifteen
+`publish = false`. The **publish set** is therefore fifteen of the sixteen
 workspace members — everything except `choreo-gui` (a non-shipped stub).
 `choreo-sanitize` is published too (previously private): the members that
 depend on it must resolve it from crates.io after a release, and
@@ -226,7 +233,7 @@ cargo-release's publish verification rejects unpublished workspace deps:
 `choreographr` (root), `choreo-daemon`, `choreo-blockchain`, `choreo-tui`,
 `choreo-im`, `choreo-acp`, `choreo-proto`, `choreo-keystore`, `choreo-transport`,
 `choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`, `choreo-sanitize`,
-`choreo-markdown`
+`choreo-markdown`, `choreo-image`
 
 `choreo-gui` sets `publish = false`: it is a stub that drags in the
 dioxus/webkit2gtk native-widget tree and is not part of the shipped suite, so
@@ -237,11 +244,11 @@ out of the publish selection explicitly — `scripts/publish-stable.sh` always
 passes `--exclude choreo-gui` because cargo-release 1.1.5 does not honor
 `publish = false` in `--workspace` selection (verified: its plan lists the
 GUI crate, and a real publish would then fail on cargo's own refusal). The
-root `choreographr` package transitively depends on the other 13 publish-set
-members, so releasing the suite publishes 14 crates in dependency order.
+root `choreographr` package transitively depends on the other 14 publish-set
+members, so releasing the suite publishes 15 crates in dependency order.
 
 Releases are driven by **cargo-release** (`[workspace.metadata.release]` in
-the root `Cargo.toml`): it bumps versions, tags, and publishes the 14 crates
+the root `Cargo.toml`): it bumps versions, tags, and publishes the 15 crates
 to crates.io topologically. With `dependent-version = "fix"`, published
 manifest requirements (e.g. `choreo-tui = "0.1"`) stay in lockstep across
 minor/major bumps. The crates.io publish runs through `scripts/publish-stable.sh`
@@ -363,6 +370,31 @@ Previously this logic was duplicated across `choreo-daemon`'s `tools/mod.rs`,
 a policy or budget change (or a Unicode table bump) is applied everywhere at
 once, and the guard tests live next to the code they protect.
 
+
+### `choreo-image` — Shared image decode helpers
+
+A leaf crate (`publish = true`, depends only on `image` + `heif-oxide`) that
+owns the two decode paths shared by `choreo-daemon` (vision normalization for
+`read_image`, and `display_image`) and `choreo-tui` (client display decode), so
+the model path and the UI path can never drift apart:
+
+| Function | Purpose |
+|---|---|
+| `decode_raster_oriented` | `image`-crate raster decode with EXIF orientation baked in (JPEG/WebP/PNG-`eXIf`), in one pass, under a decompression-bomb `image::Limits` guard (`MAX_SOURCE_DIMENSION` x-side, `MAX_DECODE_ALLOC`). |
+| `decode_heic` | Pure-Rust `heif-oxide` HEIC/HEIF decode. Applies the container's orientation, delivers display-ready sRGB, and runs a **pre-decode allocation guard** (see below). |
+
+**HEIC decompression-bomb guard.** `heif-oxide` exposes no decoder limit and
+allocates its YUV/RGB/RGBA buffers from file-declared geometry, so an
+untrusted HEIC could otherwise drive a huge allocation before resize. The
+crate scans the ISOBMFF box tree (`heic_declared_geometry` / `scan_boxes`)
+for the `ispe` (ImageSpatialExtentsProperty) boxes that every conformant
+still-image item carries, and rejects any container whose declared extent
+exceeds [`MAX_SOURCE_DIMENSION`] before `heif-oxide` runs. The scan descends
+only into a whitelist of container boxes (`meta`/`iprp`/`ipco`/…), never
+`mdat` raw media data, so arbitrary payload bytes cannot cause a false
+rejection. Residual risk — a grid's *tile count* amplification — is bounded by
+`choreo-daemon`'s 20 MiB source cap (each tile is a real referenced codestream
+that must decode).
 
 ### `choreo-keystore` — Identity keypair & credential crypto
 
@@ -1187,7 +1219,7 @@ while !app.should_quit:
 | `syntax.rs` | Shared syntect helpers (`syntax_set`, `highlight_theme`, `to_ratatui_color`). Used by `markdown_render.rs` for code-block syntax highlighting. |
 | `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `choreo-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Math is pretty-printed via `choreo-markdown`'s `render_math_pretty` (a LaTeX → Unicode mapper: Greek letters, operator symbols, sub/superscripts, `\frac{..}{..}` → `a/b`, `cases`/matrix environments, `\mathbb`): inline math (`$...$`) renders as an unbreakable word coloured yellow, display math (`$$...$$`) renders as a centred block line in magenta (wrapped left-aligned when too wide for the content width, breaking the paragraph before and after); the printer is a total, depth-bounded, table-driven parser that falls back to raw source for anything it cannot map — so streaming partial input (a half-arrived `\frac{`) and hostile constructs degrade gracefully instead of losing data — and table cells run their plain-text extraction through the same printer so math in a table reads like the surrounding cell content. Code blocks are syntax-highlighted via `syntect` (shared setup from `syntax.rs`). Tool results are rendered as collapsible sections: each result's header row (triangle + first line of the invocation description, falling back to the `tool result:`/`tool error:` label while the description is empty) is always drawn, the full invocation description (including any wrapped continuation lines) stays visible beneath it, and the body (label row + content) appears below only when expanded — the description is wrapped two columns narrower than the content width so the triangle-prefixed header row never overflows the viewport. Tool results are dispatched to one of three renderers in fixed order: ANSI-escaped content takes the colored `ansi_lines` path, error results and every non-allowlisted tool render as **plain text** (verbatim) — so `**` in a grep match or shell line is data, not emphasis, and hostile results cannot weaponize markdown syntax to restyle output — and only tools that emit markdown by design reach the styled markdown parser (`MARKDOWN_TOOLS`: `pdf_to_markdown`; the daemon's `git_diff`/`git_show`/`git_add`/`edit_file`, whose diffs arrive ` ```diff `-fenced; and `write_file`, which returns the written file's contents in a `fence_content`-sized code block tagged by `ext_to_lang`, so the fence renders as a syntax-highlighted code block rather than literal fence markers). Verbatim plain text is still pre-wrapped at the tool content width (`plain_text_lines` → `wrap_plain_line`): lines that exceed the width are broken at whitespace boundaries when one fits, else hard-split by grapheme cluster via the shared `grapheme_chunks` (the same hard-splitter `split_word_to_width` uses for markdown word-splitting), preserving every character — indentation and aligned columns included — so no rendered line overflows the non-wrapping `Paragraph` that draws the history. Every tool-result body first passes through `sanitize_for_terminal`, which keeps complete SGR color sequences verbatim (so `ansi_lines` coloring survives) but escapes every other control/format char — lone CR included (a CRLF pair is folded to a single `\n`), and via the shared `choreo_sanitize::is_unsafe_unicode` predicate — the sink defense that makes raw shell/VM streams safe to draw (see "Tool output sanitization and bounding"); it iterates with a `Peekable<Chars>` (no intermediate `Vec<char>`, one reused ESC-sequence buffer), so the streaming fast path stays O(chunk) per chunk. Sanitized content then passes through `expand_tabs`, which replaces each `\t` with spaces advancing to the next 4-column stop (tracking the column per logical line; complete SGR sequences are copied through without advancing the column, so a tab after a color code still pads to the correct stop): `unicode-width` measures `\t` as 0 columns and ratatui drops control chars at draw time, so a literal tab would both mis-measure every width computation (wrap, height `div_ceil`, fill padding) and silently vanish from the rendered output — expansion makes the measured width exactly what ratatui draws and keeps tab-aligned columns aligned. Diff rendering is now fully opt-in rather than content-detected: within the markdown renderer a ` ```diff ` fenced code block — the daemon emits every diff fenced that way (git tools via `append_fenced_diff`/`git_diff_impl`, `edit_file` inline in `format_edit_result`) — has its *interior* handed to `diff_render::try_render_diff_content` (side-by-side when the block width is ≥ 40, unified otherwise), while the surrounding text (e.g. `git_show`'s commit preamble) renders normally; a ` ```diff ` block whose interior isn't a parseable diff falls back to a literal code block. Because only fence interiors ever reach the diff parser, the raw `--- ` / `diff --git` auto-detection sniffs — and the `DIFF_EXCLUDED_TOOLS` gate they forced — are gone. Collapse defaults come from `tool_result_default_collapsed`: quiet tools (`read_file`, `read_file_range`, `http_request`) default collapsed — the old hard suppression of their verbatim bodies is now just a default state, so expanding a quiet tool reveals the content — while error results and everything else default expanded. Tool call labels (`tool: name(args)`) have been removed from the assistant block — tool invocations are now visible through the `invocation_description` rendered in each result's header, and through streaming output. The assistant block renders the response first, followed by a collapsible reasoning section: a dimmed header line (arrow glyph + "Reasoning") is always shown when reasoning content exists, with the reasoning body below it only when expanded (▼), or hidden behind a right-pointing arrow (▶) once the response arrives. A request-level failure (`Turn.error`) renders as a red block below the user text: the message is pre-wrapped at the content width through the same `plain_text_lines` wrapper (an unwrapped single line would clip at the viewport edge — long provider JSON truncates mid-token) after passing the same terminal-safety gate as tool output (`sanitize_for_terminal` + `expand_tabs`, so hostile bytes in a provider error body render inert), so every line fits the non-wrapping history `Paragraph` and the height math stays exact. `render_turn_lines` returns a `RenderedTurnLines` struct carrying the reasoning header's semantic-line index, each tool result header's semantic-line index, a per-line *content column range* (`content_ranges` — where each row's real text starts/ends, `None` for pure-chrome rows like box separators/padding, and an *empty* `(lo, lo)` range for blank *content* rows so the selection copy can tell the renderer's blank spacers (heading/paragraph breaks, blank lines in tool output) apart from chrome and keep them as blank lines), and a per-line *copy-join* record (`joins`, a `LineJoin` vector aligned with the lines) so callers never re-scan the rendered output to locate them or the selectable cells. The copy-join metadata is what lets a selection copy the *original* text instead of the renderer's wrapped rows: every row records how it glues to the row before it — `Break` for a fresh paragraph/block (a list item, a code line, a table row, box chrome), `Space` for a wrapped continuation whose reflow consumed a word boundary (the copy re-inserts the one separating space), and `Join` for a hard mid-word grapheme split (`split_word_to_width`/`grapheme_chunks`) or a plain-text wrap that kept its whitespace run on the previous chunk (`wrap_plain_line` cuts at whitespace boundaries and keeps the run on the previous chunk, so `Join` concatenation reproduces the input byte-for-byte). `wrap_styled_line`/`inlines_to_lines` record `Space` at word-boundary flushes and `Join` after split-word flushes; code lines, list items, and table rows stay `Break`; blockquote rows are forced `Break` so the per-row `"> "` markers never merge mid-copy. |
 | `lib.rs` | `RenderedImage` struct, `build_picker()` helper, public re-exports |
-| `image_worker.rs` | Background worker thread for image decode + terminal protocol encoding. SVG is rasterized via `resvg` (`usvg` + `tiny_skia`); HEIC/HEIF via `heif-oxide`; raster formats via the `image` crate with EXIF orientation baked in (`into_decoder` → `orientation` → `apply_orientation`) so phone/camera photos render upright. Communicates with the UI thread via `mpsc` channels; raw image data shared through `Arc<Vec<u8>>` to avoid copies. |
+| `image_worker.rs` | Background worker thread for image decode + terminal protocol encoding. SVG is rasterized via `resvg` (`usvg` + `tiny_skia`); HEIC/HEIF and raster formats go through the shared `choreo-image` decoder (EXIF orientation baked in; HEIC gated by a pre-decode allocation guard) so phone/camera photos render upright. Communicates with the UI thread via `mpsc` channels; raw image data shared through `Arc<Vec<u8>>` to avoid copies. |
 | `terminal_progress.rs` | Terminal-native progress bar via OSC 9;4 escape sequences. Cached capability detection, percentage/indeterminate/remove modes based on `last_prompt_tokens` vs `context_window`. |
 | `selection.rs` | Mouse text selection over the chat history pane (select-to-copy, mirroring opencode). A drag gesture is tracked in *content* coordinates (a global content line plus a viewport column — `TextSelection` on `App`, which also records the last cursor screen position and the layout fingerprint the head was resolved against), so the anchor stays pinned to the text it was drawn over when the viewport moves, while the live drag head re-resolves to the content under the cursor (terminal-native drag-while-scroll) — on wheel events immediately, and at draw time via `follow_cursor` (called right after `compute_total_height_and_markers`, fingerprint-gated so an idle frame costs a tuple compare) whenever *content-induced* movement (streaming growth, appended turns, undo/redo) shifts the history under a stationary pointer; on mouse-up the covered rows are resolved — via the same height-prefix + render-cache machinery the click hit-testing uses, the exact inverse — to the plain text they display, which the caller hands to `clipboard`. Because the history renders pre-wrapped rows, the copy uses each row's per-line copy-join metadata (`RenderedTurn::joins`, a `LineJoin` vector produced by the renderer) to *un-wrap*: rows marked `Space` (a word-boundary reflow) are trimmed at the seam and re-joined with the single space the wrap consumed, rows marked `Join` (a hard mid-word split, or a plain-text wrap that kept its whitespace on the previous row) concatenate directly, and everything else (a fresh paragraph/block, a real newline, a turn boundary) stays a `\n` — so selecting a wrapped assistant response yields the original unwrapped paragraph, and selecting long verbatim tool output reproduces it byte-for-byte, instead of the old behavior of copying the display's wrap points as newlines. Rows that resolve to no content (pure-chrome rows, image blocks, lines past the end) are skipped, so what is highlighted is exactly what is copied; blank *content* rows — the renderer's spacer rows between blocks — resolve to an empty slot, so a blank line inside the selected text survives the copy as a blank line (the `Break` join of the row after it re-inserts the newline) instead of collapsing into its neighbour. The draw-time highlight re-evaluates the content-anchored selection against the current scroll every frame. Both the highlight and the copy are clamped to each line's *content range* — the renderer records where every line's real text starts and ends (`RenderedTurn::content_ranges`), excluding the box chrome (`┃` gutter, indents, trailing fill), so selecting an assistant response never drags the surrounding box into the selection. The gesture only becomes a real selection once the drag moves past the anchor; a plain click keeps its existing toggle/cursor behavior and copies nothing. Line slices snap to grapheme boundaries (never split a ZWJ emoji), use display columns for wide characters, and use terminal-native *anchor-fixed* columns on reverse (bottom-to-top) drags: the anchor row extends from the anchor column to end-of-line and the head row from start-of-line to the head column, so a reverse diagonal mirrors the columns instead of swapping them (the old lexicographic normalization swapped them). The draw-time highlight (`apply_selection_to_lines` → `style_line_selection`) restyles the covered column range with a solid selection background (`SELECTION_BG`, a mid-blue) — not `Modifier::REVERSED`, which is invisible on the shaded `BG_SHADE` turn boxes — without mutating the render cache. The status line reads "Selection copied to clipboard." Selection is cleared on session switch, suspend, page switch, opening the model selector, and terminal resize (a resize re-wraps every line, so the stored column anchor would point at different text afterwards) so a stale rectangle never highlights a different session's content. The extraction path and the draw-time highlight share one row→line→column mapping (`content_range_for_row`), so the two can never drift apart again — they already diverged twice (the screen-row offset and within-line column bugs, both pinned by regression tests); the gesture state machine lives in `selection.rs` (`handle_selection_mouse`), so the connection loop only performs the clipboard write and the status message. The production module is split from its tests: `selection.rs` holds the gesture/extraction/highlight code, `selection/tests.rs` (same `src/` tree, `mod tests;` under `#[cfg(test)]`) holds the unit tests. |
 | `clipboard.rs` | OSC 52 clipboard writer: `copy_to_clipboard` encodes the text as base64 and writes `ESC ] 52 ; c ; <payload> ST` to stdout, mirroring `terminal_progress`'s OSC 9;4 usage. The terminal mediates the write, so it works over SSH/tmux (the *local* clipboard), is a silent no-op on terminals without OSC 52 support (e.g. macOS Terminal.app), and can be refused by the terminal without affecting the TUI. Selections larger than 1 MiB are refused up front (the caller shows a "too large to copy" status) rather than stalling the UI loop on a multi-megabyte escape sequence terminals may drop anyway. `build_osc52` is a pure function, so the byte layout is unit-tested without a terminal. A write is only ever triggered by a user-initiated mouse-up over their own selection — hostile LLM/tool output can never inject a clipboard write through this path. |
@@ -2486,6 +2518,9 @@ WebP, GIF, BMP, TIFF, TGA, DDS, ICO, PNM, HDR, OpenEXR, Farbfeld, QOI), **SVG**
 library) so the default/release build stays C-free. Raster EXIF orientation is baked in
 (`ImageReader::into_decoder` → `decoder.orientation` → `apply_orientation`) so
 phone/camera photos reach the model upright; `heif-oxide` applies HEIC's own orientation.
+The raster-decode and HEIC-decode paths (and the HEIC pre-decode allocation guard) live
+in the shared [`choreo-image`](#choreo-image--shared-image-decode-helpers) leaf crate, so
+the model path and the TUI display path use the same guarded decoder.
 All sources are resized to ≤2000px, and re-encoded to PNG (alpha) or JPEG (opaque) under
 a decompression-bomb guard. The tool reports a text handle (path, dimensions, MIME,
 bytes), and returns an `ImageReference` that carries the **normalized bytes**
@@ -3346,7 +3381,7 @@ cargo run -p choreographr --bin choreo-im -- telegram
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
 | `ratatui` + `crossterm` | choreo-tui | Terminal UI |
 | `dioxus` | choreo-gui | Desktop UI |
-| `image` + `resvg` + `heif-oxide` | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization (resvg), HEIC/HEIF decode (heif-oxide) |
+| `image` + `resvg` + `heif-oxide` (via the `choreo-image` leaf crate) | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization (resvg), HEIC/HEIF decode (heif-oxide) with a pre-decode allocation guard |
 | `syntect` | choreo-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `x25519-dalek` + `hkdf` + `sha2` | keystore | X25519 ECDH key agreement, HKDF key derivation |

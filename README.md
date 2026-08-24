@@ -393,7 +393,7 @@ cargo run --release -p choreographr --bin choreo-acp                 # ACP bridg
 
 ## Crates
 
-A Rust workspace of fifteen crates (resolver = "3"):
+A Rust workspace of sixteen crates (resolver = "3"):
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the daemon's
 internals — threading model, provider architecture, tool system, and session
@@ -407,6 +407,7 @@ data model.
 | `choreo-blockchain` | Blockchain tools — EVM (alloy) and Substrate/Polkadot (subxt) read-only queries plus the tokio sidecar runtime they run on; pulled in by the daemon's `blockchain` feature (off by default) |
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
 | `choreo-sanitize` | Internal leaf crate — the single source of truth for the Unicode "spoofing" predicates (bidi/ZWSP escaping) and the shared tool-output byte budget + `...[truncated]` marker, used by the daemon, TUI, blockchain tools, and client |
+| `choreo-image` | Leaf crate — the single raster decode path (EXIF orientation baked in) and HEIC/HEIF decode (with a pre-decode allocation guard), shared by the daemon and the TUI so the model and UI paths cannot drift |
 | `choreo-keystore` | X25519 keypair + ECDH/AES-256-GCM crypto library for encrypted credentials |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
 | `choreo-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio |
@@ -448,7 +449,11 @@ OpenEXR, Farbfeld, QOI) plus SVG (`resvg`) and HEIC/HEIF (`heif-oxide`, pure Rus
 AVIF is gated behind the `avif` feature (`image/avif-native`/dav1d, a C library) so
 the default/release build stays C-free — see the static-musl rationale. EXIF
 orientation is baked in for raster sources (and applied by `heif-oxide` for HEIC),
-so phone/camera photos are not rotated. `read_image` reads a file from disk,
+so phone/camera photos are not rotated. The raster-decode and HEIC-decode
+paths live in the shared `choreo-image` leaf crate, so the model and UI paths
+use the same guarded decoder — a hostile HEIC's declared geometry is rejected
+before it allocates.
+`read_image` reads a file from disk,
 normalizes it (resize to ≤2000px, re-encode to PNG/JPEG under a decompression-bomb
 guard), and feeds it to a vision-capable model as image input on the next request.
 The normalized bytes are
