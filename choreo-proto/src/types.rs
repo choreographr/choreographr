@@ -223,25 +223,31 @@ pub struct ToolResultRecord {
     pub content: String,
     pub is_error: bool,
     pub invocation_description: String,
-    /// A vision image this tool result produced, stored as a *reference* (the
-    /// source path + metadata) rather than bytes — an additive, `#[serde(default)]`
-    /// field so old persisted turns deserialize with `None`. The request builder
-    /// re-reads and normalizes the file at request time (pass-through; there is
-    /// no artifact store), so the durable record stays small. `None` for
-    /// text-only results and for image results on non-vision models (the gate
-    /// substitutes a text placeholder instead of persisting a reference the
-    /// model cannot use).
+    /// A vision image this tool result produced, stored as a *reference* that
+    /// carries the normalized image **bytes** (`ImageReference::data`), so the
+    /// request builder attaches them directly without re-reading the source
+    /// file — an additive, `#[serde(default)]` field so old persisted turns
+    /// deserialize with `None`. `None` for text-only results and for image
+    /// results on non-vision models (the gate substitutes a text placeholder
+    /// instead of persisting a reference the model cannot use).
     #[serde(default)]
     pub image: Option<ImageReference>,
 }
 
 /// A reference to a vision image produced by a tool (e.g. `read_image`),
-/// resolved to bytes at request-build time by reading `path`. Kept out of the
-/// durable record to avoid bloating the transcript/DB — the bytes are
-/// re-read and normalized (resize, MIME, EXIF) on each request.
+/// carrying the normalized image **bytes** (PNG/JPEG) durably so the request
+/// builder can attach them directly to the model request without re-reading
+/// the source file.
+///
+/// `data` is daemon/model-only: it feeds the request builder directly, is
+/// stripped from client-facing turns by `turn_for_client`, and is persisted
+/// in the `session_attachments` DB table at write time (kept out of the
+/// zstd turn blob) and re-attached on read. `#[serde(default)]` keeps old
+/// persisted records backward compatible — they deserialize with an empty
+/// `data`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageReference {
-    /// Source path the image was read from (re-read at request time).
+    /// Source path the image was read from.
     pub path: String,
     /// Image MIME type as produced by normalization (e.g. `image/png`).
     pub mime_type: String,
@@ -249,6 +255,11 @@ pub struct ImageReference {
     pub width: u32,
     /// Height in pixels after normalization.
     pub height: u32,
+    /// The normalized image bytes (PNG/JPEG), durable and daemon/model-only.
+    /// Empty on old persisted records (the `#[serde(default)]` backward-compat
+    /// path) and on non-vision gate placeholders.
+    #[serde(default)]
+    pub data: Vec<u8>,
 }
 
 /// Which OpenAI-compatible chat field carried the reasoning text, locked in

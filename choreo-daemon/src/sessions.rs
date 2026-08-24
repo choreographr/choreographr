@@ -851,17 +851,27 @@ impl SessionState {
 }
 
 /// Client-bound copy of a turn with the opaque reasoning round-trip payload
-/// stripped: only the daemon consumes `reasoning_artifact`/`reasoning_producer`
-/// (it rebuilds the next provider request from them); clients render
-/// `assistant_reasoning` and never need the artifact bytes.  Stripping here
-/// keeps the artifact off every `DaemonMessage` payload (bandwidth + privacy:
-/// thinking-block JSON and encrypted provider blobs never leave the daemon
-/// process), while the authoritative `Turn` in `SessionState` and the DB keeps
-/// the full payload for the next request's builder.
+/// and the vision image **bytes** stripped: only the daemon consumes
+/// `reasoning_artifact`/`reasoning_producer` (it rebuilds the next provider
+/// request from them) and `ToolResultRecord.image` (the request builder reads
+/// the bytes from the daemon-side `SessionState`/DB); clients render
+/// `assistant_reasoning` and never need the artifact bytes, and they render
+/// tool images via `displayed_images`, which is deliberately left INTACT
+/// here.  Stripping keeps the artifact and the vision bytes off every
+/// `DaemonMessage` payload (bandwidth + privacy: thinking-block JSON,
+/// encrypted provider blobs, and raw vision image bytes never leave the
+/// daemon process), while the authoritative `Turn` in `SessionState` and the
+/// DB keeps the full payload for the next request's builder.
 pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
     let mut clone = turn.clone();
     clone.reasoning_artifact = None;
     clone.reasoning_producer = None;
+    // Vision image bytes are daemon/model-only: the request builder consumes
+    // them from the authoritative daemon-side turn, and the client renders
+    // images via `displayed_images` (kept below), so drop the raw bytes here.
+    for record in clone.tool_results.iter_mut() {
+        record.image = None;
+    }
     clone
 }
 

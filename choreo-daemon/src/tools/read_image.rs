@@ -4,11 +4,10 @@
 //! The tool normalizes the image (resize / MIME / re-encode — see
 //! `crate::image_prep`), reports a text handle (path, dimensions, MIME, byte
 //! size) the model can reason about, and carries an [`ImageReference`] (path +
-//! metadata, not bytes) in its `Return` value that the framework hands to the
-//! request builder via the `extract_image_ref` hook. At request time the
-//! builder re-reads and re-normalizes the file and attaches the pixels to a
-//! synthetic user message (reference-based / pass-through design: no artifact
-//! store, so nothing is persisted beyond the path).
+//! metadata + the normalized bytes) in its `Return` value that the framework
+//! hands to the request builder via the `extract_image_ref` hook. The reference
+//! now carries the normalized bytes durably (daemon-only), so the request
+//! builder attaches them directly instead of re-reading the source file.
 //!
 //! The reference travels with the per-invocation `ReadImageReturn` (read from
 //! `ret` in the hook), not a shared `Mutex` slot: the tool is registered once
@@ -128,11 +127,17 @@ impl super::Tool for ReadImage {
         _ctx: Option<&super::context::ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
         let (resolved, prep) = resolve_and_normalize(&args, working_dir)?;
+        // Capture the byte length before moving `prep.data` into the reference
+        // (the text handle and log below still need it).
+        let byte_len = prep.data.len();
         let reference = ImageReference {
             path: resolved.display().to_string(),
             mime_type: prep.mime_type.to_string(),
             width: prep.width,
             height: prep.height,
+            // Move the normalized bytes into the reference so the request
+            // builder can attach them directly without re-reading the source.
+            data: prep.data,
         };
         let text = truncate_tool_output(&format!(
             "read image: {} ({}x{}, {}, {})",
@@ -140,14 +145,14 @@ impl super::Tool for ReadImage {
             prep.width,
             prep.height,
             prep.mime_type,
-            humfmt::bytes(prep.data.len() as u64),
+            humfmt::bytes(byte_len as u64),
         ));
         info!(
             path = %resolved.display(),
             width = prep.width,
             height = prep.height,
             mime = %prep.mime_type,
-            bytes = prep.data.len(),
+            bytes = byte_len,
             "read_image: read image successfully"
         );
         // Carry the reference in the return value for the framework's
@@ -239,6 +244,7 @@ mod tests {
                 mime_type: "image/png".to_string(),
                 width: 1,
                 height: 1,
+                data: Vec::new(),
             },
         };
         let json = serde_json::to_string(&ret).unwrap();

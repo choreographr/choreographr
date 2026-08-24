@@ -285,7 +285,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 | `last_prompt_tokens` | `Option<u32>` field on session metadata and protocol messages tracking the `input_tokens` from the most recent API response — the actual context size being sent to the model, used for context-window progress displays. |
 | `last_modified` | `i64` Unix-epoch-**milliseconds** on `SessionSummary` / `SessionEvent::SessionStatusChanged` (proto) and `SessionMetadata` / `SessionConfig` / `SessionRecord` (daemon). Bumped on **completed requests**, session creation, and explicit metadata edits (title/model/account/reasoning) — NOT on transient status transitions (Inference/ToolCall/Retrying), which would re-sort the sessions list mid-request. The sessions list is ordered by it (newest first) and it survives restarts via `SessionRecord`. All session-level timestamps (`created_at`, `last_modified`) are milliseconds to match `Turn.created_at` (`TimestampMs`). |
 | `SessionStatus` | Enum representing the current session state: `Inactive`, `Inference`, `ToolCall(String)`, `Retrying {…}`, `Sleeping`. Included in `SessionSummary` and `SessionEvent::SessionState` for live status display in client toolbars. |
-| `ToolResultRecord` | Persisted tool result with fields `call_id`, `name`, `content`, `is_error`, `invocation_description`, and an additive `image: Option<ImageReference>` (a **reference** to a vision image this tool produced — the source path + MIME + dimensions, not bytes; `#[serde(default)]` so old persisted turns deserialize with `None`). The reference is what lets the request builder feed a `read_image` tool result back to a vision-capable model by re-reading the file at request time. |
+| `ToolResultRecord` | Persisted tool result with fields `call_id`, `name`, `content`, `is_error`, `invocation_description`, and an additive `image: Option<ImageReference>` (a **reference** to a vision image this tool produced — the source path + MIME + dimensions **plus the normalized bytes** in `ImageReference::data`; `#[serde(default)]` so old persisted turns deserialize with `None`). The bytes are daemon/model-only: they feed the request builder directly and are moved to the `session_attachments` table at persistence time, and they are stripped from client-facing turns (see `turn_for_client`). |
 
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
@@ -2111,7 +2111,8 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 | Table | Key | Value |
 |---|---|---|
 | `sessions` | `u64` session ID | MessagePack named(`SessionRecord`) |
-| `session_turns` | `(u64, u32)` (session ID, turn ID) | zstd-compressed MessagePack named(`Turn`) — since schema 2 each value is a zstd frame around the MessagePack blob; turn text/tool-output/reasoning is the bulk of the DB and compresses 4–10× |
+| `session_turns` | `(u64, u32)` (session ID, turn ID) | zstd-compressed MessagePack named(`Turn`) — since schema 2 each value is a zstd frame around the MessagePack blob; turn text/tool-output/reasoning is the bulk of the DB and compresses 4–10×. Image/attachment bytes are **split out** of the blob into `session_attachments` (they are already incompressible PNG/JPEG) |
+| `session_attachments` | `(u64, u32, String)` (session ID, turn ID, slot) | raw `Vec<u8>` — the general on-demand byte store for a turn: display + vision image bytes, persisted uncompressed and keyed by slot (`d{i}` for display index `i`, `r<call_id>` for a tool-result vision image), re-attached into the decoded turn by `read_turns`; written atomically with the turn blob in `write_turn`, removed by both delete paths |
 | `credentials` | `&str` service name | encrypted blob |
 | `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
 | `deleted_sessions` | `u64` session ID | `()` tombstone — marks a deleted session whose still-shutting-down thread may re-create the record; written only when the delete is deferred (a live thread exists), cleared once the exit finalize re-deletes the record, purged at startup |
@@ -2477,25 +2478,35 @@ Model calls display_image tool
 ### Vision input flow (`read_image` → model)
 
 **Vision input** is the mirror-image pipeline: images are sent *to* the model rather than
-*from* it. It is reference-based and pass-through — no artifact store. The `read_image`
-tool (`tools/read_image.rs`) reads and normalizes an image file (`crate::image_prep`:
-resize to ≤2000px, MIME sniff, re-encode to PNG/JPEG under a decompression-bomb guard),
-reports a text handle (path, dimensions, MIME, bytes), and parks an `ImageReference`
-(path + metadata, not bytes) via the `Tool::extract_image_ref` hook. The framework moves
-that reference onto the durable `ToolResultRecord.image` field. At request-build time
-(`build_chat_request_messages` in `reasoning.rs`), each image-bearing tool result is
-re-read and re-normalized and attached to a **synthetic user message** appended *after*
-all of the turn's tool messages (preserving `tool_use → tool_result` adjacency), and the
-provider adapters serialize it per protocol:
+*from* it. The `read_image` tool (`tools/read_image.rs`) reads and normalizes an image
+file (`crate::image_prep`: resize to ≤2000px, MIME sniff, re-encode to PNG/JPEG under a
+decompression-bomb guard), reports a text handle (path, dimensions, MIME, bytes), and
+returns an `ImageReference` that carries the **normalized bytes** (`ImageReference::data`)
+via the `Tool::extract_image_ref` hook. The framework moves that reference onto the
+durable `ToolResultRecord.image` field, and the bytes are persisted in the raw
+`session_attachments` table (split out of the zstd turn blob) so the model always has the
+image on later turns — the source file is never re-read, so it can vanish without breaking
+the session. At request-build time (`build_chat_request_messages` in `reasoning.rs`), each
+image-bearing tool result attaches its stored bytes directly to a **synthetic user
+message** appended *after* all of the turn's tool messages (preserving
+`tool_use → tool_result` adjacency), and the provider adapters serialize it per protocol:
 
 ```
-read_image tool → image_prep::load_and_normalize → ImageReference → ToolResultRecord.image
+read_image tool → image_prep::load_and_normalize → ImageReference(data) → ToolResultRecord.image
+  → persisted: bytes → session_attachments; blob carries byte-less turn
   → build_chat_request_messages: model_supports_vision gate
-      vision model  → re-read + re-normalize → ChatRequestMessage.images (synthetic user msg)
+      vision model  → attach ImageReference.data → ChatRequestMessage.images (synthetic user msg)
       text-only     → placeholder text message (never pixels) — the vision gate
   → provider serializer: OpenAI chat image_url / Responses input_image /
                          Anthropic image / Google inline_data
 ```
+
+The bytes never reach clients: `turn_for_client` strips `ToolResultRecord.image` from the
+client-facing turn (display images, which clients render, travel separately via
+`displayed_images` and persist in the same `session_attachments` table).
+
+Replay across turns is byte-identical (the same normalized bytes from `session_attachments`
+every request), which keeps provider prompt/image caches hitting.
 
 The **vision gate** uses `catalog::model_supports_vision(provider_slug, model)` (from the
 models.dev `modalities.input` flag, overridable via the overlay). On a text-only model the

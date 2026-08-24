@@ -42,6 +42,20 @@ const CATALOG_LAST_ATTEMPT_KEY: &str = "last_attempt_ms";
 /// which self-heals via a 200 on the next fetch).
 const CATALOG_ETAG_KEY: &str = "etag";
 const SESSION_KV: TableDefinition<(u64, String), Vec<u8>> = TableDefinition::new("session_kv");
+/// Raw, uncompressed image/attachment bytes for a turn, keyed by
+/// (session_id, turn_id, slot). Images (display + vision) are kept OUT of the
+/// zstd-compressed `session_turns` blob because they are already
+/// incompressible (PNG/JPEG) — storing them raw here avoids wasted zstd CPU
+/// and keeps `MAX_TURN_DECODED_BYTES` meaningful for the text/tool blob.
+/// Created lazily on first write (additive; no schema bump needed).
+///
+/// This is the general on-demand byte store for a turn (per the D2 decision):
+/// anything that is incompressible or sizeable and owned by a turn — today the
+/// display + vision image bytes, future blobs as they arise — is split out of
+/// the compressed text/tool blob into this raw table at the persistence
+/// boundary and re-attached on read.
+const SESSION_ATTACHMENTS: TableDefinition<(u64, u32, String), &[u8]> =
+    TableDefinition::new("session_attachments");
 /// Tombstones for deleted sessions whose still-shutting-down thread may
 /// re-create the record.  Keyed by session id; present means "deleted — purge
 /// any record bearing this id at next startup" (see [`purge_tombstoned_sessions`]).
@@ -606,6 +620,28 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
                 .map_err(|e| db_err(format!("redb remove session_kv: {e}")))?;
         }
     }
+    {
+        let mut att_table = write_txn
+            .open_table(SESSION_ATTACHMENTS)
+            .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
+        // Range-remove this session's attachment rows too — the same
+        // (session_id, …)..(session_range_end(session_id), …) bound as the
+        // turns/KV deletes above, so no orphaned image bytes survive a delete.
+        let att_keys: Vec<(u64, u32, String)> = att_table
+            .range::<(u64, u32, String)>(
+                (session_id, 0u32, String::new())
+                    ..(session_range_end(session_id), 0u32, String::new()),
+            )
+            .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
+            .filter_map(|result| result.ok())
+            .map(|(k, _)| k.value())
+            .collect();
+        for key in att_keys {
+            att_table
+                .remove(key)
+                .map_err(|e| db_err(format!("redb remove session_attachment: {e}")))?;
+        }
+    }
     write_txn
         .commit()
         .map_err(|e| db_err(format!("redb commit delete: {e}")))?;
@@ -805,14 +841,63 @@ pub fn write_turn(
     turn_id: u32,
     turn: &Turn,
 ) -> io::Result<()> {
+    // Build a "storage view" of the turn: clone it and empty every image byte
+    // field (display + vision). The bytes themselves are persisted separately
+    // into SESSION_ATTACHMENTS (raw, incompressible), so the zstd-compressed
+    // session_turns blob carries only the text/tool metadata. Keep all the
+    // metadata (mime, width, height, path, tool_call_id, call_id) — only the
+    // byte payloads move out. Slots are derivable from the byte-less turn on
+    // read, so re-attachment needs no extra metadata.
+    let mut storage = turn.clone();
+    for img in &mut storage.displayed_images {
+        img.data.clear();
+    }
+    for tr in &mut storage.tool_results {
+        if let Some(image) = &mut tr.image {
+            image.data.clear();
+        }
+    }
     let payload =
-        rmp_serde::to_vec_named(turn).map_err(|e| db_err(format!("codec encode turn: {e}")))?;
+        rmp_serde::to_vec_named(&storage).map_err(|e| db_err(format!("codec encode turn: {e}")))?;
     // Serialize first, then compress the whole blob (see [`zstd_encode`]).
     let compressed = zstd_encode(&payload);
     let write_txn = db
         .begin_write()
         .map_err(|e| db_err(format!("redb write txn: {e}")))?;
     {
+        // Persist the image/attachment bytes and the byte-less turn blob in the
+        // SAME write transaction so they can never diverge: a crash leaves
+        // either both written or neither (the blob and its attachments are
+        // atomic as a set).
+        let mut attachments = write_txn
+            .open_table(SESSION_ATTACHMENTS)
+            .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
+        let mut attachments_written = 0usize;
+        for (i, img) in turn.displayed_images.iter().enumerate() {
+            if img.data.is_empty() {
+                continue; // nothing to persist
+            }
+            let slot = format!("d{i}");
+            attachments
+                .insert((session_id, turn_id, slot), img.data.as_slice())
+                .map_err(|e| db_err(format!("redb insert display attachment: {e}")))?;
+            attachments_written += 1;
+        }
+        for tr in &turn.tool_results {
+            if let Some(image) = &tr.image
+                && !image.data.is_empty()
+            {
+                let slot = format!("r{}", tr.call_id);
+                attachments
+                    .insert((session_id, turn_id, slot), image.data.as_slice())
+                    .map_err(|e| db_err(format!("redb insert result attachment: {e}")))?;
+                attachments_written += 1;
+            }
+        }
+        debug!(
+            session_id,
+            turn_id, attachments_written, "split image bytes into session_attachments"
+        );
         let mut table = write_txn
             .open_table(SESSION_TURNS)
             .map_err(|e| db_err(format!("redb open turns: {e}")))?;
@@ -833,6 +918,16 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
     let table = read_txn
         .open_table(SESSION_TURNS)
         .map_err(|e| db_err(format!("redb open turns: {e}")))?;
+    // The attachments table is opened in the SAME read transaction as the turns
+    // table so both see a consistent snapshot — a turn and its attachment rows
+    // were committed atomically, so re-attachment can never observe a half-
+    // written turn. A fresh database has no table yet (created lazily on first
+    // write), so a missing table reads as empty.
+    let attachments = match read_txn.open_table(SESSION_ATTACHMENTS) {
+        Ok(t) => Some(t),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(db_err(format!("redb open session_attachments: {e}"))),
+    };
     let mut turns: Vec<(u32, Turn)> = Vec::new();
     // Bounded range scan over exactly this session's turn ids rather than
     // iterating (and, since schema 2, decompressing) every turn in every
@@ -847,7 +942,45 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
         match zstd_decode(value.value())
             .and_then(|buf| rmp_serde::from_slice::<Turn>(&buf).map_err(io::Error::other))
         {
-            Ok(turn) => turns.push((idx, turn)),
+            Ok(mut turn) => {
+                // Re-attach the split-out image bytes back into the byte-less
+                // decoded turn. A missing attachment row (e.g. an old persisted
+                // turn written before this table existed, or an empty-data
+                // image that was never split out) leaves `data` empty — the
+                // request builder's existing placeholder path handles that.
+                if let Some(attachments) = &attachments {
+                    for (i, img) in turn.displayed_images.iter_mut().enumerate() {
+                        if img.data.is_empty() {
+                            let slot = format!("d{i}");
+                            if let Some(guard) = attachments
+                                .get((session_id, idx, slot))
+                                .map_err(|e| db_err(format!("redb get display attachment: {e}")))?
+                            {
+                                img.data = guard.value().to_vec();
+                            }
+                        }
+                    }
+                    for tr in turn.tool_results.iter_mut() {
+                        if let Some(image) = &mut tr.image
+                            && image.data.is_empty()
+                        {
+                            let slot = format!("r{}", tr.call_id);
+                            if let Some(guard) = attachments
+                                .get((session_id, idx, slot))
+                                .map_err(|e| db_err(format!("redb get result attachment: {e}")))?
+                            {
+                                image.data = guard.value().to_vec();
+                            }
+                        }
+                    }
+                }
+                debug!(
+                    session_id,
+                    turn_id = idx,
+                    "re-attached turn image attachments"
+                );
+                turns.push((idx, turn));
+            }
             Err(e) => {
                 tracing::warn!(session_id, turn_id = idx, error = %e, "undecodable turn, skipping");
             }
@@ -910,6 +1043,28 @@ pub fn delete_session_turns(db: &redb::Database, session_id: u64) -> io::Result<
             table
                 .remove(key)
                 .map_err(|e| db_err(format!("redb remove turn: {e}")))?;
+        }
+    }
+    {
+        let mut att_table = write_txn
+            .open_table(SESSION_ATTACHMENTS)
+            .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
+        // Deleting all of a session's turns must also remove that session's
+        // attachment rows, so no orphaned image bytes accumulate when turns are
+        // cleared without deleting the whole session.
+        let att_keys: Vec<(u64, u32, String)> = att_table
+            .range::<(u64, u32, String)>(
+                (session_id, 0u32, String::new())
+                    ..(session_range_end(session_id), 0u32, String::new()),
+            )
+            .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
+            .filter_map(|result| result.ok())
+            .map(|(k, _)| k.value())
+            .collect();
+        for key in att_keys {
+            att_table
+                .remove(key)
+                .map_err(|e| db_err(format!("redb remove session_attachment: {e}")))?;
         }
     }
     write_txn
@@ -1372,7 +1527,9 @@ pub fn write_session_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use choreo_proto::Turn;
+    use choreo_proto::{
+        DisplayedImageRecord, ImageMetadata, ImageReference, ToolResultRecord, Turn,
+    };
 
     /// Read the current `next_session_id` from the DB and atomically
     /// increment it.  Only used by tests — production code derives the
@@ -1478,6 +1635,121 @@ mod tests {
         assert!(read_session(&db, id).unwrap().is_none());
         assert!(read_turns(&db, id).unwrap().is_empty());
 
+        drop(db);
+    }
+
+    #[test]
+    fn turn_image_bytes_split_into_attachments_and_reattached() {
+        // Persistence boundary contract: a turn's image bytes (display + vision)
+        // are split OUT of the zstd-compressed session_turns blob into the raw
+        // session_attachments table on write, and re-attached on read so the
+        // round-tripped turn matches the original byte-for-byte.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let id = 1u64;
+
+        let mut turn = dummy_turn();
+        // A display image with non-empty bytes at index 0 → slot `d0`.
+        turn.displayed_images = vec![DisplayedImageRecord {
+            metadata: ImageMetadata {
+                mime_type: "image/png".into(),
+                width: 32,
+                height: 32,
+                byte_len: 5,
+                alt: None,
+            },
+            data: b"\x89PNG\r".to_vec(),
+            tool_call_id: Some("call_disp".into()),
+        }];
+        // A tool result carrying a vision image with non-empty bytes → slot
+        // `r<call_id>`.
+        turn.tool_results = vec![ToolResultRecord {
+            call_id: "call_v".into(),
+            name: "read_image".into(),
+            content: "image".into(),
+            is_error: false,
+            invocation_description: "read_image".into(),
+            image: Some(ImageReference {
+                path: "/tmp/foo.png".into(),
+                mime_type: "image/png".into(),
+                width: 16,
+                height: 16,
+                data: b"\x89PNG-vision".to_vec(),
+            }),
+        }];
+
+        write_turn(&db, id, 0, &turn).unwrap();
+
+        // (a) The stored session_turns blob decodes to a byte-less turn: the
+        // zstd frame must NOT carry the image bytes.
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(SESSION_TURNS).unwrap();
+            let guard = table.get((id, 0u32)).unwrap().unwrap();
+            let blob = guard.value();
+            assert!(blob.starts_with(&ZSTD_FRAME_MAGIC));
+            let decoded: Turn = rmp_serde::from_slice(&zstd_decode(blob).unwrap()).unwrap();
+            assert_eq!(decoded.displayed_images[0].data, Vec::<u8>::new());
+            assert_eq!(
+                decoded.tool_results[0].image.as_ref().unwrap().data,
+                Vec::<u8>::new()
+            );
+        }
+        // (b) The bytes ARE present in the session_attachments table at the
+        // expected slots.
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(SESSION_ATTACHMENTS).unwrap();
+            let d0 = table.get((id, 0u32, "d0".to_string())).unwrap().unwrap();
+            assert_eq!(d0.value(), b"\x89PNG\r");
+            let rv = table
+                .get((id, 0u32, "rcall_v".to_string()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(rv.value(), b"\x89PNG-vision");
+        }
+        // (c) read_turns re-attaches both byte fields, matching the original.
+        let turns = read_turns(&db, id).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].1, turn);
+
+        // Both delete paths must clean up the attachment rows so no orphaned
+        // image bytes are left behind.
+        delete_session_turns(&db, id).unwrap();
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(SESSION_ATTACHMENTS).unwrap();
+            assert!(
+                table.get((id, 0u32, "d0".to_string())).unwrap().is_none(),
+                "delete_session_turns must remove the display attachment"
+            );
+            assert!(
+                table
+                    .get((id, 0u32, "rcall_v".to_string()))
+                    .unwrap()
+                    .is_none(),
+                "delete_session_turns must remove the result attachment"
+            );
+        }
+
+        // Rewrite, then delete the whole session — attachments must go too.
+        write_turn(&db, id, 0, &turn).unwrap();
+        delete_session(&db, id).unwrap();
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(SESSION_ATTACHMENTS).unwrap();
+            assert!(
+                table.get((id, 0u32, "d0".to_string())).unwrap().is_none(),
+                "delete_session must remove the display attachment"
+            );
+            assert!(
+                table
+                    .get((id, 0u32, "rcall_v".to_string()))
+                    .unwrap()
+                    .is_none(),
+                "delete_session must remove the result attachment"
+            );
+        }
         drop(db);
     }
 

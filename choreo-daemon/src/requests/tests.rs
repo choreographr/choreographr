@@ -138,6 +138,9 @@ fn session_with_image_result() -> (SessionState, tempfile::NamedTempFile) {
         mime_type: "image/jpeg".into(),
         width: 3,
         height: 2,
+        // Non-empty stored bytes so the vision-attach path attaches the image
+        // (an empty `data` would degrade to a placeholder).
+        data: vec![0u8; 16],
     };
     session.update_tool_result(
         tid,
@@ -197,9 +200,10 @@ fn build_chat_request_messages_non_vision_model_gates_image() {
 }
 
 #[test]
-fn build_chat_request_messages_vision_model_missing_file_places_placeholder() {
-    // A reference whose source file was deleted after the tool ran degrades
-    // to a placeholder on a vision model (never a panic, never a stale path).
+fn build_chat_request_messages_vision_model_empty_bytes_places_placeholder() {
+    // A reference whose stored bytes are empty (e.g. an old persisted turn
+    // that predates the bytes, or a non-vision gate) degrades to a placeholder
+    // on a vision model (never a panic, never a source-path re-read).
     let mut session = SessionState::empty();
     let (tid, _) = session.start_turn(Some("look".into()));
     session.set_assistant_response(
@@ -229,6 +233,7 @@ fn build_chat_request_messages_vision_model_missing_file_places_placeholder() {
                 mime_type: "image/jpeg".into(),
                 width: 3,
                 height: 2,
+                data: Vec::new(),
             }),
             ..Default::default()
         },
@@ -243,7 +248,7 @@ fn build_chat_request_messages_vision_model_missing_file_places_placeholder() {
             .content
             .as_deref()
             .unwrap()
-            .contains("could not be re-read")
+            .contains("image bytes are unavailable")
     );
 }
 

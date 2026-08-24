@@ -444,13 +444,17 @@ Markdown, query blockchains, post to X, etc.). Tools implement the `Tool` trait
 **Vision input.** Choreographr can send images *to* the model: the `read_image`
 tool reads an image file from disk, normalizes it (resize to ≤2000px, MIME sniff,
 re-encode to PNG/JPEG under a decompression-bomb guard), and feeds it to a
-vision-capable model as image input on the next request. The durable record
-stores only an `ImageReference` (path + metadata), and the bytes are re-read and
-re-normalized at request time (pass-through, no artifact store). Each provider's
-wire format is supported (OpenAI chat `image_url`, Responses `input_image`,
-Anthropic `image`, Google `inline_data`), and a **vision gate** (`supports_vision`
-from the models.dev catalog, overridable via the overlay) ensures images are
-never sent to a text-only model — they degrade to a text placeholder instead.
+vision-capable model as image input on the next request. The normalized bytes are
+stored durably in the `session_attachments` DB table (kept out of the compressed
+turn blob, so the source file can disappear without breaking later turns), and the
+request builder attaches those stored bytes directly on every request — no re-read
+or re-normalization. Each provider's wire format is supported (OpenAI chat
+`image_url`, Responses `input_image`, Anthropic `image`, Google `inline_data`),
+and a **vision gate** (`supports_vision` from the models.dev catalog, overridable
+via the overlay) ensures images are never sent to a text-only model — they
+degrade to a text placeholder instead. Vision bytes are daemon/model-only: they
+never reach clients, while `display_image` images (which clients render) persist
+in the same table and still stream to the TUI.
 Vision support is per-model: pick a vision-capable model (e.g.
 `deepseek-v4-flash-vision-exp`) and call `read_image` with a path.
 

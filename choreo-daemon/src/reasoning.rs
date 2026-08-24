@@ -14,7 +14,6 @@ use choreo_ai_protocols::{
     ReasoningPassback, model_reasoning_passback, model_supports_vision, requires_reasoning_content,
 };
 use choreo_proto::{ReasoningArtifact, Turn};
-use std::path::Path;
 use tracing::{debug, warn};
 
 use crate::sessions::SessionState;
@@ -155,10 +154,10 @@ pub fn build_chat_request_messages(
         // Synthetic user messages carrying tool-result images (vision input),
         // appended AFTER every tool message of the turn so the provider's
         // tool_use → tool_result adjacency holds (a user message interleaved
-        // between tool results would break it). Each image is re-read and
-        // re-normalized from its source path at request time (pass-through
-        // design; no artifact store). On non-vision models the gate emits a
-        // text placeholder instead of pixels.
+        // between tool results would break it). The image bytes are read from
+        // the stored reference (`img.data`), not re-read from the source file
+        // at request time. On non-vision models the gate emits a text
+        // placeholder instead of pixels.
         messages.extend(tool_result_image_messages(turn, vision));
     }
     messages
@@ -168,13 +167,13 @@ pub fn build_chat_request_messages(
 /// (vision input) for the request builder. Each image-bearing tool result
 /// yields one user message placed after the turn's tool messages.
 ///
-/// On a vision-capable model the image is re-read from its source path,
-/// normalized, and attached as a [`ChatImagePart`]; on a non-vision model (or
-/// when the file can no longer be read — it may have been deleted since the
-/// tool ran), a text placeholder is emitted instead so the model is never
-/// sent pixels it cannot process and never silently loses the image. The
-/// placeholder names the source path so the model can re-read it with a text
-/// tool if it wants.
+/// On a vision-capable model the normalized image bytes are attached directly
+/// from the stored reference (`ImageReference::data`) — no file I/O, no source
+/// path dependency; on a non-vision model, or when the reference carries no
+/// bytes (e.g. an old persisted turn whose `data` deserialized empty), a text
+/// placeholder is emitted instead so the model is never sent pixels it cannot
+/// process and never silently loses the image. The placeholder names the
+/// source path so the model can re-read it with a text tool if it wants.
 fn tool_result_image_messages(turn: &Turn, vision: bool) -> Vec<ChatRequestMessage> {
     let mut out = Vec::new();
     for tr in &turn.tool_results {
@@ -193,39 +192,38 @@ fn tool_result_image_messages(turn: &Turn, vision: bool) -> Vec<ChatRequestMessa
             ));
             continue;
         }
-        match crate::image_prep::load_and_normalize(Path::new(&img.path)) {
-            Ok(prep) => {
-                debug!(
-                    path = %img.path,
-                    width = prep.width,
-                    height = prep.height,
-                    mime = %prep.mime_type,
-                    "attaching tool-result image to request"
-                );
-                out.push(ChatRequestMessage::with_images(
-                    "user",
-                    lead,
-                    vec![ChatImagePart {
-                        data: prep.data,
-                        mime_type: prep.mime_type.to_string(),
-                    }],
-                ));
-            }
-            Err(e) => {
-                warn!(
-                    path = %img.path,
-                    error = %e,
-                    "tool-result image could not be re-read at request time; attaching placeholder"
-                );
-                out.push(ChatRequestMessage::with_images(
-                    "user",
-                    format!(
-                        "{lead} — the image file could not be re-read ({e}); only its \
-                              text metadata is available."
-                    ),
-                    Vec::new(),
-                ));
-            }
+        if img.data.is_empty() {
+            // No stored bytes (an old persisted turn, or a reference built
+            // before the bytes were carried): degrade to a text placeholder so
+            // the model still learns the image existed.
+            warn!(
+                path = %img.path,
+                "tool-result image bytes unavailable; attaching placeholder"
+            );
+            out.push(ChatRequestMessage::with_images(
+                "user",
+                format!(
+                    "{lead} — the image bytes are unavailable (e.g. an old persisted turn); \
+                     only its text metadata is available."
+                ),
+                Vec::new(),
+            ));
+        } else {
+            // Attach the normalized bytes straight from the stored reference.
+            debug!(
+                path = %img.path,
+                mime = %img.mime_type,
+                bytes = img.data.len(),
+                "attaching stored tool-result image to request"
+            );
+            out.push(ChatRequestMessage::with_images(
+                "user",
+                lead,
+                vec![ChatImagePart {
+                    data: img.data.clone(),
+                    mime_type: img.mime_type.clone(),
+                }],
+            ));
         }
     }
     out

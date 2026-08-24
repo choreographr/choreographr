@@ -150,6 +150,80 @@ fn turn_for_client_strips_artifact_and_producer() {
 }
 
 #[test]
+fn turn_for_client_strips_vision_image_keeps_displayed_images() {
+    // The client-facing copy must never carry vision image bytes: the request
+    // builder reads `ToolResultRecord.image` from the authoritative daemon-side
+    // turn, so the client clone strips them.  `displayed_images` are what the
+    // client actually renders, so they must survive intact.
+    let authoritative = Turn {
+        created_at: TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("what's in a.png?".into()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: Vec::new(),
+        token_usage: None,
+        tool_results: vec![ToolResultRecord {
+            call_id: "c0".into(),
+            name: "read_image".into(),
+            content: "pixels".into(),
+            is_error: false,
+            invocation_description: "Reading `a.png`.".into(),
+            image: Some(choreo_proto::ImageReference {
+                path: "/tmp/a.png".into(),
+                mime_type: "image/png".into(),
+                width: 2,
+                height: 2,
+                data: b"\x89PNG-vision-bytes".to_vec(),
+            }),
+        }],
+        displayed_images: vec![DisplayedImageRecord {
+            metadata: choreo_proto::ImageMetadata {
+                mime_type: "image/png".into(),
+                width: 2,
+                height: 2,
+                byte_len: 8,
+                alt: Some("a.png".into()),
+            },
+            data: b"\x89PNG-display-bytes".to_vec(),
+            tool_call_id: Some("c0".into()),
+        }],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    // Guard the fixture: without stripping both images would be present.
+    assert!(
+        !authoritative.tool_results[0]
+            .image
+            .as_ref()
+            .unwrap()
+            .data
+            .is_empty()
+    );
+    assert!(!authoritative.displayed_images[0].data.is_empty());
+
+    let client = turn_for_client(&authoritative);
+
+    // Vision image bytes are stripped (daemon/model-only)…
+    assert_eq!(client.tool_results[0].image, None);
+    // …while the display image the client renders survives untouched.
+    assert!(!client.displayed_images[0].data.is_empty());
+    assert_eq!(client.displayed_images[0].data, b"\x89PNG-display-bytes");
+    assert_eq!(client.tool_results[0].name, "read_image");
+
+    // The authoritative turn keeps the vision bytes for the request builder.
+    assert!(
+        !authoritative.tool_results[0]
+            .image
+            .as_ref()
+            .unwrap()
+            .data
+            .is_empty()
+    );
+}
+
+#[test]
 fn session_state_message_strips_artifacts_from_turns() {
     // `SessionState` snapshots ride on attach — every turn in the map must
     // be the client-bound copy, even though the session's authoritative
@@ -1507,6 +1581,7 @@ fn update_tool_result_sets_all_record_fields_from_output() {
             mime_type: "image/jpeg".into(),
             width: 3,
             height: 2,
+            data: Vec::new(),
         }),
         ..Default::default()
     };
