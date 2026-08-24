@@ -22,6 +22,10 @@ name = "choreo_ai_protocols"
 # ArcSwap global is a declared direct dependency.
 anyhow.workspace = true
 arc-swap = "1.9.2"
+# Base64-encode image bytes into `data:` URLs for the vision content parts
+# (`image_url` on OpenAI chat/Responses, `image.source.data` on Anthropic,
+# `inline_data.data` on Google).
+base64.workspace = true
 choreo-proto.workspace = true
 # RFC 7231 Retry-After headers arrive in two forms: delta-seconds (the
 # common one) or an HTTP-date (`Wed, 21 Oct 2015 07:28:00 GMT`).  chrono is

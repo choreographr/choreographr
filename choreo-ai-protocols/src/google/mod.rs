@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use serde::{Deserialize, Serialize};
 
-use crate::openai::{ChatRequestMessage, ChatToolDefinition};
+use crate::openai::{ChatImagePart, ChatRequestMessage, ChatToolDefinition};
 use crate::overrides::ProviderOverrides;
 use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
@@ -322,6 +322,16 @@ enum PartPayload<'a> {
     FunctionResponse {
         function_response: FunctionResponsePayload<'a>,
     },
+    /// Gemini vision image: `{"inline_data":{"mime_type":…,"data":<base64>}}`.
+    /// `data` is owned (the base64 string is built at request time);
+    /// `mime_type` borrows from the message.
+    InlineData { inline_data: InlineDataPayload<'a> },
+}
+
+#[derive(Debug, Serialize)]
+struct InlineDataPayload<'a> {
+    mime_type: &'a str,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -559,8 +569,9 @@ fn attach_thought_signatures(
             thought_signature, ..
         } => *thought_signature = Some(last_signature.clone()),
         // Tool results are user-role parts and never appear in assistant
-        // content, so this arm is unreachable in practice.
-        PartPayload::FunctionResponse { .. } => {}
+        // content, so this arm is unreachable in practice. Inline data
+        // (vision) also never appears in assistant content.
+        PartPayload::FunctionResponse { .. } | PartPayload::InlineData { .. } => {}
     }
     Ok(())
 }
@@ -571,6 +582,28 @@ fn attach_thought_signatures(
 /// NOT added to `contents` because Gemini (unlike OpenAI) uses a separate
 /// top-level field for system instructions, and putting them in contents would
 /// cause a rejection.
+/// Build a Gemini `inline_data` part from a vision image part, or `None` for
+/// an unsupported MIME type (the caller keeps the text it already emitted).
+/// Gemini's `inline_data` is the user-role image carrier; `data` is the
+/// base64 payload (owned), `mime_type` borrows from the message.
+fn google_inline_image<'a>(image: &'a ChatImagePart) -> Option<PartPayload<'a>> {
+    // Gemini accepts PNG/JPEG/WEBP/GIF/HEIC/HEIF inline; we restrict to the
+    // four our normalization can produce (re-encode to PNG/JPEG/WEBP), so an
+    // exotic blob never reaches the provider.
+    const SUPPORTED: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+    if !SUPPORTED.contains(&image.mime_type.as_str()) {
+        return None;
+    }
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD.encode(&image.data);
+    Some(PartPayload::InlineData {
+        inline_data: InlineDataPayload {
+            mime_type: &image.mime_type,
+            data,
+        },
+    })
+}
+
 /// Assistant messages use role "model" (Gemini's term for the model, matching
 /// the API's role enum). Tool results use role "user" with functionResponse parts
 /// because Gemini requires tool responses to be sent under the user role.
@@ -632,14 +665,23 @@ fn build_message_payloads<'a>(
                 });
             }
             role => {
+                // User or other roles: text parts, plus an inline_data part
+                // per attached image (vision). Images ride user messages (the
+                // daemon defers tool-result images to synthetic user messages).
+                let mut parts: Vec<PartPayload<'a>> = Vec::new();
                 let content = msg.content.as_deref().unwrap_or("");
-                payloads.push(ContentPayload {
-                    role,
-                    parts: vec![PartPayload::Text {
+                if !content.is_empty() {
+                    parts.push(PartPayload::Text {
                         text: content,
                         thought_signature: None,
-                    }],
-                });
+                    });
+                }
+                for image in &msg.images {
+                    if let Some(part) = google_inline_image(image) {
+                        parts.push(part);
+                    }
+                }
+                payloads.push(ContentPayload { role, parts });
             }
         }
     }

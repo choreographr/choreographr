@@ -781,6 +781,7 @@ fn blank_lines_in_tool_output_are_copied() {
         content: content.into(),
         is_error: false,
         invocation_description: "read a file".into(),
+        image: None,
     }];
     app.display_for(0).view.insert_or_replace(0, t);
     app.rebuild_height_prefix();
@@ -810,6 +811,7 @@ fn wrapped_plain_tool_output_copies_unwrapped_text() {
         content: content.into(),
         is_error: false,
         invocation_description: "read a long file".into(),
+        image: None,
     }];
     app.display_for(0).view.insert_or_replace(0, t);
     app.rebuild_height_prefix();

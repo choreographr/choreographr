@@ -441,6 +441,19 @@ Markdown, query blockchains, post to X, etc.). Tools implement the `Tool` trait
 (name, group, description, JSON Schema, `fn execute`) and are registered in a
 `ToolRegistry` at daemon startup.
 
+**Vision input.** Choreographr can send images *to* the model: the `read_image`
+tool reads an image file from disk, normalizes it (resize to ≤2000px, MIME sniff,
+re-encode to PNG/JPEG under a decompression-bomb guard), and feeds it to a
+vision-capable model as image input on the next request. The durable record
+stores only an `ImageReference` (path + metadata), and the bytes are re-read and
+re-normalized at request time (pass-through, no artifact store). Each provider's
+wire format is supported (OpenAI chat `image_url`, Responses `input_image`,
+Anthropic `image`, Google `inline_data`), and a **vision gate** (`supports_vision`
+from the models.dev catalog, overridable via the overlay) ensures images are
+never sent to a text-only model — they degrade to a text placeholder instead.
+Vision support is per-model: pick a vision-capable model (e.g.
+`deepseek-v4-flash-vision-exp`) and call `read_image` with a path.
+
 **Tool group.** Tools are organized into groups (`core`, `git`, `shell`, `x`,
 `vm`, `db`, `mcp`, `blockchain`). Only `core`, `git`, and `shell` are active by default. The
 model can activate additional groups with `load_tools` and deactivate them with

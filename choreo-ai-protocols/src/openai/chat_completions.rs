@@ -1483,6 +1483,7 @@ mod tests {
         let msg = ChatRequestMessage {
             role: "assistant",
             content: Some("answer".into()),
+            images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -1512,6 +1513,7 @@ mod tests {
             let msg = ChatRequestMessage {
                 role: "assistant",
                 content: Some("answer".into()),
+                images: Vec::new(),
                 tool_call_id: None,
                 tool_calls: None,
                 reasoning_content: None,
@@ -1554,6 +1556,7 @@ mod tests {
         let msg = ChatRequestMessage {
             role: "assistant",
             content: Some("answer".into()),
+            images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -1578,6 +1581,7 @@ mod tests {
         let msg = ChatRequestMessage {
             role: "user",
             content: Some("hi".into()),
+            images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -1600,6 +1604,7 @@ mod tests {
         let msg = ChatRequestMessage {
             role: "assistant",
             content: Some("answer".into()),
+            images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,

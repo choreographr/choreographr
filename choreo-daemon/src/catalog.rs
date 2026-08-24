@@ -724,6 +724,7 @@ mod tests {
                     openai_responses: false,
                     reasoning_passback: None,
                     reasoning_content_required: None,
+                    supports_vision: false,
                 }],
             },
             ProviderEntry {

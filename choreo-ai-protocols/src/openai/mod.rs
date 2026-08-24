@@ -97,10 +97,46 @@ pub struct AssistantToolFunction {
     pub arguments: String,
 }
 
+/// One image carried by a user chat message, sent to the provider as a
+/// vision content part. The daemon attaches these (attached images, or a
+/// `read_image` tool result re-read at request time); each provider adapter
+/// renders them in its own wire format:
+///
+/// - OpenAI Chat Completions → `{"type":"image_url","image_url":{"url":"data:…;base64,…","detail":"auto"}}`
+/// - OpenAI Responses API → `{"type":"input_image","image_url":"data:…;base64,…"}` (flat string)
+/// - Anthropic Messages → `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`
+/// - Google Gemini → `{"inline_data":{"mime_type":…,"data":…}}`
+///
+/// Bytes are the raw encoded image (PNG/JPEG/WebP/GIF), not base64; the
+/// serializers encode them. Only `user`-role messages carry images (per
+/// provider restrictions), which the daemon guarantees by deferring tool
+/// images to a synthetic user message.
+#[derive(Debug, Clone)]
+pub struct ChatImagePart {
+    /// Raw encoded image bytes.
+    pub data: Vec<u8>,
+    /// Image MIME type (e.g. `image/png`).
+    pub mime_type: String,
+}
+
+impl ChatImagePart {
+    /// `data:<mime>;base64,<bytes>` URL — the wire value for OpenAI
+    /// `image_url.url` (chat and Responses).
+    pub fn data_url(&self) -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&self.data);
+        format!("data:{};base64,{}", self.mime_type, b64)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequestMessage {
     pub role: &'static str,
     pub content: Option<String>,
+    /// Images attached to this message (user role). Empty for text-only
+    /// messages. Rendered per-provider by the serializers; see
+    /// [`ChatImagePart`].
+    pub images: Vec<ChatImagePart>,
     pub tool_call_id: Option<String>,
     pub tool_calls: Option<Vec<AssistantToolCall>>,
     pub reasoning_content: Option<String>,
@@ -181,7 +217,14 @@ impl Serialize for ChatRequestMessage {
 
         let mut msg = serializer.serialize_struct("ChatRequestMessage", 7)?;
         msg.serialize_field("role", &self.role)?;
-        if let Some(content) = &self.content {
+        // When the message carries images, `content` becomes an array of
+        // `{type:"text"/"image_url"}` parts (the OpenAI chat vision shape);
+        // otherwise it stays a plain string. Only user messages carry images
+        // (the daemon guarantees this), but the branch is unconditional so a
+        // misconstructed message still serializes rather than 400-ing later.
+        if !self.images.is_empty() {
+            msg.serialize_field("content", &self.openai_chat_content_value())?;
+        } else if let Some(content) = &self.content {
             msg.serialize_field("content", content)?;
         }
         if let Some(tool_call_id) = &self.tool_call_id {
@@ -205,15 +248,74 @@ impl Serialize for ChatRequestMessage {
 
 impl ChatRequestMessage {
     pub fn simple(role: &'static str, content: String) -> Self {
+        ChatRequestMessage::with_images(role, content, Vec::new())
+    }
+
+    /// Build a text + image user message (vision input). `content` is the
+    /// lead-in text rendered ahead of the images; each provider adapter emits
+    /// the images in its own wire format. Only `user`-role messages carry
+    /// images (the daemon guarantees this by deferring tool images to
+    /// synthetic user messages).
+    pub fn with_images(role: &'static str, content: String, images: Vec<ChatImagePart>) -> Self {
         ChatRequestMessage {
             role,
             content: Some(content),
+            images,
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
             reasoning_text: None,
             reasoning_artifact: None,
+        }
+    }
+
+    /// The OpenAI chat-completions `content` value for this message: a plain
+    /// string when it carries no images, or an array of `{type:"text"}` and
+    /// `{type:"image_url"}` parts when it does. `detail` is fixed to `"auto"`
+    /// (the provider decides; see the vision plan).
+    pub fn openai_chat_content_value(&self) -> serde_json::Value {
+        if self.images.is_empty() {
+            serde_json::Value::String(self.content.clone().unwrap_or_default())
+        } else {
+            let mut parts: Vec<serde_json::Value> = Vec::new();
+            if let Some(text) = self.content.as_deref().filter(|t| !t.is_empty()) {
+                parts.push(serde_json::json!({ "type": "text", "text": text }));
+            }
+            for image in &self.images {
+                parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image.data_url(),
+                        "detail": "auto",
+                    }
+                }));
+            }
+            serde_json::Value::Array(parts)
+        }
+    }
+
+    /// The Responses API `input` content value for a user/assistant message:
+    /// a plain string when image-free, or an array of `input_text` and
+    /// `input_image` parts when it carries images. `input_image.image_url` is a
+    /// **flat string** (the Responses gotcha — it is not the nested object the
+    /// chat-completions `image_url` uses). `detail` fixed to `"auto"`.
+    pub fn responses_content_value(&self) -> serde_json::Value {
+        if self.images.is_empty() {
+            serde_json::Value::String(self.content.clone().unwrap_or_default())
+        } else {
+            let mut parts: Vec<serde_json::Value> = Vec::new();
+            if let Some(text) = self.content.as_deref().filter(|t| !t.is_empty()) {
+                parts.push(serde_json::json!({ "type": "input_text", "text": text }));
+            }
+            for image in &self.images {
+                parts.push(serde_json::json!({
+                    "type": "input_image",
+                    "image_url": image.data_url(),
+                    "detail": "auto",
+                }));
+            }
+            serde_json::Value::Array(parts)
         }
     }
 }
@@ -522,7 +624,7 @@ pub(crate) fn messages_to_responses_input(
                     items.push(responses_input_item_value(
                         responses::ResponsesInputItem::Message {
                             role: "system".to_string(),
-                            content: content.clone(),
+                            content: serde_json::Value::String(content.clone()),
                         },
                     )?);
                 }
@@ -543,11 +645,15 @@ pub(crate) fn messages_to_responses_input(
                     );
                     items.extend(reasoning_items);
                 }
-                if let Some(ref content) = msg.content {
+                // Content is a plain string, or an array of input_text/
+                // input_image parts when the message carries images. A message
+                // with neither text nor images is skipped (as before — an
+                // empty input item would be meaningless).
+                if msg.content.is_some() || !msg.images.is_empty() {
                     items.push(responses_input_item_value(
                         responses::ResponsesInputItem::Message {
                             role: msg.role.to_string(),
-                            content: content.clone(),
+                            content: msg.responses_content_value(),
                         },
                     )?);
                 }

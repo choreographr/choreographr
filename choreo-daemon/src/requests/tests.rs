@@ -85,6 +85,7 @@ fn build_chat_request_messages_with_tool_calls() {
         "file.txt".into(),
         false,
         String::new(),
+        None,
     );
 
     let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL);
@@ -94,6 +95,146 @@ fn build_chat_request_messages_with_tool_calls() {
     assert!(result[1].tool_calls.is_some());
     assert_eq!(result[2].role, "tool");
     assert_eq!(result[2].tool_call_id.as_deref(), Some("call_1"));
+}
+
+/// Write a tiny opaque PNG to a temp file and return the handle plus its path.
+fn write_temp_png() -> tempfile::NamedTempFile {
+    let buf = image::ImageBuffer::from_fn(3, 2, |x, y| {
+        image::Rgb([(x * 80) as u8, (y * 90) as u8, 40])
+    });
+    let mut file = tempfile::NamedTempFile::new().expect("temp png");
+    image::DynamicImage::ImageRgb8(buf)
+        .write_to(&mut file, image::ImageFormat::Png)
+        .expect("write png");
+    file
+}
+
+/// Build a session whose single turn's `read_image` tool result carries an
+/// image reference to a real temp PNG.
+fn session_with_image_result() -> (SessionState, tempfile::NamedTempFile) {
+    let file = write_temp_png();
+    let mut session = SessionState::empty();
+    let (tid, _) = session.start_turn(Some("look at this image".into()));
+    session.set_assistant_response(
+        tid,
+        AssistantResponse {
+            text: Some("Reading the image.".into()),
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: "call_img".into(),
+                name: "read_image".into(),
+                arguments_json: r#"{"path": "/tmp/x.png"}"#.into(),
+            }],
+            ..Default::default()
+        },
+    );
+    let calls = session.turns[&tid].tool_calls.clone();
+    session.seed_tool_results(tid, &calls, &["".into()]);
+    let img_ref = choreo_proto::ImageReference {
+        path: file.path().display().to_string(),
+        mime_type: "image/jpeg".into(),
+        width: 3,
+        height: 2,
+    };
+    session.update_tool_result(
+        tid,
+        "call_img",
+        "read_image".into(),
+        "read image: (3x2, image/jpeg)".into(),
+        false,
+        String::new(),
+        Some(img_ref),
+    );
+    (session, file)
+}
+
+#[test]
+fn build_chat_request_messages_vision_model_attaches_image() {
+    // On a vision-capable model, an image-bearing tool result yields a
+    // synthetic user message carrying the image, appended after the tool
+    // message (tool_use→tool_result adjacency preserved).
+    let (session, _file) = session_with_image_result();
+    let result =
+        build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-flash-vision-exp");
+    assert_eq!(result.len(), 4); // user, assistant, tool, image-user
+    assert_eq!(result[2].role, "tool");
+    assert_eq!(result[3].role, "user");
+    assert_eq!(result[3].images.len(), 1);
+    assert_eq!(result[3].images[0].mime_type, "image/jpeg");
+    assert!(
+        result[3]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("[image from")
+    );
+}
+
+#[test]
+fn build_chat_request_messages_non_vision_model_gates_image() {
+    // On a text-only model the gate replaces the image with a placeholder
+    // text message (no pixels), so the request never 400s.
+    let (session, _file) = session_with_image_result();
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    assert_eq!(result.len(), 4); // user, assistant, tool, placeholder-user
+    assert_eq!(result[3].role, "user");
+    assert_eq!(result[3].images.len(), 0);
+    assert!(
+        result[3]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("does not support image input"),
+        "{}",
+        result[3].content.as_deref().unwrap()
+    );
+}
+
+#[test]
+fn build_chat_request_messages_vision_model_missing_file_places_placeholder() {
+    // A reference whose source file was deleted after the tool ran degrades
+    // to a placeholder on a vision model (never a panic, never a stale path).
+    let mut session = SessionState::empty();
+    let (tid, _) = session.start_turn(Some("look".into()));
+    session.set_assistant_response(
+        tid,
+        AssistantResponse {
+            text: Some("Reading.".into()),
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: "c".into(),
+                name: "read_image".into(),
+                arguments_json: r#"{}"#.into(),
+            }],
+            ..Default::default()
+        },
+    );
+    let calls = session.turns[&tid].tool_calls.clone();
+    session.seed_tool_results(tid, &calls, &["".into()]);
+    session.update_tool_result(
+        tid,
+        "c",
+        "read_image".into(),
+        "read image: (3x2)".into(),
+        false,
+        String::new(),
+        Some(choreo_proto::ImageReference {
+            path: "/nonexistent/deleted.png".into(),
+            mime_type: "image/jpeg".into(),
+            width: 3,
+            height: 2,
+        }),
+    );
+    let result =
+        build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-flash-vision-exp");
+    assert_eq!(result.len(), 4);
+    assert_eq!(result[3].role, "user");
+    assert_eq!(result[3].images.len(), 0);
+    assert!(
+        result[3]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("could not be re-read")
+    );
 }
 
 #[test]
@@ -268,6 +409,7 @@ fn builder_tool_loop_attaches_artifact_for_tool_result_turns() {
             content: "ok".into(),
             is_error: false,
             invocation_description: String::new(),
+            image: None,
         });
 
     let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
@@ -1061,6 +1203,7 @@ fn ok_output(result_json: Option<serde_json::Value>) -> ToolOutput {
         content: String::new(),
         is_error: false,
         invocation_description: String::new(),
+        image_ref: None,
         result_json,
     }
 }
@@ -1529,6 +1672,7 @@ fn estimate_prompt_tokens_counts_tool_call_metadata() {
     let messages = vec![ChatRequestMessage {
         role: "assistant",
         content: None,
+        images: Vec::new(),
         tool_calls: Some(vec![AssistantToolCall {
             id: "call_abc".into(),
             kind: "function".into(),

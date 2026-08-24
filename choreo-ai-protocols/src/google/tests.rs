@@ -61,6 +61,7 @@ fn build_message_payloads_tool_result() {
     let msgs = vec![ChatRequestMessage {
         role: "tool",
         content: Some("Temperature is 72°F".to_string()),
+        images: Vec::new(),
         tool_call_id: Some("call_abc".to_string()),
         tool_calls: None,
         reasoning_content: None,
@@ -84,6 +85,7 @@ fn build_message_payloads_tool_call() {
     let msgs = vec![ChatRequestMessage {
         role: "assistant",
         content: Some("I'll check the weather.".to_string()),
+        images: Vec::new(),
         tool_call_id: None,
         tool_calls: Some(vec![AssistantToolCall {
             id: "call_1".to_string(),
@@ -847,6 +849,7 @@ fn build_message_payloads_attaches_thought_signature_to_last_part() {
     let msgs = vec![ChatRequestMessage {
         role: "assistant",
         content: Some("Checking the weather.".to_string()),
+        images: Vec::new(),
         tool_call_id: None,
         tool_calls: Some(vec![AssistantToolCall {
             id: "call_1".to_string(),
@@ -885,6 +888,7 @@ fn build_message_payloads_thought_signature_on_single_text_part() {
     let msgs = vec![ChatRequestMessage {
         role: "assistant",
         content: Some("Done.".to_string()),
+        images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
         reasoning_content: None,
@@ -920,6 +924,7 @@ fn build_message_payloads_foreign_artifact_variant_is_dropped() {
     let msgs = vec![ChatRequestMessage {
         role: "assistant",
         content: Some("answer".to_string()),
+        images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
         reasoning_content: None,
@@ -935,4 +940,33 @@ fn build_message_payloads_foreign_artifact_variant_is_dropped() {
     let parts = json_val["parts"].as_array().unwrap();
     assert_eq!(parts.len(), 1);
     assert!(parts[0].get("thoughtSignature").is_none());
+}
+
+#[test]
+fn build_message_payloads_user_image_renders_inline_data() {
+    // A user message carrying a vision image renders a Gemini `inline_data`
+    // part with a base64 payload; the text rides ahead of it.
+    use crate::openai::ChatImagePart;
+    let msgs = vec![ChatRequestMessage {
+        role: "user",
+        content: Some("what".to_string()),
+        images: vec![ChatImagePart {
+            data: b"\x89PNG-fake".to_vec(),
+            mime_type: "image/png".to_string(),
+        }],
+        tool_call_id: None,
+        tool_calls: None,
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+        reasoning_artifact: None,
+    }];
+    let (payloads, _) = build_message_payloads(&msgs).unwrap();
+    assert_eq!(payloads[0].role, "user");
+    let json_val = serde_json::to_value(&payloads[0]).unwrap();
+    let parts = json_val["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0]["text"], "what");
+    assert_eq!(parts[1]["inline_data"]["mime_type"], "image/png");
+    assert_eq!(parts[1]["inline_data"]["data"], "iVBORy1mYWtl");
 }

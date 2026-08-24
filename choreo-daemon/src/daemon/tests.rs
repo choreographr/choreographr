@@ -2303,6 +2303,7 @@ fn tiny_base() -> Vec<choreo_ai_protocols::ProviderEntry> {
             openai_responses: false,
             reasoning_passback: None,
             reasoning_content_required: None,
+            supports_vision: false,
         }],
     }]
 }

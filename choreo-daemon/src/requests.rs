@@ -25,6 +25,14 @@ use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
     OutputStream, ReasoningProducer, SessionEvent, SessionStatus, TokenUsage,
 };
+
+/// Fixed per-image token estimate for prompt-token accounting. Providers bill
+/// image input as tokens derived from (resized) dimensions, with no portable
+/// way to compute the exact count client-side; the surveyed agents converge on
+/// ~1000 tokens/image, which is a good middle estimate (DeepSeek caps at 384,
+/// Anthropic/OpenAI high-detail run higher). This feeds the context-window
+/// display and compaction weighting, not billing (which uses provider usage).
+pub const IMAGE_TOKEN_ESTIMATE: u32 = 1000;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -727,6 +735,16 @@ fn estimate_prompt_tokens(
                 .map(|text| enc.count(text) as u32)
                 .sum();
 
+            // Vision images are billed by the provider as tokens based on their
+            // (resized) dimensions. We don't know the exact per-provider
+            // tokenizer for images, so use the fixed estimate the surveyed
+            // agents converge on (~1000 tokens/image): the estimate feeds the
+            // context-window display and compaction weighting, not billing.
+            let image_tokens: u32 = messages
+                .iter()
+                .map(|m| (m.images.len() as u32).saturating_mul(IMAGE_TOKEN_ESTIMATE))
+                .sum();
+
             let tool_call_tokens: u32 = messages
                 .iter()
                 .filter_map(|m| m.tool_calls.as_ref())
@@ -758,7 +776,7 @@ fn estimate_prompt_tokens(
                 .map(|artifact| reasoning_artifact_tokens(enc, artifact))
                 .sum();
 
-            content_tokens + tool_call_tokens + tool_def_tokens + artifact_tokens
+            content_tokens + tool_call_tokens + tool_def_tokens + artifact_tokens + image_tokens
         }
         None => {
             // Effectively unreachable — `get_encoding("cl100k_base")` above
@@ -2044,6 +2062,10 @@ fn finish_tool_call(
     let is_error = output.is_error;
     let content = output.content.clone();
     let invocation_description = output.invocation_description.clone();
+    // The vision image reference (if any) rides onto the durable tool result
+    // so the request builder can feed it to a vision-capable model on the
+    // next request (reference-based: only the path + metadata, not bytes).
+    let image_ref = output.image_ref.clone();
 
     session.update_tool_result(
         turn_id,
@@ -2052,6 +2074,7 @@ fn finish_tool_call(
         content.clone(),
         is_error,
         invocation_description,
+        image_ref,
     );
 
     broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, turn_id);

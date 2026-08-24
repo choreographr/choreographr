@@ -223,6 +223,32 @@ pub struct ToolResultRecord {
     pub content: String,
     pub is_error: bool,
     pub invocation_description: String,
+    /// A vision image this tool result produced, stored as a *reference* (the
+    /// source path + metadata) rather than bytes — an additive, `#[serde(default)]`
+    /// field so old persisted turns deserialize with `None`. The request builder
+    /// re-reads and normalizes the file at request time (pass-through; there is
+    /// no artifact store), so the durable record stays small. `None` for
+    /// text-only results and for image results on non-vision models (the gate
+    /// substitutes a text placeholder instead of persisting a reference the
+    /// model cannot use).
+    #[serde(default)]
+    pub image: Option<ImageReference>,
+}
+
+/// A reference to a vision image produced by a tool (e.g. `read_image`),
+/// resolved to bytes at request-build time by reading `path`. Kept out of the
+/// durable record to avoid bloating the transcript/DB — the bytes are
+/// re-read and normalized (resize, MIME, EXIF) on each request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageReference {
+    /// Source path the image was read from (re-read at request time).
+    pub path: String,
+    /// Image MIME type as produced by normalization (e.g. `image/png`).
+    pub mime_type: String,
+    /// Width in pixels after normalization.
+    pub width: u32,
+    /// Height in pixels after normalization.
+    pub height: u32,
 }
 
 /// Which OpenAI-compatible chat field carried the reasoning text, locked in
@@ -930,6 +956,7 @@ mod tests {
                 content: "file.txt".to_string(),
                 is_error: false,
                 invocation_description: String::new(),
+                image: None,
             }],
             displayed_images: vec![DisplayedImageRecord {
                 metadata: ImageMetadata {
@@ -1050,6 +1077,7 @@ mod tests {
                         content: format!("output line {i} of the tool\n"),
                         is_error: false,
                         invocation_description: format!("Running: echo step {i}"),
+                        image: None,
                     })
                     .collect(),
                 displayed_images: (0..n_images)

@@ -539,6 +539,7 @@ fn build_message_payloads_reemits_thinking_blocks_verbatim() {
     let msgs = vec![ChatRequestMessage {
         role: "assistant",
         content: Some("Here is the answer".to_string()),
+        images: Vec::new(),
         tool_call_id: None,
         tool_calls: Some(vec![AssistantToolCall {
             id: "call_1".to_string(),
@@ -596,6 +597,7 @@ fn build_message_payloads_drops_thinking_blocks_when_thinking_disabled() {
     let msgs = vec![ChatRequestMessage {
         role: "assistant",
         content: Some("answer".to_string()),
+        images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
         reasoning_content: None,
@@ -633,6 +635,7 @@ fn build_message_payloads_foreign_artifact_variant_is_dropped() {
     let msgs = vec![ChatRequestMessage {
         role: "assistant",
         content: Some("answer".to_string()),
+        images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
         reasoning_content: None,
@@ -648,4 +651,68 @@ fn build_message_payloads_foreign_artifact_variant_is_dropped() {
     let blocks = blocks.as_array().unwrap();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0], json!({"type": "text", "text": "answer"}));
+}
+
+#[test]
+fn build_message_payloads_user_image_renders_image_block() {
+    // A user message carrying a vision image renders an Anthropic `image`
+    // content block with a base64 source; the text rides ahead of it.
+    use crate::openai::ChatImagePart;
+    let msgs = vec![ChatRequestMessage {
+        role: "user",
+        content: Some("describe".to_string()),
+        images: vec![ChatImagePart {
+            data: b"\x89PNG-fake".to_vec(),
+            mime_type: "image/png".to_string(),
+        }],
+        tool_call_id: None,
+        tool_calls: None,
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+        reasoning_artifact: None,
+    }];
+    let (payloads, _) = build_message_payloads(&msgs, &[], false).unwrap();
+    assert_eq!(payloads[0].role, "user");
+    let blocks = serde_json::to_value(&payloads[0].content).unwrap();
+    let blocks = blocks.as_array().unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0], json!({"type": "text", "text": "describe"}));
+    assert_eq!(
+        blocks[1],
+        json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBORy1mYWtl",
+            },
+        })
+    );
+}
+
+#[test]
+fn build_message_payloads_unsupported_image_mime_degrades_to_text_only() {
+    // A non-allowlisted image MIME type must not become an image block (a
+    // single unsupported blob would 400 the whole request) — the text stays.
+    use crate::openai::ChatImagePart;
+    let msgs = vec![ChatRequestMessage {
+        role: "user",
+        content: Some("note".to_string()),
+        images: vec![ChatImagePart {
+            data: b"svg".to_vec(),
+            mime_type: "image/svg+xml".to_string(),
+        }],
+        tool_call_id: None,
+        tool_calls: None,
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+        reasoning_artifact: None,
+    }];
+    let (payloads, _) = build_message_payloads(&msgs, &[], false).unwrap();
+    let blocks = serde_json::to_value(&payloads[0].content).unwrap();
+    let blocks = blocks.as_array().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0], json!({"type": "text", "text": "note"}));
 }

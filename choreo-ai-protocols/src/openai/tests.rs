@@ -2,6 +2,49 @@ use super::*;
 use std::time::Duration;
 
 #[test]
+fn chat_message_with_images_serializes_content_as_parts_array() {
+    // A user message carrying an image serializes `content` as an array of
+    // `text` + `image_url` parts (the OpenAI chat vision shape), with the
+    // data URL nested under `image_url.url` and `detail` fixed to "auto".
+    let msg = ChatRequestMessage {
+        role: "user",
+        content: Some("what is this?".to_string()),
+        images: vec![ChatImagePart {
+            data: b"\x89PNG-fake".to_vec(),
+            mime_type: "image/png".to_string(),
+        }],
+        tool_call_id: None,
+        tool_calls: None,
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+        reasoning_artifact: None,
+    };
+    let value = serde_json::to_value(&msg).unwrap();
+    let content = value["content"].as_array().expect("content array");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "what is this?");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "data:image/png;base64,iVBORy1mYWtl"
+    );
+    assert_eq!(content[1]["image_url"]["detail"], "auto");
+    // The images field itself must never appear on the wire as its own field.
+    assert!(value.get("images").is_none());
+}
+
+#[test]
+fn chat_message_without_images_serializes_content_as_plain_string() {
+    // Regression: a text-only message keeps the exact legacy wire shape
+    // (content is a plain string; no images field).
+    let msg = ChatRequestMessage::simple("user", "hi".to_string());
+    let value = serde_json::to_value(&msg).unwrap();
+    assert_eq!(value["content"], "hi");
+    assert!(value.get("images").is_none());
+}
+
+#[test]
 fn build_sse_event_joins_multiple_data_lines() {
     let mut lines = vec![
         "event: message".to_string(),

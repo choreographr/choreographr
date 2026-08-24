@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use serde::{Deserialize, Serialize};
 
-use crate::openai::{ChatRequestMessage, ChatToolDefinition};
+use crate::openai::{ChatImagePart, ChatRequestMessage, ChatToolDefinition};
 use crate::overrides::ProviderOverrides;
 use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
@@ -317,11 +317,27 @@ enum ContentBlockPayload<'a> {
         tool_use_id: &'a str,
         content: &'a str,
     },
+    /// Vision image block: `{"type":"image","source":{"type":"base64",
+    /// "media_type":…,"data":…}}`. `data` is owned (the base64 string is
+    /// built at request time); `media_type` borrows from the message.
+    Image {
+        r#type: &'a str,
+        source: ImageSourcePayload<'a>,
+    },
     /// Provider-owned thinking / redacted_thinking block, replayed verbatim
     /// from the round-trip artifact (never rebuilt or reordered). Serializes
     /// as the embedded JSON value; untagged serialization delegates to the
     /// actual variant, so the raw block passes through unchanged.
     Raw(serde_json::Value),
+}
+
+/// Anthropic vision image source. `data` is the base64 payload (owned);
+/// `media_type` is one of image/jpeg, image/png, image/gif, image/webp.
+#[derive(Debug, Serialize)]
+struct ImageSourcePayload<'a> {
+    r#type: &'a str,
+    media_type: &'a str,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -558,6 +574,32 @@ fn artifact_thinking_blocks(
     Ok(blocks.into_iter().map(ContentBlockPayload::Raw).collect())
 }
 
+/// Anthropic's allowlisted vision media types. Only these become `image`
+/// blocks; any other `image/*` blob degrades to a text marker so an
+/// unsupported type cannot 400 the whole request.
+const ANTHROPIC_IMAGE_MEDIA_TYPES: [&str; 4] =
+    ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Build an Anthropic `image` content block from a vision image part, or
+/// `None` when the MIME type is not Anthropic-allowlisted (the caller keeps a
+/// text marker in its place). The base64 payload is owned; `media_type`
+/// borrows from the message.
+fn anthropic_image_block<'a>(image: &'a ChatImagePart) -> Option<ContentBlockPayload<'a>> {
+    if !ANTHROPIC_IMAGE_MEDIA_TYPES.contains(&image.mime_type.as_str()) {
+        return None;
+    }
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD.encode(&image.data);
+    Some(ContentBlockPayload::Image {
+        r#type: "image",
+        source: ImageSourcePayload {
+            r#type: "base64",
+            media_type: &image.mime_type,
+            data,
+        },
+    })
+}
+
 /// Convert a list of messages + tools into the format expected by the
 /// Anthropic Messages API.
 ///
@@ -636,14 +678,28 @@ fn build_message_payloads<'a>(
                 });
             }
             role => {
-                // User or other roles: wrap content as text blocks.
+                // User or other roles: text blocks, plus an image block per
+                // attached image (vision). Images ride user messages (the
+                // daemon defers tool-result images to synthetic user messages),
+                // and only allowlisted Anthropic media types become image
+                // blocks — anything else falls back to a text marker so a
+                // single unsupported blob cannot 400 the whole request.
+                let mut blocks: Vec<ContentBlockPayload<'a>> = Vec::new();
                 let content = msg.content.as_deref().unwrap_or("");
-                payloads.push(MessagePayload {
-                    role,
-                    content: vec![ContentBlockPayload::Text {
+                if !content.is_empty() {
+                    blocks.push(ContentBlockPayload::Text {
                         r#type: "text",
                         text: content,
-                    }],
+                    });
+                }
+                for image in &msg.images {
+                    if let Some(block) = anthropic_image_block(image) {
+                        blocks.push(block);
+                    }
+                }
+                payloads.push(MessagePayload {
+                    role,
+                    content: blocks,
                 });
             }
         }

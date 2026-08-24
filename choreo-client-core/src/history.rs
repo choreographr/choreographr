@@ -260,6 +260,7 @@ impl SessionView {
                         .get(call_id)
                         .cloned()
                         .unwrap_or_default(),
+                    image: None,
                 });
             }
         }
@@ -331,6 +332,7 @@ mod tests {
             content: "first".into(),
             is_error: false,
             invocation_description: String::new(),
+            image: None,
         });
         view.insert_or_replace(1, turn);
         view.request_to_turn.insert(7, 1);
@@ -356,6 +358,7 @@ mod tests {
             content: prefix.clone(),
             is_error: false,
             invocation_description: String::new(),
+            image: None,
         });
         view.insert_or_replace(1, turn);
         view.request_to_turn.insert(7, 1);
@@ -426,6 +429,7 @@ mod tests {
             content: exact.clone(),
             is_error: false,
             invocation_description: String::new(),
+            image: None,
         });
         view.insert_or_replace(1, turn);
         view.request_to_turn.insert(7, 1);
@@ -611,6 +615,7 @@ mod tests {
             content: "done".into(),
             is_error: false,
             invocation_description: "Running shell command: `ls`.".into(),
+            image: None,
         });
         view.insert_or_replace(1, turn);
 
@@ -665,6 +670,7 @@ mod tests {
             content: String::new(),
             is_error: false,
             invocation_description: String::new(),
+            image: None,
         });
         view.insert_or_replace(1, turn);
         view.request_to_turn.insert(7, 1);

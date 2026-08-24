@@ -264,6 +264,7 @@ fn tool_result_record_serde_round_trip() {
         content: "file.txt".into(),
         is_error: false,
         invocation_description: String::new(),
+        image: None,
     };
     let frame = encode_frame(&record).expect("encode");
     let decoded: ToolResultRecord = decode_frame(&frame[4..]).expect("decode");
@@ -295,6 +296,7 @@ fn turn_with_tool_results_round_trip() {
             content: "file.txt".into(),
             is_error: false,
             invocation_description: String::new(),
+            image: None,
         }],
         displayed_images: vec![],
         reasoning_artifact: None,

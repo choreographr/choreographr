@@ -1,0 +1,183 @@
+//! `read_image`: read an image file from disk and feed it back to a
+//! vision-capable model.
+//!
+//! The tool normalizes the image (resize / MIME / re-encode — see
+//! `crate::image_prep`), reports a text handle (path, dimensions, MIME, byte
+//! size) the model can reason about, and parks an [`ImageReference`] (path +
+//! metadata, not bytes) that the framework hands to the request builder via
+//! the `extract_image_ref` hook. At request time the builder re-reads and
+//! re-normalizes the file and attaches the pixels to a synthetic user message
+//! (reference-based / pass-through design: no artifact store, so nothing is
+//! persisted beyond the path).
+//!
+//! v1 accepts local file paths only. URLs / clipboard paste are future work.
+
+use super::{ImageRefSlot, ToolExecError, truncate_tool_output};
+use crate::image_prep;
+use choreo_keystore::ServiceCredential;
+use choreo_proto::ImageReference;
+use schemars::JsonSchema;
+use serde::Deserialize;
+use std::path::Path;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadImageArgs {
+    /// Path to an image file to read (relative to the working directory, or
+    /// absolute).
+    pub path: String,
+}
+
+pub(crate) struct ReadImage {
+    /// Parks the parsed image reference for the framework's `extract_image_ref`
+    /// hook (see [`ImageRefSlot`]).
+    last_ref: ImageRefSlot,
+}
+
+impl ReadImage {
+    pub(crate) fn new() -> Self {
+        ReadImage {
+            last_ref: ImageRefSlot::default(),
+        }
+    }
+}
+
+/// Resolve `path` against the working directory and normalize the file into a
+/// vision image. Returns the prepared image plus the resolved path to embed in
+/// the reference.
+fn resolve_and_normalize(
+    args: &ReadImageArgs,
+    working_dir: Option<&Path>,
+) -> Result<(std::path::PathBuf, image_prep::PreparedVisionImage), ToolExecError> {
+    if args.path.trim().is_empty() {
+        return Err(ToolExecError(
+            "missing required string argument: path".to_string(),
+        ));
+    }
+    let resolved = super::resolve_path(&args.path, working_dir);
+    let prep = image_prep::load_and_normalize(&resolved)
+        .map_err(|e| ToolExecError(format!("failed to read image: {e}")))?;
+    Ok((resolved, prep))
+}
+
+impl super::Tool for ReadImage {
+    type Args = ReadImageArgs;
+    type Return = String;
+    type Error = ToolExecError;
+
+    fn name(&self) -> &'static str {
+        "read_image"
+    }
+    fn description(&self) -> &'static str {
+        "Read an image file from the local workspace and provide it to a vision-capable model as image input. Returns the image's path, dimensions, and MIME type, and feeds the image to the model on the next request."
+    }
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        format!("Reading image `{}`.", args.path)
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        _ctx: Option<&super::context::ToolContext>,
+    ) -> Result<Self::Return, Self::Error> {
+        let (resolved, prep) = resolve_and_normalize(&args, working_dir)?;
+        let reference = ImageReference {
+            path: resolved.display().to_string(),
+            mime_type: prep.mime_type.to_string(),
+            width: prep.width,
+            height: prep.height,
+        };
+        // Park the reference for the framework's `extract_image_ref` hook,
+        // which moves it into the tool result's durable `image` field.
+        self.last_ref.store(reference);
+        Ok(truncate_tool_output(&format!(
+            "read image: {} ({}x{}, {}, {})",
+            resolved.display(),
+            prep.width,
+            prep.height,
+            prep.mime_type,
+            humfmt::bytes(prep.data.len() as u64),
+        )))
+    }
+
+    fn extract_image_ref(&self, _ret: &Self::Return) -> Option<ImageReference> {
+        self.last_ref.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Tool as _;
+    use super::*;
+    use std::io::Write;
+
+    fn run(path: &str) -> Result<String, ToolExecError> {
+        let tool = ReadImage::new();
+        tool.execute(
+            ReadImageArgs {
+                path: path.to_string(),
+            },
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn write_png() -> tempfile::NamedTempFile {
+        // A tiny 3×2 opaque PNG via the image crate (used by image_prep tests).
+        let buf = image::ImageBuffer::from_fn(3, 2, |x, y| {
+            image::Rgb([(x * 80) as u8, (y * 90) as u8, 40])
+        });
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        image::DynamicImage::ImageRgb8(buf)
+            .write_to(&mut file, image::ImageFormat::Png)
+            .unwrap();
+        file
+    }
+
+    #[test]
+    fn reads_image_and_reports_metadata() {
+        let file = write_png();
+        let out = run(&file.path().display().to_string()).unwrap();
+        assert!(out.contains("read image:"), "{out}");
+        assert!(out.contains("3x2"), "{out}");
+        // Opaque PNG re-encodes to JPEG.
+        assert!(out.contains("image/jpeg"), "{out}");
+    }
+
+    #[test]
+    fn exposes_image_reference_via_hook() {
+        let tool = ReadImage::new();
+        let file = write_png();
+        let args = ReadImageArgs {
+            path: file.path().display().to_string(),
+        };
+        let ret = tool.execute(args, None, None, None).expect("execute");
+        let reference = tool.extract_image_ref(&ret).expect("image ref");
+        assert_eq!(reference.mime_type, "image/jpeg");
+        assert_eq!(reference.width, 3);
+        assert_eq!(reference.height, 2);
+        assert_eq!(reference.path, file.path().display().to_string());
+        // A second take is empty (the slot was drained).
+        assert!(tool.extract_image_ref(&ret).is_none());
+    }
+
+    #[test]
+    fn rejects_missing_path() {
+        let err = run("  ").unwrap_err();
+        assert!(err.to_string().contains("missing required"));
+    }
+
+    #[test]
+    fn rejects_non_image_file() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"just text, not an image").unwrap();
+        let err = run(&file.path().display().to_string()).unwrap_err();
+        assert!(err.to_string().contains("failed to read image"), "{err}");
+    }
+}

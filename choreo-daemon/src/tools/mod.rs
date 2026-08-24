@@ -2,6 +2,7 @@ use choreo_ai_protocols::ChatToolCall;
 pub(crate) use choreo_ai_protocols::openai::AllowedCaller;
 use choreo_ai_protocols::openai::ChatToolDefinition;
 use choreo_keystore::ServiceCredential;
+use choreo_proto::ImageReference;
 use crossbeam_channel;
 use humfmt::{BytesOptions, bytes_with};
 use schemars::JsonSchema;
@@ -173,6 +174,7 @@ pub(crate) mod pdf;
 pub(crate) mod random;
 pub(crate) mod read_file;
 pub(crate) mod read_file_range;
+pub(crate) mod read_image;
 pub(crate) mod retrieve_webpage;
 pub(crate) mod series;
 pub(crate) mod session_inspect;
@@ -194,6 +196,10 @@ pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
     pub invocation_description: String,
+    /// A vision image reference this tool produced (e.g. `read_image`), fed
+    /// back to a vision-capable model on the next request. Carried as a
+    /// reference, not bytes — see [`Tool::extract_image_ref`].
+    pub image_ref: Option<ImageReference>,
     /// The tool's structured return value, captured after a successful
     /// execution (`serde_json::to_value(ret)`). `None` for error/timeout
     /// outputs and for returns that fail to serialize.  The request worker
@@ -239,6 +245,29 @@ impl ImageSlot {
     /// Move out and clear the parked image, if any, for `extract_image`.
     pub(crate) fn take(&self) -> Option<PreparedImage> {
         // Recover from a poisoned lock instead of panicking (AGENTS.md).
+        self.last.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// Cache that lets the `read_image` tool hand an [`ImageReference`] to the
+/// framework's `extract_image_ref` hook (the vision-input counterpart to
+/// [`ImageSlot`]). Same rationale: `Tool::execute` takes `&self`, so the
+/// reference is parked here for the immediately-following `extract_image_ref`
+/// call to `take()`. The mutex is single-purpose, carries only a best-effort
+/// reference hand-off, and is uncontended in the common single-threaded path.
+#[derive(Default)]
+pub(crate) struct ImageRefSlot {
+    last: Mutex<Option<ImageReference>>,
+}
+
+impl ImageRefSlot {
+    /// Park `reference` as "the most recent one this tool produced".
+    pub(crate) fn store(&self, reference: ImageReference) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(reference);
+    }
+
+    /// Move out and clear the parked reference, if any, for `extract_image_ref`.
+    pub(crate) fn take(&self) -> Option<ImageReference> {
         self.last.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
@@ -405,6 +434,15 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Optional: extract a vision image *reference* from the return value, so
+    /// the daemon can feed it back to a vision-capable model on the next
+    /// request (reference-based: the durable record stores the path + metadata,
+    /// and the request builder re-reads + normalizes the bytes at request
+    /// time). Only the `read_image` tool overrides this.
+    fn extract_image_ref(&self, _ret: &Self::Return) -> Option<ImageReference> {
+        None
+    }
+
     /// Whether this tool produces streaming output via `execute_streaming`.
     ///
     /// Streaming tools forward their live output as `ToolResultChunk`s.  The
@@ -539,6 +577,7 @@ impl<T: Tool + 'static> ToolDyn for T {
         {
             let _ = tx.send(image);
         }
+        let image_ref = self.extract_image_ref(&ret);
         Ok(ToolOutput {
             content: match format {
                 ToolOutputFormat::Text => T::return_string(&ret),
@@ -549,6 +588,7 @@ impl<T: Tool + 'static> ToolDyn for T {
             },
             is_error: false,
             invocation_description: desc,
+            image_ref,
             result_json: serde_json::to_value(&ret).ok(),
         })
     }
@@ -608,6 +648,7 @@ impl<T: Tool + 'static> ToolDyn for T {
         {
             let _ = tx.send(image);
         }
+        let image_ref = self.extract_image_ref(&ret);
         Ok(ToolOutput {
             content: match format {
                 ToolOutputFormat::Text => T::return_string(&ret),
@@ -618,6 +659,7 @@ impl<T: Tool + 'static> ToolDyn for T {
             },
             is_error: false,
             invocation_description: desc,
+            image_ref,
             result_json: serde_json::to_value(&ret).ok(),
         })
     }
@@ -716,6 +758,7 @@ impl ToolRegistry {
         reg.register(find::Find);
         reg.register(pdf::PdfClassify);
         reg.register(pdf::PdfToMarkdown);
+        reg.register(read_image::ReadImage::new());
         // Blockchain tools — registered only when the `blockchain` feature is
         // enabled; the tools themselves live in the `choreo-blockchain` crate.
         #[cfg(feature = "blockchain")]

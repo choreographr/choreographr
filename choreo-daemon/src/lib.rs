@@ -9,6 +9,7 @@ pub mod context;
 pub mod daemon;
 pub mod db;
 pub mod diff_util;
+pub mod image_prep;
 pub mod mcp;
 pub mod metrics;
 pub mod providers;

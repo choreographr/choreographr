@@ -12,9 +12,9 @@ pub use io::{
 pub use types::{
     AccountInfo, AssistantToolCallRecord, CatalogProvider, ChatReasoningField, ClientMessage,
     ContextConfig, DaemonMessage, DiscardedToolCall, DisplayedImageRecord, ImageMetadata,
-    InferenceError, OutputStream, ReasoningArtifact, ReasoningCapability, ReasoningProducer,
-    RefreshStatus, SessionEvent, SessionStatus, SessionSummary, TimestampMs, TokenUsage,
-    ToolResultRecord, Turn,
+    ImageReference, InferenceError, OutputStream, ReasoningArtifact, ReasoningCapability,
+    ReasoningProducer, RefreshStatus, SessionEvent, SessionStatus, SessionSummary, TimestampMs,
+    TokenUsage, ToolResultRecord, Turn,
 };
 
 #[cfg(test)]

@@ -64,6 +64,7 @@ fn assistant_message_from_tool_use(tool_use: &ChatAssistantToolUse) -> ChatReque
     ChatRequestMessage {
         role: "assistant",
         content: tool_use.content.clone(),
+        images: Vec::new(),
         tool_call_id: None,
         tool_calls: Some(tool_calls),
         reasoning_content: None,
@@ -78,6 +79,7 @@ fn tool_result_message(tool_use: &ChatAssistantToolUse) -> ChatRequestMessage {
     ChatRequestMessage {
         role: "tool",
         content: Some("72°F and sunny".to_string()),
+        images: Vec::new(),
         tool_call_id: Some(tool_use.tool_calls[0].id.clone()),
         tool_calls: None,
         reasoning_content: None,

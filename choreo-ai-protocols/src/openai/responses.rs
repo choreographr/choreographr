@@ -22,7 +22,10 @@ use std::io;
 pub(crate) enum ResponsesInputItem {
     Message {
         role: String,
-        content: String,
+        /// A plain string, or an array of `input_text` / `input_image` parts
+        /// when the message carries images (vision). Built via
+        /// [`ChatRequestMessage::responses_content_value`].
+        content: serde_json::Value,
     },
     #[serde(rename = "function_call_output")]
     FunctionCallOutput {
@@ -1111,12 +1114,48 @@ mod tests {
     fn responses_input_item_message_serializes() {
         let item = ResponsesInputItem::Message {
             role: "user".to_string(),
-            content: "hello".to_string(),
+            content: serde_json::Value::String("hello".to_string()),
         };
         let value = serde_json::to_value(&item).unwrap();
         assert_eq!(value["type"], "message");
         assert_eq!(value["role"], "user");
         assert_eq!(value["content"], "hello");
+    }
+
+    #[test]
+    fn responses_input_item_message_with_images_serializes_parts() {
+        // A user message carrying an image renders `content` as an array of
+        // `input_text` + `input_image` parts, with `image_url` as a flat
+        // string (the Responses gotcha) and `detail` fixed to "auto".
+        use crate::openai::ChatImagePart;
+        let item = ResponsesInputItem::Message {
+            role: "user".to_string(),
+            content: ChatRequestMessage {
+                role: "user",
+                content: Some("look".to_string()),
+                images: vec![ChatImagePart {
+                    data: b"\x89PNG-fake".to_vec(),
+                    mime_type: "image/png".to_string(),
+                }],
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_text: None,
+                reasoning_artifact: None,
+            }
+            .responses_content_value(),
+        };
+        let value = serde_json::to_value(&item).unwrap();
+        let content = value["content"].as_array().expect("content array");
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "look");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(
+            content[1]["image_url"],
+            "data:image/png;base64,iVBORy1mYWtl"
+        );
+        assert_eq!(content[1]["detail"], "auto");
     }
 
     #[test]
@@ -1913,6 +1952,7 @@ mod tests {
         let msg = ChatRequestMessage {
             role: "assistant",
             content: Some("Here is the answer".to_string()),
+            images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -1942,6 +1982,7 @@ mod tests {
         let msg = ChatRequestMessage {
             role: "assistant",
             content: Some("Let me check".to_string()),
+            images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,

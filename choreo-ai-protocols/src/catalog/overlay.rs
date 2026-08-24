@@ -179,6 +179,7 @@ fn apply_models_overlay(
                     openai_responses: false,
                     reasoning_passback: None,
                     reasoning_content_required: None,
+                    supports_vision: false,
                 };
                 apply_model_overlay(&mut model, table);
                 entry.models.push(model);
@@ -232,6 +233,13 @@ fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
                 None => warn!(
                     model = %model.model,
                     "overlay: reasoning_content_required is not a bool; skipping",
+                ),
+            },
+            "supports_vision" => match value.as_bool() {
+                Some(support) => model.supports_vision = support,
+                None => warn!(
+                    model = %model.model,
+                    "overlay: supports_vision is not a bool; skipping",
                 ),
             },
             other => warn!(
@@ -324,6 +332,7 @@ mod tests {
                         openai_responses: false,
                         reasoning_passback: None,
                         reasoning_content_required: None,
+                        supports_vision: true,
                     },
                     ModelEntry {
                         model: "acme-lite".into(),
@@ -333,6 +342,7 @@ mod tests {
                         openai_responses: false,
                         reasoning_passback: None,
                         reasoning_content_required: None,
+                        supports_vision: false,
                     },
                 ],
             },
@@ -350,6 +360,7 @@ mod tests {
                     openai_responses: false,
                     reasoning_passback: None,
                     reasoning_content_required: None,
+                    supports_vision: false,
                 }],
             },
         ]

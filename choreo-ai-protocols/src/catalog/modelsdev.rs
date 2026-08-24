@@ -69,6 +69,18 @@ struct RawModel {
     /// (`0` = unknown, as today). Absent → 0.
     #[serde(default)]
     limit: Option<ModelLimit>,
+    /// Input/output modalities (`{"input": ["text", "image"], "output": ["text"]}`).
+    /// A model is vision-capable when `"image"` appears in `modalities.input`;
+    /// absent → treated as text-only. This is the source of truth for
+    /// [`ModelEntry::supports_vision`].
+    #[serde(default)]
+    modalities: Option<RawModalities>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawModalities {
+    #[serde(default)]
+    input: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +147,13 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
             // DeepSeek/Kimi reasoning_content-echo is likewise derived from
             // the model name/family at lookup time, not baked into the base.
             reasoning_content_required: None,
+            // Vision: `"image"` in `modalities.input`. Absent modalities
+            // (older snapshot entries) default to text-only.
+            supports_vision: m
+                .modalities
+                .as_ref()
+                .map(|mods| mods.input.iter().any(|m| m == "image"))
+                .unwrap_or(false),
         })
         .collect();
 
@@ -220,7 +239,8 @@ mod tests {
                 "gpt-5.4": {
                     "reasoning": true,
                     "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}],
-                    "limit": {"context": 400000, "output": 131072}
+                    "limit": {"context": 400000, "output": 131072},
+                    "modalities": {"input": ["text", "image"], "output": ["text"]}
                 }
             }
         },
@@ -329,6 +349,16 @@ mod tests {
         // reasoning=false model has no levels.
         assert!(!catalog[4].models[0].reasoning_supported);
         assert!(catalog[4].models[0].openai_reasoning_levels.is_empty());
+    }
+
+    #[test]
+    fn derives_vision_from_modalities_input() {
+        let catalog = normalize_modelsdev(SNAPSHOT);
+        // gpt-5.4 declares image in input modalities → vision.
+        assert!(catalog[1].models[0].supports_vision);
+        // glm-5 (text only) and chatty-1 (no modalities field) → not vision.
+        assert!(!catalog[0].models[0].supports_vision);
+        assert!(!catalog[4].models[0].supports_vision);
     }
 
     #[test]

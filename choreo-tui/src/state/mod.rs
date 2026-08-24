@@ -4606,6 +4606,7 @@ mod tests {
             content: "x".into(),
             is_error: false,
             invocation_description: String::new(),
+            image: None,
         };
         let loud = ToolResultRecord {
             call_id: "c2".into(),
@@ -4613,6 +4614,7 @@ mod tests {
             content: "y".into(),
             is_error: false,
             invocation_description: String::new(),
+            image: None,
         };
         // No override → the derived default wins (quiet collapsed, others
         // expanded).
@@ -4653,6 +4655,7 @@ mod tests {
                 content: "file contents".into(),
                 is_error: false,
                 invocation_description: "Reading file `src/main.rs`.".into(),
+                image: None,
             }],
             displayed_images: vec![],
             reasoning_artifact: None,
@@ -4731,6 +4734,7 @@ mod tests {
                 content: "y".into(),
                 is_error: false,
                 invocation_description: String::new(),
+                image: None,
             }],
             displayed_images: vec![],
             reasoning_artifact: None,
@@ -4759,6 +4763,7 @@ mod tests {
                 content: "x".into(),
                 is_error: false,
                 invocation_description: String::new(),
+                image: None,
             }],
             displayed_images: vec![],
             reasoning_artifact: None,
@@ -4809,6 +4814,7 @@ mod tests {
                     content: "x".into(),
                     is_error: false,
                     invocation_description: "Reading `a`.".into(),
+                    image: None,
                 },
                 ToolResultRecord {
                     call_id: "c2".into(),
@@ -4816,6 +4822,7 @@ mod tests {
                     content: "y".into(),
                     is_error: false,
                     invocation_description: "Running `b`.".into(),
+                    image: None,
                 },
             ],
             displayed_images: vec![],
@@ -5804,6 +5811,7 @@ mod tests {
                     content: String::new(),
                     is_error: false,
                     invocation_description: "Reading `a`.".into(),
+                    image: None,
                 },
                 ToolResultRecord {
                     call_id: "loud".into(),
@@ -5811,6 +5819,7 @@ mod tests {
                     content: String::new(),
                     is_error: false,
                     invocation_description: "Running `b`.".into(),
+                    image: None,
                 },
             ],
             displayed_images: vec![],
@@ -5907,6 +5916,7 @@ mod tests {
                 content: String::new(),
                 is_error: false,
                 invocation_description: "Running `b`.".into(),
+                image: None,
             }],
             displayed_images: vec![],
             reasoning_artifact: None,
@@ -6000,6 +6010,7 @@ mod tests {
                 content: String::new(),
                 is_error: false,
                 invocation_description: "Running `b`.".into(),
+                image: None,
             }],
             displayed_images: vec![],
             reasoning_artifact: None,
@@ -6066,6 +6077,7 @@ mod tests {
                 content: String::new(),
                 is_error: false,
                 invocation_description: String::new(),
+                image: None,
             }],
             displayed_images: vec![],
             reasoning_artifact: None,

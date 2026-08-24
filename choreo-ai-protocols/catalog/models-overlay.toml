@@ -75,6 +75,12 @@
 [provider.deepseek]
   default_model = "deepseek-v4-pro"
 
+# deepseek-v4-flash-vision-exp is not in the models.dev snapshot (vision model
+# shipped outside the catalog), so it is created here with the vision flag set.
+# Images are sent to it via the OpenAI-compatible image_url content part.
+[provider.deepseek.models."deepseek-v4-flash-vision-exp"]
+  supports_vision = true
+
 # empiriolabs -> empiriolabs (policy from the pre-models.dev TOML)
 [provider.empiriolabs]
   default_model = "deepseek-v4-pro"

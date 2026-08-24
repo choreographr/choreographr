@@ -1404,7 +1404,15 @@ fn seed_then_update_tool_results_preserves_call_order() {
     );
 
     // c finishes first — its placeholder is filled in place.
-    state.update_tool_result(tid, "c", "sh".into(), "c-out".into(), false, String::new());
+    state.update_tool_result(
+        tid,
+        "c",
+        "sh".into(),
+        "c-out".into(),
+        false,
+        String::new(),
+        None,
+    );
     assert_eq!(order_of(&state), vec!["a", "b", "c"]);
     assert_eq!(state.turns[&tid].tool_results[2].content, "c-out");
 
@@ -1416,6 +1424,7 @@ fn seed_then_update_tool_results_preserves_call_order() {
         "a-out".into(),
         false,
         String::new(),
+        None,
     );
     state.update_tool_result(
         tid,
@@ -1424,13 +1433,22 @@ fn seed_then_update_tool_results_preserves_call_order() {
         "b-out".into(),
         false,
         String::new(),
+        None,
     );
     assert_eq!(order_of(&state), vec!["a", "b", "c"]);
     assert_eq!(state.turns[&tid].tool_results[0].content, "a-out");
     assert_eq!(state.turns[&tid].tool_results[1].content, "b-out");
 
     // Error results also land in place.
-    state.update_tool_result(tid, "b", "grep".into(), "boom".into(), true, String::new());
+    state.update_tool_result(
+        tid,
+        "b",
+        "grep".into(),
+        "boom".into(),
+        true,
+        String::new(),
+        None,
+    );
     assert_eq!(order_of(&state), vec!["a", "b", "c"]);
     assert!(state.turns[&tid].tool_results[1].is_error);
     assert_eq!(state.turns[&tid].tool_results[1].content, "boom");
@@ -1450,6 +1468,7 @@ fn update_tool_result_unknown_call_id_is_noop() {
         "x".into(),
         false,
         String::new(),
+        None,
     );
     assert!(state.turns[&tid].tool_results.is_empty());
 }
@@ -1489,6 +1508,7 @@ fn mark_unexecuted_tool_results_marks_only_unexecuted() {
         "a-out".into(),
         false,
         String::new(),
+        None,
     );
     let executed = HashSet::from(["a".to_string()]);
     state.mark_unexecuted_tool_results(tid, &executed);
@@ -1522,6 +1542,7 @@ fn mark_unexecuted_tool_results_preserves_recorded_error_results() {
         "timed out".into(),
         true,
         String::new(),
+        None,
     );
     state.mark_unexecuted_tool_results(tid, &HashSet::from(["a".to_string()]));
     assert_eq!(state.turns[&tid].tool_results[0].content, "timed out");

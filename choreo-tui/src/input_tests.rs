@@ -1654,6 +1654,7 @@ fn click_on_tool_result_header_toggles_collapse() {
             content: "file contents".into(),
             is_error: false,
             invocation_description: "Reading file `src/main.rs`.".into(),
+            image: None,
         }],
         displayed_images: vec![],
         reasoning_artifact: None,

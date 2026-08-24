@@ -715,6 +715,7 @@ impl SessionState {
                     content: String::new(),
                     is_error: false,
                     invocation_description: desc.clone(),
+                    image: None,
                 })
                 .collect();
         }
@@ -724,6 +725,7 @@ impl SessionState {
     /// so the result keeps its position in the model's call order regardless
     /// of when the tool actually finished. Requires the turn to have been
     /// seeded via [`Self::seed_tool_results`]; otherwise it is a no-op.
+    #[expect(clippy::too_many_arguments)]
     pub fn update_tool_result(
         &mut self,
         turn_id: u32,
@@ -732,6 +734,7 @@ impl SessionState {
         content: String,
         is_error: bool,
         invocation_description: String,
+        image: Option<choreo_proto::ImageReference>,
     ) {
         if let Some(turn) = self.turns.get_mut(&turn_id)
             && let Some(record) = turn.tool_results.iter_mut().find(|r| r.call_id == call_id)
@@ -740,6 +743,7 @@ impl SessionState {
             record.content = content;
             record.is_error = is_error;
             record.invocation_description = invocation_description;
+            record.image = image;
         }
     }
 

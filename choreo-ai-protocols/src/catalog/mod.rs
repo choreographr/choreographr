@@ -110,6 +110,14 @@ pub struct ModelEntry {
     /// aliased DeepSeek/Kimi model, or off for an exception).
     #[serde(default)]
     pub reasoning_content_required: Option<bool>,
+    /// Whether the model accepts image input (vision). Derived from the
+    /// models.dev `modalities.input` array (`"image"` present) at ingestion;
+    /// the overlay can override it where the snapshot is wrong or a model is
+    /// not covered. `false` = text-only — images must be gated out of the
+    /// request and replaced with a text placeholder (see the vision gate).
+    /// `false` is the safe default for unknown models.
+    #[serde(default)]
+    pub supports_vision: bool,
 }
 
 /// Protocol variant — selects wire format and carries protocol-specific fields.
@@ -252,6 +260,23 @@ pub fn provider_slug_for_model(model: &str) -> Option<String> {
         .iter()
         .find(|e| e.models.iter().any(|m| m.model == model))
         .map(|e| e.slug.clone())
+}
+
+/// Whether the given model on the given provider accepts image input (vision).
+///
+/// The vision gate uses this to decide whether attached/read images are sent
+/// to the model natively or replaced with a text placeholder. Unknown models
+/// and providers default to `false` (text-only) — the safe conservative
+/// choice: sending an image to a text-only model would 400 the whole request,
+/// whereas gating it out only degrades the image to a placeholder.
+pub fn model_supports_vision(provider_slug: &str, model: &str) -> bool {
+    let catalog = PROVIDER_CATALOG.load();
+    catalog
+        .iter()
+        .find(|e| e.slug == provider_slug)
+        .and_then(|e| e.models.iter().find(|m| m.model == model))
+        .map(|m| m.supports_vision)
+        .unwrap_or(false)
 }
 
 /// Compute the reasoning capability for a given model on a given provider.
@@ -1008,6 +1033,7 @@ mod tests {
                 openai_responses: false,
                 reasoning_passback: None,
                 reasoning_content_required: None,
+                supports_vision: false,
             }],
         }]
     }
@@ -1041,6 +1067,19 @@ mod tests {
         // self-documenting about returning the global to its initial state.
         replace_catalog(bundled.to_vec());
         assert!(lookup_provider("openai").is_some());
+    }
+
+    #[test]
+    fn model_supports_vision_resolves_from_catalog() {
+        let _restore = RestoreBundledOnDrop;
+        // The bundled overlay adds deepseek-v4-flash-vision-exp with vision on;
+        // a known text-only model resolves false; an unknown model defaults false.
+        assert!(model_supports_vision(
+            "deepseek",
+            "deepseek-v4-flash-vision-exp"
+        ));
+        assert!(!model_supports_vision("deepseek", "deepseek-v4-pro"));
+        assert!(!model_supports_vision("no-such-provider", "any-model"));
     }
 
     #[test]
