@@ -1571,12 +1571,15 @@ full absolute path. The `~user` form is *not* expanded and is passed through unc
 `read_file` and `read_file_range` share a streaming, memory-bounded design. Each tool
 lives in its own module (`tools/read_file.rs`, `tools/read_file_range.rs`); the shared
 streaming and binary-sniff helpers (`open_text_reader`, `TextStream`, `render_streamed_line`,
-`OutputBudget`, `read_line_capped`, `drain_rest_of_line`) live in `tools/mod.rs` alongside
-the shared output-formatting helpers (`sanitize_name`, `human_size`,
-`symlink_target_label`, `truncation_marker`) used by the line-oriented
-tools (`list_files`, `find`, `grep`); the shared byte budget,
+`OutputBudget`, `read_line_capped`, `drain_rest_of_line`) live in `tools/text_stream.rs`;
+the sanitization suite (`sanitize_name`, `sanitize_text`/`sanitize_content`,
+`sanitize_transcript`, `sanitize_multiline`, `truncation_marker`, …) lives in
+`tools/sanitize.rs`; and the shared byte budget,
 `truncate_tool_output`, and `finish_tool_output` now live in the
-`choreo-sanitize` leaf crate and are re-exported from `tools/mod.rs`.
+`choreo-sanitize` leaf crate and are re-exported from `tools/mod.rs` (alongside the
+split-out helpers, so every `crate::tools::X` reference keeps resolving unchanged).
+The line-oriented output-formatting helpers `human_size` and `symlink_target_label`
+stay in `tools/mod.rs`.
 `finish_tool_output` caps a body at the shared
 byte budget, reserving room *inside* the budget for the marker/footer it
 appends — so the count signal survives even a byte-capped result, and stays
@@ -1624,7 +1627,7 @@ Tool output is defended in three layers — at the **source** (the tool that pro
 bytes), at the **transcript** (what the model sees on the next call), and at the
 **sink** (the terminal that renders it):
 
-- **Source.** `sanitize_text` / `sanitize_name` / `sanitize_content` (in `tools/mod.rs`)
+- **Source.** `sanitize_text` / `sanitize_name` / `sanitize_content` (in `tools/sanitize.rs`)
   escape C0/C1 controls, the line/paragraph separators U+2028/U+2029, and every Unicode
   *format* character (general category Cf) except the joiners U+200C/U+200D, via
   `char::escape_default`. The spoofing predicate itself is the shared
@@ -1649,7 +1652,7 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   escaped. Tools that append a critical tail to *raw* output (the VM exit footer,
   `format_shell_output`'s `Exit code:` line, `pdf_to_markdown`'s closing
   untrusted-content delimiter) sanitize **before** the cap instead, via
-  `finish_tool_output_sanitized` (in `tools/mod.rs`): `sanitize_transcript` is
+  `finish_tool_output_sanitized` (in `tools/sanitize.rs`): `sanitize_transcript` is
   idempotent on its own ASCII escape output, so the choke point's re-sanitize is a
   no-op and its re-cap cannot cut the tail off — closing the residual gap where a
   Cf-heavy raw body near the cap would expand past the budget and lose its footer.
