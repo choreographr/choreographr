@@ -3,22 +3,29 @@
 //!
 //! The tool normalizes the image (resize / MIME / re-encode — see
 //! `crate::image_prep`), reports a text handle (path, dimensions, MIME, byte
-//! size) the model can reason about, and parks an [`ImageReference`] (path +
-//! metadata, not bytes) that the framework hands to the request builder via
-//! the `extract_image_ref` hook. At request time the builder re-reads and
-//! re-normalizes the file and attaches the pixels to a synthetic user message
-//! (reference-based / pass-through design: no artifact store, so nothing is
-//! persisted beyond the path).
+//! size) the model can reason about, and carries an [`ImageReference`] (path +
+//! metadata, not bytes) in its `Return` value that the framework hands to the
+//! request builder via the `extract_image_ref` hook. At request time the
+//! builder re-reads and re-normalizes the file and attaches the pixels to a
+//! synthetic user message (reference-based / pass-through design: no artifact
+//! store, so nothing is persisted beyond the path).
+//!
+//! The reference travels with the per-invocation `ReadImageReturn` (read from
+//! `ret` in the hook), not a shared `Mutex` slot: the tool is registered once
+//! and shared across sessions, so parking the reference on `&self` would let a
+//! concurrent session's invocation overwrite it before this invocation's hook
+//! reads it back.
 //!
 //! v1 accepts local file paths only. URLs / clipboard paste are future work.
 
-use super::{ImageRefSlot, ToolExecError, truncate_tool_output};
+use super::{ToolExecError, truncate_tool_output};
 use crate::image_prep;
 use choreo_keystore::ServiceCredential;
 use choreo_proto::ImageReference;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadImageArgs {
@@ -27,17 +34,42 @@ pub struct ReadImageArgs {
     pub path: String,
 }
 
-pub(crate) struct ReadImage {
-    /// Parks the parsed image reference for the framework's `extract_image_ref`
-    /// hook (see [`ImageRefSlot`]).
-    last_ref: ImageRefSlot,
+/// The `read_image` tool's return value: a human-readable text handle plus the
+/// parsed image reference, so the framework's `extract_image_ref` hook reads
+/// the reference straight off the per-invocation return value (no shared
+/// state). `impl Serialize` emits only `text`, so the JSON tool result is a
+/// plain string exactly as before.
+#[derive(Debug)]
+pub struct ReadImageReturn {
+    /// The text handle (path, dimensions, MIME, bytes) shown to the model.
+    pub text: String,
+    /// The image reference (path + metadata) fed back to vision models.
+    pub reference: ImageReference,
 }
+
+impl Serialize for ReadImageReturn {
+    /// Serialize to just the text handle, keeping the JSON wire format a plain
+    /// string (identical to the previous `Return = String`).
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+impl JsonSchema for ReadImageReturn {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ReadImageReturn")
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string" })
+    }
+}
+
+pub(crate) struct ReadImage {}
 
 impl ReadImage {
     pub(crate) fn new() -> Self {
-        ReadImage {
-            last_ref: ImageRefSlot::default(),
-        }
+        ReadImage {}
     }
 }
 
@@ -54,14 +86,24 @@ fn resolve_and_normalize(
         ));
     }
     let resolved = super::resolve_path(&args.path, working_dir);
-    let prep = image_prep::load_and_normalize(&resolved)
-        .map_err(|e| ToolExecError(format!("failed to read image: {e}")))?;
-    Ok((resolved, prep))
+    match image_prep::load_and_normalize(&resolved) {
+        Ok(prep) => {
+            debug!(
+                path = %resolved.display(),
+                "read_image: normalized image file"
+            );
+            Ok((resolved, prep))
+        }
+        Err(e) => {
+            warn!(path = %resolved.display(), error = %e, "read_image: failed to read image");
+            Err(ToolExecError(format!("failed to read image: {e}")))
+        }
+    }
 }
 
 impl super::Tool for ReadImage {
     type Args = ReadImageArgs;
-    type Return = String;
+    type Return = ReadImageReturn;
     type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
@@ -75,7 +117,7 @@ impl super::Tool for ReadImage {
     }
 
     fn return_string(ret: &Self::Return) -> String {
-        ret.clone()
+        ret.text.clone()
     }
 
     fn execute(
@@ -92,21 +134,29 @@ impl super::Tool for ReadImage {
             width: prep.width,
             height: prep.height,
         };
-        // Park the reference for the framework's `extract_image_ref` hook,
-        // which moves it into the tool result's durable `image` field.
-        self.last_ref.store(reference);
-        Ok(truncate_tool_output(&format!(
+        let text = truncate_tool_output(&format!(
             "read image: {} ({}x{}, {}, {})",
             resolved.display(),
             prep.width,
             prep.height,
             prep.mime_type,
             humfmt::bytes(prep.data.len() as u64),
-        )))
+        ));
+        info!(
+            path = %resolved.display(),
+            width = prep.width,
+            height = prep.height,
+            mime = %prep.mime_type,
+            bytes = prep.data.len(),
+            "read_image: read image successfully"
+        );
+        // Carry the reference in the return value for the framework's
+        // `extract_image_ref` hook to read from `ret` (no shared-state parking).
+        Ok(ReadImageReturn { text, reference })
     }
 
-    fn extract_image_ref(&self, _ret: &Self::Return) -> Option<ImageReference> {
-        self.last_ref.take()
+    fn extract_image_ref(&self, ret: &Self::Return) -> Option<ImageReference> {
+        Some(ret.reference.clone())
     }
 }
 
@@ -126,6 +176,7 @@ mod tests {
             None,
             None,
         )
+        .map(|ret| ret.text)
     }
 
     fn write_png() -> tempfile::NamedTempFile {
@@ -163,8 +214,35 @@ mod tests {
         assert_eq!(reference.width, 3);
         assert_eq!(reference.height, 2);
         assert_eq!(reference.path, file.path().display().to_string());
-        // A second take is empty (the slot was drained).
-        assert!(tool.extract_image_ref(&ret).is_none());
+        // The reference is read off the return value, so it is present on every
+        // call (no slot to drain).
+        assert!(tool.extract_image_ref(&ret).is_some());
+    }
+
+    #[test]
+    fn return_string_is_the_text_handle() {
+        let tool = ReadImage::new();
+        let file = write_png();
+        let args = ReadImageArgs {
+            path: file.path().display().to_string(),
+        };
+        let ret = tool.execute(args, None, None, None).expect("execute");
+        assert_eq!(ReadImage::return_string(&ret), ret.text);
+    }
+
+    #[test]
+    fn serializes_to_plain_string() {
+        let ret = ReadImageReturn {
+            text: "read image: hello".to_string(),
+            reference: ImageReference {
+                path: "/tmp/x.png".to_string(),
+                mime_type: "image/png".to_string(),
+                width: 1,
+                height: 1,
+            },
+        };
+        let json = serde_json::to_string(&ret).unwrap();
+        assert_eq!(json, r#""read image: hello""#);
     }
 
     #[test]

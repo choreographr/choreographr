@@ -15,7 +15,6 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::mpsc;
 // The shared spoofing predicates come from choreo-sanitize (the leaf crate
@@ -209,67 +208,13 @@ pub struct ToolOutput {
     pub result_json: Option<serde_json::Value>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreparedImage {
     pub(crate) mime_type: String,
     pub(crate) data: Vec<u8>,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) alt: Option<String>,
-}
-
-/// Cache that lets an image-producing tool hand a `PreparedImage` to the
-/// framework's `extract_image` hook.
-///
-/// `Tool::execute` takes `&self` (a tool is registered once and shared across
-/// sessions), so an image cannot be returned as plain state — it has to be
-/// parked somewhere the immediately-following `extract_image(&self, …)` call
-/// can `take()` it. The `Mutex` is single-purpose ("the last image this tool
-/// produced") and is only contended across concurrent invocations of the same
-/// registered instance, which is rare for the display/retrieve tools and, in
-/// the common single-threaded path, not contended at all. It carries no
-/// protocol data, only a best-effort image hand-off, in the spirit of
-/// AGENTS.md's minimal shared-state allowance.
-#[derive(Default)]
-pub(crate) struct ImageSlot {
-    last: Mutex<Option<PreparedImage>>,
-}
-
-impl ImageSlot {
-    /// Park `image` as "the most recent one this tool produced".
-    pub(crate) fn store(&self, image: PreparedImage) {
-        // Recover from a poisoned lock instead of panicking (AGENTS.md).
-        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
-    }
-
-    /// Move out and clear the parked image, if any, for `extract_image`.
-    pub(crate) fn take(&self) -> Option<PreparedImage> {
-        // Recover from a poisoned lock instead of panicking (AGENTS.md).
-        self.last.lock().unwrap_or_else(|e| e.into_inner()).take()
-    }
-}
-
-/// Cache that lets the `read_image` tool hand an [`ImageReference`] to the
-/// framework's `extract_image_ref` hook (the vision-input counterpart to
-/// [`ImageSlot`]). Same rationale: `Tool::execute` takes `&self`, so the
-/// reference is parked here for the immediately-following `extract_image_ref`
-/// call to `take()`. The mutex is single-purpose, carries only a best-effort
-/// reference hand-off, and is uncontended in the common single-threaded path.
-#[derive(Default)]
-pub(crate) struct ImageRefSlot {
-    last: Mutex<Option<ImageReference>>,
-}
-
-impl ImageRefSlot {
-    /// Park `reference` as "the most recent one this tool produced".
-    pub(crate) fn store(&self, reference: ImageReference) {
-        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(reference);
-    }
-
-    /// Move out and clear the parked reference, if any, for `extract_image_ref`.
-    pub(crate) fn take(&self) -> Option<ImageReference> {
-        self.last.lock().unwrap_or_else(|e| e.into_inner()).take()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -428,8 +373,17 @@ pub trait Tool: Send + Sync {
         self.execute(args, x_credentials, working_dir, ctx)
     }
 
-    /// Optional: extract a PreparedImage from the return value.
-    /// Only display_image overrides this.
+    /// Optional: extract a [`PreparedImage`] from the return value.
+    ///
+    /// Image-producing tools carry their image directly in their `Return`
+    /// value (read from `ret`), with **no shared-state parking** — the tool is
+    /// registered once and shared across sessions, so an image parked in a
+    /// `Mutex` slot on `execute` could be overwritten by a concurrent session's
+    /// invocation before this hook (called with the current invocation's `ret`)
+    /// reads it back. Each image-bearing tool's `Return` struct holds its
+    /// `PreparedImage` and `impl Serialize` emits only the text handle, so the
+    /// JSON wire format is unchanged. Only `display_image` and
+    /// `retrieve_webpage` (Screenshot action) override this.
     fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> {
         None
     }
@@ -438,7 +392,12 @@ pub trait Tool: Send + Sync {
     /// the daemon can feed it back to a vision-capable model on the next
     /// request (reference-based: the durable record stores the path + metadata,
     /// and the request builder re-reads + normalizes the bytes at request
-    /// time). Only the `read_image` tool overrides this.
+    /// time). The reference is carried in the tool's `Return` value (read from
+    /// `ret`) with **no shared-state parking** — same rationale as
+    /// [`Tool::extract_image`]: the `read_image` tool is shared across sessions,
+    /// so the per-invocation reference must travel with its `Return` rather
+    /// than a `Mutex` slot that a concurrent session could overwrite. Only the
+    /// `read_image` tool overrides this.
     fn extract_image_ref(&self, _ret: &Self::Return) -> Option<ImageReference> {
         None
     }

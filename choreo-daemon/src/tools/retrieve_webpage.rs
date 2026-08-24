@@ -1,6 +1,4 @@
-use super::{
-    ImageSlot, PreparedImage, ToolExecError, context::ToolContext, human_size, resolve_path,
-};
+use super::{PreparedImage, ToolExecError, context::ToolContext, human_size, resolve_path};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_keystore::ServiceCredential;
 use headless_chrome::Tab;
@@ -8,7 +6,7 @@ use headless_chrome::protocol::cdp::Page;
 use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
 use headless_chrome::{Browser, LaunchOptions};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -300,19 +298,47 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
+/// The `retrieve_webpage` tool's return value: a human-readable text handle
+/// plus an optional screenshot, so the framework's `extract_image` hook reads
+/// the image straight off the per-invocation return value (no shared state).
+/// Only the Screenshot action sets `image`; Content/Text/Pdf set `None`. `impl
+/// Serialize` emits only `text`, so the JSON tool result is a plain string
+/// exactly as before.
+#[derive(Debug)]
+pub struct RetrieveWebpageReturn {
+    /// The text handle (captured content, screenshot message, or saved-PDF
+    /// message) shown to the model.
+    pub text: String,
+    /// The prepared screenshot handed to the client via `extract_image`, when
+    /// the action was Screenshot.
+    pub image: Option<PreparedImage>,
+}
+
+impl Serialize for RetrieveWebpageReturn {
+    /// Serialize to just the text handle, keeping the JSON wire format a plain
+    /// string (identical to the previous `Return = String`).
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+impl JsonSchema for RetrieveWebpageReturn {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("RetrieveWebpageReturn")
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string" })
+    }
+}
+
 /// A tool that renders a URL in a local headless Chromium/Chrome and returns
 /// page content (HTML), plain text, a screenshot, or a PDF.
-pub struct RetrieveWebpage {
-    /// Holds the most recent screenshot so `extract_image` can hand it to the
-    /// client as an inline image (same shared slot as `DisplayImage`).
-    last_image: ImageSlot,
-}
+pub struct RetrieveWebpage {}
 
 impl RetrieveWebpage {
     pub fn new() -> Self {
-        RetrieveWebpage {
-            last_image: ImageSlot::default(),
-        }
+        RetrieveWebpage {}
     }
 }
 
@@ -324,7 +350,7 @@ impl Default for RetrieveWebpage {
 
 impl super::Tool for RetrieveWebpage {
     type Args = RetrieveWebpageArgs;
-    type Return = String;
+    type Return = RetrieveWebpageReturn;
     type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
@@ -353,7 +379,7 @@ impl super::Tool for RetrieveWebpage {
     }
 
     fn return_string(ret: &Self::Return) -> String {
-        ret.clone()
+        ret.text.clone()
     }
 
     fn execute(
@@ -413,7 +439,7 @@ impl super::Tool for RetrieveWebpage {
         // Run the whole capture in a closure so the `Browser` (and its Chromium
         // child process) is released on every path, success or error, when it
         // drops. Explicit `close()` is best-effort on top of that.
-        let outcome = (|| -> Result<String, ToolExecError> {
+        let outcome = (|| -> Result<RetrieveWebpageReturn, ToolExecError> {
             let tab = browser
                 .new_tab()
                 .map_err(|e| ToolExecError(format!("failed to open a tab: {e:#}")))?;
@@ -433,7 +459,7 @@ impl super::Tool for RetrieveWebpage {
             }
             debug!(timeout_ms, wait_ms, "page navigated; capturing");
 
-            Self::capture(&self.last_image, &tab, &args, action, url, working_dir)
+            Self::capture(&tab, &args, action, url, working_dir)
         })();
 
         match &outcome {
@@ -447,8 +473,8 @@ impl super::Tool for RetrieveWebpage {
         outcome
     }
 
-    fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> {
-        self.last_image.take()
+    fn extract_image(&self, ret: &Self::Return) -> Option<PreparedImage> {
+        ret.image.clone()
     }
 }
 
@@ -456,24 +482,30 @@ impl RetrieveWebpage {
     /// Perform the per-action capture on an already-navigated tab. Broken out
     /// of `execute` so each branch stays small and testable; handles the file
     /// write + inline-image hand-off for the binary actions (screenshot/pdf).
+    /// The screenshot is returned inside the [`RetrieveWebpageReturn`] so the
+    /// framework's `extract_image` hook reads it off the per-invocation return
+    /// value (no shared-state parking).
     fn capture(
-        image_slot: &ImageSlot,
         tab: &Tab,
         args: &RetrieveWebpageArgs,
         action: WebpageAction,
         url: &str,
         working_dir: Option<&Path>,
-    ) -> Result<String, ToolExecError> {
+    ) -> Result<RetrieveWebpageReturn, ToolExecError> {
         match action {
             WebpageAction::Content => match args.selector.as_deref() {
                 Some(sel) => {
                     let obj = tab
                         .evaluate(&html_expression(sel), false)
                         .map_err(|e| ToolExecError(format!("failed to extract HTML: {e:#}")))?;
-                    Ok(remote_text(&obj))
+                    Ok(RetrieveWebpageReturn {
+                        text: remote_text(&obj),
+                        image: None,
+                    })
                 }
                 None => tab
                     .get_content()
+                    .map(|text| RetrieveWebpageReturn { text, image: None })
                     .map_err(|e| ToolExecError(format!("failed to get page HTML: {e:#}"))),
             },
 
@@ -482,7 +514,10 @@ impl RetrieveWebpage {
                 let obj = tab
                     .evaluate(&expr, false)
                     .map_err(|e| ToolExecError(format!("failed to extract text: {e:#}")))?;
-                Ok(remote_text(&obj))
+                Ok(RetrieveWebpageReturn {
+                    text: remote_text(&obj),
+                    image: None,
+                })
             }
 
             WebpageAction::Screenshot => {
@@ -497,10 +532,10 @@ impl RetrieveWebpage {
                 let size = bytes.len();
                 let alt = Some(format!("Screenshot of {url}"));
 
-                // Optionally persist to output_path, then hand the buffer to the
-                // inline-image slot. The write happens *before* the buffer moves
-                // into the slot, so a potentially multi-MB screenshot is never
-                // cloned.
+                // Optionally persist to output_path, then carry the buffer in the
+                // return value for `extract_image`. The write happens *before* the
+                // buffer moves into the return, so a potentially multi-MB
+                // screenshot is never cloned.
                 let message = match args.output_path.as_deref() {
                     Some(out) => {
                         let path = resolve_path(out, working_dir);
@@ -520,14 +555,16 @@ impl RetrieveWebpage {
                 };
 
                 // Always offer the screenshot inline to the client.
-                image_slot.store(PreparedImage {
-                    mime_type: "image/png".to_string(),
-                    data: bytes,
-                    width,
-                    height,
-                    alt,
-                });
-                Ok(message)
+                Ok(RetrieveWebpageReturn {
+                    text: message,
+                    image: Some(PreparedImage {
+                        mime_type: "image/png".to_string(),
+                        data: bytes,
+                        width,
+                        height,
+                        alt,
+                    }),
+                })
             }
 
             WebpageAction::Pdf => {
@@ -541,11 +578,14 @@ impl RetrieveWebpage {
                     .map_err(|e| ToolExecError(format!("failed to render PDF: {e:#}")))?;
                 let path = resolve_path(out, working_dir);
                 write_bytes_with_dirs(&path, &bytes)?;
-                Ok(format!(
-                    "saved PDF ({size}) to {path}",
-                    size = human_size(bytes.len() as u64),
-                    path = path.display(),
-                ))
+                Ok(RetrieveWebpageReturn {
+                    text: format!(
+                        "saved PDF ({size}) to {path}",
+                        size = human_size(bytes.len() as u64),
+                        path = path.display(),
+                    ),
+                    image: None,
+                })
             }
         }
     }
@@ -679,21 +719,5 @@ mod tests {
     fn png_dimensions_rejects_garbage() {
         assert_eq!(png_dimensions(b"not a png"), None);
         assert_eq!(png_dimensions(&[0u8; 32]), None);
-    }
-
-    #[test]
-    fn image_slot_round_trips() {
-        let slot = ImageSlot::default();
-        assert!(slot.take().is_none(), "empty slot should take None");
-        slot.store(PreparedImage {
-            mime_type: "image/png".to_string(),
-            data: vec![1, 2, 3],
-            width: 1,
-            height: 1,
-            alt: None,
-        });
-        let img = slot.take().expect("image should be present");
-        assert_eq!(img.data, vec![1, 2, 3]);
-        assert!(slot.take().is_none(), "slot should be empty after take");
     }
 }

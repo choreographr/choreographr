@@ -1,13 +1,13 @@
-use super::ImageSlot;
 use super::{PreparedImage, ToolExecError, context::ToolContext, truncate_tool_output};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_keystore::ServiceCredential;
 use image::GenericImageView;
 use resvg::usvg;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::{io, time::Duration};
+use tracing::{debug, info, warn};
 use url::Url;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -29,6 +29,37 @@ pub struct DisplayImageArgs {
 const MAX_DISPLAY_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const SUPPORTED_IMAGE_MIME_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/svg+xml"];
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
+
+/// The `display_image` tool's return value: a human-readable text handle plus
+/// the prepared image, so the framework's `extract_image` hook reads the image
+/// straight off the per-invocation return value (no shared state). `impl
+/// Serialize` emits only `text`, so the JSON tool result is a plain string
+/// exactly as before.
+#[derive(Debug)]
+pub struct DisplayImageReturn {
+    /// The text handle (mime, dimensions, bytes) shown to the model.
+    pub text: String,
+    /// The prepared image handed to the client via `extract_image`.
+    pub image: PreparedImage,
+}
+
+impl Serialize for DisplayImageReturn {
+    /// Serialize to just the text handle, keeping the JSON wire format a plain
+    /// string (identical to the previous `Return = String`).
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+impl JsonSchema for DisplayImageReturn {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("DisplayImageReturn")
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string" })
+    }
+}
 
 fn prepare_image(args: &DisplayImageArgs) -> io::Result<PreparedImage> {
     let mime_type = normalize_image_mime_type(&args.mime_type)?;
@@ -160,22 +191,17 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
     }
 }
 
-pub(crate) struct DisplayImage {
-    /// Hands the prepared image to the framework's `extract_image` hook.
-    last_image: ImageSlot,
-}
+pub(crate) struct DisplayImage {}
 
 impl DisplayImage {
     pub(crate) fn new() -> Self {
-        DisplayImage {
-            last_image: ImageSlot::default(),
-        }
+        DisplayImage {}
     }
 }
 
 impl super::Tool for DisplayImage {
     type Args = DisplayImageArgs;
-    type Return = String;
+    type Return = DisplayImageReturn;
     type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
@@ -205,7 +231,7 @@ impl super::Tool for DisplayImage {
     }
 
     fn return_string(ret: &Self::Return) -> String {
-        ret.clone()
+        ret.text.clone()
     }
     fn execute(
         &self,
@@ -214,19 +240,41 @@ impl super::Tool for DisplayImage {
         _working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
-        let image = prepare_image(&args).map_err(|e| ToolExecError(e.to_string()))?;
+        let image = match prepare_image(&args) {
+            Ok(image) => image,
+            Err(e) => {
+                warn!(error = %e, "display_image: failed to prepare image");
+                return Err(ToolExecError(e.to_string()));
+            }
+        };
         let mime_type = image.mime_type.clone();
         let width = image.width;
         let height = image.height;
         let byte_len = image.data.len();
-        self.last_image.store(image);
-        Ok(truncate_tool_output(&format!(
+        debug!(
+            mime = %mime_type,
+            width,
+            height,
+            bytes = byte_len,
+            "display_image: prepared image"
+        );
+        let text = truncate_tool_output(&format!(
             "displayed image ({mime_type}, {width}x{height}, {})",
             humfmt::bytes(byte_len as u64),
-        )))
+        ));
+        info!(
+            mime = %mime_type,
+            width,
+            height,
+            bytes = byte_len,
+            "display_image: displayed image successfully"
+        );
+        // Carry the image in the return value for the framework's `extract_image`
+        // hook to read from `ret` (no shared-state parking).
+        Ok(DisplayImageReturn { text, image })
     }
 
-    fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> {
-        self.last_image.take()
+    fn extract_image(&self, ret: &Self::Return) -> Option<PreparedImage> {
+        Some(ret.image.clone())
     }
 }
