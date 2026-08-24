@@ -4,7 +4,7 @@ use crate::daemon::DaemonCommand;
 use crate::db::{self, SessionRecord, write_session_retry, write_turn_retry};
 use crate::providers::InferenceProvider;
 use crate::requests::run_agent_loop;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolOutput, ToolRegistry};
 use choreo_ai_protocols::model_reasoning_capability;
 use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ReasoningArtifact,
@@ -725,25 +725,26 @@ impl SessionState {
     /// so the result keeps its position in the model's call order regardless
     /// of when the tool actually finished. Requires the turn to have been
     /// seeded via [`Self::seed_tool_results`]; otherwise it is a no-op.
-    #[expect(clippy::too_many_arguments)]
+    ///
+    /// The five per-record fields (content, is_error, invocation_description,
+    /// image) are collapsed into the `output` value so the signature stays
+    /// under clippy's `too_many_arguments` threshold; `name` stays explicit
+    /// because `ToolOutput` does not carry it (it comes from the tool call).
     pub fn update_tool_result(
         &mut self,
         turn_id: u32,
         call_id: &str,
         name: String,
-        content: String,
-        is_error: bool,
-        invocation_description: String,
-        image: Option<choreo_proto::ImageReference>,
+        output: &ToolOutput,
     ) {
         if let Some(turn) = self.turns.get_mut(&turn_id)
             && let Some(record) = turn.tool_results.iter_mut().find(|r| r.call_id == call_id)
         {
             record.name = name;
-            record.content = content;
-            record.is_error = is_error;
-            record.invocation_description = invocation_description;
-            record.image = image;
+            record.content = output.content.clone();
+            record.is_error = output.is_error;
+            record.invocation_description = output.invocation_description.clone();
+            record.image = output.image_ref.clone();
         }
     }
 

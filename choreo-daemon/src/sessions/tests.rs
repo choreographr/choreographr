@@ -1,6 +1,6 @@
 use super::*;
 use crate::broadcast::test_sink;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolOutput, ToolRegistry};
 use choreo_proto::SessionStatus;
 use std::collections::HashMap;
 use tempfile::tempdir;
@@ -1408,10 +1408,12 @@ fn seed_then_update_tool_results_preserves_call_order() {
         tid,
         "c",
         "sh".into(),
-        "c-out".into(),
-        false,
-        String::new(),
-        None,
+        &ToolOutput {
+            content: "c-out".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            ..Default::default()
+        },
     );
     assert_eq!(order_of(&state), vec!["a", "b", "c"]);
     assert_eq!(state.turns[&tid].tool_results[2].content, "c-out");
@@ -1421,19 +1423,23 @@ fn seed_then_update_tool_results_preserves_call_order() {
         tid,
         "a",
         "read_file".into(),
-        "a-out".into(),
-        false,
-        String::new(),
-        None,
+        &ToolOutput {
+            content: "a-out".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            ..Default::default()
+        },
     );
     state.update_tool_result(
         tid,
         "b",
         "grep".into(),
-        "b-out".into(),
-        false,
-        String::new(),
-        None,
+        &ToolOutput {
+            content: "b-out".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            ..Default::default()
+        },
     );
     assert_eq!(order_of(&state), vec!["a", "b", "c"]);
     assert_eq!(state.turns[&tid].tool_results[0].content, "a-out");
@@ -1444,10 +1450,12 @@ fn seed_then_update_tool_results_preserves_call_order() {
         tid,
         "b",
         "grep".into(),
-        "boom".into(),
-        true,
-        String::new(),
-        None,
+        &ToolOutput {
+            content: "boom".into(),
+            is_error: true,
+            invocation_description: String::new(),
+            ..Default::default()
+        },
     );
     assert_eq!(order_of(&state), vec!["a", "b", "c"]);
     assert!(state.turns[&tid].tool_results[1].is_error);
@@ -1465,12 +1473,55 @@ fn update_tool_result_unknown_call_id_is_noop() {
         tid,
         "ghost",
         "read_file".into(),
-        "x".into(),
-        false,
-        String::new(),
-        None,
+        &ToolOutput {
+            content: "x".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            ..Default::default()
+        },
     );
     assert!(state.turns[&tid].tool_results.is_empty());
+}
+
+#[test]
+fn update_tool_result_sets_all_record_fields_from_output() {
+    // The collapsed signature takes the five per-record fields from a
+    // `ToolOutput`; this pins that it still populates every field on the
+    // matched record, including the vision image reference (which was the
+    // 7th parameter the vision commit added).
+    let mut state = SessionState::empty();
+    let (tid, _) = state.start_turn(Some("look".into()));
+    let calls = vec![AssistantToolCallRecord {
+        call_id: "a".into(),
+        name: "read_image".into(),
+        arguments_json: "{}".into(),
+    }];
+    state.seed_tool_results(tid, &calls, &["".into()]);
+
+    let output = ToolOutput {
+        content: "pixel".into(),
+        is_error: true,
+        invocation_description: "Reading `a`.".into(),
+        image_ref: Some(choreo_proto::ImageReference {
+            path: "/tmp/x.png".into(),
+            mime_type: "image/jpeg".into(),
+            width: 3,
+            height: 2,
+        }),
+        ..Default::default()
+    };
+    state.update_tool_result(tid, "a", "read_image".into(), &output);
+
+    let record = &state.turns[&tid].tool_results[0];
+    assert_eq!(record.name, "read_image");
+    assert_eq!(record.content, "pixel");
+    assert!(record.is_error);
+    assert_eq!(record.invocation_description, "Reading `a`.");
+    let img = record.image.as_ref().expect("image reference set");
+    assert_eq!(img.path, "/tmp/x.png");
+    assert_eq!(img.mime_type, "image/jpeg");
+    assert_eq!(img.width, 3);
+    assert_eq!(img.height, 2);
 }
 
 #[test]
@@ -1505,10 +1556,12 @@ fn mark_unexecuted_tool_results_marks_only_unexecuted() {
         tid,
         "a",
         "read_file".into(),
-        "a-out".into(),
-        false,
-        String::new(),
-        None,
+        &ToolOutput {
+            content: "a-out".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            ..Default::default()
+        },
     );
     let executed = HashSet::from(["a".to_string()]);
     state.mark_unexecuted_tool_results(tid, &executed);
@@ -1539,10 +1592,12 @@ fn mark_unexecuted_tool_results_preserves_recorded_error_results() {
         tid,
         "a",
         "sh".into(),
-        "timed out".into(),
-        true,
-        String::new(),
-        None,
+        &ToolOutput {
+            content: "timed out".into(),
+            is_error: true,
+            invocation_description: String::new(),
+            ..Default::default()
+        },
     );
     state.mark_unexecuted_tool_results(tid, &HashSet::from(["a".to_string()]));
     assert_eq!(state.turns[&tid].tool_results[0].content, "timed out");

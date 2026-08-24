@@ -2054,21 +2054,11 @@ fn finish_tool_call(
 ) {
     let is_error = output.is_error;
     let content = output.content.clone();
-    let invocation_description = output.invocation_description.clone();
-    // The vision image reference (if any) rides onto the durable tool result
-    // so the request builder can feed it to a vision-capable model on the
-    // next request (reference-based: only the path + metadata, not bytes).
-    let image_ref = output.image_ref.clone();
 
-    session.update_tool_result(
-        turn_id,
-        &tool_call.id,
-        tool_call.name.clone(),
-        content.clone(),
-        is_error,
-        invocation_description,
-        image_ref,
-    );
+    // The five per-record fields come from `output` (content, is_error,
+    // invocation_description, image_ref); only `name` is taken from the tool
+    // call, since `ToolOutput` does not carry it.
+    session.update_tool_result(turn_id, &tool_call.id, tool_call.name.clone(), output);
 
     broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, turn_id);
 

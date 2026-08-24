@@ -82,10 +82,12 @@ fn build_chat_request_messages_with_tool_calls() {
         tid,
         "call_1",
         "ls".into(),
-        "file.txt".into(),
-        false,
-        String::new(),
-        None,
+        &ToolOutput {
+            content: "file.txt".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            ..Default::default()
+        },
     );
 
     let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL);
@@ -139,10 +141,13 @@ fn session_with_image_result() -> (SessionState, tempfile::NamedTempFile) {
         tid,
         "call_img",
         "read_image".into(),
-        "read image: (3x2, image/jpeg)".into(),
-        false,
-        String::new(),
-        Some(img_ref),
+        &ToolOutput {
+            content: "read image: (3x2, image/jpeg)".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            image_ref: Some(img_ref),
+            ..Default::default()
+        },
     );
     (session, file)
 }
@@ -213,15 +218,18 @@ fn build_chat_request_messages_vision_model_missing_file_places_placeholder() {
         tid,
         "c",
         "read_image".into(),
-        "read image: (3x2)".into(),
-        false,
-        String::new(),
-        Some(choreo_proto::ImageReference {
-            path: "/nonexistent/deleted.png".into(),
-            mime_type: "image/jpeg".into(),
-            width: 3,
-            height: 2,
-        }),
+        &ToolOutput {
+            content: "read image: (3x2)".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            image_ref: Some(choreo_proto::ImageReference {
+                path: "/nonexistent/deleted.png".into(),
+                mime_type: "image/jpeg".into(),
+                width: 3,
+                height: 2,
+            }),
+            ..Default::default()
+        },
     );
     let result =
         build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-flash-vision-exp");
