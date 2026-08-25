@@ -144,7 +144,9 @@ fn session_manager_set_sessions_preserves_selection_by_id() {
 mod session_manager_key_tests {
     use super::*;
     use crate::connection::handle_terminal_event;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 
     fn make_sm_app() -> App {
         let mut app = test_app();
@@ -402,6 +404,140 @@ mod session_manager_key_tests {
                 reasoning_effort: None,
             }
         );
+    }
+
+    #[test]
+    fn session_manager_click_selects_and_attaches_session() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+        app.last_terminal_size = Some((100, 40));
+        // The list renderer uses `window(viewport_height)` where viewport
+        // height = terminal height − 4; the click handler uses the same value.
+        app.session_mgr.viewport_height = 36;
+
+        let content = page_list_content_rect(Some((100, 40))).expect("geometry");
+        // The two sessions are session 1 (index 0) and session 2 (index 1).
+        // The table header occupies content row 0; clicking the second
+        // session's row (content.y + 2) selects index 1 and attaches to 2.
+        handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: content.x + 3,
+                row: content.y + 2,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &tx,
+        )
+        .expect("handle click");
+
+        assert_eq!(
+            app.page,
+            Page::Chat,
+            "clicking a session is equivalent to selecting it and pressing Enter"
+        );
+        assert_eq!(app.attached_session_id, Some(2));
+        let msg = rx.recv().expect("sent message (unsub)");
+        assert_eq!(msg, ClientMessage::UnsubscribeSessionsSummary);
+        let msg = rx.recv().expect("sent message");
+        assert_eq!(msg, ClientMessage::AttachSession { session_id: 2 });
+    }
+
+    #[test]
+    fn session_manager_click_selects_the_highlighted_session() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+        app.last_terminal_size = Some((100, 40));
+        app.session_mgr.viewport_height = 36;
+
+        let content = page_list_content_rect(Some((100, 40))).expect("geometry");
+        handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: content.x + 3,
+                row: content.y + 2,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &tx,
+        )
+        .expect("handle click");
+
+        // The attach succeeded (page flipped to Chat) but the selection still
+        // tracks the clicked session in case the send had failed.
+        assert_eq!(app.session_mgr.selection, Some(1));
+    }
+
+    #[test]
+    fn session_manager_click_header_and_border_are_noop() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+        app.last_terminal_size = Some((100, 40));
+        app.session_mgr.viewport_height = 36;
+
+        let content = page_list_content_rect(Some((100, 40))).expect("geometry");
+        // Click the header row (content.y), and the top block border (0, 0).
+        handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: content.x + 3,
+                row: content.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &tx,
+        )
+        .expect("handle header click");
+        assert_eq!(app.page, Page::SessionManager);
+        assert!(rx.try_recv().is_err(), "a header click must not attach");
+
+        handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &tx,
+        )
+        .expect("handle border click");
+        assert_eq!(app.page, Page::SessionManager);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_manager_wheel_scrolls_highlight() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+        app.last_terminal_size = Some((100, 40));
+        app.session_mgr.viewport_height = 36;
+
+        handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &tx,
+        )
+        .expect("handle scroll down");
+        assert_eq!(app.session_mgr.selection, Some(1));
+
+        handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &tx,
+        )
+        .expect("handle scroll up");
+        assert_eq!(app.session_mgr.selection, Some(0));
     }
 }
 

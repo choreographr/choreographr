@@ -1,7 +1,9 @@
-use crate::state::{AccountWizardStep, App, Page, apply_selector_left_click};
+use crate::state::{
+    AccountWizardStep, App, Page, ai_providers_list_click_index, apply_selector_left_click,
+};
 use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name};
 use choreo_proto::ClientMessage;
-use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use tui_prompts::State;
 
 pub(super) fn handle_ai_providers_event(
@@ -11,17 +13,18 @@ pub(super) fn handle_ai_providers_event(
 ) -> Result<(), ClientError> {
     // The wizard and credential modals are dispatched from `handle_ui_event`
     // before this function; only the accounts list reaches here.
-    handle_ai_providers_list_key(event, app, client_tx)
+    match event {
+        Event::Key(key) => handle_ai_providers_list_key(key, app, client_tx),
+        Event::Mouse(mouse) => handle_ai_providers_list_mouse(mouse, app, client_tx),
+        _ => Ok(()),
+    }
 }
 
 fn handle_ai_providers_list_key(
-    event: Event,
+    key: crossterm::event::KeyEvent,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    let Event::Key(key) = event else {
-        return Ok(());
-    };
     if key.kind != KeyEventKind::Press {
         return Ok(());
     }
@@ -103,6 +106,60 @@ fn handle_ai_providers_list_key(
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.set_page(Page::Chat);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Handle mouse events on the AI-providers accounts list: a left-click on a
+/// visible account row is equivalent to selecting it and pressing Enter
+/// (highlight the account, send `SetSessionAccount` and return to the chat
+/// page); the wheel scrolls the highlight.  Clicks outside the list's content
+/// rows (block border, status bar, scrollbar column, or past the last account)
+/// and clicks while a removal confirmation is armed are no-ops.
+fn handle_ai_providers_list_mouse(
+    mouse: MouseEvent,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    if app.ai_providers.confirm_remove.is_some() {
+        return Ok(());
+    }
+    match mouse.kind {
+        MouseEventKind::ScrollDown => app.ai_providers.select_down(),
+        MouseEventKind::ScrollUp => app.ai_providers.select_up(),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let total = app.ai_providers.accounts.len();
+            // The accounts list draws directly from its stored `scroll` (there
+            // is no separate `window()`), so that is the drawn start to
+            // resolve the click against.  The geometry is derived from the
+            // last known terminal size; before the first frame it is unknown,
+            // so every click is a no-op (`…_click_index` returns `None` then).
+            let scroll = app.ai_providers.scroll;
+            let Some(idx) = ai_providers_list_click_index(
+                app.last_terminal_size,
+                mouse.column,
+                mouse.row,
+                total,
+                scroll,
+            ) else {
+                return Ok(());
+            };
+            // Select the clicked account, then repeat the Enter action on the
+            // current selection (the Enter handler reads `selection`).
+            app.ai_providers.selection = Some(idx);
+            if let Some(account) = app.ai_providers.accounts.get(idx) {
+                let name = account.name.clone();
+                // Send before flipping pages (mirrors Enter): a broken pipe
+                // leaves the user on the accounts page, not stranded on Chat
+                // with an un-sent selection.
+                tracing::debug!(name, "selecting account via click");
+                client_tx
+                    .send(ClientMessage::SetSessionAccount { name })
+                    .map_err(broken_pipe)?;
+                app.set_page(Page::Chat);
+            }
         }
         _ => {}
     }

@@ -690,7 +690,8 @@ In `choreo-tui`:
 - `/account list` — list configured AI provider accounts
 - `/account remove <name>` — remove an AI provider account
 - `/account <name>` — set the session's AI provider account
-- `Ctrl+A` — open the AI provider accounts page (list accounts; `Enter` sets the highlighted account on the active session and returns to chat, `r` removes, `c` opens the API-key modal, `n` starts the new-account wizard)
+- `Ctrl+A` — open the AI provider accounts page (list accounts; `Enter` sets the highlighted account on the active session and returns to chat, `r` removes, `c` opens the API-key modal, `n` starts the new-account wizard; a click on an account row does the same as selecting it and pressing `Enter`, and the mouse wheel scrolls the highlight)
+- `Ctrl+S` — open the session manager page (list sessions; `j`/`k` or the mouse wheel navigate, `Enter` attaches to the highlighted session and returns to chat, `i` opens details, `n` creates a new session, `d` deletes; a click on a session row does the same as selecting it and pressing `Enter`, and `Esc` returns to chat)
 - New-account wizard (`n` on the accounts page) — centered modal windows: a **searchable provider picker** (type to filter by provider name, `↑`/`↓`/`PgUp`/`PgDn` or the mouse wheel navigate, `Enter` or a click on a row picks — the list is alphabetical), then a separate **slug modal** (enter the account's unique name, e.g. `/account <slug>`); `Enter` creates the account and jumps straight to the **API-key modal**
 - `/reasoning` — show current reasoning effort slug
 - `/reasoning <slug>` — set reasoning effort (e.g. `off`, `low`, `medium`, `high`, `on`, `xhigh`, `max`; available values depend on the model)
