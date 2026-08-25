@@ -123,19 +123,19 @@ fn handle_ai_providers_list_mouse(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    if app.ai_providers.confirm_remove.is_some() {
-        return Ok(());
-    }
-    match mouse.kind {
-        MouseEventKind::ScrollDown => app.ai_providers.select_down(),
-        MouseEventKind::ScrollUp => app.ai_providers.select_up(),
-        MouseEventKind::Down(MouseButton::Left) => {
-            let total = app.ai_providers.accounts.len();
+    super::handle_full_page_list_mouse(
+        app,
+        &mouse,
+        app.ai_providers.confirm_remove.is_some(),
+        |app| app.ai_providers.select_up(),
+        |app| app.ai_providers.select_down(),
+        |app| {
             // The accounts list draws directly from its stored `scroll` (there
             // is no separate `window()`), so that is the drawn start to
             // resolve the click against.  The geometry is derived from the
             // last known terminal size; before the first frame it is unknown,
             // so every click is a no-op (`…_click_index` returns `None` then).
+            let total = app.ai_providers.accounts.len();
             let scroll = app.ai_providers.scroll;
             let Some(idx) = ai_providers_list_click_index(
                 app.last_terminal_size,
@@ -160,10 +160,9 @@ fn handle_ai_providers_list_mouse(
                     .map_err(broken_pipe)?;
                 app.set_page(Page::Chat);
             }
-        }
-        _ => {}
-    }
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 /// Handle keys while the API-key modal is open.  Enter encrypts and sends the

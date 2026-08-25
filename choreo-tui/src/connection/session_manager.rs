@@ -1,7 +1,7 @@
 use crate::state::{App, Page, SessionManagerView, session_list_click_index};
 use choreo_client_core::{ClientError, broken_pipe};
 use choreo_proto::ClientMessage;
-use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEvent};
 
 pub(super) fn handle_session_manager_event(
     event: Event,
@@ -135,14 +135,13 @@ fn handle_session_list_mouse(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    if app.session_mgr.confirm_delete.is_some() {
-        return Ok(());
-    }
-    match mouse.kind {
-        MouseEventKind::ScrollDown => app.session_mgr.select_down(),
-        MouseEventKind::ScrollUp => app.session_mgr.select_up(),
-        MouseEventKind::Down(MouseButton::Left) => {
-            let total = app.session_mgr.sessions.len();
+    super::handle_full_page_list_mouse(
+        app,
+        &mouse,
+        app.session_mgr.confirm_delete.is_some(),
+        |app| app.session_mgr.select_up(),
+        |app| app.session_mgr.select_down(),
+        |app| {
             // Resolve the click against the RENDERED window start
             // (`window()`, the same function the renderer draws with), never
             // the stored `scroll`: a reorder/resize leaves the stored anchor
@@ -151,6 +150,7 @@ fn handle_session_list_mouse(
             // geometry is derived from the last known terminal size; before
             // the first frame it is unknown, so every click is a no-op
             // (`session_list_click_index` returns `None` then).
+            let total = app.session_mgr.sessions.len();
             let (window_start, _) = app.session_mgr.window(app.session_mgr.viewport_height);
             let Some(idx) = session_list_click_index(
                 app.last_terminal_size,
@@ -171,10 +171,9 @@ fn handle_session_list_mouse(
                 let session_id = session.session_id;
                 app.attach_to_session(session_id, client_tx)?;
             }
-        }
-        _ => {}
-    }
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 fn handle_session_detail_key(

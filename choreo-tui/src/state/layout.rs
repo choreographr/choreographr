@@ -275,23 +275,18 @@ pub(crate) fn page_list_content_rect(last_terminal_size: Option<(u16, u16)>) -> 
     Some(list[0])
 }
 
-/// Map an AI-providers accounts-list left-click onto the account index to
-/// select.  Each account is rendered as a fixed `AI_PROVIDER_ITEM_LINES`-row
-/// block (name / provider / credential, plus a blank separator on non-last
-/// items), so the clicked row's item is
-/// `scroll + (row − content.y) / AI_PROVIDER_ITEM_LINES`.  The click is
-/// resolved against the *stored* `scroll` — which is the renderer's drawn
-/// start for the accounts list (there is no separate `window()` for it) — and
-/// guarded to the rendered tail.  Returns `None` when the click lands outside
-/// the list's content rows (the block border, the status bar, the scrollbar
-/// column) or past the last account.
-pub(crate) fn ai_providers_list_click_index(
+/// Bounds-check a full-page-list `(column, row)` left-click against the list's
+/// content rect and return `(content, local_row)`, where `local_row` is the
+/// clicked row relative to `content.y`.  `None` when the click lands outside
+/// the content rows — the block border, the status bar, or the scrollbar
+/// column — where it is a no-op for row selection.  Shared by the AI-providers
+/// accounts list and the session-manager list so both hit-tests agree on
+/// precisely what is clickable.
+fn list_content_local_row(
     last_terminal_size: Option<(u16, u16)>,
     column: u16,
     row: u16,
-    total_items: usize,
-    scroll: usize,
-) -> Option<usize> {
+) -> Option<(Rect, usize)> {
     let content = page_list_content_rect(last_terminal_size)?;
     if column < content.x || column >= content.x + content.width {
         return None;
@@ -299,9 +294,60 @@ pub(crate) fn ai_providers_list_click_index(
     if row < content.y || row >= content.y + content.height {
         return None;
     }
-    let local = (row - content.y) as usize;
+    Some((content, (row - content.y) as usize))
+}
+
+/// Number of account items the AI-providers list renders starting at `scroll`,
+/// for a content column `max_rows` tall.  Mirrors `render_ai_providers_list`'s
+/// item loop exactly — each item is a 3-line block plus a blank separator on
+/// non-last items while a row remains, and the renderer breaks out (without
+/// drawing a partial tail) once the next 3-line block would overflow.  The
+/// click hit-test clamps against this drawn set so a click in the blank band
+/// below the drawn rows can never select an account that is not on screen.
+fn ai_providers_drawn_count(scroll: usize, total_items: usize, max_rows: usize) -> usize {
+    let mut lines = 0usize;
+    let mut drawn = 0usize;
+    for i in scroll..total_items {
+        // The renderer always draws the first item (scroll) even if it can
+        // only partially fit; later items break when a full block won't.
+        if lines + 3 > max_rows && i != scroll {
+            break;
+        }
+        lines += 3;
+        drawn += 1;
+        // A blank separator is appended after each non-last drawn item while
+        // a row remains below it.
+        if lines < max_rows && i + 1 < total_items {
+            lines += 1;
+        }
+    }
+    drawn
+}
+
+/// Map an AI-providers accounts-list left-click onto the account index to
+/// select.  Each account is rendered as a fixed `AI_PROVIDER_ITEM_LINES`-row
+/// block (name / provider / credential, plus a blank separator on non-last
+/// items), so the clicked row's item is
+/// `scroll + (row − content.y) / AI_PROVIDER_ITEM_LINES`.  The click is
+/// resolved against the *stored* `scroll` — which is the renderer's drawn
+/// start for the accounts list (there is no separate `window()` for it) — and
+/// clamped to the items actually drawn from it (see
+/// [`ai_providers_drawn_count`]), so it can never select an account the
+/// renderer did not render.  Returns `None` when the click lands outside the
+/// list's content rows (the block border, the status bar, the scrollbar
+/// column) or past the drawn tail.
+pub(crate) fn ai_providers_list_click_index(
+    last_terminal_size: Option<(u16, u16)>,
+    column: u16,
+    row: u16,
+    total_items: usize,
+    scroll: usize,
+) -> Option<usize> {
+    let (content, local) = list_content_local_row(last_terminal_size, column, row)?;
+    let drawn = ai_providers_drawn_count(scroll, total_items, content.height as usize);
     let idx = scroll.saturating_add(local / AI_PROVIDER_ITEM_LINES);
-    (idx < total_items).then_some(idx)
+    // Clamp against the drawn tail; `drawn` is already ≤ `total_items − scroll`.
+    (idx < scroll + drawn).then_some(idx)
 }
 
 /// Map a session-manager list left-click onto the session index to select.
@@ -320,16 +366,12 @@ pub(crate) fn session_list_click_index(
     total_items: usize,
     window_start: usize,
 ) -> Option<usize> {
-    let content = page_list_content_rect(last_terminal_size)?;
-    if column < content.x || column >= content.x + content.width {
-        return None;
-    }
     // The header occupies content row 0; session rows start one row below.
-    if row < content.y + 1 || row >= content.y + content.height {
+    let (_content, local) = list_content_local_row(last_terminal_size, column, row)?;
+    if local == 0 {
         return None;
     }
-    let local = (row - content.y - 1) as usize;
-    let idx = window_start.saturating_add(local);
+    let idx = window_start.saturating_add(local - 1);
     (idx < total_items).then_some(idx)
 }
 
@@ -632,6 +674,35 @@ mod tests {
             ai_providers_list_click_index(None, content.x + 2, content.y, 2, 0),
             None,
             "before the first frame"
+        );
+    }
+
+    #[test]
+    fn ai_providers_list_click_clamps_to_drawn_tail() {
+        // A short page (content height 9 in a 20x12 terminal) draws only the
+        // first two 4-row account blocks (rows 0-7); the remaining accounts are
+        // off-screen.  A click in the blank band below the drawn tail must be a
+        // no-op rather than selecting the second account's still-undrawn block.
+        let content = page_list_content_rect(Some((20, 12))).expect("geometry");
+        assert_eq!(content.height, 9, "content height for a 20x12 terminal");
+        // Four accounts, only two drawn: rows 4 and 7 select index 1 (drawn),
+        // row 8 is below the tail -> no-op, and row 9 is past the content.
+        assert_eq!(
+            ai_providers_list_click_index(Some((20, 12)), content.x + 2, content.y + 4, 4, 0),
+            Some(1)
+        );
+        assert_eq!(
+            ai_providers_list_click_index(Some((20, 12)), content.x + 2, content.y + 7, 4, 0),
+            Some(1)
+        );
+        assert_eq!(
+            ai_providers_list_click_index(Some((20, 12)), content.x + 2, content.y + 8, 4, 0),
+            None,
+            "a click below the drawn tail must not select an undrawn account"
+        );
+        assert_eq!(
+            ai_providers_list_click_index(Some((20, 12)), content.x + 2, content.y + 9, 4, 0),
+            None
         );
     }
 

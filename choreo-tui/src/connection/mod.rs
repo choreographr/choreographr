@@ -10,7 +10,8 @@ use crossbeam::channel;
 use crossbeam::select;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 #[cfg(unix)]
 use mio::unix::pipe;
@@ -66,7 +67,7 @@ use crate::selection;
 #[cfg(test)]
 use choreo_proto::DaemonMessage;
 #[cfg(test)]
-use crossterm::event::{KeyEvent, MouseButton, MouseEventKind};
+use crossterm::event::KeyEvent;
 
 /// Keyboard enhancements requested from the terminal via the kitty keyboard
 /// protocol (`CSI > flags u`), pushed at startup and re-pushed after resume.
@@ -1063,6 +1064,42 @@ pub(super) fn route_session_update(
     } else {
         SessionUpdateRouting::FallThrough
     }
+}
+
+/// Shared skeleton for the two full-page list mouse handlers (the AI-providers
+/// accounts list and the session-manager list).  Both behave identically at
+/// this level and differ only in their list-specific details, which are
+/// supplied as closures:
+///
+/// * `confirmed` — a remove/delete confirmation is armed, so every click (and
+///   the wheel) is a no-op.
+/// * `select_up` / `select_down` — move the list highlight by one row (the
+///   wheel scrolls the highlight, exactly like the picker popups).
+/// * `on_click` — a left-click: resolve the drawn row via the list's
+///   `*_list_click_index` and, when it lands on a row, apply it as the
+///   Enter-equivalent action on that selected row.  Returns `Ok(())` for a
+///   click that misses a row.
+///
+/// Kept out of the per-page modules so the confirm guard, the wheel scroll,
+/// and the left-click dispatch are written once instead of twice.
+pub(super) fn handle_full_page_list_mouse(
+    app: &mut App,
+    mouse: &MouseEvent,
+    confirmed: bool,
+    select_up: impl FnOnce(&mut App),
+    select_down: impl FnOnce(&mut App),
+    on_click: impl FnOnce(&mut App) -> Result<(), ClientError>,
+) -> Result<(), ClientError> {
+    if confirmed {
+        return Ok(());
+    }
+    match mouse.kind {
+        MouseEventKind::ScrollDown => select_down(app),
+        MouseEventKind::ScrollUp => select_up(app),
+        MouseEventKind::Down(MouseButton::Left) => on_click(app)?,
+        _ => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
