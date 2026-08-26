@@ -116,7 +116,22 @@ impl From<indexer::IndexStatusResult> for IndexerStatus {
 pub struct ChainStatus {
     pub genesis_hash: String,
     pub ss58_prefix: u16,
+    pub best_block: u64,
+    pub finalized_block: u64,
     pub item_id_namespace: u32,
+}
+
+impl From<chain::ChainStatus> for ChainStatus {
+    /// Adapt the live probe's snapshot into the tool-facing status shape.
+    fn from(s: chain::ChainStatus) -> Self {
+        ChainStatus {
+            genesis_hash: s.genesis_hash,
+            ss58_prefix: s.ss58_prefix,
+            best_block: s.best_block,
+            finalized_block: s.finalized_block,
+            item_id_namespace: s.item_id_namespace,
+        }
+    }
 }
 
 // ── Read: operations ─────────────────────────────────────────────────────────
@@ -290,13 +305,11 @@ pub fn status() -> Result<CoordStatus, CoordError> {
         peer_id: peer.peer_id,
         addresses: peer.addresses,
     });
-    // Chain status is reported from the pinned configuration (genesis hash,
-    // SS58 prefix, item-id namespace); a live connection check is a follow-up.
-    let chain = Some(ChainStatus {
-        genesis_hash: crate::config::GENESIS_HASH.to_string(),
-        ss58_prefix: 42,
-        item_id_namespace: crate::config::ITEM_ID_NAMESPACE,
-    });
+    // Chain status is a live probe: connect (verifying the genesis hash) and
+    // read the SS58 prefix. A down node or mismatched chain surfaces as `None`
+    // (reported "unavailable"), matching the indexer/IPFS arms, instead of a
+    // healthy snapshot fabricated from pinned configuration.
+    let chain = chain::chain_status().ok().map(ChainStatus::from);
     Ok(CoordStatus {
         chain,
         indexer,

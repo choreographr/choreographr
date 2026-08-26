@@ -19,6 +19,7 @@ use sp_core::sr25519::Public;
 use subxt::OnlineClient;
 use subxt::PolkadotConfig;
 use subxt::config::Config;
+use subxt::config::Header as SubxtHeader;
 use subxt::utils::{AccountId32, MultiAddress, MultiSignature};
 
 use crate::CoordError;
@@ -202,6 +203,84 @@ where
 }
 
 // ── Read (on-chain authoritative state) ──────────────────────────────────────
+
+/// A live chain status snapshot, read from a connected node.
+#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct ChainStatus {
+    /// Genesis hash as reported by the node (hex, `0x`-prefixed). Verified
+    /// against the pinned [`crate::config::GENESIS_HASH`] by [`connect`].
+    pub genesis_hash: String,
+    /// The chain's designated SS58 prefix (`System::SS58Prefix` constant).
+    pub ss58_prefix: u16,
+    /// The node's current best (head) block number.
+    pub best_block: u64,
+    /// The node's latest finalized block number.
+    pub finalized_block: u64,
+    /// Item-id derivation namespace (pinned config; not an on-chain constant).
+    pub item_id_namespace: u32,
+}
+
+/// Probe the node and return a live chain status snapshot.
+///
+/// Connects (which itself verifies the node's genesis hash matches the pinned
+/// [`crate::config::GENESIS_HASH`]), reads the SS58 prefix from the on-chain
+/// `System` constants, and reads the best + finalized block headers. A down
+/// node, a mismatched chain, or an RPC that never answers surfaces as an error
+/// (bounded by [`CHAIN_TIMEOUT`]) so the caller's status report can show the
+/// chain as unavailable rather than fabricating a healthy snapshot from pinned
+/// configuration.
+pub fn chain_status() -> Result<ChainStatus, CoordError> {
+    crate::runtime::block_on(with_chain_timeout(async move {
+        let client = connect().await?;
+        let at = client
+            .at_current_block()
+            .await
+            .map_err(|e| CoordError::Substrate(format!("failed to get block: {e}")))?;
+
+        // `at_current_block` pins to the latest finalized block, so its number
+        // is the finalized height; verify it's available before reporting.
+        let finalized_block = at.block_number();
+
+        // Read the chain's designated SS58 prefix from the on-chain `System`
+        // constant (a static address resolved by the generated API).
+        let addr = api::constants().system().ss58_prefix();
+        let ss58_prefix = at
+            .constants()
+            .entry(addr)
+            .map_err(|e| CoordError::Substrate(format!("failed to read ss58 prefix: {e}")))?;
+
+        // Fetch the best (head) block via the node RPC: `chain_getHeader` with
+        // no hash returns the latest best block. subxt does not expose a
+        // one-shot best-block accessor on the `OnlineClient` channel, and the
+        // finalized number above comes from `at_current_block` (which pins to
+        // the latest finalized block), so a short-lived RPC client is opened
+        // here just to read the head. It rides the same sidecar runtime and is
+        // bounded by `CHAIN_TIMEOUT` like everything else in this probe.
+        //
+        // The generic is pinned to the Polkadot RPC config so header decoding
+        // matches the chain config; the header's `number()` comes from
+        // `subxt::config::Header`.
+        let rpc = subxt::rpcs::RpcClient::from_insecure_url(crate::config::CHAIN_WS_URL)
+            .await
+            .map_err(|e| CoordError::Substrate(format!("failed to open rpc: {e}")))?;
+        let methods =
+            subxt::rpcs::LegacyRpcMethods::<subxt::config::RpcConfigFor<PolkadotConfig>>::new(rpc);
+        let best_header = methods
+            .chain_get_header(None)
+            .await
+            .map_err(|e| CoordError::Substrate(format!("failed to read best block header: {e}")))?
+            .ok_or_else(|| CoordError::Substrate("node returned no best block header".into()))?;
+        let best_block = best_header.number();
+
+        Ok(ChainStatus {
+            genesis_hash: crate::encode::bytes_to_hex(client.genesis_hash().as_ref()),
+            ss58_prefix,
+            best_block,
+            finalized_block,
+            item_id_namespace: crate::config::ITEM_ID_NAMESPACE,
+        })
+    }))?
+}
 
 /// Read an item's on-chain control state (owner, revision, flags).
 pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, CoordError> {

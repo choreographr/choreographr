@@ -747,8 +747,12 @@ fn format_status(status: &choreo_coord::orchestrate::CoordStatus) -> String {
     let mut out = String::new();
     match &status.chain {
         Some(chain) => out.push_str(&format!(
-            "chain: genesis={} ss58_prefix={} item_id_namespace={}\n",
-            chain.genesis_hash, chain.ss58_prefix, chain.item_id_namespace,
+            "chain: genesis={} ss58_prefix={} best_block={} finalized_block={} item_id_namespace={}\n",
+            chain.genesis_hash,
+            chain.ss58_prefix,
+            chain.best_block,
+            chain.finalized_block,
+            chain.item_id_namespace,
         )),
         None => out.push_str("chain: unavailable\n"),
     }
