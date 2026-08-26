@@ -1,5 +1,25 @@
 # Agent Instructions
 
+## Choreographr Coordination Platform (`choreo-coord`)
+
+The `choreo-coord` crate implements the always-on `coord` tool group (the
+Choreographr Coordination Platform blockchain content registry). It owns a
+tokio **sidecar runtime** used **only** to drive `subxt` for signed chain
+writes; the daemon itself stays thread-only and calls the crate's blocking
+`execute_*` functions. IPFS (`ureq`) and the indexer (`tungstenite`) are
+synchronous and never touch the sidecar.
+
+The Polkadot account credential (`ServiceCredential::Substrate`) lives in
+`choreo-keystore`; the TUI imports a Polkadot-JS keystore export client-side and
+sends it over the existing `AddCredential` path.
+
+**Temporary credential plumbing**: the coord write tools currently receive the
+daemon's single Substrate credential through the `Tool` trait's one
+`x_credentials` slot (see `// TEMPORARY` comments in `requests.rs` and
+`sessions.rs`). This single-slot reuse is a stopgap until a proper
+tool→keystore credential-access system replaces it; do not rely on it
+remaining as the permanent mechanism.
+
 ## Refactoring
 
 Always try to refactor when implementing new features. Look for opportunities to improve code structure, reduce duplication, and simplify existing code alongside any additions.

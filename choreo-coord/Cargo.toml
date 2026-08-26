@@ -50,3 +50,9 @@ schemars.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The integration tests build a signing ChainAccount from a Substrate
+# keystore credential (a plain runtime dep, promoted to dev here since only
+# the tests use it directly).
+choreo-keystore.workspace = true
