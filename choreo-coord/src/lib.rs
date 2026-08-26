@@ -28,6 +28,7 @@ pub mod encode;
 pub mod error;
 pub mod indexer;
 pub mod ipfs;
+pub mod orchestrate;
 pub mod runtime;
 
 pub use error::CoordError;
