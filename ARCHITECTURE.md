@@ -1939,7 +1939,7 @@ Implementation details:
   session, but message-text previews and raw reasoning bytes are rendered only
   for the calling session, and raw reasoning additionally requires `include_raw`
   (thinking blocks / encrypted signatures never leave the daemon otherwise).
-- Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell}`)
+- Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell, coord}`)
 - `ToolGroup` struct and `GROUPS` constant live in `choreo-daemon/src/tools/mod.rs`
 - Group metadata is appended to the system prompt in `context::build_base_prompt()`
 

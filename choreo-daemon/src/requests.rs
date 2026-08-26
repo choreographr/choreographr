@@ -772,9 +772,15 @@ pub(crate) fn run_agent_loop(
                     );
 
                     let turn_working_dir = session.config.working_dir.clone();
+                    // TEMPORARY: pass the daemon's Substrate credential through
+                    // the single `x_credentials` slot so the coord write tools
+                    // can build a ChainAccount. This single-slot reuse is a
+                    // stopgap (the X tools use the same slot, so only one
+                    // credential rides it) until a proper tool→keystore
+                    // credential-access system replaces it.
                     let (mut output, tool_cancelled, image) = execute_tool_with_timeout(
                         &tool_call,
-                        None,
+                        ctx.substrate_credential.as_ref(),
                         turn_working_dir.as_deref(),
                         tool_timeout,
                         request_id,
@@ -929,7 +935,14 @@ pub(crate) fn run_agent_loop(
                             session_id: ctx.session_id,
                             registry: Arc::clone(&reg),
                             cmd_tx: cmd_tx.clone(),
-                            x_credentials: None,
+                            // TEMPORARY: clone the daemon's Substrate credential
+                            // into the single `x_credentials` slot so the coord
+                            // write tools can build a ChainAccount. This
+                            // single-slot reuse is a stopgap (the X tools use the
+                            // same slot, so only one credential rides it) until a
+                            // proper tool→keystore credential-access system
+                            // replaces it.
+                            x_credentials: ctx.substrate_credential.clone(),
                             working_dir: session.config.working_dir.clone(),
                             ctx: tool_ctx.clone(),
                             invocation_description: invocation_description.clone(),

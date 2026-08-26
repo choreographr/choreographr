@@ -98,6 +98,15 @@ impl From<choreo_blockchain::BlockchainError> for ToolExecError {
     }
 }
 
+// Unconditional: the Coordination Platform tools are always compiled in, so
+// every `?` on a `choreo_coord` op in the `coord` module maps its error into a
+// [`ToolExecError`] without a per-site `.map_err`.
+impl From<choreo_coord::CoordError> for ToolExecError {
+    fn from(e: choreo_coord::CoordError) -> Self {
+        ToolExecError(e.to_string())
+    }
+}
+
 /// Capacity of the bounded channel between a tool's execution thread and its
 /// forwarding thread (`requests.rs`'s `spawn_tool_execution`), and between a
 /// `run_series` sub-tool and its relay thread (`series.rs`).
@@ -149,6 +158,9 @@ impl<'de> Deserialize<'de> for EmptyArgs {
 }
 
 pub mod context;
+// Choreographr Coordination Platform tools (blockchain content registry + IPFS +
+// indexer). Unconditional: the `coord` tool group is always enabled.
+pub(crate) mod coord;
 pub(crate) mod db;
 pub(crate) mod exec;
 // Blockchain tools (EVM + Substrate/Polkadot) — behind the `blockchain`
@@ -584,6 +596,12 @@ pub fn static_groups() -> &'static [ToolGroup] {
                 name: "debug".into(),
                 description: "Read-only diagnostics and request dry-runs (session_inspect)".into(),
             },
+            // Choreographr Coordination Platform (blockchain content registry +
+            // IPFS + indexer). Always enabled (unconditional, like core/git/shell).
+            ToolGroup {
+                name: "coord".into(),
+                description: "Choreographr Coordination Platform (blockchain content registry + IPFS + indexer)".into(),
+            },
         ];
         // The blockchain group only exists when the `blockchain` feature is
         // compiled in (the tools are registered conditionally too), so
@@ -663,6 +681,21 @@ impl ToolRegistry {
             reg.register(subxt::SubxtBlock);
         }
         reg.register(random::Random);
+        // Choreographr Coordination Platform tools — unconditional. The
+        // implementations live in the `choreo-coord` crate; these are thin
+        // wrappers under the always-on "coord" group.
+        reg.register(coord::CoordItem);
+        reg.register(coord::CoordRevisions);
+        reg.register(coord::CoordEvents);
+        reg.register(coord::CoordAccountItems);
+        reg.register(coord::CoordProfile);
+        reg.register(coord::CoordDecodeContent);
+        reg.register(coord::CoordStatus);
+        reg.register(coord::CoordPublishItem);
+        reg.register(coord::CoordPublishRevision);
+        reg.register(coord::CoordLifecycle);
+        reg.register(coord::CoordAccountLink);
+        reg.register(coord::CoordSetProfile);
         reg.register(time::GetCurrentTime);
         reg.register(retrieve_webpage::RetrieveWebpage::default());
         reg.register(session_inspect::SessionInspect);
@@ -1103,6 +1136,40 @@ mod tests {
         assert!(
             groups.iter().any(|g| g == "blockchain"),
             "blockchain group missing: {groups:?}"
+        );
+    }
+
+    #[test]
+    fn coord_group_registers_all_tools() {
+        // The `coord` group is unconditional (always compiled in), so every
+        // tool must be registered and the group must appear in the catalog.
+        let registry = ToolRegistry::new().build();
+        let active: HashSet<String> = ["coord".into()].into_iter().collect();
+        let defs = registry.available_definitions(&active);
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        for tool in [
+            "coord_item",
+            "coord_revisions",
+            "coord_events",
+            "coord_account_items",
+            "coord_profile",
+            "coord_decode_content",
+            "coord_status",
+            "coord_publish_item",
+            "coord_publish_revision",
+            "coord_lifecycle",
+            "coord_account_link",
+            "coord_set_profile",
+        ] {
+            assert!(
+                names.contains(&tool),
+                "missing {tool} in coord definitions: {names:?}"
+            );
+        }
+        let groups: Vec<String> = registry.groups().into_iter().map(|g| g.name).collect();
+        assert!(
+            groups.iter().any(|g| g == "coord"),
+            "coord group missing: {groups:?}"
         );
     }
 

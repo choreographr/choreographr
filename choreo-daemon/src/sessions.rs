@@ -6,6 +6,7 @@ use crate::providers::InferenceProvider;
 use crate::requests::run_agent_loop;
 use crate::tools::{ToolOutput, ToolRegistry};
 use choreo_ai_protocols::model_reasoning_capability;
+use choreo_keystore::ServiceCredential;
 use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ReasoningArtifact,
     ReasoningProducer, SessionEvent, SessionStatus, SessionSummary, TimestampMs, TokenUsage,
@@ -261,6 +262,14 @@ pub struct RequestContext {
     /// Daemon-wide backlog counter, shared with every session thread and the
     /// daemon command loop (the 6th sanctioned shared-state exception).
     pub global_lag: Arc<AtomicUsize>,
+    /// The daemon's Substrate credential, plumbed to the request worker so the
+    /// `coord` write tools can build a signing [`ChainAccount`].
+    ///
+    /// // TEMPORARY: this rides the Tool trait's single `x_credentials` slot
+    /// (the same slot the X tools use), so only ONE credential can be active
+    /// per session at a time. This is a stopgap until a proper tool→keystore
+    /// credential-access system replaces it.
+    pub substrate_credential: Option<ServiceCredential>,
 }
 
 pub struct ChildResult {
@@ -1000,7 +1009,12 @@ pub fn session_main(
             .map(|r| r.active_tool_groups.iter().cloned().collect())
             .filter(|cats: &HashSet<String>| !cats.is_empty())
             .unwrap_or_else(|| {
-                HashSet::from(["core".to_string(), "git".to_string(), "shell".to_string()])
+                HashSet::from([
+                    "core".to_string(),
+                    "git".to_string(),
+                    "shell".to_string(),
+                    "coord".to_string(),
+                ])
             }),
         context_config: init_record
             .as_ref()

@@ -56,6 +56,10 @@ hkdf.workspace = true
 zeroize.workspace = true
 humfmt.workspace = true
 choreo-keystore.workspace = true
+# Choreographr Coordination Platform read/write operations (blockchain content
+# registry + IPFS + indexer). Unconditional: the `coord` tool group is always
+# enabled, so this is a plain (non-optional) workspace dependency.
+choreo-coord.workspace = true
 choreo-mcp.workspace = true
 choreo-proto.workspace = true
 choreo-sanitize.workspace = true

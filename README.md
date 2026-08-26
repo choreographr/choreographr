@@ -470,9 +470,10 @@ in the same table and still stream to the TUI.
 Vision support is per-model: pick a vision-capable model (e.g.
 `deepseek-v4-flash-vision-exp`) and call `read_image` with a path.
 
-**Tool group.** Tools are organized into groups (`core`, `git`, `shell`, `x`,
-`vm`, `db`, `mcp`, `blockchain`). Only `core`, `git`, and `shell` are active by default. The
-model can activate additional groups with `load_tools` and deactivate them with
+**Tool group.** Tools are organized into groups (`core`, `git`, `shell`, `coord`,
+`x`, `vm`, `db`, `mcp`, `blockchain`). Only `core`, `git`, `shell`, and
+`coord` are active by default. The model can activate additional groups with
+`load_tools` and deactivate them with
 `unload_tools`. Groups are a discovery mechanism, not access control — the
 RISC-V VM always has access to all tools.
 

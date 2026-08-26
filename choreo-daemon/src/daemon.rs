@@ -557,6 +557,12 @@ impl DaemonState {
         // still uses after spawning).
         let lag_limits = self.lag_limits;
         let global_lag = Arc::clone(&self.global_lag);
+        // TEMPORARY: reserve the Tool trait's single `x_credentials` slot for the
+        // coord signing credential. Pick the daemon's Substrate credential to
+        // ride that slot; see `RequestContext::substrate_credential` for the
+        // stopgap rationale until a proper tool→keystore credential-access
+        // system replaces it.
+        let substrate_credential = self.pick_substrate_credential();
 
         // Resolve provider from the session's account name
         let account_name = metadata.account_name.clone();
@@ -583,6 +589,7 @@ impl DaemonState {
                     max_turns,
                     lag_limits,
                     global_lag,
+                    substrate_credential,
                 },
             );
         });
@@ -596,6 +603,32 @@ impl DaemonState {
         );
         self.session_metadata.insert(session_id, metadata);
         session_tx
+    }
+
+    /// Pick the single Substrate credential from the daemon's credential map.
+    ///
+    /// TEMPORARY: this reserves the Tool trait's single `x_credentials` slot
+    /// for the coord signing credential (see
+    /// `RequestContext::substrate_credential` for the stopgap rationale). When
+    /// exactly one Substrate credential exists it is returned; when several,
+    /// one named `"main"`/`"default"` is preferred (then the first in map
+    /// order); when none, `None`.
+    fn pick_substrate_credential(&self) -> Option<ServiceCredential> {
+        // First pass prefers a credential explicitly named "main"/"default";
+        // otherwise keep the first Substrate credential encountered.
+        let mut first_substrate: Option<&ServiceCredential> = None;
+        for cred in self.credentials.values() {
+            if matches!(
+                cred,
+                ServiceCredential::Substrate { name, .. } if name == "main" || name == "default"
+            ) {
+                return Some(cred.clone());
+            }
+            if first_substrate.is_none() && matches!(cred, ServiceCredential::Substrate { .. }) {
+                first_substrate = Some(cred);
+            }
+        }
+        first_substrate.cloned()
     }
 
     /// Try to resolve an `InferenceProvider` for the given account name using
@@ -640,7 +673,7 @@ impl DaemonState {
 
         let cwd_str = working_dir.as_ref().map(|p| p.display().to_string());
         let active_cats = if active_tool_groups.is_empty() {
-            vec!["core".into(), "git".into(), "shell".into()]
+            vec!["core".into(), "git".into(), "shell".into(), "coord".into()]
         } else {
             active_tool_groups.clone()
         };

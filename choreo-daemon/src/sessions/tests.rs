@@ -320,6 +320,7 @@ fn broadcast_setup() -> (SessionState, RequestContext) {
         max_turns: 0,
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
+        substrate_credential: None,
     };
     (test_state(), ctx)
 }
@@ -1126,6 +1127,7 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
         max_turns: 0,
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
+        substrate_credential: None,
     };
     let mut state = test_state();
 
@@ -1261,6 +1263,7 @@ fn sync_accumulated_usage_never_regresses_config() {
         max_turns: 0,
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
+        substrate_credential: None,
     };
     let mut state = test_state();
     let mut shutdown = false;

@@ -33,6 +33,7 @@ fn spawn_session(
                 max_turns: 0,
                 lag_limits: LagLimits::default(),
                 global_lag: Arc::new(AtomicUsize::new(0)),
+                substrate_credential: None,
             },
         );
     });
