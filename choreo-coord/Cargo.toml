@@ -1,0 +1,50 @@
+[package]
+name = "choreo-coord"
+version.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "choreo_coord"
+path = "src/lib.rs"
+
+[dependencies]
+# Substrate client — drives the Coordination Platform node (tx submission and
+# on-chain state reads). Only the `subxt` path uses the tokio sidecar; IPFS and
+# the indexer are synchronous so the daemon stays thread-only.
+subxt.workspace = true
+# sr25519 signing material — the Polkadot account's expanded ed25519 secret is
+# rebuilt into a `schnorrkel::Keypair` (wrapped in a custom `subxt::tx::Signer`)
+# to sign extrinsics. The account's serialized form lives in choreo-keystore's
+# Polkadot account store.
+schnorrkel = "0.11"
+# SS58 address parsing / AccountId32 (matches the reference implementation's
+# `Ss58Codec` usage; pulled transitively by subxt already).
+sp-core = { version = "43.0.0", features = ["std"] }
+# Protobuf content protocol (ItemMessage + mixin payloads).
+prost.workspace = true
+# SCALE encoding for deterministic item-id derivation.
+parity-scale-codec.workspace = true
+# Substrate blake2_256 for item-id derivation.
+sp-crypto-hashing.workspace = true
+# Base58 for CID <-> sha2-256-digest conversion.
+bs58.workspace = true
+# Synchronous WebSocket client for the indexer's JSON-RPC API (no tokio).
+tungstenite.workspace = true
+# Blocking HTTP client for the local IPFS daemon (add/cat).
+ureq.workspace = true
+# Sidecar async runtime — the crate's ONLY tokio use is running subxt futures.
+# The daemon never touches tokio; it calls this crate's blocking `execute_*`.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+tracing.workspace = true

@@ -21,8 +21,10 @@ path = "src/lib.rs"
 # replacing the fabricated `ens_resolve`/`ens_reverse` RPC methods the old
 # implementation invoked (no node implements those).
 alloy = { version = "2.3", features = ["providers", "rpc-types-eth", "sol-types", "ens"] }
-# Substrate/Polkadot client (light-client + JSON-RPC paths).
-subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
+# Substrate/Polkadot client (light-client + JSON-RPC paths). Promoted to the
+# workspace because choreo-coord (the always-on Coordination Platform tools)
+# uses the same client.
+subxt.workspace = true
 # Sidecar async runtime. This crate is the *only* place in the workspace that
 # depends on tokio: the daemon stays thread-only and calls into this crate's
 # blocking `execute_*` functions, which `block_on` here.

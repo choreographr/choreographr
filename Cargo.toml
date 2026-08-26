@@ -86,6 +86,7 @@ members = [
     "choreo-ai-protocols",
     "choreo-blockchain",
     "choreo-client-core",
+    "choreo-coord",
     "choreo-daemon",
     "choreo-keystore",
     "choreo-markdown",
@@ -199,6 +200,7 @@ serde = { version = "1", features = ["derive"] }
 choreo-ai-protocols = { path = "choreo-ai-protocols", version = "0.1" }
 choreo-blockchain = { path = "choreo-blockchain", version = "0.1" }
 choreo-client-core = { path = "choreo-client-core", version = "0.1" }
+choreo-coord = { path = "choreo-coord", version = "0.1" }
 choreo-keystore = { path = "choreo-keystore", version = "0.1" }
 choreo-proto = { path = "choreo-proto", version = "0.1" }
 choreo-sanitize = { path = "choreo-sanitize", version = "0.1" }
@@ -207,7 +209,7 @@ choreo-im = { path = "choreo-im", version = "0.1" }
 choreo-markdown = { path = "choreo-markdown", version = "0.1" }
 choreo-mcp = { path = "choreo-mcp", version = "0.1" }
 choreo-transport = { path = "choreo-transport", version = "0.1" }
-ureq = { version = "3", features = ["json", "brotli"] }
+ureq = { version = "3", features = ["json", "brotli", "multipart"] }
 ammonia = "4"
 base64 = "0.23"
 dirs = "6"
@@ -275,6 +277,27 @@ url = "2"
 uds_windows = "1.2.1"
 humfmt = "0.6.0"
 hex = "0.4"
+# Substrate client (native/light + JSON-RPC) — promoted to the workspace now
+# that BOTH choreo-blockchain (the `blockchain` feature) and choreo-coord (the
+# always-on Coordination Platform tools) use it.
+subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
+# sr25519 signing + Polkadot-JS keystore compat — used by choreo-keystore for
+# the Polkadot account store (the `polkadot-js-compat` feature pulls scrypt,
+# crypto_secretbox, and schnorrkel transitively).
+subxt-signer = { version = "0.50.3", default-features = false, features = ["polkadot-js-compat", "subxt"] }
+# Protobuf content protocol (choreo-coord's ItemMessage/mixin encoding).
+prost = "0.14"
+# SCALE encoding for deterministic item-id derivation (choreo-coord).
+parity-scale-codec = "3"
+# Substrate blake2_256 for item-id derivation (choreo-coord).
+sp-crypto-hashing = "0.1"
+# Base58 for the content protocol's CID <-> sha2-256-digest conversion (choreo-coord).
+bs58 = "0.5"
+# Synchronous WebSocket client for the indexer's JSON-RPC API (choreo-coord).
+# No default features: the indexer endpoint is plain `ws://`, so neither
+# native-tls nor rustls is needed (and native-tls would drag a C/OpenSSL build
+# into the static-musl release). `handshake` enables `tungstenite::connect`.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 nix = "0.31.3"
 unicode-segmentation = "1.13"
 # Filesystem notification for the user-overlay watcher (S4). 8.2.0 is the
