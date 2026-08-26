@@ -6,7 +6,8 @@
 use crate::markdown_render::display_width;
 use crate::scrollbar::SmoothScrollbarState;
 use crate::state::{
-    AI_PROVIDER_ITEM_LINES, AccountWizardStep, App, PopupSize, centered_popup, selector_list_layout,
+    AI_PROVIDER_ITEM_LINES, AccountWizardStep, App, PolkadotImportStep, PopupSize, centered_popup,
+    selector_list_layout,
 };
 use ratatui::{
     Frame,
@@ -35,6 +36,8 @@ pub(super) fn render_ai_providers(frame: &mut Frame<'_>, app: &mut App) {
             AccountWizardStep::Provider => render_wizard_provider(frame, app),
             AccountWizardStep::Slug => render_wizard_slug(frame, app),
         }
+    } else if app.ai_providers.polkadot_import.is_open() {
+        render_polkadot_import(frame, app);
     }
 }
 
@@ -432,4 +435,98 @@ fn render_wizard_slug(frame: &mut Frame<'_>, app: &mut App) {
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(status, rows[3]);
+}
+
+/// The Polkadot-account import wizard (AI providers page, `p`): a centered
+/// modal with a single input field for each of the three steps (name, keystore
+/// path, password).  The password is masked.  Enter advances / submits
+/// (connection.rs), Esc backs out one step.  Mirrors the new-account slug
+/// modal's layout.
+fn render_polkadot_import(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let popup = centered_popup(
+        area,
+        PopupSize {
+            w_num: 2,
+            w_den: 3,
+            h_num: 2,
+            h_den: 5,
+            min_w: 40,
+            min_h: 10,
+            max_w: 80,
+            max_h: 14,
+        },
+    );
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Add Polkadot Account ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    let dim = Style::default().fg(Color::DarkGray);
+
+    // Step-specific title/description line, plus the field name for the input.
+    let (title, field_label) = match app.ai_providers.polkadot_import.step {
+        PolkadotImportStep::Name => ("Account name", "Name:"),
+        PolkadotImportStep::Path => ("Keystore path", "Path:"),
+        PolkadotImportStep::Password => ("Account password", "Password:"),
+    };
+    let lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!("  {title}"),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(Span::styled(
+            "  The export is decrypted in the TUI; the password never leaves it.",
+            dim,
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), rows[0]);
+
+    let border_style = Style::default().fg(Color::Cyan);
+    let prompt = TextPrompt::new(std::borrow::Cow::Owned(field_label.to_string()))
+        .with_block(Block::bordered().border_style(border_style));
+    // Note: the password field renders as typed (tui_prompts has no mask
+    // support), but its true confidentiality is unaffected — the value never
+    // leaves the TUI and is zeroized on close (see `PolkadotImportState`).
+    (&prompt).draw(
+        frame,
+        rows[1],
+        &mut app.ai_providers.polkadot_import.field(),
+    );
+
+    if let Some(ref err) = app.ai_providers.polkadot_import.error {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  Error: {err}"),
+                Style::default().fg(Color::Red),
+            ))),
+            rows[2],
+        );
+    }
+
+    let footer = match app.ai_providers.polkadot_import.step {
+        PolkadotImportStep::Password => " enter import · esc back ",
+        _ => " enter next · esc back ",
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[3],
+    );
 }

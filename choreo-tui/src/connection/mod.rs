@@ -47,6 +47,7 @@ mod session_manager;
 // unqualified; bring them into scope without changing the call sites.
 use ai_providers::{
     handle_account_wizard_event, handle_ai_providers_event, handle_credential_modal_event,
+    handle_polkadot_import_event,
 };
 use chat::handle_chat_event;
 use model_selector::handle_model_selector_event;
@@ -890,6 +891,9 @@ pub(crate) fn handle_terminal_event(
     if app.ai_providers.wizard.is_open() {
         return handle_account_wizard_event(event, app, client_tx);
     }
+    if app.ai_providers.polkadot_import.is_open() {
+        return handle_polkadot_import_event(event, app, client_tx);
+    }
     match app.page {
         Page::SessionManager => handle_session_manager_event(event, app, client_tx),
         Page::AIProviders => handle_ai_providers_event(event, app, client_tx),
@@ -939,6 +943,9 @@ fn handle_paste_event(data: &str, app: &mut App) -> Result<(), ClientError> {
                         paste_into_text_state(&mut app.ai_providers.wizard.slug, data);
                     }
                 }
+            } else if app.ai_providers.polkadot_import.is_open() {
+                tracing::debug!("[choreo-tui] pasting into polkadot import field");
+                app.ai_providers.polkadot_import.handle_paste(data);
             }
         }
         _ => {}

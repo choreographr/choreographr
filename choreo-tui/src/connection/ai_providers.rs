@@ -1,10 +1,13 @@
 use crate::state::{
-    AccountWizardStep, App, Page, ai_providers_list_click_index, apply_selector_left_click,
+    AccountWizardStep, App, Page, PolkadotImportStep, ai_providers_list_click_index,
+    apply_selector_left_click,
 };
-use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name};
+use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name, read_public_key_bytes};
+use choreo_keystore::ServiceCredential;
 use choreo_proto::ClientMessage;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use tui_prompts::State;
+use zeroize::Zeroize;
 
 pub(super) fn handle_ai_providers_event(
     event: Event,
@@ -103,6 +106,12 @@ fn handle_ai_providers_list_key(
                 tracing::debug!(name = %account.name, "opening credential modal");
                 app.ai_providers.credential.open(account.name.clone());
             }
+        }
+        // Add a Polkadot account: import a Polkadot-JS keystore export in the
+        // TUI and store the resulting Substrate credential in the daemon.
+        KeyCode::Char('p') => {
+            tracing::debug!("opening Polkadot account import wizard");
+            app.ai_providers.polkadot_import.open();
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.set_page(Page::Chat);
@@ -236,6 +245,170 @@ pub(super) fn handle_credential_modal_event(
         // All other keys go to the credential input buffer.
         _ => {
             app.ai_providers.credential.input.handle_key(key);
+        }
+    }
+    Ok(())
+}
+
+/// Handle keys while the Polkadot-account import wizard is open (accounts
+/// page, `p`).  Enter advances through the name and keystore-path steps, then
+/// on the password step triggers the import; Esc backs out one step (cancelling
+/// on the name step); every other key edits the active step's text field.
+pub(super) fn handle_polkadot_import_event(
+    event: Event,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Event::Key(key) = event else {
+        return Ok(());
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+
+    match key.code {
+        // Enter: validate the current step and advance, or submit on password.
+        KeyCode::Enter => match app.ai_providers.polkadot_import.step {
+            PolkadotImportStep::Name => {
+                let name = app
+                    .ai_providers
+                    .polkadot_import
+                    .name
+                    .value()
+                    .trim()
+                    .to_string();
+                if name.is_empty() {
+                    app.ai_providers.polkadot_import.error =
+                        Some("Account name is required".to_string());
+                    return Ok(());
+                }
+                if !is_valid_account_name(&name) {
+                    app.ai_providers.polkadot_import.error = Some(
+                        "name must be lowercase alphanumeric, hyphens, or underscores".to_string(),
+                    );
+                    return Ok(());
+                }
+                app.ai_providers.polkadot_import.advance();
+            }
+            PolkadotImportStep::Path => {
+                let path = app
+                    .ai_providers
+                    .polkadot_import
+                    .path
+                    .value()
+                    .trim()
+                    .to_string();
+                if path.is_empty() {
+                    app.ai_providers.polkadot_import.error =
+                        Some("Keystore path is required".to_string());
+                    return Ok(());
+                }
+                app.ai_providers.polkadot_import.advance();
+            }
+            PolkadotImportStep::Password => {
+                submit_polkadot_import(app, client_tx)?;
+            }
+        },
+        // Esc backs out one step (cancels on the name step).
+        KeyCode::Esc => {
+            if app.ai_providers.polkadot_import.step == PolkadotImportStep::Name {
+                tracing::debug!("polkadot import cancelled");
+                app.ai_providers.polkadot_import.close();
+            } else {
+                app.ai_providers.polkadot_import.back();
+            }
+        }
+        // All other keys edit the active step's text field.
+        _ => {
+            app.ai_providers.polkadot_import.handle_key(key);
+        }
+    }
+    Ok(())
+}
+
+/// Read the entered keystore export, decrypt it in the TUI with the account
+/// password, and send the resulting Substrate credential over the same
+/// encrypted `AddCredential` path used for API keys.
+///
+/// The password is used only here (client-side), never logged and never sent
+/// to the daemon; it is zeroized on every exit path.
+fn submit_polkadot_import(
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let name = app
+        .ai_providers
+        .polkadot_import
+        .name
+        .value()
+        .trim()
+        .to_string();
+    let path = app
+        .ai_providers
+        .polkadot_import
+        .path
+        .value()
+        .trim()
+        .to_string();
+    let password = app.ai_providers.polkadot_import.value();
+
+    // Wipe the transient password copy after building the import call below.
+    let result = (|| -> Result<String, String> {
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read keystore {path}: {e}"))?;
+        let credential = choreo_keystore::substrate::import_from_json(&json, &name, &password)
+            .map_err(|e| format!("failed to decrypt keystore: {e}"))?;
+        let view = credential
+            .as_substrate()
+            .ok_or("decrypted credential is not a Substrate account".to_string())?;
+
+        // Encrypt the serialized Substrate credential with the daemon identity
+        // public key and bundle the identity private key so the daemon can
+        // decrypt it into memory immediately (same transport as the API-key
+        // modal).
+        let mut plaintext = postcard::to_allocvec(&credential)
+            .map_err(|e| format!("failed to serialize credential: {e}"))?;
+        let pub_key = read_public_key_bytes()
+            .map_err(|e| format!("failed to read identity public key: {e}"))?;
+        let encrypted_payload =
+            choreo_keystore::crypto::encrypt_with_public_key(&pub_key, &plaintext)
+                .map_err(|e| format!("failed to encrypt credential: {e}"))?;
+        plaintext.zeroize();
+        let unlock_key = choreo_keystore::paths::private_key_path()
+            .ok()
+            .and_then(|p| std::fs::read(p).ok())
+            .filter(|d| d.len() == 32);
+
+        tracing::info!(
+            account_id = %view.account_id,
+            name,
+            "sent encrypted Substrate credential to daemon"
+        );
+        client_tx
+            .send(ClientMessage::AddCredential {
+                service: name.clone(),
+                encrypted_payload,
+                unlock_key,
+            })
+            .map_err(broken_pipe)
+            .map_err(|e| e.to_string())?;
+        Ok(format!(
+            "[daemon] Substrate account '{name}' stored ({}); unlock the daemon to sign with it",
+            view.account_id
+        ))
+    })();
+
+    // Always wipe the password from the input buffer, success or failure.
+    app.ai_providers.polkadot_import.wipe_password();
+
+    match result {
+        Ok(status) => {
+            app.status = Some(status);
+            app.ai_providers.polkadot_import.close();
+        }
+        Err(e) => {
+            tracing::warn!(%e, "polkadot account import failed");
+            app.ai_providers.polkadot_import.error = Some(e);
         }
     }
     Ok(())
