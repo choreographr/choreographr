@@ -250,6 +250,21 @@ pub fn import_from_json(
         return Err(KeystoreError::InvalidKeystoreData);
     }
 
+    // Cross-check that the export's advertised `address` is the SS58 encoding
+    // of that public key. A mismatched `address` (a paste error or a tampered
+    // export) would otherwise yield a credential whose stored `account_id`
+    // does not match the key that actually signs. `from_raw` derives the
+    // address from the public key for exactly this reason.
+    let derived_address = ss58_address(&public_key)?;
+    if derived_address != pair.address {
+        warn!(
+            advertised = %pair.address,
+            derived = %derived_address,
+            "keystore address does not match the derived public key"
+        );
+        return Err(KeystoreError::InvalidKeystoreData);
+    }
+
     debug!(
         account_id = %pair.address,
         "imported Polkadot keyring credential"
@@ -370,6 +385,23 @@ mod tests {
         assert!(
             matches!(result, Err(KeystoreError::DecryptionFailed)),
             "expected DecryptionFailed, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn import_rejects_mismatched_address() {
+        // A valid keyring ciphertext whose advertised `address` does not match
+        // the public key encoded in the decrypted payload must be rejected so
+        // the credential's account id always corresponds to the signing key.
+        let json = ALICE_JSON.replace(
+            "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+            "5CfWTDh7XxJ2yrayqQ2aJnnZAH5v5XaF1oJFfH5QCpbfP9v8",
+        );
+        let result = import_from_json(&json, "main", "whoisalice");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidKeystoreData)),
+            "expected InvalidKeystoreData for a mismatched address, got {:?}",
             result
         );
     }

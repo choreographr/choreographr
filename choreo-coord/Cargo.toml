@@ -50,6 +50,8 @@ schemars.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 tracing.workspace = true
+# Memory zeroization for the signing secret held on `ChainAccount`.
+zeroize.workspace = true
 
 [dev-dependencies]
 # The integration tests build a signing ChainAccount from a Substrate

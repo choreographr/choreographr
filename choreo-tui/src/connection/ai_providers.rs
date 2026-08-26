@@ -3,7 +3,6 @@ use crate::state::{
     apply_selector_left_click,
 };
 use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name, read_public_key_bytes};
-use choreo_keystore::ServiceCredential;
 use choreo_proto::ClientMessage;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use tui_prompts::State;

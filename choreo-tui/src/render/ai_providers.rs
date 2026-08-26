@@ -502,11 +502,7 @@ fn render_polkadot_import(frame: &mut Frame<'_>, app: &mut App) {
     // Note: the password field renders as typed (tui_prompts has no mask
     // support), but its true confidentiality is unaffected — the value never
     // leaves the TUI and is zeroized on close (see `PolkadotImportState`).
-    (&prompt).draw(
-        frame,
-        rows[1],
-        &mut app.ai_providers.polkadot_import.field(),
-    );
+    (&prompt).draw(frame, rows[1], app.ai_providers.polkadot_import.field());
 
     if let Some(ref err) = app.ai_providers.polkadot_import.error {
         frame.render_widget(

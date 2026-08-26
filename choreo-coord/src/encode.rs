@@ -133,8 +133,17 @@ pub enum AccountType {
 /// Fixed, protocol-level content-type vocabulary. The type is *encoded* by
 /// which mixins an item carries; this enum is the closure over the known
 /// marker/profile mixins. `Document` is the default (title + body + language).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize,
-         serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    schemars::JsonSchema,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentType {
     /// Title + body + language — the default item shape.
@@ -148,8 +157,9 @@ pub enum ContentType {
 
 /// A mipmap level of an image, as uploaded to IPFS (a pre-encoded CID per
 /// level).
-#[derive(Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize,
-         serde::Deserialize)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
+)]
 pub struct MipmapLevel {
     /// Size of the level's raw bytes.
     pub filesize: u64,
@@ -158,8 +168,9 @@ pub struct MipmapLevel {
 }
 
 /// Structured image reference carried in an item.
-#[derive(Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize,
-         serde::Deserialize)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
+)]
 pub struct ImageSpec {
     pub filename: String,
     pub filesize: u64,
@@ -171,8 +182,9 @@ pub struct ImageSpec {
 }
 
 /// Structured profile fields.
-#[derive(Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize,
-         serde::Deserialize)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
+)]
 pub struct ProfileSpec {
     /// Account type (0..=8, see [`AccountType`]).
     pub account_type: i32,
@@ -180,8 +192,9 @@ pub struct ProfileSpec {
 }
 
 /// Input to [`encode_item`]: everything a caller wants in a new item revision.
-#[derive(Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize,
-         serde::Deserialize)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
+)]
 pub struct ContentInput {
     pub content_type: ContentType,
     pub title: Option<String>,
@@ -193,8 +206,9 @@ pub struct ContentInput {
 }
 
 /// The decoded, field-extracted view of an item (what a read tool returns).
-#[derive(Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize,
-         serde::Deserialize)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
+)]
 pub struct DecodedItem {
     /// The type inferred from the present marker/profile mixins.
     pub content_type: ContentType,
@@ -207,7 +221,10 @@ pub struct DecodedItem {
 
 /// Encode a [`ContentInput`] into the protobuf `ItemMessage` bytes, tagging the
 /// right mixin set for the chosen [`ContentType`].
-pub fn encode_item(input: &ContentInput) -> Vec<u8> {
+///
+/// Returns an error when an embedded image's digest hex or mipmap CID is
+/// malformed (see [`encode_image_mixin`]); a well-formed item always succeeds.
+pub fn encode_item(input: &ContentInput) -> Result<Vec<u8>, crate::CoordError> {
     let language = input
         .language
         .clone()
@@ -234,7 +251,10 @@ pub fn encode_item(input: &ContentInput) -> Vec<u8> {
     if let Some(title) = &input.title {
         mixins.push(MixinPayloadMessage {
             mixin_id: TITLE_MIXIN_ID,
-            payload: TitleMixinMessage { title: title.clone() }.encode_to_vec(),
+            payload: TitleMixinMessage {
+                title: title.clone(),
+            }
+            .encode_to_vec(),
         });
     }
     if let Some(body) = &input.body {
@@ -249,7 +269,7 @@ pub fn encode_item(input: &ContentInput) -> Vec<u8> {
     if let Some(image) = &input.image {
         mixins.push(MixinPayloadMessage {
             mixin_id: IMAGE_MIXIN_ID,
-            payload: encode_image_mixin(image),
+            payload: encode_image_mixin(image)?,
         });
     }
     if let Some(profile) = &input.profile {
@@ -263,7 +283,10 @@ pub fn encode_item(input: &ContentInput) -> Vec<u8> {
         });
     }
 
-    ItemMessage { mixin_payload: mixins }.encode_to_vec()
+    Ok(ItemMessage {
+        mixin_payload: mixins,
+    }
+    .encode_to_vec())
 }
 
 /// Decode `ItemMessage` bytes into an extracted [`DecodedItem`]. Unknown mixins
@@ -273,8 +296,10 @@ pub fn decode_item(bytes: &[u8]) -> Result<DecodedItem, crate::CoordError> {
     let item = ItemMessage::decode(bytes)
         .map_err(|e| crate::CoordError::Content(format!("failed to decode item payload: {e}")))?;
 
-    let mut out = DecodedItem::default();
-    out.content_type = infer_content_type(&item);
+    let mut out = DecodedItem {
+        content_type: infer_content_type(&item),
+        ..Default::default()
+    };
 
     for mixin in &item.mixin_payload {
         match mixin.mixin_id {
@@ -284,8 +309,9 @@ pub fn decode_item(bytes: &[u8]) -> Result<DecodedItem, crate::CoordError> {
                     .map(|m| m.language_tag);
             }
             TITLE_MIXIN_ID => {
-                out.title =
-                    TitleMixinMessage::decode(mixin.payload.as_slice()).ok().map(|m| m.title);
+                out.title = TitleMixinMessage::decode(mixin.payload.as_slice())
+                    .ok()
+                    .map(|m| m.title);
             }
             BODY_TEXT_MIXIN_ID => {
                 out.body = BodyTextMixinMessage::decode(mixin.payload.as_slice())
@@ -340,23 +366,31 @@ fn marker(mixin_id: u32) -> MixinPayloadMessage {
 }
 
 /// Encode an [`ImageSpec`] into the `ImageMixinMessage` payload bytes.
-pub fn encode_image_mixin(image: &ImageSpec) -> Vec<u8> {
-    ImageMixinMessage {
+///
+/// Returns an error if the image digest hex or any mipmap CID is malformed,
+/// rather than silently encoding an empty `ipfs_hash`. A bad image reference
+/// must fail the whole publish so it can never land on-chain.
+pub fn encode_image_mixin(image: &ImageSpec) -> Result<Vec<u8>, crate::CoordError> {
+    let mipmap_levels = image
+        .mipmap_levels
+        .iter()
+        .map(|l| {
+            Ok(MipmapLevelMessage {
+                filesize: l.filesize,
+                ipfs_hash: cid_to_digest_bytes(&l.cid)?,
+            })
+        })
+        .collect::<Result<Vec<_>, crate::CoordError>>()?;
+
+    let message = ImageMixinMessage {
         filename: image.filename.clone(),
         filesize: image.filesize,
-        ipfs_hash: digest_hex_to_bytes(&image.digest_hex),
+        ipfs_hash: digest_hex_to_bytes(&image.digest_hex)?,
         width: image.width,
         height: image.height,
-        mipmap_level: image
-            .mipmap_levels
-            .iter()
-            .map(|l| MipmapLevelMessage {
-                filesize: l.filesize,
-                ipfs_hash: cid_to_digest_bytes(&l.cid),
-            })
-            .collect(),
-    }
-    .encode_to_vec()
+        mipmap_level: mipmap_levels,
+    };
+    Ok(message.encode_to_vec())
 }
 
 /// Decode an `ImageMixinMessage` payload into an [`ImageSpec`], converting each
@@ -425,13 +459,15 @@ pub fn hex_to_bytes(hex_value: &str) -> Result<[u8; 32], crate::CoordError> {
 }
 
 /// Convenience [`hex_to_bytes`] returning a `Vec<u8>` for the mixin message.
-fn hex_to_bytes_vec(hex_value: &str) -> Vec<u8> {
-    hex_to_bytes(hex_value).map(|b| b.to_vec()).unwrap_or_default()
+///
+/// Returns an error rather than silently producing empty bytes so a malformed
+/// digest fails loudly instead of encoding a wrong (empty) payload.
+fn hex_to_bytes_vec(hex_value: &str) -> Result<Vec<u8>, crate::CoordError> {
+    Ok(hex_to_bytes(hex_value)?.to_vec())
 }
 
-/// `0x`-prefixed digest hex -> raw digest bytes (empty on failure), for the
-/// protobuf mixin.
-fn digest_hex_to_bytes(hex_value: &str) -> Vec<u8> {
+/// `0x`-prefixed digest hex -> raw digest bytes, for the protobuf mixin.
+fn digest_hex_to_bytes(hex_value: &str) -> Result<Vec<u8>, crate::CoordError> {
     hex_to_bytes_vec(hex_value)
 }
 
@@ -468,11 +504,12 @@ pub fn bytes_to_cid(digest: &[u8]) -> String {
     bs58::encode(multihash).into_string()
 }
 
-/// IPFS CIDv0 -> raw 32-byte digest (empty on failure), for the protobuf mixin.
-fn cid_to_digest_bytes(cid: &str) -> Vec<u8> {
-    cid_to_digest_hex(cid)
-        .map(|h| hex_to_bytes_vec(&h))
-        .unwrap_or_default()
+/// IPFS CIDv0 -> raw 32-byte digest, for the protobuf mixin. Performs both the
+/// multihash-form validation (in [`cid_to_digest_hex`]) and the 32-byte length
+/// check (in [`hex_to_bytes`]), returning an error instead of an empty payload
+/// on any malformed input.
+fn cid_to_digest_bytes(cid: &str) -> Result<Vec<u8>, crate::CoordError> {
+    Ok(hex_to_bytes(&cid_to_digest_hex(cid)?)?.to_vec())
 }
 
 /// Abbreviate a long hex string to `first10...last8` for display.
@@ -494,10 +531,19 @@ mod tests {
         let nonce_a = [1u8; 32];
         let nonce_b = [2u8; 32];
 
-        assert_eq!(derive_item_id(account, nonce_a), derive_item_id(account, nonce_a));
-        assert_ne!(derive_item_id(account, nonce_a), derive_item_id(account, nonce_b));
+        assert_eq!(
+            derive_item_id(account, nonce_a),
+            derive_item_id(account, nonce_a)
+        );
+        assert_ne!(
+            derive_item_id(account, nonce_a),
+            derive_item_id(account, nonce_b)
+        );
         // Changing the account changes the id.
-        assert_ne!(derive_item_id(account, nonce_a), derive_item_id([8u8; 32], nonce_a));
+        assert_ne!(
+            derive_item_id(account, nonce_a),
+            derive_item_id([8u8; 32], nonce_a)
+        );
         // Non-zero.
         assert_ne!(derive_item_id(account, nonce_a), [0u8; 32]);
     }
@@ -520,7 +566,10 @@ mod tests {
         let cid = digest_hex_to_cid(&digest).unwrap();
         assert_eq!(cid_to_digest_hex(&cid).unwrap(), digest);
         // short_hex keeps the 0x prefix in its leading 10 chars ("0x" + 8 nibbles).
-        assert_eq!(short_hex(&digest), format!("0x{}...{}", "11111111", "11111111"));
+        assert_eq!(
+            short_hex(&digest),
+            format!("0x{}...{}", "11111111", "11111111")
+        );
     }
 
     #[test]
@@ -545,7 +594,7 @@ mod tests {
             image: None,
             profile: None,
         };
-        let bytes = encode_item(&input);
+        let bytes = encode_item(&input).unwrap();
         let decoded = decode_item(&bytes).unwrap();
 
         assert_eq!(decoded.content_type, ContentType::Document);
@@ -566,7 +615,7 @@ mod tests {
             image: None,
             profile: None,
         };
-        let item = ItemMessage::decode(encode_item(&input).as_slice()).unwrap();
+        let item = ItemMessage::decode(encode_item(&input).unwrap().as_slice()).unwrap();
         assert_eq!(infer_content_type(&item), ContentType::Feed);
         assert!(
             item.mixin_payload
@@ -592,7 +641,7 @@ mod tests {
             image: None,
             profile: None,
         };
-        let c_item = ItemMessage::decode(encode_item(&comment).as_slice()).unwrap();
+        let c_item = ItemMessage::decode(encode_item(&comment).unwrap().as_slice()).unwrap();
         assert_eq!(infer_content_type(&c_item), ContentType::Comment);
 
         let profile = ContentInput {
@@ -606,12 +655,15 @@ mod tests {
                 location: "Earth".into(),
             }),
         };
-        let p_item = ItemMessage::decode(encode_item(&profile).as_slice()).unwrap();
+        let p_item = ItemMessage::decode(encode_item(&profile).unwrap().as_slice()).unwrap();
         assert_eq!(infer_content_type(&p_item), ContentType::Profile);
-        let decoded = decode_item(&encode_item(&profile)).unwrap();
+        let decoded = decode_item(&encode_item(&profile).unwrap()).unwrap();
         assert_eq!(decoded.content_type, ContentType::Profile);
         assert_eq!(decoded.title.as_deref(), Some("Alice"));
-        assert_eq!(decoded.profile.as_ref().map(|p| p.location.as_str()), Some("Earth"));
+        assert_eq!(
+            decoded.profile.as_ref().map(|p| p.location.as_str()),
+            Some("Earth")
+        );
         assert_eq!(decoded.profile.as_ref().map(|p| p.account_type), Some(2));
     }
 
@@ -636,9 +688,9 @@ mod tests {
             }),
             profile: None,
         };
-        let item = ItemMessage::decode(encode_item(&input).as_slice()).unwrap();
+        let item = ItemMessage::decode(encode_item(&input).unwrap().as_slice()).unwrap();
         assert_eq!(infer_content_type(&item), ContentType::Image);
-        let decoded = decode_item(&encode_item(&input)).unwrap();
+        let decoded = decode_item(&encode_item(&input).unwrap()).unwrap();
         let image = decoded.image.expect("image should decode");
         assert_eq!(image.filename, "photo.jpg");
         assert_eq!(image.filesize, 12345);
@@ -648,7 +700,10 @@ mod tests {
         assert_eq!(image.digest_hex, digest);
         assert_eq!(image.mipmap_levels.len(), 1);
         assert_eq!(image.mipmap_levels[0].filesize, 100);
-        assert_eq!(image.mipmap_levels[0].cid, digest_hex_to_cid(&digest).unwrap());
+        assert_eq!(
+            image.mipmap_levels[0].cid,
+            digest_hex_to_cid(&digest).unwrap()
+        );
     }
 
     #[test]
@@ -670,5 +725,51 @@ mod tests {
         let decoded = decode_item(&item.encode_to_vec()).unwrap();
         assert_eq!(decoded.title.as_deref(), Some("kept"));
         assert_eq!(decoded.content_type, ContentType::Document);
+    }
+
+    #[test]
+    fn encode_item_rejects_malformed_image_digest() {
+        // A malformed image digest must fail the whole encode rather than
+        // silently producing a payload with an empty `ipfs_hash`.
+        let input = ContentInput {
+            content_type: ContentType::Image,
+            title: None,
+            body: None,
+            language: None,
+            image: Some(ImageSpec {
+                filename: "bad.jpg".into(),
+                filesize: 1,
+                digest_hex: "0xnothex".into(),
+                width: 0,
+                height: 0,
+                mipmap_levels: vec![],
+            }),
+            profile: None,
+        };
+        assert!(encode_item(&input).is_err());
+    }
+
+    #[test]
+    fn encode_item_rejects_malformed_mipmap_cid() {
+        // A malformed mipmap CID must fail the whole encode too.
+        let input = ContentInput {
+            content_type: ContentType::Image,
+            title: None,
+            body: None,
+            language: None,
+            image: Some(ImageSpec {
+                filename: "b.jpg".into(),
+                filesize: 1,
+                digest_hex: format!("0x{}", "22".repeat(32)),
+                width: 0,
+                height: 0,
+                mipmap_levels: vec![MipmapLevel {
+                    filesize: 1,
+                    cid: "not-a-cid".into(),
+                }],
+            }),
+            profile: None,
+        };
+        assert!(encode_item(&input).is_err());
     }
 }

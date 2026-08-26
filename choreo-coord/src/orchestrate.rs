@@ -14,10 +14,10 @@
 //!
 //! [tokio sidecar]: crate::runtime
 
+use crate::CoordError;
 use crate::chain::{self, ChainAccount};
 use crate::encode::{self, ContentInput, DecodedItem};
 use crate::indexer::{self, DecodedEvent, QueryKey};
-use crate::CoordError;
 use rand::Rng;
 
 // ── Read: shape of what the tools return ─────────────────────────────────────
@@ -99,7 +99,14 @@ pub struct Span {
 impl From<indexer::IndexStatusResult> for IndexerStatus {
     fn from(r: indexer::IndexStatusResult) -> Self {
         IndexerStatus {
-            spans: r.spans.into_iter().map(|s| Span { start: s.start, end: s.end }).collect(),
+            spans: r
+                .spans
+                .into_iter()
+                .map(|s| Span {
+                    start: s.start,
+                    end: s.end,
+                })
+                .collect(),
         }
     }
 }
@@ -162,14 +169,16 @@ fn resolve_revision(
         })
         .collect();
     // The indexer returns newer-first typically; sort descending by revision.
-    revisions.sort_by(|a, b| b.revision_id.cmp(&a.revision_id));
+    revisions.sort_by_key(|r| std::cmp::Reverse(r.revision_id));
 
     let entry = match revision_id {
         Some(target) => revisions
             .into_iter()
             .find(|r| r.revision_id == target)
             .ok_or_else(|| {
-                CoordError::Content(format!("revision {target} not found for item {item_id_hex}"))
+                CoordError::Content(format!(
+                    "revision {target} not found for item {item_id_hex}"
+                ))
             })?,
         None => revisions.into_iter().next().ok_or_else(|| {
             CoordError::Content(format!("no indexed revision found for item {item_id_hex}"))
@@ -193,12 +202,16 @@ pub fn revisions(item_id_hex: &str) -> Result<Vec<RevisionEntry>, CoordError> {
             })
         })
         .collect();
-    list.sort_by(|a, b| b.revision_id.cmp(&a.revision_id));
+    list.sort_by_key(|r| std::cmp::Reverse(r.revision_id));
     Ok(list)
 }
 
 /// Query the indexer for events matching a key (low-level read primitive).
-pub fn events(key: &QueryKey, limit: u16, before: Option<(u32, u32)>) -> Result<Vec<DecodedEvent>, CoordError> {
+pub fn events(
+    key: &QueryKey,
+    limit: u16,
+    before: Option<(u32, u32)>,
+) -> Result<Vec<DecodedEvent>, CoordError> {
     indexer::get_events(key, limit, before)
 }
 
@@ -251,7 +264,11 @@ pub fn profile(account_addr: &str) -> Result<ProfileResult, CoordError> {
         item_id: Some(id_hex),
         name: resolved.content.title,
         bio: resolved.content.body,
-        location: resolved.content.profile.as_ref().map(|p| p.location.clone()),
+        location: resolved
+            .content
+            .profile
+            .as_ref()
+            .map(|p| p.location.clone()),
         account_type: resolved.content.profile.as_ref().map(|p| p.account_type),
     })
 }
@@ -305,7 +322,7 @@ pub fn publish_item(
             "invalid item flags: {flags:#x}"
         )));
     }
-    let bytes = encode::encode_item(content);
+    let bytes = encode::encode_item(content)?;
     let ipfs_hash = crate::ipfs::add(&bytes, "content.bin")?;
     let digest = encode::hex_to_bytes(&ipfs_hash)?;
 
@@ -319,14 +336,14 @@ pub fn publish_item(
 
     let outcome = chain::publish_item(account, nonce, parents, flags, links, mentions, digest)?;
     // The chain returns the created item id; verify it matches our derivation.
-    if let Some(got) = &outcome.item_id {
-        if got != &encode::bytes_to_hex(&item_id) {
-            tracing::warn!(
-                derived = %encode::bytes_to_hex(&item_id),
-                on_chain = %got,
-                "published item id differs from client derivation"
-            );
-        }
+    if let Some(got) = &outcome.item_id
+        && got != &encode::bytes_to_hex(&item_id)
+    {
+        tracing::warn!(
+            derived = %encode::bytes_to_hex(&item_id),
+            on_chain = %got,
+            "published item id differs from client derivation"
+        );
     }
     Ok(outcome)
 }
@@ -339,7 +356,7 @@ pub fn publish_revision(
     links: Vec<[u8; 32]>,
     mentions: Vec<[u8; 32]>,
 ) -> Result<chain::TxOutcome, CoordError> {
-    let bytes = encode::encode_item(content);
+    let bytes = encode::encode_item(content)?;
     let ipfs_hash = crate::ipfs::add(&bytes, "content.bin")?;
     let digest = encode::hex_to_bytes(&ipfs_hash)?;
     chain::publish_revision(account, item_id, links, mentions, digest)
@@ -376,7 +393,7 @@ pub fn set_profile(
     content: &ContentInput,
 ) -> Result<chain::TxOutcome, CoordError> {
     // Publish the profile item, then link it as the account's profile.
-    let bytes = encode::encode_item(content);
+    let bytes = encode::encode_item(content)?;
     let ipfs_hash = crate::ipfs::add(&bytes, "profile.bin")?;
     let digest = encode::hex_to_bytes(&ipfs_hash)?;
     let nonce: [u8; 32] = {
@@ -385,14 +402,23 @@ pub fn set_profile(
         n
     };
     let item_id = encode::derive_item_id(account.account_id, nonce);
-    let outcome = chain::publish_item(account, nonce, vec![], crate::config::DEFAULT_ITEM_FLAGS, vec![], vec![], digest)?;
-    let _ = chain::set_profile(account, item_id)?;
+    let outcome = chain::publish_item(
+        account,
+        nonce,
+        vec![],
+        crate::config::DEFAULT_ITEM_FLAGS,
+        vec![],
+        vec![],
+        digest,
+    )?;
+    chain::set_profile(account, item_id)?;
     Ok(outcome)
 }
 
 /// Lifecycle actions for [`lifecycle`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, schemars::JsonSchema, serde::Serialize,
-         serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleAction {
     Retract,
@@ -401,8 +427,9 @@ pub enum LifecycleAction {
 }
 
 /// Account pin/unpin actions for [`account_link`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, schemars::JsonSchema, serde::Serialize,
-         serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountLinkAction {
     Add,
@@ -425,7 +452,10 @@ mod tests {
 
     #[test]
     fn lifecycle_and_account_action_serde() {
-        assert_eq!(serde_json::to_value(LifecycleAction::Retract).unwrap(), "retract");
+        assert_eq!(
+            serde_json::to_value(LifecycleAction::Retract).unwrap(),
+            "retract"
+        );
         assert_eq!(serde_json::to_value(AccountLinkAction::Add).unwrap(), "add");
     }
 

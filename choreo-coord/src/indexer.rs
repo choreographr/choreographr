@@ -15,8 +15,10 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use tungstenite::client::IntoClientRequest;
+use std::time::Duration;
 use tungstenite::Message;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::stream::MaybeTlsStream;
 
 use crate::CoordError;
 use crate::config::INDEXER_WS_URL;
@@ -43,18 +45,23 @@ impl QueryKey {
     fn to_custom_key(&self) -> Value {
         match self {
             QueryKey::ItemId(b) => custom_key("item_id", "bytes32", Value::from(bytes_to_hex(b))),
-            QueryKey::AccountId(b) => custom_key("account_id", "bytes32", Value::from(bytes_to_hex(b))),
-            QueryKey::IpfsHash(b) => custom_key("ipfs_hash", "bytes32", Value::from(bytes_to_hex(b))),
-            QueryKey::ItemRevision { item_id, revision_id } => {
-                custom_key(
-                    "item_id_revision_id",
-                    "composite",
-                    Value::Array(vec![
-                        custom_scalar("bytes32", Value::from(bytes_to_hex(item_id))),
-                        custom_scalar("u32", Value::from(*revision_id)),
-                    ]),
-                )
+            QueryKey::AccountId(b) => {
+                custom_key("account_id", "bytes32", Value::from(bytes_to_hex(b)))
             }
+            QueryKey::IpfsHash(b) => {
+                custom_key("ipfs_hash", "bytes32", Value::from(bytes_to_hex(b)))
+            }
+            QueryKey::ItemRevision {
+                item_id,
+                revision_id,
+            } => custom_key(
+                "item_id_revision_id",
+                "composite",
+                Value::Array(vec![
+                    custom_scalar("bytes32", Value::from(bytes_to_hex(item_id))),
+                    custom_scalar("u32", Value::from(*revision_id)),
+                ]),
+            ),
             QueryKey::Raw { name, value } => {
                 // A raw key carries an already-shaped CustomValue object.
                 let kind = value["kind"].clone();
@@ -158,20 +165,28 @@ impl Connection {
             .map_err(|e| CoordError::Indexer(format!("invalid indexer url: {e}")))?;
         let (ws, _resp) = tungstenite::connect(request)
             .map_err(|e| CoordError::Indexer(format!("failed to connect to indexer: {e}")))?;
+        // Bound socket reads/writes so a hung indexer cannot block a daemon tool
+        // thread indefinitely. The indexer is reached over plain `ws://`, so
+        // the underlying stream is always a plain TcpStream (not TLS).
+        if let MaybeTlsStream::Plain(tcp) = ws.get_ref() {
+            let _ = tcp.set_read_timeout(Some(Duration::from_secs(15)));
+            let _ = tcp.set_write_timeout(Some(Duration::from_secs(10)));
+        }
         Ok(Self { ws, next_id: 1 })
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, CoordError> {
         let id = self.next_id;
         self.next_id += 1;
-        let req = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let req =
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.ws
-            .write_message(Message::Text(req.to_string().into()))
+            .send(Message::Text(req.to_string().into()))
             .map_err(|e| CoordError::Indexer(format!("write failed: {e}")))?;
         loop {
             let msg = self
                 .ws
-                .read_message()
+                .read()
                 .map_err(|e| CoordError::Indexer(format!("read failed: {e}")))?;
             match msg {
                 Message::Text(text) => {
@@ -189,7 +204,7 @@ impl Connection {
                     }
                 }
                 Message::Ping(data) => {
-                    let _ = self.ws.write_message(Message::Pong(data));
+                    let _ = self.ws.send(Message::Pong(data));
                 }
                 Message::Close(_) => {
                     return Err(CoordError::Indexer("indexer closed connection".into()));
@@ -205,7 +220,11 @@ impl Connection {
 }
 
 /// Query the indexer for events matching `key`, newest-first, up to `limit`.
-pub fn get_events(key: &QueryKey, limit: u16, before: Option<(u32, u32)>) -> Result<Vec<DecodedEvent>, CoordError> {
+pub fn get_events(
+    key: &QueryKey,
+    limit: u16,
+    before: Option<(u32, u32)>,
+) -> Result<Vec<DecodedEvent>, CoordError> {
     let mut conn = Connection::open()?;
     let key_json = key.to_custom_key();
     let params = serde_json::json!({

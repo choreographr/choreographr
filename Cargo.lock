@@ -2478,6 +2478,7 @@ dependencies = [
  "tracing",
  "tungstenite 0.30.0",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]

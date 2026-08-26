@@ -35,8 +35,7 @@ fn test_account() -> ChainAccount {
         std::env::var("CHOREOGRAPHR_SUBSTRATE_JSON"),
         std::env::var("CHOREOGRAPHR_SUBSTRATE_PASSWORD"),
     ) {
-        let cred =
-            choreo_keystore::substrate::import_from_json(&json, "test", &password).unwrap();
+        let cred = choreo_keystore::substrate::import_from_json(&json, "test", &password).unwrap();
         let view = cred.as_substrate().unwrap();
         let account_id = account_id_from_address(view.account_id).unwrap();
         return ChainAccount::from_parts(account_id, view.secret.to_vec());
@@ -72,10 +71,11 @@ fn publish_and_read_item_round_trip() {
     };
 
     // 1. Encode + pin to IPFS, derive the item id, submit.
-    let outcome =
-        orchestrate::publish_item(&account, &content, vec![], vec![], vec![], None, None)
-            .expect("publish_item should succeed");
-    let item_id_hex = outcome.item_id.expect("a PublishItem event must report the item id");
+    let outcome = orchestrate::publish_item(&account, &content, vec![], vec![], vec![], None, None)
+        .expect("publish_item should succeed");
+    let item_id_hex = outcome
+        .item_id
+        .expect("a PublishItem event must report the item id");
 
     // 2. Read it back through the indexer + IPFS, and decode the content.
     let resolved =
@@ -98,8 +98,7 @@ fn publish_and_read_item_round_trip() {
     let id = choreo_coord::encode::hex_to_bytes(&item_id_hex).unwrap();
     orchestrate::publish_revision(&account, id, &revised, vec![], vec![])
         .expect("publish_revision should succeed");
-    let after =
-        orchestrate::item(&item_id_hex, None).expect("revised item should be resolvable");
+    let after = orchestrate::item(&item_id_hex, None).expect("revised item should be resolvable");
     assert_eq!(after.content.title.as_deref(), Some("Integration Doc v2"));
 }
 

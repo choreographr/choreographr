@@ -25,8 +25,7 @@ pub const IPFS_API_URL: &str = "http://127.0.0.1:5001";
 
 /// Chain genesis hash (hex, `0x`-prefixed) from `acuity-index/acuity.toml`.
 /// Used to sanity-check that the connected node is the Coordination Platform.
-pub const GENESIS_HASH: &str =
-    "0xd6be38e4049024b2a41d76e8d6dc3fa38173d85c74c4c2d3966669c082199219";
+pub const GENESIS_HASH: &str = "0xd6be38e4049024b2a41d76e8d6dc3fa38173d85c74c4c2d3966669c082199219";
 
 /// Item-id derivation namespace (`choreo-runtime`'s `ItemIdNamespace`), pinned
 /// to `1000`. Item IDs are computed as

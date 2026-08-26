@@ -64,12 +64,6 @@ impl CoordError {
     }
 }
 
-/// Map a `subxt::Error` (and its interop/transport variants) into a
-/// [`CoordError::Substrate`] string, so `?` works on the subxt client calls.
-pub(crate) fn subxt_err<E: std::fmt::Display>(e: E) -> CoordError {
-    CoordError::Substrate(e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,8 +74,16 @@ mod tests {
             CoordError::RuntimeNotInitialized.to_string(),
             "coordinator runtime is not initialized"
         );
-        assert!(CoordError::Substrate("boom".into()).to_string().contains("boom"));
-        assert!(CoordError::Account("missing".into()).to_string().contains("missing"));
+        assert!(
+            CoordError::Substrate("boom".into())
+                .to_string()
+                .contains("boom")
+        );
+        assert!(
+            CoordError::Account("missing".into())
+                .to_string()
+                .contains("missing")
+        );
     }
 
     #[test]

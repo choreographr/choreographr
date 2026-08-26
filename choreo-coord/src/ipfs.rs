@@ -11,16 +11,25 @@
 
 use serde::Deserialize;
 use std::io::Read;
+use std::time::Duration;
 
 use crate::CoordError;
 use crate::config::IPFS_API_URL;
 use crate::encode::{cid_to_digest_hex, digest_hex_to_cid, hex_to_bytes};
 
-/// The `Name`/`Hash` pair returned by one multipart `api/v0/add` line.
+/// A `ureq` agent configured with bounded connect + overall timeouts so a
+/// hung IPFS daemon cannot block a daemon tool thread indefinitely.
+fn agent() -> ureq::Agent {
+    ureq::config::Config::builder()
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .new_agent()
+}
+
+/// The `Hash` pair returned by one multipart `api/v0/add` line.
 #[derive(Deserialize)]
 struct IpfsAddEntry {
-    #[serde(rename = "Name")]
-    name: String,
     #[serde(rename = "Hash")]
     hash: String,
 }
@@ -40,7 +49,8 @@ pub fn add(bytes: &[u8], filename: &str) -> Result<String, CoordError> {
     use ureq::unversioned::multipart::{Form, Part};
 
     let form = Form::new().part("file", Part::bytes(bytes).file_name(filename));
-    let response = ureq::post(&format!("{IPFS_API_URL}/api/v0/add"))
+    let response = agent()
+        .post(&format!("{IPFS_API_URL}/api/v0/add"))
         .query("pin", "true")
         .query("quieter", "true")
         .send(form)
@@ -53,8 +63,7 @@ pub fn add(bytes: &[u8], filename: &str) -> Result<String, CoordError> {
     // IPFS emits one JSON line per chunk; the root CID is the last non-empty.
     let last_line = text
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .next_back()
+        .rfind(|l| !l.trim().is_empty())
         .ok_or_else(|| CoordError::Ipfs("add returned an empty response".into()))?;
     let entry: IpfsAddEntry = serde_json::from_str(last_line)
         .map_err(|e| CoordError::Ipfs(format!("failed to decode add response: {e}")))?;
@@ -70,7 +79,8 @@ pub fn cat(digest_hex: &str) -> Result<Vec<u8>, CoordError> {
 
 /// Fetch the bytes stored at a raw IPFS CID (Base58).
 pub fn cat_by_cid(cid: &str) -> Result<Vec<u8>, CoordError> {
-    let response = ureq::post(&format!("{IPFS_API_URL}/api/v0/cat"))
+    let response = agent()
+        .post(&format!("{IPFS_API_URL}/api/v0/cat"))
         .query("arg", cid)
         .send_empty()
         .map_err(|e| CoordError::Ipfs(format!("failed to read {cid}: {e}")))?;
@@ -85,7 +95,8 @@ pub fn cat_by_cid(cid: &str) -> Result<Vec<u8>, CoordError> {
 
 /// Return the local daemon's peer identity (for `coord_status`).
 pub fn id() -> Result<IpfsPeerInfo, CoordError> {
-    let response = ureq::post(&format!("{IPFS_API_URL}/api/v0/id"))
+    let response = agent()
+        .post(&format!("{IPFS_API_URL}/api/v0/id"))
         .send_empty()
         .map_err(|e| CoordError::Ipfs(format!("ipfs /id failed: {e}")))?;
     let bytes = response
@@ -111,7 +122,10 @@ mod tests {
     /// the crate-level `#[ignore]` suite). Compile-only sanity here.
     #[test]
     fn digest_bytes_validates() {
-        assert_eq!(digest_bytes(&format!("0x{}", "ab".repeat(32))).unwrap(), [0xab; 32]);
+        assert_eq!(
+            digest_bytes(&format!("0x{}", "ab".repeat(32))).unwrap(),
+            [0xab; 32]
+        );
         assert!(digest_bytes("0x1234").is_err());
     }
 }

@@ -16,14 +16,15 @@
 
 use sp_core::crypto::Ss58Codec;
 use sp_core::sr25519::Public;
+use subxt::OnlineClient;
 use subxt::PolkadotConfig;
 use subxt::config::Config;
 use subxt::utils::{AccountId32, MultiAddress, MultiSignature};
-use subxt::OnlineClient;
 
 use crate::CoordError;
 use crate::acuity_runtime::api;
 use crate::config::CHAIN_WS_URL;
+use zeroize::Zeroizing;
 
 /// A signing keypair rebuilt from a stored expanded ed25519 secret.
 struct ChoreoSigner(schnorrkel::Keypair);
@@ -77,8 +78,13 @@ pub struct ChainAccount {
     pub address: String,
     /// Raw 32-byte account id.
     pub account_id: [u8; 32],
-    /// Expanded ed25519 secret (64 bytes).
-    secret: Vec<u8>,
+    /// Expanded ed25519 secret (64 bytes), zeroized on drop.
+    ///
+    /// The secret is cloned out of the `#[zeroize(drop)]` `ServiceCredential`
+    /// into this per-call account, so it is held here in a `Zeroizing` buffer
+    /// to ensure the private key is wiped from memory when the account is
+    /// dropped (not left to the allocator).
+    secret: Zeroizing<Vec<u8>>,
 }
 
 impl ChainAccount {
@@ -87,7 +93,7 @@ impl ChainAccount {
         Self {
             address: account_address(account_id),
             account_id,
-            secret,
+            secret: Zeroizing::new(secret),
         }
     }
     /// Build a chain account from an SS58 address + 64-byte expanded secret
@@ -103,7 +109,7 @@ impl ChainAccount {
         Ok(Self {
             address: address.to_string(),
             account_id,
-            secret,
+            secret: Zeroizing::new(secret),
         })
     }
     fn signer(&self) -> Result<ChoreoSigner, CoordError> {
@@ -112,10 +118,41 @@ impl ChainAccount {
 }
 
 /// Connect to the node (async; run on the sidecar).
+///
+/// Verifies the connected node is the Coordination Platform by comparing its
+/// reported genesis hash to the pinned [`crate::config::GENESIS_HASH`], so a
+/// different chain at the same endpoint is rejected before any call is issued.
 async fn connect() -> Result<OnlineClient<PolkadotConfig>, CoordError> {
-    OnlineClient::<PolkadotConfig>::from_insecure_url(CHAIN_WS_URL)
+    let client = OnlineClient::<PolkadotConfig>::from_insecure_url(CHAIN_WS_URL)
         .await
-        .map_err(|e| CoordError::Substrate(format!("failed to connect to {CHAIN_WS_URL}: {e}")))
+        .map_err(|e| CoordError::Substrate(format!("failed to connect to {CHAIN_WS_URL}: {e}")))?;
+
+    let actual = crate::encode::bytes_to_hex(client.genesis_hash().as_ref());
+    if actual != crate::config::GENESIS_HASH {
+        return Err(CoordError::Substrate(format!(
+            "node genesis {actual} does not match expected {}",
+            crate::config::GENESIS_HASH
+        )));
+    }
+    Ok(client)
+}
+
+/// Per-chain-operation wall-clock budget. A hung node (or an RPC that never
+/// answers) must not block a daemon tool thread indefinitely, so every subxt
+/// future runs inside this timeout on the sidecar.
+const CHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run a chain async operation, bounding it with [`CHAIN_TIMEOUT`]. The future
+/// must resolve to a `CoordError`-bearing `Result` so a timeout maps to a
+/// [`CoordError::Substrate`] that flows through the caller's `?`.
+async fn with_chain_timeout<T, F>(fut: F) -> Result<T, CoordError>
+where
+    F: std::future::Future<Output = Result<T, CoordError>>,
+{
+    match tokio::time::timeout(CHAIN_TIMEOUT, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(CoordError::Substrate("chain RPC timed out".into())),
+    }
 }
 
 /// A finalized transaction result (what write tools report).
@@ -125,12 +162,13 @@ pub struct TxOutcome {
     pub item_id: Option<String>,
 }
 
-/// Submit a signed extrinsics and wait for finalized success, then scan for a
-/// `Content::PublishItem` event to capture the created item id.
-async fn submit_publish<Call>(
+/// Submit a call, wait for finalized success, and return the finalized events.
+/// Shared by every write extrinsic; the publish wrappers additionally parse the
+/// created item id from those events (see [`submit_publish`]).
+async fn submit_and_wait<Call>(
     call: &Call,
     account: &ChainAccount,
-) -> Result<TxOutcome, CoordError>
+) -> Result<subxt::extrinsics::ExtrinsicEvents<PolkadotConfig>, CoordError>
 where
     Call: subxt::tx::Payload,
 {
@@ -140,16 +178,21 @@ where
         .await
         .map_err(|e| CoordError::Substrate(format!("failed to get block for tx: {e}")))?;
     let signer = account.signer()?;
-    let tx_events = at
-        .tx()
+    at.tx()
         .sign_and_submit_then_watch_default(call, &signer)
         .await
         .map_err(|e| CoordError::Transaction(format!("submit failed: {e}")))?
         .wait_for_finalized_success()
         .await
-        .map_err(|e| CoordError::Transaction(format!("finalized failed: {e}")))?;
+        .map_err(|e| CoordError::Transaction(format!("finalized failed: {e}")))
+}
 
-    // Extract the item id from a Content::PublishItem event (if any).
+/// Submit a publish call and capture the `Content::PublishItem` item id.
+async fn submit_publish<Call>(call: &Call, account: &ChainAccount) -> Result<TxOutcome, CoordError>
+where
+    Call: subxt::tx::Payload,
+{
+    let tx_events = submit_and_wait(call, account).await?;
     let item_id = tx_events
         .find_first::<api::content::events::PublishItem>()
         .transpose()
@@ -162,7 +205,7 @@ where
 
 /// Read an item's on-chain control state (owner, revision, flags).
 pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, CoordError> {
-    crate::runtime::block_on(async move {
+    crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
         let at = client
             .at_current_block()
@@ -171,7 +214,10 @@ pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, CoordError> {
         let addr = api::storage().content().item_state();
         let thunk = at
             .storage()
-            .try_fetch(addr, (api::runtime_types::pallet_content::pallet::ItemId(item_id),))
+            .try_fetch(
+                addr,
+                (api::runtime_types::pallet_content::pallet::ItemId(item_id),),
+            )
             .await
             .map_err(|e| CoordError::Substrate(format!("item state query failed: {e}")))?;
         match thunk {
@@ -187,12 +233,12 @@ pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, CoordError> {
             }
             None => Err(CoordError::Content("item not found on-chain".into())),
         }
-    })?
+    }))?
 }
 
 /// Read the list of item ids an account has pinned in `pallet-account-content`.
 pub fn account_item_ids(account: [u8; 32]) -> Result<Vec<[u8; 32]>, CoordError> {
-    crate::runtime::block_on(async move {
+    crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
         let at = client
             .at_current_block()
@@ -213,12 +259,12 @@ pub fn account_item_ids(account: [u8; 32]) -> Result<Vec<[u8; 32]>, CoordError> 
             }
             None => Ok(Vec::new()),
         }
-    })?
+    }))?
 }
 
 /// Read the profile item id an account has set (`pallet-account-profile`).
 pub fn profile_item(account: [u8; 32]) -> Result<Option<[u8; 32]>, CoordError> {
-    crate::runtime::block_on(async move {
+    crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
         let at = client
             .at_current_block()
@@ -239,7 +285,7 @@ pub fn profile_item(account: [u8; 32]) -> Result<Option<[u8; 32]>, CoordError> {
             }
             None => Ok(None),
         }
-    })?
+    }))?
 }
 
 /// On-chain control state of an item.
@@ -288,7 +334,7 @@ pub fn publish_item(
         account_bounded(&mentions),
         api::runtime_types::pallet_content::pallet::IpfsHash(ipfs_hash),
     );
-    crate::runtime::block_on(submit_publish(&call, account))?
+    crate::runtime::block_on(with_chain_timeout(submit_publish(&call, account)))?
 }
 
 /// Publish a new revision of an existing item.
@@ -305,7 +351,7 @@ pub fn publish_revision(
         account_bounded(&mentions),
         api::runtime_types::pallet_content::pallet::IpfsHash(ipfs_hash),
     );
-    crate::runtime::block_on(submit_publish(&call, account))?
+    crate::runtime::block_on(with_chain_timeout(submit_publish(&call, account)))?
 }
 
 /// Retract an item.
@@ -313,7 +359,7 @@ pub fn retract_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), Coo
     let call = api::tx()
         .content()
         .retract_item(api::runtime_types::pallet_content::pallet::ItemId(item_id));
-    let _ = crate::runtime::block_on(submit_publish(&call, account))?;
+    let _ = crate::runtime::block_on(with_chain_timeout(submit_and_wait(&call, account)))?;
     Ok(())
 }
 
@@ -322,7 +368,7 @@ pub fn set_not_revisionable(account: &ChainAccount, item_id: [u8; 32]) -> Result
     let call = api::tx()
         .content()
         .set_not_revisionable(api::runtime_types::pallet_content::pallet::ItemId(item_id));
-    let _ = crate::runtime::block_on(submit_publish(&call, account))?;
+    let _ = crate::runtime::block_on(with_chain_timeout(submit_and_wait(&call, account)))?;
     Ok(())
 }
 
@@ -331,7 +377,7 @@ pub fn set_not_retractable(account: &ChainAccount, item_id: [u8; 32]) -> Result<
     let call = api::tx()
         .content()
         .set_not_retractable(api::runtime_types::pallet_content::pallet::ItemId(item_id));
-    let _ = crate::runtime::block_on(submit_publish(&call, account))?;
+    let _ = crate::runtime::block_on(with_chain_timeout(submit_and_wait(&call, account)))?;
     Ok(())
 }
 
@@ -340,7 +386,7 @@ pub fn add_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(),
     let call = api::tx()
         .account_content()
         .add_item(api::runtime_types::pallet_content::pallet::ItemId(item_id));
-    let _ = crate::runtime::block_on(submit_publish(&call, account))?;
+    let _ = crate::runtime::block_on(with_chain_timeout(submit_and_wait(&call, account)))?;
     Ok(())
 }
 
@@ -358,7 +404,7 @@ pub fn set_profile(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), Coor
     let call = api::tx()
         .account_profile()
         .set_profile(api::runtime_types::pallet_content::pallet::ItemId(item_id));
-    let _ = crate::runtime::block_on(submit_publish(&call, account))?;
+    let _ = crate::runtime::block_on(with_chain_timeout(submit_and_wait(&call, account)))?;
     Ok(())
 }
 
