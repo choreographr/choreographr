@@ -14,4 +14,8 @@ pub enum KeystoreError {
     ConfigDirNotFound,
     #[error("encrypted data too short")]
     TooShort,
+    #[error("unsupported Polkadot-JS keystore encoding")]
+    UnsupportedKeystoreFormat,
+    #[error("malformed or corrupt keystore data")]
+    InvalidKeystoreData,
 }

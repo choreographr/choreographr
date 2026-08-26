@@ -12,6 +12,16 @@ rust-version.workspace = true
 [dependencies]
 aes-gcm = "0.11"
 argon2 = "0.5"
+# Polkadot account store (Polkadot-JS keystore import + ss58 addressing).
+# scrypt, crypto_secretbox, and schnorrkel implement the Polkadot-JS
+# keyring encryption format; sp-core provides the SS58 codec for deriving
+# the display address from a raw public key.
+scrypt = "0.12"
+crypto_secretbox = { version = "0.1.1", features = ["alloc", "salsa20"] }
+schnorrkel = "0.11"
+sp-core = { version = "43.0.0", features = ["std", "serde"] }
+base64.workspace = true
+serde_json.workspace = true
 dirs.workspace = true
 rand.workspace = true
 rand_core.workspace = true
@@ -23,5 +33,4 @@ hkdf.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true

@@ -3,8 +3,10 @@ use std::fmt;
 pub mod crypto;
 pub mod error;
 pub mod paths;
+pub mod substrate;
 
 pub use error::KeystoreError;
+pub use substrate::SubstrateCredentialView;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -112,6 +114,17 @@ pub enum ServiceCredential {
         access_token_secret: String,
         bearer_token: Option<String>,
     },
+    #[serde(rename = "substrate")]
+    Substrate {
+        /// Account name (matches the daemon's credential key, e.g. "main").
+        name: String,
+        /// SS58 address.
+        account_id: String,
+        /// Expanded ed25519 secret key (64 bytes) from a Polkadot-JS keystore export.
+        secret: Vec<u8>,
+        /// Raw 32-byte public key (=== account id bytes).
+        public: Vec<u8>,
+    },
 }
 
 /// Redacting display to prevent secret leakage in logs.
@@ -128,6 +141,9 @@ impl fmt::Display for ServiceCredential {
                      access_token: ***, access_token_secret: ***, \
                      bearer_token: *** }}"
                 )
+            }
+            ServiceCredential::Substrate { .. } => {
+                write!(f, "Substrate {{ name: ***, account_id: ***, seed: *** }}")
             }
         }
     }
@@ -159,6 +175,25 @@ impl ServiceCredential {
                 access_token,
                 access_token_secret,
                 bearer_token: bearer_token.as_deref(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Returns a view of the Substrate credential fields if this is the
+    /// Substrate variant.
+    pub fn as_substrate(&self) -> Option<SubstrateCredentialView<'_>> {
+        match self {
+            ServiceCredential::Substrate {
+                name,
+                account_id,
+                secret,
+                public,
+            } => Some(SubstrateCredentialView {
+                name,
+                account_id,
+                secret,
+                public,
             }),
             _ => None,
         }
@@ -343,5 +378,88 @@ mod tests {
         let secret_arr: [u8; 32] = secret.try_into().expect("32-byte secret");
         let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret_arr));
         assert_eq!(derived.as_bytes().as_slice(), public.as_slice());
+    }
+
+    #[test]
+    fn service_credential_substrate_as_substrate_returns_view() {
+        let cred = ServiceCredential::Substrate {
+            name: "main".into(),
+            account_id: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into(),
+            secret: vec![0x11; 64],
+            public: vec![0x22; 32],
+        };
+        let view = cred.as_substrate().expect("expected Substrate view");
+        assert_eq!(view.name, "main");
+        assert_eq!(
+            view.account_id,
+            "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+        );
+        assert_eq!(view.secret.len(), 64);
+        assert_eq!(view.public.len(), 32);
+    }
+
+    #[test]
+    fn service_credential_substrate_as_substrate_none_for_other_variant() {
+        let cred = ServiceCredential::ApiKey {
+            key: "sk-test".into(),
+        };
+        assert!(cred.as_substrate().is_none());
+    }
+
+    #[test]
+    fn service_credential_substrate_display_redacts_secrets() {
+        let cred = ServiceCredential::Substrate {
+            name: "main".into(),
+            account_id: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into(),
+            secret: vec![0x11; 64],
+            public: vec![0x22; 32],
+        };
+        let display = format!("{cred}");
+        assert_eq!(
+            display,
+            "Substrate { name: ***, account_id: ***, seed: *** }"
+        );
+        assert!(!display.contains("main"));
+        assert!(!display.contains("5Grwva"));
+        assert_eq!(display.matches("***").count(), 3);
+    }
+
+    #[test]
+    fn service_credential_substrate_zeroize_clears_fields() {
+        let mut cred = ServiceCredential::Substrate {
+            name: "main".into(),
+            account_id: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into(),
+            secret: vec![0x11; 64],
+            public: vec![0x22; 32],
+        };
+        cred.zeroize();
+        match &cred {
+            ServiceCredential::Substrate {
+                name,
+                account_id,
+                secret,
+                public,
+            } => {
+                assert!(name.as_bytes().iter().all(|&b| b == 0));
+                assert!(account_id.as_bytes().iter().all(|&b| b == 0));
+                assert!(secret.iter().all(|&b| b == 0));
+                assert!(public.iter().all(|&b| b == 0));
+            }
+            _ => panic!("expected Substrate variant"),
+        }
+    }
+
+    #[test]
+    fn service_credential_substrate_serialization_round_trip() {
+        let cred = ServiceCredential::Substrate {
+            name: "main".into(),
+            account_id: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into(),
+            secret: vec![0x11; 64],
+            public: vec![0x22; 32],
+        };
+        let json = serde_json::to_string(&cred).unwrap();
+        let restored: ServiceCredential = serde_json::from_str(&json).unwrap();
+        assert!(matches!(restored, ServiceCredential::Substrate { .. }));
+        assert!(json.contains("\"substrate\""));
     }
 }
