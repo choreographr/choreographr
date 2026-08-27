@@ -654,6 +654,7 @@ each requester's status reflects its own `--force` flag).
 | `model_max_tokens_fields` | Per-model token field overrides |
 | `responses_max_output_tokens` | Default max output tokens for Responses API |
 | `model_responses_max_output_tokens` | Per-model max output tokens for Responses API |
+| — *(all token limits above)* | Clamped down to the catalog's per-model `max_output_tokens` fact (`lookup_max_output_tokens`) when the lookup resolves and the request exceeds it; a lower request is never raised, and unknown models / `0` = unknown pass through untouched |
 | `programmatic_tool_calling` | Enable programmatic tool calling (Responses API, gpt-5.6+) |
 | `context_window` | Default context window for all models (overrides catalog defaults) |
 | `model_context_windows` | Per-model context window overrides (e.g. `{"gpt-4.1-nano": 1048576}`) |

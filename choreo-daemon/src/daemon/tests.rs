@@ -2299,11 +2299,8 @@ fn tiny_base() -> Vec<choreo_ai_protocols::ProviderEntry> {
             model: "tiny-1".into(),
             context_window: 4096,
             reasoning_supported: true,
-            openai_reasoning_levels: vec![],
-            openai_responses: false,
-            reasoning_passback: None,
-            reasoning_content_required: None,
-            supports_vision: false,
+            max_output_tokens: 2048,
+            ..Default::default()
         }],
     }]
 }

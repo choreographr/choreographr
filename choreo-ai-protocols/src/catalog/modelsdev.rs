@@ -69,6 +69,24 @@ struct RawModel {
     /// (`0` = unknown, as today). Absent → 0.
     #[serde(default)]
     limit: Option<ModelLimit>,
+    /// How the model interleaves reasoning with tool calls. The snapshot
+    /// encodes it three ways (see [`RawInterleaved`]): an object carrying the
+    /// echo field name, a plain-string shorthand for the field name, or a
+    /// bare `true` meaning "interleaved thinking supported" with NO field
+    /// fact. Normalized to the field name, if any.
+    #[serde(default)]
+    interleaved: Option<RawInterleaved>,
+    /// Whether the model accepts the `temperature` request parameter.
+    /// Reasoning-first models (o-series, GPT-5.x, several Kimi/GLM lanes)
+    /// reject it. Absent → `true` (models.dev only encodes the fact when the
+    /// answer is interesting; the wire default stays permissive).
+    #[serde(default)]
+    temperature: Option<bool>,
+    /// Lifecycle status straight from the snapshot (e.g.
+    /// `"deprecated"`). Only the deprecated value is lifted into the
+    /// catalog today; everything else is treated as "no fact".
+    #[serde(default)]
+    status: Option<String>,
     /// Input/output modalities (`{"input": ["text", "image"], "output": ["text"]}`).
     /// A model is vision-capable when `"image"` appears in `modalities.input`;
     /// absent → treated as text-only. This is the source of truth for
@@ -98,6 +116,41 @@ struct ReasoningOption {
 struct ModelLimit {
     #[serde(default)]
     context: u32,
+    /// Maximum output tokens the model can produce (`0` = unknown — the
+    /// fact is simply not recorded; lookups treat 0 like context's 0).
+    #[serde(default)]
+    output: u32,
+}
+
+/// The snapshot's `interleaved` value in any of its encodings. Serde tries
+/// each untagged variant in order; `true` matches only the bool variant, so
+/// a bare `true` can never be mistaken for a field name. The bool form
+/// ("supports interleaved thinking") carries no field name and is the
+/// models.dev schema's documented shape (`true | { field: ... }`); the plain
+/// string shorthand is accepted for forward compatibility the same way
+/// opencode's provider deserializer accepts it (a string IS the field name).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawInterleaved {
+    /// `{ "field": "reasoning_content" }` — the echo field the model demands.
+    Field { field: String },
+    /// A plain string IS the field name (shorthand).
+    Shorthand(String),
+    /// `true` — interleaved thinking supported, but no echo-field fact. The
+    /// payload is intentionally ignored (a capability flag, not a fact).
+    Just(#[allow(dead_code)] bool),
+}
+
+impl RawInterleaved {
+    /// The echo field name the snapshot records, if this encoding carries
+    /// one (`true` does not — it is a capability flag, not a fact about
+    /// which request field the upstream demands).
+    fn field(&self) -> Option<&str> {
+        match self {
+            RawInterleaved::Field { field } | RawInterleaved::Shorthand(field) => Some(field),
+            RawInterleaved::Just(_) => None,
+        }
+    }
 }
 
 /// Normalize a models.dev snapshot document into the base provider catalog.
@@ -144,9 +197,27 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
             // carries no passback policy; per-model exceptions come from the
             // overlay.
             reasoning_passback: None,
-            // DeepSeek/Kimi reasoning_content-echo is likewise derived from
-            // the model name/family at lookup time, not baked into the base.
-            reasoning_content_required: None,
+            // Reasoning_content echo: a FACT from the snapshot now — the model
+            // demands `reasoning_content` on every assistant message exactly
+            // when its `interleaved` names that field (DeepSeek/GLM 5.x on
+            // their own endpoints). Any other encoding (string shorthand for
+            // another field, bare `true`, absent) is "no explicit fact" →
+            // `None`; the overlay overrides, and `None` resolves to false at
+            // lookup time (no name-based guessing anymore).
+            reasoning_content_required: if m.interleaved.as_ref().and_then(RawInterleaved::field)
+                == Some("reasoning_content")
+            {
+                Some(true)
+            } else {
+                None
+            },
+            // Output-token ceiling (`0` = unknown, mirroring context_window).
+            max_output_tokens: m.limit.as_ref().map_or(0, |l| l.output),
+            // Temperature acceptance: absent means models.dev records no
+            // constraint, so the permissive wire default stands.
+            supports_temperature: m.temperature.unwrap_or(true),
+            // Lifecycle status: only "deprecated" is lifted into the base.
+            deprecated: m.status.as_deref() == Some("deprecated"),
             // Vision: `"image"` in `modalities.input`. Absent modalities
             // (older snapshot entries) default to text-only.
             supports_vision: m
@@ -276,6 +347,34 @@ mod tests {
                     "limit": {"context": 8192, "output": 4096}
                 }
             }
+        },
+        "features": {
+            "name": "Features",
+            "npm": "@ai-sdk/openai-compatible",
+            "api": "https://features.example/v1",
+            "models": {
+                "echo-field": {
+                    "reasoning": true,
+                    "interleaved": {"field": "reasoning_content"},
+                    "limit": {"context": 100000, "output": 32000}
+                },
+                "shorthand-other-field": {
+                    "reasoning": true,
+                    "interleaved": "reasoning"
+                },
+                "bare-true": {
+                    "reasoning": true,
+                    "interleaved": true
+                },
+                "no-facts": {
+                    "reasoning": true
+                },
+                "frozen-no-temp": {
+                    "reasoning": true,
+                    "temperature": false,
+                    "status": "deprecated"
+                }
+            }
         }
     }"#;
 
@@ -285,7 +384,7 @@ mod tests {
         let slugs: Vec<&str> = catalog.iter().map(|e| e.slug.as_str()).collect();
         assert_eq!(
             slugs,
-            vec!["zai", "openai", "anthropic", "google", "chatty"]
+            vec!["zai", "openai", "anthropic", "google", "chatty", "features"]
         );
     }
 
@@ -364,5 +463,51 @@ mod tests {
     #[test]
     fn malformed_snapshot_yields_empty_catalog() {
         assert!(normalize_modelsdev("not json").is_empty());
+    }
+
+    #[test]
+    fn interleaved_field_reasoning_content_is_a_required_echo_fact() {
+        let catalog = normalize_modelsdev(SNAPSHOT);
+        let features = &catalog[5];
+        let m = &features.models[0];
+        assert_eq!(m.model, "echo-field");
+        assert_eq!(m.reasoning_content_required, Some(true));
+        // limit.output is lifted into max_output_tokens.
+        assert_eq!(m.max_output_tokens, 32_000);
+    }
+
+    #[test]
+    fn interleaved_without_the_reasoning_content_field_is_no_fact() {
+        let catalog = normalize_modelsdev(SNAPSHOT);
+        let features = &catalog[5];
+        // A plain string shorthand names a field — but only "reasoning_content"
+        // is a fact this catalog acts on; anything else (and a bare `true`,
+        // which carries no field at all) stays "no explicit fact" → None.
+        assert_eq!(features.models[1].reasoning_content_required, None);
+        assert_eq!(features.models[2].reasoning_content_required, None);
+        // Absent interleaved → None (never Some(false); None means unknown).
+        assert_eq!(features.models[3].reasoning_content_required, None);
+    }
+
+    #[test]
+    fn temperature_and_status_are_lifted() {
+        let catalog = normalize_modelsdev(SNAPSHOT);
+        let features = &catalog[5];
+        // temperature:false → supports_temperature false; status
+        // "deprecated" → deprecated true.
+        let frozen = &features.models[4];
+        assert!(!frozen.supports_temperature);
+        assert!(frozen.deprecated);
+        // Absent temperature → permissive true; absent status → not deprecated.
+        let plain = &features.models[0];
+        assert!(plain.supports_temperature);
+        assert!(!plain.deprecated);
+    }
+
+    #[test]
+    fn absent_limit_yields_zero_max_output_tokens() {
+        let catalog = normalize_modelsdev(SNAPSHOT);
+        // "no-facts" carries no limit at all → 0 (= unknown).
+        assert_eq!(catalog[5].models[3].max_output_tokens, 0);
     }
 }

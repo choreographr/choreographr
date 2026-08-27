@@ -168,6 +168,17 @@
   max_tokens_field = "max_tokens"
   default_model = "kimi-k2.7-code"
 
+# glm-5.3-flash: served by the go gateway but not yet in the models.dev
+# snapshot (upstream currently exposes it under the internal names
+# ox-alpha / x-preview-f). Defined wholesale here so the model resolves:
+# the GLM 5.x family carries `interleaved: {field: "reasoning_content"}`
+# on models.dev, so the gateway requires the reasoning_content echo on
+# every assistant message — set explicitly until the snapshot catches up.
+[provider.opencode-go.models."glm-5.3-flash"]
+  context_window = 200000
+  reasoning_supported = true
+  reasoning_content_required = true
+
 # opencode -> opencode (policy from the pre-models.dev TOML)
 [provider.opencode]
   max_tokens_field = "max_tokens"
@@ -256,14 +267,12 @@
   context_window = 200000
   reasoning_supported = true
   reasoning_levels = ["off", "minimal", "low", "medium", "high", "xhigh"]
-  responses = false
   reasoning_passback = "tool_loop"
 
 [provider.anthropic.models."claude-opus-4-1-20250805"]
   context_window = 200000
   reasoning_supported = true
   reasoning_levels = ["off", "minimal", "low", "medium", "high", "xhigh"]
-  responses = false
   reasoning_passback = "tool_loop"
 
 # Cerebras gpt-oss-120b: gateway rejects replayed reasoning_content
@@ -362,29 +371,17 @@
   default_model = "claude-sonnet-4-20250514"
 [provider.futurmix.models."claude-sonnet-4-20250514"]
   context_window = 200000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.futurmix.models."gpt-4o"]
   context_window = 128000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.futurmix.models."gemini-2.5-pro"]
   context_window = 1048576
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.futurmix.models."deepseek-chat"]
   context_window = 131072
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
+  # Aliased DeepSeek models relied on the removed name heuristic; the echo
+  # requirement is now an explicit overlay flag.
+  reasoning_content_required = true
 [provider.futurmix.models."claude-haiku-4-20250514"]
   context_window = 200000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 
 # GitLawb OpenGateway (not covered by models.dev; defined wholesale)
 [provider.gitlawb-opengateway]
@@ -399,19 +396,10 @@
   default_model = "4.0Ultra"
 [provider.iflytek.models."4.0Ultra"]
   context_window = 8192
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.iflytek.models."generalv3.5"]
   context_window = 8192
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.iflytek.models."max-32k"]
   context_window = 32768
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 
 # iFlytek Astron MaaS (not covered by models.dev; defined wholesale)
 [provider.iflytek-astron]
@@ -420,59 +408,32 @@
   default_model = "xopglm51"
 [provider.iflytek-astron.models."xsparkx2"]
   context_window = 131072
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.iflytek-astron.models."xsparkx2flash"]
   context_window = 131072
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.iflytek-astron.models."xopglm51"]
   context_window = 204800
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.iflytek-astron.models."xopglm5"]
   context_window = 204800
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.iflytek-astron.models."xopdeepseekv4pro"]
   context_window = 131072
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
+  # Aliased DeepSeek/Kimi ids relied on the removed name heuristic; the echo
+  # requirement is now an explicit overlay flag.
+  reasoning_content_required = true
 [provider.iflytek-astron.models."xopdeepseekv4flash"]
   context_window = 131072
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
+  reasoning_content_required = true
 [provider.iflytek-astron.models."xopdeepseekv32"]
   context_window = 131072
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
+  reasoning_content_required = true
 [provider.iflytek-astron.models."xopkimik26"]
   context_window = 262144
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
+  reasoning_content_required = true
 [provider.iflytek-astron.models."xminimaxm25"]
   context_window = 131072
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.iflytek-astron.models."xopqwen35397b"]
   context_window = 262144
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.iflytek-astron.models."astron-code-latest"]
   context_window = 131072
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 
 # Kimi Code subscription (not covered by models.dev; defined wholesale)
 [provider.kimi-code]
@@ -483,12 +444,14 @@
   context_window = 1048576
   reasoning_supported = true
   reasoning_levels = ["xhigh"]
-  responses = false
+  # Aliased Kimi models relied on the removed name heuristic; the echo
+  # requirement is now an explicit overlay flag.
+  reasoning_content_required = true
 [provider.kimi-code.models."kimi-for-coding"]
   context_window = 262144
   reasoning_supported = true
+  reasoning_content_required = true
   reasoning_levels = ["medium", "xhigh"]
-  responses = false
 
 # Llama Swap (not covered by models.dev; defined wholesale)
 [provider.llama-swap]
@@ -523,47 +486,26 @@
   context_window = 272000
   reasoning_supported = true
   reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
-  responses = false
 [provider.openai-codex.models."gpt-5.6-terra"]
   context_window = 272000
   reasoning_supported = true
   reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
-  responses = false
 [provider.openai-codex.models."gpt-5.6-luna"]
   context_window = 272000
   reasoning_supported = true
   reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
-  responses = false
 [provider.openai-codex.models."gpt-5.5"]
   context_window = 272000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.openai-codex.models."gpt-5.4"]
   context_window = 272000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.openai-codex.models."gpt-5.4-mini"]
   context_window = 400000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.openai-codex.models."gpt-5.3-codex"]
   context_window = 400000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.openai-codex.models."gpt-5.3-codex-spark"]
   context_window = 400000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.openai-codex.models."gpt-5.2"]
   context_window = 400000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 
 # OpenAI Compatible (not covered by models.dev; defined wholesale)
 [provider.openai_compatible]
@@ -597,34 +539,19 @@
   default_model = "deepseek-v4-pro"
 [provider.routstr.models."claude-opus-4.7"]
   context_window = 1000000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.routstr.models."gemini-3.1-pro-preview"]
   context_window = 1048576
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.routstr.models."gemini-3-flash-preview"]
   context_window = 1048576
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.routstr.models."deepseek-v4-pro"]
   context_window = 1048576
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
+  # Aliased DeepSeek/Kimi ids relied on the removed name heuristic; the echo
+  # requirement is now an explicit overlay flag.
+  reasoning_content_required = true
 [provider.routstr.models."glm-5.1"]
   context_window = 202752
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.routstr.models."minimax-m2.7"]
   context_window = 196608
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 
 # VMware Tanzu Platform (not covered by models.dev; defined wholesale)
 [provider.tanzu]
@@ -633,9 +560,6 @@
   default_model = "openai/gpt-oss-120b"
 [provider.tanzu.models."openai/gpt-oss-120b"]
   context_window = 131072
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 
 # Tensorix (not covered by models.dev; defined wholesale)
 [provider.tensorix]
@@ -644,27 +568,17 @@
   default_model = "z-ai/glm-5"
 [provider.tensorix.models."z-ai/glm-5"]
   context_window = 203000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.tensorix.models."deepseek/deepseek-chat-v3.1"]
   context_window = 164000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
+  # Aliased DeepSeek/Kimi ids relied on the removed name heuristic; the echo
+  # requirement is now an explicit overlay flag.
+  reasoning_content_required = true
 [provider.tensorix.models."deepseek/deepseek-r1-0528"]
   context_window = 164000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
+  reasoning_content_required = true
 [provider.tensorix.models."minimax/minimax-m2.5"]
   context_window = 197000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
 [provider.tensorix.models."moonshotai/kimi-k2.5"]
   context_window = 262000
-  reasoning_supported = false
-  reasoning_levels = []
-  responses = false
+  reasoning_content_required = true
 

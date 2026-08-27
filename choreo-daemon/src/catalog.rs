@@ -721,10 +721,8 @@ mod tests {
                     context_window: 8192,
                     reasoning_supported: true,
                     openai_reasoning_levels: vec!["off".into(), "high".into()],
-                    openai_responses: false,
-                    reasoning_passback: None,
-                    reasoning_content_required: None,
-                    supports_vision: false,
+                    max_output_tokens: 4096,
+                    ..Default::default()
                 }],
             },
             ProviderEntry {

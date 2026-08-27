@@ -110,11 +110,42 @@ impl ServiceConfig {
             .unwrap_or(self.default_request_format)
     }
 
+    /// Clamp a requested output-token limit down to the catalog's per-model
+    /// `max_output_tokens` fact (`lookup_max_output_tokens`), when one exists.
+    ///
+    /// Why clamp-only: the catalog fact is a *ceiling* — a request may be
+    /// intentionally small (a low-turn budget, a tool-loop headroom split), so
+    /// the clamp must never *raise* a lower request. `None` (unknown provider,
+    /// unknown model, or the recorded `0` = unknown sentinel) leaves the
+    /// request untouched: an unfactored model's own API default is a better
+    /// guess than any heuristic here.
+    fn clamp_output_to_catalog(&self, model: &str, requested: u32) -> u32 {
+        match crate::catalog::lookup_max_output_tokens(&self.provider_slug, model) {
+            Some(limit) if requested > limit => {
+                tracing::info!(
+                    provider = %self.provider_slug,
+                    model = %model,
+                    requested,
+                    clamped_to = limit,
+                    "clamped outgoing output-token limit to the catalog max_output_tokens fact"
+                );
+                limit
+            }
+            // No fact, or the request already fits under the ceiling: pass the
+            // request through unchanged (clamp-down only, never clamp-up).
+            _ => requested,
+        }
+    }
+
     pub fn max_output_tokens_for_model(&self, model: &str) -> Option<u32> {
+        // Clamp-down against the catalog ceiling at the single resolution
+        // point so every Responses-path caller inherits the clamp without
+        // each body-builder having to remember it.
         self.model_responses_max_output_tokens
             .get(model)
             .copied()
             .or(self.responses_max_output_tokens)
+            .map(|requested| self.clamp_output_to_catalog(model, requested))
     }
 
     pub fn max_tokens_for_model(&self, model: &str) -> Option<u32> {
@@ -185,7 +216,12 @@ impl ServiceConfig {
     /// resolved field.  If `max_tokens_for_model` returns `None`, both
     /// fields are `None` (the API will use its own default).
     pub(crate) fn max_tokens_field_pair(&self, model: &str) -> (Option<u32>, Option<u32>) {
-        let max_tokens = self.max_tokens_for_model(model);
+        // Clamp-down against the catalog's `max_output_tokens` fact here, at
+        // the single resolution point, so every chat-completions body-builder
+        // (plain, turn, and both streaming variants) inherits the clamp.
+        let max_tokens = self
+            .max_tokens_for_model(model)
+            .map(|requested| self.clamp_output_to_catalog(model, requested));
         match self.max_tokens_field_for_model(model) {
             MaxTokensField::MaxTokens => (max_tokens, None),
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
@@ -266,6 +302,76 @@ mod tests {
                 "slug {slug} must not send opencode headers"
             );
         }
+    }
+
+    #[test]
+    fn catalog_clamp_downs_known_model() {
+        // The bundled snapshot records gpt-5.4's limit.output as 128_000, so a
+        // larger request must be clamped down to the catalog fact.
+        let config = ServiceConfig::default();
+        assert_eq!(config.clamp_output_to_catalog("gpt-5.4", 999_999), 128_000);
+        // Responses-path resolution inherits the clamp.
+        let config = ServiceConfig {
+            responses_max_output_tokens: Some(200_000),
+            ..Default::default()
+        };
+        assert_eq!(config.max_output_tokens_for_model("gpt-5.4"), Some(128_000));
+        // Chat-completions pair resolution inherits the clamp too.
+        let config = ServiceConfig {
+            chat_completions_max_tokens: Some(200_000),
+            ..Default::default()
+        };
+        // Default max_tokens_field is MaxCompletionTokens, so the pair puts
+        // the clamped value in the second slot.
+        assert_eq!(
+            config.max_tokens_field_pair("gpt-5.4"),
+            (None, Some(128_000))
+        );
+    }
+
+    #[test]
+    fn catalog_clamp_never_raises_a_lower_request() {
+        // A request already under the catalog ceiling must pass through
+        // unchanged: the request may be intentionally small.
+        let config = ServiceConfig::default();
+        assert_eq!(config.clamp_output_to_catalog("gpt-5.4", 128_000), 128_000);
+        assert_eq!(config.clamp_output_to_catalog("gpt-5.4", 512), 512);
+    }
+
+    #[test]
+    fn catalog_clamp_untouched_for_unknown_model_or_provider() {
+        // Unknown model on a known provider, and unknown provider entirely:
+        // no fact → no clamp, request passes through as-is.
+        let config = ServiceConfig::default();
+        assert_eq!(
+            config.clamp_output_to_catalog("not-a-real-model", 200_000),
+            200_000
+        );
+        let config = ServiceConfig {
+            provider_slug: "no-such-provider".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.clamp_output_to_catalog("gpt-5.4", 200_000), 200_000);
+    }
+
+    #[test]
+    fn catalog_clamp_untouched_when_fact_is_zero() {
+        // A recorded `max_output_tokens` of `0` is the "unknown" sentinel and
+        // resolves to `None` — the request must not be clamped to 0.
+        let _restore = crate::catalog::test_util::RestoreBundledOnDrop;
+        let bundled = crate::catalog::catalog_snapshot();
+        crate::catalog::replace_catalog({
+            let mut c = crate::catalog::test_util::tiny_catalog();
+            c[0].models[0].max_output_tokens = 0;
+            c
+        });
+        let config = ServiceConfig {
+            provider_slug: "tiny-test".into(),
+            chat_completions_max_tokens: Some(200_000),
+            ..Default::default()
+        };
+        assert_eq!(config.max_tokens_field_pair("tiny-model").1, Some(200_000));
+        crate::catalog::replace_catalog(bundled.to_vec());
     }
 
     #[test]

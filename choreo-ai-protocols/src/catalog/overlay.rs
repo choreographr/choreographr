@@ -173,13 +173,7 @@ fn apply_models_overlay(
             None => {
                 let mut model = ModelEntry {
                     model: model_id.clone(),
-                    context_window: 0,
-                    reasoning_supported: false,
-                    openai_reasoning_levels: Vec::new(),
-                    openai_responses: false,
-                    reasoning_passback: None,
-                    reasoning_content_required: None,
-                    supports_vision: false,
+                    ..Default::default()
                 };
                 apply_model_overlay(&mut model, table);
                 entry.models.push(model);
@@ -240,6 +234,34 @@ fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
                 None => warn!(
                     model = %model.model,
                     "overlay: supports_vision is not a bool; skipping",
+                ),
+            },
+            // Output-token ceiling: overrides the ingested `limit.output`
+            // (0 = unknown, same convention as `context_window`).
+            "max_output_tokens" => match value.as_integer() {
+                Some(n) => model.max_output_tokens = n.max(0) as u32,
+                None => warn!(
+                    model = %model.model,
+                    "overlay: max_output_tokens is not an integer; skipping",
+                ),
+            },
+            // Temperature acceptance: models.dev records the fact only when
+            // it is "no", so the overlay is where a "yes" can be pinned for
+            // a gateway that proxies a temperature-less base model.
+            "temperature" => match value.as_bool() {
+                Some(supports) => model.supports_temperature = supports,
+                None => warn!(
+                    model = %model.model,
+                    "overlay: temperature is not a bool; skipping",
+                ),
+            },
+            // Lifecycle status override (e.g. pinning a snapshot entry the
+            // upstream has since retired, or un-deprecating a re-listed one).
+            "deprecated" => match value.as_bool() {
+                Some(deprecated) => model.deprecated = deprecated,
+                None => warn!(
+                    model = %model.model,
+                    "overlay: deprecated is not a bool; skipping",
                 ),
             },
             other => warn!(
@@ -329,20 +351,13 @@ mod tests {
                         context_window: 8192,
                         reasoning_supported: true,
                         openai_reasoning_levels: vec!["off".into(), "high".into()],
-                        openai_responses: false,
-                        reasoning_passback: None,
-                        reasoning_content_required: None,
                         supports_vision: true,
+                        ..Default::default()
                     },
                     ModelEntry {
                         model: "acme-lite".into(),
                         context_window: 4096,
-                        reasoning_supported: false,
-                        openai_reasoning_levels: Vec::new(),
-                        openai_responses: false,
-                        reasoning_passback: None,
-                        reasoning_content_required: None,
-                        supports_vision: false,
+                        ..Default::default()
                     },
                 ],
             },
@@ -356,11 +371,7 @@ mod tests {
                     model: "zoo-1".into(),
                     context_window: 200_000,
                     reasoning_supported: true,
-                    openai_reasoning_levels: Vec::new(),
-                    openai_responses: false,
-                    reasoning_passback: None,
-                    reasoning_content_required: None,
-                    supports_vision: false,
+                    ..Default::default()
                 }],
             },
         ]
@@ -544,6 +555,39 @@ reasoning_passback = "signature"
             Some(ReasoningPassback::Signature)
         );
         assert_eq!(acme.base_url, "https://api.acme.dev/v1");
+    }
+
+    #[test]
+    fn new_model_facts_are_overridable() {
+        // The new ingestion fields (max_output_tokens / temperature /
+        // deprecated) are overlay-overridable like every other fact, so a
+        // user can fix a stale snapshot entry without regenerating catalog.bin.
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme.models."acme-base"]
+max_output_tokens = 64000
+temperature = false
+deprecated = true
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        let base_model = acme
+            .models
+            .iter()
+            .find(|m| m.model == "acme-base")
+            .expect("acme-base");
+        assert_eq!(base_model.max_output_tokens, 64_000);
+        assert!(!base_model.supports_temperature);
+        assert!(base_model.deprecated);
+        // The untouched sibling keeps its ingested values.
+        let lite = acme
+            .models
+            .iter()
+            .find(|m| m.model == "acme-lite")
+            .expect("acme-lite");
+        assert!(lite.supports_temperature);
+        assert!(!lite.deprecated);
     }
 
     #[test]

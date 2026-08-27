@@ -21,26 +21,34 @@
 //! refresh, overlay change, or `/refresh-models`); every change *request*
 //! travels over a channel, and only the atomic store mutates (documented as a
 //! thread-communication exception in ARCHITECTURE.md).
+//!
+//! The per-model fact **lookups** ([`lookup_context_window`],
+//! [`lookup_max_output_tokens`], [`model_request_format`], …) live in the
+//! sibling [`lookup`] module and are re-exported here so the public surface of
+//! the crate is unchanged.
 
 use std::fmt;
 use std::sync::{Arc, LazyLock};
-use tracing::{debug, trace};
+use tracing::debug;
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
-use choreo_proto::ReasoningCapability;
-
-use crate::openai::RequestFormat;
 use crate::shared::MaxTokensField;
 
 mod loader;
+mod lookup;
 mod modelsdev;
 mod overlay;
 mod persist;
 pub mod refresh;
 
 pub use loader::{bundled_overlay_src, load_bundled_base};
+pub use lookup::{
+    lookup_context_window, lookup_max_output_tokens, model_reasoning_capability,
+    model_reasoning_passback, model_request_format, model_supports_temperature,
+    model_supports_vision, requires_reasoning_content,
+};
 pub use modelsdev::normalize_modelsdev;
 pub use overlay::merge_overlay;
 pub use persist::write_file_atomic;
@@ -101,15 +109,38 @@ pub struct ModelEntry {
     /// model's reasoning".
     pub reasoning_passback: Option<ReasoningPassback>,
     /// Whether this model requires `reasoning_content` to be *present* on
-    /// every assistant message sent back (DeepSeek/Kimi chat: the upstream
-    /// rejects a history whose assistant tool-call message omits
+    /// every assistant message sent back (e.g. DeepSeek/GLM 5.x chat: the
+    /// upstream rejects a history whose assistant tool-call message omits
     /// `reasoning_content`, even when the model produced no reasoning on
-    /// that call). `None` derives the default from the model name on the
-    /// chat-completions (ToolLoop) path — see [`requires_reasoning_content`];
-    /// `Some(..)` is an explicit overlay override (force it on for an
-    /// aliased DeepSeek/Kimi model, or off for an exception).
+    /// that call). Ingested from the models.dev snapshot as a FACT — the
+    /// model's `interleaved` value names `"reasoning_content"` as the echo
+    /// field — and overridable per-model by the overlay
+    /// (`reasoning_content_required = true|false`). `None` means "no explicit
+    /// fact" and resolves to `false` in [`requires_reasoning_content`] —
+    /// there is NO name-based fallback anymore; a model not covered by the
+    /// snapshot needs an explicit overlay flag.
     #[serde(default)]
     pub reasoning_content_required: Option<bool>,
+    /// Maximum output tokens the model can produce (`0` = unknown), ingested
+    /// from the snapshot's `limit.output` and resolvable via
+    /// [`lookup_max_output_tokens`] (which maps 0 back to `None`).
+    #[serde(default)]
+    pub max_output_tokens: u32,
+    /// Whether the model accepts the `temperature` request parameter,
+    /// ingested from the snapshot's `temperature` flag (absent → `true`,
+    /// the permissive wire default). Resolvable via
+    /// [`model_supports_temperature`]. Currently **recorded but unwired**:
+    /// no request builder sends a `temperature` parameter today, so the
+    /// resolver has no production caller — the fact is kept so the gate
+    /// exists the moment temperature sending is added (see ARCHITECTURE.md,
+    /// the catalog-facts paragraph).
+    #[serde(default = "default_true")]
+    pub supports_temperature: bool,
+    /// Whether the snapshot marks the model deprecated (`status ==
+    /// "deprecated"`). Purely informational today; surfaced so UIs and
+    /// diagnostics can flag stale model picks without a second lookup.
+    #[serde(default)]
+    pub deprecated: bool,
     /// Whether the model accepts image input (vision). Derived from the
     /// models.dev `modalities.input` array (`"image"` present) at ingestion;
     /// the overlay can override it where the snapshot is wrong or a model is
@@ -118,6 +149,31 @@ pub struct ModelEntry {
     /// `false` is the safe default for unknown models.
     #[serde(default)]
     pub supports_vision: bool,
+}
+
+// Manual `impl` rather than `#[derive(Default)]` + `#[default]` because
+// `supports_temperature` must default to `true` (the permissive wire default
+// shared with its `#[serde(default = "default_true")]`); derive can only
+// express `false` for a `bool`. Every other field's natural zero-value default
+// already matches its serde behavior (`0` for unknown windows/tokens, `None`
+// for unset options), so this keeps the serde attributes untouched and the
+// wire format byte-identical while letting tests say `..Default::default()`.
+impl Default for ModelEntry {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            context_window: 0,
+            reasoning_supported: false,
+            openai_reasoning_levels: Vec::new(),
+            openai_responses: false,
+            reasoning_passback: None,
+            reasoning_content_required: None,
+            max_output_tokens: 0,
+            supports_temperature: true,
+            deprecated: false,
+            supports_vision: false,
+        }
+    }
 }
 
 /// Protocol variant — selects wire format and carries protocol-specific fields.
@@ -187,6 +243,13 @@ impl fmt::Display for ProviderProtocol {
     }
 }
 
+/// serde default helper: `bool` fields that mean "true when absent"
+/// (`supports_temperature`) cannot use plain `#[serde(default)]`, which
+/// would default to `false` and flip the permissive wire default.
+fn default_true() -> bool {
+    true
+}
+
 /// Look up a provider entry by slug. Returns `None` if not found.
 ///
 /// Returns an *owned* clone taken out of the `ArcSwap` guard, so the entry
@@ -200,28 +263,6 @@ pub fn lookup_provider(slug: &str) -> Option<ProviderEntry> {
         .iter()
         .find(|e| e.slug == slug)
         .cloned()
-}
-
-/// Look up the context window for a model on a given provider.
-/// Matches the model slug exactly against known entries.
-/// Returns `None` if no entry matches, the provider is unknown, or the
-/// entry has no known window (`context_window == 0`, e.g. a model whose
-/// window was never recorded — callers then fall back to the client config).
-pub fn lookup_context_window(provider_slug: &str, model: &str) -> Option<u32> {
-    // Hold the ArcSwap guard for the duration of the lookup so we never clone
-    // a whole provider entry just to read one model's window.
-    let catalog = PROVIDER_CATALOG.load();
-    let entry = catalog.iter().find(|e| e.slug == provider_slug)?;
-    for m in &entry.models {
-        if model == m.model {
-            return if m.context_window == 0 {
-                None
-            } else {
-                Some(m.context_window)
-            };
-        }
-    }
-    None
 }
 
 /// Return all provider slugs as owned strings.
@@ -262,199 +303,49 @@ pub fn provider_slug_for_model(model: &str) -> Option<String> {
         .map(|e| e.slug.clone())
 }
 
-/// Whether the given model on the given provider accepts image input (vision).
-///
-/// The vision gate uses this to decide whether attached/read images are sent
-/// to the model natively or replaced with a text placeholder. Unknown models
-/// and providers default to `false` (text-only) — the safe conservative
-/// choice: sending an image to a text-only model would 400 the whole request,
-/// whereas gating it out only degrades the image to a placeholder.
-pub fn model_supports_vision(provider_slug: &str, model: &str) -> bool {
-    let catalog = PROVIDER_CATALOG.load();
-    catalog
-        .iter()
-        .find(|e| e.slug == provider_slug)
-        .and_then(|e| e.models.iter().find(|m| m.model == model))
-        .map(|m| m.supports_vision)
-        .unwrap_or(false)
-}
+#[cfg(test)]
+// Shared test fixtures for the catalog tests. The resolver tests moved to
+// `lookup.rs` but still need to swap the process-global catalog and restore
+// it afterwards, and both modules' swap tests build the same synthetic
+// one-provider catalog — so the helpers live here (next to
+// `replace_catalog`/`loader`) and are shared via `pub(crate)`.
+pub(crate) mod test_util {
+    use super::ProviderEntry;
+    use super::loader;
+    use super::replace_catalog;
+    use crate::shared::MaxTokensField;
 
-/// Compute the reasoning capability for a given model on a given provider.
-/// Falls back to protocol defaults for unknown models (best-effort
-/// compatibility with new/untracked models).
-pub fn model_reasoning_capability(provider_slug: &str, model: &str) -> ReasoningCapability {
-    let catalog = PROVIDER_CATALOG.load();
-    let entry = catalog.iter().find(|e| e.slug == provider_slug);
+    /// Restores the bundled catalog when dropped, so a failing swap test can
+    /// never leave the process-global catalog swapped for later tests (the
+    /// libtest fallback shares one process).
+    pub(crate) struct RestoreBundledOnDrop;
 
-    let levels: Vec<String> = match entry {
-        Some(e) => {
-            let model_entry = e.models.iter().find(|m| m.model == model);
-            match model_entry {
-                // Known model that explicitly does not support reasoning
-                Some(m) if !m.reasoning_supported => vec![],
-                // Known model with explicit effort levels (OpenAi protocol only)
-                Some(m)
-                    if matches!(e.protocol, ProviderProtocol::OpenAi { .. })
-                        && !m.openai_reasoning_levels.is_empty() =>
-                {
-                    m.openai_reasoning_levels.clone()
-                }
-                // Known model with reasoning but no explicit levels → protocol defaults
-                Some(_) => protocol_default_levels(e.protocol),
-                // Unknown model → protocol defaults (best-effort for new models)
-                None => protocol_default_levels(e.protocol),
-            }
-        }
-        // Unknown provider — no protocol to infer defaults from
-        None => vec![],
-    };
-
-    trace!(
-        provider = %provider_slug,
-        model = %model,
-        ?levels,
-        "model_reasoning_capability"
-    );
-
-    ReasoningCapability {
-        available_effort_levels: levels,
-    }
-}
-
-/// Return the default reasoning-effort slugs for a given protocol.
-fn protocol_default_levels(protocol: ProviderProtocol) -> Vec<String> {
-    match protocol {
-        ProviderProtocol::OpenAi { .. } | ProviderProtocol::AnthropicMessages => {
-            vec!["off".into(), "low".into(), "medium".into(), "high".into()]
-        }
-        ProviderProtocol::GoogleGenerativeAi => {
-            vec!["off".into(), "on".into()]
+    impl Drop for RestoreBundledOnDrop {
+        fn drop(&mut self) {
+            replace_catalog(loader::load_catalog());
         }
     }
-}
 
-/// Look up whether a model should use OpenAI's Responses API.
-/// Returns None for unknown models — caller falls back to default_request_format.
-pub fn model_request_format(provider_slug: &str, model: &str) -> Option<RequestFormat> {
-    let catalog = PROVIDER_CATALOG.load();
-    let entry = catalog.iter().find(|e| e.slug == provider_slug)?;
-    for m in &entry.models {
-        if model == m.model {
-            return if m.openai_responses {
-                Some(RequestFormat::Responses)
-            } else {
-                Some(RequestFormat::ChatCompletions)
-            };
-        }
-    }
-    None
-}
-
-/// Compute how reasoning is replayed back to the provider for a given
-/// model. Mirrors `model_reasoning_capability`: an explicit per-model
-/// `reasoning_passback` TOML override wins — including an explicit `none`,
-/// which suppresses replay even where the protocol default would echo —
-/// otherwise the format is derived from the provider protocol (falling back
-/// to protocol defaults for unknown/new models, and `None` for unknown
-/// providers).
-pub fn model_reasoning_passback(provider_slug: &str, model: &str) -> ReasoningPassback {
-    let catalog = PROVIDER_CATALOG.load();
-    let entry = catalog.iter().find(|e| e.slug == provider_slug);
-
-    let passback = match entry {
-        Some(e) => match e.models.iter().find(|m| m.model == model) {
-            // Known model: an explicit TOML override wins (`Some(..)`, incl.
-            // `Some(ReasoningPassback::None)` for "never replay"); an unset
-            // field (`None`) derives from the protocol (and, for OpenAi
-            // providers, whether the model uses Responses).
-            Some(m) => resolve_passback(m.reasoning_passback, e.protocol, m.openai_responses),
-            // Unknown model → protocol default (best-effort for new models;
-            // OpenAi assumed chat-completions, matching
-            // `ServiceConfig::default_request_format`).
-            None => protocol_default_passback(e.protocol, false),
-        },
-        // Unknown provider — no protocol to infer a default from.
-        None => ReasoningPassback::None,
-    };
-
-    trace!(
-        provider = %provider_slug,
-        model = %model,
-        ?passback,
-        "model_reasoning_passback"
-    );
-
-    passback
-}
-
-/// Resolve the effective passback format: an explicit per-model override
-/// wins; `None` (unset) derives from the provider protocol.
-fn resolve_passback(
-    explicit: Option<ReasoningPassback>,
-    protocol: ProviderProtocol,
-    openai_responses: bool,
-) -> ReasoningPassback {
-    explicit.unwrap_or_else(|| protocol_default_passback(protocol, openai_responses))
-}
-
-/// Protocol-level default passback format, used when a model has no explicit
-/// override (or is unknown). OpenAI-protocol providers that use the
-/// Responses API chain continuity via `previous_response_id`; chat-completions
-/// providers echo reasoning on tool-call turns (DeepSeek/Kimi minimum).
-/// Anthropic echoes across all turns by default (last-turn-only models carry
-/// an explicit `tool_loop` override); Google sends encrypted signatures.
-fn protocol_default_passback(
-    protocol: ProviderProtocol,
-    openai_responses: bool,
-) -> ReasoningPassback {
-    match protocol {
-        ProviderProtocol::OpenAi { .. } if openai_responses => ReasoningPassback::ResponseId,
-        ProviderProtocol::OpenAi { .. } => ReasoningPassback::ToolLoop,
-        ProviderProtocol::AnthropicMessages => ReasoningPassback::AllTurns,
-        ProviderProtocol::GoogleGenerativeAi => ReasoningPassback::Signature,
-    }
-}
-
-/// Whether the model requires `reasoning_content` to be present on every
-/// assistant message (DeepSeek/Kimi chat completions). An explicit per-model
-/// overlay override wins; otherwise the default derives from the model name
-/// on the chat-completions (ToolLoop) passback path. Unknown providers are
-/// assumed OpenAI-ish chat so a plainly-named DeepSeek/Kimi model still gets
-/// the injection regardless of the hosting slug (mirrors opencode's
-/// `interleaved.field = "reasoning_content"` default keyed on the model id).
-pub fn requires_reasoning_content(provider_slug: &str, model: &str) -> bool {
-    let catalog = PROVIDER_CATALOG.load();
-    let entry = catalog.iter().find(|e| e.slug == provider_slug);
-    let (explicit, protocol, responses) = match entry {
-        Some(e) => match e.models.iter().find(|m| m.model == model) {
-            Some(m) => (m.reasoning_content_required, e.protocol, m.openai_responses),
-            None => (None, e.protocol, false),
-        },
-        None => (
-            None,
-            ProviderProtocol::OpenAi {
-                max_tokens_field: MaxTokensField::MaxCompletionTokens,
+    /// Build a minimal one-provider/one-model catalog for the swap tests.
+    pub(crate) fn tiny_catalog() -> Vec<ProviderEntry> {
+        vec![ProviderEntry {
+            slug: "tiny-test".into(),
+            display_name: "Tiny Test".into(),
+            protocol: crate::catalog::ProviderProtocol::OpenAi {
+                max_tokens_field: MaxTokensField::MaxTokens,
             },
-            false,
-        ),
-    };
-    explicit.unwrap_or_else(|| default_requires_reasoning_content(model, protocol, responses))
-}
-
-/// Derived default: DeepSeek/Kimi OpenAI-compatible chat models must echo
-/// `reasoning_content` on every assistant message. Responses-API models do
-/// not carry the field at all, so it is excluded here.
-fn default_requires_reasoning_content(
-    model: &str,
-    protocol: ProviderProtocol,
-    responses: bool,
-) -> bool {
-    is_deepseek_or_kimi(model) && !responses && matches!(protocol, ProviderProtocol::OpenAi { .. })
-}
-
-fn is_deepseek_or_kimi(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    m.contains("deepseek") || m.contains("kimi")
+            base_url: "https://tiny-test.example/v1".into(),
+            default_model: "tiny-model".into(),
+            models: vec![crate::catalog::ModelEntry {
+                model: "tiny-model".into(),
+                context_window: 4096,
+                reasoning_supported: true,
+                openai_reasoning_levels: vec!["off".into(), "high".into()],
+                max_output_tokens: 1024,
+                ..Default::default()
+            }],
+        }]
+    }
 }
 
 #[cfg(test)]
@@ -465,17 +356,6 @@ fn is_deepseek_or_kimi(model: &str) -> bool {
 #[serial_test::serial(catalog)]
 mod tests {
     use super::*;
-
-    /// Restores the bundled catalog when dropped, so a failing swap test can
-    /// never leave the process-global catalog swapped for later tests (the
-    /// libtest fallback shares one process).
-    struct RestoreBundledOnDrop;
-
-    impl Drop for RestoreBundledOnDrop {
-        fn drop(&mut self) {
-            replace_catalog(loader::load_catalog());
-        }
-    }
 
     #[test]
     fn embedded_catalog_loads() {
@@ -667,52 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn lookup_context_window_known_provider() {
-        // OpenAI exact slug matches
-        assert_eq!(
-            lookup_context_window("openai", "gpt-4.1-nano"),
-            Some(1_047_576)
-        );
-        assert_eq!(lookup_context_window("openai", "gpt-5"), Some(400_000));
-        // models.dev is authoritative for context windows: gpt-5.4 is a
-        // 1.05M-token model there (the old TOML's 272k was stale).
-        assert_eq!(lookup_context_window("openai", "gpt-5.4"), Some(1_050_000));
-        assert_eq!(
-            lookup_context_window("openai", "gpt-5.5-pro"),
-            Some(1_050_000)
-        );
-        // DeepSeek exact slug matches
-        assert_eq!(
-            lookup_context_window("deepseek", "deepseek-v4-flash"),
-            Some(1_000_000)
-        );
-        assert_eq!(
-            lookup_context_window("deepseek", "deepseek-v4-pro"),
-            Some(1_000_000)
-        );
-        // Anthropic exact slug matches
-        assert_eq!(
-            lookup_context_window("anthropic", "claude-sonnet-4-6"),
-            Some(1_000_000)
-        );
-        // Google exact slug matches
-        assert_eq!(
-            lookup_context_window("google", "gemini-2.5-pro"),
-            Some(1_048_576)
-        );
-    }
-
-    #[test]
-    fn lookup_context_window_unknown_provider() {
-        assert_eq!(lookup_context_window("nonexistent", "any-model"), None);
-    }
-
-    #[test]
-    fn lookup_context_window_unknown_model() {
-        assert_eq!(lookup_context_window("openai", "unknown-model-xyz"), None);
-    }
-
-    #[test]
     fn all_display_names_are_non_empty() {
         for name in all_display_names() {
             assert!(!name.is_empty());
@@ -720,374 +554,11 @@ mod tests {
     }
 
     #[test]
-    fn model_reasoning_capability_openai_known_model() {
-        let cap = model_reasoning_capability("openai", "gpt-5.4");
-        assert_eq!(
-            cap.available_effort_levels,
-            vec!["off", "low", "medium", "high", "xhigh"]
-        );
-    }
-
-    #[test]
-    fn model_reasoning_capability_openai_unknown_model() {
-        let cap = model_reasoning_capability("openai", "gpt-4.1");
-        assert!(cap.available_effort_levels.is_empty());
-    }
-
-    #[test]
-    fn model_reasoning_capability_anthropic_supported() {
-        let cap = model_reasoning_capability("anthropic", "claude-sonnet-4-6");
-        assert_eq!(
-            cap.available_effort_levels,
-            vec!["off", "low", "medium", "high"]
-        );
-    }
-
-    #[test]
-    fn model_reasoning_capability_anthropic_unknown_model_uses_defaults() {
-        // Unknown anthropic model → protocol defaults (best-effort fallback).
-        let cap = model_reasoning_capability("anthropic", "claude-opus-3");
-        assert_eq!(
-            cap.available_effort_levels,
-            vec!["off", "low", "medium", "high"]
-        );
-    }
-
-    #[test]
-    fn model_reasoning_capability_anthropic_non_reasoning() {
-        // A known non-reasoning model yields no effort levels. None of the
-        // current anthropic models are non-reasoning, so assert against a
-        // known non-reasoning OpenAI model on the openai provider instead.
-        let cap = model_reasoning_capability("openai", "gpt-4.1");
-        assert!(cap.available_effort_levels.is_empty());
-    }
-
-    #[test]
-    fn model_reasoning_capability_google_supported() {
-        let cap = model_reasoning_capability("google", "gemini-2.5-pro");
-        assert_eq!(cap.available_effort_levels, vec!["off", "on"]);
-    }
-
-    #[test]
-    fn model_reasoning_capability_google_unknown_model_uses_defaults() {
-        // Unknown google model → protocol defaults (off/on).
-        let cap = model_reasoning_capability("google", "gemini-9.9");
-        assert_eq!(cap.available_effort_levels, vec!["off", "on"]);
-    }
-
-    #[test]
-    fn model_reasoning_capability_none_provider() {
-        let cap = model_reasoning_capability("nonexistent", "any-model");
-        assert!(cap.available_effort_levels.is_empty());
-    }
-
-    #[test]
-    fn model_request_format_known_model() {
-        // OpenAI's catalog default is the Responses API.
-        let fmt = model_request_format("openai", "gpt-4.1");
-        assert_eq!(fmt, Some(RequestFormat::Responses));
-    }
-
-    #[test]
-    fn model_request_format_opencode_go_matches_gateway_docs() {
-        assert_eq!(
-            model_request_format("opencode-go", "deepseek-v4-flash"),
-            Some(RequestFormat::ChatCompletions)
-        );
-    }
-
-    #[test]
-    fn model_request_format_opencode_zen_gpt_family_uses_responses() {
-        for model in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna"] {
-            assert_eq!(
-                model_request_format("opencode", model),
-                Some(RequestFormat::Responses),
-                "expected {model} to use the Responses API on the Zen gateway"
-            );
-        }
-        assert_eq!(
-            model_request_format("opencode", "deepseek-v4-flash"),
-            Some(RequestFormat::ChatCompletions)
-        );
-    }
-
-    #[test]
-    fn model_request_format_unknown_model() {
-        let fmt = model_request_format("openai", "nonexistent-model");
-        assert_eq!(fmt, None);
-    }
-
-    #[test]
-    fn model_request_format_unknown_provider() {
-        let fmt = model_request_format("nope", "gpt-4.1");
-        assert_eq!(fmt, None);
-    }
-
-    #[test]
-    fn model_reasoning_passback_openai_responses_model() {
-        // gpt-5.4 uses the Responses API (responses = true) → chain via
-        // previous_response_id / opaque reasoning items.
-        assert_eq!(
-            model_reasoning_passback("openai", "gpt-5.4"),
-            ReasoningPassback::ResponseId
-        );
-    }
-
-    #[test]
-    fn model_reasoning_passback_openai_chat_completions_model() {
-        // A chat-completions OpenAI-protocol model would derive ToolLoop from
-        // the protocol — but Cerebras' gpt-oss-120b is pinned to `none` by the
-        // bundled overlay: the gateway rejects replayed `reasoning_content`,
-        // so this model must never replay.
-        assert_eq!(
-            model_reasoning_passback("cerebras", "gpt-oss-120b"),
-            ReasoningPassback::None
-        );
-    }
-
-    #[test]
-    fn model_reasoning_passback_deepseek_derives_tool_loop() {
-        // DeepSeek is a chat-completions OpenAI-protocol provider, so both
-        // models derive the ToolLoop default (echo reasoning on tool-call
-        // turns) — the old TOML's explicit tool_loop override was redundant
-        // with the derived default and is not carried into the overlay.
-        assert_eq!(
-            model_reasoning_passback("deepseek", "deepseek-v4-flash"),
-            ReasoningPassback::ToolLoop
-        );
-        assert_eq!(
-            model_reasoning_passback("deepseek", "deepseek-v4-pro"),
-            ReasoningPassback::ToolLoop
-        );
-    }
-
-    #[test]
-    fn model_reasoning_passback_anthropic_keep_all_turns() {
-        // Opus 4.5+ / later Opus, Sonnet 4.6+, and Fable 5 keep ALL prior
-        // turns → echo reasoning on every turn.
-        for model in [
-            "claude-opus-4-5",
-            "claude-opus-4-5-20251101",
-            "claude-opus-4-6",
-            "claude-opus-4-7",
-            "claude-opus-5",
-            "claude-sonnet-4-6",
-            "claude-sonnet-5",
-            "claude-fable-5",
-        ] {
-            assert_eq!(
-                model_reasoning_passback("anthropic", model),
-                ReasoningPassback::AllTurns,
-                "expected {model} to keep all prior turns"
-            );
-        }
-    }
-
-    #[test]
-    fn model_reasoning_passback_anthropic_last_turn_only() {
-        // Earlier Opus/Sonnet and all Haiku keep only the last turn → the
-        // tool_loop minimum (echo reasoning on assistant tool-call messages).
-        for model in [
-            "claude-opus-4-1",
-            "claude-opus-4-1-20250805",
-            "claude-sonnet-4-5",
-            "claude-sonnet-4-5-20250929",
-            "claude-haiku-4-5",
-            "claude-haiku-4-5-20251001",
-        ] {
-            assert_eq!(
-                model_reasoning_passback("anthropic", model),
-                ReasoningPassback::ToolLoop,
-                "expected {model} to keep only the last turn"
-            );
-        }
-    }
-
-    #[test]
-    fn model_reasoning_passback_google_model() {
-        // Gemini → encrypted thought signatures.
-        assert_eq!(
-            model_reasoning_passback("google", "gemini-2.5-pro"),
-            ReasoningPassback::Signature
-        );
-    }
-
-    #[test]
-    fn model_reasoning_passback_none_provider() {
-        // Unknown provider — no protocol to derive a default from.
-        assert_eq!(
-            model_reasoning_passback("nonexistent", "any-model"),
-            ReasoningPassback::None
-        );
-    }
-
-    #[test]
-    fn model_reasoning_passback_unknown_model_uses_protocol_default() {
-        // Unknown model on a known anthropic provider → AllTurns (default).
-        assert_eq!(
-            model_reasoning_passback("anthropic", "claude-opus-3"),
-            ReasoningPassback::AllTurns
-        );
-        // Unknown model on a known google provider → Signature (default).
-        assert_eq!(
-            model_reasoning_passback("google", "gemini-9.9"),
-            ReasoningPassback::Signature
-        );
-        // Unknown model on a known OpenAI-protocol provider → chat-completions
-        // default (ToolLoop), matching ServiceConfig::default_request_format.
-        assert_eq!(
-            model_reasoning_passback("openai", "gpt-9.9-unknown"),
-            ReasoningPassback::ToolLoop
-        );
-    }
-
-    #[test]
-    fn model_reasoning_passback_explicit_override_beats_protocol_default() {
-        // claude-haiku-4-5 carries an explicit tool_loop override that beats
-        // the Anthropic keep-all-turns protocol default.
-        let entry = lookup_provider("anthropic").unwrap();
-        let model = entry
-            .models
-            .iter()
-            .find(|m| m.model == "claude-haiku-4-5")
-            .unwrap();
-        assert_eq!(model.reasoning_passback, Some(ReasoningPassback::ToolLoop));
-    }
-
-    #[test]
-    fn resolve_passback_unset_uses_protocol_default() {
-        // `None` (unset) on Anthropic → the keep-all-turns protocol default.
-        assert_eq!(
-            resolve_passback(None, ProviderProtocol::AnthropicMessages, false),
-            ReasoningPassback::AllTurns
-        );
-    }
-
-    #[test]
-    fn resolve_passback_explicit_none_beats_protocol_default() {
-        // The new capability: an explicit `none` override suppresses replay
-        // even on a protocol whose default would echo (OpenAi chat-completions
-        // → ToolLoop) — a Cerebras-style model that rejects replayed
-        // `reasoning_content` can be pinned to never replay without inventing
-        // a provider.
-        let protocol = ProviderProtocol::OpenAi {
-            max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        };
-        assert_eq!(
-            resolve_passback(Some(ReasoningPassback::None), protocol, false),
-            ReasoningPassback::None
-        );
-    }
-
-    #[test]
-    fn resolve_passback_explicit_override_beats_responses_default() {
-        // An explicit ToolLoop override wins even when the model uses the
-        // Responses API, whose protocol default would be ResponseId.
-        let protocol = ProviderProtocol::OpenAi {
-            max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        };
-        assert_eq!(
-            resolve_passback(Some(ReasoningPassback::ToolLoop), protocol, true),
-            ReasoningPassback::ToolLoop
-        );
-    }
-
-    #[test]
-    fn resolve_passback_unset_openai_responses_uses_response_id() {
-        // `None` (unset) on an OpenAI-protocol Responses model → chain
-        // continuity via previous_response_id / opaque reasoning items.
-        let protocol = ProviderProtocol::OpenAi {
-            max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        };
-        assert_eq!(
-            resolve_passback(None, protocol, true),
-            ReasoningPassback::ResponseId
-        );
-    }
-
-    #[test]
-    fn bundled_toml_reasoning_passback_parses() {
-        // TOML files WITHOUT the field must still parse (serde default None).
-        // Spot-check one untouched provider resolves via protocol default.
-        assert_eq!(
-            model_reasoning_passback("groq", "groq/compound"),
-            ReasoningPassback::ToolLoop
-        );
-    }
-
-    /// Build a minimal one-provider/one-model catalog for the swap tests.
-    fn tiny_catalog() -> Vec<ProviderEntry> {
-        vec![ProviderEntry {
-            slug: "tiny-test".into(),
-            display_name: "Tiny Test".into(),
-            protocol: ProviderProtocol::OpenAi {
-                max_tokens_field: MaxTokensField::MaxTokens,
-            },
-            base_url: "https://tiny-test.example/v1".into(),
-            default_model: "tiny-model".into(),
-            models: vec![ModelEntry {
-                model: "tiny-model".into(),
-                context_window: 4096,
-                reasoning_supported: true,
-                openai_reasoning_levels: vec!["off".into(), "high".into()],
-                openai_responses: false,
-                reasoning_passback: None,
-                reasoning_content_required: None,
-                supports_vision: false,
-            }],
-        }]
-    }
-
-    #[test]
-    fn replace_catalog_swaps_what_lookup_sees() {
-        // Swapping the process-wide catalog must be visible to readers
-        // immediately (the ArcSwap store is atomic). Restore the bundled
-        // catalog on drop so a failure here cannot poison later tests.
-        let _restore = RestoreBundledOnDrop;
-        let bundled = catalog_snapshot();
-        assert!(lookup_provider("openai").is_some());
-
-        replace_catalog(tiny_catalog());
-
-        let entry = lookup_provider("tiny-test").expect("swapped catalog has tiny-test");
-        assert_eq!(entry.slug, "tiny-test");
-        assert_eq!(entry.base_url, "https://tiny-test.example/v1");
-        // The bundled catalog is gone while the tiny one is installed.
-        assert!(lookup_provider("openai").is_none());
-        assert_eq!(all_slugs(), vec!["tiny-test".to_string()]);
-
-        // Sanity-check the lookup functions read through the same global.
-        assert_eq!(lookup_context_window("tiny-test", "tiny-model"), Some(4096));
-        assert_eq!(
-            model_reasoning_capability("tiny-test", "tiny-model").available_effort_levels,
-            vec!["off", "high"]
-        );
-
-        // Explicit restore (the guard also restores on panic) so the test is
-        // self-documenting about returning the global to its initial state.
-        replace_catalog(bundled.to_vec());
-        assert!(lookup_provider("openai").is_some());
-    }
-
-    #[test]
-    fn model_supports_vision_resolves_from_catalog() {
-        let _restore = RestoreBundledOnDrop;
-        // The bundled overlay adds deepseek-v4-flash-vision-exp with vision on;
-        // a known text-only model resolves false; an unknown model defaults false.
-        assert!(model_supports_vision(
-            "deepseek",
-            "deepseek-v4-flash-vision-exp"
-        ));
-        assert!(!model_supports_vision("deepseek", "deepseek-v4-pro"));
-        assert!(!model_supports_vision("no-such-provider", "any-model"));
-    }
-
-    #[test]
     fn provider_slug_for_model_resolves_owner_and_unknown_is_none() {
         // A known model id resolves to the provider that owns it (exact match).
         // Pick a real id out of the bundled catalog rather than hardcoding a
         // slug, so the assertion tracks the catalog instead of the test.
-        let _restore = RestoreBundledOnDrop;
+        let _restore = test_util::RestoreBundledOnDrop;
         let bundled = catalog_snapshot();
         let (slug, model) = bundled
             .iter()
@@ -1099,7 +570,7 @@ mod tests {
         );
 
         // The swap is visible to the new lookup through the same process-global.
-        replace_catalog(tiny_catalog());
+        replace_catalog(test_util::tiny_catalog());
         assert_eq!(
             provider_slug_for_model("tiny-model").as_deref(),
             Some("tiny-test")
@@ -1118,10 +589,10 @@ mod tests {
     fn lookup_provider_returns_owned_clone_outliving_guard() {
         // The returned entry is owned (cloned out of the ArcSwap guard), so it
         // remains valid even after the catalog is swapped underneath it.
-        let _restore = RestoreBundledOnDrop;
+        let _restore = test_util::RestoreBundledOnDrop;
         let entry = lookup_provider("openai").expect("openai is in the bundled catalog");
 
-        replace_catalog(tiny_catalog());
+        replace_catalog(test_util::tiny_catalog());
 
         // The clone outlives the swap: its data is intact and independent.
         assert_eq!(entry.slug, "openai");

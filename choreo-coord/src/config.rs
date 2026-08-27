@@ -91,9 +91,14 @@ mod tests {
 
     #[test]
     fn item_bounds_are_positive() {
-        assert!(MAX_PARENTS > 0);
-        assert!(MAX_LINKS > 0);
-        assert!(MAX_MENTIONS > 0);
+        // Compile-time guard: the runtime rejects zero bounds, so the pinned
+        // constants are asserted in a const block (a runtime `assert!` on a
+        // constant would be dead — clippy flags it).
+        const {
+            assert!(MAX_PARENTS > 0);
+            assert!(MAX_LINKS > 0);
+            assert!(MAX_MENTIONS > 0);
+        }
         assert_eq!(ITEM_ID_NAMESPACE, 1000);
     }
 }

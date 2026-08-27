@@ -621,10 +621,9 @@ impl GrepSink {
             return Ok(false);
         }
         self.after_context_remaining -= 1;
-        if truncated {
-            return Ok(false);
-        }
-        Ok(true)
+        // Truncated output ends the stream exactly like a budget stop; the
+        // pipeline only distinguishes "keep going" from "stop".
+        Ok(!truncated)
     }
 
     /// Append an item for the currently-searched file, opening a per-file
@@ -881,13 +880,12 @@ impl Sink for GrepSink {
             return Ok(false);
         }
         let content = sanitize_content(&line);
-        if !self.push_item(GrepItem::Context {
+        // The item push doubles as the stop signal: a full budget returns
+        // false, which the searcher treats as "end the walk".
+        Ok(self.push_item(GrepItem::Context {
             line_number: ctx.line_number().unwrap_or(0),
             content,
-        }) {
-            return Ok(false);
-        }
-        Ok(true)
+        }))
     }
 
     fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
