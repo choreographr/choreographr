@@ -16,7 +16,7 @@
 
 use crate::CoordError;
 use crate::chain::{self, ChainAccount};
-use crate::encode::{self, ContentInput, DecodedItem};
+use crate::encode::{self, ContentInput, DecodedItem, ImageInput, PreparedContent};
 use crate::indexer::{self, DecodedEvent, QueryKey};
 use rand::Rng;
 
@@ -403,6 +403,43 @@ pub fn status() -> Result<CoordStatus, CoordError> {
 
 // ── Write: operations ────────────────────────────────────────────────────────
 
+/// Resolve a publish's content into the fully-specified [`PreparedContent`]
+/// that [`encode_item`] consumes.
+///
+/// The only field needing work is a `path`-based image input: the referenced
+/// file is read, its JPEG mipmap pyramid built and pinned to IPFS, and the
+/// full [`ImageSpec`] derived (the ported `acuity-dioxus` publishing
+/// pipeline — callers never compute dimensions, digests, or CIDs themselves).
+/// A `spec`-based input is passed through verbatim; supplying both `path`
+/// and `spec` is rejected as ambiguous, as is an input with neither.
+fn resolve_content(input: &ContentInput) -> Result<PreparedContent, CoordError> {
+    let image = match &input.image {
+        Some(ImageInput {
+            path: Some(path),
+            filename,
+            spec: None,
+        }) => Some(crate::image::build_image_spec(
+            std::path::Path::new(path),
+            filename.as_deref(),
+        )?),
+        Some(ImageInput {
+            path: None,
+            spec: Some(spec),
+            ..
+        }) => Some(spec.clone()),
+        Some(ImageInput { path, spec, .. }) => {
+            return Err(CoordError::InvalidArgument(match (path, spec) {
+                (Some(_), Some(_)) => {
+                    "image input: supply either `path` or `spec`, not both".into()
+                }
+                _ => "image input: one of `path` or `spec` is required".into(),
+            }));
+        }
+        None => None,
+    };
+    Ok(input.to_prepared(image))
+}
+
 /// Publish a brand-new item: encode → IPFS → derive id → submit.
 pub fn publish_item(
     account: &ChainAccount,
@@ -419,7 +456,7 @@ pub fn publish_item(
             "invalid item flags: {flags:#x}"
         )));
     }
-    let bytes = encode::encode_item(content)?;
+    let bytes = encode::encode_item(&resolve_content(content)?)?;
     let ipfs_hash = crate::ipfs::add(&bytes, "content.bin")?;
     let digest = encode::hex_to_bytes(&ipfs_hash)?;
 
@@ -453,7 +490,7 @@ pub fn publish_revision(
     links: Vec<[u8; 32]>,
     mentions: Vec<[u8; 32]>,
 ) -> Result<chain::TxOutcome, CoordError> {
-    let bytes = encode::encode_item(content)?;
+    let bytes = encode::encode_item(&resolve_content(content)?)?;
     let ipfs_hash = crate::ipfs::add(&bytes, "content.bin")?;
     let digest = encode::hex_to_bytes(&ipfs_hash)?;
     chain::publish_revision(account, item_id, links, mentions, digest)
@@ -490,7 +527,7 @@ pub fn set_profile(
     content: &ContentInput,
 ) -> Result<chain::TxOutcome, CoordError> {
     // Publish the profile item, then link it as the account's profile.
-    let bytes = encode::encode_item(content)?;
+    let bytes = encode::encode_item(&resolve_content(content)?)?;
     let ipfs_hash = crate::ipfs::add(&bytes, "profile.bin")?;
     let digest = encode::hex_to_bytes(&ipfs_hash)?;
     let nonce: [u8; 32] = {

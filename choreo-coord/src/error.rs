@@ -31,6 +31,10 @@ pub enum CoordError {
     #[error("ipfs error: {0}")]
     Ipfs(String),
 
+    /// An image could not be read, decoded, or JPEG-encoded.
+    #[error("image error: {0}")]
+    Image(String),
+
     /// The indexer WebSocket API request failed.
     #[error("indexer error: {0}")]
     Indexer(String),

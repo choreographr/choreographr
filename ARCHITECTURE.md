@@ -56,6 +56,10 @@ Choreographr (workspace)
 │                       (JSON-RPC over stdin/stdout) into choreo-proto messages over the
 │                       daemon's Unix socket, enabling ACP-compatible editors (Claude
 │                       Code, Cline, etc.) to interact with Choreographr sessions
+├── choreo-coord           Choreographr Coordination Platform client — Substrate
+│                       chain writes (subxt via a tokio sidecar), indexer reads,
+│                       IPFS add/cat, content protobuf encode/decode, and the
+│                       publish-time image mipmap pipeline behind the `coord` tools
 ├── choreo-tui             Terminal UI client (ratatui + crossterm)
 ├── choreo-gui             Desktop GUI client (Dioxus)
 └── choreo-im              IM platform bridge (Telegram)
@@ -625,6 +629,27 @@ main()
   confirmation before removing local state.
 - **Streaming:** Prompt responses are streamed from the daemon as `OutputChunk` events, translated
   to ACP `session/update` notifications, and finalized with a JSON-RPC response on `Done`/`Failed`/`Cancelled`.
+
+
+### `choreo-coord` — Coordination Platform client
+
+Implements the always-on `coord` tool group against the Choreographr
+Coordination Platform: a Substrate content registry (publish/retract items,
+revisions, profiles, account pins) with content stored on IPFS and revisions
+resolved through an event indexer. Reads are indexer-first with on-chain
+authority for control state; writes encode content → pin to IPFS → submit the
+extrinsic. Only the subxt submit path uses the tokio sidecar; IPFS (`ureq`)
+and the indexer (`tungstenite`) are synchronous.
+
+| Module | Purpose |
+|---|---|
+| `encode.rs` | Content protocol: protobuf `ItemMessage` mixin encode/decode (pinned to the reference `acuity-dioxus` mixin IDs), deterministic item-id derivation, CID ↔ sha2-256-digest helpers. `ContentInput` is the caller-facing shape — `image: ImageInput` accepts either a local file `path` or a complete `spec`; `encode_item` consumes the resolved `PreparedContent`. |
+| `image.rs` | Publish-time image pipeline (ported from `acuity-dioxus`'s `build_image_mixin`): reads a local image, encodes a JPEG q82 mipmap pyramid (level 0 = full res, halved via Lanczos3 until a dimension ≤ 64), pins every level to IPFS as its own CID, and derives the full `ImageSpec` (dimensions, original-file sha2-256 digest, per-level sizes) so callers of `coord_publish_item`/`coord_publish_revision`/`coord_set_profile` only pass a `path`. |
+| `ipfs.rs` | Blocking IPFS client (`api/v0/add` with pin, `cat`, `id`) over `ureq` with bounded timeouts. |
+| `indexer.rs` | Synchronous WebSocket JSON-RPC client for the event indexer (keyed event queries, index status). |
+| `chain.rs` | subxt extrinsic submission + state reads, signed with the keystore's Substrate credential. |
+| `orchestrate.rs` | The tool-facing read/write pipelines, including `resolve_content()` — the layer that turns a `path`-based `ImageInput` into a full `ImageSpec` via `image.rs` before encoding. |
+| `runtime.rs` | The tokio sidecar runtime used only to drive subxt futures. |
 
 
 ### `choreo-daemon` — Core server (binary `choreographr`)

@@ -26,6 +26,7 @@ pub mod chain;
 pub mod config;
 pub mod encode;
 pub mod error;
+pub mod image;
 pub mod indexer;
 pub mod ipfs;
 pub mod orchestrate;

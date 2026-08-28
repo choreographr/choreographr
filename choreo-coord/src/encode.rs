@@ -191,7 +191,47 @@ pub struct ProfileSpec {
     pub location: String,
 }
 
-/// Input to [`encode_item`]: everything a caller wants in a new item revision.
+/// Caller-supplied image reference for a publish.
+///
+/// The easy path is `path`: the daemon reads the file, builds the JPEG mipmap
+/// pyramid, uploads every level to IPFS, and derives the full [`ImageSpec`]
+/// (see [`crate::image::build_image_spec`]) — the ported `acuity-dioxus`
+/// publishing pipeline. Callers that already have a complete spec (e.g. re-
+/// publishing a previously resolved image) can supply `spec` directly.
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
+)]
+pub struct ImageInput {
+    /// Local file path of the image to read, process, and upload. Mutually
+    /// exclusive with `spec`.
+    pub path: Option<String>,
+    /// Stored filename override; defaults to the file name in `path`.
+    pub filename: Option<String>,
+    /// A fully-specified image reference, used verbatim. Mutually exclusive
+    /// with `path`.
+    pub spec: Option<ImageSpec>,
+}
+
+/// A [`ContentInput`] whose image reference has been resolved into a complete
+/// [`ImageSpec`] — the input [`encode_item`] actually encodes. Built via
+/// [`ContentInput::to_prepared`] (usually through the orchestration layer,
+/// which performs the IPFS work for `path`-based inputs).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreparedContent {
+    pub content_type: ContentType,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    /// BCP-47 language tag; defaults to [`DEFAULT_LANGUAGE_TAG`].
+    pub language: Option<String>,
+    pub image: Option<ImageSpec>,
+    pub profile: Option<ProfileSpec>,
+}
+
+/// Input to a publish: everything a caller wants in a new item revision.
+///
+/// `image` is an [`ImageInput`] so callers can just point at a local file;
+/// it is resolved (reading + uploading as needed) into a [`PreparedContent`]
+/// before encoding.
 #[derive(
     Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
 )]
@@ -201,8 +241,24 @@ pub struct ContentInput {
     pub body: Option<String>,
     /// BCP-47 language tag; defaults to [`DEFAULT_LANGUAGE_TAG`].
     pub language: Option<String>,
-    pub image: Option<ImageSpec>,
+    pub image: Option<ImageInput>,
     pub profile: Option<ProfileSpec>,
+}
+
+impl ContentInput {
+    /// Merge this input with an already-resolved image spec (the result of
+    /// resolving [`ImageInput::path`], or `spec` copied verbatim) into the
+    /// fully-specified form [`encode_item`] consumes.
+    pub fn to_prepared(&self, image: Option<ImageSpec>) -> PreparedContent {
+        PreparedContent {
+            content_type: self.content_type,
+            title: self.title.clone(),
+            body: self.body.clone(),
+            language: self.language.clone(),
+            image,
+            profile: self.profile.clone(),
+        }
+    }
 }
 
 /// The decoded, field-extracted view of an item (what a read tool returns).
@@ -224,7 +280,7 @@ pub struct DecodedItem {
 ///
 /// Returns an error when an embedded image's digest hex or mipmap CID is
 /// malformed (see [`encode_image_mixin`]); a well-formed item always succeeds.
-pub fn encode_item(input: &ContentInput) -> Result<Vec<u8>, crate::CoordError> {
+pub fn encode_item(input: &PreparedContent) -> Result<Vec<u8>, crate::CoordError> {
     let language = input
         .language
         .clone()
@@ -377,7 +433,12 @@ pub fn encode_image_mixin(image: &ImageSpec) -> Result<Vec<u8>, crate::CoordErro
         .map(|l| {
             Ok(MipmapLevelMessage {
                 filesize: l.filesize,
-                ipfs_hash: cid_to_digest_bytes(&l.cid)?,
+                // The reference client (`acuity-dioxus`) stores the FULL
+                // 34-byte multihash (`0x12 0x20 ‖ digest`) in these fields
+                // and turns them into CIDs with a bare `bs58::encode` — so
+                // the header must be present here or its `api/v0/cat` calls
+                // get a base58-of-raw-digest string that Kubo rejects (500).
+                ipfs_hash: cid_to_multihash_bytes(&l.cid)?,
             })
         })
         .collect::<Result<Vec<_>, crate::CoordError>>()?;
@@ -385,7 +446,7 @@ pub fn encode_image_mixin(image: &ImageSpec) -> Result<Vec<u8>, crate::CoordErro
     let message = ImageMixinMessage {
         filename: image.filename.clone(),
         filesize: image.filesize,
-        ipfs_hash: digest_hex_to_bytes(&image.digest_hex)?,
+        ipfs_hash: multihash_bytes(&image.digest_hex)?,
         width: image.width,
         height: image.height,
         mipmap_level: mipmap_levels,
@@ -396,10 +457,13 @@ pub fn encode_image_mixin(image: &ImageSpec) -> Result<Vec<u8>, crate::CoordErro
 /// Decode an `ImageMixinMessage` payload into an [`ImageSpec`], converting each
 /// level's digest back to a CID for display.
 pub fn decode_image_mixin(msg: ImageMixinMessage) -> ImageSpec {
+    // Accept both the reference form (34-byte multihash with the `0x12 0x20`
+    // header) and the legacy form this crate briefly wrote (bare 32-byte
+    // digest) so older items keep decoding.
     ImageSpec {
         filename: msg.filename,
         filesize: msg.filesize,
-        digest_hex: bytes_to_hex(&msg.ipfs_hash),
+        digest_hex: bytes_to_hex(&digest_from_bytes(&msg.ipfs_hash)),
         width: msg.width,
         height: msg.height,
         mipmap_levels: msg
@@ -407,9 +471,19 @@ pub fn decode_image_mixin(msg: ImageMixinMessage) -> ImageSpec {
             .into_iter()
             .map(|l| MipmapLevel {
                 filesize: l.filesize,
-                cid: bytes_to_cid(&l.ipfs_hash),
+                cid: bytes_to_cid(&digest_from_bytes(&l.ipfs_hash)),
             })
             .collect(),
+    }
+}
+
+/// Normalize a mixin hash field to the bare 32-byte digest: strip the sha2-256
+/// multihash header when present, pass raw 32-byte digests through unchanged.
+fn digest_from_bytes(bytes: &[u8]) -> Vec<u8> {
+    if bytes.len() == 34 && bytes[0] == 0x12 && bytes[1] == 0x20 {
+        bytes[2..].to_vec()
+    } else {
+        bytes.to_vec()
     }
 }
 
@@ -458,19 +532,6 @@ pub fn hex_to_bytes(hex_value: &str) -> Result<[u8; 32], crate::CoordError> {
         .map_err(|_| crate::CoordError::Cid(format!("expected 32 bytes for {hex_value}")))
 }
 
-/// Convenience [`hex_to_bytes`] returning a `Vec<u8>` for the mixin message.
-///
-/// Returns an error rather than silently producing empty bytes so a malformed
-/// digest fails loudly instead of encoding a wrong (empty) payload.
-fn hex_to_bytes_vec(hex_value: &str) -> Result<Vec<u8>, crate::CoordError> {
-    Ok(hex_to_bytes(hex_value)?.to_vec())
-}
-
-/// `0x`-prefixed digest hex -> raw digest bytes, for the protobuf mixin.
-fn digest_hex_to_bytes(hex_value: &str) -> Result<Vec<u8>, crate::CoordError> {
-    hex_to_bytes_vec(hex_value)
-}
-
 /// sha2-256 digest hex (`0x`) -> IPFS CIDv0 (Base58), prefixing the
 /// `0x12 0x20` multihash header.
 pub fn digest_hex_to_cid(hex_value: &str) -> Result<String, crate::CoordError> {
@@ -493,6 +554,28 @@ pub fn cid_to_digest_hex(cid: &str) -> Result<String, crate::CoordError> {
         )));
     }
     Ok(format!("0x{}", hex::encode(&multihash[2..])))
+}
+
+/// `0x`-prefixed digest hex -> raw digest bytes, for the protobuf mixin.
+fn multihash_bytes(hex_value: &str) -> Result<Vec<u8>, crate::CoordError> {
+    let digest = hex_to_bytes(hex_value)?;
+    let mut multihash = Vec::with_capacity(34);
+    multihash.push(0x12);
+    multihash.push(0x20);
+    multihash.extend_from_slice(&digest);
+    Ok(multihash)
+}
+
+/// IPFS CIDv0 -> full multihash bytes (with the `0x12 0x20` header), for the
+/// protobuf mixin — the reference wire form. Validates the multihash shape
+/// and the 32-byte digest length like [`cid_to_digest_bytes`].
+fn cid_to_multihash_bytes(cid: &str) -> Result<Vec<u8>, crate::CoordError> {
+    let digest = cid_to_digest_bytes(cid)?;
+    let mut multihash = Vec::with_capacity(34);
+    multihash.push(0x12);
+    multihash.push(0x20);
+    multihash.extend_from_slice(&digest);
+    Ok(multihash)
 }
 
 /// Raw 32-byte digest -> IPFS CIDv0 (Base58).
@@ -585,6 +668,51 @@ mod tests {
     }
 
     #[test]
+    fn image_mixin_stores_reference_multihash_form() {
+        // acuity-dioxus turns `mipmap_level.ipfs_hash` into a CID with a bare
+        // `bs58::encode`, so the bytes must be a full 34-byte sha2-256
+        // multihash — not the bare digest (which yields an unparseable CID
+        // and a Kubo 500). Regression for the interop break.
+        let digest = format!("0x{}", "22".repeat(32));
+        let cid = digest_hex_to_cid(&digest).unwrap();
+        let input = spec_input("photo.jpg", &digest, &cid);
+        let payload = encode_image_mixin(prepare(&input).image.as_ref().unwrap()).unwrap();
+        let msg = ImageMixinMessage::decode(payload.as_slice()).unwrap();
+
+        let expected_multihash = [[0x12u8, 0x20].as_slice(), &[0x22u8; 32]].concat();
+        assert_eq!(msg.ipfs_hash, expected_multihash);
+        assert_eq!(msg.mipmap_level[0].ipfs_hash, expected_multihash);
+
+        // Round-trips through decode (both spec fields come back as before).
+        let decoded = decode_image_mixin(msg);
+        assert_eq!(decoded.digest_hex, digest);
+        assert_eq!(decoded.mipmap_levels[0].cid, cid);
+    }
+
+    #[test]
+    fn decode_image_mixin_accepts_legacy_bare_digests() {
+        // Items published before the multihash fix carried the raw 32-byte
+        // digest; they must still decode to the same spec fields.
+        let msg = ImageMixinMessage {
+            filename: "legacy.jpg".into(),
+            filesize: 1,
+            ipfs_hash: vec![0x22; 32],
+            width: 10,
+            height: 10,
+            mipmap_level: vec![MipmapLevelMessage {
+                filesize: 1,
+                ipfs_hash: vec![0x22; 32],
+            }],
+        };
+        let decoded = decode_image_mixin(msg);
+        assert_eq!(decoded.digest_hex, format!("0x{}", "22".repeat(32)));
+        assert_eq!(
+            decoded.mipmap_levels[0].cid,
+            digest_hex_to_cid(&format!("0x{}", "22".repeat(32))).unwrap()
+        );
+    }
+
+    #[test]
     fn encode_decode_document_round_trip() {
         let input = ContentInput {
             content_type: ContentType::Document,
@@ -594,7 +722,7 @@ mod tests {
             image: None,
             profile: None,
         };
-        let bytes = encode_item(&input).unwrap();
+        let bytes = encode_item(&input.to_prepared(None)).unwrap();
         let decoded = decode_item(&bytes).unwrap();
 
         assert_eq!(decoded.content_type, ContentType::Document);
@@ -615,7 +743,8 @@ mod tests {
             image: None,
             profile: None,
         };
-        let item = ItemMessage::decode(encode_item(&input).unwrap().as_slice()).unwrap();
+        let item =
+            ItemMessage::decode(encode_item(&input.to_prepared(None)).unwrap().as_slice()).unwrap();
         assert_eq!(infer_content_type(&item), ContentType::Feed);
         assert!(
             item.mixin_payload
@@ -641,7 +770,9 @@ mod tests {
             image: None,
             profile: None,
         };
-        let c_item = ItemMessage::decode(encode_item(&comment).unwrap().as_slice()).unwrap();
+        let c_item =
+            ItemMessage::decode(encode_item(&comment.to_prepared(None)).unwrap().as_slice())
+                .unwrap();
         assert_eq!(infer_content_type(&c_item), ContentType::Comment);
 
         let profile = ContentInput {
@@ -655,9 +786,11 @@ mod tests {
                 location: "Earth".into(),
             }),
         };
-        let p_item = ItemMessage::decode(encode_item(&profile).unwrap().as_slice()).unwrap();
+        let p_item =
+            ItemMessage::decode(encode_item(&profile.to_prepared(None)).unwrap().as_slice())
+                .unwrap();
         assert_eq!(infer_content_type(&p_item), ContentType::Profile);
-        let decoded = decode_item(&encode_item(&profile).unwrap()).unwrap();
+        let decoded = decode_item(&encode_item(&profile.to_prepared(None)).unwrap()).unwrap();
         assert_eq!(decoded.content_type, ContentType::Profile);
         assert_eq!(decoded.title.as_deref(), Some("Alice"));
         assert_eq!(
@@ -667,30 +800,47 @@ mod tests {
         assert_eq!(decoded.profile.as_ref().map(|p| p.account_type), Some(2));
     }
 
-    #[test]
-    fn encode_decode_image_round_trip() {
-        let digest = format!("0x{}", "22".repeat(32));
-        let input = ContentInput {
+    /// A fully-specified image input built from the parts the tests vary.
+    fn spec_input(filename: &str, digest_hex: &str, cid: &str) -> ContentInput {
+        ContentInput {
             content_type: ContentType::Image,
             title: None,
             body: None,
             language: None,
-            image: Some(ImageSpec {
-                filename: "photo.jpg".into(),
-                filesize: 12345,
-                digest_hex: digest.clone(),
-                width: 800,
-                height: 600,
-                mipmap_levels: vec![MipmapLevel {
-                    filesize: 100,
-                    cid: digest_hex_to_cid(&digest).unwrap(),
-                }],
+            image: Some(ImageInput {
+                path: None,
+                filename: None,
+                spec: Some(ImageSpec {
+                    filename: filename.into(),
+                    filesize: 12345,
+                    digest_hex: digest_hex.into(),
+                    width: 800,
+                    height: 600,
+                    mipmap_levels: vec![MipmapLevel {
+                        filesize: 100,
+                        cid: cid.into(),
+                    }],
+                }),
             }),
             profile: None,
-        };
-        let item = ItemMessage::decode(encode_item(&input).unwrap().as_slice()).unwrap();
+        }
+    }
+
+    /// Prepare a [`ContentInput`] for encoding the way the orchestration
+    /// layer does: copy a `spec`-based image through, drop `path`-based ones
+    /// (those need IPFS and are covered in `image.rs`'s tests instead).
+    fn prepare(input: &ContentInput) -> PreparedContent {
+        input.to_prepared(input.image.as_ref().and_then(|i| i.spec.clone()))
+    }
+
+    #[test]
+    fn encode_decode_image_round_trip() {
+        let digest = format!("0x{}", "22".repeat(32));
+        let input = spec_input("photo.jpg", &digest, &digest_hex_to_cid(&digest).unwrap());
+        let prepared = prepare(&input);
+        let item = ItemMessage::decode(encode_item(&prepared).unwrap().as_slice()).unwrap();
         assert_eq!(infer_content_type(&item), ContentType::Image);
-        let decoded = decode_item(&encode_item(&input).unwrap()).unwrap();
+        let decoded = decode_item(&encode_item(&prepared).unwrap()).unwrap();
         let image = decoded.image.expect("image should decode");
         assert_eq!(image.filename, "photo.jpg");
         assert_eq!(image.filesize, 12345);
@@ -731,45 +881,14 @@ mod tests {
     fn encode_item_rejects_malformed_image_digest() {
         // A malformed image digest must fail the whole encode rather than
         // silently producing a payload with an empty `ipfs_hash`.
-        let input = ContentInput {
-            content_type: ContentType::Image,
-            title: None,
-            body: None,
-            language: None,
-            image: Some(ImageSpec {
-                filename: "bad.jpg".into(),
-                filesize: 1,
-                digest_hex: "0xnothex".into(),
-                width: 0,
-                height: 0,
-                mipmap_levels: vec![],
-            }),
-            profile: None,
-        };
-        assert!(encode_item(&input).is_err());
+        let input = spec_input("bad.jpg", "0xnothex", "unused");
+        assert!(encode_item(&prepare(&input)).is_err());
     }
 
     #[test]
     fn encode_item_rejects_malformed_mipmap_cid() {
         // A malformed mipmap CID must fail the whole encode too.
-        let input = ContentInput {
-            content_type: ContentType::Image,
-            title: None,
-            body: None,
-            language: None,
-            image: Some(ImageSpec {
-                filename: "b.jpg".into(),
-                filesize: 1,
-                digest_hex: format!("0x{}", "22".repeat(32)),
-                width: 0,
-                height: 0,
-                mipmap_levels: vec![MipmapLevel {
-                    filesize: 1,
-                    cid: "not-a-cid".into(),
-                }],
-            }),
-            profile: None,
-        };
-        assert!(encode_item(&input).is_err());
+        let input = spec_input("b.jpg", &format!("0x{}", "22".repeat(32)), "not-a-cid");
+        assert!(encode_item(&prepare(&input)).is_err());
     }
 }

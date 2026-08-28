@@ -37,6 +37,10 @@ rand.workspace = true
 sp-crypto-hashing.workspace = true
 # Base58 for CID <-> sha2-256-digest conversion.
 bs58.workspace = true
+# Raster image decode/encode for the publish-time mipmap pyramid builder.
+image.workspace = true
+# sha2-256 digests of published image files (the image mixin's `ipfs_hash`).
+sha2.workspace = true
 # Synchronous WebSocket client for the indexer's JSON-RPC API (no tokio).
 tungstenite.workspace = true
 # Blocking HTTP client for the local IPFS daemon (add/cat).
