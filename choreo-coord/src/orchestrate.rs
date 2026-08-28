@@ -228,17 +228,25 @@ pub fn item_image(
     })
 }
 
-/// Resolve a single revision's IPFS hash (and its revision counter) from the
-/// indexer, defaulting to the latest revision when none is requested.
-fn resolve_revision(
-    item_id_hex: &str,
-    revision_id: Option<u32>,
-) -> Result<(u32, String), CoordError> {
-    let events = indexer::get_events(&indexer::item_id_key(item_id_hex)?, 512, None)?;
-    // Collect PublishRevision events, newest first.
-    let mut revisions: Vec<RevisionEntry> = events
+/// Build the revision history for an item from decoded indexer events,
+/// sorted newest-first (revision id, then block height as tie-breaker).
+///
+/// The indexer tags each event by every `item_id` it references — its own
+/// `item_id` plus any ids in `links`/`parents` — so a linked item's revision
+/// events appear alongside this item's own. Only events whose `item_id`
+/// field matches the queried item are revisions of it; all others are edges
+/// of unrelated items and must be excluded.
+/// Pure so it can be unit-tested without the indexer.
+fn revision_entries_from_events(item_id_hex: &str, events: &[DecodedEvent]) -> Vec<RevisionEntry> {
+    events
         .iter()
         .filter(|e| e.pallet_name() == "Content" && e.event_name() == "PublishRevision")
+        // The event's own item_id must match the queried item; hex case is
+        // normalized by the indexer but compare leniently regardless.
+        .filter(|e| {
+            e.field_str("item_id")
+                .is_some_and(|id| id.eq_ignore_ascii_case(item_id_hex))
+        })
         .filter_map(|e| {
             let rev = e.field_u64("revision_id")? as u32;
             let hash = e.field_str("ipfs_hash")?.to_string();
@@ -249,9 +257,29 @@ fn resolve_revision(
                 timestamp: Some(e.timestamp),
             })
         })
-        .collect();
-    // The indexer returns newer-first typically; sort descending by revision.
-    revisions.sort_by_key(|r| std::cmp::Reverse(r.revision_id));
+        .collect()
+}
+
+/// Sort revisions newest-first. Block height breaks ties so that equal
+/// revision ids (e.g. revision 0 across different items) resolve
+/// deterministically.
+fn sort_revisions_newest_first(revisions: &mut [RevisionEntry]) {
+    revisions.sort_by(|a, b| {
+        b.revision_id
+            .cmp(&a.revision_id)
+            .then_with(|| b.block_number.cmp(&a.block_number))
+    });
+}
+
+/// Resolve a single revision's IPFS hash (and its revision counter) from the
+/// indexer, defaulting to the latest revision when none is requested.
+fn resolve_revision(
+    item_id_hex: &str,
+    revision_id: Option<u32>,
+) -> Result<(u32, String), CoordError> {
+    let events = indexer::get_events(&indexer::item_id_key(item_id_hex)?, 512, None)?;
+    let mut revisions = revision_entries_from_events(item_id_hex, &events);
+    sort_revisions_newest_first(&mut revisions);
 
     let entry = match revision_id {
         Some(target) => revisions
@@ -272,19 +300,8 @@ fn resolve_revision(
 /// Full revision history of an item, newest-first.
 pub fn revisions(item_id_hex: &str) -> Result<Vec<RevisionEntry>, CoordError> {
     let events = indexer::get_events(&indexer::item_id_key(item_id_hex)?, 512, None)?;
-    let mut list: Vec<RevisionEntry> = events
-        .iter()
-        .filter(|e| e.pallet_name() == "Content" && e.event_name() == "PublishRevision")
-        .filter_map(|e| {
-            Some(RevisionEntry {
-                revision_id: e.field_u64("revision_id")? as u32,
-                ipfs_hash_hex: e.field_str("ipfs_hash")?.to_string(),
-                block_number: Some(e.block_number),
-                timestamp: Some(e.timestamp),
-            })
-        })
-        .collect();
-    list.sort_by_key(|r| std::cmp::Reverse(r.revision_id));
+    let mut list = revision_entries_from_events(item_id_hex, &events);
+    sort_revisions_newest_first(&mut list);
     Ok(list)
 }
 
@@ -586,5 +603,110 @@ mod tests {
         // Decode only needs a valid-looking 32-byte digest; this checks the
         // hex prefix routing without hitting IPFS.
         assert!(encode::hex_to_bytes("0x1234").is_err());
+    }
+
+    fn publish_revision_event(
+        block_number: u32,
+        item_id: &str,
+        revision_id: u32,
+        ipfs_hash: &str,
+    ) -> DecodedEvent {
+        DecodedEvent {
+            block_number,
+            event_index: 1,
+            timestamp: 1_700_000_000_000,
+            event: crate::indexer::StoredEvent {
+                pallet_name: "Content".into(),
+                event_name: "PublishRevision".into(),
+                pallet_index: 7,
+                variant_index: 3,
+                event_index: 1,
+                fields: serde_json::json!({
+                    "item_id": item_id,
+                    "ipfs_hash": ipfs_hash,
+                    "revision_id": revision_id,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn revision_entries_exclude_linked_items_revisions() {
+        // Mirrors the feed collision: a linked item's PublishRevision is also
+        // tagged with this item's id and carries the same revision_id 0.
+        let own_id = format!("0x{}", "aa".repeat(32));
+        let linked_id = format!("0x{}", "bb".repeat(32));
+        let own_hash = format!("0x{}", "11".repeat(32));
+        let linked_hash = format!("0x{}", "22".repeat(32));
+
+        // Newest-first input, as the indexer returns events.
+        let events = vec![
+            publish_revision_event(2804, &linked_id, 0, &linked_hash),
+            publish_revision_event(2324, &own_id, 0, &own_hash),
+        ];
+
+        let entries = revision_entries_from_events(&own_id, &events);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ipfs_hash_hex, own_hash);
+        assert_eq!(entries[0].revision_id, 0);
+        assert_eq!(entries[0].block_number, Some(2324));
+    }
+
+    #[test]
+    fn revision_entries_ignore_non_revision_and_mismatched_events() {
+        let own_id = format!("0x{}", "aa".repeat(32));
+        let other_id = format!("0x{}", "bb".repeat(32));
+        let mut other_pallet =
+            publish_revision_event(3000, &own_id, 1, &format!("0x{}", "33".repeat(32)));
+        other_pallet.event.pallet_name = "Balances".into();
+
+        let events = vec![
+            other_pallet,
+            publish_revision_event(2900, &other_id, 1, &format!("0x{}", "44".repeat(32))),
+            publish_revision_event(100, &own_id, 0, &format!("0x{}", "11".repeat(32))),
+        ];
+
+        let entries = revision_entries_from_events(&own_id, &events);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].revision_id, 0);
+    }
+
+    #[test]
+    fn sort_revisions_breaks_equal_revision_id_ties_by_block() {
+        let mut revisions = vec![
+            RevisionEntry {
+                revision_id: 1,
+                ipfs_hash_hex: format!("0x{}", "22".repeat(32)),
+                block_number: Some(2804),
+                timestamp: None,
+            },
+            RevisionEntry {
+                revision_id: 1,
+                ipfs_hash_hex: format!("0x{}", "33".repeat(32)),
+                block_number: Some(3000),
+                timestamp: None,
+            },
+            RevisionEntry {
+                revision_id: 2,
+                ipfs_hash_hex: format!("0x{}", "44".repeat(32)),
+                block_number: Some(100),
+                timestamp: None,
+            },
+        ];
+
+        sort_revisions_newest_first(&mut revisions);
+
+        let hashes: Vec<&str> = revisions.iter().map(|r| r.ipfs_hash_hex.as_str()).collect();
+        // revision 2 first, then revision 1 by descending block height.
+        assert_eq!(
+            hashes,
+            vec![
+                format!("0x{}", "44".repeat(32)),
+                format!("0x{}", "33".repeat(32)),
+                format!("0x{}", "22".repeat(32)),
+            ]
+        );
     }
 }
