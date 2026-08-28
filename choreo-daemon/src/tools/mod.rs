@@ -690,6 +690,7 @@ impl ToolRegistry {
         reg.register(coord::CoordAccountItems);
         reg.register(coord::CoordProfile);
         reg.register(coord::CoordDecodeContent);
+        reg.register(coord::CoordImage);
         reg.register(coord::CoordStatus);
         reg.register(coord::CoordPublishItem);
         reg.register(coord::CoordPublishRevision);
@@ -1154,6 +1155,7 @@ mod tests {
             "coord_account_items",
             "coord_profile",
             "coord_decode_content",
+            "coord_image",
             "coord_status",
             "coord_publish_item",
             "coord_publish_revision",

@@ -161,6 +161,73 @@ pub fn item(item_id_hex: &str, revision_id: Option<u32>) -> Result<ResolvedItem,
     })
 }
 
+/// An item's embedded image fetched from IPFS, ready for display.
+#[derive(Clone, Debug)]
+pub struct ItemImage {
+    /// Full-resolution dimensions declared in the image mixin.
+    pub width: u32,
+    pub height: u32,
+    /// The mipmap level that was fetched (0 = full resolution).
+    pub level: u32,
+    /// IPFS CID (Base58) of the fetched level.
+    pub cid: String,
+    /// Declared byte size of this level.
+    pub filesize: u64,
+    /// The raw image bytes (JPEG, per the reference encoder).
+    pub data: Vec<u8>,
+}
+
+/// Pick a mipmap level from a decoded [`ImageSpec`], validating the request
+/// against the available levels. Pure so it can be unit-tested without IPFS.
+fn select_image_level(
+    image: &encode::ImageSpec,
+    level: Option<u32>,
+) -> Result<(usize, encode::MipmapLevel), crate::CoordError> {
+    if image.mipmap_levels.is_empty() {
+        // The reference protocol encodes images purely as a mipmap pyramid
+        // (level 0 = full-res); an image mixin without levels carries nothing
+        // retrievable.
+        return Err(crate::CoordError::Content(
+            "image mixin has no mipmap levels".into(),
+        ));
+    }
+    let index = level.unwrap_or(0) as usize;
+    let spec = image.mipmap_levels.get(index).ok_or_else(|| {
+        crate::CoordError::Content(format!(
+            "mipmap level {} out of range (item has {} levels)",
+            index,
+            image.mipmap_levels.len()
+        ))
+    })?;
+    Ok((index, spec.clone()))
+}
+
+/// Fetch an item's embedded image from IPFS: resolve the revision's content
+/// hash, decode the image mixin, and `cat` the requested mipmap level
+/// (`level = 0` is the full-resolution encode; `None` defaults to it).
+pub fn item_image(
+    item_id_hex: &str,
+    revision_id: Option<u32>,
+    level: Option<u32>,
+) -> Result<ItemImage, crate::CoordError> {
+    let (_revision, ipfs_hash) = resolve_revision(item_id_hex, revision_id)?;
+    let bytes = crate::ipfs::cat(&ipfs_hash)?;
+    let content = encode::decode_item(&bytes)?;
+    let image = content.image.ok_or_else(|| {
+        crate::CoordError::Content(format!("item {item_id_hex} has no embedded image"))
+    })?;
+    let (index, spec) = select_image_level(&image, level)?;
+    let data = crate::ipfs::cat_by_cid(&spec.cid)?;
+    Ok(ItemImage {
+        width: image.width,
+        height: image.height,
+        level: index as u32,
+        cid: spec.cid,
+        filesize: spec.filesize,
+        data,
+    })
+}
+
 /// Resolve a single revision's IPFS hash (and its revision counter) from the
 /// indexer, defaulting to the latest revision when none is requested.
 fn resolve_revision(
@@ -462,6 +529,36 @@ pub mod ipfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_image(levels: u32) -> encode::ImageSpec {
+        encode::ImageSpec {
+            width: 1012,
+            height: 1012,
+            mipmap_levels: (0..levels)
+                .map(|i| encode::MipmapLevel {
+                    filesize: 121_846 >> i,
+                    cid: format!("QmSample{i}"),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn select_image_level_defaults_to_full_res_and_validates() {
+        let image = sample_image(3);
+        // None defaults to level 0 (full resolution).
+        let (i, spec) = select_image_level(&image, None).unwrap();
+        assert_eq!(i, 0);
+        assert_eq!(spec.filesize, 121_846);
+        // An explicit level resolves.
+        let (i, _) = select_image_level(&image, Some(2)).unwrap();
+        assert_eq!(i, 2);
+        // Out-of-range levels are rejected, not silently clamped.
+        assert!(select_image_level(&image, Some(3)).is_err());
+        // A level-less image mixin carries nothing retrievable.
+        assert!(select_image_level(&sample_image(0), None).is_err());
+    }
 
     #[test]
     fn lifecycle_and_account_action_serde() {

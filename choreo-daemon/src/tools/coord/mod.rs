@@ -17,7 +17,7 @@
 //! [`ToolExecError`] when no Substrate credential is present. The read tools
 //! need no credential and ignore it.
 
-use crate::tools::{Tool, ToolExecError};
+use super::{Tool, ToolExecError, truncate_tool_output};
 use choreo_coord::chain::ChainAccount;
 use choreo_coord::encode::{ContentInput, bytes_to_hex, hex_to_bytes};
 use choreo_coord::indexer::QueryKey;
@@ -543,6 +543,127 @@ fn execute_coord_lifecycle(
     ))
 }
 
+// ── coord_image: fetch an item's embedded image and feed it to vision ──────
+
+pub(crate) struct CoordImage;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CoordImageArgs {
+    /// `0x` hex item id whose embedded image to fetch.
+    pub item_id: String,
+    /// Specific revision to read; defaults to the latest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<u32>,
+    /// Mipmap level to fetch (0 = full resolution, deeper levels are halved
+    /// previews). Defaults to 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<u32>,
+}
+
+/// Return value carrying both the text handle and the image reference the
+/// framework's `extract_image_ref` hook feeds to vision models (mirrors
+/// `read_image`'s design; the reference travels on the per-invocation return
+/// value, not shared state).
+#[derive(Debug)]
+pub struct CoordImageReturn {
+    pub text: String,
+    pub reference: choreo_proto::ImageReference,
+}
+
+impl Serialize for CoordImageReturn {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+impl JsonSchema for CoordImageReturn {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("CoordImageReturn")
+    }
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string" })
+    }
+}
+
+impl super::Tool for CoordImage {
+    type Args = CoordImageArgs;
+    type Return = CoordImageReturn;
+    type Error = ToolExecError;
+
+    fn name(&self) -> &'static str {
+        "coord_image"
+    }
+    fn group(&self) -> &'static str {
+        GROUP
+    }
+    fn description(&self) -> &'static str {
+        "Fetch an item's embedded image from the Choreographr Coordination Platform (via IPFS) and provide it to a vision-capable model. Returns dimensions, mipmap level, and CID, and feeds the image to the model on the next request."
+    }
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        match (args.level, args.revision_id) {
+            (Some(l), _) => format!(
+                "Fetching image of item {} (mipmap level {l}).",
+                args.item_id
+            ),
+            (None, Some(r)) => format!("Fetching image of item {} (revision {r}).", args.item_id),
+            (None, None) => format!("Fetching image of item {}.", args.item_id),
+        }
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.text.clone()
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        _working_dir: Option<&Path>,
+        _ctx: Option<&super::context::ToolContext>,
+    ) -> Result<Self::Return, Self::Error> {
+        let img =
+            choreo_coord::orchestrate::item_image(&args.item_id, args.revision_id, args.level)
+                .map_err(|e| ToolExecError(e.to_string()))?;
+        // Normalize the fetched bytes the same way `read_image` does so the
+        // reference carries a known-good MIME and bounded dimensions.
+        let prep = crate::image_prep::normalize_bytes(&img.data)
+            .map_err(|e| ToolExecError(format!("failed to normalize fetched image: {e}")))?;
+        let byte_len = prep.data.len();
+        let text = truncate_tool_output(&format!(
+            "fetched image: item {} level {} ({}) {}x{}, {}",
+            args.item_id,
+            img.level,
+            img.cid,
+            prep.width,
+            prep.height,
+            humfmt::bytes(byte_len as u64),
+        ));
+        tracing::info!(
+            item_id = %args.item_id,
+            level = img.level,
+            cid = %img.cid,
+            width = prep.width,
+            height = prep.height,
+            bytes = byte_len,
+            "coord_image: fetched embedded image"
+        );
+        Ok(CoordImageReturn {
+            reference: choreo_proto::ImageReference {
+                path: format!("ipfs:{}", img.cid),
+                mime_type: prep.mime_type.to_string(),
+                width: prep.width,
+                height: prep.height,
+                data: prep.data,
+            },
+            text,
+        })
+    }
+
+    fn extract_image_ref(&self, ret: &Self::Return) -> Option<choreo_proto::ImageReference> {
+        Some(ret.reference.clone())
+    }
+}
+
 coord_tool!(
     CoordLifecycle,
     "coord_lifecycle",
@@ -729,10 +850,30 @@ fn format_decoded_content(content: &choreo_coord::encode::DecodedItem) -> String
         out.push_str(&format!("language: {language}\n"));
     }
     if let Some(image) = &content.image {
-        out.push_str(&format!(
-            "image: filename={} filesize={} digest_hex={} {}x{}\n",
-            image.filename, image.filesize, image.digest_hex, image.width, image.height,
-        ));
+        out.push_str(&format!("image: {}x{}", image.width, image.height,));
+        // The reference protocol leaves filename/filesize/full-res digest empty
+        // and stores the image purely as a mipmap pyramid (level 0 is the
+        // full-resolution encode), so surface the levels instead of the
+        // always-empty scalar fields.
+        if !image.filename.is_empty() {
+            out.push_str(&format!(" filename={}", image.filename));
+        }
+        if image.filesize > 0 {
+            out.push_str(&format!(" filesize={}", image.filesize));
+        }
+        if image.digest_hex != "0x" && !image.digest_hex.is_empty() {
+            out.push_str(&format!(" digest_hex={}", image.digest_hex));
+        }
+        out.push('\n');
+        for (i, level) in image.mipmap_levels.iter().enumerate() {
+            // Level 0 is the full-resolution image; deeper levels are
+            // successively halved previews (down to <=64px).
+            let note = if i == 0 { " (full-res)" } else { "" };
+            out.push_str(&format!(
+                "  mipmap[{i}]: cid={} filesize={}{note}\n",
+                level.cid, level.filesize,
+            ));
+        }
     }
     if let Some(profile) = &content.profile {
         out.push_str(&format!(

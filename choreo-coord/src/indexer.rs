@@ -72,7 +72,15 @@ impl QueryKey {
     }
 }
 
-/// Build a top-level `CustomKey` object `{"name":..., "kind":..., "value":...}`.
+/// Build the wire `Key` object for `acuity_getEvents`/`acuity_subscribeEvents`.
+/// The indexer's `Key` enum is tagged `#[serde(tag = "type", content = "value")]`,
+/// so the `CustomKey` payload must be wrapped as `{"type":"Custom","value":…}`;
+/// sending the bare `CustomKey` fails to deserialize with `invalid_key`.
+fn wire_key(custom: Value) -> Value {
+    serde_json::json!({ "type": "Custom", "value": custom })
+}
+
+/// Build the inner `CustomKey` object `{"name":..., "kind":..., "value":...}`.
 fn custom_key(name: &str, kind: &str, value: Value) -> Value {
     serde_json::json!({ "name": name, "kind": kind, "value": value })
 }
@@ -94,9 +102,11 @@ pub struct DecodedEvent {
     pub event: StoredEvent,
 }
 
-/// The decoded event shape (snake-case, matching the indexer's `StoredEvent`).
+/// The decoded event shape. The indexer serializes this camelCase
+/// (`palletName`, `eventName`, …) per its documented `acuity_getEvents`
+/// response format, so we must mirror that here.
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct StoredEvent {
     pub pallet_name: String,
     pub event_name: String,
@@ -226,7 +236,7 @@ pub fn get_events(
     before: Option<(u32, u32)>,
 ) -> Result<Vec<DecodedEvent>, CoordError> {
     let mut conn = Connection::open()?;
-    let key_json = key.to_custom_key();
+    let key_json = wire_key(key.to_custom_key());
     let params = serde_json::json!({
         "key": key_json,
         "limit": limit,
@@ -264,6 +274,18 @@ pub fn item_revision_key(item_id_hex: &str, revision_id: u32) -> Result<QueryKey
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_key_wraps_custom_key() {
+        // The get_events params must carry the tagged `Key` shape the indexer
+        // deserializes, not the bare CustomKey.
+        let item_id = [0x11u8; 32];
+        let key = wire_key(QueryKey::ItemId(item_id).to_custom_key());
+        assert_eq!(key["type"], "Custom");
+        assert_eq!(key["value"]["name"], "item_id");
+        assert_eq!(key["value"]["kind"], "bytes32");
+        assert_eq!(key["value"]["value"], bytes_to_hex(&item_id));
+    }
 
     #[test]
     fn query_key_wire_shapes() {
