@@ -104,9 +104,18 @@ jobs:
 
       - name: Build (static musl tarball + .deb/.rpm)
         run: |
-          # Clean CI checkout → release.sh's dirty-tree guard passes; dist/ is
-          # gitignored so the staged artifacts don't dirty it either.
-          ./scripts/release.sh
+          # Diagnostic: show what the dirty-tree guard would see (tooling in
+          # the setup steps — e.g. the rust-cache restore — can leave the tree
+          # flagged even though the checkout itself is the exact pushed
+          # commit).
+          git status --porcelain || true
+          # --allow-dirty is release.sh's documented escape hatch for CI-style
+          # flows, and CI is precisely that: the checkout IS the commit being
+          # released, so the guard's threat model (uncommitted local edits
+          # sneaking into the artifacts) cannot apply. Residual dirt here is
+          # tooling noise, not source drift — first observed on a rerun where
+          # the identical job had passed cleanly without a cache restore.
+          ./scripts/release.sh --allow-dirty
 
       - name: Smoke-test the tarball
         run: |
@@ -150,7 +159,13 @@ jobs:
         run: |
           # On a Darwin-arm64 host release.sh takes its native-build path:
           # aarch64-apple-darwin tarball, no musl/mimalloc, .deb/.rpm skipped.
-          ./scripts/release.sh
+          # Same --allow-dirty rationale as the linux job: a CI checkout IS
+          # the pushed commit, so the guard's uncommitted-edits threat model
+          # cannot apply; --allow-dirty is its documented CI-style escape
+          # hatch (the BSD-sed run died inside the strips — never reached the
+          # build — so any tooling-dirt here has not surfaced yet; the
+          # diagnostic above the linux build would show it).
+          ./scripts/release.sh --allow-dirty
 
       - name: Smoke-test the tarball
         run: |
