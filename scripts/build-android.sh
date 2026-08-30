@@ -133,18 +133,17 @@ if [ -z "${ANDROID_HOME:-}" ]; then
     fi
     export ANDROID_HOME
 fi
-if [ -n "$NDK_VERSION" ]; then
+# Layout validation (read-only — this script NEVER writes outside the
+# project; anything needing root is documented, not done silently): the NDK
+# found above is enough for cargo-ndk (suite binaries). The ANDROID_HOME/ndk
+# symlink convention is only needed by dx/gradle (the GUI APK build, see the
+# gui-android recipe); if it is missing here we note it and move on.
+if [ -n "$NDK_VERSION" ] && [ -n "${ANDROID_HOME:-}" ]; then
     ndk_link="$ANDROID_HOME/ndk/$NDK_VERSION"
-    # Only heal the layout when it is missing or already a (possibly stale)
-    # symlink — never overwrite a real NDK directory. Best-effort: if the link
-    # already resolves to the same NDK (or we lack permission to touch a
-    # root-owned SDK dir), that is not an error — the layout is usable.
-    if [ ! -e "$ndk_link" ] || [ -L "$ndk_link" ]; then
-        current="$(readlink -f "$ndk_link" 2>/dev/null || true)"
-        if [ "$current" != "$(readlink -f "$NDK_DIR")" ]; then
-            ln -sfn "$NDK_DIR" "$ndk_link" 2>/dev/null \
-                || log "note: could not update $ndk_link (permissions); it is $current"
-        fi
+    if [ ! -e "$ndk_link" ]; then
+        log "note: $ndk_link does not exist — fine for this script (cargo-ndk uses $NDK_DIR directly),"
+        log "      but dx/gradle (gui-android) will need it. One-time root setup:"
+        log "        sudo mkdir -p '$ANDROID_HOME/ndk' && sudo ln -sfn '$NDK_DIR' '$ndk_link'"
     fi
 fi
 export ANDROID_NDK_HOME="$NDK_DIR"

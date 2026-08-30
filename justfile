@@ -165,27 +165,31 @@ android-check:
 # Self-sufficient: the `android` CLI (cmdline-tools 23+) replaces the old
 # sdkmanager and auto-accepts licenses, so any SDK packages gradle wants
 # (platform, build-tools) are fetched here on first run instead of failing
-# mid-build. Set ANDROID_HOME/ANDROID_NDK_HOME first — dx/gradle only discover
-# the NDK under ANDROID_HOME/ndk, never via ANDROID_NDK_HOME.
+# mid-build. Root-requiring setup (the ANDROID_HOME/ndk symlink for the AUR
+# standalone-NDK layout) is NOT attempted here — one-time setup is validated
+# below with exact instructions; everything else runs as the normal user.
 gui-android args="":
     #!/usr/bin/env bash
     set -euo pipefail
+    # Read-only env normalization (see build-android.sh): dx/gradle only look
+    # for the NDK under ANDROID_HOME/ndk, never via ANDROID_NDK_HOME.
     if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -d /opt/android-ndk ]; then
         export ANDROID_NDK_HOME=/opt/android-ndk
     fi
     if [ -z "${ANDROID_HOME:-}" ] && [ -d /opt/android-sdk ]; then
         export ANDROID_HOME=/opt/android-sdk
     fi
-    # Heal the ANDROID_HOME/ndk/<version> layout the same way build-android.sh
-    # does (see that script's normalization comment) — dx/gradle need it.
-    if [ -n "${ANDROID_HOME:-}" ] && [ -n "${ANDROID_NDK_HOME:-}" ] \
-        && [ -f "$ANDROID_NDK_HOME/source.properties" ]; then
-        ver="$(sed -n 's/^Pkg.Revision *= *//p' "$ANDROID_NDK_HOME/source.properties" | head -n1)"
-        link="$ANDROID_HOME/ndk/$ver"
-        if [ -n "$ver" ] && { [ ! -e "$link" ] || [ -L "$link" ]; }; then
-            mkdir -p "$ANDROID_HOME/ndk"
-            ln -sfn "$ANDROID_NDK_HOME" "$link"
-        fi
+    [ -n "${ANDROID_HOME:-}" ] || { echo "error: no Android SDK found (set ANDROID_HOME)" >&2; exit 1; }
+    [ -n "${ANDROID_NDK_HOME:-}" ] || { echo "error: no Android NDK found (set ANDROID_NDK_HOME)" >&2; exit 1; }
+    # Validate (not mutate) the ANDROID_HOME/ndk/<version> convention. If it
+    # is missing, print the exact one-time root setup and stop — the build
+    # itself must never write to /opt.
+    ver="$(sed -n 's/^Pkg.Revision *= *//p' "$ANDROID_NDK_HOME/source.properties" 2>/dev/null | head -n1)"
+    if [ -n "$ver" ] && [ ! -e "$ANDROID_HOME/ndk/$ver" ]; then
+        echo "error: $ANDROID_HOME/ndk/$ver does not exist (dx/gradle look for the NDK there)." >&2
+        echo "  One-time root setup, then re-run:" >&2
+        echo "    sudo mkdir -p '$ANDROID_HOME/ndk' && sudo ln -sfn '$ANDROID_NDK_HOME' '$ANDROID_HOME/ndk/$ver'" >&2
+        exit 1
     fi
     # Pre-fetch the SDK packages gradle/dx need if the `android` CLI is
     # available (best effort — if dx wants a different version it will say so

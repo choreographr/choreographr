@@ -890,15 +890,57 @@ stages them in `dist/android/<abi>/` for `adb push` into Termux's
 `$PREFIX/bin`. It temporarily strips the workspace's per-profile `rustflags`
 (same mechanism as `just build-stable`) — profile rustflags apply regardless of
 `--target`, and `-C target-cpu=native` would emit host-CPU code that traps on
-Android devices. Prerequisites: `cargo install cargo-ndk`, an Android NDK
-(`ANDROID_NDK_HOME` or the `ANDROID_HOME/ndk/<ver>` layout), and the rustup
-targets (`rustup target add aarch64-linux-android x86_64-linux-android`):
+Android devices. The scripts auto-detect common package-manager layouts
+(`/opt/android-ndk`, `/opt/android-sdk`) with no environment variables needed.
+
+#### One-time build-environment setup
+
+Arch Linux package names shown; the equivalents on other distros are the
+Google downloads (NDK zip, cmdline-tools zip) or distro SDK packages.
+
+```bash
+# 1. Rust cross-compilation targets (needed for both workflows):
+rustup target add aarch64-linux-android x86_64-linux-android
+
+# 2. cargo-ndk — drives the NDK toolchain for the suite binaries:
+cargo install cargo-ndk
+
+# 3. Packages (Arch/AUR). dx is installed via its own installer
+#    (https://dioxuslabs.com, `curl -fsSL https://dx.dioxuslabs.com/install.sh | sh`):
+paru -S android-ndk android-sdk-cmdline-tools-latest android-tools dx
+
+# 4. One-time ROOT setup for gui-android — the build recipes never write
+#    outside the project, so these run as you, once:
+#    a. Link the standalone NDK into the SDK layout (dx/gradle look for the
+#       NDK only under ANDROID_HOME/ndk/<version>, never ANDROID_NDK_HOME):
+sudo ln -sfn /opt/android-ndk \
+  /opt/android-sdk/ndk/$(sed -n 's/^Pkg.Revision *= *//p' /opt/android-ndk/source.properties)
+#    b. Make the SDK user-writable — gradle and the `android` CLI download
+#       platforms/build-tools into it as your user (the NDK stays root-owned,
+#       read-only — nothing needs to write there):
+sudo chown -R "$USER" /opt/android-sdk
+
+# 5. SDK components (run as your user; the `android` CLI replaces sdkmanager
+#    and handles licenses automatically):
+android sdk install platforms/android-35 build-tools/35.0.0
+```
+
+#### Building
 
 ```bash
 just android-check                        # dry run: verify prerequisites, print what would run
 just android-binaries                     # build aarch64 (arm64-v8a)
 just android-binaries -- --emulator       # also build x86_64 for the emulator
 just gui-android                          # choreo-gui via `dx build --platform android` (cdylib, NOT part of build-android.sh)
+```
+
+Deploying the suite binaries to a Termux device:
+
+```bash
+adb push dist/android/arm64-v8a/* /sdcard/choreo/
+# then inside the Termux shell (adb cannot write Termux's private app dir):
+cp /sdcard/choreo/* $PREFIX/bin/ && chmod +x \
+  $PREFIX/bin/choreographr $PREFIX/bin/choreo-tui $PREFIX/bin/choreo-im $PREFIX/bin/choreo-acp
 ```
 
 ### Supply-chain security
