@@ -17,8 +17,8 @@ shipped platforms are now built **on GitHub Actions** by
 `.github/workflows/release.yml` (see [CI builds](#ci-builds-github-actions)):
 pushing the `vX.Y.Z` tag builds every platform and creates the GitHub release
 with the combined `SHA256SUMS`. The two-machine flow in this SOP remains the
-manual alternative/fallback — it covers what CI does not (`.rpm`, the manual
-macOS daemon smoke test, and all channel updates).
+manual alternative/fallback — it covers what CI does not (the manual macOS
+daemon smoke test and all channel updates).
 
 ---
 
@@ -55,7 +55,7 @@ built nowhere.
 
 | Job | Runner | Artifacts |
 |---|---|---|
-| `linux-musl` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` (via `scripts/release.sh`; `rpmbuild` is absent, so `.rpm` stays manual) |
+| `linux-musl` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` + `.rpm` (via `scripts/release.sh`; `rpmbuild` is apt-installed in the job, since it is not preinstalled) |
 | `macos-arm64` | macos-latest | native `aarch64-apple-darwin` tarball (via `scripts/release.sh`) |
 | `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the four `.exe` files |
 | `android-termux` | ubuntu-latest + NDK | `aarch64-linux-android` Termux tarball (via `scripts/build-android.sh --features metrics,blockchain`) |
@@ -70,8 +70,8 @@ How this slots into the SOP: push the `vX.Y.Z` tag (Phase 1) **after** the
 crates.io publish (Phase 2) — the tag push both publishes binaries and is the
 release trigger — then verify the release page (Phase 4's gate) and do the
 countdown tasks in Phase 5/6 as before. Phases 3–4's manual build/upload steps
-below remain documented for the `.rpm`, for releases from machines without
-push access, and as the offline fallback.
+below remain documented for releases from machines without push access and as
+the offline fallback.
 
 ---
 
@@ -305,10 +305,10 @@ a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
 ## Phase 3 — Build binaries (two machines, or CI on tag push)
 
 > **CI path:** pushing the `vX.Y.Z` tag triggers `.github/workflows/release.yml`,
-> which builds the musl/macOS/Windows/Termux artifacts, smoke-tests them, and
-> creates the GitHub release automatically (see
-> [CI builds](#ci-builds-github-actions)). The manual flow below remains the
-> fallback and is still required for the `.rpm` and the macOS daemon smoke test.
+> which builds the musl/macOS/Windows/Termux artifacts (including the `.deb`
+> and `.rpm`), smoke-tests them, and creates the GitHub release automatically
+> (see [CI builds](#ci-builds-github-actions)). The manual flow below remains
+> the fallback and is still required for the macOS daemon smoke test.
 
 Both machines run the same dry-run flow. `scripts/release.sh`:
 

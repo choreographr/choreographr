@@ -16,10 +16,10 @@
 #
 # What each job builds (mirroring the manual SOP's conventions):
 #   linux-musl      scripts/release.sh on ubuntu — static x86_64-unknown-linux-musl
-#                   tarball (cargo-zigbuild cross-build, mimalloc) plus a
-#                   best-effort .deb (dpkg-deb is preinstalled on the runner;
-#                   rpmbuild is not, so .rpm is skipped with release.sh's own
-#                   warning — the .rpm stays a manual-SOP artifact).
+#                   tarball (cargo-zigbuild cross-build, mimalloc) plus best-effort
+#                   .deb and .rpm: dpkg-deb is preinstalled on the runner and
+#                   rpmbuild is apt-installed below, so release.sh's best-effort
+#                   step builds both.
 #   macos-arm64     scripts/release.sh on the arm64 macOS runner — native
 #                   aarch64-apple-darwin tarball (no zig needed for the host
 #                   build; .deb/.rpm skipped as on the MacBook).
@@ -91,7 +91,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build (static musl tarball + best-effort .deb)
+      - name: Install rpmbuild
+        run: |
+          # dpkg-deb (.deb) is preinstalled on ubuntu runners; rpmbuild is
+          # not. release.sh treats both as best-effort (skips with a warning
+          # when absent), so installing rpm here is what turns the .rpm from
+          # a manual-SOP artifact into a CI one. build-rpm.sh consumes the
+          # same host target/release/ build the .deb uses.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm
+
+      - name: Build (static musl tarball + .deb/.rpm)
         run: |
           # Clean CI checkout → release.sh's dirty-tree guard passes; dist/ is
           # gitignored so the staged artifacts don't dirty it either.
