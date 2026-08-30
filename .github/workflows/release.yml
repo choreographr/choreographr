@@ -21,8 +21,9 @@
 #                   rpmbuild is apt-installed below, so release.sh's best-effort
 #                   step builds both.
 #   macos-arm64     scripts/release.sh on the arm64 macOS runner — native
-#                   aarch64-apple-darwin tarball (no zig needed for the host
-#                   build; .deb/.rpm skipped as on the MacBook).
+#                   aarch64-apple-darwin tarball (.deb/.rpm skipped as on the
+#                   MacBook; zig is still required — zlob's build.rs compiles
+#                   its Zig source with `zig cc` on every host target).
 #   windows-msvc    hand-rolled: build-stable.sh host build + zip of the four
 #                   .exe files. release.sh is not reused here because its
 #                   staging is a POSIX tar.gz with the service files
@@ -132,8 +133,16 @@ jobs:
       - name: Install stable toolchain
         run: |
           # See the linux job: stable is the release policy; +stable builds
-          # never resolve the nightly pin. Native host build → no zig needed.
+          # never resolve the nightly pin.
           rustup toolchain install stable --profile minimal --no-self-update
+
+      # zlob's build.rs compiles its Zig source with `zig cc` on EVERY target
+      # (host builds included) — without zig on PATH it panics with
+      # "Failed to find zig" (seen on the windows runner). The macOS job needs
+      # it for the same reason (release.sh's own preflight lists zig for the
+      # MacBook), and the android job because cargo-ndk does not satisfy
+      # zlob's direct zig dependency.
+      - uses: mlugg/setup-zig@v2
 
       - uses: Swatinem/rust-cache@v2
 
@@ -164,6 +173,10 @@ jobs:
       - name: Install stable toolchain
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
+
+      # zlob's build.rs needs `zig cc` on every target (host builds included,
+      # see the macos job comment) — the Windows zip build is no exception.
+      - uses: mlugg/setup-zig@v2
 
       - uses: Swatinem/rust-cache@v2
 
@@ -228,6 +241,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
+
+      # zlob's build.rs invokes zig directly (`zig cc`) rather than going
+      # through the NDK toolchain, so cargo-ndk + NDK alone don't satisfy it.
+      - uses: mlugg/setup-zig@v2
 
       - uses: Swatinem/rust-cache@v2
 
