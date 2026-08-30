@@ -1494,6 +1494,122 @@ fn terminal_event_history_up_empty_does_nothing() {
 }
 
 #[test]
+fn terminal_event_down_on_last_draft_line_goes_to_end_of_line() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    // Editing a multi-line draft with no history entry loaded: Down on the
+    // last visual line must land at end-of-line (which for the last logical
+    // line is the end of the draft) instead of doing nothing.
+    app.input.text = "first\nlast line".to_string();
+    app.input.cursor = 3; // on "first" (line 0) — plain downward move
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle down");
+    // Moved into the second visual line, preserving column 3 (byte 6 + 3).
+    assert_eq!(app.input.cursor, 9);
+
+    // Already on the last visual line — Down now terminates at the end.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle down");
+    assert_eq!(app.input.cursor, app.input.text.len());
+    // Still editing the draft — no history was involved.
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input.text, "first\nlast line");
+}
+
+#[test]
+fn terminal_event_down_on_single_line_draft_goes_to_end() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.input.text = "hello".to_string();
+    app.input.cursor = 2;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle down");
+    assert_eq!(app.input.cursor, 5);
+}
+
+#[test]
+fn terminal_event_down_still_navigates_history_after_up() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    add_user_text(&mut app, "older");
+    add_user_text(&mut app, "recent");
+    // The user is editing a multi-line draft when they press Up.
+    app.input.text = "line one\ndraft".to_string();
+    app.input.cursor = 0;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle up");
+    assert_eq!(app.input.text, "recent");
+    assert!(app.history_index.is_some());
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle down");
+    // Down exits history back to the saved draft with its stashed cursor.
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input.text, "line one\ndraft");
+    assert_eq!(app.input.cursor, 0);
+
+    // Subsequent Down is back in draft mode: moves into the last line first…
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle down");
+    assert_eq!(app.input.cursor, 9);
+
+    // …and the next Down, on the last visual line, terminates at the end.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle down");
+    assert_eq!(app.input.cursor, app.input.text.len());
+}
+
+#[test]
+fn terminal_event_down_on_last_draft_line_wrapped_multibyte() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    // Wide characters end up in the middle of the last visual line; Down
+    // must land on a char boundary at the very end, not inside a grapheme.
+    app.input.text = "日本語テキスト".to_string();
+    app.input.cursor = 3; // after '本'
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle down");
+    assert_eq!(app.input.cursor, app.input.text.len());
+    assert!(app.input.text.is_char_boundary(app.input.cursor));
+}
+
+#[test]
 fn commit_does_not_duplicate_user_text() {
     let mut app = test_app();
     add_user_text(&mut app, "hello");

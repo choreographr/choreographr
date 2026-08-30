@@ -84,7 +84,18 @@ pub(super) fn handle_chat_event(
                         .map(|(w, _)| input_inner_width(w))
                         .unwrap_or(78);
                     if app.input.is_on_last_visual_line(inner) {
-                        app.navigate_history_down();
+                        // Down only drives history navigation while an entry
+                        // is loaded.  When editing the draft itself there is
+                        // nothing below it, so Down on the last visual line
+                        // lands at end-of-line instead of being a dead key —
+                        // the mirror of Up recalling history from the first
+                        // line.
+                        if app.history_index.is_some() {
+                            app.navigate_history_down();
+                        } else {
+                            app.input.cursor_end_line();
+                            app.ensure_input_cursor_visible();
+                        }
                     } else {
                         app.input.cursor_down(inner);
                         app.ensure_input_cursor_visible();
