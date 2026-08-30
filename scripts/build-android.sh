@@ -183,10 +183,15 @@ export ANDROID_NDK_HOME="$NDK_DIR"
 log "NDK found: $NDK_DIR (ANDROID_HOME=$ANDROID_HOME)"
 
 # The rustup targets must already be installed (they are a plain rustup add,
-# so the script never installs them implicitly — an explicit opt-in). The list
-# resolves against the STABLE toolchain selected above, not the workspace's
-# nightly pin.
-for target in aarch64-linux-android x86_64-linux-android; do
+# so the script never installs them implicitly — an explicit opt-in). Only the
+# targets that will actually be built are required: aarch64 always (every real
+# device), x86_64 only for the emulator flavor — CI installs just the aarch64
+# target, and demanding an unused target there would hard-fail the job. The
+# list resolves against the STABLE toolchain selected above, not the
+# workspace's nightly pin.
+targets_to_check="aarch64-linux-android"
+[ "$EMULATOR" = 1 ] && targets_to_check="$targets_to_check x86_64-linux-android"
+for target in $targets_to_check; do
     if ! rustup target list --installed | grep -qx "$target"; then
         echo "error: rustup target not installed: $target" >&2
         echo "  install it with: rustup target add $target" >&2
@@ -220,6 +225,18 @@ fi
 
 # ── real build ────────────────────────────────────────────────────────────────
 
+# ── portable in-place sed ───────────────────────────────────────────────────
+# The manifest/config strips below need in-place editing. GNU sed (Linux CI)
+# takes `sed -i 'expr' file`; BSD sed (macOS) parses that as `-i <suffix>` and
+# then eats the FILE argument as the sed SCRIPT ("invalid command code C"),
+# so the backup suffix must be attached (`sed -i ''`). Detect once via
+# --version (GNU supports it, BSD errors) and build the invocation prefix.
+if sed --version >/dev/null 2>&1; then
+    SED_I=(sed -i)
+else
+    SED_I=(sed -i '')
+fi
+
 BACKUP_DIR="$(mktemp -d)"
 restore() {
     cp -f "$BACKUP_DIR/Cargo.toml" "$MANIFEST"
@@ -234,13 +251,13 @@ cp "$CONFIG" "$BACKUP_DIR/config.toml"
 # including -C target-cpu=native). Required for every cross build: profile
 # rustflags ignore --target and would poison the Android codegen with
 # host-CPU flags. These are the only `rustflags = [` occurrences in the manifest.
-sed -i '/^rustflags = \[/d' "$MANIFEST"
+"${SED_I[@]}" '/^rustflags = \[/d' "$MANIFEST"
 
 # Also strip the `[unstable] profile-rustflags` opt-in from the cargo config —
 # this is the bit that HARD-BLOCKS stable Cargo (stable errors out at config
 # parse time; see scripts/build-stable.sh). The block is the config file's
 # final section, so removing its two lines is sufficient.
-sed -i '/^\[unstable\]$/d; /^profile-rustflags = true$/d' "$CONFIG"
+"${SED_I[@]}" '/^\[unstable\]$/d; /^profile-rustflags = true$/d' "$CONFIG"
 
 # See the header comment: RUSTFLAGS suppresses the user-level ~/.cargo
 # config.toml rustflags (build + cfg-target) that the manifest strip cannot

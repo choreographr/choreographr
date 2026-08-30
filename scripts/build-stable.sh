@@ -26,6 +26,17 @@ MANIFEST="Cargo.toml"
 CONFIG=".cargo/config.toml"
 BACKUP_DIR="$(mktemp -d)"
 
+# Portable in-place sed: GNU sed (Linux/CI) takes `sed -i 'expr' file`, but
+# BSD sed (macOS) parses that as `-i <suffix>` and then treats the FILE
+# argument as the sed SCRIPT ("invalid command code C") — the backup suffix
+# must be attached (`sed -i ''`). Detect once via --version (GNU supports it,
+# BSD errors) so the strips below work on both macOS and Linux.
+if sed --version >/dev/null 2>&1; then
+    SED_I=(sed -i)
+else
+    SED_I=(sed -i '')
+fi
+
 # Restore the manifest + config exactly as we found them, then drop the backup.
 restore() {
     cp -f "$BACKUP_DIR/Cargo.toml" "$MANIFEST"
@@ -39,9 +50,9 @@ cp "$CONFIG"   "$BACKUP_DIR/config.toml"
 
 # Strip the per-profile `rustflags` keys (the `profile-rustflags`-gated ones).
 # These are the only `rustflags = [` occurrences in the manifest.
-sed -i '/^rustflags = \[/d' "$MANIFEST"
+"${SED_I[@]}" '/^rustflags = \[/d' "$MANIFEST"
 # Strip the `[unstable] profile-rustflags` opt-in block from the cargo config
 # (it is the file's final section; removing its two lines is sufficient).
-sed -i '/^\[unstable\]$/d; /^profile-rustflags = true$/d' "$CONFIG"
+"${SED_I[@]}" '/^\[unstable\]$/d; /^profile-rustflags = true$/d' "$CONFIG"
 
 cargo +stable "$@"
