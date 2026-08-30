@@ -773,7 +773,7 @@ pub(crate) fn run_agent_loop(
 
                     let turn_working_dir = session.config.working_dir.clone();
                     // TEMPORARY: pass the daemon's Substrate credential through
-                    // the single `x_credentials` slot so the coord write tools
+                    // the single `x_credentials` slot so the content write tools
                     // can build a ChainAccount. This single-slot reuse is a
                     // stopgap (the X tools use the same slot, so only one
                     // credential rides it) until a proper tool→keystore
@@ -936,7 +936,7 @@ pub(crate) fn run_agent_loop(
                             registry: Arc::clone(&reg),
                             cmd_tx: cmd_tx.clone(),
                             // TEMPORARY: clone the daemon's Substrate credential
-                            // into the single `x_credentials` slot so the coord
+                            // into the single `x_credentials` slot so the content
                             // write tools can build a ChainAccount. This
                             // single-slot reuse is a stopgap (the X tools use the
                             // same slot, so only one credential rides it) until a

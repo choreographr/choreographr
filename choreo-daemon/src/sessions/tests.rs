@@ -2009,3 +2009,31 @@ fn poll_join_with_grace_abandons_stuck_thread() {
     // it exits promptly (no leaked threads in the test runner).
     drop(tx);
 }
+
+#[test]
+fn default_active_tool_groups_feature_branches() {
+    // The default set always contains the three always-on groups; the
+    // Coordination Platform group appears only when the `content` feature is
+    // compiled in, and only under its post-rename name. The pre-rename
+    // "coord" name must never be a default (stale persisted names are
+    // silently ignored instead — see `default_active_tool_groups`).
+    let groups = default_active_tool_groups();
+    for always_on in ["core", "git", "shell"] {
+        assert!(groups.contains(always_on), "missing {always_on}");
+    }
+    #[cfg(feature = "content")]
+    {
+        assert!(
+            groups.contains("content"),
+            "`content` feature on but group not in defaults: {groups:?}"
+        );
+        assert!(!groups.contains("coord"));
+    }
+    #[cfg(not(feature = "content"))]
+    {
+        assert!(
+            !groups.contains("content") && !groups.contains("coord"),
+            "content feature off but group in defaults: {groups:?}"
+        );
+    }
+}

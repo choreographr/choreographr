@@ -59,9 +59,11 @@ zeroize.workspace = true
 humfmt.workspace = true
 choreo-keystore.workspace = true
 # Choreographr Coordination Platform read/write operations (blockchain content
-# registry + IPFS + indexer). Unconditional: the `coord` tool group is always
-# enabled, so this is a plain (non-optional) workspace dependency.
-choreo-coord.workspace = true
+# registry + IPFS + indexer). Behind the `content` feature (off by default):
+# enabling it compiles in the `content` tool group (a thin wrapper layer over
+# this crate's synchronous `execute_*` entry points) and pulls in the crate's
+# subxt/chain-client dependency tree that a plain build has no use for.
+choreo-content = { workspace = true, optional = true }
 choreo-mcp.workspace = true
 choreo-proto.workspace = true
 choreo-sanitize.workspace = true
@@ -114,6 +116,12 @@ metrics = ["dep:prometheus", "dep:tiny_http"]
 # stacks) that a plain build has no use for. Opt in with `--features blockchain`
 # (or the root package's `blockchain` feature, which forwards here).
 blockchain = ["dep:choreo-blockchain"]
+# Choreographr Coordination Platform tools (blockchain content registry + IPFS
+# + indexer). Off by default: enabling it pulls in the choreo-content crate
+# (subxt chain writes + IPFS client) that a plain build has no use for. Opt in
+# with `--features content` (or the root package's `content` feature, which
+# forwards here).
+content = ["dep:choreo-content"]
 # Opt-in AVIF decode via `image/avif-native` (dav1d, a C library). OFF by
 # default so the default/release build stays C-free (see the release.sh
 # static-musl rationale and the workspace `image` comment). A source build with

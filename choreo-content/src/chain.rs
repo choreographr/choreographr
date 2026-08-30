@@ -22,7 +22,7 @@ use subxt::config::Config;
 use subxt::config::Header as SubxtHeader;
 use subxt::utils::{AccountId32, MultiAddress, MultiSignature};
 
-use crate::CoordError;
+use crate::ContentError;
 use crate::acuity_runtime::api;
 use crate::config::CHAIN_WS_URL;
 use zeroize::Zeroizing;
@@ -32,12 +32,12 @@ struct ChoreoSigner(schnorrkel::Keypair);
 
 impl ChoreoSigner {
     /// Build a signer from a 64-byte expanded ed25519 secret key.
-    fn from_expanded_secret(secret: &[u8]) -> Result<Self, CoordError> {
+    fn from_expanded_secret(secret: &[u8]) -> Result<Self, ContentError> {
         let secret_key: [u8; 64] = secret
             .try_into()
-            .map_err(|_| CoordError::Account("expected a 64-byte ed25519 secret".into()))?;
+            .map_err(|_| ContentError::Account("expected a 64-byte ed25519 secret".into()))?;
         let secret = schnorrkel::SecretKey::from_ed25519_bytes(&secret_key)
-            .map_err(|e| CoordError::Account(format!("invalid ed25519 secret: {e}")))?;
+            .map_err(|e| ContentError::Account(format!("invalid ed25519 secret: {e}")))?;
         let public = secret.to_public();
         Ok(Self(schnorrkel::Keypair { public, secret }))
     }
@@ -62,9 +62,10 @@ impl subxt::tx::Signer<PolkadotConfig> for ChoreoSigner {
 }
 
 /// Parse an SS58 account address into its raw 32-byte account id.
-pub fn account_id_from_address(address: &str) -> Result<[u8; 32], CoordError> {
-    let public = Public::from_ss58check(address)
-        .map_err(|e| CoordError::InvalidArgument(format!("invalid SS58 address {address}: {e}")))?;
+pub fn account_id_from_address(address: &str) -> Result<[u8; 32], ContentError> {
+    let public = Public::from_ss58check(address).map_err(|e| {
+        ContentError::InvalidArgument(format!("invalid SS58 address {address}: {e}"))
+    })?;
     Ok(public.0)
 }
 
@@ -99,11 +100,11 @@ impl ChainAccount {
     }
     /// Build a chain account from an SS58 address + 64-byte expanded secret
     /// (validates that the address matches the secret's public key).
-    pub fn from_address(address: &str, secret: Vec<u8>) -> Result<Self, CoordError> {
+    pub fn from_address(address: &str, secret: Vec<u8>) -> Result<Self, ContentError> {
         let signer = ChoreoSigner::from_expanded_secret(&secret)?;
         let account_id = account_id_from_address(address)?;
         if signer.account_id() != account_id {
-            return Err(CoordError::Account(format!(
+            return Err(ContentError::Account(format!(
                 "address {address} does not match the supplied secret"
             )));
         }
@@ -113,7 +114,7 @@ impl ChainAccount {
             secret: Zeroizing::new(secret),
         })
     }
-    fn signer(&self) -> Result<ChoreoSigner, CoordError> {
+    fn signer(&self) -> Result<ChoreoSigner, ContentError> {
         ChoreoSigner::from_expanded_secret(&self.secret)
     }
 }
@@ -123,14 +124,16 @@ impl ChainAccount {
 /// Verifies the connected node is the Coordination Platform by comparing its
 /// reported genesis hash to the pinned [`crate::config::GENESIS_HASH`], so a
 /// different chain at the same endpoint is rejected before any call is issued.
-async fn connect() -> Result<OnlineClient<PolkadotConfig>, CoordError> {
+async fn connect() -> Result<OnlineClient<PolkadotConfig>, ContentError> {
     let client = OnlineClient::<PolkadotConfig>::from_insecure_url(CHAIN_WS_URL)
         .await
-        .map_err(|e| CoordError::Substrate(format!("failed to connect to {CHAIN_WS_URL}: {e}")))?;
+        .map_err(|e| {
+            ContentError::Substrate(format!("failed to connect to {CHAIN_WS_URL}: {e}"))
+        })?;
 
     let actual = crate::encode::bytes_to_hex(client.genesis_hash().as_ref());
     if actual != crate::config::GENESIS_HASH {
-        return Err(CoordError::Substrate(format!(
+        return Err(ContentError::Substrate(format!(
             "node genesis {actual} does not match expected {}",
             crate::config::GENESIS_HASH
         )));
@@ -144,15 +147,15 @@ async fn connect() -> Result<OnlineClient<PolkadotConfig>, CoordError> {
 const CHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run a chain async operation, bounding it with [`CHAIN_TIMEOUT`]. The future
-/// must resolve to a `CoordError`-bearing `Result` so a timeout maps to a
-/// [`CoordError::Substrate`] that flows through the caller's `?`.
-async fn with_chain_timeout<T, F>(fut: F) -> Result<T, CoordError>
+/// must resolve to a `ContentError`-bearing `Result` so a timeout maps to a
+/// [`ContentError::Substrate`] that flows through the caller's `?`.
+async fn with_chain_timeout<T, F>(fut: F) -> Result<T, ContentError>
 where
-    F: std::future::Future<Output = Result<T, CoordError>>,
+    F: std::future::Future<Output = Result<T, ContentError>>,
 {
     match tokio::time::timeout(CHAIN_TIMEOUT, fut).await {
         Ok(res) => res,
-        Err(_) => Err(CoordError::Substrate("chain RPC timed out".into())),
+        Err(_) => Err(ContentError::Substrate("chain RPC timed out".into())),
     }
 }
 
@@ -169,7 +172,7 @@ pub struct TxOutcome {
 async fn submit_and_wait<Call>(
     call: &Call,
     account: &ChainAccount,
-) -> Result<subxt::extrinsics::ExtrinsicEvents<PolkadotConfig>, CoordError>
+) -> Result<subxt::extrinsics::ExtrinsicEvents<PolkadotConfig>, ContentError>
 where
     Call: subxt::tx::Payload,
 {
@@ -177,19 +180,22 @@ where
     let at = client
         .at_current_block()
         .await
-        .map_err(|e| CoordError::Substrate(format!("failed to get block for tx: {e}")))?;
+        .map_err(|e| ContentError::Substrate(format!("failed to get block for tx: {e}")))?;
     let signer = account.signer()?;
     at.tx()
         .sign_and_submit_then_watch_default(call, &signer)
         .await
-        .map_err(|e| CoordError::Transaction(format!("submit failed: {e}")))?
+        .map_err(|e| ContentError::Transaction(format!("submit failed: {e}")))?
         .wait_for_finalized_success()
         .await
-        .map_err(|e| CoordError::Transaction(format!("finalized failed: {e}")))
+        .map_err(|e| ContentError::Transaction(format!("finalized failed: {e}")))
 }
 
 /// Submit a publish call and capture the `Content::PublishItem` item id.
-async fn submit_publish<Call>(call: &Call, account: &ChainAccount) -> Result<TxOutcome, CoordError>
+async fn submit_publish<Call>(
+    call: &Call,
+    account: &ChainAccount,
+) -> Result<TxOutcome, ContentError>
 where
     Call: subxt::tx::Payload,
 {
@@ -197,7 +203,7 @@ where
     let item_id = tx_events
         .find_first::<api::content::events::PublishItem>()
         .transpose()
-        .map_err(|e| CoordError::Transaction(format!("failed to decode PublishItem: {e}")))?
+        .map_err(|e| ContentError::Transaction(format!("failed to decode PublishItem: {e}")))?
         .map(|evt| crate::encode::bytes_to_hex(&evt.item_id.0));
     Ok(TxOutcome { item_id })
 }
@@ -229,13 +235,13 @@ pub struct ChainStatus {
 /// (bounded by [`CHAIN_TIMEOUT`]) so the caller's status report can show the
 /// chain as unavailable rather than fabricating a healthy snapshot from pinned
 /// configuration.
-pub fn chain_status() -> Result<ChainStatus, CoordError> {
+pub fn chain_status() -> Result<ChainStatus, ContentError> {
     crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
         let at = client
             .at_current_block()
             .await
-            .map_err(|e| CoordError::Substrate(format!("failed to get block: {e}")))?;
+            .map_err(|e| ContentError::Substrate(format!("failed to get block: {e}")))?;
 
         // `at_current_block` pins to the latest finalized block, so its number
         // is the finalized height; verify it's available before reporting.
@@ -247,7 +253,7 @@ pub fn chain_status() -> Result<ChainStatus, CoordError> {
         let ss58_prefix = at
             .constants()
             .entry(addr)
-            .map_err(|e| CoordError::Substrate(format!("failed to read ss58 prefix: {e}")))?;
+            .map_err(|e| ContentError::Substrate(format!("failed to read ss58 prefix: {e}")))?;
 
         // Fetch the best (head) block via the node RPC: `chain_getHeader` with
         // no hash returns the latest best block. subxt does not expose a
@@ -262,14 +268,14 @@ pub fn chain_status() -> Result<ChainStatus, CoordError> {
         // `subxt::config::Header`.
         let rpc = subxt::rpcs::RpcClient::from_insecure_url(crate::config::CHAIN_WS_URL)
             .await
-            .map_err(|e| CoordError::Substrate(format!("failed to open rpc: {e}")))?;
+            .map_err(|e| ContentError::Substrate(format!("failed to open rpc: {e}")))?;
         let methods =
             subxt::rpcs::LegacyRpcMethods::<subxt::config::RpcConfigFor<PolkadotConfig>>::new(rpc);
         let best_header = methods
             .chain_get_header(None)
             .await
-            .map_err(|e| CoordError::Substrate(format!("failed to read best block header: {e}")))?
-            .ok_or_else(|| CoordError::Substrate("node returned no best block header".into()))?;
+            .map_err(|e| ContentError::Substrate(format!("failed to read best block header: {e}")))?
+            .ok_or_else(|| ContentError::Substrate("node returned no best block header".into()))?;
         let best_block = best_header.number();
 
         Ok(ChainStatus {
@@ -283,13 +289,13 @@ pub fn chain_status() -> Result<ChainStatus, CoordError> {
 }
 
 /// Read an item's on-chain control state (owner, revision, flags).
-pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, CoordError> {
+pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, ContentError> {
     crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
         let at = client
             .at_current_block()
             .await
-            .map_err(|e| CoordError::Substrate(format!("failed to get block: {e}")))?;
+            .map_err(|e| ContentError::Substrate(format!("failed to get block: {e}")))?;
         let addr = api::storage().content().item_state();
         let thunk = at
             .storage()
@@ -298,42 +304,42 @@ pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, CoordError> {
                 (api::runtime_types::pallet_content::pallet::ItemId(item_id),),
             )
             .await
-            .map_err(|e| CoordError::Substrate(format!("item state query failed: {e}")))?;
+            .map_err(|e| ContentError::Substrate(format!("item state query failed: {e}")))?;
         match thunk {
             Some(thunk) => {
                 let item = thunk
                     .decode()
-                    .map_err(|e| CoordError::Substrate(format!("decode item failed: {e}")))?;
+                    .map_err(|e| ContentError::Substrate(format!("decode item failed: {e}")))?;
                 Ok(ItemState {
                     owner: crate::encode::bytes_to_hex(&item.owner.0),
                     revision_id: item.revision_id,
                     flags: item.flags,
                 })
             }
-            None => Err(CoordError::Content("item not found on-chain".into())),
+            None => Err(ContentError::Content("item not found on-chain".into())),
         }
     }))?
 }
 
 /// Read the list of item ids an account has pinned in `pallet-account-content`.
-pub fn account_item_ids(account: [u8; 32]) -> Result<Vec<[u8; 32]>, CoordError> {
+pub fn account_item_ids(account: [u8; 32]) -> Result<Vec<[u8; 32]>, ContentError> {
     crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
         let at = client
             .at_current_block()
             .await
-            .map_err(|e| CoordError::Substrate(format!("failed to get block: {e}")))?;
+            .map_err(|e| ContentError::Substrate(format!("failed to get block: {e}")))?;
         let addr = api::storage().account_content().account_item_ids();
         let thunk = at
             .storage()
             .try_fetch(addr, (AccountId32(account),))
             .await
-            .map_err(|e| CoordError::Substrate(format!("account items query failed: {e}")))?;
+            .map_err(|e| ContentError::Substrate(format!("account items query failed: {e}")))?;
         match thunk {
             Some(thunk) => {
                 let bounded = thunk
                     .decode()
-                    .map_err(|e| CoordError::Substrate(format!("decode items failed: {e}")))?;
+                    .map_err(|e| ContentError::Substrate(format!("decode items failed: {e}")))?;
                 Ok(bounded.0.into_iter().map(|id| id.0).collect())
             }
             None => Ok(Vec::new()),
@@ -342,24 +348,24 @@ pub fn account_item_ids(account: [u8; 32]) -> Result<Vec<[u8; 32]>, CoordError> 
 }
 
 /// Read the profile item id an account has set (`pallet-account-profile`).
-pub fn profile_item(account: [u8; 32]) -> Result<Option<[u8; 32]>, CoordError> {
+pub fn profile_item(account: [u8; 32]) -> Result<Option<[u8; 32]>, ContentError> {
     crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
         let at = client
             .at_current_block()
             .await
-            .map_err(|e| CoordError::Substrate(format!("failed to get block: {e}")))?;
+            .map_err(|e| ContentError::Substrate(format!("failed to get block: {e}")))?;
         let addr = api::storage().account_profile().account_profile();
         let thunk = at
             .storage()
             .try_fetch(addr, (AccountId32(account),))
             .await
-            .map_err(|e| CoordError::Substrate(format!("profile query failed: {e}")))?;
+            .map_err(|e| ContentError::Substrate(format!("profile query failed: {e}")))?;
         match thunk {
             Some(thunk) => {
                 let decoded = thunk
                     .decode()
-                    .map_err(|e| CoordError::Substrate(format!("decode profile failed: {e}")))?;
+                    .map_err(|e| ContentError::Substrate(format!("decode profile failed: {e}")))?;
                 Ok(Some(decoded.0))
             }
             None => Ok(None),
@@ -404,7 +410,7 @@ pub fn publish_item(
     links: Vec<[u8; 32]>,
     mentions: Vec<[u8; 32]>,
     ipfs_hash: [u8; 32],
-) -> Result<TxOutcome, CoordError> {
+) -> Result<TxOutcome, ContentError> {
     let call = api::tx().content().publish_item(
         api::runtime_types::pallet_content::Nonce(nonce),
         item_bounded(&parents),
@@ -423,7 +429,7 @@ pub fn publish_revision(
     links: Vec<[u8; 32]>,
     mentions: Vec<[u8; 32]>,
     ipfs_hash: [u8; 32],
-) -> Result<TxOutcome, CoordError> {
+) -> Result<TxOutcome, ContentError> {
     let call = api::tx().content().publish_revision(
         ItemId(item_id),
         item_bounded(&links),
@@ -434,7 +440,7 @@ pub fn publish_revision(
 }
 
 /// Retract an item.
-pub fn retract_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), CoordError> {
+pub fn retract_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .content()
         .retract_item(api::runtime_types::pallet_content::pallet::ItemId(item_id));
@@ -443,7 +449,7 @@ pub fn retract_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), Coo
 }
 
 /// Clear the REVISIONABLE flag on an item.
-pub fn set_not_revisionable(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), CoordError> {
+pub fn set_not_revisionable(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .content()
         .set_not_revisionable(api::runtime_types::pallet_content::pallet::ItemId(item_id));
@@ -452,7 +458,7 @@ pub fn set_not_revisionable(account: &ChainAccount, item_id: [u8; 32]) -> Result
 }
 
 /// Clear the RETRACTABLE flag on an item.
-pub fn set_not_retractable(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), CoordError> {
+pub fn set_not_retractable(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .content()
         .set_not_retractable(api::runtime_types::pallet_content::pallet::ItemId(item_id));
@@ -461,7 +467,7 @@ pub fn set_not_retractable(account: &ChainAccount, item_id: [u8; 32]) -> Result<
 }
 
 /// Pin an item to an account (`account_content::add_item`).
-pub fn add_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), CoordError> {
+pub fn add_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .account_content()
         .add_item(api::runtime_types::pallet_content::pallet::ItemId(item_id));
@@ -470,7 +476,7 @@ pub fn add_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(),
 }
 
 /// Unpin an item from an account (`account_content::remove_item`).
-pub fn remove_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), CoordError> {
+pub fn remove_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .account_content()
         .remove_item(api::runtime_types::pallet_content::pallet::ItemId(item_id));
@@ -479,7 +485,7 @@ pub fn remove_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<
 }
 
 /// Point an account's profile at an item (`account_profile::set_profile`).
-pub fn set_profile(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), CoordError> {
+pub fn set_profile(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .account_profile()
         .set_profile(api::runtime_types::pallet_content::pallet::ItemId(item_id));

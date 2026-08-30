@@ -2441,7 +2441,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "choreo-coord"
+name = "choreo-content"
 version = "0.1.0"
 dependencies = [
  "bs58",
@@ -2476,7 +2476,7 @@ dependencies = [
  "choreo-ai-protocols",
  "choreo-blockchain",
  "choreo-client-core",
- "choreo-coord",
+ "choreo-content",
  "choreo-daemon",
  "choreo-image",
  "choreo-keystore",

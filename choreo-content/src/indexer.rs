@@ -20,7 +20,7 @@ use tungstenite::Message;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 
-use crate::CoordError;
+use crate::ContentError;
 use crate::config::INDEXER_WS_URL;
 use crate::encode::{bytes_to_hex, hex_to_bytes};
 
@@ -169,12 +169,12 @@ struct Connection {
 }
 
 impl Connection {
-    fn open() -> Result<Self, CoordError> {
+    fn open() -> Result<Self, ContentError> {
         let request = INDEXER_WS_URL
             .into_client_request()
-            .map_err(|e| CoordError::Indexer(format!("invalid indexer url: {e}")))?;
+            .map_err(|e| ContentError::Indexer(format!("invalid indexer url: {e}")))?;
         let (ws, _resp) = tungstenite::connect(request)
-            .map_err(|e| CoordError::Indexer(format!("failed to connect to indexer: {e}")))?;
+            .map_err(|e| ContentError::Indexer(format!("failed to connect to indexer: {e}")))?;
         // Bound socket reads/writes so a hung indexer cannot block a daemon tool
         // thread indefinitely. The indexer is reached over plain `ws://`, so
         // the underlying stream is always a plain TcpStream (not TLS).
@@ -185,27 +185,27 @@ impl Connection {
         Ok(Self { ws, next_id: 1 })
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Result<Value, CoordError> {
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, ContentError> {
         let id = self.next_id;
         self.next_id += 1;
         let req =
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.ws
             .send(Message::Text(req.to_string().into()))
-            .map_err(|e| CoordError::Indexer(format!("write failed: {e}")))?;
+            .map_err(|e| ContentError::Indexer(format!("write failed: {e}")))?;
         loop {
             let msg = self
                 .ws
                 .read()
-                .map_err(|e| CoordError::Indexer(format!("read failed: {e}")))?;
+                .map_err(|e| ContentError::Indexer(format!("read failed: {e}")))?;
             match msg {
                 Message::Text(text) => {
                     let v: Value = serde_json::from_str(&text)
-                        .map_err(|e| CoordError::Indexer(format!("bad json: {e}")))?;
+                        .map_err(|e| ContentError::Indexer(format!("bad json: {e}")))?;
                     // Match only our request id (ignore unrelated notifications).
                     if v.get("id").and_then(Value::as_u64) == Some(id) {
                         return if v.get("error").is_some() {
-                            Err(CoordError::Indexer(format!(
+                            Err(ContentError::Indexer(format!(
                                 "indexer error for {method}: {v}"
                             )))
                         } else {
@@ -217,7 +217,7 @@ impl Connection {
                     let _ = self.ws.send(Message::Pong(data));
                 }
                 Message::Close(_) => {
-                    return Err(CoordError::Indexer("indexer closed connection".into()));
+                    return Err(ContentError::Indexer("indexer closed connection".into()));
                 }
                 _ => {}
             }
@@ -234,7 +234,7 @@ pub fn get_events(
     key: &QueryKey,
     limit: u16,
     before: Option<(u32, u32)>,
-) -> Result<Vec<DecodedEvent>, CoordError> {
+) -> Result<Vec<DecodedEvent>, ContentError> {
     let mut conn = Connection::open()?;
     let key_json = wire_key(key.to_custom_key());
     let params = serde_json::json!({
@@ -245,26 +245,26 @@ pub fn get_events(
     let result = conn.request("acuity_getEvents", params)?;
     conn.close();
     let parsed: GetEventsResult = serde_json::from_value(result)
-        .map_err(|e| CoordError::Indexer(format!("failed to decode get_events result: {e}")))?;
+        .map_err(|e| ContentError::Indexer(format!("failed to decode get_events result: {e}")))?;
     Ok(parsed.events)
 }
 
 /// Query the current indexer status (indexed spans).
-pub fn index_status() -> Result<IndexStatusResult, CoordError> {
+pub fn index_status() -> Result<IndexStatusResult, ContentError> {
     let mut conn = Connection::open()?;
     let result = conn.request("acuity_indexStatus", serde_json::json!({}))?;
     conn.close();
     serde_json::from_value(result)
-        .map_err(|e| CoordError::Indexer(format!("failed to decode index status: {e}")))
+        .map_err(|e| ContentError::Indexer(format!("failed to decode index status: {e}")))
 }
 
 /// Convert a hex item id string (or `0x` hex) to a [`QueryKey::ItemId`].
-pub fn item_id_key(item_id_hex: &str) -> Result<QueryKey, CoordError> {
+pub fn item_id_key(item_id_hex: &str) -> Result<QueryKey, ContentError> {
     Ok(QueryKey::ItemId(hex_to_bytes(item_id_hex)?))
 }
 
 /// Build a composite [`QueryKey::ItemRevision`] from an item id + revision id.
-pub fn item_revision_key(item_id_hex: &str, revision_id: u32) -> Result<QueryKey, CoordError> {
+pub fn item_revision_key(item_id_hex: &str, revision_id: u32) -> Result<QueryKey, ContentError> {
     Ok(QueryKey::ItemRevision {
         item_id: hex_to_bytes(item_id_hex)?,
         revision_id,

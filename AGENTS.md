@@ -1,9 +1,13 @@
 # Agent Instructions
 
-## Choreographr Coordination Platform (`choreo-coord`)
+## Choreographr Coordination Platform (`choreo-content`)
 
-The `choreo-coord` crate implements the always-on `coord` tool group (the
-Choreographr Coordination Platform blockchain content registry). It owns a
+The `choreo-content` crate implements the feature-gated `content` tool group (the
+Choreographr Coordination Platform blockchain content registry). The group is
+compiled only behind the daemon's `content` cargo feature (off by default;
+enable with `--features content`) — a plain build contains no `coord`-era
+group at all, and persisted sessions carrying the stale pre-rename `coord`
+group name silently ignore it. It owns a
 tokio **sidecar runtime** used **only** to drive `subxt` for signed chain
 writes; the daemon itself stays thread-only and calls the crate's blocking
 `execute_*` functions. IPFS (`ureq`) and the indexer (`tungstenite`) are
@@ -13,7 +17,7 @@ The Polkadot account credential (`ServiceCredential::Substrate`) lives in
 `choreo-keystore`; the TUI imports a Polkadot-JS keystore export client-side and
 sends it over the existing `AddCredential` path.
 
-**Temporary credential plumbing**: the coord write tools currently receive the
+**Temporary credential plumbing**: the content write tools currently receive the
 daemon's single Substrate credential through the `Tool` trait's one
 `x_credentials` slot (see `// TEMPORARY` comments in `requests.rs` and
 `sessions.rs`). This single-slot reuse is a stopgap until a proper

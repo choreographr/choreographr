@@ -15,7 +15,7 @@
 //!
 //! ## Public surface
 //!
-//! All four modules expose [`CoordError`]-returning, blocking `execute_*`
+//! All four modules expose [`ContentError`]-returning, blocking `execute_*`
 //! functions. The daemon registers thin `Tool` wrappers over them under the
 //! `coord` tool group.
 //!
@@ -32,17 +32,17 @@ pub mod ipfs;
 pub mod orchestrate;
 pub mod runtime;
 
-pub use error::CoordError;
+pub use error::ContentError;
 
 /// Convenience: every module re-exports its central public types under a
-/// single `choreo_coord::` path for the daemon's thin tool wrappers.
+/// single `choreo_content::` path for the daemon's thin tool wrappers.
 pub mod prelude {
     pub use crate::config::*;
     pub use crate::encode::{
         AccountType, ContentInput, ContentType, DecodedItem, ImageSpec, MipmapLevel, ProfileSpec,
         derive_item_id, short_hex,
     };
-    pub use crate::error::CoordError;
+    pub use crate::error::ContentError;
 }
 
 /// Uniffi-style init hook: build the sidecar runtime. The daemon calls this

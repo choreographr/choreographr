@@ -1,8 +1,8 @@
 //! Structured error type for the Coordination Platform tools.
 //!
-//! Every `execute_*` entry point returns `Result<T, CoordError>`. The daemon
+//! Every `execute_*` entry point returns `Result<T, ContentError>`. The daemon
 //! converts this into a tool execution error via
-//! `impl From<CoordError> for ToolExecError`. Production code never panics —
+//! `impl From<ContentError> for ToolExecError`. Production code never panics —
 //! all failures (subxt/interop, IPFS, indexer, protobuf decode, item-id
 //! derivation, account/keystore, config) are surfaced here.
 
@@ -10,7 +10,7 @@ use thiserror::Error;
 
 /// Errors produced by the Choreographr Coordination Platform tools.
 #[derive(Debug, Error)]
-pub enum CoordError {
+pub enum ContentError {
     /// The sidecar tokio runtime was never initialized (or failed to start).
     #[error("coordinator runtime is not initialized")]
     RuntimeNotInitialized,
@@ -57,14 +57,14 @@ pub enum CoordError {
     Account(String),
 
     /// Any other failure (bounded, informational).
-    #[error("coord error: {0}")]
+    #[error("content error: {0}")]
     Other(String),
 }
 
-impl CoordError {
+impl ContentError {
     /// Convenience constructor for a plain string error.
     pub fn other(msg: impl Into<String>) -> Self {
-        CoordError::Other(msg.into())
+        ContentError::Other(msg.into())
     }
 }
 
@@ -75,16 +75,16 @@ mod tests {
     #[test]
     fn messages_render() {
         assert_eq!(
-            CoordError::RuntimeNotInitialized.to_string(),
+            ContentError::RuntimeNotInitialized.to_string(),
             "coordinator runtime is not initialized"
         );
         assert!(
-            CoordError::Substrate("boom".into())
+            ContentError::Substrate("boom".into())
                 .to_string()
                 .contains("boom")
         );
         assert!(
-            CoordError::Account("missing".into())
+            ContentError::Account("missing".into())
                 .to_string()
                 .contains("missing")
         );
@@ -92,6 +92,6 @@ mod tests {
 
     #[test]
     fn other_constructor() {
-        assert_eq!(CoordError::other("x").to_string(), "coord error: x");
+        assert_eq!(ContentError::other("x").to_string(), "content error: x");
     }
 }

@@ -30,6 +30,9 @@ metrics = ["choreo-daemon/metrics"]
 # Blockchain tools (EVM / Substrate-Polkadot) from choreo-daemon. Off by
 # default; opt in with `--features blockchain`.
 blockchain = ["choreo-daemon/blockchain"]
+# Choreographr Coordination Platform tools from choreo-daemon. Off by default;
+# opt in with `--features content`.
+content = ["choreo-daemon/content"]
 # Opt-in AVIF decode via `image/avif-native` (dav1d, a C library). Off by
 # default so the default/release build stays C-free (see the release.sh
 # static-musl rationale); a source build with `--features avif` enables it for
@@ -86,7 +89,7 @@ members = [
     "choreo-ai-protocols",
     "choreo-blockchain",
     "choreo-client-core",
-    "choreo-coord",
+    "choreo-content",
     "choreo-daemon",
     "choreo-keystore",
     "choreo-markdown",
@@ -200,7 +203,7 @@ serde = { version = "1", features = ["derive"] }
 choreo-ai-protocols = { path = "choreo-ai-protocols", version = "0.1" }
 choreo-blockchain = { path = "choreo-blockchain", version = "0.1" }
 choreo-client-core = { path = "choreo-client-core", version = "0.1" }
-choreo-coord = { path = "choreo-coord", version = "0.1" }
+choreo-content = { path = "choreo-content", version = "0.1" }
 choreo-keystore = { path = "choreo-keystore", version = "0.1" }
 choreo-proto = { path = "choreo-proto", version = "0.1" }
 choreo-sanitize = { path = "choreo-sanitize", version = "0.1" }
@@ -278,22 +281,22 @@ uds_windows = "1.2.1"
 humfmt = "0.6.0"
 hex = "0.4"
 # Substrate client (native/light + JSON-RPC) — promoted to the workspace now
-# that BOTH choreo-blockchain (the `blockchain` feature) and choreo-coord (the
+# that BOTH choreo-blockchain (the `blockchain` feature) and choreo-content (the
 # always-on Coordination Platform tools) use it.
 subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
 # sr25519 signing + Polkadot-JS keystore compat — used by choreo-keystore for
 # the Polkadot account store (the `polkadot-js-compat` feature pulls scrypt,
 # crypto_secretbox, and schnorrkel transitively).
 subxt-signer = { version = "0.50.3", default-features = false, features = ["polkadot-js-compat", "subxt"] }
-# Protobuf content protocol (choreo-coord's ItemMessage/mixin encoding).
+# Protobuf content protocol (choreo-content's ItemMessage/mixin encoding).
 prost = "0.14"
-# SCALE encoding for deterministic item-id derivation (choreo-coord).
+# SCALE encoding for deterministic item-id derivation (choreo-content).
 parity-scale-codec = "3"
-# Substrate blake2_256 for item-id derivation (choreo-coord).
+# Substrate blake2_256 for item-id derivation (choreo-content).
 sp-crypto-hashing = "0.1"
-# Base58 for the content protocol's CID <-> sha2-256-digest conversion (choreo-coord).
+# Base58 for the content protocol's CID <-> sha2-256-digest conversion (choreo-content).
 bs58 = "0.5"
-# Synchronous WebSocket client for the indexer's JSON-RPC API (choreo-coord).
+# Synchronous WebSocket client for the indexer's JSON-RPC API (choreo-content).
 # No default features: the indexer endpoint is plain `ws://`, so neither
 # native-tls nor rustls is needed (and native-tls would drag a C/OpenSSL build
 # into the static-musl release). `handshake` enables `tungstenite::connect`.

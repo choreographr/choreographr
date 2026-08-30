@@ -56,10 +56,11 @@ Choreographr (workspace)
 │                       (JSON-RPC over stdin/stdout) into choreo-proto messages over the
 │                       daemon's Unix socket, enabling ACP-compatible editors (Claude
 │                       Code, Cline, etc.) to interact with Choreographr sessions
-├── choreo-coord           Choreographr Coordination Platform client — Substrate
+├── choreo-content           Choreographr Coordination Platform client — Substrate
 │                       chain writes (subxt via a tokio sidecar), indexer reads,
 │                       IPFS add/cat, content protobuf encode/decode, and the
-│                       publish-time image mipmap pipeline behind the `coord` tools
+│                       publish-time image mipmap pipeline behind the `content` tools
+│                       (feature-gated `content` cargo feature, off by default)
 ├── choreo-tui             Terminal UI client (ratatui + crossterm)
 ├── choreo-gui             Desktop GUI client (Dioxus)
 └── choreo-im              IM platform bridge (Telegram)
@@ -631,9 +632,12 @@ main()
   to ACP `session/update` notifications, and finalized with a JSON-RPC response on `Done`/`Failed`/`Cancelled`.
 
 
-### `choreo-coord` — Coordination Platform client
+### `choreo-content` — Coordination Platform client
 
-Implements the always-on `coord` tool group against the Choreographr
+Implements the feature-gated `content` tool group (compiled only behind the
+daemon's `content` cargo feature — off by default; a plain build registers no
+content tools, and persisted sessions carrying the stale pre-rename `coord`
+group name silently ignore it) against the Choreographr
 Coordination Platform: a Substrate content registry (publish/retract items,
 revisions, profiles, account pins) with content stored on IPFS and revisions
 resolved through an event indexer. Reads are indexer-first with on-chain
@@ -644,7 +648,7 @@ and the indexer (`tungstenite`) are synchronous.
 | Module | Purpose |
 |---|---|
 | `encode.rs` | Content protocol: protobuf `ItemMessage` mixin encode/decode (pinned to the reference `acuity-dioxus` mixin IDs), deterministic item-id derivation, CID ↔ sha2-256-digest helpers. `ContentInput` is the caller-facing shape — `image: ImageInput` accepts either a local file `path` or a complete `spec`; `encode_item` consumes the resolved `PreparedContent`. |
-| `image.rs` | Publish-time image pipeline (ported from `acuity-dioxus`'s `build_image_mixin`): reads a local image, encodes a JPEG q82 mipmap pyramid (level 0 = full res, halved via Lanczos3 until a dimension ≤ 64), pins every level to IPFS as its own CID, and derives the full `ImageSpec` (dimensions, original-file sha2-256 digest, per-level sizes) so callers of `coord_publish_item`/`coord_publish_revision`/`coord_set_profile` only pass a `path`. |
+| `image.rs` | Publish-time image pipeline (ported from `acuity-dioxus`'s `build_image_mixin`): reads a local image, encodes a JPEG q82 mipmap pyramid (level 0 = full res, halved via Lanczos3 until a dimension ≤ 64), pins every level to IPFS as its own CID, and derives the full `ImageSpec` (dimensions, original-file sha2-256 digest, per-level sizes) so callers of `coord_publish_item`/`coord_publish_revision`/`coord_set_profile` only pass a `path` (the tools keep their pre-rename `coord_*` names; only the group is renamed to `content`). |
 | `ipfs.rs` | Blocking IPFS client (`api/v0/add` with pin, `cat`, `id`) over `ureq` with bounded timeouts. |
 | `indexer.rs` | Synchronous WebSocket JSON-RPC client for the event indexer (keyed event queries, index status). |
 | `chain.rs` | subxt extrinsic submission + state reads, signed with the keystore's Substrate credential. |
@@ -660,9 +664,10 @@ Entry point: `choreo_daemon::main` — invoked from the root package's
 
 **Concurrency model:** Pure OS threads with message passing (actor model). No async code
 in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads. The one
-exception is the optional `blockchain` feature: `choreo-blockchain` (linked only then)
-holds a tokio sidecar runtime for the async alloy/subxt clients, and the daemon calls its
-synchronous `execute_*` entry points (which `block_on` internally).
+exception is the optional `blockchain` and `content` features: `choreo-blockchain` (linked only with the former) and
+`choreo-content` (linked only with the latter) each hold a tokio sidecar runtime for their async
+alloy/subxt clients, and the daemon calls their synchronous `execute_*` entry points (which
+`block_on` internally).
 
 **Module breakdown:**
 
@@ -687,6 +692,7 @@ synchronous `execute_*` entry points (which `block_on` internally).
 | `tools/x/` | X/Twitter API tools (`x_post`, `x_search_recent`, `x_user_lookup`), one file per tool with shared OAuth1/HTTP plumbing in `x/mod.rs`. |
 | `tools/evm/` | Thin `Tool` wrappers over the EVM blockchain tools (`evm_chain`, `evm_balance`, …) — the implementations live in `choreo-blockchain`; compiled only with the `blockchain` feature. |
 | `tools/subxt.rs` | Thin `Tool` wrappers over the Substrate/Polkadot blockchain tools (`subxt_chain`, `subxt_balance`, `subxt_query`, `subxt_block`) — implementations in `choreo-blockchain`; compiled only with the `blockchain` feature. |
+| `tools/content/` | Thin `Tool` wrappers over the Choreographr Coordination Platform tools (`coord_item`, `coord_publish_item`, `coord_set_profile`, …) — the implementations live in `choreo-content`; compiled only with the `content` feature, registered under the `content` group name. |
 | `tools/admin/` | Session-admin tools (`list_sessions`, `get_session`, `load_skill`), one file per tool. |
 | `tools/pdf/` | Native PDF ingestion tools (`pdf_classify`, `pdf_to_markdown`), one file per tool (`classify.rs`, `markdown.rs`) with shared input-gating / output-hygiene helpers in `pdf/mod.rs` and the shared PDF fixture builders in `pdf/test_fixtures.rs`. |
 | `tools/glob_util.rs` | `GlobFilter` — shared glob-matching utility used by `delete_files` and `grep` that follows gitignore conventions (patterns without `/` match basename, patterns with `/` match full path). |
@@ -1903,6 +1909,7 @@ via `fn group() -> &'static str` on the `Tool` trait. Groups are:
 | `shell` | on | Shell and exec |
 | `x` | off | X/Twitter API |
 | `vm` | off | RISC-V sandboxed code execution |
+| `content` | off | Choreographr Coordination Platform (publish/retract items, revisions, profiles, account pins; IPFS + indexer + Substrate) — only present when the `content` cargo feature is enabled (the tool group was previously named `coord`) |
 | `blockchain` | off | EVM and Substrate/Polkadot blockchain queries (alloy/subxt) — only present when the `blockchain` cargo feature is enabled |
 | `debug` | off | Read-only diagnostics and request dry-runs (`session_inspect`) — opt-in via `load_tools`, never on by default |
 
@@ -1964,7 +1971,7 @@ Implementation details:
   session, but message-text previews and raw reasoning bytes are rendered only
   for the calling session, and raw reasoning additionally requires `include_raw`
   (thinking blocks / encrypted signatures never leave the daemon otherwise).
-- Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell, coord}`)
+- Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell}`, plus `content` only when the `content` cargo feature is enabled; a persisted stale `coord` group name is silently ignored)
 - `ToolGroup` struct and `GROUPS` constant live in `choreo-daemon/src/tools/mod.rs`
 - Group metadata is appended to the system prompt in `context::build_base_prompt()`
 
@@ -2883,9 +2890,10 @@ counts survive the attach instead of regressing.
 
 12. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
     where third-party libraries (alloy, subxt) require it. Both live in the `choreo-blockchain`
-    crate, which holds a global `OnceLock<tokio::runtime::Runtime>` as a sidecar and runs its
-    clients via `block_on()`. The daemon links that crate only behind the `blockchain` cargo
-    feature (off by default) and calls its synchronous `execute_*` entry points, so tokio is
+    and `choreo-content` crates, which hold a global `OnceLock<tokio::runtime::Runtime>` as a
+    sidecar and run their clients via `block_on()`. The daemon links those crates only behind
+    the `blockchain` and `content` cargo features (both off by default) and calls their
+    synchronous `execute_*` entry points, so tokio is
     never a direct dependency of the daemon. Every call is additionally bounded by a 30s
     wall-clock `RPC_TIMEOUT` inside the crate: the daemon's own ~60s tool timeout can only
     *abandon* the blocked execution thread (a synchronous `block_on` cannot be interrupted),
@@ -3415,7 +3423,7 @@ cargo run -p choreographr --bin choreo-im -- telegram
 
 | Crate | Used by | Purpose |
 |---|---|---|
-| `tokio` | choreo-blockchain | Async runtime — the sidecar the blockchain tools run on; the only workspace crate that depends on it (linked via the daemon's `blockchain` feature) |
+| `tokio` | choreo-blockchain, choreo-content | Async runtime — the sidecar the blockchain and Coordination Platform tools run on (linked via the daemon's `blockchain` and `content` features respectively) |
 | `alloy` | choreo-blockchain | EVM blockchain tools (behind the `blockchain` feature) |
 | `subxt` | choreo-blockchain | Substrate/Polkadot blockchain tools (behind the `blockchain` feature) |
 | `serde` + `rmp-serde` | proto, daemon | Wire protocol framing and DB value encoding (MessagePack, named mode) |

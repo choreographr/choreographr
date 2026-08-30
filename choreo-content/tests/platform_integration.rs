@@ -9,7 +9,7 @@
 //!   - the local IPFS daemon at `http://127.0.0.1:5001` (with a pinning
 //!     service to propagate content)
 //!
-//! Run with `cargo nextest run -p choreo-coord --run-ignored all` once the
+//! Run with `cargo nextest run -p choreo-content --run-ignored all` once the
 //! services are up. The suite seeds content end-to-end: encode a document,
 //! pin it to IPFS, derive its item id, submit the `publish_item` extrinsic,
 //! then read it back through the indexer + IPFS and verify the round-trip.
@@ -19,9 +19,9 @@
 //! or, failing that, imports the well-known dev "Alice" keystore. The account
 //! must be funded (the dev chain funds Alice by default).
 
-use choreo_coord::chain::{ChainAccount, account_id_from_address};
-use choreo_coord::encode::{ContentInput, ContentType};
-use choreo_coord::orchestrate;
+use choreo_content::chain::{ChainAccount, account_id_from_address};
+use choreo_content::encode::{ContentInput, ContentType};
+use choreo_content::orchestrate;
 
 /// A content digest hex that must not collide with the test's own upload.
 fn test_digest_hex() -> String {
@@ -58,7 +58,7 @@ fn test_account() -> ChainAccount {
 #[ignore = "requires the local Coordination Platform services (node, indexer, IPFS)"]
 fn publish_and_read_item_round_trip() {
     // Start the tokio sidecar (chain writes need it).
-    choreo_coord::init().expect("coordinator runtime must initialize");
+    choreo_content::init().expect("coordinator runtime must initialize");
 
     let account = test_account();
     let content = ContentInput {
@@ -95,7 +95,7 @@ fn publish_and_read_item_round_trip() {
         image: None,
         profile: None,
     };
-    let id = choreo_coord::encode::hex_to_bytes(&item_id_hex).unwrap();
+    let id = choreo_content::encode::hex_to_bytes(&item_id_hex).unwrap();
     orchestrate::publish_revision(&account, id, &revised, vec![], vec![])
         .expect("publish_revision should succeed");
     let after = orchestrate::item(&item_id_hex, None).expect("revised item should be resolvable");
@@ -106,7 +106,7 @@ fn publish_and_read_item_round_trip() {
 #[test]
 #[ignore = "requires the local Coordination Platform services (node, indexer, IPFS)"]
 fn indexer_resolves_revision_history() {
-    choreo_coord::init().expect("coordinator runtime must initialize");
+    choreo_content::init().expect("coordinator runtime must initialize");
     // Querying an arbitrary (likely absent) item id must not panic; it should
     // return an empty history or a clear error.
     let _ = orchestrate::revisions(&test_digest_hex());

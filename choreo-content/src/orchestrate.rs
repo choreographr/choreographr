@@ -14,7 +14,7 @@
 //!
 //! [tokio sidecar]: crate::runtime
 
-use crate::CoordError;
+use crate::ContentError;
 use crate::chain::{self, ChainAccount};
 use crate::encode::{self, ContentInput, DecodedItem, ImageInput, PreparedContent};
 use crate::indexer::{self, DecodedEvent, QueryKey};
@@ -138,7 +138,7 @@ impl From<chain::ChainStatus> for ChainStatus {
 
 /// Resolve one item: latest (or a specific) revision, decoded from IPFS,
 /// merged with the on-chain control state.
-pub fn item(item_id_hex: &str, revision_id: Option<u32>) -> Result<ResolvedItem, CoordError> {
+pub fn item(item_id_hex: &str, revision_id: Option<u32>) -> Result<ResolvedItem, ContentError> {
     let item_id = encode::hex_to_bytes(item_id_hex)?;
 
     // On-chain authority: owner, latest revision counter, and flags.
@@ -182,18 +182,18 @@ pub struct ItemImage {
 fn select_image_level(
     image: &encode::ImageSpec,
     level: Option<u32>,
-) -> Result<(usize, encode::MipmapLevel), crate::CoordError> {
+) -> Result<(usize, encode::MipmapLevel), crate::ContentError> {
     if image.mipmap_levels.is_empty() {
         // The reference protocol encodes images purely as a mipmap pyramid
         // (level 0 = full-res); an image mixin without levels carries nothing
         // retrievable.
-        return Err(crate::CoordError::Content(
+        return Err(crate::ContentError::Content(
             "image mixin has no mipmap levels".into(),
         ));
     }
     let index = level.unwrap_or(0) as usize;
     let spec = image.mipmap_levels.get(index).ok_or_else(|| {
-        crate::CoordError::Content(format!(
+        crate::ContentError::Content(format!(
             "mipmap level {} out of range (item has {} levels)",
             index,
             image.mipmap_levels.len()
@@ -209,12 +209,12 @@ pub fn item_image(
     item_id_hex: &str,
     revision_id: Option<u32>,
     level: Option<u32>,
-) -> Result<ItemImage, crate::CoordError> {
+) -> Result<ItemImage, crate::ContentError> {
     let (_revision, ipfs_hash) = resolve_revision(item_id_hex, revision_id)?;
     let bytes = crate::ipfs::cat(&ipfs_hash)?;
     let content = encode::decode_item(&bytes)?;
     let image = content.image.ok_or_else(|| {
-        crate::CoordError::Content(format!("item {item_id_hex} has no embedded image"))
+        crate::ContentError::Content(format!("item {item_id_hex} has no embedded image"))
     })?;
     let (index, spec) = select_image_level(&image, level)?;
     let data = crate::ipfs::cat_by_cid(&spec.cid)?;
@@ -276,7 +276,7 @@ fn sort_revisions_newest_first(revisions: &mut [RevisionEntry]) {
 fn resolve_revision(
     item_id_hex: &str,
     revision_id: Option<u32>,
-) -> Result<(u32, String), CoordError> {
+) -> Result<(u32, String), ContentError> {
     let events = indexer::get_events(&indexer::item_id_key(item_id_hex)?, 512, None)?;
     let mut revisions = revision_entries_from_events(item_id_hex, &events);
     sort_revisions_newest_first(&mut revisions);
@@ -286,19 +286,19 @@ fn resolve_revision(
             .into_iter()
             .find(|r| r.revision_id == target)
             .ok_or_else(|| {
-                CoordError::Content(format!(
+                ContentError::Content(format!(
                     "revision {target} not found for item {item_id_hex}"
                 ))
             })?,
         None => revisions.into_iter().next().ok_or_else(|| {
-            CoordError::Content(format!("no indexed revision found for item {item_id_hex}"))
+            ContentError::Content(format!("no indexed revision found for item {item_id_hex}"))
         })?,
     };
     Ok((entry.revision_id, entry.ipfs_hash_hex))
 }
 
 /// Full revision history of an item, newest-first.
-pub fn revisions(item_id_hex: &str) -> Result<Vec<RevisionEntry>, CoordError> {
+pub fn revisions(item_id_hex: &str) -> Result<Vec<RevisionEntry>, ContentError> {
     let events = indexer::get_events(&indexer::item_id_key(item_id_hex)?, 512, None)?;
     let mut list = revision_entries_from_events(item_id_hex, &events);
     sort_revisions_newest_first(&mut list);
@@ -310,13 +310,13 @@ pub fn events(
     key: &QueryKey,
     limit: u16,
     before: Option<(u32, u32)>,
-) -> Result<Vec<DecodedEvent>, CoordError> {
+) -> Result<Vec<DecodedEvent>, ContentError> {
     indexer::get_events(key, limit, before)
 }
 
 /// List an account's pinned content items, resolving each title via the
 /// indexer+IPFS (items that fail to resolve fall back to id-only).
-pub fn account_items(account_addr: &str) -> Result<Vec<AccountItem>, CoordError> {
+pub fn account_items(account_addr: &str) -> Result<Vec<AccountItem>, ContentError> {
     let account = chain::account_id_from_address(account_addr)?;
     let ids = chain::account_item_ids(account)?;
     let mut out = Vec::with_capacity(ids.len());
@@ -332,7 +332,7 @@ pub fn account_items(account_addr: &str) -> Result<Vec<AccountItem>, CoordError>
 }
 
 /// Resolve an item's title from its latest revision, if possible.
-fn resolve_title(item_id_hex: &str) -> Result<Option<String>, CoordError> {
+fn resolve_title(item_id_hex: &str) -> Result<Option<String>, ContentError> {
     let (_, ipfs_hash) = resolve_revision(item_id_hex, None)?;
     let bytes = crate::ipfs::cat(&ipfs_hash)?;
     let content = encode::decode_item(&bytes)?;
@@ -340,7 +340,7 @@ fn resolve_title(item_id_hex: &str) -> Result<Option<String>, CoordError> {
 }
 
 /// Resolve an account's profile.
-pub fn profile(account_addr: &str) -> Result<ProfileResult, CoordError> {
+pub fn profile(account_addr: &str) -> Result<ProfileResult, ContentError> {
     let account = chain::account_id_from_address(account_addr)?;
     let Some(profile_item_id) = chain::profile_item(account)? else {
         return Ok(ProfileResult::default());
@@ -373,7 +373,7 @@ pub fn profile(account_addr: &str) -> Result<ProfileResult, CoordError> {
 }
 
 /// Decode arbitrary content bytes from IPFS (by digest hex or CID) — no chain.
-pub fn decode_content(ipfs_hash_or_cid: &str) -> Result<DecodedItem, CoordError> {
+pub fn decode_content(ipfs_hash_or_cid: &str) -> Result<DecodedItem, ContentError> {
     let bytes = if ipfs_hash_or_cid.starts_with("0x") {
         crate::ipfs::cat(ipfs_hash_or_cid)?
     } else {
@@ -383,7 +383,7 @@ pub fn decode_content(ipfs_hash_or_cid: &str) -> Result<DecodedItem, CoordError>
 }
 
 /// Aggregate status across all three services (each is best-effort).
-pub fn status() -> Result<CoordStatus, CoordError> {
+pub fn status() -> Result<CoordStatus, ContentError> {
     let indexer = indexer::index_status().ok().map(IndexerStatus::from);
     let ipfs = crate::ipfs::id().ok().map(|peer| ipfs::IpfsStatus {
         peer_id: peer.peer_id,
@@ -412,7 +412,7 @@ pub fn status() -> Result<CoordStatus, CoordError> {
 /// pipeline — callers never compute dimensions, digests, or CIDs themselves).
 /// A `spec`-based input is passed through verbatim; supplying both `path`
 /// and `spec` is rejected as ambiguous, as is an input with neither.
-fn resolve_content(input: &ContentInput) -> Result<PreparedContent, CoordError> {
+fn resolve_content(input: &ContentInput) -> Result<PreparedContent, ContentError> {
     let image = match &input.image {
         Some(ImageInput {
             path: Some(path),
@@ -428,7 +428,7 @@ fn resolve_content(input: &ContentInput) -> Result<PreparedContent, CoordError> 
             ..
         }) => Some(spec.clone()),
         Some(ImageInput { path, spec, .. }) => {
-            return Err(CoordError::InvalidArgument(match (path, spec) {
+            return Err(ContentError::InvalidArgument(match (path, spec) {
                 (Some(_), Some(_)) => {
                     "image input: supply either `path` or `spec`, not both".into()
                 }
@@ -449,10 +449,10 @@ pub fn publish_item(
     mentions: Vec<[u8; 32]>,
     flags: Option<u8>,
     nonce: Option<[u8; 32]>,
-) -> Result<chain::TxOutcome, CoordError> {
+) -> Result<chain::TxOutcome, ContentError> {
     let flags = flags.unwrap_or(crate::config::DEFAULT_ITEM_FLAGS);
     if flags & !crate::config::VALID_PUBLISH_FLAGS != 0 {
-        return Err(CoordError::InvalidArgument(format!(
+        return Err(ContentError::InvalidArgument(format!(
             "invalid item flags: {flags:#x}"
         )));
     }
@@ -489,7 +489,7 @@ pub fn publish_revision(
     content: &ContentInput,
     links: Vec<[u8; 32]>,
     mentions: Vec<[u8; 32]>,
-) -> Result<chain::TxOutcome, CoordError> {
+) -> Result<chain::TxOutcome, ContentError> {
     let bytes = encode::encode_item(&resolve_content(content)?)?;
     let ipfs_hash = crate::ipfs::add(&bytes, "content.bin")?;
     let digest = encode::hex_to_bytes(&ipfs_hash)?;
@@ -501,7 +501,7 @@ pub fn lifecycle(
     account: &ChainAccount,
     action: LifecycleAction,
     item_id: [u8; 32],
-) -> Result<(), CoordError> {
+) -> Result<(), ContentError> {
     match action {
         LifecycleAction::Retract => chain::retract_item(account, item_id),
         LifecycleAction::SetNotRevisionable => chain::set_not_revisionable(account, item_id),
@@ -514,7 +514,7 @@ pub fn account_link(
     account: &ChainAccount,
     action: AccountLinkAction,
     item_id: [u8; 32],
-) -> Result<(), CoordError> {
+) -> Result<(), ContentError> {
     match action {
         AccountLinkAction::Add => chain::add_account_item(account, item_id),
         AccountLinkAction::Remove => chain::remove_account_item(account, item_id),
@@ -525,7 +525,7 @@ pub fn account_link(
 pub fn set_profile(
     account: &ChainAccount,
     content: &ContentInput,
-) -> Result<chain::TxOutcome, CoordError> {
+) -> Result<chain::TxOutcome, ContentError> {
     // Publish the profile item, then link it as the account's profile.
     let bytes = encode::encode_item(&resolve_content(content)?)?;
     let ipfs_hash = crate::ipfs::add(&bytes, "profile.bin")?;

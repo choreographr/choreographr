@@ -263,12 +263,13 @@ pub struct RequestContext {
     /// daemon command loop (the 6th sanctioned shared-state exception).
     pub global_lag: Arc<AtomicUsize>,
     /// The daemon's Substrate credential, plumbed to the request worker so the
-    /// `coord` write tools can build a signing [`ChainAccount`].
+    /// `content` write tools can build a signing [`ChainAccount`].
     ///
     /// // TEMPORARY: this rides the Tool trait's single `x_credentials` slot
     /// (the same slot the X tools use), so only ONE credential can be active
     /// per session at a time. This is a stopgap until a proper tool→keystore
-    /// credential-access system replaces it.
+    /// credential-access system replaces it. Only populated when the
+    /// `content` feature is compiled in (see daemon.rs `spawn_session`).
     pub substrate_credential: Option<ServiceCredential>,
 }
 
@@ -978,6 +979,29 @@ fn persist_session_metadata(state: &mut SessionState, ctx: &RequestContext, labe
     }
 }
 
+/// The default active tool-group set for a session that persisted none.
+///
+/// Mirrors the always-on groups (`core`, `git`, `shell`); the Coordination
+/// Platform group is included only when the `content` feature is compiled in —
+/// the group (and its tools) simply don't exist in a plain build, and
+/// `load_tools`/`unload_tools` validation would reject it as unknown.
+///
+/// Note on stale persisted names: an existing session whose stored
+/// `active_tool_groups` still contains the pre-rename `"coord"` (or any group
+/// whose feature is off) keeps that name in its set — stale names are
+/// *silently ignored*: a group with no registered tools contributes nothing to
+/// `available_definitions`, so nothing is exposed to the model. Only explicit
+/// `load_tools`/`unload_tools` requests validate names against the live
+/// registry, so stale names can never be re-activated.
+fn default_active_tool_groups() -> HashSet<String> {
+    // `mut` is only needed when the `content` feature inserts its group.
+    #[cfg_attr(not(feature = "content"), allow(unused_mut))]
+    let mut groups = HashSet::from(["core".to_string(), "git".to_string(), "shell".to_string()]);
+    #[cfg(feature = "content")]
+    groups.insert("content".to_string());
+    groups
+}
+
 pub fn session_main(
     rx: std::sync::mpsc::Receiver<SessionCommand>,
     provider: Option<InferenceProvider>,
@@ -1008,14 +1032,7 @@ pub fn session_main(
             .as_ref()
             .map(|r| r.active_tool_groups.iter().cloned().collect())
             .filter(|cats: &HashSet<String>| !cats.is_empty())
-            .unwrap_or_else(|| {
-                HashSet::from([
-                    "core".to_string(),
-                    "git".to_string(),
-                    "shell".to_string(),
-                    "coord".to_string(),
-                ])
-            }),
+            .unwrap_or_else(default_active_tool_groups),
         context_config: init_record
             .as_ref()
             .map(|r| r.context_config.clone())

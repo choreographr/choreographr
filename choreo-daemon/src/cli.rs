@@ -140,18 +140,20 @@ pub fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to initialize blockchain tokio runtime: {e}"))?;
 
     // The Choreographr Coordination Platform tools also run on a tokio sidecar
-    // runtime (owned by the `choreo-coord` crate) used only for signed chain
-    // writes via subxt. Initialize it once at startup; it is always compiled in
-    // (the `coord` group is unconditional). A failure is NOT fatal: read tools
-    // and IPFS/indexer still work, while coord write tools would be unavailable
+    // runtime (owned by the `choreo-content` crate) used only for signed chain
+    // writes via subxt. Initialize it once at startup when the `content`
+    // feature is enabled (off by default); without the feature the tools — and
+    // the sidecar — are compiled out entirely. A failure is NOT fatal: read
+    // tools and IPFS/indexer still work, while content write tools would be unavailable
     // until the sidecar can be built.
-    match choreo_coord::init() {
+    #[cfg(feature = "content")]
+    match choreo_content::init() {
         Ok(()) => {}
         Err(e) => {
             warn!(
                 error = %e,
                 "failed to initialize the coordination platform tokio runtime; \
-                 coord write tools will be unavailable"
+                 content write tools will be unavailable"
             );
         }
     }

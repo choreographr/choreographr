@@ -22,7 +22,7 @@ path = "src/lib.rs"
 # implementation invoked (no node implements those).
 alloy = { version = "2.3", features = ["providers", "rpc-types-eth", "sol-types", "ens"] }
 # Substrate/Polkadot client (light-client + JSON-RPC paths). Promoted to the
-# workspace because choreo-coord (the always-on Coordination Platform tools)
+# workspace because choreo-content (the always-on Coordination Platform tools)
 # uses the same client.
 subxt.workspace = true
 # Sidecar async runtime. This crate is the *only* place in the workspace that

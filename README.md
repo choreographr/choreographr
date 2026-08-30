@@ -470,9 +470,11 @@ in the same table and still stream to the TUI.
 Vision support is per-model: pick a vision-capable model (e.g.
 `deepseek-v4-flash-vision-exp`) and call `read_image` with a path.
 
-**Tool group.** Tools are organized into groups (`core`, `git`, `shell`, `coord`,
-`x`, `vm`, `db`, `mcp`, `blockchain`). Only `core`, `git`, `shell`, and
-`coord` are active by default. The model can activate additional groups with
+**Tool group.** Tools are organized into groups (`core`, `git`, `shell`,
+`content`, `x`, `vm`, `db`, `mcp`, `blockchain`). Only `core`, `git`, and
+`shell` are active by default; the `content` group additionally becomes
+available when the daemon is built with the `content` cargo feature (off by
+default; opt in with `--features content`). The model can activate additional groups with
 `load_tools` and deactivate them with
 `unload_tools`. Groups are a discovery mechanism, not access control — the
 RISC-V VM always has access to all tools.
@@ -772,6 +774,24 @@ cargo run --release -p choreographr --features blockchain
 Once enabled, the tools are registered under the `blockchain` tool group, which
 the model activates per-session with `load_tools blockchain`. In a session, they
 need no credentials — they query public RPC endpoints.
+
+## Choreographr Coordination Platform tools
+
+Publish/retract items, revisions, profiles, and account pins against the
+Choreographr Coordination Platform (a Substrate content registry with content
+stored on IPFS and revisions resolved through an event indexer) live in the
+`choreo-content` crate (subxt + IPFS + the tokio sidecar runtime for signed
+chain writes). They are compiled in via the `content` cargo feature, which is
+**off by default** — a plain build contains no such tools at all. To enable:
+
+```bash
+cargo run --release -p choreographr --features content
+```
+
+Once enabled, the tools are registered under the `content` tool group, which
+the model activates per-session with `load_tools content`. Persisted sessions
+that predate the rename still carrying the old `coord` group name silently
+ignore it.
 
 ## Testing & development
 

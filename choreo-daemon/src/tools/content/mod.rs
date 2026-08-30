@@ -1,6 +1,6 @@
 //! Thin `Tool` trait wrappers over the Choreographr Coordination Platform.
 //!
-//! The actual blocking operations live in the `choreo-coord` crate (which owns
+//! The actual blocking operations live in the `choreo-content` crate (which owns
 //! the tokio sidecar runtime that drives `subxt` for chain writes and the
 //! `ureq`/`tungstenite` synchronously for IPFS and the indexer). This module
 //! only adapts them to the daemon's `Tool` trait so `choreo-daemon` never
@@ -18,16 +18,16 @@
 //! need no credential and ignore it.
 
 use super::{Tool, ToolExecError, truncate_tool_output};
-use choreo_coord::chain::ChainAccount;
-use choreo_coord::encode::{ContentInput, bytes_to_hex, hex_to_bytes};
-use choreo_coord::indexer::QueryKey;
+use choreo_content::chain::ChainAccount;
+use choreo_content::encode::{ContentInput, bytes_to_hex, hex_to_bytes};
+use choreo_content::indexer::QueryKey;
 use choreo_keystore::ServiceCredential;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// The single `"coord"` group name shared by every tool in this module.
-const GROUP: &str = "coord";
+/// The single `"content"` group name shared by every tool in this module.
+const GROUP: &str = "content";
 
 /// A shared `impl Tool` generator for the coord tools.
 ///
@@ -221,7 +221,7 @@ fn execute_coord_item(
     _cred: Option<&ServiceCredential>,
     _wd: Option<&Path>,
 ) -> Result<String, ToolExecError> {
-    let result = choreo_coord::orchestrate::item(&args.item_id, args.revision_id)?;
+    let result = choreo_content::orchestrate::item(&args.item_id, args.revision_id)?;
     Ok(format!(
         "item {}\n{}",
         result.item_id,
@@ -251,7 +251,7 @@ fn execute_coord_revisions(
     _cred: Option<&ServiceCredential>,
     _wd: Option<&Path>,
 ) -> Result<String, ToolExecError> {
-    let result = choreo_coord::orchestrate::revisions(&args.item_id)?;
+    let result = choreo_content::orchestrate::revisions(&args.item_id)?;
     Ok(format_revision_entries(&result))
 }
 
@@ -287,7 +287,8 @@ fn execute_coord_events(
     _wd: Option<&Path>,
 ) -> Result<String, ToolExecError> {
     let key = events_key_to_query(&args.key)?;
-    let result = choreo_coord::orchestrate::events(&key, args.limit.unwrap_or(1024), args.before)?;
+    let result =
+        choreo_content::orchestrate::events(&key, args.limit.unwrap_or(1024), args.before)?;
     Ok(format_decoded_events(&result))
 }
 
@@ -313,7 +314,7 @@ fn execute_coord_account_items(
     _cred: Option<&ServiceCredential>,
     _wd: Option<&Path>,
 ) -> Result<String, ToolExecError> {
-    let result = choreo_coord::orchestrate::account_items(&args.account)?;
+    let result = choreo_content::orchestrate::account_items(&args.account)?;
     Ok(format_account_items(&result))
 }
 
@@ -342,7 +343,7 @@ fn execute_coord_profile(
     _cred: Option<&ServiceCredential>,
     _wd: Option<&Path>,
 ) -> Result<String, ToolExecError> {
-    let result = choreo_coord::orchestrate::profile(&args.account)?;
+    let result = choreo_content::orchestrate::profile(&args.account)?;
     Ok(format_profile(&result))
 }
 
@@ -371,7 +372,7 @@ fn execute_coord_decode_content(
     _cred: Option<&ServiceCredential>,
     _wd: Option<&Path>,
 ) -> Result<String, ToolExecError> {
-    let result = choreo_coord::orchestrate::decode_content(&args.content_ref)?;
+    let result = choreo_content::orchestrate::decode_content(&args.content_ref)?;
     Ok(format_decoded_content(&result))
 }
 
@@ -394,7 +395,7 @@ fn execute_coord_status(
     _cred: Option<&ServiceCredential>,
     _wd: Option<&Path>,
 ) -> Result<String, ToolExecError> {
-    let result = choreo_coord::orchestrate::status()?;
+    let result = choreo_content::orchestrate::status()?;
     Ok(format_status(&result))
 }
 
@@ -444,7 +445,7 @@ fn execute_coord_publish_item(
     let links = parse_id_list(&args.links)?;
     let mentions = parse_id_list(&args.mentions)?;
     let nonce = parse_optional_id(&args.nonce)?;
-    let outcome = choreo_coord::orchestrate::publish_item(
+    let outcome = choreo_content::orchestrate::publish_item(
         &account,
         &args.content,
         parents,
@@ -495,7 +496,7 @@ fn execute_coord_publish_revision(
     let item_id = hex_to_bytes(&args.item_id).map_err(|e| ToolExecError(e.to_string()))?;
     let links = parse_id_list(&args.links)?;
     let mentions = parse_id_list(&args.mentions)?;
-    let outcome = choreo_coord::orchestrate::publish_revision(
+    let outcome = choreo_content::orchestrate::publish_revision(
         &account,
         item_id,
         &args.content,
@@ -524,7 +525,7 @@ pub struct CoordLifecycleArgs {
     /// SS58 address of the authorizing account.
     pub account: String,
     /// The lifecycle state transition to apply.
-    pub action: choreo_coord::orchestrate::LifecycleAction,
+    pub action: choreo_content::orchestrate::LifecycleAction,
     /// `0x` hex item id.
     pub item_id: String,
 }
@@ -536,7 +537,7 @@ fn execute_coord_lifecycle(
 ) -> Result<String, ToolExecError> {
     let account = chain_account_for_write(cred, &args.account)?;
     let item_id = hex_to_bytes(&args.item_id).map_err(|e| ToolExecError(e.to_string()))?;
-    choreo_coord::orchestrate::lifecycle(&account, args.action, item_id)?;
+    choreo_content::orchestrate::lifecycle(&account, args.action, item_id)?;
     Ok(format!(
         "applied lifecycle action to item {}",
         bytes_to_hex(&item_id)
@@ -622,7 +623,7 @@ impl super::Tool for CoordImage {
         _ctx: Option<&super::context::ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
         let img =
-            choreo_coord::orchestrate::item_image(&args.item_id, args.revision_id, args.level)
+            choreo_content::orchestrate::item_image(&args.item_id, args.revision_id, args.level)
                 .map_err(|e| ToolExecError(e.to_string()))?;
         // Normalize the fetched bytes the same way `read_image` does so the
         // reference carries a known-good MIME and bounded dimensions.
@@ -683,7 +684,7 @@ pub struct CoordAccountLinkArgs {
     /// SS58 address of the account.
     pub account: String,
     /// Whether to add (pin) or remove (unpin) the item.
-    pub action: choreo_coord::orchestrate::AccountLinkAction,
+    pub action: choreo_content::orchestrate::AccountLinkAction,
     /// `0x` hex item id.
     pub item_id: String,
 }
@@ -695,12 +696,12 @@ fn execute_coord_account_link(
 ) -> Result<String, ToolExecError> {
     let account = chain_account_for_write(cred, &args.account)?;
     let item_id = hex_to_bytes(&args.item_id).map_err(|e| ToolExecError(e.to_string()))?;
-    choreo_coord::orchestrate::account_link(&account, args.action, item_id)?;
+    choreo_content::orchestrate::account_link(&account, args.action, item_id)?;
     Ok(format!(
         "{} item {} {} account",
         match args.action {
-            choreo_coord::orchestrate::AccountLinkAction::Add => "pinned",
-            choreo_coord::orchestrate::AccountLinkAction::Remove => "unpinned",
+            choreo_content::orchestrate::AccountLinkAction::Add => "pinned",
+            choreo_content::orchestrate::AccountLinkAction::Remove => "unpinned",
         },
         bytes_to_hex(&item_id),
         args.account,
@@ -735,7 +736,7 @@ fn execute_coord_set_profile(
     _wd: Option<&Path>,
 ) -> Result<String, ToolExecError> {
     let account = chain_account_for_write(cred, &args.account)?;
-    let outcome = choreo_coord::orchestrate::set_profile(&account, &args.content)?;
+    let outcome = choreo_content::orchestrate::set_profile(&account, &args.content)?;
     Ok(format_publish_outcome(&outcome))
 }
 
@@ -750,7 +751,7 @@ coord_tool!(
 
 // ── Result formatting ───────────────────────────────────────────────────────
 
-fn format_resolved_item(item: &choreo_coord::orchestrate::ResolvedItem) -> String {
+fn format_resolved_item(item: &choreo_content::orchestrate::ResolvedItem) -> String {
     format!(
         "item_id: {}\nrevision_id: {}\nipfs_hash: {}\nowner: {}\nflags: {:#04x}\ncontent:\n{}",
         item.item_id,
@@ -762,7 +763,7 @@ fn format_resolved_item(item: &choreo_coord::orchestrate::ResolvedItem) -> Strin
     )
 }
 
-fn format_revision_entries(entries: &[choreo_coord::orchestrate::RevisionEntry]) -> String {
+fn format_revision_entries(entries: &[choreo_content::orchestrate::RevisionEntry]) -> String {
     if entries.is_empty() {
         return "no indexed revisions".to_string();
     }
@@ -783,7 +784,7 @@ fn format_revision_entries(entries: &[choreo_coord::orchestrate::RevisionEntry])
     out
 }
 
-fn format_decoded_events(events: &[choreo_coord::indexer::DecodedEvent]) -> String {
+fn format_decoded_events(events: &[choreo_content::indexer::DecodedEvent]) -> String {
     if events.is_empty() {
         return "no matching events".to_string();
     }
@@ -801,7 +802,7 @@ fn format_decoded_events(events: &[choreo_coord::indexer::DecodedEvent]) -> Stri
     out
 }
 
-fn format_account_items(items: &[choreo_coord::orchestrate::AccountItem]) -> String {
+fn format_account_items(items: &[choreo_content::orchestrate::AccountItem]) -> String {
     if items.is_empty() {
         return "no pinned items".to_string();
     }
@@ -815,7 +816,7 @@ fn format_account_items(items: &[choreo_coord::orchestrate::AccountItem]) -> Str
     out
 }
 
-fn format_profile(profile: &choreo_coord::orchestrate::ProfileResult) -> String {
+fn format_profile(profile: &choreo_content::orchestrate::ProfileResult) -> String {
     if !profile.exists {
         return "no profile set".to_string();
     }
@@ -838,7 +839,7 @@ fn format_profile(profile: &choreo_coord::orchestrate::ProfileResult) -> String 
     out
 }
 
-fn format_decoded_content(content: &choreo_coord::encode::DecodedItem) -> String {
+fn format_decoded_content(content: &choreo_content::encode::DecodedItem) -> String {
     let mut out = format!("content_type: {:?}\n", content.content_type);
     if let Some(title) = &content.title {
         out.push_str(&format!("title: {title}\n"));
@@ -884,7 +885,7 @@ fn format_decoded_content(content: &choreo_coord::encode::DecodedItem) -> String
     out
 }
 
-fn format_status(status: &choreo_coord::orchestrate::CoordStatus) -> String {
+fn format_status(status: &choreo_content::orchestrate::CoordStatus) -> String {
     let mut out = String::new();
     match &status.chain {
         Some(chain) => out.push_str(&format!(
@@ -913,7 +914,7 @@ fn format_status(status: &choreo_coord::orchestrate::CoordStatus) -> String {
     out
 }
 
-fn format_publish_outcome(outcome: &choreo_coord::chain::TxOutcome) -> String {
+fn format_publish_outcome(outcome: &choreo_content::chain::TxOutcome) -> String {
     match &outcome.item_id {
         Some(id) => format!("published; item_id={id}"),
         None => "published".to_string(),

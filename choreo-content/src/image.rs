@@ -10,7 +10,7 @@
 //! pass a `path` — dimensions, digest, sizes, and mipmap levels are derived
 //! here rather than supplied by the caller.
 
-use crate::CoordError;
+use crate::ContentError;
 use crate::encode::{ImageSpec, MipmapLevel, bytes_to_hex};
 use image::{DynamicImage, GenericImageView, codecs::jpeg::JpegEncoder, imageops::FilterType};
 use sha2::{Digest, Sha256};
@@ -51,12 +51,12 @@ fn plan_levels(width: u32, height: u32) -> Vec<(u32, u32)> {
 
 /// Encode a decoded image as a quality-82 JPEG (the protocol's storage
 /// format — every level, including level 0, is a JPEG re-encode).
-pub(crate) fn encode_as_jpeg(image: &DynamicImage) -> Result<Vec<u8>, CoordError> {
+pub(crate) fn encode_as_jpeg(image: &DynamicImage) -> Result<Vec<u8>, ContentError> {
     let mut bytes = Vec::new();
     let mut cursor = Cursor::new(&mut bytes);
     JpegEncoder::new_with_quality(&mut cursor, JPEG_QUALITY)
         .encode_image(image)
-        .map_err(|e| CoordError::Image(format!("failed to encode JPEG level: {e}")))?;
+        .map_err(|e| ContentError::Image(format!("failed to encode JPEG level: {e}")))?;
     Ok(bytes)
 }
 
@@ -67,8 +67,8 @@ pub(crate) fn encode_as_jpeg(image: &DynamicImage) -> Result<Vec<u8>, CoordError
 /// [`crate::ipfs::add`] + digest->CID conversion.
 fn build_levels(
     image: &DynamicImage,
-    mut upload: impl FnMut(&[u8]) -> Result<String, CoordError>,
-) -> Result<Vec<MipmapLevel>, CoordError> {
+    mut upload: impl FnMut(&[u8]) -> Result<String, ContentError>,
+) -> Result<Vec<MipmapLevel>, ContentError> {
     let (width, height) = image.dimensions();
     let mut levels = Vec::new();
     for (level, (out_width, out_height)) in plan_levels(width, height).into_iter().enumerate() {
@@ -99,11 +99,12 @@ fn build_levels(
 pub fn build_image_spec(
     path: &Path,
     filename_override: Option<&str>,
-) -> Result<ImageSpec, CoordError> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| CoordError::Image(format!("failed to read image {}: {e}", path.display())))?;
+) -> Result<ImageSpec, ContentError> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        ContentError::Image(format!("failed to read image {}: {e}", path.display()))
+    })?;
     let image = image::load_from_memory(&bytes).map_err(|e| {
-        CoordError::Image(format!("failed to decode image {}: {e}", path.display()))
+        ContentError::Image(format!("failed to decode image {}: {e}", path.display()))
     })?;
     let (width, height) = image.dimensions();
 
@@ -112,7 +113,7 @@ pub fn build_image_spec(
     let filename = filename_override
         .map(str::to_owned)
         .unwrap_or_else(|| fallback_filename(path));
-    let upload = |jpeg_bytes: &[u8]| -> Result<String, CoordError> {
+    let upload = |jpeg_bytes: &[u8]| -> Result<String, ContentError> {
         let digest_hex = crate::ipfs::add(jpeg_bytes, &filename)?;
         crate::encode::digest_hex_to_cid(&digest_hex)
     };
@@ -233,7 +234,7 @@ mod tests {
 
     #[test]
     fn build_image_spec_rejects_non_image_bytes() {
-        let dir = std::env::temp_dir().join(format!("choreo-coord-image-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("choreo-content-image-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("not-an-image.bin");
         std::fs::write(&path, b"definitely not an image").unwrap();

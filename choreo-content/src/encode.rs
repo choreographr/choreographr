@@ -280,7 +280,7 @@ pub struct DecodedItem {
 ///
 /// Returns an error when an embedded image's digest hex or mipmap CID is
 /// malformed (see [`encode_image_mixin`]); a well-formed item always succeeds.
-pub fn encode_item(input: &PreparedContent) -> Result<Vec<u8>, crate::CoordError> {
+pub fn encode_item(input: &PreparedContent) -> Result<Vec<u8>, crate::ContentError> {
     let language = input
         .language
         .clone()
@@ -348,9 +348,9 @@ pub fn encode_item(input: &PreparedContent) -> Result<Vec<u8>, crate::CoordError
 /// Decode `ItemMessage` bytes into an extracted [`DecodedItem`]. Unknown mixins
 /// are ignored (forward compatibility); a missing/ill-formed mixin degrades
 /// that field to `None` rather than failing the whole decode.
-pub fn decode_item(bytes: &[u8]) -> Result<DecodedItem, crate::CoordError> {
+pub fn decode_item(bytes: &[u8]) -> Result<DecodedItem, crate::ContentError> {
     let item = ItemMessage::decode(bytes)
-        .map_err(|e| crate::CoordError::Content(format!("failed to decode item payload: {e}")))?;
+        .map_err(|e| crate::ContentError::Content(format!("failed to decode item payload: {e}")))?;
 
     let mut out = DecodedItem {
         content_type: infer_content_type(&item),
@@ -426,7 +426,7 @@ fn marker(mixin_id: u32) -> MixinPayloadMessage {
 /// Returns an error if the image digest hex or any mipmap CID is malformed,
 /// rather than silently encoding an empty `ipfs_hash`. A bad image reference
 /// must fail the whole publish so it can never land on-chain.
-pub fn encode_image_mixin(image: &ImageSpec) -> Result<Vec<u8>, crate::CoordError> {
+pub fn encode_image_mixin(image: &ImageSpec) -> Result<Vec<u8>, crate::ContentError> {
     let mipmap_levels = image
         .mipmap_levels
         .iter()
@@ -441,7 +441,7 @@ pub fn encode_image_mixin(image: &ImageSpec) -> Result<Vec<u8>, crate::CoordErro
                 ipfs_hash: cid_to_multihash_bytes(&l.cid)?,
             })
         })
-        .collect::<Result<Vec<_>, crate::CoordError>>()?;
+        .collect::<Result<Vec<_>, crate::ContentError>>()?;
 
     let message = ImageMixinMessage {
         filename: image.filename.clone(),
@@ -525,16 +525,16 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 /// `0x`-prefixed hex (32 bytes) -> `[u8; 32]`.
-pub fn hex_to_bytes(hex_value: &str) -> Result<[u8; 32], crate::CoordError> {
+pub fn hex_to_bytes(hex_value: &str) -> Result<[u8; 32], crate::ContentError> {
     let raw = hex::decode(hex_value.trim_start_matches("0x"))
-        .map_err(|_| crate::CoordError::Cid(format!("invalid hex value {hex_value}")))?;
+        .map_err(|_| crate::ContentError::Cid(format!("invalid hex value {hex_value}")))?;
     raw.try_into()
-        .map_err(|_| crate::CoordError::Cid(format!("expected 32 bytes for {hex_value}")))
+        .map_err(|_| crate::ContentError::Cid(format!("expected 32 bytes for {hex_value}")))
 }
 
 /// sha2-256 digest hex (`0x`) -> IPFS CIDv0 (Base58), prefixing the
 /// `0x12 0x20` multihash header.
-pub fn digest_hex_to_cid(hex_value: &str) -> Result<String, crate::CoordError> {
+pub fn digest_hex_to_cid(hex_value: &str) -> Result<String, crate::ContentError> {
     let digest = hex_to_bytes(hex_value)?;
     let mut multihash = Vec::with_capacity(34);
     multihash.push(0x12);
@@ -544,12 +544,12 @@ pub fn digest_hex_to_cid(hex_value: &str) -> Result<String, crate::CoordError> {
 }
 
 /// IPFS CIDv0 (Base58 sha2-256) -> `0x`-prefixed digest hex.
-pub fn cid_to_digest_hex(cid: &str) -> Result<String, crate::CoordError> {
+pub fn cid_to_digest_hex(cid: &str) -> Result<String, crate::ContentError> {
     let multihash = bs58::decode(cid)
         .into_vec()
-        .map_err(|_| crate::CoordError::Cid(format!("failed to decode CID {cid}")))?;
+        .map_err(|_| crate::ContentError::Cid(format!("failed to decode CID {cid}")))?;
     if multihash.len() != 34 || multihash[0] != 0x12 || multihash[1] != 0x20 {
-        return Err(crate::CoordError::Cid(format!(
+        return Err(crate::ContentError::Cid(format!(
             "CID {cid} is not a sha2-256 CIDv0 multihash"
         )));
     }
@@ -557,7 +557,7 @@ pub fn cid_to_digest_hex(cid: &str) -> Result<String, crate::CoordError> {
 }
 
 /// `0x`-prefixed digest hex -> raw digest bytes, for the protobuf mixin.
-fn multihash_bytes(hex_value: &str) -> Result<Vec<u8>, crate::CoordError> {
+fn multihash_bytes(hex_value: &str) -> Result<Vec<u8>, crate::ContentError> {
     let digest = hex_to_bytes(hex_value)?;
     let mut multihash = Vec::with_capacity(34);
     multihash.push(0x12);
@@ -569,7 +569,7 @@ fn multihash_bytes(hex_value: &str) -> Result<Vec<u8>, crate::CoordError> {
 /// IPFS CIDv0 -> full multihash bytes (with the `0x12 0x20` header), for the
 /// protobuf mixin — the reference wire form. Validates the multihash shape
 /// and the 32-byte digest length like [`cid_to_digest_bytes`].
-fn cid_to_multihash_bytes(cid: &str) -> Result<Vec<u8>, crate::CoordError> {
+fn cid_to_multihash_bytes(cid: &str) -> Result<Vec<u8>, crate::ContentError> {
     let digest = cid_to_digest_bytes(cid)?;
     let mut multihash = Vec::with_capacity(34);
     multihash.push(0x12);
@@ -591,7 +591,7 @@ pub fn bytes_to_cid(digest: &[u8]) -> String {
 /// multihash-form validation (in [`cid_to_digest_hex`]) and the 32-byte length
 /// check (in [`hex_to_bytes`]), returning an error instead of an empty payload
 /// on any malformed input.
-fn cid_to_digest_bytes(cid: &str) -> Result<Vec<u8>, crate::CoordError> {
+fn cid_to_digest_bytes(cid: &str) -> Result<Vec<u8>, crate::ContentError> {
     Ok(hex_to_bytes(&cid_to_digest_hex(cid)?)?.to_vec())
 }
 

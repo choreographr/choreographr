@@ -10,7 +10,7 @@
 //! [`init`] must be called exactly once before any tx/state tool executes
 //! (the daemon does so from `main()`). [`get`] returns `None` before init or
 //! when the runtime failed to build, and callers map that to a
-//! [`crate::CoordError::RuntimeNotInitialized`] rather than panicking.
+//! [`crate::ContentError::RuntimeNotInitialized`] rather than panicking.
 
 use std::sync::OnceLock;
 
@@ -40,22 +40,22 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 /// Access the sidecar runtime, or `None` if [`init`] has not been called (or
 /// failed). Callers must not panic on `None` — they surface a
-/// [`crate::CoordError::RuntimeNotInitialized`] error instead.
+/// [`crate::ContentError::RuntimeNotInitialized`] error instead.
 pub fn get() -> Option<&'static tokio::runtime::Runtime> {
     RUNTIME.get()
 }
 
 /// Run `fut` to completion on the sidecar tokio runtime.
 ///
-/// Returns [`crate::CoordError::RuntimeNotInitialized`] if [`init`] was never
+/// Returns [`crate::ContentError::RuntimeNotInitialized`] if [`init`] was never
 /// called (or failed), so callers surface a clear error instead of panicking on
 /// a missing runtime. Logs the wall-clock duration so every tool call leaves an
 /// observability trail.
-pub(crate) fn block_on<F>(fut: F) -> Result<F::Output, crate::CoordError>
+pub(crate) fn block_on<F>(fut: F) -> Result<F::Output, crate::ContentError>
 where
     F: std::future::Future,
 {
-    let rt = get().ok_or(crate::CoordError::RuntimeNotInitialized)?;
+    let rt = get().ok_or(crate::ContentError::RuntimeNotInitialized)?;
     let start = std::time::Instant::now();
     let out = rt.block_on(fut);
     tracing::debug!(

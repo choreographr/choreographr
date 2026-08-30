@@ -557,12 +557,16 @@ impl DaemonState {
         // still uses after spawning).
         let lag_limits = self.lag_limits;
         let global_lag = Arc::clone(&self.global_lag);
-        // TEMPORARY: reserve the Tool trait's single `x_credentials` slot for the
-        // coord signing credential. Pick the daemon's Substrate credential to
-        // ride that slot; see `RequestContext::substrate_credential` for the
-        // stopgap rationale until a proper tool→keystore credential-access
-        // system replaces it.
+        // TEMPORARY: reserve the Tool trait's single `x_credentials` slot for
+        // the content (Coordination Platform) signing credential. Only done
+        // when the `content` feature is compiled in — without it there are no
+        // content write tools to feed, so the slot stays empty. See
+        // `RequestContext::substrate_credential` for the stopgap rationale
+        // until a proper tool→keystore credential-access system replaces it.
+        #[cfg(feature = "content")]
         let substrate_credential = self.pick_substrate_credential();
+        #[cfg(not(feature = "content"))]
+        let substrate_credential = None;
 
         // Resolve provider from the session's account name
         let account_name = metadata.account_name.clone();
@@ -608,11 +612,16 @@ impl DaemonState {
     /// Pick the single Substrate credential from the daemon's credential map.
     ///
     /// TEMPORARY: this reserves the Tool trait's single `x_credentials` slot
-    /// for the coord signing credential (see
+    /// for the content (Coordination Platform) signing credential (see
     /// `RequestContext::substrate_credential` for the stopgap rationale). When
     /// exactly one Substrate credential exists it is returned; when several,
     /// one named `"main"`/`"default"` is preferred (then the first in map
     /// order); when none, `None`.
+    ///
+    /// Only compiled with the `content` feature: without it no content write
+    /// tools exist, so nothing consumes the credential and the slot stays
+    /// empty (see the `spawn_session` call site).
+    #[cfg(feature = "content")]
     fn pick_substrate_credential(&self) -> Option<ServiceCredential> {
         // First pass prefers a credential explicitly named "main"/"default";
         // otherwise keep the first Substrate credential encountered.
@@ -672,8 +681,20 @@ impl DaemonState {
         info!("CreateSession: id={}, title={:?}", sid, title);
 
         let cwd_str = working_dir.as_ref().map(|p| p.display().to_string());
+        // The default active groups mirror the always-on groups; the
+        // Coordination Platform group is included only when the `content`
+        // feature is compiled in. Stale persisted names (e.g. `coord` from
+        // before the group rename, or groups whose feature is off) are
+        // silently ignored downstream: a group with no registered tools
+        // contributes nothing to `available_definitions`, and load/unload
+        // validation rejects unknown names on new requests only.
+        // `mut` is only needed when the `content` feature pushes its group.
+        #[cfg_attr(not(feature = "content"), allow(unused_mut))]
+        let mut default_groups = vec!["core".to_string(), "git".to_string(), "shell".to_string()];
+        #[cfg(feature = "content")]
+        default_groups.push("content".to_string());
         let active_cats = if active_tool_groups.is_empty() {
-            vec!["core".into(), "git".into(), "shell".into(), "coord".into()]
+            default_groups
         } else {
             active_tool_groups.clone()
         };
