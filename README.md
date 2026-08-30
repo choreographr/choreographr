@@ -38,7 +38,7 @@ Currently the primary client is **`choreo-tui`** - a fullscreen terminal UI.
 
 Other clients being developed: 
 
-- **`choreo-gui`** — GUI built with [Dioxus](https://dioxuslabs.com/) - just a placeholder for now, it will support Linux, macOS, Windows, Android and iOS.
+- **`choreo-gui`** — Desktop/Android GUI built with [Dioxus](https://dioxuslabs.com/) on the Dioxus Native (Blitz) renderer — one renderer for both desktop and Android, no webview. Built as a lib+cdylib so dx/gradle can package it as an APK.
 - **`choreo-im`** — instant-messaging bridge (Telegram, more platforms coming) - chat with your agent on the go!
 - **`choreo-acp`** — ACP bridge so ACP-compatible editors (Claude Code, Cline, …) can drive Choreographr sessions over JSON-RPC.
 - **`choreographr`** — Choreographr servers will be able to connect to other servers to deploy work elsewhere.
@@ -360,7 +360,7 @@ RUST_LOG=debug cargo run --release -p choreographr
 ```
 
 Then a client — the suite binaries live in the root package, selected with `--bin`;
-the desktop GUI is a separate crate (`choreo-gui`):
+the GUI is a separate crate (`choreo-gui`):
 
 ```bash
 cargo run --release -p choreographr --bin choreo-tui                 # terminal UI
@@ -381,7 +381,7 @@ cargo run --release -p choreographr --bin choreo-acp                 # ACP bridg
 │  (terminal)  │                     │              │                ├────────────────────┤
 ├──────────────┤                     │              │◄──────────────►│  Anthropic Messages│
 │  choreo-gui  │◄───────────────────►│ choreographr │                ├────────────────────┤
-│  (desktop)   │   Noise-IK TCP      │  (daemon)    │◄──────────────►│  Google Gemini     │
+│ (desk/Android)│   Noise-IK TCP      │  (daemon)    │◄──────────────►│  Google Gemini     │
 ├──────────────┤                     │              │                └────────────────────┘
 │  choreo-im   │◄───────────────────►│              │
 │  (IM bridge) │                     │              │
@@ -413,7 +413,7 @@ data model.
 | `choreo-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio |
 | `choreo-acp` | ACP (Agent Communication Protocol) bridge — translates JSON-RPC 2.0 over stdin/stdout into `choreo-proto` messages so ACP-compatible editors can drive sessions |
 | `choreo-tui` | Full-screen terminal UI client (ratatui + crossterm) |
-| `choreo-gui` | Desktop GUI client (Dioxus) |
+| `choreo-gui` | Desktop/Android GUI client (Dioxus Native / Blitz renderer — no webview) |
 | `choreo-im` | Instant messaging bridge (Telegram) |
 | `choreo-client-core` | Shared parsing, markdown, image assembly, and daemon-message dispatch for UI clients |
 | `choreo-markdown` | Markdown parser, HTML renderer (pulldown-cmark + ammonia), and a LaTeX-math → Unicode pretty-printer (`render_math_pretty`) |
@@ -880,6 +880,26 @@ just tui / gui / im / acp # run the other clients (im takes e.g. `just im telegr
 recipes (`test`, `test-fast`, `test-lean`, `test-integration`, `test-all`,
 `test-crate`, `shard`, `retry`) fail with an install hint until `cargo-nextest`
 is on `PATH`.
+
+### Android (Termux) binaries
+
+The four suite binaries (`choreographr`, `choreo-tui`, `choreo-im`,
+`choreo-acp`) run under Termux on Android. `scripts/build-android.sh`
+ cross-builds them via [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) and
+stages them in `dist/android/<abi>/` for `adb push` into Termux's
+`$PREFIX/bin`. It temporarily strips the workspace's per-profile `rustflags`
+(same mechanism as `just build-stable`) — profile rustflags apply regardless of
+`--target`, and `-C target-cpu=native` would emit host-CPU code that traps on
+Android devices. Prerequisites: `cargo install cargo-ndk`, an Android NDK
+(`ANDROID_NDK_HOME` or the `ANDROID_HOME/ndk/<ver>` layout), and the rustup
+targets (`rustup target add aarch64-linux-android x86_64-linux-android`):
+
+```bash
+just android-check                        # dry run: verify prerequisites, print what would run
+just android-binaries                     # build aarch64 (arm64-v8a)
+just android-binaries -- --emulator       # also build x86_64 for the emulator
+just gui-android                          # choreo-gui via `dx build --platform android` (cdylib, NOT part of build-android.sh)
+```
 
 ### Supply-chain security
 

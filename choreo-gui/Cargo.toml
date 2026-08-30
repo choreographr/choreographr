@@ -11,12 +11,18 @@ rust-version.workspace = true
 # The GUI is not part of the shipped suite or the crates.io publish set.
 publish = false
 
-# The desktop GUI is intentionally NOT part of the prebuilt release artifacts
+# The GUI is intentionally NOT part of the prebuilt release artifacts
 # (tarball/.deb/.rpm/Homebrew/AUR ship the daemon, TUI, and bridges only) — it
-# is a stub and drags in the dioxus/webkit2gtk native-widget tree, which has no
-# place in the lean default install. It also stays off crates.io (`publish =
-# false` above), so there is no `cargo install choreo-gui`; build it from the
-# workspace tree if you want the GUI.
+# is a stub and not part of the shipped suite, so it has no place in the lean
+# default install. It also stays off crates.io (`publish = false` above), so
+# there is no `cargo install choreo-gui`; build it from the workspace tree if
+# you want the GUI.
+
+# The cdylib exists solely for the Android gradle/dx scaffold, which loads the
+# crate as a `.so` via `System.loadLibrary` to drive the Dioxus Native app. It
+# is inert on desktop builds (nothing links against the dynamic target there).
+[lib]
+crate-type = ["lib", "cdylib"]
 [[bin]]
 name = "choreo-gui"
 path = "src/bin/choreo-gui.rs"
@@ -24,7 +30,12 @@ path = "src/bin/choreo-gui.rs"
 [dependencies]
 base64.workspace = true
 clap.workspace = true
-dioxus = { version = "0.7", features = ["desktop"] }
+# Dioxus 0.7 Native renderer (Blitz/wgpu) instead of the desktop/webview
+# renderer: it is ALSO the Android renderer, so one renderer serves desktop and
+# aarch64-linux-android alike — there is no webview (webkit2gtk, etc.) anywhere
+# in the dependency tree. The platform-agnostic `launch` facade maps to
+# dioxus_native under the `native` cfg, so no per-platform entry code is needed.
+dioxus = { version = "0.7", features = ["native"] }
 futures-channel.workspace = true
 futures-util.workspace = true
 humfmt.workspace = true

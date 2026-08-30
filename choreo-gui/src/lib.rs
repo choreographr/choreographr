@@ -11,7 +11,6 @@ use crate::state::{AppState, UiEvent};
 use choreo_client_core::{ConnectionMode, read_server_pk};
 use choreo_proto::socket_path;
 use clap::Parser;
-use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use std::sync::OnceLock;
@@ -47,7 +46,7 @@ fn clap_styles() -> clap::builder::Styles {
 #[command(
     name = "choreo-gui",
     version,
-    about = "Choreographr desktop GUI",
+    about = "Choreographr GUI",
     color = clap::ColorChoice::Auto,
     styles = clap_styles()
 )]
@@ -61,7 +60,7 @@ struct Cli {
     server_pk: Option<String>,
 }
 
-/// Entry point for the `choreo-gui` desktop binary.
+/// Entry point for the `choreo-gui` UI binary.
 ///
 /// This crate declares its own `choreo-gui` binary target (`src/bin/`), a
 /// thin wrapper that calls this function, so `cargo run -p choreo-gui` in the
@@ -87,9 +86,10 @@ pub fn main() {
     // Store mode globally so the App component can read it.
     let _ = CONNECTION_MODE.set(mode);
 
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(Config::new().with_window(WindowBuilder::new().with_title("choreo-gui")))
-        .launch(App);
+    // Platform-agnostic launch facade: under the `native` feature the macro
+    // cfg routes this to the Dioxus Native (Blitz) renderer, which serves both
+    // desktop and Android — no desktop()/mobile() branching anywhere.
+    dioxus::launch(App);
 }
 
 #[component]

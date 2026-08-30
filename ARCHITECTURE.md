@@ -13,7 +13,7 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 │  (terminal)  │                    │              │                ├──────────────────────┤
 ├──────────────┤                    │  choreographr  │◄──────────────►│  Anthropic Messages   │
 │ choreo-gui       │◄──────────────────►│              │                ├──────────────────────┤
-│  (desktop)   │    Unix socket     │              │◄──────────────►│  Google Gemini API    │
+│ (desktop/Android)│    Unix socket     │              │◄──────────────►│  Google Gemini API    │
 ├──────────────┤                    │              │                ├──────────────────────┤
 │   choreo-im     │◄──────────────────►│              │◄──────────────►│  Mistral API          │
 │ (IM bridge)  │    Unix socket     │              │                ├──────────────────────┤
@@ -62,7 +62,9 @@ Choreographr (workspace)
 │                       publish-time image mipmap pipeline behind the `content` tools
 │                       (feature-gated `content` cargo feature, off by default)
 ├── choreo-tui             Terminal UI client (ratatui + crossterm)
-├── choreo-gui             Desktop GUI client (Dioxus)
+├── choreo-gui             Desktop/Android GUI client (Dioxus Native / Blitz
+│                       renderer — no webview; built as lib+cdylib for dx/gradle
+│                       APK packaging)
 └── choreo-im              IM platform bridge (Telegram)
 ```
 
@@ -115,7 +117,8 @@ Releases are cut **locally** — there is no CI pipeline. The orchestrator,
 reads the version from the root `Cargo.toml` (the single source of truth that
 the Homebrew formula, AUR PKGBUILD, and installer mirror), runs
 `cargo build --release -p choreographr` (the four shipped binaries only —
-choreo-gui's dioxus/webkit2gtk stack is excluded from the release build),
+choreo-gui's Dioxus Native (Blitz) renderer stack is excluded from
+the release build),
 packs the release tarball, writes
 `SHA256SUMS`, builds the `.deb`/`.rpm` when the tools are present, and prints
 the exact upload + checklist commands. Only `--upload` runs
@@ -137,7 +140,8 @@ Homebrew, AUR):
 
 `choreo-mcp` is a **library-only crate** (the MCP client the daemon spawns
 for tool servers) — it has no `[[bin]]` target and is never shipped as a
-binary. `choreo-gui` is a stub and is not shipped either.
+binary. `choreo-gui` is built separately (desktop via `cargo run -p choreo-gui`,
+Android via `dx build --platform android`) and is not shipped either.
 
 The shipped target set is exactly two; `release.sh` and `install.sh` hardcode
 this pair and refuse any other platform ("ships Linux x86_64 and macOS arm64
@@ -216,6 +220,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 | `publish-stable.sh` | The crates.io publish wrapper (RELEASE.md Phase 2) — strips the nightly-only per-profile `rustflags` and the `[unstable]` config opt-in for the duration of `cargo release publish` (masking the two edited files from cargo-release's clean-tree gate via `git update-index --skip-worktree`, and always passing `--exclude choreo-gui`, which cargo-release 1.1.5 won't drop on its own via `publish = false`), so published manifests stay buildable by stable `cargo install`, then restores both files and clears the masks |
 | `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine instead of GitHub Actions (no CI by design) |
 | `check-supply-chain.sh` | The dependency supply-chain gate — runs `cargo deny check advisories bans sources` against `deny.toml` (falling back to `cargo-audit` + a literal lockfile scan when cargo-deny is absent), after scanning the local `~/.cargo/registry` cache for the `.crate` files deleted during the 2026-08-20 `arrayref` attack (RUSTSEC-2026-0260). Wired into `just pre-commit` / `just ci`; see the **Dependency supply chain** subsection under **Security model** |
+| `build-android.sh` | Cross-builds the four suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run), stages them in `dist/android/<abi>/`, and prints the `adb push` guidance for Termux `$PREFIX/bin`. Strips the per-profile `rustflags` from the manifest for the duration (backed up and restored via `trap`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
 
 ### Distribution channels (0.1)
 
@@ -231,7 +236,7 @@ The workspace inherits crates.io-required fields from `[workspace.package]`
 in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
 `readme`, `description`), and members opt into publishing by *not* setting
 `publish = false`. The **publish set** is therefore fifteen of the sixteen
-workspace members — everything except `choreo-gui` (a non-shipped stub).
+workspace members — everything except `choreo-gui` (not shipped).
 `choreo-sanitize` is published too (previously private): the members that
 depend on it must resolve it from crates.io after a release, and
 cargo-release's publish verification rejects unpublished workspace deps:
@@ -241,8 +246,8 @@ cargo-release's publish verification rejects unpublished workspace deps:
 `choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`, `choreo-sanitize`,
 `choreo-markdown`, `choreo-image`
 
-`choreo-gui` sets `publish = false`: it is a stub that drags in the
-dioxus/webkit2gtk native-widget tree and is not part of the shipped suite, so
+`choreo-gui` sets `publish = false`: it drags in the Dioxus Native (Blitz/wgpu)
+renderer tree and is not part of the shipped suite, so
 it is neither published to crates.io (`cargo install choreo-gui` does not
 exist) nor included in the prebuilt release artifacts (tarball/.deb/.rpm/
 Homebrew/AUR), which carry the daemon, TUI, and bridges only. The GUI is kept
@@ -1265,14 +1270,16 @@ while !app.should_quit:
 | `clipboard.rs` | OSC 52 clipboard writer: `copy_to_clipboard` encodes the text as base64 and writes `ESC ] 52 ; c ; <payload> ST` to stdout, mirroring `terminal_progress`'s OSC 9;4 usage. The terminal mediates the write, so it works over SSH/tmux (the *local* clipboard), is a silent no-op on terminals without OSC 52 support (e.g. macOS Terminal.app), and can be refused by the terminal without affecting the TUI. Selections larger than 1 MiB are refused up front (the caller shows a "too large to copy" status) rather than stalling the UI loop on a multi-megabyte escape sequence terminals may drop anyway. `build_osc52` is a pure function, so the byte layout is unit-tested without a terminal. A write is only ever triggered by a user-initiated mouse-up over their own selection — hostile LLM/tool output can never inject a clipboard write through this path. |
 
 
-### `choreo-gui` — Desktop client
+### `choreo-gui` — Desktop/Android client
 
 Entry point: `src/bin/choreo-gui.rs` (thin wrapper calling `choreo_gui::main()`
 in `src/lib.rs`) — the crate owns its binary, unlike the daemon/TUI/IM/ACP
 which live in the root package.
 
 Unix socket or Noise IK encrypted TCP transport (selected via `--tcp-addr` / `--server-pk` CLI flags),
-rendered via Dioxus components. Uses hooks to spawn async reader/writer tasks inside
+rendered via Dioxus components on the Dioxus Native (Blitz/wgpu) renderer —
+one renderer for both desktop and Android (no webview anywhere; the crate is
+built as a lib+cdylib so dx/gradle can package it as an APK). Uses hooks to spawn async reader/writer tasks inside
 the Dioxus runtime. Subscribes to the session summary at connect
 (`SubscribeSessionsSummary`, alongside the initial `ListSessions`) so its session
 list stays live via daemon push broadcasts — required since the daemon stopped
@@ -3432,7 +3439,7 @@ cargo run -p choreographr --bin choreo-im -- telegram
 | `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
 | `ratatui` + `crossterm` | choreo-tui | Terminal UI |
-| `dioxus` | choreo-gui | Desktop UI |
+| `dioxus` | choreo-gui | Desktop/Android UI (Native/Blitz renderer) |
 | `image` + `resvg` + `heif-oxide` (via the `choreo-image` leaf crate) | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization (resvg), HEIC/HEIF decode (heif-oxide) with a pre-decode allocation guard |
 | `syntect` | choreo-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |

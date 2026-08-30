@@ -222,6 +222,15 @@ redb = "4"
 # `avif-native` (dav1d decode) is NOT enabled here: it is gated behind the
 # `avif` feature on each consumer, so the default/release build stays C-free
 # (see the release.sh static-musl rationale).
+#
+# NOTE — the caret here resolves to image 0.25.6 in Cargo.lock, and that is
+# DELIBERATE: the Dioxus Native renderer stack (dioxus-native 0.7 ->
+# blitz-dom 0.2.4, pulled in by choreo-gui) pins `image =0.25.6` EXACTLY, and
+# cargo never keeps two semver-compatible copies of one crate, so the whole
+# workspace must share 0.25.6. Consumers must stick to the 0.25.6 API surface
+# (e.g. no `DynamicImage::has_alpha`, which landed in 0.25.8 — use
+# `ColorType::has_alpha()` via `.color()` or a pixel scan instead). This pin
+# can relax when blitz-dom drops its exact-pin (0.3.x line).
 image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp", "rayon"] }
 # Pure-Rust HEIC/HEIF still-image decoder (ISOBMFF container + HEVC via
 # rust_h265). Built in unconditionally: no C dependencies, so it does NOT

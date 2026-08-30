@@ -187,7 +187,9 @@ fn finalize(img: DynamicImage, source_label: &str) -> std::io::Result<PreparedVi
         img
     };
 
-    let (data, mime_type) = if resized.has_alpha() {
+    // `ColorType::has_alpha` (image 0.25.6) rather than `DynamicImage::has_alpha`
+    // (added in 0.25.8): blitz-dom pins image to =0.25.6 workspace-wide.
+    let (data, mime_type) = if resized.color().has_alpha() {
         (encode_png(&resized)?, "image/png")
     } else {
         (encode_jpeg(&resized)?, "image/jpeg")

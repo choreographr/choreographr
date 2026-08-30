@@ -1,4 +1,4 @@
-//! Thin binary entry point for the `choreo-gui` desktop UI.
+//! Thin binary entry point for the `choreo-gui` UI.
 //!
 //! All of the GUI's logic lives in this crate's library; this wrapper exists
 //! so `cargo run -p choreo-gui` in the workspace produces a `choreo-gui`

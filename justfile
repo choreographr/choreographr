@@ -138,6 +138,32 @@ check-windows: _require-zig
     rustup target add x86_64-pc-windows-gnu
     cargo-zigbuild check {{ CARGO_FLAGS }} --target x86_64-pc-windows-gnu --workspace --lib
 
+# ── Android ───────────────────────────────────────────────────────────────────
+# Termux is the Android runtime for the four suite binaries: they are pushed
+# into Termux's $PREFIX/bin as plain executables. choreo-gui is different —
+# on Android it is built by `dx` as a cdylib (APK payload), not a suite binary.
+
+# Cross-build the four suite binaries for aarch64-linux-android via
+# cargo-ndk. Requires an Android NDK (ANDROID_NDK_HOME / sdkmanager layout);
+# add `emulator=true` for an x86_64 build too. See scripts/build-android.sh.
+android-binaries *args="":
+    ./scripts/build-android.sh {{ args }}
+
+# Prerequisite check + dry run for `android-binaries` — validates cargo-ndk,
+# the NDK, and the rustup Android targets, then prints what would run without
+# touching the tree. This is the script's verification path (no NDK needed to
+# at least see it fail with an actionable message).
+android-check:
+    ./scripts/build-android.sh --check
+
+# Build choreo-gui for Android via Dioxus CLI (NOT part of build-android.sh —
+# different toolchain: dx drives the Android Gradle/cdylib packaging itself).
+# `dx` infers the native renderer on Android; requires the NDK for the final
+# link. `--package` scopes the build to the choreo-gui crate (dx reads the
+# workspace root; the Dioxus config lives in the crate).
+gui-android args="":
+    dx build --platform android --release --package choreo-gui {{ args }}
+
 # ── testing ───────────────────────────────────────────────────────────────────
 
 # Full suite — unit + integration — via nextest in one pass (alias of `test-all`)
