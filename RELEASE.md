@@ -12,9 +12,13 @@ A release ships three things:
    AUR, `cargo binstall`, and the `choreographr.com` installer.
 3. **Channel updates** — Homebrew tap, AUR, choreographr.com.
 
-One release conductor drives all three; two build machines are involved (see
-[Build machines](#build-machines)). There is **no CI** — every step runs on
-owned machines, GitHub is only artifact hosting.
+One release conductor drives all three. The binary artifacts for the four
+shipped platforms are now built **on GitHub Actions** by
+`.github/workflows/release.yml` (see [CI builds](#ci-builds-github-actions)):
+pushing the `vX.Y.Z` tag builds every platform and creates the GitHub release
+with the combined `SHA256SUMS`. The two-machine flow in this SOP remains the
+manual alternative/fallback — it covers what CI does not (`.rpm`, the manual
+macOS daemon smoke test, and all channel updates).
 
 ---
 
@@ -28,6 +32,46 @@ owned machines, GitHub is only artifact hosting.
 Artifacts are **staged and uploaded from the Linux box** — it can build
 everything except the macOS tarball, so the macOS tarball is copied to it
 before upload (see [Phase 4](#phase-4--assemble-and-upload)).
+
+---
+
+## CI builds (GitHub Actions)
+
+`.github/workflows/release.yml` builds the release binaries on GitHub-hosted
+runners. It reuses `scripts/release.sh` (Linux + macOS jobs run it verbatim)
+and `scripts/build-android.sh`, so build flags, `--locked`, feature selection,
+artifact naming, and smoke tests stay in the scripts — the workflow only adds
+per-runner toolchain setup and artifact plumbing. `choreo-gui` (a stub) is
+built nowhere.
+
+**Triggers** (deliberately narrow — full 4-platform builds are expensive):
+
+- **`v*` tag push** — builds everything, then creates the GitHub release with
+  all artifacts and one combined `SHA256SUMS`. The release job guards that the
+  pushed tag matches the manifest version.
+- **`workflow_dispatch`** — identical builds, but **no release is created**;
+  artifacts attach to the workflow run (default 90-day retention). This is
+  how the pipeline itself is tested without spamming tags.
+
+| Job | Runner | Artifacts |
+|---|---|---|
+| `linux-musl` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` (via `scripts/release.sh`; `rpmbuild` is absent, so `.rpm` stays manual) |
+| `macos-arm64` | macos-latest | native `aarch64-apple-darwin` tarball (via `scripts/release.sh`) |
+| `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the four `.exe` files |
+| `android-termux` | ubuntu-latest + NDK | `aarch64-linux-android` Termux tarball (via `scripts/build-android.sh --features metrics,blockchain`) |
+
+Every job builds the same four binaries (`choreographr choreo-tui choreo-im
+choreo-acp`) with `--features metrics,blockchain` on the **stable** toolchain,
+smoke-tests its artifact, and uploads it; the `release` job only runs for tag
+pushes. Windows/Termux artifacts ship **in addition to** the Homebrew/AUR
+channels — those package the same tarballs CI produces.
+
+How this slots into the SOP: push the `vX.Y.Z` tag (Phase 1) **after** the
+crates.io publish (Phase 2) — the tag push both publishes binaries and is the
+release trigger — then verify the release page (Phase 4's gate) and do the
+countdown tasks in Phase 5/6 as before. Phases 3–4's manual build/upload steps
+below remain documented for the `.rpm`, for releases from machines without
+push access, and as the offline fallback.
 
 ---
 
@@ -258,7 +302,13 @@ a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
 
 ---
 
-## Phase 3 — Build binaries (two machines)
+## Phase 3 — Build binaries (two machines, or CI on tag push)
+
+> **CI path:** pushing the `vX.Y.Z` tag triggers `.github/workflows/release.yml`,
+> which builds the musl/macOS/Windows/Termux artifacts, smoke-tests them, and
+> creates the GitHub release automatically (see
+> [CI builds](#ci-builds-github-actions)). The manual flow below remains the
+> fallback and is still required for the `.rpm` and the macOS daemon smoke test.
 
 Both machines run the same dry-run flow. `scripts/release.sh`:
 

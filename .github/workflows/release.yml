@@ -1,0 +1,290 @@
+# release.yml — build the release binaries on GitHub Actions.
+#
+# CI counterpart of scripts/release.sh (the two-machine SOP in RELEASE.md).
+# The Linux and macOS jobs literally run scripts/release.sh, so build flags,
+# --locked, feature selection, service-file staging, tarball naming, and the
+# smoke-test conventions stay in ONE place — the workflow only adds the
+# per-runner toolchain setup and artifact plumbing around it.
+#
+# Triggers (option 3 of the release-CI design):
+#   * push of a `vX.Y.Z` tag → build everything, then create the GitHub
+#     release with the combined SHA256SUMS (release job).
+#   * workflow_dispatch → identical builds, but NO release is created; the
+#     artifacts attach to the workflow run instead. This exists so the first
+#     real tag is never the first test of the pipeline — platform/NDK quirks
+#     are iterated out on demand.
+#
+# What each job builds (mirroring the manual SOP's conventions):
+#   linux-musl      scripts/release.sh on ubuntu — static x86_64-unknown-linux-musl
+#                   tarball (cargo-zigbuild cross-build, mimalloc) plus a
+#                   best-effort .deb (dpkg-deb is preinstalled on the runner;
+#                   rpmbuild is not, so .rpm is skipped with release.sh's own
+#                   warning — the .rpm stays a manual-SOP artifact).
+#   macos-arm64     scripts/release.sh on the arm64 macOS runner — native
+#                   aarch64-apple-darwin tarball (no zig needed for the host
+#                   build; .deb/.rpm skipped as on the MacBook).
+#   windows-msvc    hand-rolled: build-stable.sh host build + zip of the four
+#                   .exe files. release.sh is not reused here because its
+#                   staging is a POSIX tar.gz with the service files
+#                   (systemd/launchd mean nothing on Windows) and the Windows
+#                   artifact is a zip; build flags still match release.sh.
+#   android-termux  scripts/build-android.sh on ubuntu + NDK — aarch64
+#                   Termux executables via cargo-ndk (choreo-gui is NOT built:
+#                   its APK payload is a dx/gradle flow, out of scope here).
+#
+# choreo-gui is deliberately absent from every job: it is a stub and is not
+# part of the shipped release set (see scripts/release.sh's header comment).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Default read; the release job widens to `contents: write` locally (it is the
+# only job that touches GitHub Releases).
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel an in-flight release build: a cancelled tag build would leave
+  # the conductor unsure whether the release exists (assets are immutable once
+  # uploaded — see RELEASE.md's hotfix section).
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux-musl:
+    name: linux x86_64 (static musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          # The workspace pins nightly via rust-toolchain.toml, but release
+          # binaries build on STABLE (scripts/release.sh policy: reproducible,
+          # matches the crates.io/MSRV story). Every cargo invocation below
+          # goes through scripts/build-stable.sh (`cargo +stable`), so only
+          # stable must be present — rustup will NOT download nightly.
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add --toolchain stable x86_64-unknown-linux-musl
+
+      # The musl cross-build runs through cargo-zigbuild (see release.sh:
+      # cc-rs passes the full Rust triple, which zig's target grammar
+      # rejects; cargo-zigbuild translates it for cc-rs and the linker).
+      # cargo-zigbuild comes from taiki-e's prebuilt binaries (no cargo
+      # install compile time); zig itself from the official setup action.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - uses: mlugg/setup-zig@v2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (static musl tarball + best-effort .deb)
+        run: |
+          # Clean CI checkout → release.sh's dirty-tree guard passes; dist/ is
+          # gitignored so the staged artifacts don't dirty it either.
+          ./scripts/release.sh
+
+      - name: Smoke-test the tarball
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-musl
+          # Glob (not the literal name) so a future release.sh .rpm would be
+          # picked up without touching this file. Per-job SHA256SUMS files are
+          # deliberately NOT uploaded — the release job recomputes one
+          # combined checksum file over ALL artifacts.
+          path: dist/choreographr-*
+          if-no-files-found: error
+
+  macos-arm64:
+    name: macOS aarch64
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          # See the linux job: stable is the release policy; +stable builds
+          # never resolve the nightly pin. Native host build → no zig needed.
+          rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (aarch64-apple-darwin tarball)
+        run: |
+          # On a Darwin-arm64 host release.sh takes its native-build path:
+          # aarch64-apple-darwin tarball, no musl/mimalloc, .deb/.rpm skipped.
+          ./scripts/release.sh
+
+      - name: Smoke-test the tarball
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-aarch64-apple-darwin.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: dist/choreographr-*.tar.gz
+          if-no-files-found: error
+
+  windows-msvc:
+    name: windows x86_64 (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: |
+          # Same build line as release.sh's macOS/host path: stable, --locked,
+          # metrics + blockchain features, system allocator (mimalloc is a
+          # static-musl-only property of the tarball build). build-stable.sh
+          # strips the nightly-only profile-rustflags bits that hard-block
+          # stable Cargo — it is plain bash + sed, so it runs fine under Git
+          # Bash on the Windows runner.
+          ./scripts/build-stable.sh build --locked --release -p choreographr --features metrics,blockchain
+
+      - name: Stage, smoke-test, and zip
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          STAGE="$(mktemp -d)"
+          for b in choreographr choreo-tui choreo-im choreo-acp; do
+              cp "target/release/$b.exe" "$STAGE/$b.exe"
+          done
+          # Smoke (mirrors scripts/smoke-test.sh): the TUI/IM/ACP clients
+          # cannot run fully headless, but --version must print the release
+          # version and exit 0 — never hang or crash.
+          for b in choreographr choreo-tui choreo-im choreo-acp; do
+              "$STAGE/$b.exe" --version
+          done
+          mkdir -p dist
+          # Git Bash's /usr/bin/tar is GNU tar, which cannot write zip; the
+          # System32 tar.exe is bsdtar, and -a picks zip up from the suffix.
+          /c/Windows/System32/tar.exe -a -cf \
+              "dist/choreographr-${VERSION}-x86_64-pc-windows-msvc.zip" \
+              -C "$STAGE" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-msvc
+          path: dist/choreographr-*.zip
+          if-no-files-found: error
+
+  android-termux:
+    name: android aarch64 (Termux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain + Android rust target
+        run: |
+          # build-android.sh forces the stable toolchain (RUSTUP_TOOLCHAIN)
+          # and checks the rustup targets against it, so the target must be
+          # added to STABLE, not the toml-pinned nightly.
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add --toolchain stable aarch64-linux-android
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          # Exports ANDROID_NDK_HOME, which build-android.sh discovers.
+          # Bump the NDK release here when upgrading (r27c == 27.2.x).
+          ndk-version: r27c
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Termux binaries
+        run: |
+          # Same features as the desktop release binaries (release.sh passes
+          # metrics,blockchain) so the Termux suite behaves identically.
+          ./scripts/build-android.sh --features metrics,blockchain
+
+      - name: Package + sanity-check
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          # A wrong-target Android build still "works" on the runner and only
+          # fails on-device, so verify the artifacts are ARM aarch64 ELF here.
+          file dist/android/arm64-v8a/*
+          file dist/android/arm64-v8a/* | grep -q 'ARM aarch64'
+          tar czf "dist/choreographr-${VERSION}-aarch64-linux-android.tar.gz" \
+              -C dist/android/arm64-v8a choreographr choreo-tui choreo-im choreo-acp
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-aarch64-termux
+          path: dist/choreographr-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: create GitHub release
+    needs: [linux-musl, macos-arm64, windows-msvc, android-termux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only tag pushes publish. workflow_dispatch runs skip this job — their
+    # artifacts stay attached to the run (default 90-day retention) for
+    # pipeline testing.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          merge-multiple: true
+          path: dist
+
+      - name: Combined SHA256SUMS
+        run: |
+          # One checksum file over ALL artifacts (the release.sh convention:
+          # install.sh and the tap/AUR update scripts verify against it).
+          # Regenerated here rather than reused per-job so it always covers
+          # the complete release, exactly like release.sh's dist/ glob.
+          ( cd dist && sha256sum choreographr-* > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          # Guard against a tag that disagrees with the manifest — the tag is
+          # what users download, the manifest is the version source of truth
+          # (RELEASE.md); a mismatch would ship a mislabeled release.
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+              echo "error: tag ${GITHUB_REF_NAME} != manifest version v${VERSION}" >&2
+              exit 1
+          fi
+          # Assets are immutable once uploaded (RELEASE.md hotfix section): a
+          # re-run after the release exists fails on create — delete and
+          # re-create per the SOP rather than "fixing" this job.
+          gh release create "v${VERSION}" dist/* \
+              --title "choreographr ${VERSION}" --generate-notes

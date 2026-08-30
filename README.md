@@ -250,8 +250,11 @@ parallel and can be interacted with independently. How the other agents compare:
 
 Prebuilt releases ship exactly four binaries — `choreographr choreo-tui
 choreo-im choreo-acp` (`choreo-mcp` is a library-only crate and ships no
-binary) — for **x86_64 Linux** and **macOS (Apple Silicon)**. All installs
-below use prebuilt binaries; no Rust or Zig toolchain is required.
+binary) — for **x86_64 Linux**, **macOS (Apple Silicon)**, **Windows (x86_64)**,
+and **Android/Termux (aarch64)**. All installs below use prebuilt binaries; no
+Rust or Zig toolchain is required. (The binaries are built by the GitHub
+Actions `release` workflow on every `vX.Y.Z` tag — see RELEASE.md's
+"CI builds" section.)
 
 ### macOS
 
@@ -300,6 +303,23 @@ Alternatives:
   hosts to the musl asset, so no `--target` is needed) ·
   `cargo install choreographr` (source build, needs Zig — installs the whole
   suite: `choreographr`, `choreo-tui`, `choreo-im`, `choreo-acp`)
+
+### Windows & Android (Termux)
+
+No package managers for these — grab the release asset and put the four
+binaries on your `PATH`:
+
+- **Windows (x86_64)** — download
+  `choreographr-<version>-x86_64-pc-windows-msvc.zip` from the
+  [releases page](https://github.com/choreographr/choreographr/releases) and
+  add the extracted `.exe` files to your `PATH`.
+- **Android (Termux, aarch64)** — download
+  `choreographr-<version>-aarch64-linux-android.tar.gz`, extract it inside a
+  Termux shell, and copy the four binaries into Termux's bin directory:
+  `cp choreographr choreo-tui choreo-im choreo-acp $PREFIX/bin/ &&
+  chmod +x $PREFIX/bin/{choreographr,choreo-tui,choreo-im,choreo-acp}`. The
+  binaries are plain NDK/bionic executables — no root, no Termux packages
+  beyond the basics.
 
 ### Running the daemon
 

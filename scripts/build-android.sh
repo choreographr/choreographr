@@ -38,10 +38,24 @@
 # "wrong instructions at runtime" — the build dies mid-compile.
 #
 # Modes:
-#   build-android.sh               real build (aarch64 only)
-#   build-android.sh --emulator    real build (aarch64 + x86_64 for the emulator)
-#   build-android.sh --check       dry run: validate prerequisites, print the
-#                                  commands that would run, touch nothing
+#   build-android.sh                    real build (aarch64 only)
+#   build-android.sh --emulator         real build (aarch64 + x86_64 for the emulator)
+#   build-android.sh --check            dry run: validate prerequisites, print the
+#                                       commands that would run, touch nothing
+#   --features <comma-list>             append `--features <list>` to the build —
+#                                       release CI passes `metrics,blockchain` so
+#                                       the Termux binaries match the desktop
+#                                       release binaries (scripts/release.sh);
+#                                       local deploys default to no features
+#
+# Like scripts/release.sh, the real build runs on the STABLE toolchain
+# (RUSTUP_TOOLCHAIN=stable overrides the workspace's rust-toolchain.toml
+# nightly pin for the outer `cargo ndk` AND the nested `cargo build` it
+# spawns) — reproducible release artifacts, consistent with the desktop
+# binaries. The nightly-only `[unstable] profile-rustflags` config block and
+# per-profile `rustflags` that hard-block stable Cargo are stripped from
+# Cargo.toml AND .cargo/config.toml for the duration (same approach as
+# scripts/build-stable.sh) and restored on any exit.
 #
 # Prerequisites: cargo-ndk (`cargo install cargo-ndk`), an Android NDK
 # (ANDROID_NDK_HOME or ANDROID_NDK_ROOT, or under ANDROID_HOME/ndk/<ver>), and
@@ -53,20 +67,38 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MANIFEST="Cargo.toml"
+CONFIG=".cargo/config.toml"
 EMULATOR=0
 CHECK=0
+FEATURES=""
 
 # ── flag parsing ──────────────────────────────────────────────────────────────
 # Only literal flags — no positionals, no eval, nothing that could smuggle in
 # a command. Unknown flags fail loudly rather than being passed to cargo.
-for arg in "$@"; do
-    case "$arg" in
+# `--features` takes a comma-separated cargo feature list from the next argv
+# slot (shifted off) and is forwarded verbatim as one `--features <list>` arg;
+# it is NOT validated here — an unknown feature must fail as a normal cargo
+# feature error, not as a parser guess.
+while [ "$#" -gt 0 ]; do
+    case "$1" in
         --emulator) EMULATOR=1 ;;
         --check)    CHECK=1 ;;
+        --features)
+            [ "$#" -ge 2 ] || { echo "error: --features requires a value" >&2; exit 1; }
+            FEATURES="$2"
+            shift ;;
         -h|--help)  sed -n '2,30p' "$0"; exit 0 ;;
-        *) echo "error: unknown flag: $arg (supported: --emulator, --check)" >&2; exit 1 ;;
+        *) echo "error: unknown flag: $1 (supported: --emulator, --check, --features)" >&2; exit 1 ;;
     esac
+    shift
 done
+
+# ── stable toolchain policy ───────────────────────────────────────────────────
+# Exported BEFORE the prerequisite checks so `rustup target list --installed`
+# below resolves against stable (the target check must match the toolchain
+# the build will actually use). See the header comment for why stable and how
+# the nightly-only config bits are neutralized.
+export RUSTUP_TOOLCHAIN=stable
 
 log() { echo "==> $*"; }
 
@@ -151,7 +183,9 @@ export ANDROID_NDK_HOME="$NDK_DIR"
 log "NDK found: $NDK_DIR (ANDROID_HOME=$ANDROID_HOME)"
 
 # The rustup targets must already be installed (they are a plain rustup add,
-# so the script never installs them implicitly — an explicit opt-in).
+# so the script never installs them implicitly — an explicit opt-in). The list
+# resolves against the STABLE toolchain selected above, not the workspace's
+# nightly pin.
 for target in aarch64-linux-android x86_64-linux-android; do
     if ! rustup target list --installed | grep -qx "$target"; then
         echo "error: rustup target not installed: $target" >&2
@@ -172,9 +206,10 @@ if [ "$CHECK" = 1 ]; then
     # Dry run: report what WOULD happen and exit before touching the manifest.
     # This is the script's verification path — it must be safe on any machine,
     # NDK or not is decided above, and nothing below mutates the tree.
-    log "dry run — no changes made. Would build:"
+    log "dry run — no changes made. Would build (on the stable toolchain):"
     for abi in $TARGETS; do
-        log "  cargo ndk -t $abi -o dist/android/$abi -- build --release \\"
+        log "  cargo ndk -t $abi -o dist/android/$abi -- build --locked --release \\"
+        [ -n "$FEATURES" ] && log "      --features $FEATURES \\"
         for bin in $BINS; do
             log "      -p choreographr --bin $bin"
         done
@@ -188,16 +223,24 @@ fi
 BACKUP_DIR="$(mktemp -d)"
 restore() {
     cp -f "$BACKUP_DIR/Cargo.toml" "$MANIFEST"
+    cp -f "$BACKUP_DIR/config.toml" "$CONFIG"
     rm -rf "$BACKUP_DIR"
 }
 trap restore EXIT
 cp "$MANIFEST" "$BACKUP_DIR/Cargo.toml"
+cp "$CONFIG" "$BACKUP_DIR/config.toml"
 
 # Strip the per-profile `rustflags` arrays (the nightly profile-rustflags keys,
 # including -C target-cpu=native). Required for every cross build: profile
 # rustflags ignore --target and would poison the Android codegen with
 # host-CPU flags. These are the only `rustflags = [` occurrences in the manifest.
 sed -i '/^rustflags = \[/d' "$MANIFEST"
+
+# Also strip the `[unstable] profile-rustflags` opt-in from the cargo config —
+# this is the bit that HARD-BLOCKS stable Cargo (stable errors out at config
+# parse time; see scripts/build-stable.sh). The block is the config file's
+# final section, so removing its two lines is sufficient.
+sed -i '/^\[unstable\]$/d; /^profile-rustflags = true$/d' "$CONFIG"
 
 # See the header comment: RUSTFLAGS suppresses the user-level ~/.cargo
 # config.toml rustflags (build + cfg-target) that the manifest strip cannot
@@ -226,7 +269,14 @@ for abi in $TARGETS; do
     # against shared artifacts.
     PKG_ARGS=()
     for bin in $BINS; do PKG_ARGS+=("-p" choreographr "--bin" "$bin"); done
-    cargo ndk -t "$abi" -- build --release "${PKG_ARGS[@]}"
+    # --locked mirrors scripts/release.sh: the committed Cargo.lock is
+    # authoritative for release artifacts (supply-chain control — a silent
+    # lockfile regeneration must never repick semver-compatible versions).
+    # FEATURE_ARGS stays empty without --features, so local zero-flag Termux
+    # deploys keep building the default feature set exactly as before.
+    FEATURE_ARGS=()
+    [ -n "$FEATURES" ] && FEATURE_ARGS+=("--features" "$FEATURES")
+    cargo ndk -t "$abi" -- build --locked --release "${FEATURE_ARGS[@]}" "${PKG_ARGS[@]}"
     # Copy the executables into the per-ABI output dir (see abi_to_triple note:
     # cargo-ndk does not do this for plain bins).
     mkdir -p "dist/android/$abi"
