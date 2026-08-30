@@ -81,25 +81,74 @@ fi
 
 # The NDK itself is what cargo-ndk drives. Search the standard env vars and the
 # sdkmanager layout (ANDROID_HOME/ndk/<version>) so users of either convention
-# work without extra configuration.
+# work without extra configuration. Whatever is found is then exported as BOTH
+# variables (ANDROID_NDK_HOME *and* ANDROID_HOME/ndk discovery via a version
+# probe) so downstream tools — cargo-ndk, dx/gradle — agree on one NDK no
+# matter which variable the user set. dx/gradle in particular do not read
+# ANDROID_NDK_HOME; they only look under ANDROID_HOME/ndk, so a user who set
+# only ANDROID_NDK_HOME (the common AUR layout, /opt/android-ndk) would break
+# the GUI build without this normalization.
 NDK_DIR=""
+# Env vars first (ANDROID_NDK_HOME, ANDROID_NDK_ROOT), then the SDK-layout
+# search under ANDROID_HOME, then — for fully zero-config operation — the
+# common package-manager install locations (Arch/AUR: /opt/android-ndk;
+# Studio SDK layout is covered by the ANDROID_HOME search below).
 for candidate in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}"; do
     if [ -n "$candidate" ] && [ -d "$candidate" ]; then
         NDK_DIR="$candidate"
         break
     fi
 done
+if [ -z "$NDK_DIR" ] && [ -d /opt/android-ndk ]; then
+    NDK_DIR=/opt/android-ndk
+fi
 if [ -z "$NDK_DIR" ] && [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk" ]; then
     # Pick the highest-versioned NDK under the SDK (sdkmanager can keep several).
     NDK_DIR="$(ls -1d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -n1 || true)"
 fi
 if [ -z "$NDK_DIR" ]; then
     echo "error: Android NDK not found (this machine has none installed)." >&2
-    echo "  Install one, e.g.: sdkmanager 'ndk;27.2.12479018'" >&2
+    echo "  Install one, e.g.: android sdk install ndk/latest" >&2
     echo "  and set ANDROID_NDK_HOME=<ndk-dir> (or ANDROID_NDK_ROOT, or ANDROID_HOME with ndk/<ver> inside)." >&2
     exit 1
 fi
-log "NDK found: $NDK_DIR"
+# Read the NDK's own version stamp (source.properties carries Pkg.Revision,
+# e.g. "29.0.14206865") so ANDROID_HOME/ndk/<version> can be derived without
+# requiring the user to have created the symlink themselves.
+NDK_VERSION=""
+if [ -f "$NDK_DIR/source.properties" ]; then
+    NDK_VERSION="$(sed -n 's/^Pkg.Revision *= *//p' "$NDK_DIR/source.properties" | head -n1)"
+fi
+# ANDROID_HOME: reuse the user's if set. Otherwise auto-detect the common
+# locations (Arch/AUR layout: /opt/android-sdk; Google Studio layout:
+# ~/Android/Sdk) and only then fall back to the NDK's parent — this covers
+# dx/gradle, which do not read ANDROID_NDK_HOME and would otherwise find
+# nothing in the standalone /opt/android-ndk layout.
+if [ -z "${ANDROID_HOME:-}" ]; then
+    for candidate in /opt/android-sdk "$HOME/Android/Sdk"; do
+        if [ -d "$candidate" ]; then ANDROID_HOME="$candidate"; break; fi
+    done
+    if [ -z "$ANDROID_HOME" ]; then
+        ANDROID_HOME="$(dirname "$NDK_DIR")"
+    fi
+    export ANDROID_HOME
+fi
+if [ -n "$NDK_VERSION" ]; then
+    ndk_link="$ANDROID_HOME/ndk/$NDK_VERSION"
+    # Only heal the layout when it is missing or already a (possibly stale)
+    # symlink — never overwrite a real NDK directory. Best-effort: if the link
+    # already resolves to the same NDK (or we lack permission to touch a
+    # root-owned SDK dir), that is not an error — the layout is usable.
+    if [ ! -e "$ndk_link" ] || [ -L "$ndk_link" ]; then
+        current="$(readlink -f "$ndk_link" 2>/dev/null || true)"
+        if [ "$current" != "$(readlink -f "$NDK_DIR")" ]; then
+            ln -sfn "$NDK_DIR" "$ndk_link" 2>/dev/null \
+                || log "note: could not update $ndk_link (permissions); it is $current"
+        fi
+    fi
+fi
+export ANDROID_NDK_HOME="$NDK_DIR"
+log "NDK found: $NDK_DIR (ANDROID_HOME=$ANDROID_HOME)"
 
 # The rustup targets must already be installed (they are a plain rustup add,
 # so the script never installs them implicitly — an explicit opt-in).

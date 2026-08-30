@@ -161,8 +161,40 @@ android-check:
 # `dx` infers the native renderer on Android; requires the NDK for the final
 # link. `--package` scopes the build to the choreo-gui crate (dx reads the
 # workspace root; the Dioxus config lives in the crate).
+#
+# Self-sufficient: the `android` CLI (cmdline-tools 23+) replaces the old
+# sdkmanager and auto-accepts licenses, so any SDK packages gradle wants
+# (platform, build-tools) are fetched here on first run instead of failing
+# mid-build. Set ANDROID_HOME/ANDROID_NDK_HOME first — dx/gradle only discover
+# the NDK under ANDROID_HOME/ndk, never via ANDROID_NDK_HOME.
 gui-android args="":
-    dx build --platform android --release --package choreo-gui {{ args }}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -d /opt/android-ndk ]; then
+        export ANDROID_NDK_HOME=/opt/android-ndk
+    fi
+    if [ -z "${ANDROID_HOME:-}" ] && [ -d /opt/android-sdk ]; then
+        export ANDROID_HOME=/opt/android-sdk
+    fi
+    # Heal the ANDROID_HOME/ndk/<version> layout the same way build-android.sh
+    # does (see that script's normalization comment) — dx/gradle need it.
+    if [ -n "${ANDROID_HOME:-}" ] && [ -n "${ANDROID_NDK_HOME:-}" ] \
+        && [ -f "$ANDROID_NDK_HOME/source.properties" ]; then
+        ver="$(sed -n 's/^Pkg.Revision *= *//p' "$ANDROID_NDK_HOME/source.properties" | head -n1)"
+        link="$ANDROID_HOME/ndk/$ver"
+        if [ -n "$ver" ] && { [ ! -e "$link" ] || [ -L "$link" ]; }; then
+            mkdir -p "$ANDROID_HOME/ndk"
+            ln -sfn "$ANDROID_NDK_HOME" "$link"
+        fi
+    fi
+    # Pre-fetch the SDK packages gradle/dx need if the `android` CLI is
+    # available (best effort — if dx wants a different version it will say so
+    # and the user can `android sdk install` it explicitly).
+    if command -v android >/dev/null 2>&1 && [ -n "${ANDROID_HOME:-}" ]; then
+        android sdk install platforms/android-35 build-tools/35.0.0 || \
+            echo "warning: could not pre-install SDK packages; dx will report exactly what it needs" >&2
+    fi
+    exec dx build --platform android --release --package choreo-gui {{ args }}
 
 # ── testing ───────────────────────────────────────────────────────────────────
 
