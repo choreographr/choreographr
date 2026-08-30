@@ -136,6 +136,15 @@ Runs **before** any binary building (binaries are versioned by the same
 bump, and `cargo install` must resolve the published crates). From either
 machine, on the clean tree:
 
+0. **Sync the MSRV claim first.** Dependency resolution is MSRV-unconstrained
+   (`resolver.incompatible-rust-versions = "allow"` in `.cargo/config.toml`),
+   so the workspace `rust-version` may lag the resolved tree. Compute the
+   resolved tree's floor:
+   `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'`
+   and set the result in `[workspace.package]` `rust-version` (root
+   `Cargo.toml`), committing the bump together with `Cargo.lock`, so the
+   crates.io metadata published below is truthful.
+
 ```bash
 ./scripts/publish-stable.sh publish --workspace  # publishes the Phase-1-bumped version in
                                                  # topological order — publish does NOT bump
@@ -451,6 +460,7 @@ repo and push.
 ## Quick checklist (condensed)
 
 - [ ] `just ci` green; tree clean; master pulled
+- [ ] MSRV sync: `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'` → update `rust-version` in `[workspace.package]` (with `Cargo.lock`) if changed
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
 - [ ] `./scripts/publish-stable.sh publish --workspace` → 14 crates on crates.io; `cargo install --locked` verified
 - [ ] First release only: 12 new crates staged in ≤5-crate batches (or crates.io burst override) — see Phase 2; the next release adds `choreo-blockchain` and `choreo-sanitize` as new crates

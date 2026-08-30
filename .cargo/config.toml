@@ -1,11 +1,14 @@
-# MSRV-aware dependency resolution: when cargo resolves dependencies it prefers
-# versions whose declared `rust-version` is compatible with the workspace's
-# minimum supported Rust version (1.94.1, see the root Cargo.toml). If no
-# compatible version satisfies a requirement, fall back to the newest version
-# and emit a warning instead of failing the build. This is a stable Cargo
-# feature and works identically on nightly and stable.
+# MSRV-aware dependency resolution, DISABLED: development runs on nightly and
+# dist/publish builds on the current stable, so we always want the newest
+# available dependency versions. `allow` tells cargo to resolve to latest even
+# when a dep's declared `rust-version` exceeds the workspace's own
+# `rust-version` (root Cargo.toml, `[workspace.package]`) instead of holding
+# that dep back at an older compatible release. The workspace `rust-version`
+# therefore becomes a *release-time claim*, not a resolver constraint: before
+# publishing, sync it to the resolved tree's true floor (see RELEASE.md Phase
+# 2 and the "Build and run" section of ARCHITECTURE.md).
 [resolver]
-incompatible-rust-versions = "fallback"
+incompatible-rust-versions = "allow"
 
 # cargo-nextest convenience aliases (the parallel test runner). They mirror the
 # README's libtest split (`cargo test` = unit tests, `-- --ignored` = integration

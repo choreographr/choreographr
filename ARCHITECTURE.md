@@ -3326,16 +3326,22 @@ cargo test -- --ignored   # libtest integration tests
 
 ## Build and run
 
-The workspace targets a minimum supported Rust version (MSRV) of **1.94.1**,
-declared via `rust-version` in every crate manifest (inherited from
-`[workspace.package]` in the root `Cargo.toml`). Keep code and dependencies
-within this floor; the CI MSRV job enforces it.
-
-The 1.94.1 floor (bumped from 1.92 on the 2026-08 dependency refresh) is a
-deliberate housekeeping raise that unblocks two previously-pinned deps:
-`serial_test` 4.x requires Rust 1.93.1 (it was held at 3.x while the floor was
-1.92), and `alloy` 2.4.1 requires Rust 1.94.1 — the new ceiling of the resolved
-dependency graph. See the root `Cargo.toml`.
+The manifests declare a `rust-version` (MSRV) in every crate, inherited from
+`[workspace.package]` in the root `Cargo.toml`. It is a **release-time claim,
+not a build constraint**: development runs on nightly and dist/publish builds
+run on the current stable, and `.cargo/config.toml` sets
+`resolver.incompatible-rust-versions = "allow"` so dependency resolution
+always picks the newest available versions even when their declared
+`rust-version` exceeds the workspace floor. Consequently the MSRV number may
+lag the resolved tree during development; that is fine. Before publishing,
+sync it: compute the resolved tree's floor with
+`cargo metadata --format-version 1 | jq -r '[.packages[].rust_version |
+select(. != null)] | sort_by(split(".") | map(tonumber)) | last'`, set the
+result in `[workspace.package]` `rust-version`, and commit lockfile + bump
+together, so
+the crates.io metadata on the published crates is accurate (see RELEASE.md
+Phase 2). The CI MSRV job validates the claim at release time rather than
+constraining day-to-day development.
 
 **Building defaults to nightly.** `rust-toolchain.toml` pins the workspace to
 the `nightly` channel (rustup auto-installs it on first `cargo` run) so that
@@ -3361,8 +3367,8 @@ baseline CPU, and the RISC-V guest compiles (`tools/vm.rs`) are direct
 `rustc +stable` calls that never see cargo rustflags at all.
 
 **Stable builds are a supported opt-out.** The sources use no nightly-only
-features, so the code targets a stable MSRV floor (`rust-version = "1.94.1"`,
-enforced by the CI MSRV job) and builds on any stable ≥ 1.94.1. The nightly-only
+features, so the code builds on current stable (the MSRV claim in the root
+`Cargo.toml` documents the tested floor; see above). The nightly-only
 `profile-rustflags` wiring, however, hard-blocks stable *Cargo* (the keys it
 enables require that unstable feature), so a stable build is run through
 `scripts/build-stable.sh` (`just build-stable` / `check-stable` /

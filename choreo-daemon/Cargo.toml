@@ -33,7 +33,9 @@ rustix = { version = "1.1.4", features = ["event", "fs", "process"] }
 # binary already installed on the host — we never auto-download one.
 headless_chrome = "1.0.22"
 
-gix = { version = "0.86", features = ["tree-editor", "revision"] }
+# gix 0.87 removed the `tree-editor` feature (tree editing is now part of the
+# default API surface); `tree-error` enables the error-context variant.
+gix = { version = "0.87", features = ["revision"] }
 gix-imara-diff = { version = "0.2", features = ["unified_diff"] }
 hmac = "0.13"
 image.workspace = true
