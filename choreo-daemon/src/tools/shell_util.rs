@@ -250,21 +250,6 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
     rustix::process::kill_process(pid, rustix::process::Signal::KILL).is_ok()
 }
 
-/// Minimal FFI for the one process-wait primitive windows-sys does not expose:
-/// `WaitForSingleObject` with a zero timeout is the standard non-blocking
-/// "has this process exited?" probe (windows-sys 0.61 carries a thin kernel32
-/// surface and omits it; kernel32 is already linked by std).
-#[cfg(windows)]
-mod winffi {
-    #[link(name = "Kernel32")]
-    unsafe extern "system" {
-        pub(super) fn wait_for_single_object(
-            handle: windows_sys::Win32::Foundation::HANDLE,
-            timeout_ms: u32,
-        ) -> u32;
-    }
-}
-
 /// Windows process-tree isolation: the child is assigned to a Job Object so a
 /// timeout (or the job handle dropping) can terminate the whole tree — the
 /// equivalent of Unix process-group killpg(2). JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -390,10 +375,16 @@ impl ProcessIsAlive {
     /// WAIT_TIMEOUT (0x102) while the process runs and WAIT_OBJECT_0 once it
     /// has exited; the zero timeout never blocks.
     fn is_running(&self) -> bool {
+        // `WaitForSingleObject` with a zero timeout is the standard non-blocking
+        // "has this process exited?" probe. windows_sys's `Threading` module
+        // DOES carry it (windows_link! wires the kernel32.dll import — there
+        // is no need for a hand-rolled `#[link]` extern; a hand-declared
+        // `wait_for_single_object` renamed the real export and failed MSVC
+        // linking with LNK2019 `__imp_wait_for_single_object`).
         // SAFETY: `self.0` is a valid open process handle (a copy of the std
         // Child's handle) and the call is non-blocking (zero timeout).
         unsafe {
-            winffi::wait_for_single_object(self.0, 0)
+            windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, 0)
                 == windows_sys::Win32::Foundation::WAIT_TIMEOUT
         }
     }
