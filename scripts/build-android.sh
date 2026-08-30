@@ -12,13 +12,30 @@
 # `gui-android` justfile recipe). Different tool, different output, different
 # consumer.
 #
-# IMPORTANT (why the manifest gets stripped): the workspace Cargo.toml carries
-# per-profile `rustflags` (nightly `profile-rustflags`, including
-# `-C target-cpu=native`). Rustflags from profiles apply REGARDLESS of
-# `--target`, so a native-CPU build would emit x86-64-v3 instructions that
-# SIGILL on every Android device. This script strips those keys for the
-# duration (same approach as scripts/build-stable.sh) and restores them on any
-# exit.
+# IMPORTANT (why the manifest gets stripped AND RUSTFLAGS is set): host-CPU
+# rustflags leak into Android builds from TWO places, and each needs its own
+# countermeasure:
+#
+# 1. The workspace Cargo.toml carries per-profile `rustflags` (nightly
+#    `profile-rustflags`, including `-C target-cpu=native`). Profile rustflags
+#    apply REGARDLESS of `--target` AND are not suppressed by a RUSTFLAGS env
+#    var, so they must be stripped from the manifest for the duration (same
+#    approach as scripts/build-stable.sh); restored on any exit.
+# 2. The developer's ~/.cargo/config.toml very often sets `[build] rustflags`
+#    (this machine's does: `-C target-cpu=native`) plus cfg-target rustflags
+#    (here: `-fuse-ld=wild` for `cfg(all(target_os = "linux"))`, which ALSO
+#    matches Android and would break the bionic link). An empty-string env
+#    override is treated as unset, and `--config build.rustflags=[]` does not
+#    reliably win, so the only dependable suppression is setting RUSTFLAGS
+#    itself: when RUSTFLAGS is set, cargo ignores config build/target
+#    rustflags entirely. `-C target-cpu=generic` is the correct baseline for
+#    Android artifacts (and empty-ish alternatives like `-Cdebug-assertions=off`
+#    are worse than stating the intent).
+#
+# Why this matters beyond correctness: nightly rustc/LLVM has been observed to
+# SEGFAULT while compiling aarch64 code that carries x86 host-CPU features
+# (e.g. `-C target-cpu=native` on a znver3 host), so a leak here is not just
+# "wrong instructions at runtime" — the build dies mid-compile.
 #
 # Modes:
 #   build-android.sh               real build (aarch64 only)
@@ -133,20 +150,44 @@ cp "$MANIFEST" "$BACKUP_DIR/Cargo.toml"
 # host-CPU flags. These are the only `rustflags = [` occurrences in the manifest.
 sed -i '/^rustflags = \[/d' "$MANIFEST"
 
+# See the header comment: RUSTFLAGS suppresses the user-level ~/.cargo
+# config.toml rustflags (build + cfg-target) that the manifest strip cannot
+# reach. Exported (not per-command) so it also covers any nested cargo
+# invocation cargo-ndk makes.
+export RUSTFLAGS="-C target-cpu=generic"
+
 mkdir -p dist/android
+# Map each cargo-ndk ABI name to its rustup triple (for locating the linked
+# binaries) — cargo-ndk's `-o` flag only copies *cdylib* artifacts into the
+# output dir (verified on a real run: plain `bin` executables are left in
+# target/<triple>/release/), so the executables are copied explicitly below.
+abi_to_triple() {
+    case "$1" in
+        arm64-v8a) echo aarch64-linux-android ;;
+        x86_64)    echo x86_64-linux-android ;;
+        *) echo "error: unmapped ABI: $1" >&2; return 1 ;;
+    esac
+}
 for abi in $TARGETS; do
-    log "building suite binaries for $abi"
+    triple="$(abi_to_triple "$abi")"
+    log "building suite binaries for $abi ($triple)"
     # cargo ndk syntax verified against `cargo ndk --help` (cargo-ndk 3.x):
-    # `-t` takes the Android ABI name, `-o` places the linked binaries in DIR,
-    # cargo args follow after `--`. All four bins live in the root package, so
-    # one invocation per ABI builds them against shared artifacts.
+    # `-t` takes the Android ABI name, cargo args follow after `--`. All four
+    # bins live in the root package, so one invocation per ABI builds them
+    # against shared artifacts.
     PKG_ARGS=()
     for bin in $BINS; do PKG_ARGS+=("-p" choreographr "--bin" "$bin"); done
-    cargo ndk -t "$abi" -o "dist/android/$abi" -- build --release "${PKG_ARGS[@]}"
+    cargo ndk -t "$abi" -- build --release "${PKG_ARGS[@]}"
+    # Copy the executables into the per-ABI output dir (see abi_to_triple note:
+    # cargo-ndk does not do this for plain bins).
+    mkdir -p "dist/android/$abi"
+    for bin in $BINS; do
+        cp "target/$triple/release/$bin" "dist/android/$abi/$bin"
+    done
 done
 
-# cargo-ndk -o already places the binaries in the output dir; make the layout
-# explicit and print the push commands the Termux side needs.
+# The binaries were copied from target/<triple>/release/ above; verify the
+# layout and print the push commands the Termux side needs.
 log "binaries ready:"
 for bin in $BINS; do
     for abi in $TARGETS; do
