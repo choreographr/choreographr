@@ -92,6 +92,28 @@ pub fn main() {
     dioxus::launch(App);
 }
 
+// ── Android entry glue ────────────────────────────────────────────────────────
+//
+// WHY THIS EXISTS: the Android runtime starts a native-activity app at the C
+// symbol `android_main` (android-activity's native_app_glue C shim calls it
+// from `rust_glue_entry`); nothing in the dioxus-native/blitz dependency tree
+// defines it for us. The `native` cfg's `dioxus::launch` → `dioxus_native::
+// launch_cfg` path handles the rest of the Android wiring itself: blitz-shell's
+// `create_default_event_loop` fetches the JVM `AndroidApp` handle from a global
+// slot and feeds it to winit via `EventLoopBuilderExtAndroid::with_android_app`,
+// so the ONLY missing piece is this no_mangle trampoline: stash the `AndroidApp`
+// in blitz-shell's slot, then run the exact same `main()` the desktop binary
+// uses (the `native` renderer serves desktop and Android with one code path —
+// there is deliberately no mobile/webview entry here). On Android the process
+// is started with no meaningful argv, and every clap arg is optional, so
+// `Cli::parse()` resolves to the Unix-socket default connection mode.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)] // edition 2024: no_mangle is an unsafe attribute
+fn android_main(app: android_activity::AndroidApp) {
+    blitz_shell::set_android_app(app);
+    main();
+}
+
 #[component]
 fn App() -> Element {
     let (daemon_tx, mut events_rx) = use_daemon_connection();

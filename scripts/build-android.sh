@@ -119,13 +119,14 @@ NDK_VERSION=""
 if [ -f "$NDK_DIR/source.properties" ]; then
     NDK_VERSION="$(sed -n 's/^Pkg.Revision *= *//p' "$NDK_DIR/source.properties" | head -n1)"
 fi
-# ANDROID_HOME: reuse the user's if set. Otherwise auto-detect the common
-# locations (Arch/AUR layout: /opt/android-sdk; Google Studio layout:
-# ~/Android/Sdk) and only then fall back to the NDK's parent — this covers
-# dx/gradle, which do not read ANDROID_NDK_HOME and would otherwise find
-# nothing in the standalone /opt/android-ndk layout.
+# ANDROID_HOME: reuse the user's if set. Otherwise prefer the standard
+# user-owned SDK locations (Google's own default is ~/Android/Sdk — gradle
+# and `android sdk install` write there, which is why /opt package trees
+# must NOT be used as ANDROID_HOME even when present) and only then fall
+# back to package-manager layouts. This covers dx/gradle, which do not read
+# ANDROID_NDK_HOME.
 if [ -z "${ANDROID_HOME:-}" ]; then
-    for candidate in /opt/android-sdk "$HOME/Android/Sdk"; do
+    for candidate in "$HOME/Android/Sdk" /opt/android-sdk; do
         if [ -d "$candidate" ]; then ANDROID_HOME="$candidate"; break; fi
     done
     if [ -z "$ANDROID_HOME" ]; then

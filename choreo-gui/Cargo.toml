@@ -44,3 +44,15 @@ choreo-keystore.workspace = true
 choreo-markdown.workspace = true
 choreo-proto.workspace = true
 tracing.workspace = true
+
+# Android-only entry glue (see android_main in lib.rs): android-activity gives
+# us the `AndroidApp` argument type of the `android_main` symbol the native
+# runtime calls, and blitz-shell (dioxus-native's shell layer) exposes the
+# `set_android_app` slot its event-loop factory reads on Android. Versions
+# match the ones dioxus-native/winit already resolve to (blitz-shell 0.2,
+# android-activity 0.6, native-activity flavor), so Cargo unifies them into a
+# single crate — the AndroidApp type identity must be shared for the slot to
+# accept the handle we pass.
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+blitz-shell = "0.2"

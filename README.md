@@ -895,8 +895,12 @@ Android devices. The scripts auto-detect common package-manager layouts
 
 #### One-time build-environment setup
 
-Arch Linux package names shown; the equivalents on other distros are the
-Google downloads (NDK zip, cmdline-tools zip) or distro SDK packages.
+Principle: **nothing under `/opt` is ever modified** — package-manager trees
+(Arch: `/opt/android-ndk`, `/opt/android-sdk`) stay root-owned and read-only.
+The SDK that gradle and the `android` CLI write into lives in your home
+directory (`~/Android/Sdk`, Google's own default location), and the NDK is
+*read* from `/opt` via a symlink *inside your home SDK*. Arch package names
+shown; other distros: the Google NDK/cmdline-tools zips or distro packages.
 
 ```bash
 # 1. Rust cross-compilation targets (needed for both workflows):
@@ -905,25 +909,37 @@ rustup target add aarch64-linux-android x86_64-linux-android
 # 2. cargo-ndk — drives the NDK toolchain for the suite binaries:
 cargo install cargo-ndk
 
-# 3. Packages (Arch/AUR). dx is installed via its own installer
-#    (https://dioxuslabs.com, `curl -fsSL https://dx.dioxuslabs.com/install.sh | sh`):
+# 3. Packages (Arch/AUR). dx comes from its own installer
+#    (https://dioxuslabs.com):
 paru -S android-ndk android-sdk-cmdline-tools-latest android-tools dx
 
-# 4. One-time ROOT setup for gui-android — the build recipes never write
-#    outside the project, so these run as you, once:
-#    a. Link the standalone NDK into the SDK layout (dx/gradle look for the
-#       NDK only under ANDROID_HOME/ndk/<version>, never ANDROID_NDK_HOME):
-sudo ln -sfn /opt/android-ndk \
-  /opt/android-sdk/ndk/$(sed -n 's/^Pkg.Revision *= *//p' /opt/android-ndk/source.properties)
-#    b. Make the SDK user-writable — gradle and the `android` CLI download
-#       platforms/build-tools into it as your user (the NDK stays root-owned,
-#       read-only — nothing needs to write there):
-sudo chown -R "$USER" /opt/android-sdk
+# 4. A JDK for the gradle APK build (see note below) — JDK 17/21/25 all work;
+#    JDK 26+ does NOT (gradle's Groovy rejects class file major version 70):
+paru -S jdk21-openjdk
 
-# 5. SDK components (run as your user; the `android` CLI replaces sdkmanager
-#    and handles licenses automatically):
+# 5. User-owned SDK in the standard location (all unprivileged — the AUR
+#    cmdline-tools stay in /opt; we just borrow their binary via a symlink):
+mkdir -p ~/Android/Sdk/cmdline-tools
+ln -sfn /opt/android-sdk/cmdline-tools/latest ~/Android/Sdk/cmdline-tools/latest
+ln -sfn /opt/android-ndk ~/Android/Sdk/ndk/$(sed -n 's/^Pkg.Revision *= *//p' /opt/android-ndk/source.properties)
+export ANDROID_HOME="$HOME/Android/Sdk"   # persist in your shell config
+
+# 6. SDK components (unprivileged; the `android` CLI replaces sdkmanager and
+#    handles licenses automatically):
 android sdk install platforms/android-35 build-tools/35.0.0
 ```
+
+> **JDK version note.** `just gui-android` runs gradle (via the dx-generated
+> build, currently Gradle 9.1), which fails under JDK 26+ with `BUG!
+> exception in phase 'semantic analysis' … Unsupported class file major
+> version 70`. The recipe therefore auto-selects a compatible JDK when
+> `JAVA_HOME` is unset — preferring JDK 21 (LTS), then 25, then 17 under
+> `/usr/lib/jvm` — and falls back to the default `java` with a warning. Set
+> `JAVA_HOME` yourself if your JDK lives elsewhere (Nix, sdkman, …).
+
+If you set `ANDROID_HOME` in your shell config, the build scripts pick
+everything up automatically; there is no privileged step anywhere in the
+day-to-day workflow.
 
 #### Building
 

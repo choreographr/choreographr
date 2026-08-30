@@ -168,6 +168,15 @@ android-check:
 # mid-build. Root-requiring setup (the ANDROID_HOME/ndk symlink for the AUR
 # standalone-NDK layout) is NOT attempted here — one-time setup is validated
 # below with exact instructions; everything else runs as the normal user.
+#
+# JDK note: the dx-generated Gradle build (Gradle 9.1) cannot run on JDK 26+
+# — its Groovy build-script compiler rejects class file major version 70
+# ("Unsupported class file major version 70"). JAVA_HOME is therefore
+# normalized to a supported JDK the same way ANDROID_HOME/ANDROID_NDK_HOME
+# are: only when the caller has not already set it, never overriding an
+# explicit choice. Preference order: JAVA_HOME → JDK 21 (LTS) → JDK 25 →
+# whatever `java` resolves to (with a warning, since a too-new default is
+# exactly the failure mode above).
 gui-android args="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -176,21 +185,47 @@ gui-android args="":
     if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -d /opt/android-ndk ]; then
         export ANDROID_NDK_HOME=/opt/android-ndk
     fi
-    if [ -z "${ANDROID_HOME:-}" ] && [ -d /opt/android-sdk ]; then
-        export ANDROID_HOME=/opt/android-sdk
+    if [ -z "${ANDROID_HOME:-}" ] && [ -d "$HOME/Android/Sdk" ]; then
+        export ANDROID_HOME="$HOME/Android/Sdk"
+    elif [ -z "${ANDROID_HOME:-}" ] && [ -d /opt/android-sdk ]; then
+        export ANDROID_HOME=/opt/android-sdk   # read-only fallback; SDK installs need a writable ANDROID_HOME
+    fi
+    # Normalize JAVA_HOME to a Gradle-9.1-compatible JDK (see the comment
+    # above): explicit JAVA_HOME wins, then the known JDK install roots, then
+    # the PATH default with a warning. Exported so gradle (a JVM process dx
+    # spawns) and the dx JVM toolchain resolution both inherit it.
+    if [ -z "${JAVA_HOME:-}" ]; then
+        for jdk in /usr/lib/jvm/java-21-openjdk /usr/lib/jvm/java-25-openjdk \
+                   /usr/lib/jvm/java-17-openjdk; do
+            if [ -x "$jdk/bin/java" ]; then
+                export JAVA_HOME="$jdk"
+                break
+            fi
+        done
+        if [ -z "${JAVA_HOME:-}" ]; then
+            echo "warning: no JAVA_HOME set and no known JDK found under /usr/lib/jvm; gradle will use the default java (must be JDK ≤ 25 — newer JDKs fail with 'Unsupported class file major version 70')" >&2
+        fi
     fi
     [ -n "${ANDROID_HOME:-}" ] || { echo "error: no Android SDK found (set ANDROID_HOME)" >&2; exit 1; }
     [ -n "${ANDROID_NDK_HOME:-}" ] || { echo "error: no Android NDK found (set ANDROID_NDK_HOME)" >&2; exit 1; }
-    # Validate (not mutate) the ANDROID_HOME/ndk/<version> convention. If it
-    # is missing, print the exact one-time root setup and stop — the build
-    # itself must never write to /opt.
-    ver="$(sed -n 's/^Pkg.Revision *= *//p' "$ANDROID_NDK_HOME/source.properties" 2>/dev/null | head -n1)"
-    if [ -n "$ver" ] && [ ! -e "$ANDROID_HOME/ndk/$ver" ]; then
-        echo "error: $ANDROID_HOME/ndk/$ver does not exist (dx/gradle look for the NDK there)." >&2
-        echo "  One-time root setup, then re-run:" >&2
-        echo "    sudo mkdir -p '$ANDROID_HOME/ndk' && sudo ln -sfn '$ANDROID_NDK_HOME' '$ANDROID_HOME/ndk/$ver'" >&2
+    # Validate (read-only) that the NDK the build will actually use exists.
+    # dx resolves the NDK via ANDROID_NDK_HOME alone (verified empirically) and
+    # does NOT require the ANDROID_HOME/ndk/<version> convention, so requiring
+    # that symlink would wrongly reject valid setups like /opt/android-ndk.
+    [ -e "$ANDROID_NDK_HOME/source.properties" ] || {
+        echo "error: $ANDROID_NDK_HOME does not look like an NDK (no source.properties)" >&2
         exit 1
-    fi
+    }
+    # Suppress user-level cargo config rustflags for the Android codegen, the
+    # same way scripts/build-android.sh does: ~/.cargo/config.toml typically
+    # sets [build] rustflags = -C target-cpu=native (host-CPU flags that poison
+    # Android codegen and can even SEGFAULT nightly LLVM on aarch64). When
+    # RUSTFLAGS is set, cargo ignores build/target rustflags from config files
+    # entirely; an empty-string override is treated as unset and --config
+    # build.rustflags=[] does not reliably win, so exporting RUSTFLAGS is the
+    # only dependable suppression. Exported (not per-command) so it also covers
+    # any nested cargo invocation dx makes.
+    export RUSTFLAGS="-C target-cpu=generic"
     # Pre-fetch the SDK packages gradle/dx need if the `android` CLI is
     # available (best effort — if dx wants a different version it will say so
     # and the user can `android sdk install` it explicitly).
