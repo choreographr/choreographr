@@ -191,19 +191,23 @@ if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     # range, whose baselines are split (Debian/Arch/Fedora = v1, RHEL 10 =
     # v3), so baseline (2003 SSE2) is the only level that covers them all.
     ./scripts/build-stable.sh build --locked --profile dist -p choreographr --features metrics,blockchain
-fi
 
-# .deb/.rpm are best-effort: skip with a warning when the toolchain is absent
-# so a Linux-x86_64 release can still proceed without dpkg/rpmbuild installed.
-if command -v dpkg-deb >/dev/null 2>&1; then
-    "$REPO_ROOT/scripts/build-deb.sh"
-else
-    echo "warning: dpkg-deb not found — skipping .deb (install with: pacman -S dpkg)" >&2
-fi
-if command -v rpmbuild >/dev/null 2>&1; then
-    "$REPO_ROOT/scripts/build-rpm.sh"
-else
-    echo "warning: rpmbuild not found — skipping .rpm (install with: pacman -S rpm-tools)" >&2
+    # .deb/.rpm are best-effort: skip with a warning when the toolchain is
+    # absent so a Linux-x86_64 release can still proceed without dpkg/rpmbuild
+    # installed. The whole block is gated on the Linux-musl target because
+    # .deb/.rpm are Linux-only artifacts — on the macOS build these checks
+    # would otherwise print irrelevant "dpkg-deb/rpmbuild not found" warnings
+    # (seen for real in the 2026-08-31 workflow_dispatch macOS job).
+    if command -v dpkg-deb >/dev/null 2>&1; then
+        "$REPO_ROOT/scripts/build-deb.sh"
+    else
+        echo "warning: dpkg-deb not found — skipping .deb (install with: pacman -S dpkg)" >&2
+    fi
+    if command -v rpmbuild >/dev/null 2>&1; then
+        "$REPO_ROOT/scripts/build-rpm.sh"
+    else
+        echo "warning: rpmbuild not found — skipping .rpm (install with: pacman -S rpm-tools)" >&2
+    fi
 fi
 
 # ── Checksums over EVERY artifact for this version ──────────────────────────

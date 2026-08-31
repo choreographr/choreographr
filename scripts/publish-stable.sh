@@ -24,6 +24,26 @@
 # clears the marks on every exit path. `cargo package` itself tolerates the
 # dirtiness internally (cargo-release already passes `--allow-dirty` there).
 #
+# Kill-safety (same SIGKILL hazard class as the pre-hardening build-stable.sh,
+# fixed the same way): the strip + skip-worktree masking is NOT atomic with the
+# restore. A hard-killed run (SIGKILL bypasses every trap; CI-style timeouts
+# kill hard) could leave TWO kinds of residue:
+#
+#   1. Stripped files + lost backup. A mktemp backup dies with /tmp cleanup and
+#      gave no warning — the NEXT run would back up the already-stripped files
+#      and later "restore" them, permanently poisoning the manifest/config
+#      (this actually happened to build-stable.sh twice before its hardening).
+#      Fix: backups live in a PERSISTENT, gitignored dir under target/ and the
+#      next run's startup self-heal restores from them before taking fresh ones.
+#   2. Stale skip-worktree marks. The marks hide real future changes to these
+#      two files from `git status` FOREVER — a poisoned tree that looks clean.
+#      The self-heal clears any stale marks on these two files at startup (this
+#      script is their only legitimate setter, so a set mark here can only
+#      mean an interrupted prior run).
+#
+# Motivation for the fix: publish runs take long enough (workspace `cargo
+# release` verification) that a CI/operator timeout mid-publish is realistic.
+#
 # Gatekeeping: publishing ships the working-tree state (the `.crate` is built
 # from the tree, not from HEAD), so uncommitted changes must never silently
 # ride along. By default the script refuses to start on a dirty tree. Pass
@@ -69,6 +89,9 @@ MANIFEST="Cargo.toml"
 CONFIG=".cargo/config.toml"
 
 # Snapshot the honest tree state BEFORE any masking or stripping.
+# (Cleared stale marks from a killed run would otherwise make this status lie:
+# a stripped file with a stale skip-worktree mark reports as clean.)
+git update-index --no-skip-worktree "$MANIFEST" "$CONFIG" >/dev/null 2>&1 || true
 START_STATUS="$(git status --porcelain)"
 
 # Gate: refuse by default unless the caller explicitly owns the dirtiness.
@@ -78,16 +101,50 @@ if [ "$ALLOW_DIRTY" -eq 0 ] && [ -n "$START_STATUS" ]; then
     exit 1
 fi
 
-BACKUP_DIR="$(mktemp -d)"
+# Backup location — deliberately PERSISTENT (inside target/, gitignored)
+# rather than a mktemp dir. Same reasoning as build-stable.sh: a mktemp backup
+# is lost with a hard kill, so the next run would back up the already-stripped
+# files and "restore" them — the poisoning failure mode, observed for real on
+# the build-stable.sh side. With a persistent location, a killed run's backups
+# survive and the next run self-heals (see below) before taking fresh backups.
+BACKUP_DIR="target/.publish-stable-backup"
+mkdir -p "$BACKUP_DIR"
+
+# Interrupted-run self-heal: backups still present means a previous run was
+# killed after stripping but before its EXIT-trap restore. Put the originals
+# back FIRST so the fresh backup below is taken from an unstripped tree.
+# (If the operator edited these files between the interruption and now, those
+# edits are clobbered — hence the loud warning; the alternative is a silently
+# poisoned manifest, which is strictly worse. The stale skip-worktree marks
+# were already cleared above, before the honest status snapshot.)
+if [ -e "$BACKUP_DIR/Cargo.toml" ]; then
+    echo "warning: $0: a previous run was interrupted before its restore completed — restoring the tree from that run's backups" >&2
+    echo "warning: if you edited $MANIFEST or $CONFIG between the interruption and now, re-apply those edits (they have been overwritten)" >&2
+    cp -f "$BACKUP_DIR/Cargo.toml" "$MANIFEST"
+    cp -f "$BACKUP_DIR/config.toml" "$CONFIG"
+fi
+rm -rf "$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR"
+
+# Take the fresh backups BEFORE arming any trap, so there is no window where
+# the EXIT trap could fire against missing backup files.
 cp "$MANIFEST" "$BACKUP_DIR/Cargo.toml"
 cp "$CONFIG"   "$BACKUP_DIR/config.toml"
 
 cleanup() {
-    # 1. Restore the stripped files to their pre-run content.
-    cp -f "$BACKUP_DIR/Cargo.toml" "$MANIFEST" 2>/dev/null || true
-    cp -f "$BACKUP_DIR/config.toml" "$CONFIG" 2>/dev/null || true
+    # 1. Restore the stripped files to their pre-run content. `if` guards
+    #    rather than `[ ] &&` chains so a missing file doesn't trip `set -e`
+    #    inside the trap (the only way a backup is missing now is a kill in
+    #    the window between the two cps above).
+    if [ -f "$BACKUP_DIR/Cargo.toml" ]; then
+        cp -f "$BACKUP_DIR/Cargo.toml" "$MANIFEST"
+    fi
+    if [ -f "$BACKUP_DIR/config.toml" ]; then
+        cp -f "$BACKUP_DIR/config.toml" "$CONFIG"
+    fi
     # 2. Clear the skip-worktree masks (idempotent; survives a `cargo release`
-    #    failure via the EXIT trap, not a SIGKILL — see the header note).
+    #    failure via the EXIT trap. A SIGKILL bypasses this — the startup
+    #    self-heal is the safety net for that case, see the header note).
     git update-index --no-skip-worktree "$MANIFEST" "$CONFIG" >/dev/null 2>&1 || true
     rm -rf "$BACKUP_DIR"
     # 3. Defensive end-check: the tree must be exactly as we found it. A diff
@@ -99,6 +156,13 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+# Signal hygiene: on Ctrl-C / TERM / HUP, exit as soon as the signal-hit cargo
+# child dies, which runs the EXIT trap (cleanup). Without these, bash defers
+# trap handling until the foreground child finishes on its own. SIGKILL cannot
+# be trapped by anyone — the startup self-heal is the safety net for that case.
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 # Mask the two files from cargo-release's clean-tree gate (libgit2 status):
 # the strip below would otherwise trip the unconditional check that

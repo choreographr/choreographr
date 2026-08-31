@@ -225,6 +225,27 @@ targets — and the only C component on the musl tarball is the mimalloc
 allocator, enabled via `--features mimalloc` (the only shipped artifact with a
 non-system allocator).
 
+**CI linker policy: default linkers everywhere.** No mold/wild/lld-fast-linker
+additions in the release pipeline. Fat-LTO links spend their time in LLVM, not
+the linker's data structures, so a faster linker barely moves link time; macOS
+links Mach-O via `ld64` and Windows links PE via `link.exe` regardless, and CI
+link time is a rounding error next to the 20–30 minute fat-LTO builds. A
+developer's local `wild` (via `~/.cargo/config.toml`) is deliberately
+overridden by the release scripts' env `RUSTFLAGS`.
+
+**Known-benign linker warning on the musl zigbuild link**: `warning: linker
+stderr: ignoring deprecated linker optimization setting '1'`
+(`#[warn(linker_messages)]`, once per binary). Root cause verified against the
+rustc source and reproduced locally: rustc itself emits `-Wl,-O1` for every
+optimized (opt-level ≥ 2) GNU-flavor link (`GccLinker::optimize()` in
+`rustc_codegen_ssa/src/back/linker.rs`) — a GNU-ld output-optimization hint
+that zig's bundled lld recognizes as deprecated and ignores. It never appears
+on `cargo -v`'s rustc command line because rustc constructs linker args
+internally at link time (same reason the relro args don't show there), which
+is why the source of the flag took a spy-linker investigation to pin down.
+Binaries are correct; treat it as CI noise, not something to suppress with
+`-A linker_messages` (that would hide real linker warnings too).
+
 ### `packaging/` assets
 
 | Asset | Purpose |
