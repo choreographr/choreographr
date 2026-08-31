@@ -175,7 +175,12 @@
 # on models.dev, so the gateway requires the reasoning_content echo on
 # every assistant message — set explicitly until the snapshot catches up.
 [provider.opencode-go.models."glm-5.3-flash"]
-  context_window = 200000
+  # 1M context / 128K output: the fact is not derivable from the snapshot
+  # (which still lacks the model under this provider), so it is pinned here.
+  # 1_000_000 is the value every upstream models.dev listing carries
+  # (vancine / tokengo / orcarouter); a stale 200k pin used to live here and
+  # made the UI's context display and compaction weighting wrong.
+  context_window = 1000000
   reasoning_supported = true
   reasoning_content_required = true
 
