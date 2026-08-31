@@ -69,7 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         run: |
@@ -123,7 +123,7 @@ jobs:
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-x86_64-musl
           # Glob (not the literal name) so a future release.sh .rpm would be
@@ -138,7 +138,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         run: |
@@ -173,7 +173,7 @@ jobs:
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-aarch64-apple-darwin.tar.gz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-aarch64
           path: dist/choreographr-*.tar.gz
@@ -184,7 +184,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         run: |
@@ -236,7 +236,7 @@ jobs:
               "dist/choreographr-${VERSION}-x86_64-pc-windows-msvc.zip" \
               -C "$STAGE" .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64-msvc
           path: dist/choreographr-*.zip
@@ -247,7 +247,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain + Android rust target
         run: |
@@ -290,7 +290,7 @@ jobs:
           tar czf "dist/choreographr-${VERSION}-aarch64-linux-android.tar.gz" \
               -C dist/android/arm64-v8a choreographr choreo-tui choreo-im choreo-acp
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: android-aarch64-termux
           path: dist/choreographr-*.tar.gz
@@ -308,9 +308,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: "*"
           merge-multiple: true
