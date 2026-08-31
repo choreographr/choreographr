@@ -3,7 +3,8 @@
 # binaries plus the systemd user unit.
 #
 # Prerequisites:
-#   - `cargo build --release --workspace` artifacts in target/release/
+#   - dist-profile artifacts in target/dist/ — produced by scripts/release.sh
+#     or `./scripts/build-stable.sh build --locked --profile dist --workspace`
 #     (binaries: choreographr choreo-tui choreo-im choreo-acp)
 #   - packaging/choreographr.service
 #   - dpkg-deb (install on Arch with: pacman -S dpkg)
@@ -25,8 +26,8 @@ command -v dpkg-deb >/dev/null 2>&1 || {
 
 # Fail fast on missing inputs so we never ship a half-built package.
 for b in "${BINARIES[@]}"; do
-    [ -x "$REPO_ROOT/target/release/$b" ] || {
-        echo "error: missing $REPO_ROOT/target/release/$b — run 'cargo build --release --workspace' first" >&2
+    [ -x "$REPO_ROOT/target/dist/$b" ] || {
+        echo "error: missing $REPO_ROOT/target/dist/$b — run the release pipeline first (scripts/release.sh) or: ./scripts/build-stable.sh build --locked --profile dist --workspace" >&2
         exit 1
     }
 done
@@ -40,7 +41,7 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/lib/systemd/user" "$STAGE/DEBIAN"
 for b in "${BINARIES[@]}"; do
-    install -m 0755 "$REPO_ROOT/target/release/$b" "$STAGE/usr/bin/$b"
+    install -m 0755 "$REPO_ROOT/target/dist/$b" "$STAGE/usr/bin/$b"
 done
 install -m 0644 "$REPO_ROOT/packaging/choreographr.service" \
     "$STAGE/usr/lib/systemd/user/choreographr.service"

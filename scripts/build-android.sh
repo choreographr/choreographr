@@ -213,7 +213,7 @@ if [ "$CHECK" = 1 ]; then
     # NDK or not is decided above, and nothing below mutates the tree.
     log "dry run — no changes made. Would build (on the stable toolchain):"
     for abi in $TARGETS; do
-        log "  cargo ndk -t $abi -o dist/android/$abi -- build --locked --release \\"
+        log "  cargo ndk -t $abi -o dist/android/$abi -- build --locked --profile dist \\"
         [ -n "$FEATURES" ] && log "      --features $FEATURES \\"
         for bin in $BINS; do
             log "      -p choreographr --bin $bin"
@@ -237,15 +237,47 @@ else
     SED_I=(sed -i '')
 fi
 
-BACKUP_DIR="$(mktemp -d)"
-restore() {
+# Backup location — persistent (target/ is gitignored), same kill-safety
+# rationale as scripts/build-stable.sh: a hard-killed run (CI-style timeout,
+# SIGKILL) bypasses the EXIT trap, and with a mktemp backup dir that meant the
+# next run would back up the ALREADY-STRIPPED files and "restore" them —
+# permanently poisoning the manifest/config. A persistent dir lets the next
+# run self-heal (below) from the killed run's surviving backups.
+BACKUP_DIR="target/.build-android-backup"
+mkdir -p "$BACKUP_DIR"
+
+# Interrupted-run self-heal (same semantics as build-stable.sh): backups still
+# present means the previous run died after stripping, before restoring.
+if [ -e "$BACKUP_DIR/Cargo.toml" ]; then
+    echo "warning: $0: a previous run was interrupted before its restore completed — restoring the tree from that run's backups" >&2
+    echo "warning: if you edited $MANIFEST or $CONFIG between the interruption and now, re-apply those edits (they have been overwritten)" >&2
     cp -f "$BACKUP_DIR/Cargo.toml" "$MANIFEST"
     cp -f "$BACKUP_DIR/config.toml" "$CONFIG"
+fi
+rm -rf "$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR"
+
+# Fresh backups BEFORE arming traps — no window where the EXIT trap fires
+# against missing backup files.
+cp "$MANIFEST" "$BACKUP_DIR/Cargo.toml"
+cp "$CONFIG" "$BACKUP_DIR/config.toml"
+
+restore() {
+    if [ -f "$BACKUP_DIR/Cargo.toml" ]; then
+        cp -f "$BACKUP_DIR/Cargo.toml" "$MANIFEST"
+    fi
+    if [ -f "$BACKUP_DIR/config.toml" ]; then
+        cp -f "$BACKUP_DIR/config.toml" "$CONFIG"
+    fi
     rm -rf "$BACKUP_DIR"
 }
 trap restore EXIT
-cp "$MANIFEST" "$BACKUP_DIR/Cargo.toml"
-cp "$CONFIG" "$BACKUP_DIR/config.toml"
+
+# Signal hygiene (same as build-stable.sh): Ctrl-C / TERM / HUP exit through
+# the EXIT trap (restore) as soon as the signal-hit cargo dies. SIGKILL can't
+# be trapped — the startup self-heal covers that case.
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 # Strip the per-profile `rustflags` arrays (the nightly profile-rustflags keys,
 # including -C target-cpu=native). Required for every cross build: profile
@@ -269,7 +301,8 @@ mkdir -p dist/android
 # Map each cargo-ndk ABI name to its rustup triple (for locating the linked
 # binaries) — cargo-ndk's `-o` flag only copies *cdylib* artifacts into the
 # output dir (verified on a real run: plain `bin` executables are left in
-# target/<triple>/release/), so the executables are copied explicitly below.
+# target/<triple>/<profile>/), so the executables are copied explicitly below
+# — from target/<triple>/dist/ now that the build uses --profile dist.
 abi_to_triple() {
     case "$1" in
         arm64-v8a) echo aarch64-linux-android ;;
@@ -293,16 +326,19 @@ for abi in $TARGETS; do
     # deploys keep building the default feature set exactly as before.
     FEATURE_ARGS=()
     [ -n "$FEATURES" ] && FEATURE_ARGS+=("--features" "$FEATURES")
-    cargo ndk -t "$abi" -- build --locked --release "${FEATURE_ARGS[@]}" "${PKG_ARGS[@]}"
+    # --profile dist matches the desktop release pipeline (release.sh): the
+    # shipped Termux binaries come from the same [profile.dist] profile, and
+    # land in target/<triple>/dist rather than target/<triple>/release.
+    cargo ndk -t "$abi" -- build --locked --profile dist "${FEATURE_ARGS[@]}" "${PKG_ARGS[@]}"
     # Copy the executables into the per-ABI output dir (see abi_to_triple note:
     # cargo-ndk does not do this for plain bins).
     mkdir -p "dist/android/$abi"
     for bin in $BINS; do
-        cp "target/$triple/release/$bin" "dist/android/$abi/$bin"
+        cp "target/$triple/dist/$bin" "dist/android/$abi/$bin"
     done
 done
 
-# The binaries were copied from target/<triple>/release/ above; verify the
+# The binaries were copied from target/<triple>/dist/ above; verify the
 # layout and print the push commands the Termux side needs.
 log "binaries ready:"
 for bin in $BINS; do

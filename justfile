@@ -403,11 +403,11 @@ release-tap args="":
 smoke-test tarball="":
     ./scripts/smoke-test.sh "{{ if tarball == "" { release-tarball } else { tarball } }}"
 
-# Build the fat .deb from existing target/release artifacts (Linux only)
+# Build the fat .deb from existing target/dist artifacts (Linux only)
 package-deb:
     ./scripts/build-deb.sh
 
-# Build the fat .rpm from existing target/release artifacts (Linux only)
+# Build the fat .rpm from existing target/dist artifacts (Linux only)
 package-rpm:
     ./scripts/build-rpm.sh
 

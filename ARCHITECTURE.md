@@ -112,13 +112,22 @@ allocation guard), so the model path and the UI path cannot drift apart.
 
 ## Release & packaging
 
-Releases are cut **locally** — there is no CI pipeline. The orchestrator,
+Releases are cut **locally** with the orchestrator below, or on GitHub
+Actions by pushing a `vX.Y.Z` tag —
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) is the CI
+counterpart of `scripts/release.sh` (the Linux and macOS jobs literally run
+that script, so build flags, `--locked`, feature selection, service-file
+staging, and tarball naming stay in one place; the Windows and Termux jobs
+pass the same build line inline). A `workflow_dispatch` run builds everything
+but creates no release — that is the pipeline-test path so the first real tag
+is never the first test of the pipeline. The orchestrator,
 [`scripts/release.sh`](../scripts/release.sh), is a dry-run by default: it
 reads the version from the root `Cargo.toml` (the single source of truth that
 the Homebrew formula, AUR PKGBUILD, and installer mirror), runs
-`cargo build --release -p choreographr` (the four shipped binaries only —
+`cargo build --profile dist -p choreographr` (the four shipped binaries only —
 choreo-gui's Dioxus Native (Blitz) renderer stack is excluded from
-the release build),
+the release build) under the workspace's dedicated `[profile.dist]` profile
+(root `Cargo.toml`),
 packs the release tarball, writes
 `SHA256SUMS`, builds the `.deb`/`.rpm` when the tools are present, and prints
 the exact upload + checklist commands. Only `--upload` runs
@@ -162,27 +171,53 @@ binaries at the **top level** (no `bin/` prefix)
 plus both service files, exec bits preserved — `install.sh` and the Homebrew
 formula reference them directly.
 
-**All shipped binaries are stripped.** The workspace `[profile.release]` sets
-`strip = "symbols"` (root `Cargo.toml`), so every artifact — tarball, `.deb`,
+**All shipped binaries are stripped.** The workspace `[profile.dist]` profile
+(root `Cargo.toml` — the shipped-artifact profile every release-pipeline build
+selects with `--profile dist`; every shipped-relevant key is pinned
+explicitly there so `[profile.release]` tuning for local builds can't leak
+into artifacts) sets `strip = "symbols"`, so every
+artifact — tarball, `.deb`,
 `.rpm`, Homebrew, AUR — ships binaries without a symbol table (~22% smaller;
-~10% smaller tarball). Thin LTO is NOT enabled: `lto = "thin"` was removed
-from the profile because it made every release link (and thus the default
-local `cargo build --release`) slow and memory-hungry; if a release ever wants
-cross-crate optimization back, set `CARGO_PROFILE_RELEASE_LTO=thin` in
-`scripts/release.sh`. Panic messages keep their `file:line` locations
-(compiled-in string constants via `#[track_caller]`); only
+~10% smaller tarball). Shipped binaries get **fat LTO + `codegen-units = 1`**
+— set in `[profile.dist]` only, so the default local `cargo build --release`
+keeps its fast, LTO-free links (thin LTO was removed from `[profile.release]`
+in e6b5a47 because it made every default release link slow and memory-hungry;
+the dist profile is the shipped-only tuning home, and the fat-LTO link cost
+lands only in the release pipeline). Panic messages keep their `file:line`
+locations (compiled-in string constants via `#[track_caller]`); only
 `RUST_BACKTRACE=1` symbolization is lost, and the daemon emits no backtraces.
 `panic = "abort"` is deliberately NOT set: the daemon isolates
 request-worker panics with `catch_unwind` (sessions.rs), which abort would
 defeat. The RPM spec keeps `__os_install_post %{nil}` so rpm's brp scripts
 never re-process the already-stripped binaries.
 
-All shipped binaries also build at the target's **default CPU**: the
-workspace's `-C target-cpu=native` profile flags (and the nightly `-Z…` flags)
-are stripped by `scripts/build-stable.sh` before every stable release build, so
-the static musl tarball runs on any x86-64 Linux (never just the build
-machine's microarchitecture), the `.deb`/`.rpm` stay baseline, and the macOS
-tarball keeps the generic aarch64 feature set.
+Shipped binaries build at an explicit **CPU floor per target**, set via
+`RUSTFLAGS="-C target-cpu=…"` in the release scripts/workflow — never
+`target-cpu=native`, and never profile rustflags (those ignore `--target`, are
+nightly-only, and are stripped by `scripts/build-stable.sh` before every
+stable release build; env rustflags additionally override any developer's
+`~/.cargo/config.toml`, so local and CI artifacts are comparable):
+
+- **musl tarball + Windows zip: x86-64-v2** (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/
+  CMPXCHG16B — Intel Nehalem 2008+, AMD Bulldozer 2011+). The level enterprise
+  distros have moved to (RHEL 10 baseline = v3, SLES 16 = v2) while the
+  community distros (Debian/Arch/Fedora, Ubuntu mainline) stay v1 — v2 is the
+  pragmatic floor between "runs on anything since 2003" and modern
+  vectorization. Future per-CPU-level artifacts (e.g. a v3 tarball) reuse the
+  same `RUSTFLAGS` mechanism with a different value.
+- **macOS tarball: the target default** — `aarch64-apple-darwin` already
+  defaults to `apple-a14` (Apple-Silicon-tuned), and the fleet is homogeneous
+  by definition; no flag needed.
+- **Android/Termux: generic `armv8-a`** — the device fleet spans a decade of
+  cores with nothing newer in common; `build-android.sh` enforces
+  `RUSTFLAGS="-C target-cpu=generic"`.
+- **.deb/.rpm: baseline (v1)** — the glibc-distro range they serve is split
+  (Debian/Arch = v1, RHEL 10 = v3), so baseline is the only level covering
+  all of them.
+
+C dependencies (mimalloc, compiled by `cc`/zig) are NOT affected by
+`RUSTFLAGS` — only rustc codegen is — but those libraries do their own runtime
+feature detection.
 
 The desktop-notify tool (`notify_send`, backed by notify-rust) was removed
 from the daemon, so the shipped binaries link no C libraries on the glibc
@@ -214,13 +249,13 @@ with `systemctl --user enable --now choreographr` (Linux) or
 | Script | Role |
 |---|---|
 | `install.sh` | curl\|sh installer — downloads the pinned-version tarball, verifies its SHA-256 against the `SHA256SUMS` fetched over the same TLS channel (no trust-on-first-use, no eval), extracts only the four binaries via an explicit member list, installs the platform service file, and never auto-enables. `--uninstall` removes everything; `CHOREOGRAPHR_BASE_URL` overrides the download base for testing/mirrors only. |
-| `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing all four binaries plus the systemd user unit, from existing `target/release/` artifacts |
+| `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing all four binaries plus the systemd user unit, from existing `target/dist/` artifacts |
 | `smoke-test.sh` | Extracts a release tarball, checks the four binaries exist and are executable, asserts each binary's `--version` reports the release version, and runs `--help` on all four clap clients |
-| `release.sh` | The release orchestrator — local builds only, no CI; dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard |
+| `release.sh` | The release orchestrator — local builds (its CI counterpart is `.github/workflows/release.yml`, which runs it on the Linux/macOS runners); dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard (CI passes it: a checkout IS the pushed commit, so the uncommitted-edits threat model cannot apply) |
 | `publish-stable.sh` | The crates.io publish wrapper (RELEASE.md Phase 2) — strips the nightly-only per-profile `rustflags` and the `[unstable]` config opt-in for the duration of `cargo release publish` (masking the two edited files from cargo-release's clean-tree gate via `git update-index --skip-worktree`, and always passing `--exclude choreo-gui`, which cargo-release 1.1.5 won't drop on its own via `publish = false`), so published manifests stay buildable by stable `cargo install`, then restores both files and clears the masks |
-| `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine instead of GitHub Actions (no CI by design) |
+| `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine (the CI release workflow ships the tarballs but does not touch the tap) |
 | `check-supply-chain.sh` | The dependency supply-chain gate — runs `cargo deny check advisories bans sources` against `deny.toml` (falling back to `cargo-audit` + a literal lockfile scan when cargo-deny is absent), after scanning the local `~/.cargo/registry` cache for the `.crate` files deleted during the 2026-08-20 `arrayref` attack (RUSTSEC-2026-0260). Wired into `just pre-commit` / `just ci`; see the **Dependency supply chain** subsection under **Security model** |
-| `build-android.sh` | Cross-builds the four suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run), stages them in `dist/android/<abi>/`, and prints the `adb push` guidance for Termux `$PREFIX/bin`. Strips the per-profile `rustflags` from the manifest for the duration (backed up and restored via `trap`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
+| `build-android.sh` | Cross-builds the four suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run) under `--profile dist` (the shipped-artifact profile — matches the desktop release pipeline), stages them in `dist/android/<abi>/`, and prints the `adb push` guidance for Termux `$PREFIX/bin`. Strips the per-profile `rustflags` from the manifest for the duration (persistent backups under `target/` + EXIT-trap restore, plus a next-run self-heal that recovers a tree left stripped by a hard-killed predecessor — the trap-reliant restore alone was not kill-safe; see `build-stable.sh`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
 
 ### Distribution channels (0.1)
 
@@ -3377,8 +3412,10 @@ per-machine linker flags (e.g. the wild linker in `~/.cargo/config.toml`)
 still apply. `-C target-cpu=native` is a repo-wide local-build default that
 NEVER reaches a shipped artifact: both `scripts/build-stable.sh` (dist
 binaries) and `scripts/publish-stable.sh` (crates.io) strip the per-profile
-rustflags keys, so dist and published-source builds stay on each target's
-baseline CPU, and the RISC-V guest compiles (`tools/vm.rs`) are direct
+rustflags keys, so dist builds get their CPU floor from the per-target
+`RUSTFLAGS="-C target-cpu=…"` set in the release scripts (see the
+"Release & packaging" section), published-source builds stay baseline, and
+the RISC-V guest compiles (`tools/vm.rs`) are direct
 `rustc +stable` calls that never see cargo rustflags at all.
 
 **Stable builds are a supported opt-out.** The sources use no nightly-only
@@ -3389,6 +3426,13 @@ enables require that unstable feature), so a stable build is run through
 `scripts/build-stable.sh` (`just build-stable` / `check-stable` /
 `test-stable`): it temporarily strips the nightly-only `rustflags` keys and the
 `[unstable]` block, runs `cargo +stable ...`, and restores them on exit.
+Kill-safety: the strip/restore is hardened against a hard-killed run (CI-style
+timeout, SIGKILL — the EXIT trap cannot fire for those): backups are kept
+persistently under `target/`, and the next run self-heals by restoring a
+predecessor's surviving backups before taking its own (the failure this
+closes — a killed run's mktemp backups lost, so the next run backed up and
+"restored" the stripped files — was observed for real). `build-android.sh`
+shares the mechanism.
 
 The publish step has the identical constraint from the consumer side: per-
 profile rustflags that ship inside a published `.crate` hard-break stable

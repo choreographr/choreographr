@@ -158,7 +158,8 @@ dependent-version = "fix"
 #   release — is tuned for the box it runs on. This is the repo-wide default
 #   and deliberately NEVER reaches a shipped artifact: dist binaries are built
 #   on STABLE via scripts/build-stable.sh, which strips these per-profile
-#   rustflags keys (so they stay on the target's baseline CPU), and
+#   rustflags keys (shipped artifacts set their own per-target CPU floor via
+#   RUSTFLAGS in the release scripts — see ARCHITECTURE.md), and
 #   scripts/publish-stable.sh strips them for crates.io (profile rustflags in
 #   a published manifest hard-break stable `cargo install` — the
 #   profile-rustflags feature is nightly-only). The RISC-V guest compiles in
@@ -171,8 +172,10 @@ dependent-version = "fix"
 debug = "line-tables-only"
 rustflags = ["-Zunstable-options", "--jobs-frontend=0", "-Zshare-generics=yes", "-C", "target-cpu=native"]
 
-# Release profile for shipped binaries (all four artifact types build with
-# `cargo build --release`). One deliberate setting, one deliberate omission:
+# Release profile for locally-built optimized binaries (`cargo build
+# --release`); shipped artifacts build from its [profile.dist] child (see
+# below) so the release pipeline has its own output directory. One deliberate
+# setting, one deliberate omission:
 #
 # - strip = "symbols": cuts shipped size ~22% (tarball ~10%). Panic messages
 #   keep their file:line locations (compiled-in string constants via
@@ -193,6 +196,64 @@ rustflags = ["-Zunstable-options", "--jobs-frontend=0", "-Zshare-generics=yes", 
 [profile.release]
 strip = "symbols"
 rustflags = ["-Zunstable-options", "--jobs-frontend=0", "-C", "target-cpu=native"]
+
+# Dist profile — the SHIPPED-ARTIFACT profile, selected with `--profile dist`.
+# Used exclusively by the release pipeline: scripts/release.sh (tarball +
+# .deb/.rpm), scripts/build-android.sh (Termux), and the GitHub release
+# workflow (.github/workflows/release.yml — Linux/macOS call release.sh,
+# Windows/build-android equivalents pass the same flag inline). Plain local
+# `cargo build --release` keeps building into target/release, while every
+# release-pipeline build lands in target/<triple>/dist — so the packaging
+# scripts (build-deb.sh / build-rpm.sh / release.sh staging) consume ONLY
+# artifacts the release pipeline itself produced, and a stale or
+# feature-mismatched local `cargo build --release` binary can never be
+# packaged by accident.
+# Deliberately EXPLICIT: every key that affects a shipped binary is pinned
+# here rather than relied on from inheritance, so future tuning of
+# [profile.release] (which exists for LOCAL builds — e.g. someone adding debug
+# line tables for profiling) cannot silently leak into shipped artifacts.
+# `inherits = "release"` stays because cargo profiles are inheritance-based by
+# design — a custom profile always has a base (release, implicitly, if the key
+# is omitted — dropping the line would hide the coupling, not remove it); it
+# now only covers keys we deliberately leave to platform defaults
+# (split-debuginfo) and the nightly-only rustflags, which are irrelevant here:
+# dist builds always run through build-stable.sh / build-android.sh, which
+# strip all manifest rustflags before stable cargo ever parses them.
+#
+# Shipped-only tuning: fat LTO + one codegen unit. This is precisely why the
+# profile exists — thin LTO was removed from [profile.release] (e6b5a47)
+# because it made every default local release link slow and memory-hungry, but
+# a [profile.dist]-only LTO never touches `cargo build --release`. The cost
+# lands only in the release pipeline: fat LTO makes the four-binary link
+# slower and hungrier (watch the CI job timeouts), and codegen-units = 1
+# serializes codegen for maximum cross-crate optimization.
+[profile.dist]
+inherits = "release"
+# Optimization: cargo's release level (3), pinned so a local opt-level
+# experiment in [profile.release] can't ship.
+opt-level = 3
+# Fat LTO across the whole crate graph + single codegen unit: maximum
+# cross-crate optimization at the cost of link time (see above).
+lto = "fat"
+codegen-units = 1
+# No symbol table (~22% smaller binaries, ~10% smaller tarballs). The RPM spec
+# disables brp post-install stripping so rpm never re-processes these.
+strip = "symbols"
+# No debuginfo, no overflow checks, no debug assertions — the shipped-surface
+# versions of the release defaults, pinned for the same leak-proofing reason
+# as opt-level.
+debug = false
+debug-assertions = false
+overflow-checks = false
+# Deterministic non-incremental codegen (release default; irrelevant for CI's
+# one-shot builds but pinned anyway).
+incremental = false
+# unwind is LOAD-BEARING: the daemon isolates request-worker panics with
+# catch_unwind (sessions.rs) — panic = "abort" here would turn any single
+# request panic into a whole-daemon crash. Pinned so a future panic-strategy
+# experiment in [profile.release] can't inherit into shipped binaries.
+panic = "unwind"
+rpath = false
 
 [workspace.dependencies]
 anyhow = "1"

@@ -2,14 +2,16 @@
 # binaries plus the systemd user unit.
 #
 # Staging assumption (why): nothing is compiled here. The binaries are prebuilt
-# release artifacts (target/release/ from `cargo build --release --workspace`)
+# dist-profile artifacts (target/dist/, from the release pipeline or
+# `cargo build --profile dist --workspace`)
 # and scripts/build-rpm.sh stages them — together with
 # packaging/choreographr.service — into a staging root, then invokes:
 #     rpmbuild -bb --buildroot <staging> --define __os_install_post <nil> \
 #       packaging/rpm/choreographr.spec
 # (the __os_install_post define disables rpm's brp post-install processing.
-# Our binaries are already stripped by the workspace [profile.release] strip =
-# "symbols" — see the root Cargo.toml — so brp-strip would be a no-op anyway;
+# Our binaries are already stripped by the workspace [profile.dist] (inherits
+# [profile.release]) strip = "symbols" — see the root Cargo.toml — so brp-strip
+# would be a no-op anyway;
 # we disable it so brp never re-processes or rewrites the prebuilt artifacts.)
 # %files below therefore lists the staged layout verbatim; there are no
 # BuildRequires, no Source tarball, and no %prep/%build/%install sections.

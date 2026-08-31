@@ -314,12 +314,18 @@ Both machines run the same dry-run flow. `scripts/release.sh`:
 
 - builds the shipped binaries on **stable** Rust (each cargo build runs through
   `scripts/build-stable.sh`, reproducible and matching the crates.io/MSRV
-  story; see the README build notes),
-- builds every artifact at the target's **default CPU**: the local
-  `-C target-cpu=native` profile flags (and the nightly `-Z…` flags) are
-  stripped by `scripts/build-stable.sh` before each stable build, so the static
-  musl tarball keeps its "runs on any Linux" portability promise and the
-  `.deb`/`.rpm` stay baseline — never bake in the build machine's CPU,
+  story; see the README build notes) under the workspace's dedicated
+  `[profile.dist]` profile — `--profile dist`, not `--release` — so the
+  shipped artifacts land in `target/<triple>/dist/`, separate from any local
+  `cargo build --release` output the packaging steps could otherwise pick up
+  by mistake (see root `Cargo.toml`),
+- builds every artifact at an explicit **CPU floor per target** via
+  `RUSTFLAGS="-C target-cpu=…"` (see ARCHITECTURE.md "Release & packaging"):
+  x86-64-v2 for the musl tarball, the target default (`apple-a14`) for macOS,
+  baseline for the `.deb`/`.rpm` — the local `-C target-cpu=native` profile
+  flags (and the nightly `-Z…` flags) are additionally stripped by
+  `scripts/build-stable.sh` before each stable build, so the build machine's
+  CPU can never leak into a shipped artifact,
 - reads the version from `Cargo.toml`,
 - guards against a dirty tree,
 - builds with `--features metrics,blockchain` (the metrics endpoint stays

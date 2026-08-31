@@ -13,9 +13,14 @@
 # below cross-compiles via zig).
 #
 # Dist/release binaries are built on STABLE Rust (reproducible; matches the
-# crates.io/MSRV story). Each cargo build goes through scripts/build-stable.sh,
-# which temporarily strips the nightly-only profile-rustflags bits the dev
-# toolchain uses, runs the build under `cargo +stable`, then restores them.
+# crates.io/MSRV story) under the workspace's dedicated [profile.dist] profile
+# (see root Cargo.toml): `--profile dist` rather than `--release` puts the
+# shipped artifacts in target/<triple>/dist, separate from any local
+# `cargo build --release` output, so the staging below can only ever pick up
+# binaries this pipeline produced. Each cargo build goes through
+# scripts/build-stable.sh, which temporarily strips the nightly-only
+# profile-rustflags bits the dev toolchain uses, runs the build under
+# `cargo +stable`, then restores them.
 set -euo pipefail
 
 usage() {
@@ -131,11 +136,24 @@ echo "==> building release binaries (root package)"
 # (RUSTSEC-2026-0260). The lockfile itself is also checked by
 # scripts/check-supply-chain.sh (deny.toml bans) in `just pre-commit`/`ci`.
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
-    ./scripts/build-stable.sh zigbuild --locked --release -p choreographr --target x86_64-unknown-linux-musl --features metrics,mimalloc,blockchain
-    TARBALL_BIN_DIR="target/x86_64-unknown-linux-musl/release"
+    # CPU floor: x86-64-v2 (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/CMPXCHG16B) — the
+    # level every AMD64 CPU since Intel Nehalem (2008) / AMD Bulldozer (2011)
+    # implements, and the direction enterprise distros have moved (RHEL 10
+    # baseline = v3, SLES 16 = v2; Debian/Arch/Fedora stay v1). RUSTFLAGS env,
+    # NOT profile rustflags, because (a) profile rustflags ignore --target and
+    # would poison cross builds (the build-android.sh lesson), and (b) env
+    # rustflags override any user ~/.cargo/config.toml [build] rustflags (e.g.
+    # a developer's target-cpu=native), so local and CI artifacts are
+    # comparable. Future per-CPU-level artifacts (e.g. a v3 tarball) reuse this
+    # exact mechanism with a different value.
+    RUSTFLAGS="-C target-cpu=x86-64-v2" ./scripts/build-stable.sh zigbuild --locked --profile dist -p choreographr --target x86_64-unknown-linux-musl --features metrics,mimalloc,blockchain
+    TARBALL_BIN_DIR="target/x86_64-unknown-linux-musl/dist"
 else
-    ./scripts/build-stable.sh build --locked --release -p choreographr --features metrics,blockchain
-    TARBALL_BIN_DIR="target/release"
+    # macOS: NO target-cpu flag — the aarch64-apple-darwin target spec already
+    # defaults to apple-a14 (Apple-Silicon-tuned), and the fleet is homogeneous
+    # by definition, so the target default is the right answer here.
+    ./scripts/build-stable.sh build --locked --profile dist -p choreographr --features metrics,blockchain
+    TARBALL_BIN_DIR="target/dist"
 fi
 
 # Stage the tarball contents: the four binaries plus both service files, all
@@ -164,12 +182,15 @@ tar czf "$TARBALL" -C "$STAGE" \
 # (Debian/Fedora/openSUSE), where the system allocator is competitive — static
 # musl + mimalloc is a property of the tarball (which serves general Linux AND
 # the AUR `-bin` package in one artifact), not of the distro packages. They
-# consume `target/release/` from a plain host build; the musl tarball build
+# consume `target/dist/` from a plain host build; the musl tarball build
 # above does NOT populate that directory, so build it here. (On macOS this
 # step is skipped — dpkg/rpmbuild are not present.)
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
-    echo "==> building host (glibc) release binaries for .deb/.rpm"
-    ./scripts/build-stable.sh build --locked --release -p choreographr --features metrics,blockchain
+    echo "==> building host (glibc) dist binaries for .deb/.rpm"
+    # Deliberately NO target-cpu: the .deb/.rpm serve the full glibc-distro
+    # range, whose baselines are split (Debian/Arch/Fedora = v1, RHEL 10 =
+    # v3), so baseline (2003 SSE2) is the only level that covers them all.
+    ./scripts/build-stable.sh build --locked --profile dist -p choreographr --features metrics,blockchain
 fi
 
 # .deb/.rpm are best-effort: skip with a warning when the toolchain is absent

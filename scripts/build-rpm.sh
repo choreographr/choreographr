@@ -3,7 +3,8 @@
 # binaries plus the systemd user unit.
 #
 # Prerequisites:
-#   - `cargo build --release --workspace` artifacts in target/release/
+#   - dist-profile artifacts in target/dist/ — produced by scripts/release.sh
+#     or `./scripts/build-stable.sh build --locked --profile dist --workspace`
 #   - packaging/choreographr.service + packaging/rpm/choreographr.spec
 #   - rpmbuild (install on Arch with: pacman -S rpm-tools)
 #
@@ -13,7 +14,8 @@
 # point rpmbuild's --buildroot at that staging root so the spec's %files
 # section picks up the staged files verbatim. __os_install_post is disabled so
 # rpm's brp scripts don't re-process the prebuilt binaries — which are already
-# stripped by the workspace [profile.release] strip = "symbols" setting.
+# stripped by the workspace [profile.dist] (inherited from [profile.release])
+# strip = "symbols" setting.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,8 +30,8 @@ command -v rpmbuild >/dev/null 2>&1 || {
 }
 
 for b in "${BINARIES[@]}"; do
-    [ -x "$REPO_ROOT/target/release/$b" ] || {
-        echo "error: missing $REPO_ROOT/target/release/$b — run 'cargo build --release --workspace' first" >&2
+    [ -x "$REPO_ROOT/target/dist/$b" ] || {
+        echo "error: missing $REPO_ROOT/target/dist/$b — run the release pipeline first (scripts/release.sh) or: ./scripts/build-stable.sh build --locked --profile dist --workspace" >&2
         exit 1
     }
 done
@@ -46,7 +48,7 @@ trap 'rm -rf "$STAGE" "$TOPDIR"' EXIT
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/lib/systemd/user"
 mkdir -p "$TOPDIR"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS,tmp}
 for b in "${BINARIES[@]}"; do
-    install -m 0755 "$REPO_ROOT/target/release/$b" "$STAGE/usr/bin/$b"
+    install -m 0755 "$REPO_ROOT/target/dist/$b" "$STAGE/usr/bin/$b"
 done
 install -m 0644 "$REPO_ROOT/packaging/choreographr.service" \
     "$STAGE/usr/lib/systemd/user/choreographr.service"
