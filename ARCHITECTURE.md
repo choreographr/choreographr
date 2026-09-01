@@ -548,6 +548,46 @@ Used by `choreo-tui`, `choreo-gui`, and `choreo-im`.
 `TurnEventHandler` is the `choreo-client-core` dispatch sink; the `ClientError` type used by the connection layer is a thiserror enum — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `PrivateKeyEncRead`, `PrivateKeyDecrypt`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Postcard`, `Encryption`.
 
 
+## Enrollment & transport trust
+
+The TCP enrollment model is a deliberate ASYMMETRY — the SSH `known_hosts`
+pattern, not symmetric TOFU. It exists so that the first-contact window (the
+only moment a MITM could strike) can never observe the daemon's private key,
+which clients send inside `Unlock`. Every key arrives over a channel the
+operator already trusts, or is confirmed by a human comparing fingerprints:
+
+- **Client keys → daemon: out of band, always.** A client's transport public
+  key is never learned from the wire for authorization purposes. It is
+  provisioned into `authorized_clients.toml` by the operator via one of three
+  equivalent paths (manual file edit, `/acl add` from a LOCAL connection,
+  `choreographr acl-add` CLI) — all converging on the same file and the same
+  advisory-file-lock discipline, with the hot-reload chain making every path
+  effective without a daemon restart. The ACL parse-compare reload policy
+  means a torn editor save never un-authorizes live clients.
+- **Server key → client: learned in-band on FIRST contact only, confirmed by
+  a human, then pinned.** With no pin for the address, the client runs the
+  Noise XX handshake (`PREAMBLE_XX`), which reveals the server's static key;
+  the client renders its fingerprint (base64 clustered into 4-char groups —
+  bijective with the 32-byte key) and requires confirmation against the value
+  the daemon operator read out during the enrollment conversation (interactive
+  y/N before the TUI starts, or `--trust-fingerprint` for headless clients).
+  Only then is the key pinned to `known_servers.toml` and any protocol traffic
+  — `Unlock` in particular — allowed to flow. Every later connection uses
+  Noise IK (`PREAMBLE_IK`) against the pin; a changed server key fails LOUDLY
+  with the pinned fingerprint and re-pair guidance, never a silent re-prompt.
+- **Why not symmetric OOB, and why not blind TOFU:** blind TOFU would let a
+  first-contact MITM harvest an `Unlock` (the daemon's master private key) —
+  strictly worse than a phished SSH password. The XX + fingerprint flow keeps
+  the single out-of-band artifact to one fingerprint readout while
+  eliminating the client-side file handling of a symmetric exchange. The
+  daemon-as-client future reuses exactly this shape: one keypair per daemon
+  serving both roles, enrollment operator-driven, headless confirmation via
+  the fingerprint flag.
+- **Decision rule:** a new peer is always provisioned by an operator who can
+  touch a trusted machine — never by the network. Any future feature that
+  seems to require in-band trust bootstrapping is a sign of trying to automate
+  operator trust; revisit the XX confirm UX before weakening the gate.
+
 ### `choreo-mcp` — MCP client (Model Context Protocol)
 
 Communicates with MCP server subprocesses over JSON-RPC 2.0 stdio transport.
