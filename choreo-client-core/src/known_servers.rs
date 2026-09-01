@@ -26,6 +26,15 @@
 //! contrast, take an advisory exclusive file lock and rewrite the whole
 //! file (the same discipline as `ensure_transport_keypair`), so concurrent
 //! processes pinning different servers cannot tear the store.
+//!
+//! Concurrency caveat: the lock prevents TEARING, not lost updates —
+//! `pin()` rewrites the whole file from this process's in-memory view, so
+//! two processes that load the store concurrently and both pin serialize
+//! their writes but the SECOND write clobbers the FIRST's new entry
+//! (last-writer-wins). That is acceptable for a known_hosts analogue (the
+//! store is small, per-user, and a vanished pin degrades to a re-confirmed
+//! first contact — never silent trust), but it is why this store must not
+//! grow into a general-purpose mutable registry.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

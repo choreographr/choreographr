@@ -1980,6 +1980,15 @@ impl DaemonState {
 
             // Single-writer reload: the parse-compare inside reload makes
             // this the authoritative snapshot update.
+            //
+            // Note: append_key_locked does fsync-able file I/O ON THE
+            // COMMAND LOOP — the one thread all daemon state serializes
+            // through. This is a deliberate, accepted trade: the write is
+            // rare (only on actual enrollment), small (one ~70-byte
+            // append), and the command loop already performs comparable
+            // blocking I/O in its other handler paths; moving it to a
+            // worker thread would add cross-thread coordination for a
+            // once-per-enrollment millisecond-scale stall.
             acl.reload();
 
             Ok(acl.len())

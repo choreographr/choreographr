@@ -133,10 +133,10 @@ struct Cli {
     server_pk: Option<String>,
 
     /// Pre-approve the server fingerprint for first contact (headless mode:
-    /// the fingerprint, with or without spaces, must match the key the
-    /// daemon presents during the XX probe; compare against the value the
-    /// daemon operator reads out with 'choreographr fingerprint'). Ignored
-    /// when --server-pk is given.
+    /// the fingerprint, with or without spaces, must match exactly —
+    /// including letter case — the key the daemon presents during the XX
+    /// probe; compare against the value the daemon operator reads out with
+    /// 'choreographr fingerprint'). Ignored when --server-pk is given.
     #[arg(long = "trust-fingerprint")]
     trust_fingerprint: Option<String>,
 }
@@ -196,7 +196,7 @@ fn resolve_connect_mode(
         // Headless: compare against the pre-approved fingerprint (whitespace
         // is insignificant — accept either the grouped or the plain form).
         Some(expected) => {
-            let matches = strip_fp_spaces(expected) == strip_fp_spaces(&fp);
+            let matches = strip_fp_whitespace(expected) == strip_fp_whitespace(&fp);
             if !matches {
                 tracing::error!(
                     addr,
@@ -233,16 +233,18 @@ fn resolve_connect_mode(
     })
 }
 
-/// Normalize a fingerprint for comparison: drop the grouping spaces and
-/// compare case-insensitively (base64 standard alphabet is
-/// case-sensitive, but a human-transcribed comparison should not punish
-/// case slips when the operator copy-pasted; strict case would turn a
-/// valid match into a confusing refusal).
-fn strip_fp_spaces(fp: &str) -> String {
-    fp.chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_lowercase()
+/// Normalize a fingerprint for comparison: drop the grouping spaces, keep
+/// case EXACTLY. Base64's standard alphabet is case-sensitive, and the
+/// fingerprint gate is the only thing standing between a first-contact MITM
+/// and the daemon's private key — so the comparison must not widen the
+/// match: a case-insensitive compare would let an attacker whose key
+/// differs from the real one only in letter case pass the check after
+/// ~2^28 key-generation tries. Whitespace stays insignificant (copy-paste
+/// with or without the 4-char grouping must both work), but any case
+/// difference is a mismatch — a transcribed-but-mistyped fingerprint
+/// SHOULD be refused and re-read rather than fuzzily accepted.
+fn strip_fp_whitespace(fp: &str) -> String {
+    fp.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// Interactive first-contact confirmation: render the fingerprint, ask for
@@ -378,12 +380,30 @@ mod cli_tests {
     }
 
     #[test]
-    fn fingerprint_comparison_ignores_whitespace_and_case() {
+    fn fingerprint_comparison_ignores_whitespace_but_not_case() {
         // The headless --trust-fingerprint comparison accepts the grouped
-        // form, the plain form, and any case mix of either.
-        assert_eq!(strip_fp_spaces("AB CD EF"), strip_fp_spaces("abcdef"));
-        assert_eq!(strip_fp_spaces("  AbCd  Ef  "), "abcdef");
-        assert_ne!(strip_fp_spaces("AB CD EF"), strip_fp_spaces("AB CD EE"));
+        // form and the plain form interchangeably (whitespace is
+        // insignificant), but case is EXACT: base64 is case-sensitive, and
+        // loosening case would widen the MITM match window on the trust
+        // gate. A case-different "match" must be refused.
+        assert_eq!(
+            strip_fp_whitespace("AB CD EF"),
+            strip_fp_whitespace("ABCDEF")
+        );
+        assert_eq!(strip_fp_whitespace("  AbCd  Ef  "), "AbCdEf");
+        assert_ne!(
+            strip_fp_whitespace("AB CD EF"),
+            strip_fp_whitespace("AB CD EE")
+        );
+        // Case slips must NOT match — the compare is case-sensitive.
+        assert_ne!(
+            strip_fp_whitespace("AB CD EF"),
+            strip_fp_whitespace("abcdef")
+        );
+        assert_ne!(
+            strip_fp_whitespace("AB CD EF"),
+            strip_fp_whitespace("ab cd ef")
+        );
     }
 }
 

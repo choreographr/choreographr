@@ -159,8 +159,39 @@ pub fn run_daemon_tcp_connection(
     let (client_sk, _client_pk) =
         ensure_transport_keypair().map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
 
-    // Connect TCP, declare the handshake mode, then perform Noise IK.
-    let mut tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+    // Dial FIRST, as its own step. Keeping the dial and the handshake
+    // separate is what lets the pinned-mode wrapper (see
+    // `run_daemon_tcp_connection_pinned`) attach trust guidance to
+    // HANDSHAKE failures only — a plain dial failure (daemon down, network
+    // down) is reported verbatim and must never suggest re-pairing.
+    let tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+
+    ik_handshake_and_serve(
+        tcp,
+        client_sk.as_bytes(),
+        server_pk,
+        handle_daemon_message,
+        from_ui,
+        shutdown_rx,
+    )
+}
+
+/// Preamble + Noise IK handshake over an ALREADY-DIALED TCP stream, then
+/// the encrypted session loop. Shared by [`run_daemon_tcp_connection`] and
+/// [`run_daemon_tcp_connection_pinned`] so both paths run the identical
+/// preamble+handshake sequence. A handshake failure surfaces as
+/// `ConnectionRefused` (the pre-existing wire convention) — which is why
+/// the caller must dial separately: only then does a `ConnectionRefused`
+/// returned from here unambiguously mean the HANDSHAKE failed, not the
+/// network.
+fn ik_handshake_and_serve(
+    mut tcp: std::net::TcpStream,
+    client_sk: &[u8; 32],
+    server_pk: &[u8; 32],
+    handle_daemon_message: impl FnMut(DaemonMessage),
+    from_ui: mpsc::Receiver<ClientMessage>,
+    shutdown_rx: Option<mpsc::Receiver<()>>,
+) -> Result<(), ClientError> {
     // The 1-byte handshake-mode preamble (TCP wire v5) goes out BEFORE any
     // handshake message. It is unauthenticated by design — the daemon uses it
     // only to pick which equally-authenticated handshake to run; the IK
@@ -168,7 +199,7 @@ pub fn run_daemon_tcp_connection(
     // A single-byte write to a fresh blocking socket cannot meaningfully
     // block (it fits any socket buffer), so no timeout is armed for it.
     tcp.write_all(&[PREAMBLE_IK]).map_err(ClientError::Io)?;
-    let noise = handshake_initiator(tcp, client_sk.as_bytes(), server_pk).map_err(|e| {
+    let noise = handshake_initiator(tcp, client_sk, server_pk).map_err(|e| {
         ClientError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             e,
@@ -370,12 +401,14 @@ pub fn probe_server_key(addr: &str) -> Result<[u8; 32], ClientError> {
 /// Connect via Noise IK against the key PINNED in `known_servers.toml` for
 /// `addr` (the [`ConnectionMode::TcpPinned`] path).
 ///
-/// The whole point of this wrapper is the failure UX: an IK handshake
-/// against a pinned key fails identically whether the server's key CHANGED
-/// or the network is down — but the operator needs to know which remediation
-/// applies. On any handshake failure the returned error carries the pinned
-/// fingerprint and the explicit re-pair instructions, so a key change is a
-/// loud, actionable message rather than a bare `ConnectionRefused`.
+/// The whole point of this wrapper is the failure UX: a HANDSHAKE failure
+/// against the pinned key carries the pinned fingerprint and the explicit
+/// re-pair instructions, so a server key change is a loud, actionable
+/// message rather than an opaque error (the known_hosts behavior). The
+/// dial is performed HERE, as a separate step, so a network-down daemon is
+/// reported as a plain connect error WITHOUT the re-pair guidance — the
+/// remediation advice is reserved for the one failure it actually applies
+/// to (the server's key changed).
 ///
 /// Errors if no pin exists for `addr` — callers must resolve first contact
 /// (probe + confirm + [`KnownServers::pin`]) before using this mode.
@@ -400,34 +433,48 @@ pub fn run_daemon_tcp_connection_pinned(
         "connecting with pinned server key"
     );
 
-    run_daemon_tcp_connection(addr, &pinned, handle_daemon_message, from_ui, shutdown_rx)
-        .map_err(|e| {
-            // Attach the trust context ONLY to the handshake-failure case
-            // (the ConnectionRefused wrapper run_daemon_tcp_connection uses
-            // for a failed IK handshake). Later failures — a mid-session
-            // disconnect — have nothing to do with the pin and must not
-            // suggest re-pairing.
-            match &e {
-                ClientError::Io(io)
-                    if io.kind() == std::io::ErrorKind::ConnectionRefused =>
-                {
-                    // Multi-line guidance: the fingerprint is what the user
-                    // compares against the daemon operator's out-of-band
-                    // readout; the two follow-up lines separate the expected
-                    // remediation from the warning when the change was NOT
-                    // expected.
-                    let msg = format!(
-                        "handshake with the pinned server key failed: {e}\n\
-                         pinned fingerprint for {addr}: {}\n\
-                         if the server's key legitimately changed, remove the entry for {addr} from known_servers.toml and reconnect to re-confirm the new fingerprint;\n\
-                         if you did NOT expect a change, do not reconnect — investigate the network first",
-                        choreo_transport::key::fingerprint(&pinned)
-                    );
-                    ClientError::Io(std::io::Error::other(msg))
-                }
-                _ => e,
+    // Dial as its own step (plain error, no trust guidance — the daemon
+    // being down has nothing to do with the pin).
+    let tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+
+    let (client_sk, _client_pk) =
+        ensure_transport_keypair().map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
+
+    // The dial already succeeded, so a `ConnectionRefused` coming back from
+    // `ik_handshake_and_serve` can only be its handshake-failure wrapper —
+    // exactly the case where the re-pair guidance belongs. Later failures
+    // (a mid-session disconnect) still pass through untouched: a broken
+    // pipe has nothing to do with the pin and must not suggest re-pairing.
+    ik_handshake_and_serve(
+        tcp,
+        client_sk.as_bytes(),
+        &pinned,
+        handle_daemon_message,
+        from_ui,
+        shutdown_rx,
+    )
+    .map_err(|e| {
+        match &e {
+            ClientError::Io(io)
+                if io.kind() == std::io::ErrorKind::ConnectionRefused =>
+            {
+                // Multi-line guidance: the fingerprint is what the user
+                // compares against the daemon operator's out-of-band
+                // readout; the two follow-up lines separate the expected
+                // remediation from the warning when the change was NOT
+                // expected.
+                let msg = format!(
+                    "handshake with the pinned server key failed: {e}\n\
+                     pinned fingerprint for {addr}: {}\n\
+                     if the server's key legitimately changed, remove the entry for {addr} from known_servers.toml and reconnect to re-confirm the new fingerprint;\n\
+                     if you did NOT expect a change, do not reconnect — investigate the network first",
+                    choreo_transport::key::fingerprint(&pinned)
+                );
+                ClientError::Io(std::io::Error::other(msg))
             }
-        })
+            _ => e,
+        }
+    })
 }
 
 /// Connect to a daemon using the given connection mode.
