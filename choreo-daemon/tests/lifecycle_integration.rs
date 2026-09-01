@@ -2,7 +2,6 @@ use choreo_daemon::run_server;
 use choreo_proto::{ClientMessage, DaemonMessage, read_message, write_message};
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -19,9 +18,7 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
 
     // Dummy transport key and empty ACL (no TCP listener needed for this test).
     let transport_sk = choreo_transport::key::TransportSecretKey::new([0u8; 32]);
-    let acl = Arc::new(choreo_daemon::server::acl::Acl::load(std::path::Path::new(
-        "/nonexistent",
-    )));
+    let acl = choreo_daemon::server::acl::SharedAcl::load(std::path::Path::new("/nonexistent"));
 
     // Run the server in a background thread.
     let handle = thread::spawn(move || {

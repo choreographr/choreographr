@@ -98,6 +98,11 @@ pub struct DaemonState {
     /// unit-test DaemonState has no maintenance thread, and `/refresh-models`
     /// then replies with an error instead of hanging.
     pub maintenance_tx: Option<crossbeam_channel::Sender<MaintenanceEvent>>,
+    /// The hot-reloadable client ACL (see `crate::server::acl::SharedAcl`).
+    /// `None` until `run_server` installs it — a unit-test DaemonState has
+    /// no ACL file to reload, and `AclReload` then logs and no-ops instead
+    /// of touching state it does not own.
+    pub acl: Option<std::sync::Arc<crate::server::acl::SharedAcl>>,
     /// Filesystem locations of the runtime catalog cache + user overlay
     /// (resolved from the standard XDG dirs; see `crate::catalog`).
     pub catalog_paths: CatalogPaths,
@@ -309,6 +314,13 @@ pub enum DaemonCommand {
     /// fire-and-forget reload signal, and the sender may be absent entirely
     /// (an un-unlocked daemon has no loaded accounts to reload).
     AccountsReload,
+    /// The config watcher detected an `authorized_clients.toml` edit. The
+    /// command loop is the SINGLE WRITER of the client ACL (`SharedAcl`, the
+    /// sanctioned ArcSwap exception #4): it is the one that calls
+    /// `SharedAcl::reload` (re-read, parse-compare, atomic swap). The TCP
+    /// accept path only ever READS lock-free snapshots. No reply:
+    /// fire-and-forget, like `AccountsReload`.
+    AclReload,
     ResolveProviderCmd {
         account: String,
         reply: std::sync::mpsc::Sender<Option<InferenceProvider>>,
@@ -531,6 +543,7 @@ impl DaemonState {
             }
             DaemonCommand::ListAccountsCmd { reply } => self.handle_list_accounts(reply),
             DaemonCommand::AccountsReload => self.handle_accounts_reload(),
+            DaemonCommand::AclReload => self.handle_acl_reload(),
             DaemonCommand::ResolveProviderCmd { account, reply } => {
                 self.handle_resolve_provider(account, reply)
             }
@@ -1926,6 +1939,26 @@ impl DaemonState {
             credentialed.extend(blobs.into_keys());
         }
         self.accounts.list(&credentialed)
+    }
+
+    /// Handle an `authorized_clients.toml` watcher event: hand the reload to
+    /// the `SharedAcl` (the command loop is its single writer — re-read,
+    /// parse-compare, atomic swap all live inside `reload`). A unit-test
+    /// DaemonState has no ACL (`None`) and the event is a logged no-op.
+    /// No reply: fire-and-forget, mirroring `handle_accounts_reload`.
+    fn handle_acl_reload(&mut self) {
+        match &self.acl {
+            Some(acl) => {
+                debug!(
+                    path = %acl.path().display(),
+                    "AclReload: re-reading authorized_clients.toml"
+                );
+                acl.reload();
+            }
+            None => {
+                debug!("AclReload ignored: no ACL installed (unit-test state)");
+            }
+        }
     }
 
     /// Re-read `accounts.toml` after a watcher event and apply a real change.

@@ -19,7 +19,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use choreo_daemon::accounts::AccountManager;
 use choreo_daemon::broadcast::LagLimits;
-use choreo_daemon::server::acl::Acl;
+use choreo_daemon::server::acl::SharedAcl;
 use choreo_daemon::{DaemonState, run_server};
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -83,6 +83,8 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         // catalog-maintenance thread and fills this in; a dummy value here is
         // overwritten before any client connects.
         maintenance_tx: None,
+        // Installed by run_server from the `acl` parameter.
+        acl: None,
         catalog_paths: choreo_daemon::catalog::CatalogPaths::default(),
     }
 }
@@ -110,6 +112,9 @@ pub struct SpawnedDaemon {
     pub socket_path: std::path::PathBuf,
     pub tcp_addr: SocketAddr, // 127.0.0.1:<free port>
     pub server_pk: [u8; 32],  // X25519 public key of the server
+    /// The ACL file the daemon loaded at startup — tests for ACL hot-reload
+    /// rewrite this file and reconnect with newly-authorized clients.
+    pub acl_path: std::path::PathBuf,
     handle: Option<thread::JoinHandle<std::io::Result<()>>>,
     _tmp: tempfile::TempDir, // keeps socket + ACL file alive
     /// Objects the daemon depends on for its lifetime (e.g. a
@@ -191,7 +196,7 @@ impl SpawnedDaemon {
             acl_toml.push_str(&format!("[[client]]\npubkey = \"{}\"\n", BASE64.encode(pk)));
         }
         std::fs::write(&acl_path, acl_toml).expect("write ACL file");
-        let acl = Arc::new(Acl::load(&acl_path));
+        let acl = SharedAcl::load(&acl_path);
 
         // Reserve a free TCP port: bind :0, read the kernel-assigned port,
         // then drop the probe listener so `run_server` can bind it. There
@@ -258,6 +263,7 @@ impl SpawnedDaemon {
                 socket_path,
                 tcp_addr,
                 server_pk,
+                acl_path: acl_path.clone(),
                 handle,
                 _tmp: tmp,
                 _keepalive: keepalive,

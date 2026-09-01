@@ -686,7 +686,7 @@ pub(crate) fn client_thread(
 pub(crate) fn tcp_handshake_and_client_thread(
     mut tcp: TcpStream,
     transport_sk: [u8; 32],
-    acl: Arc<crate::server::acl::Acl>,
+    acl: Arc<crate::server::acl::SharedAcl>,
     daemon_tx: mpsc::Sender<DaemonCommand>,
     client_id: u64,
     writer: crate::broadcast::SubscriberSink,

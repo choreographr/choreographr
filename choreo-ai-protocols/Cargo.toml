@@ -21,7 +21,7 @@ name = "choreo_ai_protocols"
 # `catalog/mod.rs`); previously a transitive dependency, promoted so the
 # ArcSwap global is a declared direct dependency.
 anyhow.workspace = true
-arc-swap = "1.9.2"
+arc-swap.workspace = true
 # Base64-encode image bytes into `data:` URLs for the vision content parts
 # (`image_url` on OpenAI chat/Responses, `image.source.data` on Anthropic,
 # `inline_data.data` on Google).

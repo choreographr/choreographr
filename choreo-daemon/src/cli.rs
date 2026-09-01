@@ -259,6 +259,9 @@ pub fn main() -> anyhow::Result<()> {
         // Populated by `run_server`, which spawns the maintenance thread
         // (it needs the real command-loop channel, created there).
         maintenance_tx: None,
+        // Installed by `run_server` from the `acl` parameter (the command
+        // loop needs the same Arc the accept paths read).
+        acl: None,
         catalog_paths: crate::catalog::CatalogPaths::from_dirs(),
     };
 
@@ -269,7 +272,7 @@ pub fn main() -> anyhow::Result<()> {
     // Load the ACL of authorized client public keys.
     let acl_path = choreo_keystore::paths::authorized_clients_path()
         .context("failed to resolve authorized_clients path")?;
-    let acl = std::sync::Arc::new(crate::server::acl::Acl::load(&acl_path));
+    let acl = crate::server::acl::SharedAcl::load(&acl_path);
 
     let socket_path = socket_path();
     crate::run_server(

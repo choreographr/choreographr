@@ -762,7 +762,11 @@ stored credential blobs into memory.
   authenticates against the pin and a changed server key fails LOUDLY with
   the pinned fingerprint and re-pair guidance (`--trust-fingerprint`
   pre-approves the fingerprint for headless clients). Client keys are
-  provisioned out of band via the daemon's `authorized_clients.toml`.
+  provisioned out of band via the daemon's `authorized_clients.toml`, which
+  the daemon HOT-RELOADS: adding a client key takes effect on the next
+  connect attempt without restarting the daemon (a missing or unparseable
+  file during a reload keeps the current keys; only a valid rewrite —
+  including an intentionally empty one — changes authorization).
 
 ## Monitoring
 

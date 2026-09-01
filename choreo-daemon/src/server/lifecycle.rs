@@ -198,7 +198,7 @@ pub fn run_server(
     metrics_addr: Option<String>,
     tcp_addr: Option<String>,
     transport_sk: TransportSecretKey,
-    acl: std::sync::Arc<crate::server::acl::Acl>,
+    acl: std::sync::Arc<crate::server::acl::SharedAcl>,
 ) -> io::Result<()> {
     if Path::new(socket_path).exists() {
         std::fs::remove_file(socket_path)?;
@@ -208,6 +208,39 @@ pub fn run_server(
 
     let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
     state.daemon_tx = daemon_tx.clone();
+
+    // Install the shared ACL into the state BEFORE the command loop takes
+    // ownership: the command loop becomes its single WRITER (AclReload),
+    // while the TCP accept path below keeps a clone for lock-free reads.
+    // One Arc, two roles — see the SharedAcl docs for the exception-#4
+    // rationale.
+    let acl_path = acl.path().to_path_buf();
+    state.acl = Some(acl.clone());
+
+    // Dedicated config watcher for the ACL file. It watches the ACL's OWN
+    // parent directory, not the general config dir: in production they are
+    // the same directory, but tests (and any future --acl-path override)
+    // place the ACL elsewhere — and the watcher must follow the file the
+    // SharedAcl actually holds, not where the catalog overlay happens to
+    // live. The basename subscription keeps unrelated files in that dir
+    // from triggering reloads.
+    if let Some(acl_dir) = acl_path.parent() {
+        let mut acl_watcher = crate::config_watch::ConfigWatcher::new(acl_dir.to_path_buf());
+        let acl_rx = acl_watcher.subscribe(
+            acl_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .as_deref()
+                .unwrap_or("authorized_clients.toml"),
+        );
+        acl_watcher.spawn();
+        crate::server::acl::spawn_acl_watcher(daemon_tx.clone(), acl_rx);
+    } else {
+        warn!(
+            path = %acl_path.display(),
+            "ACL path has no parent directory; ACL hot-reload disabled"
+        );
+    }
 
     // Shared config-file watching transport: ONE notify watcher on the config
     // directory, fanned out per-basename to consumers (the catalog overlay,
