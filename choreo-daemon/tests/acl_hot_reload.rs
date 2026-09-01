@@ -272,8 +272,7 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
         // Pace the retry (integration-test bounded wait; see the deadline).
         thread::sleep(Duration::from_millis(100));
     }
-    let client_b =
-        connected.expect("the enrolled client must connect without a daemon restart");
+    let client_b = connected.expect("the enrolled client must connect without a daemon restart");
     client_b
         .from_ui
         .send(choreo_proto::ClientMessage::Ping)

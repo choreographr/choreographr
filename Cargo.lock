@@ -2836,15 +2836,20 @@ dependencies = [
 name = "choreo-client-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "choreo-keystore",
  "choreo-proto",
  "choreo-sanitize",
  "choreo-transport",
  "postcard",
+ "rand 0.10.2",
+ "serde",
  "tempfile",
  "thiserror 2.0.20",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "uds_windows",
+ "x25519-dalek 3.0.0",
  "zeroize",
 ]
 
@@ -2880,6 +2885,7 @@ name = "choreo-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "base64 0.23.1",
  "choreo-ai-protocols",
  "choreo-blockchain",
@@ -3059,6 +3065,7 @@ dependencies = [
 name = "choreo-transport"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "choreo-proto",
  "dirs",
  "nix 0.31.3",
