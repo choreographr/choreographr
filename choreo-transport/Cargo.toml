@@ -17,6 +17,9 @@ snow.workspace = true
 dirs.workspace = true
 x25519-dalek.workspace = true
 rand.workspace = true
+# Fingerprint rendering of transport public keys (base64, standard alphabet —
+# the same encoding the daemon's ACL uses for pubkeys, so one convention).
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

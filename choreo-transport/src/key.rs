@@ -116,6 +116,56 @@ pub fn read_server_pk(path: Option<&str>) -> Result<[u8; 32], TransportError> {
     Ok(pk)
 }
 
+/// Render a 32-byte transport public key as a human-comparable fingerprint.
+///
+/// The fingerprint is the base64 (standard alphabet — the SAME encoding the
+/// daemon's ACL uses for pubkeys) of the key itself, clustered into
+/// 4-character groups: e.g. `3F2A 9C11 7B04 ... 8xE=`. Because the key is
+/// only 32 bytes, the fingerprint is BIJECTIVE with the key — no hashing
+/// (SSH hashes because host keys can be much longer), so comparing two
+/// fingerprints compares the actual keys, and a fingerprint can be traced
+/// back to its key by eye or by decoding.
+///
+/// This is the string both sides of an enrollment exchange render and
+/// compare: the daemon operator reads out the server's fingerprint (or the
+/// client's, for the ACL), and the client's first-contact flow displays it
+/// for the human confirm step. The base64 cluster groups are small enough
+/// to compare by eye without mistaking a single changed character.
+pub fn fingerprint(pk: &[u8; 32]) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(pk);
+    // Cluster the 44-char base64 string into 4-char groups joined by
+    // spaces. 44 % 4 == 0, so every group is exactly 4 chars — no ragged
+    // tail to special-case. (from_utf8_lossy, not unwrap: the base64
+    // alphabet is ASCII so lossy decoding is identity, but production code
+    // has no unwrap escape hatches.)
+    let groups: Vec<String> = b64
+        .as_bytes()
+        .chunks(4)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect();
+    groups.join(" ")
+}
+
+/// [`fingerprint`] of the 32-byte key stored in a file.
+///
+/// Used by the `fingerprint` subcommand to render either side's key: with
+/// no argument, the local `transport.pub`; with a path, a copied server key
+/// (to verify a download) or any pinned known-servers entry. Enforces the
+/// 32-byte length exactly like [`read_server_pk`] — a truncated or padded
+/// file is an error, never a quietly wrong fingerprint.
+pub fn fingerprint_of_file(path: &std::path::Path) -> Result<String, TransportError> {
+    let bytes = std::fs::read(path)?;
+    let len = bytes.len();
+    let pk: [u8; 32] = bytes.try_into().map_err(|_| {
+        TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("key file must be exactly 32 bytes, got {len}"),
+        ))
+    })?;
+    Ok(fingerprint(&pk))
+}
+
 /// Ensure that a Noise IK transport keypair exists at the standard paths
 /// (~/.config/choreographr/transport.sec and ~/.config/choreographr/transport.pub).
 ///
@@ -289,5 +339,60 @@ mod tests {
         // write, and the secret/public halves must not be mismatched.
         assert_eq!(sk_a.as_bytes(), sk_b.as_bytes());
         assert_eq!(pk_a, pk_b);
+    }
+
+    /// A fixed known key: the fingerprint must be deterministic, purely a
+    /// regrouping of the base64 encoding (so the ACL's base64 form and the
+    /// fingerprint are trivially cross-checkable), 11 groups of exactly 4
+    /// chars (44 base64 chars + 10 separators = 54), and decodable back to
+    /// the original key.
+    #[test]
+    fn fingerprint_is_deterministic_grouped_and_bijective() {
+        let pk = [
+            0x3F, 0x2A, 0x9C, 0x11, 0x7B, 0x04, 0xE5, 0xD8, 0xA1, 0xC6, 0x42, 0xD9, 0x08, 0xF3,
+            0xB7, 0xE2, 0x5D, 0x60, 0x19, 0xAB, 0xCC, 0x37, 0x84, 0x0E, 0x71, 0xFA, 0x92, 0x63,
+            0xDD, 0x4B, 0x26, 0x50,
+        ];
+        let fp = fingerprint(&pk);
+        assert_eq!(fp, fingerprint(&pk), "fingerprint must be deterministic");
+
+        let groups: Vec<&str> = fp.split(' ').collect();
+        assert_eq!(groups.len(), 11, "32 bytes -> 44 base64 chars -> 11 groups");
+        for g in &groups {
+            assert_eq!(g.len(), 4, "every group is exactly 4 chars: {g}");
+        }
+
+        // Stripping the separators yields the plain base64 — the same
+        // string the ACL stores — and decoding THAT is the original key.
+        use base64::Engine as _;
+        let joined: String = groups.concat();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&joined)
+            .expect("regrouped fingerprint must still be valid base64");
+        assert_eq!(decoded, pk, "fingerprint is bijective with the key");
+    }
+
+    /// `fingerprint_of_file` round-trips a real key file and REJECTS a
+    /// wrong-length file (a truncated download must never render as a
+    /// plausible-looking fingerprint of something else).
+    #[test]
+    fn fingerprint_of_file_round_trips_and_rejects_bad_length() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("key.bin");
+        let pk = [7u8; 32];
+        std::fs::write(&path, pk).expect("write key file");
+
+        let fp = fingerprint_of_file(&path).expect("32-byte file renders");
+        assert_eq!(fp, fingerprint(&pk));
+
+        // 31 bytes (a classic truncation) must error, not render.
+        std::fs::write(&path, [7u8; 31]).expect("write truncated file");
+        assert!(fingerprint_of_file(&path).is_err());
+
+        // 33 bytes (a trailing newline accident) must error too.
+        let mut long = vec![7u8; 32];
+        long.push(b'\n');
+        std::fs::write(&path, long).expect("write overlong file");
+        assert!(fingerprint_of_file(&path).is_err());
     }
 }

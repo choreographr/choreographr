@@ -4,6 +4,7 @@ pub mod diff;
 pub mod dispatch;
 pub mod error;
 pub mod history;
+pub mod known_servers;
 pub mod shell;
 
 pub use choreo_transport::key::read_server_pk;
@@ -18,6 +19,7 @@ pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 pub use dispatch::{SessionStateData, ToolCallEvent, TurnEventHandler, dispatch_daemon_message};
 pub use error::{ClientError, broken_pipe};
 pub use history::SessionView;
+pub use known_servers::{KnownServerEntry, KnownServers, known_servers_path};
 pub use shell::{
     ShellCommand, UnlockMethod, is_valid_account_name, parse_input_line, shell_command_echo,
 };
