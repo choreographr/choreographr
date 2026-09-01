@@ -122,6 +122,12 @@ pub enum ConnectionMode {
     /// Connect via TCP/Noise IK at the given address with the server's
     /// 32-byte X25519 public key (resolved before constructing this variant).
     Tcp { addr: String, server_pk: [u8; 32] },
+    /// Connect via TCP/Noise IK against the key PINNED in
+    /// `known_servers.toml` for the address. The pin is loaded at connect
+    /// time; a handshake failure is reported WITH the pinned fingerprint and
+    /// the re-pair guidance, so a server key change is loud instead of an
+    /// opaque connection error (the known_hosts behavior).
+    TcpPinned(String),
 }
 
 impl Default for ConnectionMode {
@@ -322,6 +328,108 @@ fn serve_noise_connection(
     Ok(())
 }
 
+/// Probe a daemon's static public key without establishing a session.
+///
+/// Performs the XX first-contact handshake ONLY: connect, preamble, the
+/// three handshake messages, extract the learned server key, and DROP the
+/// stream — no data-plane message is ever sent or received. This is the
+/// building block UIs use to implement the trust flow synchronously (in a
+/// normal-mode terminal, before any TUI/GUI starts): learn the key, show
+/// the fingerprint, get the human's confirmation, pin, and only then open
+/// the real connection with [`ConnectionMode::Tcp`] / IK.
+///
+/// The probe itself authenticates NOTHING about the server (there is no pin
+/// yet — that is the point), but it does authenticate the probe TO the
+/// daemon, so the daemon's ACL applies: probing requires the client's key
+/// to be enrolled. The daemon ACL check completes inside the XX handshake
+/// (after message 3), so a not-yet-enrolled client gets `Err` here too.
+pub fn probe_server_key(addr: &str) -> Result<[u8; 32], ClientError> {
+    info!("probing server key at {addr} (XX first contact)");
+
+    let (client_sk, _client_pk) =
+        ensure_transport_keypair().map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
+
+    let mut tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+    // Same preamble contract as the session-opening XX path.
+    tcp.write_all(&[PREAMBLE_XX]).map_err(ClientError::Io)?;
+    let (noise, server_pk) = handshake_initiator_xx(tcp, client_sk.as_bytes()).map_err(|e| {
+        ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            e,
+        ))
+    })?;
+
+    // Drop the established transport immediately: the probe never speaks
+    // the protocol. Closing here is also what keeps the daemon's connection
+    // slot usage bounded — the real connection opens fresh afterwards.
+    drop(noise);
+    debug!(addr, "server key probe complete; transport dropped");
+    Ok(server_pk)
+}
+
+/// Connect via Noise IK against the key PINNED in `known_servers.toml` for
+/// `addr` (the [`ConnectionMode::TcpPinned`] path).
+///
+/// The whole point of this wrapper is the failure UX: an IK handshake
+/// against a pinned key fails identically whether the server's key CHANGED
+/// or the network is down — but the operator needs to know which remediation
+/// applies. On any handshake failure the returned error carries the pinned
+/// fingerprint and the explicit re-pair instructions, so a key change is a
+/// loud, actionable message rather than a bare `ConnectionRefused`.
+///
+/// Errors if no pin exists for `addr` — callers must resolve first contact
+/// (probe + confirm + [`KnownServers::pin`]) before using this mode.
+pub fn run_daemon_tcp_connection_pinned(
+    addr: &str,
+    handle_daemon_message: impl FnMut(DaemonMessage),
+    from_ui: mpsc::Receiver<ClientMessage>,
+    shutdown_rx: Option<mpsc::Receiver<()>>,
+) -> Result<(), ClientError> {
+    let known = crate::known_servers::KnownServers::load()?;
+    let pinned = known
+        .lookup(addr)?
+        .ok_or_else(|| {
+            ClientError::Io(std::io::Error::other(format!(
+                "no pinned server key for {addr}: complete first contact (probe + fingerprint confirmation) before using the pinned mode"
+            )))
+        })?;
+
+    info!(
+        addr,
+        fingerprint = %choreo_transport::key::fingerprint(&pinned),
+        "connecting with pinned server key"
+    );
+
+    run_daemon_tcp_connection(addr, &pinned, handle_daemon_message, from_ui, shutdown_rx)
+        .map_err(|e| {
+            // Attach the trust context ONLY to the handshake-failure case
+            // (the ConnectionRefused wrapper run_daemon_tcp_connection uses
+            // for a failed IK handshake). Later failures — a mid-session
+            // disconnect — have nothing to do with the pin and must not
+            // suggest re-pairing.
+            match &e {
+                ClientError::Io(io)
+                    if io.kind() == std::io::ErrorKind::ConnectionRefused =>
+                {
+                    // Multi-line guidance: the fingerprint is what the user
+                    // compares against the daemon operator's out-of-band
+                    // readout; the two follow-up lines separate the expected
+                    // remediation from the warning when the change was NOT
+                    // expected.
+                    let msg = format!(
+                        "handshake with the pinned server key failed: {e}\n\
+                         pinned fingerprint for {addr}: {}\n\
+                         if the server's key legitimately changed, remove the entry for {addr} from known_servers.toml and reconnect to re-confirm the new fingerprint;\n\
+                         if you did NOT expect a change, do not reconnect — investigate the network first",
+                        choreo_transport::key::fingerprint(&pinned)
+                    );
+                    ClientError::Io(std::io::Error::other(msg))
+                }
+                _ => e,
+            }
+        })
+}
+
 /// Connect to a daemon using the given connection mode.
 /// Dispatches to the appropriate connection function.
 pub fn run_daemon_connection_with_mode(
@@ -341,5 +449,8 @@ pub fn run_daemon_connection_with_mode(
             from_ui,
             shutdown_rx,
         ),
+        ConnectionMode::TcpPinned(addr) => {
+            run_daemon_tcp_connection_pinned(&addr, handle_daemon_message, from_ui, shutdown_rx)
+        }
     }
 }

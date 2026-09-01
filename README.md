@@ -755,6 +755,14 @@ stored credential blobs into memory.
   out-of-band before any protocol traffic (in particular the `Unlock` that
   carries the daemon's private key) is sent, and IK is used for every
   connection after that.
+- The client-side trust flow (SSH `known_hosts` model): the daemon's key is
+  learned on first contact via the XX probe and confirmed by comparing
+  fingerprints with the daemon operator, then pinned to
+  `~/.config/choreographr/known_servers.toml`; every later connection
+  authenticates against the pin and a changed server key fails LOUDLY with
+  the pinned fingerprint and re-pair guidance (`--trust-fingerprint`
+  pre-approves the fingerprint for headless clients). Client keys are
+  provisioned out of band via the daemon's `authorized_clients.toml`.
 
 ## Monitoring
 

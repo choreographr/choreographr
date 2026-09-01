@@ -121,6 +121,9 @@ fn App() -> Element {
         let display_path = match CONNECTION_MODE.get() {
             Some(ConnectionMode::UnixSocket(path)) => path.clone(),
             Some(ConnectionMode::Tcp { addr, .. }) => addr.clone(),
+            // Pinned mode also dials an address — display it exactly like
+            // the explicit-key Tcp variant (the pin itself is not secret).
+            Some(ConnectionMode::TcpPinned(addr)) => addr.clone(),
             None => socket_path(),
         };
         AppState::new(display_path)

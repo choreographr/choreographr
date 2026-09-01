@@ -126,9 +126,159 @@ struct Cli {
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
 
-    /// Path to the server's Noise IK public key (defaults to ~/.config/choreographr/transport.pub)
+    /// Path to the server's Noise IK public key (defaults to the pinned key
+    /// in known_servers.toml; on first contact the key is learned via the
+    /// Noise XX handshake and must be confirmed interactively)
     #[arg(long = "server-pk")]
     server_pk: Option<String>,
+
+    /// Pre-approve the server fingerprint for first contact (headless mode:
+    /// the fingerprint, with or without spaces, must match the key the
+    /// daemon presents during the XX probe; compare against the value the
+    /// daemon operator reads out with 'choreographr fingerprint'). Ignored
+    /// when --server-pk is given.
+    #[arg(long = "trust-fingerprint")]
+    trust_fingerprint: Option<String>,
+}
+
+/// Resolve the connection mode for a TCP address, implementing the trust
+/// flow. Resolution order:
+///
+/// 1. explicit `--server-pk` file — operator-provided pin, used directly
+///    (IK against it; this is the original out-of-band mechanism and wins
+///    over everything);
+/// 2. a pin in `known_servers.toml` — IK against the pinned key, with the
+///    loud re-pair guidance on handshake failure (TcpPinned);
+/// 3. otherwise FIRST CONTACT: probe the daemon's key with the Noise XX
+///    handshake and require the human to confirm its fingerprint (either
+///    `expected_fingerprint` for headless use, or an interactive y/N prompt
+///    — this runs in main() while the terminal is still in cooked mode, so
+///    the prompt is a plain stdout/stdin exchange, no TUI involved) before
+///    pinning and connecting.
+///
+/// This runs BEFORE the TUI starts, so no `Unlock` — which carries the
+/// daemon's private key — can ever flow over an unconfirmed channel.
+fn resolve_connect_mode(
+    addr: &str,
+    server_pk_path: Option<&str>,
+    expected_fingerprint: Option<&str>,
+) -> anyhow::Result<choreo_client_core::ConnectionMode> {
+    use choreo_client_core::ConnectionMode;
+
+    // 1. Explicit operator-provided key file wins over the store.
+    if let Some(path) = server_pk_path {
+        let pk = choreo_client_core::read_server_pk(Some(path))
+            .context("failed to read server public key")?;
+        tracing::info!(addr, path, "using explicitly provided server public key");
+        return Ok(ConnectionMode::Tcp {
+            addr: addr.to_string(),
+            server_pk: pk,
+        });
+    }
+
+    // 2. A pinned key from a previous confirmed first contact.
+    let mut known = choreo_client_core::KnownServers::load()?;
+    if let Some(pk) = known.lookup(addr)? {
+        tracing::info!(
+            addr,
+            fingerprint = %choreo_client_core::fingerprint(&pk),
+            "connecting with pinned server key"
+        );
+        return Ok(ConnectionMode::TcpPinned(addr.to_string()));
+    }
+
+    // 3. First contact: learn the key, confirm the fingerprint, pin.
+    let learned = choreo_client_core::probe_server_key(addr)
+        .context("first-contact probe failed (is the daemon running with --tcp-addr, and is this client's key enrolled in its ACL?)")?;
+    let fp = choreo_client_core::fingerprint(&learned);
+
+    let confirmed = match expected_fingerprint {
+        // Headless: compare against the pre-approved fingerprint (whitespace
+        // is insignificant — accept either the grouped or the plain form).
+        Some(expected) => {
+            let matches = strip_fp_spaces(expected) == strip_fp_spaces(&fp);
+            if !matches {
+                tracing::error!(
+                    addr,
+                    expected = %expected,
+                    actual = %fp,
+                    "--trust-fingerprint does not match the server's key"
+                );
+            }
+            matches
+        }
+        // Interactive: ask the human. The daemon operator should have sent
+        // this fingerprint out-of-band in the enrollment conversation.
+        None => {
+            let mut stdin = std::io::stdin().lock();
+            let mut stdout = std::io::stdout();
+            confirm_first_contact(addr, &fp, &mut stdin, &mut stdout)?
+        }
+    };
+
+    if !confirmed {
+        anyhow::bail!(
+            "first contact with {addr} not confirmed — refusing to connect; \
+             verify the daemon's fingerprint with its operator and retry"
+        );
+    }
+
+    known
+        .pin(addr, &learned)
+        .context("failed to persist the confirmed server key")?;
+    tracing::info!(addr, fingerprint = %fp, "server key confirmed and pinned");
+    Ok(ConnectionMode::Tcp {
+        addr: addr.to_string(),
+        server_pk: learned,
+    })
+}
+
+/// Normalize a fingerprint for comparison: drop the grouping spaces and
+/// compare case-insensitively (base64 standard alphabet is
+/// case-sensitive, but a human-transcribed comparison should not punish
+/// case slips when the operator copy-pasted; strict case would turn a
+/// valid match into a confusing refusal).
+fn strip_fp_spaces(fp: &str) -> String {
+    fp.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Interactive first-contact confirmation: render the fingerprint, ask for
+/// y/N, read the answer. Factored with injected I/O so tests can drive it
+/// without a real terminal.
+fn confirm_first_contact(
+    addr: &str,
+    fingerprint: &str,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> anyhow::Result<bool> {
+    writeln!(output, "First contact with {addr}.")?;
+    writeln!(output, "Server fingerprint:")?;
+    writeln!(output, "  {fingerprint}")?;
+    writeln!(
+        output,
+        "Compare this with the fingerprint the daemon operator sent you,"
+    )?;
+    writeln!(output, "then trust and pin this server? [y/N]")?;
+    output.flush()?;
+
+    let mut line = String::new();
+    let n = input
+        .read_line(&mut line)
+        .context("failed to read the trust confirmation answer")?;
+    if n == 0 {
+        // EOF on stdin (piped/redirected input without an answer): treat as
+        // a refusal — an absent human never confirms trust.
+        tracing::warn!(
+            addr,
+            "stdin closed during first-contact confirmation; refusing"
+        );
+        return Ok(false);
+    }
+    let answer = line.trim().to_lowercase();
+    Ok(answer == "y" || answer == "yes")
 }
 
 /// Entry point for the `choreo-tui` binary wrapper.
@@ -141,9 +291,11 @@ pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let mode = if let Some(addr) = cli.tcp_addr {
-        let server_pk = choreo_client_core::read_server_pk(cli.server_pk.as_deref())
-            .context("failed to read server public key")?;
-        choreo_client_core::ConnectionMode::Tcp { addr, server_pk }
+        resolve_connect_mode(
+            &addr,
+            cli.server_pk.as_deref(),
+            cli.trust_fingerprint.as_deref(),
+        )?
     } else {
         choreo_client_core::ConnectionMode::UnixSocket(choreo_proto::socket_path())
     };
@@ -178,6 +330,60 @@ mod cli_tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    // ── First-contact trust confirmation ─────────────────────────────
+
+    /// Drive `confirm_first_contact` with in-memory I/O.
+    fn confirm_with(answer: &str) -> (bool, String) {
+        let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
+        let mut output: Vec<u8> = Vec::new();
+        let confirmed = confirm_first_contact("host:9443", "ABCD EFGH", &mut input, &mut output)
+            .expect("confirmation prompt");
+        (confirmed, String::from_utf8(output).expect("utf8 output"))
+    }
+
+    #[test]
+    fn confirm_accepts_y_and_yes_case_insensitively() {
+        for answer in ["y", "Y", "yes", "YES", "  y  "] {
+            let (confirmed, _) = confirm_with(&format!("{answer}\n"));
+            assert!(confirmed, "'{answer}' must confirm trust");
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_n_and_garbage() {
+        for answer in ["n", "N", "no", "", "maybe", "yy"] {
+            let (confirmed, _) = confirm_with(&format!("{answer}\n"));
+            assert!(!confirmed, "'{answer}' must refuse trust");
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_on_eof() {
+        // Empty input = stdin closed: an absent human never confirms.
+        let (confirmed, _) = confirm_with("");
+        assert!(!confirmed, "EOF must be treated as a refusal");
+    }
+
+    #[test]
+    fn confirm_prompt_renders_the_fingerprint() {
+        let (_, output) = confirm_with("y\n");
+        assert!(output.contains("host:9443"), "the address must be shown");
+        assert!(
+            output.contains("ABCD EFGH"),
+            "the fingerprint must be shown"
+        );
+        assert!(output.contains("[y/N]"), "the default must be refuse");
+    }
+
+    #[test]
+    fn fingerprint_comparison_ignores_whitespace_and_case() {
+        // The headless --trust-fingerprint comparison accepts the grouped
+        // form, the plain form, and any case mix of either.
+        assert_eq!(strip_fp_spaces("AB CD EF"), strip_fp_spaces("abcdef"));
+        assert_eq!(strip_fp_spaces("  AbCd  Ef  "), "abcdef");
+        assert_ne!(strip_fp_spaces("AB CD EF"), strip_fp_spaces("AB CD EE"));
     }
 }
 

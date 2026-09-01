@@ -35,3 +35,8 @@ uds_windows.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Integration tests (tests/first_contact.rs) generate X25519 server keypairs
+# for the hand-rolled responder threads and read the client's transport
+# keypair override from choreo-transport.
+x25519-dalek.workspace = true
+rand.workspace = true
