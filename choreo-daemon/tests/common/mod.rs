@@ -21,7 +21,7 @@ use choreo_daemon::accounts::AccountManager;
 use choreo_daemon::broadcast::LagLimits;
 use choreo_daemon::server::acl::Acl;
 use choreo_daemon::{DaemonState, run_server};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -77,6 +77,7 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         lag_limits: limits,
         model_cache: HashMap::new(),
+        model_prefetch_in_flight: HashSet::new(),
         mcp_manager: choreo_daemon::mcp::McpManager::empty(),
         // The integration harness runs the real `run_server`, which spawns the
         // catalog-maintenance thread and fills this in; a dummy value here is

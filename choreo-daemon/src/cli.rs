@@ -6,7 +6,7 @@ use anyhow::Context;
 use choreo_proto::socket_path;
 use choreo_transport::key::ensure_transport_keypair;
 use clap::Parser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc;
 use tracing::{info, warn};
@@ -254,6 +254,7 @@ pub fn main() -> anyhow::Result<()> {
         global_lag: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         lag_limits: crate::broadcast::LagLimits::default(),
         model_cache: HashMap::new(),
+        model_prefetch_in_flight: HashSet::new(),
         mcp_manager,
         // Populated by `run_server`, which spawns the maintenance thread
         // (it needs the real command-loop channel, created there).

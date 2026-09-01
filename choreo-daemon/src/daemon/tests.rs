@@ -1,11 +1,11 @@
 use super::*;
 use crate::broadcast::test_sink;
-use crate::providers::test_util::make_test_provider;
+use crate::providers::test_util::{make_failing_provider, make_test_provider};
 use crate::sessions::SessionMetadata;
 use choreo_proto::{DaemonMessage, SessionEvent, SessionStatus};
 use std::collections::HashMap;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
     let (daemon_tx, daemon_rx) = mpsc::channel();
@@ -35,6 +35,7 @@ fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
         global_lag: Arc::new(AtomicUsize::new(0)),
         lag_limits: LagLimits::default(),
         model_cache: HashMap::new(),
+        model_prefetch_in_flight: HashSet::new(),
         mcp_manager: crate::mcp::McpManager::empty(),
         maintenance_tx: None,
         catalog_paths: CatalogPaths::default(),
@@ -2552,4 +2553,171 @@ fn activity_subscriber_gets_current_provider_list_on_register() {
         }
         other => panic!("expected CatalogUpdated, got {other:?}"),
     }
+}
+
+// ── Background model prefetch ────────────────────────────────────────────
+
+#[test]
+fn should_prefetch_models_gates_on_provider_flight_and_freshness() {
+    let (mut state, _rx) = make_daemon_state();
+
+    // No resolved provider → nothing to prefetch.
+    assert!(!state.should_prefetch_models("acct"));
+
+    state.providers.insert("acct".into(), make_test_provider());
+    // Provider present, no cache → prefetch needed.
+    assert!(state.should_prefetch_models("acct"));
+
+    // In-flight → no duplicate prefetch (the dedup guard).
+    state.model_prefetch_in_flight.insert("acct".into());
+    assert!(!state.should_prefetch_models("acct"));
+    state.model_prefetch_in_flight.clear();
+
+    // Fresh cache (inside MODEL_CACHE_TTL) → no prefetch.
+    state
+        .model_cache
+        .insert("acct".into(), (vec!["m".into()], Instant::now()));
+    assert!(!state.should_prefetch_models("acct"));
+
+    // Stale cache (past MODEL_CACHE_TTL) → prefetch again.
+    state.model_cache.insert(
+        "acct".into(),
+        (
+            vec!["m".into()],
+            Instant::now() - MODEL_CACHE_TTL - Duration::from_secs(1),
+        ),
+    );
+    assert!(state.should_prefetch_models("acct"));
+}
+
+#[test]
+fn handle_model_prefetch_result_success_populates_cache_and_releases_guard() {
+    let (mut state, _rx) = make_daemon_state();
+    state.model_prefetch_in_flight.insert("acct".into());
+
+    state.handle_command(DaemonCommand::ModelPrefetchResult {
+        account: "acct".into(),
+        result: Ok(vec!["m1".into(), "m2".into()]),
+    });
+
+    // The guard must be released so a later stale-cache join re-prefetches.
+    assert!(!state.model_prefetch_in_flight.contains("acct"));
+    let (models, cached_at) = state.model_cache.get("acct").expect("cache populated");
+    assert_eq!(models, &["m1".to_string(), "m2".to_string()]);
+    // Freshness stamp is "now": within a TTL of the handler running.
+    assert!(cached_at.elapsed() < MODEL_CACHE_TTL);
+}
+
+#[test]
+fn handle_model_prefetch_result_failure_releases_guard_without_caching() {
+    let (mut state, _rx) = make_daemon_state();
+    state.model_prefetch_in_flight.insert("acct".into());
+
+    state.handle_command(DaemonCommand::ModelPrefetchResult {
+        account: "acct".into(),
+        result: Err("provider unreachable".into()),
+    });
+
+    // A failed fetch must NOT wedge the account: guard released, cache
+    // untouched, so the next session join retries the prefetch and the
+    // on-demand ListModels path stays the fallback.
+    assert!(!state.model_prefetch_in_flight.contains("acct"));
+    assert!(!state.model_cache.contains_key("acct"));
+}
+
+#[test]
+fn update_metadata_account_change_spawns_background_prefetch() {
+    // `make_failing_provider` returns list-models errors instantly (no
+    // network), so the spawned prefetch thread completes immediately and
+    // sends its result back over the daemon channel.
+    let (mut state, rx) = make_daemon_state();
+    state
+        .providers
+        .insert("acct".into(), make_failing_provider());
+    state.session_metadata.insert(
+        1,
+        SessionMetadata {
+            title: Some("s".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            created_at: 1000,
+            last_modified: 1000,
+            turn_count: 0,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: None,
+            accumulated_usage: TokenUsage::default(),
+            context_window: None,
+            last_prompt_tokens: None,
+        },
+    );
+
+    // Attach an account: a real change → prefetch spawned, guard set.
+    let mut meta = state.session_metadata.get(&1).unwrap().clone();
+    meta.account_name = Some("acct".into());
+    state.handle_command(DaemonCommand::UpdateMetadata {
+        session_id: 1,
+        metadata: meta.clone(),
+    });
+    assert!(
+        state.model_prefetch_in_flight.contains("acct"),
+        "account change must spawn a prefetch"
+    );
+
+    // The fetch thread reports back through the command channel; feed the
+    // message through the command loop like the real loop would, which
+    // releases the in-flight guard and records the failure.
+    let msg = rx.recv().unwrap();
+    assert!(
+        matches!(
+            &msg,
+            DaemonCommand::ModelPrefetchResult { account, result }
+                if account == "acct" && result.is_err()
+        ),
+        "expected ModelPrefetchResult for 'acct' with Err (failing provider)"
+    );
+    state.handle_command(msg);
+    assert!(!state.model_prefetch_in_flight.contains("acct"));
+
+    // Repeating the SAME account on the next request (the common
+    // UpdateMetadata-per-request case) must NOT spawn another prefetch: the
+    // account didn't CHANGE between the stored metadata and this update,
+    // even though the guard is clear and the cache is empty.
+    state.handle_command(DaemonCommand::UpdateMetadata {
+        session_id: 1,
+        metadata: meta.clone(),
+    });
+    assert!(
+        rx.try_recv().is_err(),
+        "no prefetch thread may be spawned for an unchanged account"
+    );
+}
+
+#[test]
+fn create_session_with_account_spawns_background_prefetch() {
+    let (mut state, _rx) = make_daemon_state();
+    state
+        .providers
+        .insert("acct".into(), make_failing_provider());
+    let (reply, rx) = mpsc::channel();
+
+    state.handle_command(DaemonCommand::CreateSession {
+        title: None,
+        parent_session_id: None,
+        working_dir: None,
+        reasoning_effort: None,
+        selected_model: None,
+        context_config: None,
+        account_name: Some("acct".into()),
+        active_tool_groups: Vec::new(),
+        reply,
+    });
+    rx.recv().unwrap().expect("session created");
+
+    assert!(
+        state.model_prefetch_in_flight.contains("acct"),
+        "session create with an account must spawn a prefetch"
+    );
 }

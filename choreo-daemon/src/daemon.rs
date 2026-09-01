@@ -22,11 +22,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 mod subscriber_handlers;
+
+/// TTL for cached provider model lists. Shared by the on-demand fetch path
+/// (`handle_list_models_inner`) and the background-prefetch freshness guard
+/// (`should_prefetch_models`) so both paths agree on what "fresh" means.
+const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Reply type for the ListModels command.
 pub(super) type ListModelsReply =
@@ -78,6 +84,14 @@ pub struct DaemonState {
     /// tests can use tiny caps; defaults are 64 MiB / 512 MiB.
     pub lag_limits: LagLimits,
     pub model_cache: HashMap<String, (Vec<String>, Instant)>,
+    /// Accounts with a model-list prefetch currently running on a background
+    /// thread. The command loop sets a name when it spawns the fetch thread
+    /// and clears it when the thread's `ModelPrefetchResult` arrives — the
+    /// guard that keeps several session joins on the same account from
+    /// spawning duplicate HTTP fetches. Managed exclusively by the command
+    /// loop (single writer); the fetch threads themselves never touch it —
+    /// they report back through the `daemon_tx` channel.
+    pub model_prefetch_in_flight: HashSet<String>,
     pub mcp_manager: McpManager,
     /// Sender to the ONE background catalog-maintenance thread (see
     /// `crate::catalog`). `None` until `run_server` spawns the thread — a
@@ -186,6 +200,17 @@ pub enum DaemonCommand {
     GetCredential {
         service: String,
         reply: std::sync::mpsc::Sender<Option<String>>,
+    },
+    /// A background model-prefetch thread (spawned by
+    /// [`DaemonState::maybe_spawn_model_prefetch`]) finished fetching an
+    /// account's model list. Routed through the command loop — the single
+    /// writer of `model_cache` — so the insert is serialized with all other
+    /// cache mutations. `result` carries the fetch outcome so the loop can
+    /// release the per-account in-flight guard even on failure (otherwise a
+    /// failed fetch would permanently block re-prefetching that account).
+    ModelPrefetchResult {
+        account: String,
+        result: Result<Vec<String>, String>,
     },
     RegisterSummarySubscriber {
         client_id: u64,
@@ -439,6 +464,9 @@ impl DaemonState {
             DaemonCommand::GetCredential { service, reply } => {
                 self.handle_get_credential(service, reply)
             }
+            DaemonCommand::ModelPrefetchResult { account, result } => {
+                self.handle_model_prefetch_result(account, result)
+            }
             DaemonCommand::RegisterSummarySubscriber { client_id, writer } => {
                 self.handle_register_summary_subscriber(client_id, writer)
             }
@@ -642,18 +670,113 @@ impl DaemonState {
 
     /// Try to resolve an `InferenceProvider` for the given account name using
     /// the stored credential.  Silently ignores missing credentials or config.
-    /// Resolve the provider for `name` and pre-fetch the model list so
-    /// SetModel doesn't wait on an HTTP round-trip through the event loop.
+    /// This is a pure in-memory operation (client construction from config —
+    /// no I/O); the model list is warmed separately, in the background, by
+    /// [`Self::maybe_spawn_model_prefetch`], so unlocking and credential/
+    /// account mutations never block the command loop on HTTP round-trips.
     /// Returns `true` if a provider was successfully created and cached.
     fn resolve_account_provider(&mut self, name: &str, api_key: Option<String>) -> bool {
         if let Some(config) = self.accounts.get(name)
             && let Ok(provider) = InferenceProvider::from_account_config(config, api_key)
         {
-            fetch_and_cache_models(self, name, &provider);
             self.providers.insert(name.to_string(), provider);
             true
         } else {
             false
+        }
+    }
+
+    /// Decide whether the model list for `account` needs a background
+    /// prefetch: only when a resolved provider exists, no fetch is already
+    /// running for the account, and the cached list is missing or past
+    /// [`MODEL_CACHE_TTL`].  Pure — no side effects — so tests can assert the
+    /// gate independently of thread spawning.
+    fn should_prefetch_models(&self, account: &str) -> bool {
+        if !self.providers.contains_key(account) || self.model_prefetch_in_flight.contains(account)
+        {
+            return false;
+        }
+        match self.model_cache.get(account) {
+            Some((_, cached_at)) => Instant::now().duration_since(*cached_at) >= MODEL_CACHE_TTL,
+            None => true,
+        }
+    }
+
+    /// Spawn a detached background thread that fetches the model list for
+    /// `account` and reports the outcome back to the command loop via
+    /// [`DaemonCommand::ModelPrefetchResult`] — the loop, not the fetch
+    /// thread, owns `model_cache` and the in-flight guard.  A no-op unless
+    /// [`Self::should_prefetch_models`] says a fetch is needed, which is what
+    /// keeps a burst of session joins (or an account switch per request) from
+    /// stacking duplicate HTTP fetches.  A failed spawn releases the guard so
+    /// the account stays re-prefetchable.
+    fn maybe_spawn_model_prefetch(&mut self, account: &str) {
+        if !self.should_prefetch_models(account) {
+            return;
+        }
+        self.model_prefetch_in_flight.insert(account.to_string());
+        // `should_prefetch_models` guarantees the provider exists; the None
+        // arm is belt-and-braces so the in-flight guard can never leak.
+        let provider = match self.providers.get(account) {
+            Some(p) => p.clone(),
+            None => {
+                self.model_prefetch_in_flight.remove(account);
+                return;
+            }
+        };
+        let daemon_tx = self.daemon_tx.clone();
+        let account_name = account.to_string();
+        let spawned = thread::Builder::new()
+            .name(format!("model-prefetch-{account_name}"))
+            .spawn(move || {
+                // The fetch is deliberately detached from the command loop:
+                // a slow provider endpoint (up to the full request timeout,
+                // retried) must never stall daemon commands the way the old
+                // unlock-time synchronous prefetch did.
+                let result = provider.list_models().map_err(|e| e.to_string());
+                let _ = daemon_tx.send(DaemonCommand::ModelPrefetchResult {
+                    account: account_name,
+                    result,
+                });
+            });
+        if let Err(e) = spawned {
+            self.model_prefetch_in_flight.remove(account);
+            warn!(
+                account = %account,
+                error = %e,
+                "failed to spawn model prefetch thread; account stays re-prefetchable"
+            );
+        }
+    }
+
+    /// Receive a background model-prefetch outcome: release the account's
+    /// in-flight guard and, on success, populate `model_cache` (the command
+    /// loop is its single writer).  Failures are logged only — the next
+    /// session join re-prefetches, and the on-demand path in
+    /// `handle_list_models_inner` remains the fallback while nothing is
+    /// cached.
+    fn handle_model_prefetch_result(
+        &mut self,
+        account: String,
+        result: Result<Vec<String>, String>,
+    ) {
+        self.model_prefetch_in_flight.remove(&account);
+        match result {
+            Ok(models) => {
+                debug!(
+                    account = %account,
+                    models = models.len(),
+                    "background model prefetch complete"
+                );
+                self.model_cache.insert(account, (models, Instant::now()));
+            }
+            Err(e) => {
+                warn!(
+                    account = %account,
+                    error = %e,
+                    "background model prefetch failed; will retry on the next join"
+                );
+            }
         }
     }
 
@@ -754,6 +877,13 @@ impl DaemonState {
         };
         let session_tx = self.spawn_session(sid, record, metadata);
 
+        // Warm the model list for the session's account in the background so
+        // the model picker is populated by the time the user opens it — a
+        // no-op when the cache is already fresh or a fetch is in flight.
+        if let Some(name) = &account_name {
+            self.maybe_spawn_model_prefetch(name);
+        }
+
         // Track parent→child relationship so cancellation/deletion
         // of the parent propagates to sub-sessions.
         if let Some(parent_id) = parent_session_id {
@@ -814,9 +944,26 @@ impl DaemonState {
             )));
             return;
         }
-        match self.active_sessions.get(&session_id) {
-            Some(entry) => {
-                let _ = reply.send(Ok(entry.cmd_tx.clone()));
+        match self
+            .active_sessions
+            .get(&session_id)
+            .map(|entry| entry.cmd_tx.clone())
+        {
+            Some(cmd_tx) => {
+                // Attach to an already-active session also warms its model
+                // list in the background — the session may have been joined on
+                // a different client (or before this account's cache went
+                // stale), and the in-flight guard keeps this idempotent.
+                // The sender is cloned out first (above) so no borrow of
+                // `self` is live across the mutable spawn call.
+                let account = self
+                    .session_metadata
+                    .get(&session_id)
+                    .and_then(|m| m.account_name.clone());
+                if let Some(name) = account {
+                    self.maybe_spawn_model_prefetch(&name);
+                }
+                let _ = reply.send(Ok(cmd_tx));
             }
             None => match db::read_session(&self.db, session_id) {
                 Ok(Some(record)) => {
@@ -824,6 +971,15 @@ impl DaemonState {
                     metadata.status = SessionStatus::Inactive;
                     let session_tx = self.spawn_session(session_id, record, metadata);
                     info!("AttachSession: loaded session {} from db", session_id);
+                    // Warm the model list for the reattached session's
+                    // account in the background (no-op when fresh).
+                    if let Some(name) = self
+                        .session_metadata
+                        .get(&session_id)
+                        .and_then(|m| m.account_name.clone())
+                    {
+                        self.maybe_spawn_model_prefetch(&name);
+                    }
                     let _ = reply.send(Ok(session_tx));
                 }
                 Ok(None) => {
@@ -903,7 +1059,24 @@ impl DaemonState {
                 metadata.status = SessionStatus::Sleeping;
             }
         }
+        // Detect a real account CHANGE before the metadata is moved into the
+        // index: switching (or attaching) an account on a live session is the
+        // third trigger for a background model-list prefetch, alongside
+        // create and attach.  UpdateMetadata fires per request, so the
+        // in-flight + freshness guards inside `maybe_spawn_model_prefetch`
+        // are what keep this from spawning repeated fetches.
+        let old_account = self
+            .session_metadata
+            .get(&session_id)
+            .and_then(|m| m.account_name.clone());
+        let new_account = metadata.account_name.clone();
         self.session_metadata.insert(session_id, metadata);
+        if new_account.is_some()
+            && new_account != old_account
+            && let Some(name) = new_account.as_deref()
+        {
+            self.maybe_spawn_model_prefetch(name);
+        }
     }
 
     /// Mark a session as exited (sleeping) and broadcast the status change.
@@ -1032,8 +1205,9 @@ impl DaemonState {
                     self.x_credentials = Some(cred.clone());
                 }
                 self.credentials.insert(service.clone(), cred.clone());
-                // Resolve provider (and pre-fetch models) for any account
-                // matching this service name.
+                // Resolve the provider (in-memory only, no I/O) for any
+                // account matching this service name; the model list warms
+                // in the background when a session joins the account.
                 if let ServiceCredential::ApiKey { key: api_key } = &cred {
                     self.resolve_account_provider(&service, Some(api_key.clone()));
                 }
@@ -1231,10 +1405,10 @@ impl DaemonState {
     }
 
     /// Validate that a model exists in the provider's model list for this
-    /// session's account.  The model list is pre-populated by
-    /// `fetch_and_cache_models` at provider-resolution time (unlock, credential
-    /// save, account add).  If no cached data exists (fetch failed or provider
-    /// was just resolved without a successful fetch) the model is allowed
+    /// session's account.  The model list is warmed by the background
+    /// prefetch spawned at session join/attach/account-switch time
+    /// (`maybe_spawn_model_prefetch`).  If no cached data exists (fetch
+    /// failed or the prefetch hasn't landed yet) the model is allowed
     /// through — we'd rather fail at inference time than reject a potentially
     /// valid model we couldn't verify.
     fn handle_validate_model(
@@ -1665,7 +1839,8 @@ impl DaemonState {
             ),
         }
         // If account was added and there's a matching credential,
-        // resolve the provider immediately (which also pre-fetches models).
+        // resolve the provider immediately (in-memory only — the model
+        // list warms in the background on session join).
         if result.is_ok()
             && let Some(ServiceCredential::ApiKey { key }) = self.credentials.get(&name)
         {
@@ -1898,13 +2073,16 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
         state.x_credentials = Some(c.clone());
     }
 
+    state.credentials = credentials;
+
+    // Log AFTER the assignment: this used to run before `state.credentials`
+    // was updated, so it always reported the pre-unlock (stale or empty) map
+    // instead of what this unlock actually decrypted.
     info!(
         "Unlock: decrypted {} credentials from DB: {:?}",
         state.credentials.len(),
         state.credentials.keys().collect::<Vec<_>>()
     );
-
-    state.credentials = credentials;
 
     // Load accounts from TOML
     let accounts_path = accounts_config_path()
@@ -1958,35 +2136,6 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
 
     key.zeroize();
     Ok(())
-}
-
-/// Eagerly fetch the model list for `provider` and cache it under
-/// `account_name`.  If the fetch fails (network, API error, etc.) we
-/// simply log a warning — callers will fall through to their allow-on-error
-/// path or attempt an on-demand fetch (see `handle_list_models_inner`).
-fn fetch_and_cache_models(
-    state: &mut DaemonState,
-    account_name: &str,
-    provider: &InferenceProvider,
-) {
-    match provider.list_models() {
-        Ok(models) => {
-            debug!(
-                "cached {} models for account '{}'",
-                models.len(),
-                account_name
-            );
-            state
-                .model_cache
-                .insert(account_name.to_string(), (models, Instant::now()));
-        }
-        Err(e) => {
-            warn!(
-                "failed to fetch model list for account '{}': {e}",
-                account_name
-            );
-        }
-    }
 }
 
 /// Build the slug + display-name pair list for a `CatalogUpdated` broadcast
@@ -2063,9 +2212,8 @@ fn handle_list_models_inner(
     })?;
 
     let now = Instant::now();
-    let five_minutes = std::time::Duration::from_secs(300);
     let models = match state.model_cache.get(&account_name) {
-        Some((cached_models, cached_at)) if now.duration_since(*cached_at) < five_minutes => {
+        Some((cached_models, cached_at)) if now.duration_since(*cached_at) < MODEL_CACHE_TTL => {
             cached_models.clone()
         }
         _ => {
