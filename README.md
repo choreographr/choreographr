@@ -747,7 +747,14 @@ stored credential blobs into memory.
   browsing — credentials are only needed at prompt time.
 - Remote connections (over TCP) use the Noise IK handshake with X25519 key
   agreement, giving an authenticated, encrypted transport for clients like
-  `choreo-gui` (via `--tcp-addr` / `--server-pk`).
+  `choreo-gui` (via `--tcp-addr` / `--server-pk`). TCP wire v5 prepends a
+  1-byte handshake-mode preamble: `0x01` selects Noise IK (the normal mode,
+  client already knows the server's pinned public key) and `0x02` selects
+  Noise XX first contact, where the client does not yet know the server's
+  key — the handshake reveals it, the client verifies its fingerprint
+  out-of-band before any protocol traffic (in particular the `Unlock` that
+  carries the daemon's private key) is sent, and IK is used for every
+  connection after that.
 
 ## Monitoring
 

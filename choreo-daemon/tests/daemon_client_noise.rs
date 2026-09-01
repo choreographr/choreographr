@@ -25,8 +25,10 @@
 use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_connection;
 use choreo_client_core::run_daemon_tcp_connection;
+use choreo_client_core::run_daemon_tcp_connection_xx_first_contact;
 use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
 use choreo_transport::key::{ensure_transport_keypair, set_test_config_root};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
@@ -643,6 +645,200 @@ fn noise_large_message_daemon_to_client() {
         }
         other => panic!("expected Sessions, got {other:?}"),
     }
+
+    daemon.shutdown();
+    client.finish().expect("clean close after shutdown");
+}
+
+/// Connect to `addr` in XX first-contact mode (the new TCP wire v5 path),
+/// presenting the keypair in `key_dir` and confirming the trust decision
+/// with `confirm`. The server public key learned from the XX handshake is
+/// sent over `learned_tx` so the test can assert the XX contract (the
+/// learned key IS the daemon's real static) — the same hook a real UI uses
+/// to render the fingerprint for out-of-band comparison.
+///
+/// The keypair-override reasoning is identical to [`NoiseClient::connect`]
+/// (thread-local `set_test_config_root` must be re-installed on the
+/// connection thread).
+fn connect_xx(
+    addr: &str,
+    key_dir: PathBuf,
+    confirm: bool,
+    learned_tx: mpsc::Sender<[u8; 32]>,
+) -> NoiseClient {
+    let (from_ui, to_daemon) = mpsc::channel::<ClientMessage>();
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<DaemonMessage>();
+    let (result_tx, result_rx) = mpsc::channel::<Result<(), ClientError>>();
+    let addr = addr.to_string();
+    thread::spawn(move || {
+        set_test_config_root(Some(key_dir));
+        let result = run_daemon_tcp_connection_xx_first_contact(
+            &addr,
+            |m| {
+                let _ = tx.send(m);
+            },
+            to_daemon,
+            Some(shutdown_rx),
+            |learned_pk| {
+                let _ = learned_tx.send(learned_pk);
+                confirm
+            },
+        );
+        set_test_config_root(None);
+        let _ = result_tx.send(result);
+    });
+    NoiseClient {
+        from_ui,
+        rx,
+        shutdown_tx,
+        result_rx,
+    }
+}
+
+/// Full-path XX first contact: real daemon preamble reader → XX responder →
+/// ACL check → `tcp_client_thread`, real client
+/// `run_daemon_tcp_connection_xx_first_contact` on the other. Pins the XX
+/// contract end to end: the client learns the daemon's true static key
+/// before any protocol traffic flows, confirms, and only then is the
+/// encrypted channel used (Ping -> Pong).
+#[test]
+#[ignore]
+fn noise_xx_first_contact_full_path() {
+    let (key_dir, client_pk) = test_keypair();
+    let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
+
+    let (learned_tx, learned_rx) = mpsc::channel();
+    let client = connect_xx(
+        &daemon.tcp_addr.to_string(),
+        key_dir.path().to_path_buf(),
+        true,
+        learned_tx,
+    );
+
+    // The learned key must be exactly the daemon's static — this is the
+    // value a real UI fingerprint-renders for the human to verify against
+    // the daemon operator's out-of-band readout.
+    let learned = learned_rx
+        .recv_timeout(TIMEOUT)
+        .expect("XX handshake must reveal the server key before the session starts");
+    assert_eq!(
+        learned, daemon.server_pk,
+        "XX first contact must learn the daemon's real static key"
+    );
+
+    // After confirmation the encrypted channel must work end to end.
+    client.send(ClientMessage::Ping);
+    assert_eq!(client.recv(), DaemonMessage::Pong);
+
+    daemon.shutdown();
+    client.finish().expect("clean close after shutdown");
+}
+
+/// XX first contact with the caller REFUSING the trust decision: the
+/// connection must close without a single protocol message reaching the
+/// daemon-side session loop. This is the transport half of the gated-Unlock
+/// rule — a first-contact MITM (or an unwanted server) must never be able
+/// to harvest an `Unlock` (the daemon's private key) by answering the dial.
+#[test]
+#[ignore]
+fn noise_xx_first_contact_reject_closes_without_traffic() {
+    let (key_dir, client_pk) = test_keypair();
+    let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
+
+    let (learned_tx, learned_rx) = mpsc::channel();
+    let client = connect_xx(
+        &daemon.tcp_addr.to_string(),
+        key_dir.path().to_path_buf(),
+        false, // refuse the trust decision
+        learned_tx,
+    );
+
+    // The handshake itself still reveals the server key (msg2 precedes any
+    // possible confirmation — inherent to XX), but the caller refused, so:
+    let learned = learned_rx
+        .recv_timeout(TIMEOUT)
+        .expect("handshake completes before the trust gate");
+    assert_eq!(learned, daemon.server_pk);
+
+    // The connection thread must end cleanly (a refusal is not an error) —
+    // and crucially, it ends WITHOUT starting the writer thread, so no
+    // message path to the daemon ever existed. Destructure first: `finish`
+    // consumes the client, and the pins below need its channels.
+    let NoiseClient {
+        from_ui,
+        rx,
+        shutdown_tx,
+        result_rx,
+    } = client;
+    let _ = shutdown_tx.send(()); // sever the socket (no-op after refusal)
+    let result = result_rx
+        .recv_timeout(TIMEOUT)
+        .unwrap_or_else(|e| panic!("timed out waiting for connection result: {e:?}"));
+    assert!(
+        result.is_ok(),
+        "trust refusal closes cleanly, got {:?}",
+        result.err()
+    );
+
+    // The proof that the trust gate held: queueing a message after the
+    // refusal fails outright — the receiver side (`to_daemon`) was dropped
+    // when the connection returned, so there is no path on which the Ping
+    // could ever reach the daemon. (A SendError here is the pin: pre-gate,
+    // the writer thread would be draining this channel and the send would
+    // succeed — which is exactly the leak the gate exists to prevent.)
+    let send_result = from_ui.send(ClientMessage::Ping);
+    assert!(
+        send_result.is_err(),
+        "after refusal no message path to the daemon may exist"
+    );
+
+    // And the daemon-side channel closed without delivering anything: recv
+    // must see Disconnected — never a buffered protocol message. (recv
+    // drains buffered values before Disconnected, so an Ok here would mean
+    // traffic leaked through the gate.)
+    if let Ok(msg) = rx.recv() {
+        panic!("refused first contact must deliver no protocol messages, got {msg:?}");
+    }
+
+    daemon.shutdown();
+}
+
+/// A client that sends an UNKNOWN handshake-mode preamble byte gets its
+/// connection closed by the daemon before any handshake begins. The
+/// preamble is the only daemon-side state the wire can touch
+/// pre-authentication, so an invalid value must never produce a
+/// half-open connection — it is dropped, and nothing is ever read again.
+#[test]
+#[ignore]
+fn noise_unknown_preamble_is_rejected() {
+    let (key_dir, client_pk) = test_keypair();
+    let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
+
+    let mut stream = std::net::TcpStream::connect(daemon.tcp_addr).expect("connect");
+    stream.write_all(&[0xFF]).expect("write garbage preamble");
+    // The daemon logs a warning and closes. The client's read must observe
+    // that closure (EOF — Ok(0)) rather than hang, bounded by a read
+    // timeout so a daemon regression fails loudly instead of wedging.
+    stream
+        .set_read_timeout(Some(TIMEOUT))
+        .expect("set read timeout");
+    let mut buf = [0u8; 1];
+    match stream.read(&mut buf) {
+        Ok(0) => {} // EOF: the daemon closed the connection as required
+        Ok(n) => panic!("daemon must not reply to an unknown preamble, got {n} byte(s)"),
+        Err(e) => panic!("read after unknown preamble errored unexpectedly: {e}"),
+    }
+
+    // The daemon must still be healthy: an authorized IK client connects
+    // fine after the garbage connection was discarded.
+    let client = NoiseClient::connect(
+        &daemon.tcp_addr.to_string(),
+        &daemon.server_pk,
+        key_dir.path().to_path_buf(),
+    );
+    client.send(ClientMessage::Ping);
+    assert_eq!(client.recv(), DaemonMessage::Pong);
 
     daemon.shutdown();
     client.finish().expect("clean close after shutdown");

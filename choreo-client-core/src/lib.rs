@@ -9,7 +9,7 @@ pub mod shell;
 pub use choreo_transport::key::read_server_pk;
 pub use connection::{
     ConnectionMode, run_daemon_connection, run_daemon_connection_with_mode, run_daemon_reader,
-    run_daemon_tcp_connection,
+    run_daemon_tcp_connection, run_daemon_tcp_connection_xx_first_contact,
 };
 pub use credentials::{
     build_add_credential_message, read_public_key_bytes, resolve_private_key, try_auto_unlock_key,

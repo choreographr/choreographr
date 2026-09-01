@@ -480,31 +480,23 @@ pub fn run_server(
                         let (client_id, writer_tx, writer_rx) =
                             crate::server::connection::register_client_writer(&tx);
                         let handle = thread::spawn(move || {
-                            // Held through the handshake AND the connection
-                            // thread: released when this thread exits
-                            // (handshake failure or connection end), even on
-                            // panic.
+                            // Held through the preamble + handshake AND the
+                            // connection thread: released when this thread
+                            // exits (handshake failure or connection end),
+                            // even on panic.
                             let _slot = slot;
-                            let noise = match choreo_transport::handshake::handshake_responder(
-                                tcp,
-                                &sk_bytes,
-                                |pk| acl.contains(pk),
-                            ) {
-                                Ok(ns) => ns,
-                                Err(e) => {
-                                    error!(error = %e, "Noise IK handshake rejected");
-                                    // The writer channel was registered at accept
-                                    // time; unregister so a failed handshake does
-                                    // not leave a stale writer entry in the
-                                    // daemon's client_writers registry.
-                                    let _ =
-                                        tx.send(DaemonCommand::ClientDisconnected { client_id });
-                                    return;
-                                }
-                            };
-                            if let Err(e) = crate::server::connection::tcp_client_thread(
-                                noise, tx, client_id, writer_tx, writer_rx, global_lag,
-                            ) {
+                            // The preamble read + handshake-mode dispatch +
+                            // responder handshake all live in
+                            // tcp_handshake_and_client_thread (server/connection.rs)
+                            // so the accept thread stays a pure spawn loop; it
+                            // also unregisters the writer channel on every
+                            // pre-transport failure path.
+                            if let Err(e) =
+                                crate::server::connection::tcp_handshake_and_client_thread(
+                                    tcp, sk_bytes, acl, tx, client_id, writer_tx, writer_rx,
+                                    global_lag,
+                                )
+                            {
                                 error!(error = %e, "TCP client error");
                             }
                         });

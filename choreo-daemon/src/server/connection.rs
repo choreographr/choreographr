@@ -5,7 +5,7 @@ use choreo_proto::{
     write_message,
 };
 use std::io::{self, BufReader, BufWriter, Write};
-use std::net::Shutdown;
+use std::net::{Shutdown, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -657,6 +657,96 @@ pub(crate) fn client_thread(
         writer_handle,
     );
     Ok(())
+}
+
+/// TCP accept path: read the 1-byte handshake-mode preamble, run the
+/// matching Noise responder handshake (IK or XX), and hand the encrypted
+/// stream to [`tcp_client_thread`].
+///
+/// The writer channel is registered with the daemon by the acceptor BEFORE
+/// this function runs (see `register_client_writer`), so every failure path
+/// here — unknown preamble, silent/garbage peer, rejected handshake — must
+/// unregister via `ClientDisconnected`, exactly as the old inline handshake
+/// failure path in `server/lifecycle.rs` did. This keeps the daemon's
+/// `client_writers` registry honest: a connection that never produced a
+/// working transport must not leave a stale writer entry behind.
+///
+/// **The preamble is UNAUTHENTICATED by design.** It is a cleartext mode
+/// selector read before any keying material exists, so it cannot carry
+/// authentication itself. That is safe because it authorizes NOTHING: it
+/// only selects which handshake runs. Everything that matters is
+/// authenticated by the subsequent Noise handshake — IK and XX both
+/// authenticate both parties' static keys via the DH operations, so a
+/// man-in-the-middle cannot downgrade the mode or impersonate either side
+/// (a MITM would have to complete the chosen handshake, which requires the
+/// server's private key), and the daemon's ACL check runs inside whichever
+/// handshake the client picked. The worst an attacker controls is which
+/// of two equally-authenticated handshakes runs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tcp_handshake_and_client_thread(
+    mut tcp: TcpStream,
+    transport_sk: [u8; 32],
+    acl: Arc<crate::server::acl::Acl>,
+    daemon_tx: mpsc::Sender<DaemonCommand>,
+    client_id: u64,
+    writer: crate::broadcast::SubscriberSink,
+    writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
+    global_lag: Arc<AtomicUsize>,
+) -> io::Result<()> {
+    // The preamble read runs BEFORE any authentication, so it is bounded by
+    // the transport's absolute-deadline machinery (same as the handshake
+    // itself): a peer that connects and sends nothing is cut off instead of
+    // holding this thread + FD open forever.
+    let preamble = match choreo_transport::handshake::read_handshake_preamble(&mut tcp) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "TCP client never sent a valid handshake-mode preamble; closing"
+            );
+            // Drop `tcp` (closes the socket) and unregister the writer
+            // channel this connection registered at accept time.
+            let _ = daemon_tx.send(DaemonCommand::ClientDisconnected { client_id });
+            return Ok(());
+        }
+    };
+
+    // Dispatch on the mode byte. Each arm runs the full responder handshake
+    // with the SAME ACL closure, so XX connections are authorized exactly
+    // like IK ones (the check lives inside the handshake in both cases).
+    let handshake_result = match preamble {
+        choreo_transport::handshake::PREAMBLE_IK => {
+            debug!("TCP client selected Noise IK handshake");
+            choreo_transport::handshake::handshake_responder(tcp, &transport_sk, |pk| {
+                acl.contains(pk)
+            })
+        }
+        choreo_transport::handshake::PREAMBLE_XX => {
+            debug!("TCP client selected Noise XX (first-contact) handshake");
+            choreo_transport::handshake::handshake_responder_xx(tcp, &transport_sk, |pk| {
+                acl.contains(pk)
+            })
+        }
+        other => {
+            warn!(
+                preamble = other,
+                "unknown handshake-mode preamble byte; closing connection"
+            );
+            let _ = daemon_tx.send(DaemonCommand::ClientDisconnected { client_id });
+            return Ok(()); // dropping `tcp` closes the connection
+        }
+    };
+
+    let noise = match handshake_result {
+        Ok(noise) => noise,
+        Err(e) => {
+            error!(error = %e, "Noise handshake rejected");
+            let _ = daemon_tx.send(DaemonCommand::ClientDisconnected { client_id });
+            return Ok(());
+        }
+    };
+
+    tcp_client_thread(noise, daemon_tx, client_id, writer, writer_rx, global_lag)
 }
 
 pub(crate) fn tcp_client_thread(

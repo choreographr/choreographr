@@ -26,6 +26,21 @@ use crate::noise::NoiseStream;
 /// needs (sub-millisecond on loopback, a few ms on a real network).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Handshake-mode preamble byte: Noise IK (the existing authenticated
+/// mode — the client knows the server's static key in advance).
+///
+/// TCP wire protocol v5: every TCP connection now starts with exactly one
+/// unauthenticated mode byte before any handshake message. 0x00 is
+/// deliberately reserved (never assigned) so an all-zero garbage fill or a
+/// trailing-NUL bug can never be mistaken for a valid mode.
+pub const PREAMBLE_IK: u8 = 0x01;
+
+/// Handshake-mode preamble byte: Noise XX (first-contact mode — the client
+/// does NOT know the server's static key in advance and learns it from the
+/// handshake; the caller then verifies the key out-of-band before any
+/// protocol traffic flows).
+pub const PREAMBLE_XX: u8 = 0x02;
+
 /// Read exactly `len` bytes from `stream`, never taking longer than
 /// `deadline` in total.
 ///
@@ -114,6 +129,34 @@ fn write_handshake_all(
         }
     }
     Ok(())
+}
+
+/// Read the 1-byte handshake-mode preamble from `stream`, using the default
+/// [`HANDSHAKE_TIMEOUT`] budget (see [`read_handshake_preamble_with_timeout`]).
+///
+/// The preamble runs BEFORE any authentication, so it must be bounded by the
+/// same absolute-deadline machinery as the handshake itself: an
+/// unauthenticated peer that connects and sends nothing must not be able to
+/// hold a connection thread + FD open. The preamble read gets its own full
+/// budget, and the handshake that follows gets its own — the two are
+/// independent deadlines, which only widens the worst case by one budget and
+/// keeps the deadline plumbing in exactly one place.
+pub fn read_handshake_preamble(stream: &mut TcpStream) -> Result<u8, TransportError> {
+    read_handshake_preamble_with_timeout(stream, HANDSHAKE_TIMEOUT)
+}
+
+/// [`read_handshake_preamble`] with an explicit total-duration budget.
+/// Reuses [`read_handshake_exact`] (1 byte), so the deadline semantics are
+/// byte-for-byte the handshake's: a silent peer is cut off with
+/// `HandshakeTimeout`, and a dribbling peer cannot stretch the read past the
+/// deadline by keeping per-read timers alive.
+pub fn read_handshake_preamble_with_timeout(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> Result<u8, TransportError> {
+    let deadline = Instant::now() + timeout;
+    let byte = read_handshake_exact(stream, deadline, 1)?;
+    Ok(byte[0])
 }
 
 /// Perform the Noise IK handshake as the **initiator** (client side), using
@@ -266,5 +309,200 @@ where
 
     let transport = handshake.into_transport_mode()?;
     debug!("Noise IK handshake complete (responder)");
+    Ok(NoiseStream::new(stream, transport))
+}
+
+/// Perform the Noise XX handshake as the **initiator** (client side, first
+/// contact), using the default [`HANDSHAKE_TIMEOUT`] budget.
+///
+/// Unlike [`handshake_initiator`] (Noise IK), the XX initiator does NOT know
+/// the server's static key in advance — that is the point of first-contact
+/// mode. The server's static public key is transmitted (encrypted) in
+/// handshake message 2 and is returned alongside the transport so the caller
+/// can verify it out-of-band (fingerprint confirmation) BEFORE any encrypted
+/// protocol traffic other than the handshake itself flows.
+///
+/// * `stream` — the already-connected TCP stream (the handshake-mode
+///   preamble byte has already been sent by the caller).
+/// * `static_sk` — the client's transport.sec (32-byte X25519 secret key).
+///
+/// On success returns `(NoiseStream, [u8; 32])` — the encrypted transport
+/// and the server's static public key learned from the handshake. Fails if
+/// the server never transmitted its static key (an XX protocol-contract
+/// violation, surfaced as `InvalidFragment`).
+pub fn handshake_initiator_xx(
+    stream: TcpStream,
+    static_sk: &[u8; 32],
+) -> Result<(NoiseStream, [u8; 32]), TransportError> {
+    handshake_initiator_xx_with_timeout(stream, static_sk, HANDSHAKE_TIMEOUT)
+}
+
+/// [`handshake_initiator_xx`] with an explicit total-duration budget for the
+/// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`]). Reuses the exact same
+/// absolute-deadline plumbing as the IK variants — [`read_handshake_exact`]
+/// and [`write_handshake_all`] — so the XX timeout semantics are identical:
+/// a silent or dribbling peer is cut off at the deadline with
+/// `HandshakeTimeout`, and both socket timeouts are cleared before the data
+/// plane.
+pub fn handshake_initiator_xx_with_timeout(
+    mut stream: TcpStream,
+    static_sk: &[u8; 32],
+    timeout: Duration,
+) -> Result<(NoiseStream, [u8; 32]), TransportError> {
+    use snow::Builder;
+
+    let deadline = Instant::now() + timeout;
+
+    // XX initiator: NO `.remote_public_key()` — the server's static key is
+    // unknown until the handshake reveals it (IK hard-codes it here, which
+    // is what makes IK a 2-message pattern instead of XX's 3).
+    let mut handshake = Builder::new("Noise_XX_25519_AESGCM_SHA256".parse()?)
+        .local_private_key(static_sk)?
+        .build_initiator()?;
+
+    // The write side is bounded exactly like IK: the 2-byte length prefix
+    // and the body go out as ONE bounded payload (see write_handshake_all).
+    let mut buf = vec![0u8; 2 + 1024];
+
+    // Message 1 (-> e): the client's ephemeral key only.
+    let n = handshake.write_message(&[], &mut buf[2..])?;
+    buf[..2].copy_from_slice(&(n as u16).to_be_bytes());
+    write_handshake_all(&mut stream, deadline, &buf[..2 + n])?;
+
+    // Message 2 (<- e, ee, s, es): the server's ephemeral AND static keys,
+    // with the static authenticated by the DH operations. After reading this
+    // the initiator can extract the server's static via get_remote_static().
+    let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
+    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
+    handshake.read_message(&rbuf, &mut buf[2..])?;
+
+    // Message 3 (-> s, es): the client's static key, authenticating us to
+    // the server (the server's responder-side ACL check consumes it).
+    let n = handshake.write_message(&[], &mut buf[2..])?;
+    buf[..2].copy_from_slice(&(n as u16).to_be_bytes());
+    write_handshake_all(&mut stream, deadline, &buf[..2 + n])?;
+
+    // Handshake complete — restore the unbounded data-plane I/O (see
+    // handshake_initiator_with_timeout: BOTH timeouts must be cleared,
+    // read_handshake_exact armed SO_RCVTIMEO and write_handshake_all armed
+    // SO_SNDTIMEO).
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+
+    // Learn the server's static key — the entire reason this mode exists.
+    // XX always transmits `s` in message 2, so an absent value is a protocol
+    // contract violation, not an authentication failure; InvalidFragment is
+    // the closest honest variant (the responder side DOES use AuthFailed for
+    // the analogous check, because there it gates the ACL decision).
+    let server_pk_bytes = handshake
+        .get_remote_static()
+        .ok_or_else(|| {
+            TransportError::InvalidFragment(
+                "XX handshake: server did not transmit its static key".to_string(),
+            )
+        })?
+        .to_owned();
+    let mut server_pk = [0u8; 32];
+    server_pk.copy_from_slice(&server_pk_bytes);
+
+    let transport = handshake.into_transport_mode()?;
+    debug!("Noise XX handshake complete (initiator)");
+    Ok((NoiseStream::new(stream, transport), server_pk))
+}
+
+/// Perform the Noise XX handshake as the **responder** (server side,
+/// first-contact), using the default [`HANDSHAKE_TIMEOUT`] budget.
+///
+/// Mirrors [`handshake_responder`] (Noise IK) except for the message flow:
+/// XX is 3 messages instead of IK's 2, and the client's static key arrives
+/// with message 3 (not message 1), so the `check_client` ACL closure runs
+/// AFTER the full key exchange — see the comment at the check below for why
+/// that is still safe.
+pub fn handshake_responder_xx<F>(
+    stream: TcpStream,
+    static_sk: &[u8; 32],
+    check_client: F,
+) -> Result<NoiseStream, TransportError>
+where
+    F: FnOnce(&[u8; 32]) -> bool,
+{
+    handshake_responder_xx_with_timeout(stream, static_sk, check_client, HANDSHAKE_TIMEOUT)
+}
+
+/// [`handshake_responder_xx`] with an explicit total-duration budget for the
+/// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`]). Same absolute-deadline
+/// plumbing as the IK responder — every read AND write is bounded by the
+/// time remaining until the deadline.
+pub fn handshake_responder_xx_with_timeout<F>(
+    mut stream: TcpStream,
+    static_sk: &[u8; 32],
+    check_client: F,
+    timeout: Duration,
+) -> Result<NoiseStream, TransportError>
+where
+    F: FnOnce(&[u8; 32]) -> bool,
+{
+    use snow::Builder;
+
+    let deadline = Instant::now() + timeout;
+
+    let mut handshake = Builder::new("Noise_XX_25519_AESGCM_SHA256".parse()?)
+        .local_private_key(static_sk)?
+        .build_responder()?;
+
+    // Message 1 (-> e): read the client's ephemeral key. Every read is
+    // bounded by the remaining budget — pre-authentication, exactly like IK.
+    let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
+    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
+    let mut out_buf = vec![0u8; 1024];
+    handshake.read_message(&rbuf, &mut out_buf)?;
+
+    // Message 2 (<- e, ee, s, es): our ephemeral + static keys. Unlike IK,
+    // this MUST be written before the ACL check — the client's static only
+    // arrives with message 3, and message 2 is what carries the server's
+    // static to the client. This is inherent to XX (the server cannot know
+    // who it is talking to until the client finishes authenticating), and it
+    // is not a disclosure risk: msg2's static is encrypted to the client's
+    // ephemeral key, so a passive observer learns nothing, and an active
+    // attacker would have to complete the key exchange to decrypt it — at
+    // which point its own static is exposed to the ACL check.
+    let mut buf = vec![0u8; 2 + 1024];
+    let n = handshake.write_message(&[], &mut buf[2..])?;
+    buf[..2].copy_from_slice(&(n as u16).to_be_bytes());
+    write_handshake_all(&mut stream, deadline, &buf[..2 + n])?;
+
+    // Message 3 (-> s, es): the client's static key arrives here — this is
+    // the point where the responder finally learns who it is talking to.
+    let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
+    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
+    handshake.read_message(&rbuf, &mut out_buf)?;
+
+    // ACL check — the same closure pattern as the IK responder, so XX
+    // connections are authorized identically. The check runs after the key
+    // exchange (see the msg2 comment) but BEFORE the transport is handed
+    // over: a rejected client gets a closed socket and can never send or
+    // receive a single data-plane byte.
+    if let Some(client_pk) = handshake.get_remote_static() {
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(client_pk);
+        if !check_client(&pk) {
+            info!("Noise XX handshake rejected: client not in ACL");
+            return Err(TransportError::AuthFailed);
+        }
+    } else {
+        info!("Noise XX handshake rejected: client did not send static key");
+        return Err(TransportError::AuthFailed);
+    }
+
+    // Handshake complete — restore the unbounded data-plane I/O (see
+    // handshake_responder_with_timeout).
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+
+    let transport = handshake.into_transport_mode()?;
+    debug!("Noise XX handshake complete (responder)");
     Ok(NoiseStream::new(stream, transport))
 }

@@ -1,7 +1,8 @@
 use choreo_proto::{ClientMessage, DaemonMessage};
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::{
-    handshake_initiator, handshake_responder, handshake_responder_with_timeout,
+    handshake_initiator, handshake_initiator_xx, handshake_responder,
+    handshake_responder_with_timeout, handshake_responder_xx, handshake_responder_xx_with_timeout,
 };
 use choreo_transport::noise::NoiseStream;
 use snow::Builder;
@@ -1018,6 +1019,206 @@ fn noise_handshake_times_out_against_dribbling_peer() {
     // the 500 ms deadline instead of accepting each slow byte forever. Later
     // writes may fail once the responder has errored and closed the socket,
     // which is the desired outcome — tolerate the error.
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(150));
+        let _ = stream.write_all(&[0xAB]);
+    }
+
+    let server_result = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("responder must return instead of accepting dribbles forever");
+    match server_result {
+        Err(TransportError::HandshakeTimeout) => {}
+        other => panic!("a dribbling peer must be cut off with HandshakeTimeout, got {other:?}"),
+    }
+}
+
+/// Test the full Noise XX handshake between client and server (first-contact
+/// mode), including the data plane over the resulting transport.
+///
+/// XX differs from IK in one contract-critical way: the client does NOT know
+/// the server's static key in advance — it LEARNS it from handshake message
+/// 2. The returned key must be exactly the server's real static (that is
+/// what the caller later verifies out-of-band / fingerprint-compares), and
+/// the derived transport must carry encrypted traffic (Ping -> Pong) exactly
+/// like the IK transport.
+#[test]
+#[ignore]
+fn noise_xx_handshake_round_trip() {
+    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        // Same ACL closure shape as the IK responder: XX clients are
+        // authorized identically (the check runs after msg3, where XX
+        // delivers the client's static).
+        let result = handshake_responder_xx(stream, &server_sk, |pk| *pk == client_pk);
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let (mut client, learned_server_pk) =
+        handshake_initiator_xx(stream, &client_sk).expect("client XX handshake");
+
+    // THE XX contract: the learned key IS the server's static. A MITM
+    // substituting its own key would surface exactly here (as a different
+    // learned value for the human to reject) — this assert is the pin.
+    assert_eq!(
+        learned_server_pk, server_pk,
+        "learned key must be the server's static"
+    );
+
+    let mut server = rx
+        .recv()
+        .expect("recv server result")
+        .expect("server handshake");
+    // Prove the data plane over the XX transport: one encrypted round trip.
+    client
+        .send_client_message(&ClientMessage::Ping)
+        .expect("send Ping over XX transport");
+    assert_eq!(
+        server.recv_client_message().expect("recv from XX client"),
+        ClientMessage::Ping
+    );
+    server
+        .send_daemon_message(&DaemonMessage::Pong)
+        .expect("send Pong over XX transport");
+    assert_eq!(
+        client.recv_daemon_message().expect("recv Pong"),
+        DaemonMessage::Pong
+    );
+}
+
+/// Test that the XX responder's ACL check rejects a client whose static key
+/// is not authorized — the same policy as IK.
+///
+/// XX ordering note: the rejection happens AFTER msg2 (the server cannot
+/// check the ACL before msg3, because XX delivers the client's static only
+/// with msg3 — and msg2 must go out first since it carries the server's
+/// static). So the CLIENT's handshake completes successfully and it learns
+/// the server's key; the rejection surfaces as the server closing the
+/// socket before any data-plane traffic flows, which the client's reader
+/// observes as a clean ConnectionClosed. This asymmetry is inherent to XX
+/// and is safe: the rejected client holds no channel — it never sends or
+/// receives a single data-plane byte.
+#[test]
+#[ignore]
+fn noise_xx_handshake_rejects_unknown_client() {
+    let (listener, server_sk, _server_pk, client_sk, _client_pk) = noise_test_pair();
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        // Nobody is authorized: the ACL closure rejects everyone.
+        let result = handshake_responder_xx(stream, &server_sk, |_| false);
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    // The client's XX handshake itself succeeds — msg2 (with the server's
+    // static) was already written when the server ran the ACL check.
+    let (mut client, learned) =
+        handshake_initiator_xx(stream, &client_sk).expect("client handshake");
+    let _ = learned; // public key, not secret — learning it is harmless
+
+    // The server must have rejected the unknown client. (Match, not Debug
+    // format: NoiseStream deliberately has no Debug impl — a Debug render of
+    // a live transport would risk leaking keying state into logs.)
+    let server_result = rx.recv().expect("recv server result");
+    assert!(
+        matches!(server_result, Err(TransportError::AuthFailed)),
+        "server must reject the unknown client (AuthFailed)"
+    );
+
+    // And the rejected client must not be able to push any data-plane byte
+    // through: the server closed its end, so the client's next read hits a
+    // clean ConnectionClosed.
+    match client.recv_daemon_message() {
+        Err(TransportError::ConnectionClosed) => {}
+        other => panic!("rejected client's reader must see ConnectionClosed, got {other:?}"),
+    }
+}
+
+/// XX variant of `noise_handshake_times_out_when_peer_silent`: a peer that
+/// connects and sends nothing must be cut off by the ABSOLUTE deadline, not
+/// hold a thread + FD forever. The XX responder's first read (msg1 -> e) is
+/// pre-authentication, exactly like IK's, so the same resource-exhaustion
+/// argument applies to the first-contact path.
+#[test]
+#[ignore]
+fn noise_xx_handshake_times_out_when_peer_silent() {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_sk_bytes = server_sk.to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = handshake_responder_xx_with_timeout(
+            stream,
+            &server_sk_bytes,
+            |_| true,
+            Duration::from_millis(100),
+        );
+        tx.send(result.map(|_| ())).expect("send server result");
+    });
+
+    let _silent = TcpStream::connect(addr).expect("connect");
+
+    let server_result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("responder must return instead of hanging");
+    match server_result {
+        Err(TransportError::HandshakeTimeout) => {}
+        other => panic!("a silent peer must be cut off with HandshakeTimeout, got {other:?}"),
+    }
+}
+
+/// XX variant of `noise_handshake_times_out_against_dribbling_peer`: a peer
+/// that dribbles bytes to keep every individual read alive must still be cut
+/// off by the absolute deadline. An XX msg1 (-> e) is 48 bytes on the wire
+/// (32-byte ephemeral + 16-byte GCM tag), so the dribbler claims 48 and then
+/// paces single bytes — each within the read window, the total far past it.
+#[test]
+#[ignore]
+fn noise_xx_handshake_times_out_against_dribbling_peer() {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_sk_bytes = server_sk.to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        // 500 ms total budget, one dribbled byte per 150 ms — same shape as
+        // the IK variant (see its comment for why this defeats a per-recv
+        // timeout but not the absolute deadline).
+        let result = handshake_responder_xx_with_timeout(
+            stream,
+            &server_sk_bytes,
+            |_| true,
+            Duration::from_millis(500),
+        );
+        tx.send(result.map(|_| ())).expect("send server result");
+    });
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    // An XX msg1 is 48 bytes on the wire; claim 48 with the 2-byte prefix...
+    stream
+        .write_all(&(48u16).to_be_bytes())
+        .expect("write prefix");
+    // ...then dribble. Later writes may fail once the responder has errored
+    // and closed the socket — tolerate the error.
     for _ in 0..8 {
         thread::sleep(Duration::from_millis(150));
         let _ = stream.write_all(&[0xAB]);

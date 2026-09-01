@@ -1,7 +1,9 @@
 use crate::error::ClientError;
 use choreo_proto::{ClientMessage, DaemonMessage, ProtoError, read_message, write_message};
 use choreo_transport::error::TransportError;
-use choreo_transport::handshake::handshake_initiator;
+use choreo_transport::handshake::{
+    PREAMBLE_IK, PREAMBLE_XX, handshake_initiator, handshake_initiator_xx,
+};
 use choreo_transport::key::ensure_transport_keypair;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(unix)]
@@ -141,7 +143,7 @@ impl Default for ConnectionMode {
 pub fn run_daemon_tcp_connection(
     addr: &str,
     server_pk: &[u8; 32],
-    mut handle_daemon_message: impl FnMut(DaemonMessage),
+    handle_daemon_message: impl FnMut(DaemonMessage),
     from_ui: mpsc::Receiver<ClientMessage>,
     shutdown_rx: Option<mpsc::Receiver<()>>,
 ) -> Result<(), ClientError> {
@@ -151,15 +153,100 @@ pub fn run_daemon_tcp_connection(
     let (client_sk, _client_pk) =
         ensure_transport_keypair().map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
 
-    // Connect TCP and perform Noise IK handshake.
-    let tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
-    let mut noise = handshake_initiator(tcp, client_sk.as_bytes(), server_pk).map_err(|e| {
+    // Connect TCP, declare the handshake mode, then perform Noise IK.
+    let mut tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+    // The 1-byte handshake-mode preamble (TCP wire v5) goes out BEFORE any
+    // handshake message. It is unauthenticated by design — the daemon uses it
+    // only to pick which equally-authenticated handshake to run; the IK
+    // handshake itself authenticates both static keys and gates the ACL.
+    // A single-byte write to a fresh blocking socket cannot meaningfully
+    // block (it fits any socket buffer), so no timeout is armed for it.
+    tcp.write_all(&[PREAMBLE_IK]).map_err(ClientError::Io)?;
+    let noise = handshake_initiator(tcp, client_sk.as_bytes(), server_pk).map_err(|e| {
         ClientError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             e,
         ))
     })?;
 
+    serve_noise_connection(noise, handle_daemon_message, from_ui, shutdown_rx)
+}
+
+/// Connect to a daemon via Noise XX over TCP (first contact).
+///
+/// Use this when the client has NO pinned server public key for `addr`: the
+/// XX handshake reveals the server's static key, which is handed to
+/// `on_first_contact` BEFORE the encrypted session loop starts. The caller
+/// is expected to render the key's fingerprint for a human and return
+/// `true` only after an out-of-band confirmation (this is the trust gate —
+/// on `false` the connection is closed and NOTHING is sent, in particular
+/// no `Unlock`, so a first-contact MITM can never harvest the daemon's
+/// private key). The confirmed key is NOT stored here — pinning to
+/// `known_servers.toml` is the caller's job (phase 2), because the trust
+/// decision belongs to the UI layer, not the transport plumbing.
+///
+/// The writer thread only starts after `on_first_contact` returns `true`,
+/// so any `ClientMessage` already queued by the UI (including the TUI's
+/// auto-`Unlock`) is structurally held back until the trust decision is
+/// made — the gating is by construction, not by convention.
+///
+/// Otherwise identical to [`run_daemon_tcp_connection`] (same reader/writer
+/// thread shape, same shutdown semantics — see [`serve_noise_connection`]).
+pub fn run_daemon_tcp_connection_xx_first_contact(
+    addr: &str,
+    handle_daemon_message: impl FnMut(DaemonMessage),
+    from_ui: mpsc::Receiver<ClientMessage>,
+    shutdown_rx: Option<mpsc::Receiver<()>>,
+    on_first_contact: impl FnOnce([u8; 32]) -> bool,
+) -> Result<(), ClientError> {
+    info!("first-contact connect to daemon at {addr}");
+
+    // Load the client transport keypair (generates one if absent).
+    let (client_sk, _client_pk) =
+        ensure_transport_keypair().map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
+
+    // Connect TCP, declare first-contact mode, run Noise XX.
+    let mut tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+    // Same preamble reasoning as the IK path: unauthenticated mode selector,
+    // authenticated by nothing, needed for nothing — the handshake that
+    // follows carries all the cryptographic guarantees.
+    tcp.write_all(&[PREAMBLE_XX]).map_err(ClientError::Io)?;
+    let (noise, server_pk) = handshake_initiator_xx(tcp, client_sk.as_bytes()).map_err(|e| {
+        ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            e,
+        ))
+    })?;
+
+    // Trust gate: the caller verifies the learned key out-of-band. On
+    // refusal, drop the (already-established) encrypted transport without
+    // sending a single protocol message — the connection simply closes.
+    if !on_first_contact(server_pk) {
+        info!("first-contact trust rejected by caller; closing connection");
+        return Ok(());
+    }
+
+    serve_noise_connection(noise, handle_daemon_message, from_ui, shutdown_rx)
+}
+
+/// Shared tail of both TCP connection modes: the encrypted session loop over
+/// an already-established `NoiseStream`.
+///
+/// Uses two blocking threads:
+/// - Reader thread (the caller's): blocks on NoiseStream::recv_daemon_message()
+/// - Writer thread: blocks on from_ui.recv_timeout()
+/// - Shutdown: blocks on shutdown_rx.recv(), then shuts down the TCP stream
+///
+/// Extracted so [`run_daemon_tcp_connection`] (IK) and
+/// [`run_daemon_tcp_connection_xx_first_contact`] (XX) share one writer/reader
+/// implementation — the two modes differ ONLY in preamble + handshake, not in
+/// how the established transport is served.
+fn serve_noise_connection(
+    mut noise: choreo_transport::noise::NoiseStream,
+    mut handle_daemon_message: impl FnMut(DaemonMessage),
+    from_ui: mpsc::Receiver<ClientMessage>,
+    shutdown_rx: Option<mpsc::Receiver<()>>,
+) -> Result<(), ClientError> {
     // Channel to signal writer thread to stop when reader finishes.
     let (writer_shutdown_tx, writer_shutdown_rx) = mpsc::channel::<()>();
     const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
