@@ -159,6 +159,21 @@ pub(crate) fn handle_daemon_message(
             app.status = Some(format!("[daemon] credential removed: {service}"));
             let _ = client_tx.send(ClientMessage::ListAccounts);
         }
+        // ACL enrollment feedback: the direct reply says whether THIS add
+        // worked; the broadcast tells every connected client the new total
+        // (this client included, so one status line suffices per event).
+        DaemonMessage::AclAddResult { ok, message } => {
+            if *ok {
+                app.status = Some(format!("[daemon] {message}"));
+            } else {
+                app.status = Some(format!("[daemon] acl add failed: {message}"));
+            }
+        }
+        DaemonMessage::AclUpdated { clients } => {
+            app.status = Some(format!(
+                "[daemon] ACL updated — {clients} authorized client(s)"
+            ));
+        }
 
         DaemonMessage::Session {
             session_id: Some(session_id),

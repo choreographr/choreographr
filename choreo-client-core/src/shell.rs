@@ -27,6 +27,12 @@ pub enum ShellCommand {
     RemoveCredential {
         service: String,
     },
+    /// `/acl add <base64-pubkey>` — enroll a new client in the daemon's
+    /// ACL. Rejected by the daemon unless this connection is local (Unix
+    /// socket): the approver must be physically at the machine.
+    AclAdd {
+        pubkey: String,
+    },
     Undo,
     Redo,
     /// Continue a stopped/idle session — sends a "Please continue." prompt
@@ -53,6 +59,22 @@ pub fn is_valid_account_name(name: &str) -> bool {
     }
     name.chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// Syntactic check for a base64-encoded 32-byte transport public key (the
+/// form both the daemon ACL and the fingerprint renderer use). Returns the
+/// usage-error message on failure. The daemon re-validates authoritatively —
+/// this only keeps obvious typos from a network round trip.
+fn validate_pubkey_b64(b64: &str) -> Result<(), String> {
+    use base64::Engine as _;
+    match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+        Ok(bytes) if bytes.len() == 32 => Ok(()),
+        Ok(bytes) => Err(format!(
+            "invalid pubkey: base64 decodes to {} bytes, expected 32",
+            bytes.len()
+        )),
+        Err(e) => Err(format!("invalid pubkey: not valid base64: {e}")),
+    }
 }
 
 // ── Sub-parsers for grouped shell commands ──────────────────────
@@ -326,6 +348,33 @@ fn parse_command(
         };
     }
 
+    // /acl subcommand group: currently only `add`, but parsed as a group so
+    // future subcommands (`list`, `remove`) extend without touching the
+    // top-level dispatch. Usage errors name the accepted forms.
+    if let Some(sub) = rest.strip_prefix("acl ") {
+        let parts: Vec<&str> = sub.split_whitespace().collect();
+        match parts.first().copied() {
+            Some("add") => {
+                if parts.len() != 2 {
+                    return ShellCommand::UnknownCommand(
+                        "usage: /acl add <base64-pubkey>".to_string(),
+                    );
+                }
+                // Syntactic validation only (base64 shape + 32-byte length);
+                // the daemon re-validates authoritatively.
+                if let Err(e) = validate_pubkey_b64(parts[1]) {
+                    return ShellCommand::UnknownCommand(e);
+                }
+                return ShellCommand::AclAdd {
+                    pubkey: parts[1].to_string(),
+                };
+            }
+            _ => {
+                return ShellCommand::UnknownCommand("usage: /acl add <base64-pubkey>".to_string());
+            }
+        }
+    }
+
     if rest == "lock" {
         return ShellCommand::Send(ClientMessage::Lock);
     }
@@ -403,6 +452,7 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
             Some(format!("> /add-key {service}{suffix}"))
         }
         ShellCommand::RemoveCredential { service } => Some(format!("> /remove-key {service}")),
+        ShellCommand::AclAdd { pubkey } => Some(format!("> /acl add {pubkey}")),
         ShellCommand::Undo => Some("> undo".to_string()),
         ShellCommand::Redo => Some("> redo".to_string()),
         ShellCommand::Continue => Some("> continue".to_string()),

@@ -160,6 +160,15 @@ pub enum DaemonCommand {
         service: String,
         reply: mpsc::Sender<Result<(), String>>,
     },
+    /// Enroll a client key in the ACL (from a LOCAL connection only — the
+    /// transport check lives in the connection dispatch). The handler
+    /// validates, appends to `authorized_clients.toml` under the advisory
+    /// file lock, hot-reloads the SharedAcl (single writer), broadcasts
+    /// `AclUpdated`, and replies with the new total.
+    AclAddCmd {
+        pubkey: String,
+        reply: mpsc::Sender<Result<usize, String>>,
+    },
     ListModels {
         session_id: Option<u64>,
         reply: ListModelsReply,
@@ -459,6 +468,7 @@ impl DaemonState {
             DaemonCommand::RemoveCredentialCmd { service, reply } => {
                 self.handle_remove_credential(service, reply)
             }
+            DaemonCommand::AclAddCmd { pubkey, reply } => self.handle_acl_add(pubkey, reply),
             DaemonCommand::ListModels { session_id, reply } => {
                 self.handle_list_models(session_id, reply)
             }
@@ -1939,6 +1949,100 @@ impl DaemonState {
             credentialed.extend(blobs.into_keys());
         }
         self.accounts.list(&credentialed)
+    }
+
+    /// Enroll a client key: validate the base64/32-byte key, append a
+    /// `[[client]]` entry to `authorized_clients.toml` under the advisory
+    /// file lock (coexisting with the watcher's reads and future
+    /// `choreographr acl-add` writes), hot-reload the SharedAcl (this loop
+    /// is its single writer), broadcast `AclUpdated` so connected clients
+    /// see the new trust total, and reply with the count.
+    ///
+    /// Re-authorizing an ALREADY-present key is a success reply with no
+    /// write — idempotent for a client that retries a slow request.
+    fn handle_acl_add(&mut self, pubkey: String, reply: mpsc::Sender<Result<usize, String>>) {
+        use base64::Engine as _;
+        let result = (|| -> Result<usize, String> {
+            let Some(acl) = &self.acl else {
+                return Err("no ACL is loaded (unit-test state)".to_string());
+            };
+            let key: [u8; 32] = base64::engine::general_purpose::STANDARD
+                .decode(pubkey.trim())
+                .map_err(|e| format!("invalid pubkey: not valid base64: {e}"))?
+                .try_into()
+                .map_err(|_| "invalid pubkey: must decode to exactly 32 bytes".to_string())?;
+
+            // Idempotency: an already-trusted key is a successful no-op.
+            if acl.contains(&key) {
+                return Ok(acl.len());
+            }
+
+            let path = acl.path().to_path_buf();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create the ACL directory: {e}"))?;
+            }
+
+            // Append under the advisory exclusive lock — the same discipline
+            // the config watcher's reads and `choreographr acl-add` use, so
+            // a concurrent reload never observes a torn entry.
+            #[cfg(unix)]
+            let file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                let f: std::fs::File = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .read(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(|e| format!("cannot open the ACL file: {e}"))?;
+                f.lock()
+                    .map_err(|e| format!("cannot lock the ACL file: {e}"))?;
+                f
+            };
+            #[cfg(not(unix))]
+            let file: std::fs::File = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&path)
+                .map_err(|e| format!("cannot open the ACL file: {e}"))?;
+            let mut file = file;
+            file.lock()
+                .map_err(|e| format!("cannot lock the ACL file: {e}"))?;
+            // Append mode + O_APPEND: the entry lands atomically at the end.
+            use std::io::Write;
+            write!(
+                file,
+                "[[client]]\npubkey = \"{}\"\n",
+                base64::engine::general_purpose::STANDARD.encode(key)
+            )
+            .map_err(|e| format!("cannot write the ACL entry: {e}"))?;
+            file.sync_all()
+                .map_err(|e| format!("cannot flush the ACL file: {e}"))?;
+            file.unlock()
+                .map_err(|e| format!("cannot unlock the ACL file: {e}"))?;
+            drop(file);
+
+            // Single-writer reload: the parse-compare inside reload makes
+            // this the authoritative snapshot update.
+            acl.reload();
+
+            Ok(acl.len())
+        })();
+
+        if let Ok(count) = &result {
+            info!(clients = count, "ACL: client key enrolled (hot-reload)");
+            // Connection-level control broadcast (no session origin): every
+            // connected client learns the new trust total.
+            self.handle_broadcast_activity(
+                None,
+                DaemonMessage::AclUpdated {
+                    clients: *count as u64,
+                },
+            );
+        }
+        let _ = reply.send(result);
     }
 
     /// Handle an `authorized_clients.toml` watcher event: hand the reload to

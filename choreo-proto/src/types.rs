@@ -465,6 +465,18 @@ pub enum ClientMessage {
     RemoveCredential {
         service: String,
     },
+    /// Enroll a NEW client in the daemon's ACL (base64 of the client's
+    /// 32-byte transport public key). LOCAL connections only — the daemon
+    /// rejects this from TCP clients, because the person physically at the
+    /// machine (or an ssh session into it) is the right approver for a
+    /// trust decision, and an already-remote client must not be able to
+    /// mint new trust. The daemon appends the key to
+    /// `authorized_clients.toml` under a file lock; the ACL hot-reload
+    /// chain makes it authoritative immediately, and an `AclUpdated`
+    /// broadcast informs every connected client.
+    AclAdd {
+        pubkey: String,
+    },
     DeleteSession {
         session_id: u64,
     },
@@ -775,6 +787,19 @@ pub enum DaemonMessage {
     CredentialRemoveFailed {
         service: String,
         error: String,
+    },
+    /// Reply to [`ClientMessage::AclAdd`]: `ok` false carries the failure
+    /// reason in `message` (rejected transport, bad key, I/O error); `ok`
+    /// true carries the new total of authorized clients.
+    AclAddResult {
+        ok: bool,
+        message: String,
+    },
+    /// Global broadcast (connection-level, no session) after a successful
+    /// ACL change: the new total of authorized client keys. Clients that
+    /// surface ACL information can refresh; it carries no key material.
+    AclUpdated {
+        clients: u64,
     },
     Credential {
         service: String,

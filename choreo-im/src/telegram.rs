@@ -160,6 +160,15 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: crate::tg_api::Message)
                 warn!("failed to send remove credential to bridge: {e}");
             }
         }
+        ShellCommand::AclAdd { .. } => {
+            // An IM bridge is inherently a REMOTE client: the daemon refuses
+            // AclAdd from TCP/Noise connections, so do not even forward it.
+            let _ = bot.send_message(
+                chat_id_val,
+                "[error] /acl add is only available from local connections",
+                None,
+            );
+        }
         ShellCommand::Empty | ShellCommand::InvalidCancel(_) => {}
         ShellCommand::Undo | ShellCommand::Redo => {}
         ShellCommand::Continue | ShellCommand::Stop => {

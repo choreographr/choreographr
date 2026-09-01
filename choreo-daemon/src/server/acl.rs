@@ -132,6 +132,17 @@ impl SharedAcl {
         self.swap.load().contains(pubkey)
     }
 
+    /// The number of authorized clients in the CURRENT snapshot (for the
+    /// `AclUpdated` broadcast's count).
+    pub fn len(&self) -> usize {
+        self.swap.load().keys.len()
+    }
+
+    /// Whether the CURRENT snapshot authorizes no clients.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Re-read the ACL file and swap the snapshot in if it changed.
     ///
     /// Called ONLY from the daemon command loop (the single writer).

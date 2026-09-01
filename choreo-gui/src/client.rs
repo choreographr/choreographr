@@ -74,6 +74,11 @@ pub(crate) fn handle_shell_command(
             Ok(msg) => send_client_message(state, daemon_tx, msg),
             Err(e) => state.status_texts.push(format!("[error] {e}")),
         },
+        ShellCommand::AclAdd { pubkey } => {
+            // The daemon enforces local-only; forward like any other command
+            // and surface the refusal if this GUI connection is remote.
+            send_client_message(state, daemon_tx, ClientMessage::AclAdd { pubkey });
+        }
         ShellCommand::RemoveCredential { service } => {
             send_client_message(
                 state,

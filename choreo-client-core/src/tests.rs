@@ -356,6 +356,39 @@ fn parses_remove_key() {
 }
 
 #[test]
+fn parses_acl_add_with_valid_key() {
+    let mut next = 3;
+    // b64 of exactly 32 bytes.
+    let key_b64 = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+    assert_eq!(
+        parse_input_line(&format!("/acl add {key_b64}"), &mut next, None),
+        ShellCommand::AclAdd {
+            pubkey: key_b64.to_string(),
+        }
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn rejects_acl_add_with_bad_base64_or_wrong_length() {
+    let mut next = 3;
+    assert!(matches!(
+        parse_input_line("/acl add not-base64!!!", &mut next, None),
+        ShellCommand::UnknownCommand(_)
+    ));
+    // Valid base64 but 16 bytes.
+    assert!(matches!(
+        parse_input_line("/acl add c29tZTE2Ynl0ZXNr", &mut next, None),
+        ShellCommand::UnknownCommand(_)
+    ));
+    // Missing argument.
+    assert!(matches!(
+        parse_input_line("/acl add", &mut next, None),
+        ShellCommand::UnknownCommand(_)
+    ));
+}
+
+#[test]
 fn rejects_remove_key_with_invalid_service_name() {
     let mut next = 3;
     assert_eq!(

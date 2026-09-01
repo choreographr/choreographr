@@ -196,6 +196,18 @@ fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandle
                 "[daemon] credential remove failed ({service}): {error}"
             ));
         }
+        DaemonMessage::AclAddResult { ok, message } => {
+            if *ok {
+                handler.handle_status_text(format!("[daemon] {message}"));
+            } else {
+                handler.handle_error(format!("[daemon] acl add failed: {message}"));
+            }
+        }
+        DaemonMessage::AclUpdated { clients } => {
+            handler.handle_status_text(format!(
+                "[daemon] ACL updated — {clients} authorized client(s)"
+            ));
+        }
         DaemonMessage::Credential { .. } => {}
         DaemonMessage::AccountAdded { name } => {
             handler.handle_status_text(format!("[daemon] account added: {name}"));

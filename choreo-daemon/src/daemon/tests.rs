@@ -38,6 +38,7 @@ fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
         model_prefetch_in_flight: HashSet::new(),
         mcp_manager: crate::mcp::McpManager::empty(),
         maintenance_tx: None,
+        acl: None,
         catalog_paths: CatalogPaths::default(),
     };
     (state, daemon_rx)
@@ -1434,6 +1435,111 @@ fn drain_send_on_subscribe(rx: &crossbeam_channel::Receiver<DaemonMessage>) {
         matches!(&msg, DaemonMessage::CatalogUpdated { providers } if !providers.is_empty()),
         "expected the send-on-subscribe CatalogUpdated, got {msg:?}",
     );
+}
+
+// ── AclAdd (the /acl add enrollment path) ──────────────────────────────────
+
+const ACL_KEY_A: [u8; 32] = [1u8; 32];
+const ACL_KEY_B: [u8; 32] = [2u8; 32];
+
+fn acl_b64(key: &[u8; 32]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(key)
+}
+
+/// A DaemonState with a SharedAcl loaded from a temp file containing KEY_A.
+fn make_acl_state() -> (DaemonState, tempfile::TempDir) {
+    let (mut state, _rx) = make_daemon_state();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("authorized_clients.toml");
+    std::fs::write(
+        &path,
+        format!("[[client]]\npubkey = \"{}\"\n", acl_b64(&ACL_KEY_A)),
+    )
+    .unwrap();
+    state.acl = Some(crate::server::acl::SharedAcl::load(&path));
+    (state, dir)
+}
+
+#[test]
+fn handle_acl_add_enrolls_key_updates_file_and_broadcasts() {
+    let (mut state, dir) = make_acl_state();
+    let acl_path = state.acl.as_ref().unwrap().path().to_path_buf();
+    let _ = &dir;
+
+    // An activity subscriber observes the AclUpdated broadcast.
+    let (writer, writer_rx) = test_sink();
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 1,
+        writer,
+    });
+    // Registration sends the current catalog first (the subscriber's
+    // send-on-subscribe); drain it so the next message is the AclUpdated.
+    drain_send_on_subscribe(&writer_rx);
+
+    // Enroll KEY B from a local client.
+    let (reply_tx, reply_rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::AclAddCmd {
+        pubkey: acl_b64(&ACL_KEY_B),
+        reply: reply_tx,
+    });
+
+    // Reply carries the new total (2), the file gained the entry, and the
+    // in-memory snapshot is already authoritative.
+    assert_eq!(reply_rx.recv().unwrap().unwrap(), 2);
+    let file = std::fs::read_to_string(&acl_path).unwrap();
+    assert!(file.contains(&acl_b64(&ACL_KEY_A)), "existing key survives");
+    assert!(file.contains(&acl_b64(&ACL_KEY_B)), "new key written");
+    assert!(state.acl.as_ref().unwrap().contains(&ACL_KEY_B));
+
+    match writer_rx.recv().unwrap() {
+        DaemonMessage::AclUpdated { clients } => assert_eq!(clients, 2),
+        other => panic!("expected AclUpdated broadcast, got {other:?}"),
+    }
+}
+
+#[test]
+fn handle_acl_add_is_idempotent_for_an_already_trusted_key() {
+    let (mut state, dir) = make_acl_state();
+    let acl_path = state.acl.as_ref().unwrap().path().to_path_buf();
+    let before = std::fs::read_to_string(&acl_path).unwrap();
+    let _ = &dir;
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::AclAddCmd {
+        pubkey: acl_b64(&ACL_KEY_A),
+        reply: reply_tx,
+    });
+
+    // Success, no duplicate entry written.
+    assert_eq!(reply_rx.recv().unwrap().unwrap(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&acl_path).unwrap(),
+        before,
+        "re-adding a trusted key must not rewrite the file"
+    );
+}
+
+#[test]
+fn handle_acl_add_rejects_a_bad_key() {
+    let (mut state, _dir) = make_acl_state();
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::AclAddCmd {
+        pubkey: "not-base64!!!".to_string(),
+        reply: reply_tx,
+    });
+    assert!(reply_rx.recv().unwrap().is_err(), "bad base64 must fail");
+
+    // Valid base64, wrong length.
+    use base64::Engine as _;
+    let short = base64::engine::general_purpose::STANDARD.encode([9u8; 16]);
+    let (reply_tx, reply_rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::AclAddCmd {
+        pubkey: short,
+        reply: reply_tx,
+    });
+    assert!(reply_rx.recv().unwrap().is_err(), "wrong length must fail");
 }
 
 // ── AccountsReload (the external-edit watcher consumer) ───────────────────

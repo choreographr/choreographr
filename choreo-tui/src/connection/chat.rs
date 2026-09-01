@@ -227,6 +227,16 @@ pub(super) fn handle_chat_event(
                                 }
                             }
                         }
+                        ShellCommand::AclAdd { ref pubkey } => {
+                            if let Some(echo) = shell_command_echo(&ShellCommand::AclAdd {
+                                pubkey: pubkey.clone(),
+                            }) {
+                                app.status = Some(echo);
+                            }
+                            let _ = client_tx.send(ClientMessage::AclAdd {
+                                pubkey: pubkey.clone(),
+                            });
+                        }
                         ShellCommand::RemoveCredential { ref service } => {
                             if let Some(echo) =
                                 shell_command_echo(&ShellCommand::RemoveCredential {

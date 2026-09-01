@@ -224,6 +224,11 @@ struct ClientCtx<'a> {
     attached_session_id: &'a mut Option<u64>,
     attached_session_tx: &'a mut Option<mpsc::Sender<SessionCommand>>,
     client_id: u64,
+    /// Whether this connection arrived over the local Unix socket (vs the
+    /// TCP/Noise listener). Trust-boundary input for local-only commands:
+    /// `AclAdd` is refused on TCP because the approver for a trust decision
+    /// must be at the machine, not on the network.
+    is_unix: bool,
 }
 
 /// Clean up a client connection: detach from session, unregister the summary
@@ -481,6 +486,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             );
             handle_remove_credential_sync(ctx, service);
         }
+        ClientMessage::AclAdd { pubkey } => {
+            info!("client {}: AclAdd (local={})", ctx.client_id, ctx.is_unix);
+            handle_acl_add_sync(ctx, pubkey);
+        }
         ClientMessage::ListModels => {
             debug!("client {}: ListModels", ctx.client_id);
             handle_list_models_sync(ctx, *ctx.attached_session_id);
@@ -627,6 +636,7 @@ pub(crate) fn client_thread(
                     attached_session_id: &mut attached_session_id,
                     attached_session_tx: &mut attached_session_tx,
                     client_id,
+                    is_unix: true,
                 };
                 if let Err(e) = dispatch_client_message(msg, &mut ctx) {
                     debug!("daemon disconnected: {e}");
@@ -798,6 +808,7 @@ pub(crate) fn tcp_client_thread(
                     attached_session_id: &mut attached_session_id,
                     attached_session_tx: &mut attached_session_tx,
                     client_id,
+                    is_unix: false,
                 };
                 if let Err(e) = dispatch_client_message(msg, &mut ctx) {
                     debug!("daemon disconnected: {e}");
@@ -1156,6 +1167,53 @@ fn handle_add_credential_sync(
     }
 }
 
+/// Enroll a client key in the daemon's ACL. LOCAL (Unix socket) connections
+/// only: the check happens HERE, on the connection thread, so a remote
+/// client gets its refusal without the command loop ever seeing the command.
+/// The trust approver must be at the machine (console or ssh) — an
+/// already-remote client must not be able to mint new trust.
+fn handle_acl_add_sync(ctx: &mut ClientCtx, pubkey: String) {
+    if !ctx.is_unix {
+        warn!(
+            "client {}: AclAdd refused: remote connections cannot change the ACL",
+            ctx.client_id
+        );
+        send_to_writer(
+            ctx,
+            DaemonMessage::AclAddResult {
+                ok: false,
+                message: "ACL changes are only permitted from local connections".to_string(),
+            },
+        );
+        return;
+    }
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::AclAddCmd {
+        pubkey: pubkey.clone(),
+        reply,
+    });
+    match result {
+        Ok(Ok(count)) => {
+            send_to_writer(
+                ctx,
+                DaemonMessage::AclAddResult {
+                    ok: true,
+                    message: format!("client key authorized ({count} client(s) now trusted)"),
+                },
+            );
+        }
+        Ok(Err(e)) => {
+            send_to_writer(
+                ctx,
+                DaemonMessage::AclAddResult {
+                    ok: false,
+                    message: e,
+                },
+            );
+        }
+        Err(_) => warn!("daemon disconnected while handling acl add"),
+    }
+}
+
 fn handle_remove_credential_sync(ctx: &mut ClientCtx, service: String) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::RemoveCredentialCmd {
         service: service.clone(),
@@ -1485,6 +1543,49 @@ mod tests {
     }
 
     #[test]
+    fn handle_acl_add_sync_refuses_remote_clients_without_dialing_daemon() {
+        // A TCP client's AclAdd must be refused at the connection layer: the
+        // daemon command loop is never even contacted (asserted by the
+        // channel receiver staying empty), and the client gets a structured
+        // refusal — the approver for a trust decision must be at the machine.
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer: &sink,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 7,
+            is_unix: false, // a TCP/Noise client
+        };
+
+        handle_acl_add_sync(
+            &mut ctx,
+            "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=".to_string(),
+        );
+
+        let msg = writer_rx.recv().unwrap();
+        match msg {
+            DaemonMessage::AclAddResult { ok: false, message } => {
+                assert!(
+                    message.contains("local connections"),
+                    "the refusal must explain the trust boundary, got: {message}"
+                );
+            }
+            other => panic!("expected AclAddResult refusal, got {other:?}"),
+        }
+        // The command loop saw NOTHING (a refusal must not even route).
+        assert!(
+            daemon_rx.try_recv().is_err(),
+            "a remote AclAdd must never reach the daemon command loop"
+        );
+    }
+
+    #[test]
     fn handle_unlock_sync_ok() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         let (sink, writer_rx) = test_sink();
@@ -1498,6 +1599,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::Unlock { reply, .. }) = daemon_rx.recv() {
@@ -1523,6 +1625,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::Unlock { reply, .. }) = daemon_rx.recv() {
@@ -1551,6 +1654,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         drop(daemon_rx);
         handle_unlock_sync(&mut ctx, vec![0u8; 32]);
@@ -1571,6 +1675,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::ListModels { reply, .. }) = daemon_rx.recv() {
@@ -1602,6 +1707,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::RefreshModels { force, reply }) = daemon_rx.recv() {
@@ -1639,6 +1745,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::RefreshModels { reply, .. }) = daemon_rx.recv() {
@@ -1666,6 +1773,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::ListModels { reply, .. }) = daemon_rx.recv() {
@@ -1694,6 +1802,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::GetCredential { service, reply }) = daemon_rx.recv() {
@@ -1724,6 +1833,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::GetCredential { service, reply }) = daemon_rx.recv() {
@@ -1756,6 +1866,7 @@ mod tests {
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
             client_id: 42,
+            is_unix: true,
         };
 
         switch_attached_session(2, new_tx, &mut ctx);
@@ -1790,6 +1901,7 @@ mod tests {
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
             client_id: 42,
+            is_unix: true,
         };
 
         switch_attached_session(1, new_tx, &mut ctx);
@@ -1819,6 +1931,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::DeleteSession { reply, .. }) = daemon_rx.recv() {
@@ -1844,6 +1957,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::DeleteSession { reply, .. }) = daemon_rx.recv() {
@@ -1883,6 +1997,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
         drop(daemon_rx);
         handle_delete_session_sync(&mut ctx, 42);
@@ -1904,6 +2019,7 @@ mod tests {
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
             client_id: 42,
+            is_unix: true,
         };
 
         switch_attached_session(1, new_tx, &mut ctx);
@@ -1932,6 +2048,7 @@ mod tests {
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
             client_id: 42,
+            is_unix: true,
         };
 
         dispatch_client_message(ClientMessage::Undo, &mut ctx).unwrap();
@@ -1956,6 +2073,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
 
         dispatch_client_message(ClientMessage::Undo, &mut ctx).unwrap();
@@ -1981,6 +2099,7 @@ mod tests {
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
             client_id: 42,
+            is_unix: true,
         };
 
         dispatch_client_message(ClientMessage::Redo, &mut ctx).unwrap();
@@ -2005,6 +2124,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
 
         dispatch_client_message(ClientMessage::Redo, &mut ctx).unwrap();
@@ -2029,6 +2149,7 @@ mod tests {
             attached_session_id: &mut attached_id,
             attached_session_tx: &mut attached_tx,
             client_id: 42,
+            is_unix: true,
         };
 
         dispatch_client_message(
@@ -2061,6 +2182,7 @@ mod tests {
             attached_session_id: &mut none_id,
             attached_session_tx: &mut none_tx,
             client_id: 0,
+            is_unix: true,
         };
 
         dispatch_client_message(

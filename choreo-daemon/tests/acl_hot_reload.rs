@@ -67,12 +67,20 @@ impl Client {
 
     /// Whether the handshake succeeded and the encrypted channel answers a
     /// Ping. A rejected client (ACL miss) surfaces as a failed connection
-    /// result; a live one gets a Pong.
+    /// result within milliseconds of the dial — checked FIRST, so a refusal
+    /// costs milliseconds, not a full Pong timeout; a live client waits for
+    /// the Pong instead (its connection result only arrives at teardown).
     fn is_alive(&mut self) -> bool {
         use choreo_proto::{ClientMessage, DaemonMessage};
-        self.from_ui.send(ClientMessage::Ping).is_ok()
-            && matches!(self.rx.recv_timeout(TIMEOUT), Ok(DaemonMessage::Pong))
-            && self.result_rx.try_recv().map(|r| r.is_ok()).unwrap_or(true)
+        if self.from_ui.send(ClientMessage::Ping).is_err() {
+            return false;
+        }
+        // Short bounded peek for a handshake rejection...
+        if let Ok(result) = self.result_rx.recv_timeout(Duration::from_millis(500)) {
+            return result.is_ok();
+        }
+        // ...otherwise the connection is (still) up: expect the Pong.
+        matches!(self.rx.recv_timeout(TIMEOUT), Ok(DaemonMessage::Pong))
     }
 }
 
@@ -132,10 +140,10 @@ fn acl_edit_authorizes_new_client_without_restart() {
             connected = Some(client);
             break;
         }
-        // Give the previous attempt's thread a moment to observe its own
-        // rejection before recycling the keypair dir handle. The retry
-        // cadence is the connect timeout itself, not a sleep.
-        thread::yield_now();
+        // Pace the retry (integration-test bounded wait): 100 ms gives the
+        // filesystem watcher latency room without a hot spin on connect
+        // attempts, and the deadline bounds the total.
+        thread::sleep(Duration::from_millis(100));
     }
 
     let client_b = connected.expect("the ACL edit must authorize the new client without a restart");
@@ -165,4 +173,122 @@ fn acl_edit_authorizes_new_client_without_restart() {
 
     daemon.shutdown();
     let _ = client_a.result_rx.recv_timeout(TIMEOUT);
+}
+
+/// THE /acl add enrollment path end to end: a LOCAL (Unix socket) client
+/// sends `AclAdd` with a new client's public key, the daemon writes the ACL
+/// entry + hot-reloads, and the new client connects over TCP WITHOUT a
+/// daemon restart. This is the phase-5 flow that replaces the manual
+/// file-edit from `acl_edit_authorizes_new_client_without_restart`.
+#[test]
+#[ignore]
+fn acl_add_from_local_client_enrolls_new_tcp_client() {
+    let (_key_dir_a, client_pk_a) = test_keypair();
+    let (key_dir_b, client_pk_b) = test_keypair();
+    let mut daemon = common::SpawnedDaemon::start(&[client_pk_a]);
+
+    // Local unix client: the trust approver. Carries a shutdown channel so
+    // the reader can be severed deterministically at teardown (the daemon
+    // does not close an idle connection just because the client's writer
+    // side dropped).
+    use choreo_client_core::run_daemon_connection;
+    let (from_ui, to_daemon) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
+    let (unix_shutdown_tx, unix_shutdown_rx) = mpsc::channel();
+    let socket = daemon.socket_str();
+    let unix_handle = thread::spawn(move || {
+        run_daemon_connection(
+            &socket,
+            |m| {
+                let _ = tx.send(m);
+            },
+            to_daemon,
+            Some(unix_shutdown_rx),
+        )
+    });
+
+    // Subscribe to activity broadcasts, exactly like the real TUI does at
+    // startup — that is the channel the AclUpdated control broadcast rides.
+    from_ui
+        .send(choreo_proto::ClientMessage::SubscribeAllActivity)
+        .expect("subscribe to activity");
+
+    use base64::Engine as _;
+    let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(client_pk_b);
+
+    // Sanity: client B is rejected BEFORE enrollment.
+    {
+        let mut rejected = Client::connect(
+            &daemon.tcp_addr.to_string(),
+            &daemon.server_pk,
+            key_dir_b.path().to_path_buf(),
+        );
+        assert!(
+            !rejected.is_alive(),
+            "a client absent from the ACL must be rejected before /acl add"
+        );
+    }
+
+    // Enroll client B via the LOCAL connection.
+    from_ui
+        .send(choreo_proto::ClientMessage::AclAdd {
+            pubkey: pubkey_b64.clone(),
+        })
+        .expect("send AclAdd");
+    // The AclUpdated broadcast is written to this client's writer BEFORE the
+    // direct AclAddResult reply (the broadcast happens inside the handler,
+    // the reply after it returns), so accept both here and pin the ordering
+    // fact; the direct reply is what ends the wait.
+    let mut enrolled = false;
+    loop {
+        match rx.recv_timeout(TIMEOUT).expect("AclAdd reply") {
+            choreo_proto::DaemonMessage::AclUpdated { clients } => {
+                assert_eq!(clients, 2, "the broadcast carries the new total");
+                enrolled = true;
+            }
+            choreo_proto::DaemonMessage::AclAddResult { ok, message: _ } => {
+                assert!(ok, "/acl add from a local client must succeed");
+                break;
+            }
+            choreo_proto::DaemonMessage::CatalogUpdated { .. } => continue,
+            other => panic!("expected AclAddResult, got {other:?}"),
+        }
+    }
+    let _ = enrolled;
+
+    // The new client connects over TCP immediately — no daemon restart.
+    let deadline = Instant::now() + RELOAD_DEADLINE;
+    let mut connected = None;
+    while Instant::now() < deadline {
+        let mut client = Client::connect(
+            &daemon.tcp_addr.to_string(),
+            &daemon.server_pk,
+            key_dir_b.path().to_path_buf(),
+        );
+        if client.is_alive() {
+            connected = Some(client);
+            break;
+        }
+        // Pace the retry (integration-test bounded wait; see the deadline).
+        thread::sleep(Duration::from_millis(100));
+    }
+    let client_b =
+        connected.expect("the enrolled client must connect without a daemon restart");
+    client_b
+        .from_ui
+        .send(choreo_proto::ClientMessage::Ping)
+        .expect("send over enrolled connection");
+    assert_eq!(
+        client_b.rx.recv_timeout(TIMEOUT).expect("Pong"),
+        choreo_proto::DaemonMessage::Pong
+    );
+    drop(client_b);
+
+    // Shut the daemon down FIRST: that closes every connection, so the unix
+    // client's reader observes EOF and the thread exits (joining before the
+    // shutdown would block forever on an idle open socket).
+    daemon.shutdown();
+    drop(from_ui);
+    let _ = unix_shutdown_tx.send(());
+    let _ = unix_handle.join().expect("unix client thread");
 }

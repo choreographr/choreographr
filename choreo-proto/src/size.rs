@@ -357,6 +357,8 @@ impl DaemonMessage {
             Self::CredentialRemoveFailed { service, error } => {
                 named_field_overhead(2) + service.len() + error.len()
             }
+            Self::AclAddResult { ok: _, message } => named_field_overhead(2) + message.len(),
+            Self::AclUpdated { .. } => named_field_overhead(1),
             Self::Credential { service, key } => {
                 named_field_overhead(2) + service.len() + option_str_len(key)
             }
