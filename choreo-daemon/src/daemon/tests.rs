@@ -2593,6 +2593,10 @@ fn should_prefetch_models_gates_on_provider_flight_and_freshness() {
 #[test]
 fn handle_model_prefetch_result_success_populates_cache_and_releases_guard() {
     let (mut state, _rx) = make_daemon_state();
+    // A resolved provider is the real precondition for a prefetch (the
+    // spawn gate requires one), and the handler now discards results for
+    // accounts whose provider vanished mid-flight.
+    state.providers.insert("acct".into(), make_test_provider());
     state.model_prefetch_in_flight.insert("acct".into());
 
     state.handle_command(DaemonCommand::ModelPrefetchResult {
@@ -2620,7 +2624,8 @@ fn handle_model_prefetch_result_failure_releases_guard_without_caching() {
 
     // A failed fetch must NOT wedge the account: guard released, cache
     // untouched, so the next session join retries the prefetch and the
-    // on-demand ListModels path stays the fallback.
+    // on-demand ListModels path serves stale data or a retryable "warming"
+    // error in the meantime.
     assert!(!state.model_prefetch_in_flight.contains("acct"));
     assert!(!state.model_cache.contains_key("acct"));
 }
@@ -2720,4 +2725,173 @@ fn create_session_with_account_spawns_background_prefetch() {
         state.model_prefetch_in_flight.contains("acct"),
         "session create with an account must spawn a prefetch"
     );
+}
+
+// ── ListModels never blocks the command loop ─────────────────────────────
+
+/// Build a state whose session 1 points at `account`, with the given
+/// provider (or none when `provider` is `None`).  Shared by the ListModels
+/// prefetch tests to keep the verbose SessionMetadata boilerplate in one
+/// place.
+fn state_with_session_account(
+    account: &str,
+    provider: Option<InferenceProvider>,
+) -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
+    let (mut state, rx) = make_daemon_state();
+    if let Some(p) = provider {
+        state.providers.insert(account.to_string(), p);
+    }
+    state.session_metadata.insert(
+        1,
+        SessionMetadata {
+            title: Some("s".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            created_at: 1000,
+            last_modified: 1000,
+            turn_count: 0,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: Some(account.to_string()),
+            accumulated_usage: TokenUsage::default(),
+            context_window: None,
+            last_prompt_tokens: None,
+        },
+    );
+    (state, rx)
+}
+
+#[test]
+fn list_models_serves_stale_cache_without_duplicate_fetch_while_prefetch_in_flight() {
+    // In-flight prefetch + a stale cache: the on-demand path must serve the
+    // stale list and NOT spawn a second (duplicate) HTTP fetch behind the
+    // running one.
+    let (mut state, rx) = state_with_session_account("acct", Some(make_failing_provider()));
+    state.model_cache.insert(
+        "acct".into(),
+        (
+            vec!["old-model".into()],
+            Instant::now() - MODEL_CACHE_TTL - Duration::from_secs(1),
+        ),
+    );
+    state.model_prefetch_in_flight.insert("acct".into());
+
+    let (models, _) = handle_list_models_inner(&mut state, Some(1)).expect("stale list served");
+    assert_eq!(models, vec!["old-model".to_string()]);
+
+    // No second fetch may have been spawned for the in-flight account.
+    assert!(rx.try_recv().is_err(), "no duplicate prefetch spawned");
+}
+
+#[test]
+fn list_models_with_cold_cache_triggers_background_prefetch_and_reports_warming() {
+    // Cold cache, no prefetch running: the fetch must be handed to the
+    // background thread (never the command loop) and the caller gets a
+    // retryable "warming" error.
+    let (mut state, rx) = state_with_session_account("acct", Some(make_failing_provider()));
+
+    let err = handle_list_models_inner(&mut state, Some(1)).expect_err("cold cache → warming");
+    assert!(err.contains("warming"), "unexpected error: {err}");
+    assert!(
+        state.model_prefetch_in_flight.contains("acct"),
+        "a background prefetch must have been spawned"
+    );
+
+    // The spawned fetch reports back through the command channel; feed it
+    // through the loop like the real command loop would.
+    let msg = rx.recv().unwrap();
+    assert!(matches!(
+        &msg,
+        DaemonCommand::ModelPrefetchResult { account, result }
+            if account == "acct" && result.is_err()
+    ));
+    state.handle_command(msg);
+    assert!(!state.model_prefetch_in_flight.contains("acct"));
+    assert!(!state.model_cache.contains_key("acct"));
+}
+
+#[test]
+fn list_models_with_stale_cache_and_no_prefetch_serves_stale_and_warms_background() {
+    // Stale-but-present cache, nothing in flight: serve the stale list (it
+    // beats nothing) AND kick off a background refresh.
+    let (mut state, rx) = state_with_session_account("acct", Some(make_failing_provider()));
+    state.model_cache.insert(
+        "acct".into(),
+        (
+            vec!["old-model".into()],
+            Instant::now() - MODEL_CACHE_TTL - Duration::from_secs(1),
+        ),
+    );
+
+    let (models, _) = handle_list_models_inner(&mut state, Some(1)).expect("stale list served");
+    assert_eq!(models, vec!["old-model".to_string()]);
+    assert!(
+        state.model_prefetch_in_flight.contains("acct"),
+        "stale cache must trigger a background refresh"
+    );
+    // Drain the spawned fetch's result. A blocking recv (not a timed wait)
+    // is deterministic here: the failing provider errors instantly and the
+    // thread always sends exactly one message.
+    let _ = rx.recv().unwrap();
+}
+
+// ── Prefetch guard robustness ─────────────────────────────────────────
+
+#[test]
+fn prefetch_result_for_removed_account_is_discarded_not_cached() {
+    // The account's provider was removed while the fetch was in flight
+    // (RemoveAccountCmd / a rebuild from AccountsReload): the result must
+    // not populate the cache — a dead provider's list would otherwise be
+    // served for a full TTL.
+    let (mut state, _rx) = make_daemon_state();
+    state.model_prefetch_in_flight.insert("acct".into());
+    // No provider for "acct" — it was removed mid-flight.
+
+    state.handle_command(DaemonCommand::ModelPrefetchResult {
+        account: "acct".into(),
+        result: Ok(vec!["stale".into()]),
+    });
+
+    assert!(!state.model_prefetch_in_flight.contains("acct"));
+    assert!(!state.model_cache.contains_key("acct"), "result discarded");
+}
+
+#[test]
+fn panicking_fetch_releases_in_flight_guard_with_error() {
+    // `make_test_provider`'s list_models panics. A panic inside the fetch
+    // thread must still produce a `ModelPrefetchResult` (via catch_unwind)
+    // — otherwise the in-flight guard leaks and the account can never be
+    // re-prefetched until daemon restart.
+    let (mut state, rx) = make_daemon_state();
+    state.providers.insert("acct".into(), make_test_provider());
+
+    state.maybe_spawn_model_prefetch("acct");
+    assert!(
+        state.model_prefetch_in_flight.contains("acct"),
+        "prefetch spawned"
+    );
+
+    let msg = rx.recv().unwrap();
+    assert!(
+        matches!(
+            &msg,
+            DaemonCommand::ModelPrefetchResult { account, result }
+                if account == "acct" && result.as_ref().is_err_and(|e| e.contains("panicked"))
+        ),
+        "expected a panicking fetch reported as an Err"
+    );
+    if let DaemonCommand::ModelPrefetchResult { result, .. } = &msg {
+        assert!(
+            result.as_ref().is_err_and(|e| e.contains("panicked")),
+            "expected Err mentioning 'panicked', got {result:?}"
+        );
+    }
+    state.handle_command(msg);
+    assert!(
+        !state.model_prefetch_in_flight.contains("acct"),
+        "guard released"
+    );
+    assert!(!state.model_cache.contains_key("acct"));
 }

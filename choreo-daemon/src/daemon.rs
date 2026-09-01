@@ -29,8 +29,8 @@ use zeroize::Zeroize;
 
 mod subscriber_handlers;
 
-/// TTL for cached provider model lists. Shared by the on-demand fetch path
-/// (`handle_list_models_inner`) and the background-prefetch freshness guard
+/// TTL for cached provider model lists. Shared by the freshness checks in
+/// `handle_list_models_inner` and the background-prefetch guard
 /// (`should_prefetch_models`) so both paths agree on what "fresh" means.
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 
@@ -733,7 +733,31 @@ impl DaemonState {
                 // a slow provider endpoint (up to the full request timeout,
                 // retried) must never stall daemon commands the way the old
                 // unlock-time synchronous prefetch did.
-                let result = provider.list_models().map_err(|e| e.to_string());
+                //
+                // The whole fetch is wrapped in `catch_unwind` (the provider
+                // is an owned value, so `AssertUnwindSafe` is sound here —
+                // the thread never touches shared state): a panic inside the
+                // provider's HTTP/serde code is not covered by the
+                // workspace's no-panic discipline, and an uncaught unwind
+                // would skip the `ModelPrefetchResult` send below — the ONLY
+                // message that releases the in-flight guard — permanently
+                // wedging the account against re-prefetching until daemon
+                // restart. A caught panic is reported as a plain fetch
+                // error, and the next join retries.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    provider.list_models().map_err(|e| e.to_string())
+                }))
+                .unwrap_or_else(|panic| {
+                    // Panic payloads are `String`/`&str` in practice, but
+                    // the payload type is `dyn Any` — fall back to a generic
+                    // message rather than assuming the shape.
+                    let detail = panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                        .unwrap_or_else(|| "unknown panic payload".to_string());
+                    Err(format!("model list fetch panicked: {detail}"))
+                });
                 let _ = daemon_tx.send(DaemonCommand::ModelPrefetchResult {
                     account: account_name,
                     result,
@@ -763,6 +787,19 @@ impl DaemonState {
         self.model_prefetch_in_flight.remove(&account);
         match result {
             Ok(models) => {
+                // Only cache while the account still has a resolved provider:
+                // the account may have been removed or reconfigured
+                // (`AccountsReload` rebuilds the provider) while the fetch
+                // was in flight, and inserting then would serve a dead
+                // provider's model list for a full TTL.
+                if !self.providers.contains_key(&account) {
+                    debug!(
+                        account = %account,
+                        "discarding background model prefetch result; \
+                         account was removed or reconfigured while the fetch ran"
+                    );
+                    return;
+                }
                 debug!(
                     account = %account,
                     models = models.len(),
@@ -2059,12 +2096,9 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
             }
         }
     }
-    info!(
-        "Unlock: decrypted {}/{} credentials; {} failures",
-        credentials.len(),
-        blobs.len(),
-        decrypt_failures
-    );
+    // The full decrypt summary (counts, failures, service names) is logged
+    // once, below, AFTER `state.credentials` is assigned — so the log always
+    // reports what this unlock actually decrypted, not a pre-assignment map.
 
     // Set up X credentials
     if let Some(c) = credentials.get("twitter")
@@ -2079,8 +2113,10 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
     // was updated, so it always reported the pre-unlock (stale or empty) map
     // instead of what this unlock actually decrypted.
     info!(
-        "Unlock: decrypted {} credentials from DB: {:?}",
+        "Unlock: decrypted {}/{} credentials ({} failures): {:?}",
         state.credentials.len(),
+        blobs.len(),
+        decrypt_failures,
         state.credentials.keys().collect::<Vec<_>>()
     );
 
@@ -2203,27 +2239,46 @@ fn handle_list_models_inner(
         state.providers.keys().collect::<Vec<_>>()
     );
 
-    let provider = state.providers.get(&account_name).ok_or_else(|| {
-        if state.accounts.is_empty() {
+    // Existence check only — no provider instance is needed below, because
+    // the actual fetch (if any) runs on the detached background thread.
+    if !state.providers.contains_key(&account_name) {
+        return Err(if state.accounts.is_empty() {
             "no accounts configured".to_string()
         } else {
             format!("no credential stored for account '{account_name}'")
-        }
-    })?;
+        });
+    }
 
+    // A fresh cache answers immediately. Otherwise the fetch NEVER runs here
+    // synchronously: a blocking HTTP round-trip (up to the full request
+    // timeout, retried) would stall the whole daemon command loop — the
+    // exact stall the background-prefetch design removed from unlock. The
+    // request instead TRIGGERS a background prefetch (dedup-guarded via
+    // `maybe_spawn_model_prefetch` — no-op when one is already running, so
+    // an open picker while a join-time prefetch is in flight does not
+    // double-fetch) and serves what it can:
+    //   - a stale-but-present list beats nothing, so it is served;
+    //   - with nothing cached at all, a retryable "warming" error is
+    //     returned and the client refetches once the prefetch lands.
     let now = Instant::now();
     let models = match state.model_cache.get(&account_name) {
         Some((cached_models, cached_at)) if now.duration_since(*cached_at) < MODEL_CACHE_TTL => {
             cached_models.clone()
         }
         _ => {
-            let models = provider
-                .list_models()
-                .map_err(|e| format!("failed to list models: {e}"))?;
-            state
+            // Clone the stale list (if any) BEFORE the mutable spawn call,
+            // so no borrow of `state` is live across it.
+            let stale = state
                 .model_cache
-                .insert(account_name, (models.clone(), now));
-            models
+                .get(&account_name)
+                .map(|(models, _)| models.clone());
+            state.maybe_spawn_model_prefetch(&account_name);
+            stale.ok_or_else(|| {
+                format!(
+                    "model list for account '{account_name}' is warming in the \
+                     background; retry in a moment"
+                )
+            })?
         }
     };
 

@@ -1424,9 +1424,14 @@ startup                    /unlock [passphrase]
   back via the `DaemonCommand::ModelPrefetchResult` command so the command loop — the single
   writer of `model_cache` — records the result; a per-account `model_prefetch_in_flight` guard
   deduplicates bursts of joins and is released even on fetch failure. The shared
-  `MODEL_CACHE_TTL` (5 min) governs both prefetch freshness and the on-demand fetch in
-  `handle_list_models_inner`, which remains the fallback when a user opens the model picker
-  before the prefetch lands.
+  `MODEL_CACHE_TTL` (5 min) governs both prefetch freshness and the on-demand path in
+  `handle_list_models_inner`, which NEVER fetches on the command loop: a fresh cache answers
+  immediately; a stale/missing cache triggers the same background prefetch (no-op while one
+  is in flight, so an open picker cannot double-fetch) and serves the stale list if one
+  exists, or a retryable "warming" error otherwise. A panic inside the fetch thread is
+  caught (`catch_unwind`) and reported as a normal failure so the in-flight guard can never
+  leak, and a result arriving for an account whose provider was removed or rebuilt mid-flight
+  is discarded instead of cached.
 - There is no global "default account". Each session carries its own `account_name: Option<String>`
   field. When RunInput is issued, the daemon resolves the provider from the session's own account name.
   This avoids a global mutable fallback and lets different sessions use different accounts.
