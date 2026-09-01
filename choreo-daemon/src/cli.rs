@@ -66,6 +66,79 @@ struct Cli {
     /// (e.g. 0.0.0.0:9443).  When absent no TCP listener is started.
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
+
+    /// Optional utility subcommand. When absent (the overwhelmingly common
+    /// case) the daemon runs — `choreographr --tcp-addr 0.0.0.0:9443` keeps
+    /// working unchanged because the serve flags stay on the parent command.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Utility subcommands. The daemon itself is the default (no subcommand).
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Enroll a client key in the ACL: appends a `[[client]]` entry to
+    /// `authorized_clients.toml` under the advisory file lock; a running
+    /// daemon hot-reloads it, so the client can connect immediately without
+    /// a restart. Works while the daemon is locked and needs no socket.
+    AclAdd {
+        /// Base64 of the client's 32-byte transport public key (the client
+        /// prints it with `choreo-tui`'s help or reads its transport.pub)
+        pubkey: String,
+    },
+    /// Print the human-comparable fingerprint of a transport public key —
+    /// with no argument, this machine's own (read out to the client operator
+    /// during enrollment); with a path, any key file (verify a copied
+    /// server key or a pinned known-servers entry).
+    Fingerprint {
+        /// Path to a 32-byte raw transport public key file
+        #[arg(default_value = None)]
+        path: Option<String>,
+    },
+}
+
+/// Enroll `pubkey_b64` into the ACL file at `path`. The testable core of the
+/// `acl-add` subcommand: the CLI resolves the path from the standard config
+/// dir and delegates here.
+fn acl_add_to(path: &std::path::Path, pubkey_b64: &str) -> anyhow::Result<usize> {
+    use base64::Engine as _;
+    let key: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(pubkey_b64.trim())
+        .map_err(|e| anyhow::anyhow!("invalid pubkey: not valid base64: {e}"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid pubkey: must decode to exactly 32 bytes"))?;
+
+    // Idempotency: an already-present key is a no-op (no duplicate entry).
+    let existing = crate::server::acl::Acl::load(path);
+    if existing.contains(&key) {
+        info!("pubkey is already authorized; nothing to do");
+        return Ok(existing.len());
+    }
+
+    // The advisory file lock makes this safe against a concurrent daemon
+    // /acl add; the daemon's watcher + parse-compare reload makes the new
+    // entry live without a restart.
+    crate::server::acl::append_key_locked(path, &key).map_err(|e| anyhow::anyhow!(e))?;
+    let count = crate::server::acl::Acl::load(path).len();
+    info!(clients = count, "ACL: client key enrolled");
+    Ok(count)
+}
+
+/// Print the fingerprint of a transport public key (see `Command::Fingerprint`).
+fn fingerprint_cli(path: Option<&str>) -> anyhow::Result<()> {
+    use choreo_transport::key::{fingerprint, fingerprint_of_file, read_server_pk};
+    let fp = match path {
+        Some(p) => fingerprint_of_file(std::path::Path::new(p))
+            .with_context(|| format!("failed to fingerprint key file {p}"))?,
+        None => {
+            let pk = read_server_pk(None).context(
+                "failed to read this machine's transport public key (has the daemon ever run here?)",
+            )?;
+            fingerprint(&pk)
+        }
+    };
+    println!("{fp}");
+    Ok(())
 }
 
 const DEFAULT_MAX_TURNS: u32 = 0;
@@ -130,6 +203,20 @@ pub fn main() -> anyhow::Result<()> {
     fmt().with_env_filter(env_filter).init();
 
     info!(effective_level = ?log_level.unwrap_or("from RUST_LOG"), "logging initialized");
+
+    // Utility subcommands exit early — they are one-shot file operations and
+    // never touch the DB, providers, or listeners below.
+    match &cli.command {
+        Some(Command::AclAdd { pubkey }) => {
+            let path = choreo_keystore::paths::authorized_clients_path()
+                .context("failed to resolve authorized_clients path")?;
+            let count = acl_add_to(&path, pubkey)?;
+            println!("client key authorized ({count} client(s) now trusted)");
+            return Ok(());
+        }
+        Some(Command::Fingerprint { path }) => return fingerprint_cli(path.as_deref()),
+        None => {}
+    }
 
     // The blockchain tools (EVM/Substrate) run on a tokio sidecar runtime owned
     // by the `choreo-blockchain` crate. Initialize it once at startup when the
@@ -289,6 +376,60 @@ pub fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── acl-add CLI core ──────────────────────────────────────────────
+
+    const CLI_KEY_A: [u8; 32] = [1u8; 32];
+    const CLI_KEY_B: [u8; 32] = [2u8; 32];
+
+    fn cli_b64(key: &[u8; 32]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(key)
+    }
+
+    /// The CLI's idempotent enroll: a fresh file gains the entry; a second
+    /// identical add is a no-op returning the SAME count; a different key
+    /// appends alongside. These pin the behavior an operator relies on when
+    /// scripting `choreographr acl-add` against a live daemon.
+    #[test]
+    fn acl_add_to_appends_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized_clients.toml");
+
+        // First add: file is created (with its parent dir), count = 1.
+        let count = acl_add_to(&path, &cli_b64(&CLI_KEY_A)).unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            crate::server::acl::Acl::load(&path).contains(&CLI_KEY_A),
+            "the enrolled key must authorize"
+        );
+
+        // Idempotent re-add: no duplicate entry.
+        assert_eq!(acl_add_to(&path, &cli_b64(&CLI_KEY_A)).unwrap(), 1);
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            file.matches("pubkey").count(),
+            1,
+            "re-adding must not duplicate the entry"
+        );
+
+        // A second key appends alongside.
+        assert_eq!(acl_add_to(&path, &cli_b64(&CLI_KEY_B)).unwrap(), 2);
+        assert!(crate::server::acl::Acl::load(&path).contains(&CLI_KEY_B));
+    }
+
+    #[test]
+    fn acl_add_to_rejects_bad_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized_clients.toml");
+        assert!(acl_add_to(&path, "not-base64!!!").is_err());
+        // Valid base64, wrong decoded length.
+        use base64::Engine as _;
+        let short = base64::engine::general_purpose::STANDARD.encode([9u8; 16]);
+        assert!(acl_add_to(&path, &short).is_err());
+        // Nothing was written for the rejected keys.
+        assert!(!path.exists(), "a rejected add must not create the file");
+    }
 
     #[test]
     fn parse_max_turns_env_accepts_zero() {

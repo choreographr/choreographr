@@ -1952,11 +1952,10 @@ impl DaemonState {
     }
 
     /// Enroll a client key: validate the base64/32-byte key, append a
-    /// `[[client]]` entry to `authorized_clients.toml` under the advisory
-    /// file lock (coexisting with the watcher's reads and future
-    /// `choreographr acl-add` writes), hot-reload the SharedAcl (this loop
-    /// is its single writer), broadcast `AclUpdated` so connected clients
-    /// see the new trust total, and reply with the count.
+    /// `[[client]]` entry via [`acl::append_key_locked`] (the shared
+    /// lock-discipline write used by the CLI too), hot-reload the SharedAcl
+    /// (this loop is its single writer), broadcast `AclUpdated` so connected
+    /// clients see the new trust total, and reply with the count.
     ///
     /// Re-authorizing an ALREADY-present key is a success reply with no
     /// write — idempotent for a client that retries a slow request.
@@ -1977,52 +1976,7 @@ impl DaemonState {
                 return Ok(acl.len());
             }
 
-            let path = acl.path().to_path_buf();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("cannot create the ACL directory: {e}"))?;
-            }
-
-            // Append under the advisory exclusive lock — the same discipline
-            // the config watcher's reads and `choreographr acl-add` use, so
-            // a concurrent reload never observes a torn entry.
-            #[cfg(unix)]
-            let file = {
-                use std::os::unix::fs::OpenOptionsExt;
-                let f: std::fs::File = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .read(true)
-                    .mode(0o600)
-                    .open(&path)
-                    .map_err(|e| format!("cannot open the ACL file: {e}"))?;
-                f.lock()
-                    .map_err(|e| format!("cannot lock the ACL file: {e}"))?;
-                f
-            };
-            #[cfg(not(unix))]
-            let file: std::fs::File = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&path)
-                .map_err(|e| format!("cannot open the ACL file: {e}"))?;
-            let mut file = file;
-            file.lock()
-                .map_err(|e| format!("cannot lock the ACL file: {e}"))?;
-            // Append mode + O_APPEND: the entry lands atomically at the end.
-            use std::io::Write;
-            write!(
-                file,
-                "[[client]]\npubkey = \"{}\"\n",
-                base64::engine::general_purpose::STANDARD.encode(key)
-            )
-            .map_err(|e| format!("cannot write the ACL entry: {e}"))?;
-            file.sync_all()
-                .map_err(|e| format!("cannot flush the ACL file: {e}"))?;
-            file.unlock()
-                .map_err(|e| format!("cannot unlock the ACL file: {e}"))?;
-            drop(file);
+            crate::server::acl::append_key_locked(acl.path(), &key)?;
 
             // Single-writer reload: the parse-compare inside reload makes
             // this the authoritative snapshot update.

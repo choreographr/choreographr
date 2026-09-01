@@ -90,6 +90,16 @@ impl Acl {
     pub fn contains(&self, pubkey: &[u8; 32]) -> bool {
         self.keys.contains(pubkey)
     }
+
+    /// The number of authorized clients (for counts in replies/logs).
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether no clients are authorized.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
 }
 
 /// A hot-reloadable ACL: the file path it was loaded from plus an
@@ -191,6 +201,54 @@ impl SharedAcl {
             "ACL reloaded from disk (hot-reload)"
         );
     }
+}
+
+/// Append one `[[client]]` entry to the ACL file at `path` under the
+/// advisory exclusive file lock — the single write discipline shared by the
+/// daemon's `/acl add` handler and the `choreographr acl-add` CLI, so
+/// concurrent reload reads, socket-driven adds, and CLI adds serialize
+/// instead of tearing each other's entries. Creates the parent dir and the
+/// file itself as needed. Returns after an fsync: the entry is on disk.
+pub fn append_key_locked(path: &Path, key: &[u8; 32]) -> Result<(), String> {
+    use base64::Engine as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create the ACL directory: {e}"))?;
+    }
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("cannot open the ACL file: {e}"))?
+    };
+    #[cfg(not(unix))]
+    let file: std::fs::File = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)
+        .map_err(|e| format!("cannot open the ACL file: {e}"))?;
+    file.lock()
+        .map_err(|e| format!("cannot lock the ACL file: {e}"))?;
+    // Append mode (O_APPEND): the entry lands atomically at the end even
+    // against another process's concurrent append.
+    use std::io::Write;
+    write!(
+        &file,
+        "[[client]]\npubkey = \"{}\"\n",
+        base64::engine::general_purpose::STANDARD.encode(key)
+    )
+    .map_err(|e| format!("cannot write the ACL entry: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("cannot flush the ACL file: {e}"))?;
+    file.unlock()
+        .map_err(|e| format!("cannot unlock the ACL file: {e}"))?;
+    Ok(())
 }
 
 /// Spawn the thin consumer that watches `authorized_clients.toml` edits
