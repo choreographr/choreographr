@@ -304,6 +304,14 @@ impl SpawnedDaemon {
         }
     }
 
+    /// Reclaim the server thread's JoinHandle without signaling or joining.
+    /// For tests that deliver SIGINT themselves and poll — rather than join —
+    /// the server thread, so a wedged shutdown fails the test instead of
+    /// hanging the teardown's unbounded `handle.join()`.
+    pub fn take_handle(&mut self) -> Option<thread::JoinHandle<std::io::Result<()>>> {
+        self.handle.take()
+    }
+
     /// Convenience: the socket path as a String for client APIs.
     pub fn socket_str(&self) -> String {
         self.socket_path

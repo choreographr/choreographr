@@ -140,6 +140,11 @@ impl McpManager {
     pub fn shutdown_all(&mut self) {
         info!(count = self.clients.len(), "shutting down MCP servers");
         for (slug, shared) in self.clients.drain() {
+            // Log per-server BEGIN and END: if a Ctrl+C wedge stops between
+            // the two, THIS server is the culprit — either its client mutex
+            // is held by a stuck tool call (blocked before the "done" line)
+            // or its transport shutdown hung (after it).
+            debug!(server = %slug, "waiting for MCP client lock + shutdown");
             match shared.lock() {
                 Ok(mut client) => {
                     debug!(server = %slug, "shutting down MCP server");
@@ -152,7 +157,9 @@ impl McpManager {
                     );
                 }
             }
+            debug!(server = %slug, "MCP server shut down");
         }
+        info!("all MCP servers shut down");
     }
 
     /// Create an empty McpManager with no servers (for testing).

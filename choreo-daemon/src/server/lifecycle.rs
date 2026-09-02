@@ -385,12 +385,26 @@ pub fn run_server(
     let cmd_handle = thread::spawn(move || {
         loop {
             match daemon_rx.recv() {
-                Ok(DaemonCommand::Shutdown) => break,
+                Ok(DaemonCommand::Shutdown) => {
+                    // Announce the stage: everything after this line is
+                    // teardown (session joins, MCP shutdown), and each stage
+                    // below logs its completion — the last line printed
+                    // under a wedged Ctrl+C identifies the culprit.
+                    info!("command loop: shutdown command received; beginning teardown");
+                    break;
+                }
                 Ok(cmd) => state.handle_command(cmd),
-                Err(mpsc::RecvError) => break,
+                Err(mpsc::RecvError) => {
+                    info!("command loop: all daemon command senders dropped");
+                    break;
+                }
             }
         }
         let active_sessions = std::mem::take(&mut state.active_sessions);
+        info!(
+            active_sessions = active_sessions.len(),
+            "command loop teardown: signalling session threads"
+        );
         for entry in active_sessions.values() {
             let _ = entry.cmd_tx.send(SessionCommand::Shutdown);
         }
@@ -414,8 +428,12 @@ pub fn run_server(
         for joiner in joiners {
             let _ = joiner.join();
         }
+        info!("command loop teardown: session threads drained");
         // Shut down MCP servers after all sessions have exited.
+        // `shutdown_all` logs its begin/end; a wedge between those two lines
+        // means an MCP client lock is held by a stuck tool call.
         state.mcp_manager.shutdown_all();
+        info!("command loop teardown: complete");
     });
 
     // Initialize the metrics registry so that instrumented code throughout
@@ -563,6 +581,7 @@ pub fn run_server(
     // (the kernel deschedules us until a connection arrives).
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            info!("accept loop: shutdown flag observed (pre-accept check)");
             break;
         }
         // Collect TCP connection threads whose handshakes completed since the
@@ -572,6 +591,7 @@ pub fn run_server(
             Ok((stream, _)) => {
                 if shutdown.load(Ordering::SeqCst) {
                     // Wakeup from the signal handler — shut down.
+                    info!("accept loop: woken by shutdown signal");
                     break;
                 }
                 // Enforce the concurrent-connection cap: at the cap, the
@@ -642,7 +662,8 @@ pub fn run_server(
         let _ = TcpStream::connect_timeout(&probe, ACCEPT_PROBE_CONNECT_TIMEOUT);
     }
     if let Some(handle) = tcp_accept_handle.take() {
-        join_thread_bounded(handle, Instant::now() + CONNECTION_DRAIN_GRACE);
+        let exited = join_thread_bounded(handle, Instant::now() + CONNECTION_DRAIN_GRACE);
+        info!(exited, "TCP accept thread drained");
     }
 
     // Collect TCP connection threads spawned concurrently with shutdown so
@@ -655,12 +676,17 @@ pub fn run_server(
     // socket, so a client observes the notification before the EOF. The main
     // thread writes nothing to client sockets — that is what guarantees the
     // notification cannot be lost to a race with a socket close.
+    info!(
+        tracked_connection_threads = client_threads.len(),
+        "queueing shutdown broadcast + command-loop stop"
+    );
     let _ = daemon_tx.send(DaemonCommand::BroadcastShuttingDown);
     let _ = daemon_tx.send(DaemonCommand::Shutdown);
     drop(daemon_tx);
     cmd_handle.join().unwrap_or_else(|e| {
         error!("command thread panicked: {e:?}");
     });
+    info!("command loop thread joined");
 
     // Collect any stragglers, then wait (bounded) for each connection thread
     // — and, through it, its writer thread — to finish. Every healthy writer
@@ -672,13 +698,19 @@ pub fn run_server(
     // deadline so N wedged clients cost ~one grace period, not N × grace.
     drain_tcp_handles(&tcp_client_rx, &mut client_threads);
     let drain_deadline = Instant::now() + CONNECTION_DRAIN_GRACE;
+    info!(
+        connection_threads = client_threads.len(),
+        "draining connection threads (bounded)"
+    );
     for handle in client_threads {
         join_thread_bounded(handle, drain_deadline);
     }
+    info!("connection threads drained");
 
     if Path::new(socket_path).exists() {
         std::fs::remove_file(socket_path)?;
     }
+    info!("shutdown complete");
     Ok(())
 }
 
