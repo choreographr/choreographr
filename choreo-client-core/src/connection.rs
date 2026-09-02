@@ -176,6 +176,27 @@ pub fn run_daemon_tcp_connection(
     )
 }
 
+/// The 1-byte handshake-mode preamble (TCP wire v5) goes out BEFORE any
+/// handshake message, then the Noise IK handshake runs. Returns the raw
+/// `TransportError` so callers can classify the failure (the
+/// ConnectionRefused wrapping lives one layer up, in
+/// [`ik_handshake_and_serve`]). Shared by the session-opening path and the
+/// [`verify_daemon_authorization`] preflight so both exercise the exact
+/// same wire sequence the daemon will judge.
+fn ik_handshake_raw(
+    mut tcp: std::net::TcpStream,
+    client_sk: &[u8; 32],
+    server_pk: &[u8; 32],
+) -> Result<choreo_transport::noise::NoiseStream, TransportError> {
+    // The preamble is unauthenticated by design — the daemon uses it
+    // only to pick which equally-authenticated handshake to run; the IK
+    // handshake itself authenticates both static keys and gates the ACL.
+    // A single-byte write to a fresh blocking socket cannot meaningfully
+    // block (it fits any socket buffer), so no timeout is armed for it.
+    tcp.write_all(&[PREAMBLE_IK])?;
+    handshake_initiator(tcp, client_sk, server_pk)
+}
+
 /// Preamble + Noise IK handshake over an ALREADY-DIALED TCP stream, then
 /// the encrypted session loop. Shared by [`run_daemon_tcp_connection`] and
 /// [`run_daemon_tcp_connection_pinned`] so both paths run the identical
@@ -185,27 +206,19 @@ pub fn run_daemon_tcp_connection(
 /// returned from here unambiguously mean the HANDSHAKE failed, not the
 /// network.
 fn ik_handshake_and_serve(
-    mut tcp: std::net::TcpStream,
+    tcp: std::net::TcpStream,
     client_sk: &[u8; 32],
     server_pk: &[u8; 32],
     handle_daemon_message: impl FnMut(DaemonMessage),
     from_ui: mpsc::Receiver<ClientMessage>,
     shutdown_rx: Option<mpsc::Receiver<()>>,
 ) -> Result<(), ClientError> {
-    // The 1-byte handshake-mode preamble (TCP wire v5) goes out BEFORE any
-    // handshake message. It is unauthenticated by design — the daemon uses it
-    // only to pick which equally-authenticated handshake to run; the IK
-    // handshake itself authenticates both static keys and gates the ACL.
-    // A single-byte write to a fresh blocking socket cannot meaningfully
-    // block (it fits any socket buffer), so no timeout is armed for it.
-    tcp.write_all(&[PREAMBLE_IK]).map_err(ClientError::Io)?;
-    let noise = handshake_initiator(tcp, client_sk, server_pk).map_err(|e| {
+    let noise = ik_handshake_raw(tcp, client_sk, server_pk).map_err(|e| {
         ClientError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             e,
         ))
     })?;
-
     serve_noise_connection(noise, handle_daemon_message, from_ui, shutdown_rx)
 }
 
@@ -396,6 +409,82 @@ pub fn probe_server_key(addr: &str) -> Result<[u8; 32], ClientError> {
     drop(noise);
     debug!(addr, "server key probe complete; transport dropped");
     Ok(server_pk)
+}
+
+/// Why a preflight authorization check failed (see
+/// [`verify_daemon_authorization`]). The two cases need DIFFERENT
+/// remediation — "start the daemon / check the network" vs "get your key
+/// enrolled" — so they are distinguished at the type level instead of by
+/// string-matching an `io::ErrorKind` (a dial refusal and a handshake
+/// rejection both involve connection-level I/O and must not be conflated).
+#[derive(Debug, thiserror::Error)]
+pub enum PreflightError {
+    /// The daemon could not be reached at all (dial failure).
+    #[error("cannot reach the daemon: {0}")]
+    Unreachable(#[source] std::io::Error),
+    /// The daemon was reached but the Noise IK handshake failed: the
+    /// daemon either does not hold the expected server key, or its ACL
+    /// did not admit this client's transport key. (An IK handshake is the
+    /// ONLY probe that can detect the ACL rejection — the daemon aborts
+    /// the handshake before message 2 — which is why this preflight runs
+    /// IK even on a first-contact flow that already probed with XX.)
+    #[error("the daemon rejected the connection handshake: {0}")]
+    Rejected(#[source] TransportError),
+}
+
+/// The client's OWN Noise transport public key (generating the on-disk
+/// keypair first if absent). This is the identity the daemon's ACL judges:
+/// UIs embed it (and its fingerprint) in enrollment-remediation messages so
+/// a TUI-only user never needs the daemon binary just to read out their key.
+pub fn own_transport_pubkey() -> Result<[u8; 32], ClientError> {
+    let (_sk, pk) =
+        ensure_transport_keypair().map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
+    Ok(pk)
+}
+
+/// Verify that the daemon at `addr` will actually admit this client BEFORE
+/// the caller commits to a full session (the TUI runs this before starting
+/// any UI).
+///
+/// Dials `addr`, runs the complete Noise IK handshake against `server_pk`,
+/// and immediately drops the established transport — no protocol message is
+/// ever sent. A successful IK handshake proves BOTH properties at once:
+/// the daemon holds the expected static key (the handshake authenticates
+/// it) AND the daemon's ACL admitted this client's key (the responder
+/// checks the ACL mid-handshake and closes the connection before completing
+/// it when the client is not enrolled). No other check can detect the
+/// enrollment case: the XX first-contact probe completes client-side before
+/// the daemon's ACL check runs, so it always "succeeds" for un-enrolled
+/// clients.
+///
+/// The cost is one extra handshake per connect — negligible against the
+/// session it gates, and it converts "TUI starts, then dies with a cryptic
+/// I/O error on first use" into a clear refusal before any UI exists.
+pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(), PreflightError> {
+    info!(
+        addr,
+        "authorization preflight: probing daemon with IK handshake"
+    );
+
+    let (client_sk, _client_pk) = ensure_transport_keypair()
+        .map_err(|e| PreflightError::Unreachable(std::io::Error::other(e)))?;
+
+    // Dial failure = the daemon is down / unreachable — reported as-is so
+    // the caller's message can point at the network, not at enrollment.
+    let tcp = std::net::TcpStream::connect(addr).map_err(PreflightError::Unreachable)?;
+
+    // Handshake failure = rejection (wrong server key OR this client not
+    // enrolled in the daemon's ACL). Classified as `Rejected`; the caller
+    // renders the remediation.
+    let noise =
+        ik_handshake_raw(tcp, client_sk.as_bytes(), server_pk).map_err(PreflightError::Rejected)?;
+
+    // The handshake succeeded — the daemon will admit us. Drop the
+    // transport; the real session opens fresh (the daemon cleans the
+    // preflight connection up through its normal disconnect path).
+    drop(noise);
+    debug!(addr, "authorization preflight passed");
+    Ok(())
 }
 
 /// Connect via Noise IK against the key PINNED in `known_servers.toml` for

@@ -158,6 +158,14 @@ struct Cli {
 ///
 /// This runs BEFORE the TUI starts, so no `Unlock` — which carries the
 /// daemon's private key — can ever flow over an unconfirmed channel.
+///
+/// Every TCP path here ALSO ends with an authorization preflight
+/// ([`preflight_daemon_authorization`]): a full Noise IK handshake that the
+/// daemon's ACL judges. This is what DENIES the TUI from starting when this
+/// client's key is not enrolled — the XX probe used for first contact CANNOT
+/// detect that (its handshake completes client-side before the daemon's ACL
+/// check runs), so without the preflight an un-enrolled client used to get
+/// all the way into the TUI and only fail later with a cryptic I/O error.
 fn resolve_connect_mode(
     addr: &str,
     server_pk_path: Option<&str>,
@@ -170,6 +178,7 @@ fn resolve_connect_mode(
         let pk = choreo_client_core::read_server_pk(Some(path))
             .context("failed to read server public key")?;
         tracing::info!(addr, path, "using explicitly provided server public key");
+        preflight_daemon_authorization(addr, &pk)?;
         return Ok(ConnectionMode::Tcp {
             addr: addr.to_string(),
             server_pk: pk,
@@ -184,6 +193,7 @@ fn resolve_connect_mode(
             fingerprint = %choreo_client_core::fingerprint(&pk),
             "connecting with pinned server key"
         );
+        preflight_daemon_authorization(addr, &pk)?;
         return Ok(ConnectionMode::TcpPinned(addr.to_string()));
     }
 
@@ -227,10 +237,78 @@ fn resolve_connect_mode(
         .pin(addr, &learned)
         .context("failed to persist the confirmed server key")?;
     tracing::info!(addr, fingerprint = %fp, "server key confirmed and pinned");
+    preflight_daemon_authorization(addr, &learned)?;
     Ok(ConnectionMode::Tcp {
         addr: addr.to_string(),
         server_pk: learned,
     })
+}
+
+/// Preflight the daemon's authorization decision: run a full Noise IK
+/// handshake against the server key we are about to connect with, so the
+/// daemon's ACL verdict is known BEFORE the TUI starts. On refusal this
+/// exits with a remediation message instead of letting the TUI start and
+/// die on its first prompt.
+fn preflight_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> anyhow::Result<()> {
+    if let Err(e) = choreo_client_core::verify_daemon_authorization(addr, server_pk) {
+        // The enrollment-remediation message embeds THIS client's identity,
+        // so a TUI-only user (who has no choreographr binary) can copy-paste
+        // their key straight to the daemon operator. Reading the keypair is
+        // best-effort: it exists whenever the preflight ran, and a failure
+        // degrades to the generic wording rather than masking the real
+        // error.
+        let client_pk = choreo_client_core::own_transport_pubkey().ok();
+        anyhow::bail!(preflight_failure_message(addr, &e, client_pk.as_ref()));
+    }
+    Ok(())
+}
+
+/// Render a preflight failure as a human-actionable message. Factored out
+/// of [`preflight_daemon_authorization`] so tests can pin the wording.
+fn preflight_failure_message(
+    addr: &str,
+    err: &choreo_client_core::PreflightError,
+    client_pk: Option<&[u8; 32]>,
+) -> String {
+    match err {
+        choreo_client_core::PreflightError::Unreachable(io) => format!(
+            "cannot reach the daemon at {addr}: {io}\n\
+             is the daemon running, and did it start with --tcp-addr?",
+        ),
+        choreo_client_core::PreflightError::Rejected(_) => {
+            // The identity block: fingerprint for human comparison, plus the
+            // raw base64 pubkey the operator's enrollment command consumes —
+            // everything the TUI-only user needs, nothing left for them to
+            // run on this machine.
+            let identity = client_pk
+                .map(|pk| {
+                    use base64::Engine as _;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(pk);
+                    format!(
+                        "your client fingerprint:\n\
+                         {}\n\
+                         your public key (send this to the daemon operator):\n\
+                         {b64}\n\
+                         the operator enrolls it on the daemon machine with:\n\
+                         choreographr acl-add {b64}\n\
+                         (or '/acl add {b64}' from a local TUI connection there)\n",
+                        choreo_client_core::fingerprint(pk),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "your client key could not be read from this machine's config directory.\n"
+                        .to_string()
+                });
+            format!(
+                "the daemon at {addr} did not authorize this client's transport key.\n\
+                 {identity}\
+                 once enrolled, reconnect.\n\
+                 if you pinned this server before and its key has since changed, remove the\n\
+                 entry for {addr} from known_servers.toml and reconnect to re-confirm.\n\
+                 ({err})",
+            )
+        }
+    }
 }
 
 /// Normalize a fingerprint for comparison: drop the grouping spaces, keep
@@ -403,6 +481,91 @@ mod cli_tests {
         assert_ne!(
             strip_fp_whitespace("AB CD EF"),
             strip_fp_whitespace("ab cd ef")
+        );
+    }
+
+    // ── Preflight failure messages ─────────────────────────
+
+    /// An UNREACHABLE daemon (dial failure) must read as a network problem,
+    /// never as an enrollment problem.
+    #[test]
+    fn preflight_unreachable_message_points_at_the_network() {
+        let err = choreo_client_core::PreflightError::Unreachable(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+        let msg = preflight_failure_message("host:9443", &err, None);
+        assert!(
+            msg.contains("cannot reach the daemon at host:9443"),
+            "unreachable must name the address, got: {msg}"
+        );
+        assert!(
+            msg.contains("--tcp-addr"),
+            "unreachable must hint at the daemon's flags, got: {msg}"
+        );
+        assert!(
+            !msg.contains("acl-add"),
+            "unreachable must NOT suggest enrollment remediation, got: {msg}"
+        );
+    }
+
+    /// A REJECTED handshake (daemon up, ACL miss / key change) must read as
+    /// an authorization problem and carry the enrollment remediation with
+    /// THIS client's identity EMBEDDED — the TUI user has no choreographr
+    /// binary, so the message itself must carry the fingerprint and the
+    /// copy-pasteable base64 pubkey.
+    #[test]
+    fn preflight_rejected_message_carries_enrollment_remediation() {
+        let err = choreo_client_core::PreflightError::Rejected(
+            choreo_transport::error::TransportError::AuthFailed,
+        );
+        let pk = [
+            0x3F, 0x2A, 0x9C, 0x11, 0x7B, 0x04, 0xE5, 0xD8, 0xA1, 0xC6, 0x42, 0xD9, 0x08, 0xF3,
+            0xB7, 0xE2, 0x5D, 0x60, 0x19, 0xAB, 0xCC, 0x37, 0x84, 0x0E, 0x71, 0xFA, 0x92, 0x63,
+            0xDD, 0x4B, 0x26, 0x50,
+        ];
+        use base64::Engine as _;
+        let pk_b64 = base64::engine::general_purpose::STANDARD.encode(pk);
+        let msg = preflight_failure_message("host:9443", &err, Some(&pk));
+        assert!(
+            msg.contains("did not authorize this client's transport key"),
+            "rejected must state the authorization failure, got: {msg}"
+        );
+        // The client's identity is IN the message — nothing to run locally.
+        assert!(
+            msg.contains(&choreo_client_core::fingerprint(&pk)),
+            "rejected must embed the client's fingerprint, got: {msg}"
+        );
+        assert!(
+            msg.contains(&pk_b64),
+            "rejected must embed the copy-pasteable base64 pubkey, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("choreographr acl-add {pk_b64}")),
+            "the enrollment command must be ready to run with the actual key, got: {msg}"
+        );
+        assert!(
+            msg.contains("known_servers.toml"),
+            "rejected must cover the server-key-change re-pair path, got: {msg}"
+        );
+    }
+
+    /// Degradation: if the client keypair cannot be read, the message must
+    /// still state the authorization failure (never mask the real error
+    /// with a key-reading failure).
+    #[test]
+    fn preflight_rejected_message_degrades_without_the_client_key() {
+        let err = choreo_client_core::PreflightError::Rejected(
+            choreo_transport::error::TransportError::AuthFailed,
+        );
+        let msg = preflight_failure_message("host:9443", &err, None);
+        assert!(
+            msg.contains("did not authorize this client's transport key"),
+            "the failure statement must survive a missing key, got: {msg}"
+        );
+        assert!(
+            msg.contains("could not be read"),
+            "the missing key must be mentioned, got: {msg}"
         );
     }
 }

@@ -156,6 +156,92 @@ fn probe_server_key_learns_server_static() {
         .expect("responder handshake succeeded");
 }
 
+/// THE enrollment preflight, accepted side: `verify_daemon_authorization`
+/// against a responder that authorizes this client (the daemon's shape:
+/// preamble + IK responder with an ACL closure) must succeed without any
+/// protocol message being exchanged — the preflight drops the transport.
+#[test]
+#[ignore]
+fn verify_daemon_authorization_accepts_enrolled_client() {
+    let roots = TestRoots::install();
+    let _ = &roots;
+    let server = ServerKeys::generate();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr").to_string();
+
+    let client_pk = roots.client_pk;
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut preamble = [0u8; 1];
+        stream.read_exact(&mut preamble).expect("read preamble");
+        assert_eq!(preamble[0], choreo_transport::handshake::PREAMBLE_IK);
+        let result = choreo_transport::handshake::handshake_responder(stream, &server.sk, |pk| {
+            pk == &client_pk
+        })
+        .map(|_| ());
+        let _ = result_tx.send(result);
+    });
+
+    choreo_client_core::verify_daemon_authorization(&addr, &server.pk)
+        .expect("an enrolled client must pass the preflight");
+
+    // The responder completed the handshake too (the preflight is a real
+    // full IK handshake, then drops the transport).
+    result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("responder result")
+        .expect("responder handshake succeeded");
+}
+
+/// THE enrollment preflight, rejected side — the exact bug this closes: a
+/// client NOT in the daemon's ACL must be refused HERE, before any UI
+/// starts, with a `Rejected` classification (not an unreachable/network
+/// error). The daemon's IK responder aborts before message 2 when the ACL
+/// misses, so the client's handshake fails mid-read; the XX probe cannot
+/// detect this (it completes client-side before the daemon's check), which
+/// is why the preflight speaks IK.
+#[test]
+#[ignore]
+fn verify_daemon_authorization_rejects_unenrolled_client() {
+    let roots = TestRoots::install();
+    let _ = &roots;
+    let server = ServerKeys::generate();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr").to_string();
+
+    // The daemon's ACL closure rejects EVERYONE — this client is not
+    // enrolled.
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut preamble = [0u8; 1];
+        stream.read_exact(&mut preamble).expect("read preamble");
+        assert_eq!(preamble[0], choreo_transport::handshake::PREAMBLE_IK);
+        let result =
+            choreo_transport::handshake::handshake_responder(stream, &server.sk, |_| false)
+                .map(|_| ());
+        let _ = result_tx.send(result);
+    });
+
+    let outcome = choreo_client_core::verify_daemon_authorization(&addr, &server.pk);
+    match &outcome {
+        Err(choreo_client_core::PreflightError::Rejected(_)) => {}
+        other => panic!("an un-enrolled client must be classified Rejected, got {other:?}"),
+    }
+
+    // The daemon-side handshake reports the ACL rejection.
+    let server_result = result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("responder result");
+    assert!(
+        server_result.is_err(),
+        "the responder must have rejected the un-enrolled client"
+    );
+}
+
 /// `run_daemon_connection_with_mode(TcpPinned)` against a pinned key: full
 /// encrypted Ping → Pong round trip over the pinned-IK connection, with the
 /// responder replicating the daemon's preamble + IK accept path.

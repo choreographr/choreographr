@@ -3092,6 +3092,7 @@ dependencies = [
  "choreo-markdown",
  "choreo-proto",
  "choreo-sanitize",
+ "choreo-transport",
  "chrono",
  "clap",
  "crossbeam",

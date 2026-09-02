@@ -547,11 +547,24 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         println!("{message}");
     }
 
+    // The connection task's result is NEVER surfaced as an error: a failed
+    // dial/handshake is a condition the user needs a readable explanation
+    // for, not a crash. Returning it from run_app would escape main as a
+    // raw anyhow 'Error: I/O error: ...' line (observed as a crash when a
+    // daemon rejected an un-enrolled client). Instead the reason becomes
+    // the exit message, printed on the restored terminal.
     match connection_task.join() {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => return Err(error.into()),
+        Ok(Err(error)) => {
+            // Overwrite (not get_or_insert) the quit message: the
+            // ui_rx-disconnect arm has already inserted the generic
+            // "the connection to the daemon was closed" text, and the
+            // real error is strictly more specific.
+            app.quit_message = Some(format!("connection to the daemon failed: {error}"));
+        }
         Err(_) => {
-            return Err(io::Error::other("daemon connection thread panicked"));
+            app.quit_message
+                .get_or_insert_with(|| "daemon connection thread panicked".to_string());
         }
     }
 

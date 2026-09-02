@@ -61,3 +61,6 @@ avif = ["image/avif-native"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# Unit tests construct `PreflightError::Rejected(TransportError)` to pin the
+# preflight failure message's wording without a network.
+choreo-transport.workspace = true
