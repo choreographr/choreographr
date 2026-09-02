@@ -30,9 +30,11 @@
 #                   staging is a POSIX tar.gz with the service files
 #                   (systemd/launchd mean nothing on Windows) and the Windows
 #                   artifact is a zip; build flags still match release.sh.
-#   android-termux  scripts/build-android.sh on ubuntu + NDK — aarch64
-#                   Termux executables via cargo-ndk (choreo-gui is NOT built:
-#                   its APK payload is a dx/gradle flow, out of scope here),
+#   android-termux  scripts/build-android.sh on ubuntu (the runner image's
+#                   preinstalled Android NDK — see the comment in the job) —
+#                   aarch64 Termux executables via cargo-ndk (choreo-gui is
+#                   NOT built: its APK payload is a dx/gradle flow, out of
+#                   scope here),
 #                   then scripts/build-deb-termux.sh packages the same
 #                   binaries into the Termux-native .deb (no rebuild).
 #
@@ -259,19 +261,28 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add --toolchain stable aarch64-linux-android
 
-      - name: Install Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          # Exports ANDROID_NDK_HOME, which build-android.sh discovers.
-          # Bump the NDK release here when upgrading (r27c == 27.2.x).
-          ndk-version: r27c
-
+      # No NDK install step: the ubuntu runner image PREINSTALLS the Android
+      # NDK under ANDROID_HOME/ndk/<version>, and build-android.sh's own
+      # discovery (ANDROID_HOME/ndk, highest version wins) picks it up with
+      # zero configuration. A pinned download (nttld/setup-ndk@v1) was tried
+      # first and was silently ignored — the action only adds its copy to PATH
+      # and does NOT export ANDROID_NDK_HOME, so build-android.sh kept finding
+      # the image's NDK first (observed on run #8: pinned r27c downloaded, but
+      # the binaries were stamped r27d). Shipping the image's NDK avoids a
+      # ~700 MB download per run plus one action dependency; the cost is that
+      # the toolchain version tracks the runner image. That drift is VISIBLE,
+      # not silent: build-android.sh logs the discovered path ("==> NDK found:
+      # ..."), hard-fails if the image ever ships without an NDK, and every
+      # artifact records its NDK build in its ELF stamp (file(1): "built by NDK
+      # rXX (build)"). Bump the pinned-NDK approach back in only if a release
+      # genuinely needs a specific bionic/clang toolchain version.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
 
       # zlob's build.rs invokes zig directly (`zig cc`) rather than going
-      # through the NDK toolchain, so cargo-ndk + NDK alone don't satisfy it.
+      # through the NDK toolchain, so the preinstalled NDK alone doesn't
+      # satisfy it.
       - uses: mlugg/setup-zig@v2
 
       - uses: Swatinem/rust-cache@v2
