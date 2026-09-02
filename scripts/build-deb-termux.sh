@@ -13,9 +13,15 @@
 # Why this is NOT scripts/build-deb.sh reused:
 #   - Architecture tag: Termux's dpkg expects `aarch64`, not Debian's `arm64`
 #     (mismatched tags make dpkg refuse the package as "wrong architecture").
-#   - Install layout: files live at ./bin/<name>, which Termux's dpkg maps to
-#     $PREFIX/bin. Zero absolute paths anywhere in the package — there is no
-#     /usr on Android.
+#   - Install layout: files live at ./data/data/com.termux/files/usr/bin/<name>
+#     — the REAL on-device path of Termux's fixed $PREFIX. Termux's dpkg runs
+#     with install-root / (an app cannot chroot), so packages must carry the
+#     absolute path, exactly like Termux's own repo packages (verified against
+#     upstream dash_0.5.12: ./data/data/com.termux/files/usr/bin/dash). The
+#     earlier ./bin/ convention was wrong — dpkg tried to create /bin at the
+#     read-only device root (on-device failure, 2026-09-02). This hardcodes
+#     the official Termux app id (com.termux); forks with a different app id
+#     have a different private dir and need a rebuilt package.
 #   - No `Depends:`: the four binaries are static-bionic executables linking
 #     only Android system libs (interpreter /system/bin/linker64), so there is
 #     nothing in Termux's package universe to depend on.
@@ -73,21 +79,22 @@ for b in "${BINARIES[@]}"; do
 done
 
 # Stage the Termux layout in a throwaway root, then let dpkg-deb archive it.
-# `bin/` at the archive root is the Termux convention: Termux's dpkg rewrites
-# the package path list so ./bin/* lands in $PREFIX/bin. No other directories
-# — no /usr, no /etc, no absolute paths at all.
+# The path is Termux's fixed $PREFIX as it exists ON DEVICE — Termux's dpkg
+# installs against / with no chroot (see header), so the package must spell
+# out data/data/com.termux/files/usr/bin exactly. These are still RELATIVE
+# paths inside the archive (./data/...), anchored at the device root.
+TERMUX_USR="data/data/com.termux/files/usr"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
-# mktemp creates the root 0700; the package's root and bin/ directory entries
-# should carry sane 0755 modes (dpkg-deb preserves the staging tree's modes
-# verbatim, and there is no reason to ship a 0700 dir entry).
+# mktemp creates the root 0700; the package's directory entries should carry
+# sane 0755 modes (dpkg-deb preserves the staging tree's modes verbatim).
 chmod 0755 "$STAGE"
-mkdir -p "$STAGE/bin" "$STAGE/DEBIAN"
-chmod 0755 "$STAGE/bin"
+mkdir -p "$STAGE/$TERMUX_USR/bin" "$STAGE/DEBIAN"
+chmod 0755 "$STAGE/$TERMUX_USR/bin"
 for b in "${BINARIES[@]}"; do
     # 0755 explicitly: dpkg-deb preserves the staging tree's modes verbatim,
     # and the source bits are whatever the cross-build left on disk.
-    install -m 0755 "$REPO_ROOT/target/android/$ABI_DIR/$b" "$STAGE/bin/$b"
+    install -m 0755 "$REPO_ROOT/target/android/$ABI_DIR/$b" "$STAGE/$TERMUX_USR/bin/$b"
 done
 
 # Minimal control file: no Depends (static bionic binaries — see header), no
@@ -181,28 +188,39 @@ if [ "$CTRL_OK" -ne 1 ]; then
 fi
 echo "  ok: no maintainer scripts or conffiles"
 
-# Contents + exec bits: all four binaries at ./bin/<name>, mode -rwxr-xr-x
-# (dpkg-deb --contents prints the staging tree's modes verbatim).
+# Contents + exec bits: all four binaries at Termux's $PREFIX/bin (the real
+# on-device path — see the header), mode -rwxr-xr-x (dpkg-deb --contents
+# prints the staging tree's modes verbatim).
 CONTENTS="$(dpkg-deb --contents "$DEB")"
 for b in "${BINARIES[@]}"; do
-    if grep -q "^-rwxr-xr-x .* ./bin/$b\$" <<<"$CONTENTS"; then
-        echo "  ok: ./bin/$b (0755)"
+    if grep -q "^-rwxr-xr-x .* \./$TERMUX_USR/bin/$b\$" <<<"$CONTENTS"; then
+        echo "  ok: \$PREFIX/bin/$b (0755)"
     else
-        echo "error: $DEB contents check failed: expected executable ./bin/$b" >&2
+        echo "error: $DEB contents check failed: expected executable ./$TERMUX_USR/bin/$b" >&2
         echo "$CONTENTS" >&2
         exit 1
     fi
 done
 
-# Nothing else may be in the data archive — a stray absolute path (e.g. /usr)
-# would break the Termux layout guarantee.
-STRAY="$(grep -vE '^\S+ \S+ +[0-9]+ [0-9-]+ [0-9:]+ \./bin/(choreographr|choreo-tui|choreo-im|choreo-acp)$|^drwxr-xr-x .* \./$|^drwxr-xr-x .* \./bin/$' <<<"$CONTENTS" || true)"
-if [ -n "$STRAY" ]; then
-    echo "error: $DEB contains unexpected entries (only ./bin/* + dirs allowed):" >&2
-    echo "$STRAY" >&2
+# Nothing else may be in the data archive — the only directory chain allowed
+# is Termux's $PREFIX path (+ its parents), plus the four binaries. An explicit
+# whitelist loop (not a regex) so an unbalanced pattern can't silently invert
+# the check.
+STRAY_OK=1
+while IFS= read -r entry; do
+    # The archive path is the entry's last whitespace-separated field.
+    case "${entry##* }" in
+        ./|./data/|./data/data/|./data/data/com.termux/|./data/data/com.termux/files/|./data/data/com.termux/files/usr/|./data/data/com.termux/files/usr/bin/) ;;
+        ./data/data/com.termux/files/usr/bin/choreographr|./data/data/com.termux/files/usr/bin/choreo-tui|./data/data/com.termux/files/usr/bin/choreo-im|./data/data/com.termux/files/usr/bin/choreo-acp) ;;
+        *) STRAY_OK=0 ;;
+    esac
+done <<<"$CONTENTS"
+if [ "$STRAY_OK" -ne 1 ]; then
+    echo "error: $DEB contains unexpected entries (only \$PREFIX/bin/* allowed):" >&2
+    echo "$CONTENTS" >&2
     exit 1
 fi
-echo "  ok: data archive contains only ./bin/*"
+echo "  ok: data archive contains only \$PREFIX/bin/*"
 
 log "built $DEB"
 log "install inside a Termux shell: pkg install ./choreographr-termux_${VERSION}_${ARCH}.deb"

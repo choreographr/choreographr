@@ -944,8 +944,11 @@ The four suite binaries (`choreographr`, `choreo-tui`, `choreo-im`,
  cross-builds them via [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) and
 stages them in `target/android/<abi>/` — the staging tree that BOTH Termux
 release channels consume: `scripts/build-deb-termux.sh` packages it into the
-Termux-native `.deb` (`Architecture: aarch64`, files at `./bin/`, no
-`Depends:`, no maintainer scripts — the release-page artifact), and the raw
+Termux-native `.deb` (`Architecture: aarch64`, files at Termux's real
+`$PREFIX` path `./data/data/com.termux/files/usr/bin/` — its dpkg installs
+against `/` with no chroot, so the package carries the absolute on-device
+path like upstream Termux packages do; no `Depends:`, no maintainer scripts —
+the release-page artifact), and the raw
 `adb push` flow below remains the tarball fallback. (The staging lives under
 cargo's `target/`, not `dist/`: `dist/` holds only final publishable
 artifacts.) It temporarily strips the

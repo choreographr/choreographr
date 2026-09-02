@@ -92,12 +92,15 @@ if [[ "$TARBALL" == *.deb ]]; then
         FAIL=1
     fi
 
-    echo "==> checking contents (the four binaries at ./bin/, mode 0755)"
+    echo "==> checking contents (the four binaries in Termux's \$PREFIX/bin, mode 0755)"
+    # Termux's dpkg installs against / with no chroot, so the package carries
+    # the real on-device path of $PREFIX (like Termux's own repo packages).
+    TERMUX_BIN='\./data/data/com\.termux/files/usr/bin'
     for b in "${BINARIES[@]}"; do
-        if grep -q "^-rwxr-xr-x .* ./bin/$b\$" <<<"$CONTENTS"; then
-            echo "  ok: ./bin/$b (0755)"
+        if grep -q "^-rwxr-xr-x .* ${TERMUX_BIN}/$b\$" <<<"$CONTENTS"; then
+            echo "  ok: \$PREFIX/bin/$b (0755)"
         else
-            echo "  FAIL: ./bin/$b missing, wrong mode, or not executable" >&2
+            echo "  FAIL: \$PREFIX/bin/$b missing, wrong mode, or not executable" >&2
             FAIL=1
         fi
     done

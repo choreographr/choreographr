@@ -43,10 +43,14 @@ correctly once the user loads it, but loading is always the user's action.
 **Termux `.deb` — no tracked asset.** The Termux package's control file is
 generated inline by `scripts/build-deb-termux.sh` because it shares nothing
 with the desktop package: package `choreographr` with `Architecture: aarch64`
-(Termux's tag — NOT Debian's `arm64`), files at `./bin/<name>` (Termux's dpkg
-maps that onto `$PREFIX/bin`; zero absolute paths — there is no `/usr` on
-Android), no `Depends:` (the binaries are static bionic executables linking
-only Android system libs), and no maintainer scripts or conffiles — Termux has
+(Termux's tag — NOT Debian's `arm64`), files at
+`./data/data/com.termux/files/usr/bin/<name>` — Termux's dpkg installs
+against `/` (an app cannot chroot), so the package must carry the real
+on-device path of the fixed `$PREFIX`, exactly as upstream Termux packages
+do; a `./bin/` layout makes dpkg try to write `/bin` at the read-only device
+root (on-device failure, 2026-09-02). No `Depends:` (the binaries are static
+bionic executables linking only Android system libs), and no maintainer
+scripts or conffiles — Termux has
 no root (dpkg runs as the app uid) and nothing to configure; runtime state
 lives in `~/.local/share/choreographr/`, unpackaged. The archive is forced to
 xz compression (`-Zxz`): Termux's dpkg build has no zstd support, while
