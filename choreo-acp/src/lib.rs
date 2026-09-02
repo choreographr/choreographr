@@ -56,13 +56,33 @@ struct Cli {
     socket_path: String,
 
     /// Path to the log file (stderr is unused to avoid corrupting the ACP protocol stream).
-    #[arg(long = "log-file", default_value_t = String::from("/tmp/choreo-acp.log"))]
+    #[arg(long = "log-file", default_value_t = default_log_file())]
     log_file: String,
 }
 
+/// The ACP adapter's default log file: under the PLATFORM temp dir
+/// (`std::env::temp_dir()`), never a hardcoded `/tmp` — on Android/Termux
+/// there is no writable `/tmp`, and the adapter is started by an ACP client
+/// (editor) that cannot pass CLI flags, so the default must work there.
+fn default_log_file() -> String {
+    std::env::temp_dir()
+        .join("choreo-acp.log")
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn setup_logging(log_file: &str) -> Result<(), anyhow::Error> {
-    let file = std::fs::File::create(log_file)
-        .with_context(|| format!("failed to create log file '{log_file}'"))?;
+    // The log file is auxiliary diagnostics — stdout carries the ACP JSON-RPC
+    // stream and the adapter's job is to relay it, so a failure to create the
+    // log must never kill the adapter (the Termux /tmp lesson: diagnostics
+    // are never a startup precondition). The warning goes to stderr, which
+    // ACP clients surface as adapter logs without protocol corruption.
+    let Ok(file) = std::fs::File::create(log_file) else {
+        eprintln!(
+            "warning: could not create log file '{log_file}'; continuing without file logging"
+        );
+        return Ok(());
+    };
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::sync::Mutex::new(file))
         .with_ansi(false);
@@ -88,8 +108,9 @@ fn setup_logging(log_file: &str) -> Result<(), anyhow::Error> {
 pub fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
-    // Logging goes to /tmp/choreo-acp.log (never stderr, which is unused
-    // in the ACP protocol — stdout carries the JSON-RPC stream).
+    // Logging goes to $TMPDIR/choreo-acp.log (never stderr, which is unused
+    // in the ACP protocol — stdout carries the JSON-RPC stream); if the log
+    // file cannot be created the adapter continues without file logging.
     setup_logging(&cli.log_file).context("failed to initialize logging")?;
 
     tracing::info!(
@@ -159,5 +180,34 @@ mod cli_tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// The default log file must live under the PLATFORM temp dir — never a
+    /// hardcoded `/tmp`, which is not writable on Android/Termux (where the
+    /// ACP client launches the adapter without CLI flags, so the default is
+    /// the only path there is).
+    #[test]
+    fn default_log_file_is_under_the_platform_temp_dir() {
+        let path = default_log_file();
+        let expected = std::env::temp_dir().join("choreo-acp.log");
+        assert_eq!(path, expected.to_string_lossy());
+    }
+
+    /// A log file that cannot be created must not prevent the adapter from
+    /// starting: setup_logging degrades to no file logging (its stderr
+    /// warning is the only trace, safe in ACP since stdout carries the
+    /// JSON-RPC stream).
+    #[test]
+    fn setup_logging_survives_an_uncreatable_log_file() {
+        // A path under a regular FILE cannot be created as a directory
+        // child — deterministic EACCES/ENOENT without root assumptions.
+        let blocker = std::env::temp_dir().join("choreo-acp-log-test-blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker file");
+        let impossible = blocker.join("choreo-acp.log");
+
+        setup_logging(&impossible.to_string_lossy())
+            .expect("an uncreatable log file must degrade, not fail");
+
+        let _ = std::fs::remove_file(&blocker);
     }
 }
