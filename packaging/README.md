@@ -105,6 +105,11 @@ bump checklist. The manual steps that must stay in lockstep:
 
 ## Notes
 
+- **`.deb` archives are xz-compressed.** `dpkg-deb` ≥ 1.22 defaults to zstd
+  members, but both deb flavors must install on dpkg builds without zstd: the
+  desktop `.deb` targets old-dpkg distros (Ubuntu 22.04's dpkg 1.21.1), and
+  Termux's dpkg has no zstd at all. Both build scripts pass `-Zxz` and assert
+  the `debian-binary + control.tar.xz + data.tar.xz` member set.
 - **Binaries are stripped.** The workspace `[profile.release]` sets
   `strip = "symbols"` (root `Cargo.toml`), so the tarball, `.deb`, and `.rpm`
   all ship stripped binaries (~22% smaller). (Thin LTO was removed from the

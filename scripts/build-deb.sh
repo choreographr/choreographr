@@ -63,8 +63,24 @@ Description: Agentic coding assistant — daemon, TUI, and bridges
 EOF
 
 mkdir -p "$REPO_ROOT/dist"
+# -Zxz: force xz members — NOT dpkg-deb's default. dpkg >= 1.22 defaults to
+# zstd, but this package targets old-dpkg distros (the same old-CPU floor the
+# build targets — Ubuntu 22.04's dpkg 1.21.1 has no zstd support), which fail
+# with "could not locate member control.tar{xz,lzma,}" on a zstd package.
+# xz is universally supported; the assertion below guards the choice so a
+# future dpkg default flip fails here, not at install time.
+DEB="$REPO_ROOT/dist/choreographr-${VERSION}-x86_64.deb"
 # --root-owner-group stamps the archive files as root:root regardless of who
 # builds, so the .deb is byte-stable across builders.
-dpkg-deb --build --root-owner-group "$STAGE" \
-    "$REPO_ROOT/dist/choreographr-${VERSION}-x86_64.deb"
+dpkg-deb --build --root-owner-group -Zxz "$STAGE" "$DEB"
+
+# The archive members must be exactly the xz flavor (see the -Zxz comment).
+MEMBERS="$(ar t "$DEB")"
+if [ "$MEMBERS" != "$(printf 'debian-binary\ncontrol.tar.xz\ndata.tar.xz')" ]; then
+    echo "error: $DEB archive members are not the compat-safe xz set, found:" >&2
+    echo "$MEMBERS" >&2
+    exit 1
+fi
+echo "==> members ok: debian-binary + control.tar.xz + data.tar.xz (no zstd)"
+
 echo "built dist/choreographr-${VERSION}-x86_64.deb"
