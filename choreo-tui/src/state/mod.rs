@@ -66,6 +66,11 @@ pub(crate) fn input_inner_width(term_width: u16) -> usize {
 
 pub(crate) const CTRL_HELP_LINE1: &str =
     "ctrl+h help  ctrl+q quit  ctrl+a accounts  ctrl+s sessions  ctrl+m models";
+/// Help line for terminals WITHOUT the kitty keyboard protocol, where Ctrl+M
+/// is byte 0x0D (indistinguishable from Enter) and the model selector is
+/// rebound to Ctrl+O instead — see `App::keyboard_enhanced`.
+pub(crate) const CTRL_HELP_LINE1_LEGACY: &str =
+    "ctrl+h help  ctrl+q quit  ctrl+a accounts  ctrl+s sessions  ctrl+o models";
 pub(crate) const CTRL_HELP_LINE2: &str =
     "esc stop  alt+enter continue  ctrl+up undo  ctrl+down redo  ctrl+r reasoning";
 
@@ -350,6 +355,14 @@ pub(crate) struct App {
     pub(crate) attached_tool_groups: Vec<String>,
     pub(crate) page: Page,
     pub(crate) show_ctrl_help: bool,
+    /// Whether the terminal implemented the kitty keyboard protocol we push
+    /// at startup (probed via crossterm's `supports_keyboard_enhancement`
+    /// before the terminal-event thread starts). On legacy terminals (Termux
+    /// and friends) Ctrl+M is byte 0x0D — identical to Enter — so the model
+    /// selector is rebound to Ctrl+O and hints reflect it. Defaults to `true`:
+    /// kitty-capable terminals are the desktop majority, and every simulated
+    /// KeyEvent in tests is a kitty-encoding event.
+    pub(crate) keyboard_enhanced: bool,
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
     pub(crate) model_selector: ModelSelectorState,
@@ -487,6 +500,7 @@ impl App {
             attached_tool_groups: Vec::new(),
             page: Page::Chat,
             show_ctrl_help: true,
+            keyboard_enhanced: true,
             session_mgr: SessionManagerState::new(),
             ai_providers: AIProvidersState::new(),
             model_selector: ModelSelectorState::new(),
@@ -519,6 +533,18 @@ impl App {
             terminal_resized: false,
             session_displays: HashMap::new(),
             active_session_id: None,
+        }
+    }
+
+    /// The key that opens the model selector on THIS terminal: Ctrl+M on
+    /// kitty-protocol terminals; Ctrl+O on legacy terminals where Ctrl+M is
+    /// byte 0x0D (Enter) and can never reach the handler. Used by hint and
+    /// status strings so the user is always told a key that actually works.
+    pub(crate) fn model_selector_label(&self) -> &'static str {
+        if self.keyboard_enhanced {
+            "Ctrl+M"
+        } else {
+            "Ctrl+O"
         }
     }
 

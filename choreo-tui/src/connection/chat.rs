@@ -654,7 +654,10 @@ fn handle_chat_ctrl_key(
                     );
                 }
                 None => {
-                    app.status = Some("no model selected — pick one with Ctrl+M".to_string());
+                    app.status = Some(format!(
+                        "no model selected — pick one with {}",
+                        app.model_selector_label()
+                    ));
                     tracing::warn!(
                         session_id = ?app.attached_session_id,
                         "Ctrl+R pressed with no model selected",
@@ -690,8 +693,23 @@ fn handle_chat_ctrl_key(
                 .send(ClientMessage::ListAccounts)
                 .map_err(broken_pipe)?;
         }
-        KeyCode::Char('m') => {
-            tracing::debug!("Ctrl+M opening model selector");
+        KeyCode::Char('m') | KeyCode::Char('o') => {
+            // Two bindings, deliberately BOTH always live:
+            //   - Ctrl+M is the historical binding; it can only arrive as
+            //     Char('m')+CONTROL on a terminal that emitted the kitty CSI-u
+            //     encoding for it (a legacy terminal's Ctrl+M is byte 0x0D,
+            //     which crossterm reports as Enter and never reaches this arm).
+            //   - Ctrl+O is the legacy-terminal binding (Termux and friends,
+            //     where the kitty push is ignored) — see
+            //     `App::keyboard_enhanced`. Binding it unconditionally keeps
+            //     one code path and gives kitty terminals a working alias.
+            // The hint/status strings only ever name the key that works on
+            // the current terminal (`model_selector_label`).
+            tracing::debug!(
+                key = ?key.code,
+                enhanced = app.keyboard_enhanced,
+                "opening model selector"
+            );
             // An armed selection is keyed to the Chat page's history, but
             // the selector is a modal overlay that routes mouse events away
             // from the selection arms — a mid-drag Ctrl+M must not leave the

@@ -49,6 +49,58 @@ fn chat_ctrl_m_opens_selector_and_requests_models() {
     assert_eq!(msg, ClientMessage::ListModels);
 }
 
+// ── Model selector (Ctrl+O — legacy-terminal binding) ──
+//
+// On terminals without the kitty keyboard protocol (Termux et al.) Ctrl+M is
+// byte 0x0D — identical to Enter — so the selector is rebound to Ctrl+O (see
+// `App::keyboard_enhanced`). The binding itself is unconditional in the
+// handler; only hints are mode-aware.
+
+#[test]
+fn chat_ctrl_o_opens_selector_and_requests_models() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+o");
+
+    assert!(app.model_selector.is_open(), "ctrl+o opens the selector");
+    assert!(app.model_selector.loading, "selector waits for the reply");
+    let msg = rx.recv().expect("sent message");
+    assert_eq!(msg, ClientMessage::ListModels);
+}
+
+#[test]
+fn chat_ctrl_o_also_works_in_enhanced_mode() {
+    // Ctrl+O stays live on kitty-protocol terminals as an undocumented alias
+    // (the hints there advertise Ctrl+M, the historical binding).
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    assert!(app.keyboard_enhanced, "test_app defaults to enhanced mode");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+o in enhanced mode");
+
+    assert!(app.model_selector.is_open());
+}
+
+#[test]
+fn legacy_mode_hints_name_ctrl_o() {
+    let mut app = test_app();
+    assert_eq!(app.model_selector_label(), "Ctrl+M");
+
+    app.keyboard_enhanced = false;
+    assert_eq!(app.model_selector_label(), "Ctrl+O");
+}
+
 #[test]
 fn model_selector_populates_from_models_reply() {
     let (tx, _rx) = std::sync::mpsc::channel();

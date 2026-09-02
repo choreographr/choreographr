@@ -97,8 +97,10 @@ use crossterm::event::KeyEvent;
 /// (newline) remain distinguishable.
 ///
 /// Terminals that do not implement the kitty protocol simply ignore the push
-/// and keep legacy encodings (there Ctrl+M arrives as Enter); supporting
-/// those terminals is out of scope for now.
+/// and keep legacy encodings (there Ctrl+M arrives as Enter).  That case is
+/// detected at startup via `supports_keyboard_enhancement` and the model
+/// selector is rebound to Ctrl+O — see `App::keyboard_enhanced` and the
+/// `KeyCode::Char('o')` arm in `handle_chat_ctrl_key`.
 const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags = KeyboardEnhancementFlags::from_bits_retain(
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits(),
 );
@@ -301,6 +303,38 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // next keypress.  A zero-timeout poll is non-blocking and consumes nothing.
     let _ = event::poll(Duration::ZERO);
 
+    // Probe whether the terminal actually implemented the kitty protocol we
+    // just pushed.  This MUST run before the terminal-event thread below is
+    // spawned — the probe's response is delivered through the same crossterm
+    // event source the thread would drain, so a running thread would eat it
+    // and the probe would spuriously time out even on kitty terminals.
+    // crossterm's query waits up to 2s for a reply; kitty terminals answer
+    // immediately, legacy ones (Termux et al.) either answer DA-only or stay
+    // silent, both of which land here as "not enhanced".  Err (no response in
+    // time) is treated the same as false — the worst case is the legacy key
+    // binding on a terminal that actually supports the protocol, never the
+    // reverse.
+    let keyboard_enhanced = match crossterm::terminal::supports_keyboard_enhancement() {
+        Ok(true) => {
+            tracing::info!(
+                "[choreo-tui] terminal supports the kitty keyboard protocol — Ctrl+M opens the model selector"
+            );
+            true
+        }
+        Ok(false) => {
+            tracing::info!(
+                "[choreo-tui] terminal answered but lacks kitty keyboard enhancements — rebinding the model selector to Ctrl+O (Ctrl+M is Enter here)"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::info!(
+                "[choreo-tui] terminal did not answer the keyboard-enhancement probe ({e}) — assuming legacy encoding, model selector on Ctrl+O"
+            );
+            false
+        }
+    };
+
     // Spawn a background thread that reads terminal events via crossterm and
     // forwards them through a crossbeam channel so the main loop can block on
     // all event sources simultaneously via select!.
@@ -477,6 +511,9 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 
     let mut app = App::new();
     app.image_job_tx = Some(worker.job_tx);
+    // The probe ran before the reader thread spawned (see above); thread the
+    // result into App so key handlers and hints know which selector key works.
+    app.keyboard_enhanced = keyboard_enhanced;
 
     // ── Auto-unlock the daemon on connect ──────────────────────────
     //
