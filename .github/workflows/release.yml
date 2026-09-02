@@ -298,10 +298,13 @@ jobs:
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           # A wrong-target Android build still "works" on the runner and only
           # fails on-device, so verify the artifacts are ARM aarch64 ELF here.
-          file dist/android/arm64-v8a/*
-          file dist/android/arm64-v8a/* | grep -q 'ARM aarch64'
+          # target/android/<abi>/ is build-android.sh's staging tree (under
+          # cargo's target/ — dist/ is reserved for final publishable
+          # artifacts); packaging consumes it without rebuilding.
+          file target/android/arm64-v8a/*
+          file target/android/arm64-v8a/* | grep -q 'ARM aarch64'
           tar czf "dist/choreographr-${VERSION}-aarch64-linux-android.tar.gz" \
-              -C dist/android/arm64-v8a choreographr choreo-tui choreo-im choreo-acp
+              -C target/android/arm64-v8a choreographr choreo-tui choreo-im choreo-acp
 
       - name: Package the Termux .deb (no rebuild)
         run: |

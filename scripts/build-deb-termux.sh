@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # build-deb-termux.sh — build the Termux-native .deb from the ALREADY-BUILT
-# Android binaries in dist/android/arm64-v8a/. NO REBUILD happens here: the
+# Android binaries in target/android/arm64-v8a/. NO REBUILD happens here: the
 # binaries are cross-compiled by scripts/build-android.sh (locally) or by the
 # android-termux CI job (release.yml) before this script runs.
 #
@@ -40,7 +40,7 @@
 # (and documented in README's Termux section); a green CI run proves the
 # package is well-formed, not that Termux accepts it.
 #
-# Prerequisites: the four binaries in dist/android/arm64-v8a/ (see
+# Prerequisites: the four binaries in target/android/arm64-v8a/ (see
 # scripts/build-android.sh) and dpkg-deb (preinstalled on ubuntu runners; on
 # Arch install with: pacman -S dpkg).
 set -euo pipefail
@@ -66,8 +66,8 @@ command -v dpkg-deb >/dev/null 2>&1 || {
 # Fail fast on missing inputs so we never ship a half-built package. The
 # binaries must ALREADY be built (build-android.sh); this script never builds.
 for b in "${BINARIES[@]}"; do
-    [ -f "$REPO_ROOT/dist/android/$ABI_DIR/$b" ] || {
-        echo "error: missing $REPO_ROOT/dist/android/$ABI_DIR/$b — build the Android binaries first: ./scripts/build-android.sh" >&2
+    [ -f "$REPO_ROOT/target/android/$ABI_DIR/$b" ] || {
+        echo "error: missing $REPO_ROOT/target/android/$ABI_DIR/$b — build the Android binaries first: ./scripts/build-android.sh" >&2
         exit 1
     }
 done
@@ -87,7 +87,7 @@ chmod 0755 "$STAGE/bin"
 for b in "${BINARIES[@]}"; do
     # 0755 explicitly: dpkg-deb preserves the staging tree's modes verbatim,
     # and the source bits are whatever the cross-build left on disk.
-    install -m 0755 "$REPO_ROOT/dist/android/$ABI_DIR/$b" "$STAGE/bin/$b"
+    install -m 0755 "$REPO_ROOT/target/android/$ABI_DIR/$b" "$STAGE/bin/$b"
 done
 
 # Minimal control file: no Depends (static bionic binaries — see header), no

@@ -942,11 +942,13 @@ is on `PATH`.
 The four suite binaries (`choreographr`, `choreo-tui`, `choreo-im`,
 `choreo-acp`) run under Termux on Android. `scripts/build-android.sh`
  cross-builds them via [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) and
-stages them in `dist/android/<abi>/` — the staging tree that BOTH Termux
+stages them in `target/android/<abi>/` — the staging tree that BOTH Termux
 release channels consume: `scripts/build-deb-termux.sh` packages it into the
 Termux-native `.deb` (`Architecture: aarch64`, files at `./bin/`, no
 `Depends:`, no maintainer scripts — the release-page artifact), and the raw
-`adb push` flow below remains the tarball fallback. It temporarily strips the
+`adb push` flow below remains the tarball fallback. (The staging lives under
+cargo's `target/`, not `dist/`: `dist/` holds only final publishable
+artifacts.) It temporarily strips the
 workspace's per-profile `rustflags`
 (same mechanism as `just build-stable`) — profile rustflags apply regardless of
 `--target`, and `-C target-cpu=native` would emit host-CPU code that traps on
@@ -1007,7 +1009,7 @@ day-to-day workflow.
 just android-check                        # dry run: verify prerequisites, print what would run
 just android-binaries                     # build aarch64 (arm64-v8a)
 just android-binaries -- --emulator       # also build x86_64 for the emulator
-just package-deb-termux                   # package dist/android/arm64-v8a into the Termux .deb (no rebuild)
+just package-deb-termux                   # package target/android/arm64-v8a into the Termux .deb (no rebuild)
 just gui-android                          # choreo-gui via `dx build --platform android` (cdylib, NOT part of build-android.sh)
 ```
 
@@ -1021,7 +1023,7 @@ adb push dist/choreographr-termux_*.deb /sdcard/choreo/
 pkg install /sdcard/choreo/choreographr-termux_*.deb   # binaries land in $PREFIX/bin
 
 # Option 2 — the raw tarball fallback:
-adb push dist/android/arm64-v8a/* /sdcard/choreo/
+adb push target/android/arm64-v8a/* /sdcard/choreo/
 # then inside the Termux shell (adb cannot write Termux's private app dir):
 cp /sdcard/choreo/* $PREFIX/bin/ && chmod +x \
   $PREFIX/bin/choreographr $PREFIX/bin/choreo-tui $PREFIX/bin/choreo-im $PREFIX/bin/choreo-acp

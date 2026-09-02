@@ -213,13 +213,15 @@ if [ "$CHECK" = 1 ]; then
     # NDK or not is decided above, and nothing below mutates the tree.
     log "dry run — no changes made. Would build (on the stable toolchain):"
     for abi in $TARGETS; do
-        log "  cargo ndk -t $abi -o dist/android/$abi -- build --locked --profile dist \\"
+        # Matches the real invocation below (no -o: cargo-ndk only auto-copies
+        # cdylibs anyway; the binaries are staged explicitly afterwards).
+        log "  cargo ndk -t $abi -- build --locked --profile dist \\"
         [ -n "$FEATURES" ] && log "      --features $FEATURES \\"
         for bin in $BINS; do
             log "      -p choreographr --bin $bin"
         done
     done
-    log "output layout: dist/android/<abi>/{choreographr,choreo-tui,choreo-im,choreo-acp}"
+    log "staging layout: target/android/<abi>/{choreographr,choreo-tui,choreo-im,choreo-acp}"
     exit 0
 fi
 
@@ -297,7 +299,12 @@ trap 'exit 143' TERM HUP
 # invocation cargo-ndk makes.
 export RUSTFLAGS="-C target-cpu=generic"
 
-mkdir -p dist/android
+# Staging root for the per-ABI binaries. Under target/ (cargo's scratch space,
+# gitignored), NOT under dist/: dist/ is reserved for final, publishable
+# artifacts (tarballs, .deb, SHA256SUMS), and this tree is an intermediate —
+# a restaging of what cargo already wrote to target/<triple>/dist/ — that
+# packaging (build-deb-termux.sh) and adb-push consume as input.
+mkdir -p target/android
 # Map each cargo-ndk ABI name to its rustup triple (for locating the linked
 # binaries) — cargo-ndk's `-o` flag only copies *cdylib* artifacts into the
 # output dir (verified on a real run: plain `bin` executables are left in
@@ -330,11 +337,11 @@ for abi in $TARGETS; do
     # shipped Termux binaries come from the same [profile.dist] profile, and
     # land in target/<triple>/dist rather than target/<triple>/release.
     cargo ndk -t "$abi" -- build --locked --profile dist "${FEATURE_ARGS[@]}" "${PKG_ARGS[@]}"
-    # Copy the executables into the per-ABI output dir (see abi_to_triple note:
-    # cargo-ndk does not do this for plain bins).
-    mkdir -p "dist/android/$abi"
+    # Copy the executables into the per-ABI staging dir (see abi_to_triple
+    # note: cargo-ndk does not do this for plain bins).
+    mkdir -p "target/android/$abi"
     for bin in $BINS; do
-        cp "target/$triple/dist/$bin" "dist/android/$abi/$bin"
+        cp "target/$triple/dist/$bin" "target/android/$abi/$bin"
     done
 done
 
@@ -343,7 +350,7 @@ done
 log "binaries ready:"
 for bin in $BINS; do
     for abi in $TARGETS; do
-        src="dist/android/$abi/$bin"
+        src="target/android/$abi/$bin"
         [ -f "$src" ] || { echo "error: expected binary missing: $src" >&2; exit 1; }
         echo "  $src"
     done
@@ -352,7 +359,7 @@ done
 log "deploy to Termux (adb) — push to /sdcard, then copy from inside the Termux shell
 (because adb cannot write directly into Termux's private app dir):"
 cat <<EOF
-  adb push dist/android/arm64-v8a/* /sdcard/choreo/
+  adb push target/android/arm64-v8a/* /sdcard/choreo/
   # then inside the Termux shell:
   cp /sdcard/choreo/* \$PREFIX/bin/ && chmod +x \
     \$PREFIX/bin/choreographr \$PREFIX/bin/choreo-tui \$PREFIX/bin/choreo-im \$PREFIX/bin/choreo-acp
