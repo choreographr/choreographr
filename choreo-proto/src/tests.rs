@@ -180,7 +180,13 @@ fn socket_path_uses_env_override() {
 
 #[test]
 fn socket_path_default_when_env_not_set() {
-    assert_eq!(crate::io::socket_path_impl(|| None), DEFAULT_SOCKET_PATH);
+    // The default must live under the PLATFORM temp dir (TMPDIR-aware, so
+    // Termux/Android lands in the app's writable prefix tmp dir instead of
+    // a hardcoded /tmp that yields EACCES).
+    let default = crate::io::socket_path_impl(|| None);
+    let expected = std::env::temp_dir().join("choreographr.sock");
+    assert_eq!(default, expected.to_string_lossy());
+    assert_eq!(default, crate::default_socket_path());
 }
 
 #[test]

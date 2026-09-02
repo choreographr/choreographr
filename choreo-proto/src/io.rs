@@ -3,15 +3,29 @@ use crate::frame::{MAX_FRAME_SIZE, decode_frame, encode_frame};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/choreographr.sock";
 pub const SOCKET_PATH_ENV: &str = "CHOREOGRAPHR_SOCKET_PATH";
+
+/// The default Unix-socket path when `CHOREOGRAPHR_SOCKET_PATH` is unset:
+/// `choreographr.sock` under the PLATFORM temp dir (`std::env::temp_dir()`).
+///
+/// That is `/tmp/choreographr.sock` on a desktop Linux (TMPDIR unset), so
+/// behavior there is unchanged — but on Android/Termux `TMPDIR` points at
+/// the app's writable prefix tmp dir, which is the difference between the
+/// daemon and TUI working at all and dying with a context-free
+/// "Permission denied (os error 13)" on a hardcoded `/tmp`.
+pub fn default_socket_path() -> String {
+    std::env::temp_dir()
+        .join("choreographr.sock")
+        .to_string_lossy()
+        .into_owned()
+}
 
 pub fn socket_path() -> String {
     socket_path_impl(|| std::env::var(SOCKET_PATH_ENV).ok())
 }
 
 pub(crate) fn socket_path_impl(get_env: impl Fn() -> Option<String>) -> String {
-    get_env().unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string())
+    get_env().unwrap_or_else(default_socket_path)
 }
 
 pub fn write_message<W, T>(writer: &mut W, message: &T) -> Result<(), ProtoError>

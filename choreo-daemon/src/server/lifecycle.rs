@@ -200,10 +200,24 @@ pub fn run_server(
     transport_sk: TransportSecretKey,
     acl: std::sync::Arc<crate::server::acl::SharedAcl>,
 ) -> io::Result<()> {
+    // Both operations carry the socket path in the error: a bind/removal
+    // failure otherwise surfaces as a context-free "Permission denied (os
+    // error 13)" (the Termux /tmp failure mode) with no hint WHICH path
+    // was the problem — the path is the entire diagnosis.
     if Path::new(socket_path).exists() {
-        std::fs::remove_file(socket_path)?;
+        std::fs::remove_file(socket_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("removing the stale socket at {socket_path}: {e}"),
+            )
+        })?;
     }
-    let listener = UnixListener::bind(socket_path)?;
+    let listener = UnixListener::bind(socket_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("binding the Unix socket at {socket_path}: {e}"),
+        )
+    })?;
     info!(%socket_path, "choreographr listening");
 
     let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
