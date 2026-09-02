@@ -147,23 +147,67 @@ pub(crate) fn build_agent(
     connect_timeout_secs: u64,
     read_timeout_secs: u64,
     total_timeout_secs: u64,
+    user_agent: Option<&str>,
 ) -> ureq::Agent {
-    ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_connect(Some(std::time::Duration::from_secs(connect_timeout_secs)))
-            .timeout_recv_body(if read_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(read_timeout_secs))
-            } else {
-                None
-            })
-            .timeout_global(if total_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(total_timeout_secs))
-            } else {
-                None
-            })
-            .http_status_as_error(false)
-            .build(),
-    )
+    let mut cfg = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(connect_timeout_secs)))
+        .timeout_recv_body(if read_timeout_secs > 0 {
+            Some(std::time::Duration::from_secs(read_timeout_secs))
+        } else {
+            None
+        })
+        .timeout_global(if total_timeout_secs > 0 {
+            Some(std::time::Duration::from_secs(total_timeout_secs))
+        } else {
+            None
+        })
+        .http_status_as_error(false);
+    // Identify every inference request as choreographr, not ureq's default
+    // "ureq/x.y.z": providers use the User-Agent for metrics and some
+    // gateways treat unknown agents worse than named ones. The daemon
+    // supplies its version; `None` (e.g. tests) keeps ureq's default.
+    if let Some(ua) = user_agent {
+        cfg = cfg.user_agent(ua);
+    }
+    ureq::Agent::new_with_config(cfg.build())
+}
+
+/// `x-opencode-client` value sent to the opencode.ai zen/go gateway: names
+/// the calling agent, mirroring upstream's `x-opencode-client` flag.
+pub(crate) const OPENCODE_CLIENT_ID: &str = "choreographr";
+
+/// Gateway routing headers for the opencode.ai zen/go providers.
+///
+/// The gateway picks one weighted upstream per request from the providers
+/// that are *currently healthy* (it filters out disabled, over-budget,
+/// rate-limited and underperforming-tps upstreams, then keeps only the top
+/// priority tier) by hashing the **last 4 characters** of a sticky id: the
+/// `x-opencode-session` header when present, else the workspace id, else the
+/// caller IP. A sticky tracker then prefers the last provider that returned
+/// 200 for that (model, session) pair while it stays healthy. Sending the
+/// REAL per-session id — like upstream's own client does — spreads sessions
+/// across buckets and lets the gateway's own health machinery route around
+/// broken upstreams; a fixed constant would pin every choreographr session
+/// to one bucket forever, which is why the old hardcoded value was removed.
+///
+/// Only the known gateway slugs get headers (exact match, so an unrelated
+/// `opencode-*` slug is never given routing behavior it wasn't configured
+/// for); every other slug gets an empty list. Used by both the OpenAI client
+/// path and the Anthropic Messages path — the gateway reads the header
+/// before protocol dispatch, so both wire formats route identically.
+pub(crate) fn opencode_gateway_headers(
+    provider_slug: &str,
+    session_id: &str,
+    request_id: &str,
+) -> Vec<(&'static str, String)> {
+    match provider_slug {
+        "opencode" | "opencode-go" | "opencode-go-anthropic-compatible" => vec![
+            ("x-opencode-session", session_id.to_string()),
+            ("x-opencode-request", request_id.to_string()),
+            ("x-opencode-client", OPENCODE_CLIENT_ID.to_string()),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 /// Try to list models via the API; fall back to the static known list on any
@@ -402,5 +446,49 @@ mod tests {
         let mut cb = |_: StreamEvent| Err(io::Error::other("oops"));
         let err = emit_non_streaming_events(result, &mut cb).unwrap_err();
         assert_eq!(err.to_string(), "oops");
+    }
+
+    #[test]
+    fn opencode_gateway_headers_carry_real_session_identity() {
+        // The gateway hashes the last 4 chars of the sticky id and keys its
+        // sticky provider tracker on it — the values must be the turn's real
+        // ids, never a fixed constant.
+        for slug in [
+            "opencode",
+            "opencode-go",
+            "opencode-go-anthropic-compatible",
+        ] {
+            let headers = opencode_gateway_headers(slug, "18446744073709551615", "7");
+            assert_eq!(
+                headers,
+                vec![
+                    ("x-opencode-session", "18446744073709551615".to_string()),
+                    ("x-opencode-request", "7".to_string()),
+                    ("x-opencode-client", OPENCODE_CLIENT_ID.to_string()),
+                ],
+                "slug {slug} must send the full gateway header set"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_gateway_headers_exact_slug_allowlist() {
+        // Prefix matches (e.g. a hypothetical `opencode-mirror`) and slugs
+        // merely *containing* "opencode" must not get gateway headers — an
+        // unknown opencode-* slug is not known to be a gateway and must not be
+        // given routing behavior it wasn't configured for.
+        for slug in [
+            "opencode-future-tier",
+            "not-opencode-gateway",
+            "my-opencode-proxy",
+            "openai",
+            "deepseek",
+            "anthropic",
+        ] {
+            assert!(
+                opencode_gateway_headers(slug, "1", "1").is_empty(),
+                "slug {slug} must not send opencode headers"
+            );
+        }
     }
 }

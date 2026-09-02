@@ -22,6 +22,12 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// Configuration for the Anthropic Messages API client.
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
+    /// Catalog slug of the provider this client serves (e.g.
+    /// "opencode-go-anthropic-compatible" for the Anthropic-format route
+    /// through the opencode zen/go gateway). Drives gateway header gating and
+    /// the `ProviderClient::provider_slug` metric label; defaults to the
+    /// first-party "anthropic".
+    pub provider_slug: String,
     pub base_url: String,
     pub api_version: String,
     pub max_tokens: u32,
@@ -39,14 +45,19 @@ pub struct AnthropicConfig {
     /// It covers one attempt: each retry restarts the deadline, so retries
     /// plus their backoff can exceed this value in aggregate.
     pub total_timeout_secs: u64,
+    /// User-Agent for inference requests. The daemon sets
+    /// `choreographr/<version>`; `None` keeps ureq's default (tests).
+    pub user_agent: Option<String>,
 }
 
 impl Default for AnthropicConfig {
     fn default() -> Self {
         Self {
+            provider_slug: "anthropic".to_string(),
             base_url: DEFAULT_BASE_URL.to_string(),
             api_version: DEFAULT_API_VERSION.to_string(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            user_agent: None,
             context_window_config: ContextWindowConfig::default(),
             streaming: true,
             retry_max_attempts: 5,
@@ -128,7 +139,11 @@ use choreo_proto::InferenceError;
 
 impl ProviderClient for AnthropicClient {
     fn provider_slug(&self) -> &str {
-        "anthropic"
+        // The catalog slug, not a hardcoded "anthropic": gateway providers
+        // served over the Anthropic wire format (opencode-go-anthropic-
+        // compatible) must report their real slug for metrics and capability
+        // lookups, and `opencode_gateway_headers` gates on it.
+        &self.config.provider_slug
     }
 
     fn chat_completion_turn(
@@ -166,6 +181,7 @@ impl AnthropicClient {
             config.connect_timeout_secs,
             config.request_timeout_secs,
             config.total_timeout_secs,
+            config.user_agent.as_deref(),
         );
         // Zeroizing<String> wipes the key bytes from memory when the client is
         // dropped; `new` keeps its `String` signature so callers are unaffected.
@@ -204,6 +220,9 @@ impl AnthropicClient {
             effort = %params.thinking_effort,
             "Anthropic chat completion turn"
         );
+        // The turn's real session/request ids drive the opencode gateway's
+        // per-session sticky routing (see `shared::opencode_gateway_headers`).
+        let route = Some((params.session_id.as_str(), params.request_id.as_str()));
         requests::messages_request(
             &self.http,
             &self.config,
@@ -215,6 +234,7 @@ impl AnthropicClient {
             false,
             params.on_retry,
             params.cancel_rx,
+            route,
         )
     }
 
@@ -234,6 +254,9 @@ impl AnthropicClient {
             return Ok(result);
         }
 
+        // The turn's real session/request ids drive the opencode gateway's
+        // per-session sticky routing (see `shared::opencode_gateway_headers`).
+        let route = Some((params.session_id.as_str(), params.request_id.as_str()));
         requests::messages_request_streaming(
             &self.http,
             &self.config,
@@ -244,6 +267,7 @@ impl AnthropicClient {
             &params.thinking_effort,
             params.on_retry,
             params.cancel_rx,
+            route,
             on_event,
         )
     }

@@ -479,6 +479,14 @@ pub(crate) fn run_agent_loop(
         // Running count of output tokens produced by the current turn.
         let mut output_token_count: u32 = 0;
 
+        // Gateway routing identity for the opencode zen/go providers: the
+        // session's real id plus this turn's request id, as strings (the
+        // gateway hashes the last 4 characters to pick an upstream bucket and
+        // keys its sticky provider tracker on the session id). Owned locals,
+        // so the borrowed fields outlive the provider call below.
+        let oc_session_id = ctx.session_id.to_string();
+        let oc_request_id = request_id.to_string();
+
         match client.chat_completion_turn_streaming(
             ChatTurnRequest {
                 model,
@@ -490,6 +498,8 @@ pub(crate) fn run_agent_loop(
                 previous_response_id: prev_resp_id.as_deref(),
                 tool_results: &tool_results,
                 programmatic_tool_calling: client.supports_programmatic_tool_calling(model),
+                session_id: oc_session_id,
+                request_id: oc_request_id,
             },
             &mut |event| {
                 match event {

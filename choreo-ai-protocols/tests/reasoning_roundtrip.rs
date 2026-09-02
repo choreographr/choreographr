@@ -174,6 +174,8 @@ fn deepseek_tool_loop_echoes_reasoning_content_verbatim() {
             previous_response_id: None,
             tool_results: &[],
             programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
         })
         .expect("turn 1");
     let ChatTurnResult::ToolUse(tool_use) = turn1 else {
@@ -208,6 +210,8 @@ fn deepseek_tool_loop_echoes_reasoning_content_verbatim() {
             previous_response_id: None,
             tool_results: &[],
             programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
         })
         .expect("turn 2");
     assert!(matches!(turn2, ChatTurnResult::FinalText(_)));
@@ -316,6 +320,8 @@ fn anthropic_thinking_blocks_echoed_byte_identical() {
             previous_response_id: None,
             tool_results: &[],
             programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
         })
         .expect("turn 1");
     let ChatTurnResult::ToolUse(tool_use) = turn1 else {
@@ -348,6 +354,8 @@ fn anthropic_thinking_blocks_echoed_byte_identical() {
             previous_response_id: None,
             tool_results: &[],
             programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
         })
         .expect("turn 2");
     assert!(matches!(turn2, ChatTurnResult::FinalText(_)));
@@ -458,6 +466,8 @@ fn gemini_thought_signatures_reemitted() {
             previous_response_id: None,
             tool_results: &[],
             programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
         })
         .expect("turn 1");
     let ChatTurnResult::ToolUse(tool_use) = turn1 else {
@@ -491,6 +501,8 @@ fn gemini_thought_signatures_reemitted() {
             previous_response_id: None,
             tool_results: &[],
             programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
         })
         .expect("turn 2");
     assert!(matches!(turn2, ChatTurnResult::FinalText(_)));
@@ -609,6 +621,8 @@ fn responses_chains_reasoning_continuity_via_response_id() {
             previous_response_id: None,
             tool_results: &[],
             programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
         })
         .expect("turn 1");
     let ChatTurnResult::ToolUse(tool_use) = turn1 else {
@@ -663,6 +677,8 @@ fn responses_chains_reasoning_continuity_via_response_id() {
             previous_response_id: Some("resp_1"),
             tool_results: &[],
             programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
         })
         .expect("turn 2");
     assert!(matches!(turn2, ChatTurnResult::FinalText(_)));
@@ -696,10 +712,12 @@ fn responses_chains_reasoning_continuity_via_response_id() {
     );
 }
 
-// ── opencode x-opencode-session header tests ─────────────────────────────
+// ── opencode gateway header tests ────────────────────────────────────────────
 
 /// Drive one non-streaming chat completion turn against the mock provider and
-/// return the captured request.
+/// return the captured request. Uses the real turn path (not the prompt API),
+/// because only turns carry the session identity that feeds the gateway
+/// routing headers.
 fn chat_turn_request(config: ServiceConfig) -> CapturedRequest {
     let response = r#"{
         "choices":[{"message":{"content":"hello","tool_calls":[],"reasoning_content":null,"reasoning":null,"reasoning_text":null}}],
@@ -718,16 +736,31 @@ fn chat_turn_request(config: ServiceConfig) -> CapturedRequest {
     .expect("openai client");
 
     client
-        .completion("deepseek-v4-flash", "hi")
-        .expect("completion");
+        .chat_completion_turn(ChatTurnRequest {
+            model: "deepseek-v4-flash",
+            messages: &[user_message("hi")],
+            tools: &[],
+            thinking_effort: "off".to_string(),
+            on_retry: &mut None,
+            cancel_rx: None,
+            previous_response_id: None,
+            tool_results: &[],
+            programmatic_tool_calling: false,
+            session_id: "18446744073709551615".to_string(),
+            request_id: "7".to_string(),
+        })
+        .expect("turn");
     mock.requests().into_iter().next().expect("one request")
 }
 
 #[test]
 #[ignore]
-fn opencode_provider_sends_x_opencode_session_header() {
-    // opencode-go (the go tier) and opencode (zen) both send the fixed session
-    // header so the gateway routes to a stable, working upstream provider.
+fn opencode_provider_sends_per_session_gateway_headers() {
+    // opencode-go (the go tier) and opencode (zen) route each turn by hashing
+    // the per-session sticky id, so the headers must carry the REAL session
+    // and request ids from the turn — never a fixed constant (a constant would
+    // pin every choreographr session to one upstream bucket) — plus the client
+    // identifier, mirroring upstream's own client.
     for slug in ["opencode-go", "opencode"] {
         let req = chat_turn_request(ServiceConfig {
             provider_slug: slug.to_string(),
@@ -736,17 +769,46 @@ fn opencode_provider_sends_x_opencode_session_header() {
         });
         assert_eq!(
             req.header("x-opencode-session"),
+            Some("18446744073709551615"),
+            "slug {slug} must send x-opencode-session with the turn's real session id"
+        );
+        assert_eq!(
+            req.header("x-opencode-request"),
+            Some("7"),
+            "slug {slug} must send x-opencode-request with the turn's request id"
+        );
+        assert_eq!(
+            req.header("x-opencode-client"),
             Some("choreographr"),
-            "slug {slug} must send x-opencode-session: choreographr"
+            "slug {slug} must send x-opencode-client: choreographr"
         );
     }
 }
 
 #[test]
 #[ignore]
+fn user_agent_from_config_is_sent_on_inference_requests() {
+    // The daemon sets "choreographr/<version>" on every client config (see
+    // providers::from_account_config); build_agent must put it on the wire in
+    // place of ureq's generic default, for all providers.
+    let req = chat_turn_request(ServiceConfig {
+        provider_slug: "openai".to_string(),
+        streaming: false,
+        user_agent: Some("choreographr/9.9.9-test".to_string()),
+        ..Default::default()
+    });
+    assert_eq!(
+        req.header("user-agent"),
+        Some("choreographr/9.9.9-test"),
+        "inference requests must carry the configured User-Agent"
+    );
+}
+
+#[test]
+#[ignore]
 fn non_opencode_provider_omits_x_opencode_session_header() {
-    // Providers that aren't opencode gateways must not get the header — the
-    // header is only meaningful to opencode.ai's routing.
+    // Providers that aren't opencode gateways must not get the headers — the
+    // gateway routing semantics only apply to opencode.ai endpoints.
     for slug in ["openai", "deepseek"] {
         let req = chat_turn_request(ServiceConfig {
             provider_slug: slug.to_string(),
@@ -757,6 +819,11 @@ fn non_opencode_provider_omits_x_opencode_session_header() {
             req.header("x-opencode-session"),
             None,
             "slug {slug} must not send x-opencode-session"
+        );
+        assert_eq!(
+            req.header("x-opencode-request"),
+            None,
+            "slug {slug} must not send x-opencode-request"
         );
     }
 }

@@ -119,6 +119,8 @@ fn retry_succeeds_with_callback() {
         previous_response_id: None,
         tool_results: &[],
         programmatic_tool_calling: false,
+        session_id: "42".to_string(),
+        request_id: "7".to_string(),
     });
 
     match result {
@@ -184,6 +186,8 @@ fn retry_cancelled_during_backoff() {
         previous_response_id: None,
         tool_results: &[],
         programmatic_tool_calling: false,
+        session_id: "42".to_string(),
+        request_id: "7".to_string(),
     });
 
     assert!(
@@ -240,6 +244,8 @@ fn hard_rate_limit_fails_without_retrying() {
         previous_response_id: None,
         tool_results: &[],
         programmatic_tool_calling: false,
+        session_id: "42".to_string(),
+        request_id: "7".to_string(),
     });
 
     // The error surfaces the provider's message — the same terminal path
@@ -303,6 +309,8 @@ fn server_503_with_long_retry_after_fails_without_retrying() {
         previous_response_id: None,
         tool_results: &[],
         programmatic_tool_calling: false,
+        session_id: "42".to_string(),
+        request_id: "7".to_string(),
     });
 
     assert!(
@@ -365,6 +373,8 @@ fn retry_after_in_budget_is_honored_on_503() {
         previous_response_id: None,
         tool_results: &[],
         programmatic_tool_calling: false,
+        session_id: "42".to_string(),
+        request_id: "7".to_string(),
     });
 
     match result {
@@ -473,6 +483,8 @@ fn streaming_cancelled_during_sse_events() {
             previous_response_id: None,
             tool_results: &[],
             programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
         },
         |_event: StreamEvent| -> std::io::Result<()> { Ok(()) },
     );
@@ -508,6 +520,8 @@ fn streaming_cancelled_before_first_event() {
             previous_response_id: None,
             tool_results: &[],
             programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
         },
         |_event: StreamEvent| -> std::io::Result<()> { Ok(()) },
     );

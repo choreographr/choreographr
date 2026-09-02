@@ -191,6 +191,8 @@ fn model_switch_sends_no_reasoning_on_the_wire() {
                 previous_response_id: None,
                 tool_results: &[],
                 programmatic_tool_calling: false,
+                session_id: "42".to_string(),
+                request_id: "7".to_string(),
             })
             .expect("turn succeeds");
     };

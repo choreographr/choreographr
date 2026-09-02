@@ -31,6 +31,13 @@ pub struct ChatTurnRequest<'a> {
     pub tool_results: &'a [ToolResultItem],
     /// Enable programmatic tool calling (Responses API, gpt-5.6+).
     pub programmatic_tool_calling: bool,
+    /// Session identity for gateways that route per session (opencode zen/go
+    /// sticky routing). The daemon session id in string form; sent as
+    /// `x-opencode-session` to the known gateway providers only.
+    pub session_id: String,
+    /// Per-turn request id (same id the daemon broadcasts in `SessionEvent::
+    /// Started`); sent as `x-opencode-request` alongside `session_id`.
+    pub request_id: String,
 }
 
 /// Trait that every provider client must implement.

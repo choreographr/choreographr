@@ -36,6 +36,9 @@ pub struct GoogleConfig {
     /// It covers one attempt: each retry restarts the deadline, so retries
     /// plus their backoff can exceed this value in aggregate.
     pub total_timeout_secs: u64,
+    /// User-Agent for inference requests. The daemon sets
+    /// `choreographr/<version>`; `None` keeps ureq's default (tests).
+    pub user_agent: Option<String>,
 }
 
 impl Default for GoogleConfig {
@@ -50,6 +53,7 @@ impl Default for GoogleConfig {
             connect_timeout_secs: 30,
             request_timeout_secs: 120,
             total_timeout_secs: 3600,
+            user_agent: None,
         }
     }
 }
@@ -122,6 +126,7 @@ impl GoogleClient {
             config.connect_timeout_secs,
             config.request_timeout_secs,
             config.total_timeout_secs,
+            config.user_agent.as_deref(),
         );
         // Zeroizing<String> wipes the key bytes from memory when the client is
         // dropped; `new` keeps its `String` signature so callers are unaffected.

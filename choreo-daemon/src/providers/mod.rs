@@ -29,6 +29,14 @@ pub struct InferenceProvider {
     slug: String,
 }
 
+/// User-Agent product string for every inference request: names the daemon
+/// with its own crate version (the version users actually run), so providers'
+/// metrics and any UA-based allowlisting see "choreographr/x.y.z" instead of
+/// ureq's generic default.
+fn daemon_user_agent() -> String {
+    format!("choreographr/{}", env!("CARGO_PKG_VERSION"))
+}
+
 impl InferenceProvider {
     pub fn from_openai(client: OpenAiClient) -> Self {
         Self {
@@ -67,6 +75,11 @@ impl InferenceProvider {
                     base_url: entry.base_url.to_string(),
                     chat_completions_max_tokens_field: max_tokens_field,
                     provider_slug: entry.slug.clone(),
+                    // Every inference request identifies as the daemon
+                    // ("choreographr/<version>"), not ureq's default — see
+                    // `build_agent`. One construction point covers all
+                    // accounts; tests and other callers keep `None`.
+                    user_agent: Some(daemon_user_agent()),
                     ..Default::default()
                 };
                 config.apply_overrides(&mut svc_config);
@@ -87,6 +100,10 @@ impl InferenceProvider {
                 if config.base_url.is_none() {
                     anthro_cfg.base_url = entry.base_url.to_string();
                 }
+                // Catalog slug (not hardcoded "anthropic") so gateway header
+                // gating and metrics see e.g. "opencode-go-anthropic-compatible".
+                anthro_cfg.provider_slug = entry.slug.clone();
+                anthro_cfg.user_agent = Some(daemon_user_agent());
                 let overrides = config.provider_overrides();
                 anthro_cfg.apply_overrides(&overrides);
                 let client = AnthropicClient::new(anthro_cfg, key)
@@ -104,6 +121,7 @@ impl InferenceProvider {
                 if config.base_url.is_none() {
                     google_cfg.base_url = entry.base_url.to_string();
                 }
+                google_cfg.user_agent = Some(daemon_user_agent());
                 let overrides = config.provider_overrides();
                 google_cfg.apply_overrides(&overrides);
                 let client = GoogleClient::new(google_cfg, key)

@@ -385,6 +385,7 @@ impl OpenAiClient {
             config.connect_timeout_secs,
             config.request_timeout_secs,
             config.total_timeout_secs,
+            config.user_agent.as_deref(),
         );
         // Zeroizing<String> wipes the key bytes from memory when the client is
         // dropped; `new` keeps its `String` signature so callers are unaffected.
@@ -502,6 +503,9 @@ impl OpenAiClient {
     ) -> Result<ChatTurnResult, OpenAiError> {
         let reasoning_effort = reasoning_effort_api_value(&params.thinking_effort);
         tracing::debug!(effort = %params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
+        // The turn's real session/request ids drive the opencode gateway's
+        // per-session sticky routing (see `shared::opencode_gateway_headers`).
+        let route = Some((params.session_id.as_str(), params.request_id.as_str()));
         match self.config.request_format_for_model(params.model) {
             RequestFormat::Responses => responses::responses_request_with_tools(
                 &self.http,
@@ -516,6 +520,7 @@ impl OpenAiClient {
                 params.on_retry,
                 params.cancel_rx,
                 params.programmatic_tool_calling,
+                route,
             ),
             RequestFormat::ChatCompletions => {
                 chat_completions::chat_completions_request_with_tools(
@@ -528,6 +533,7 @@ impl OpenAiClient {
                     reasoning_effort,
                     params.on_retry,
                     params.cancel_rx,
+                    route,
                 )
             }
         }
@@ -553,6 +559,9 @@ impl OpenAiClient {
             return Ok(result);
         }
 
+        // The turn's real session/request ids drive the opencode gateway's
+        // per-session sticky routing (see `shared::opencode_gateway_headers`).
+        let route = Some((params.session_id.as_str(), params.request_id.as_str()));
         match self.config.request_format_for_model(params.model) {
             RequestFormat::Responses => responses::responses_request_streaming_with_tools(
                 &self.http,
@@ -567,6 +576,7 @@ impl OpenAiClient {
                 params.on_retry,
                 params.cancel_rx,
                 params.programmatic_tool_calling,
+                route,
                 &mut on_event,
             ),
             RequestFormat::ChatCompletions => {
@@ -580,6 +590,7 @@ impl OpenAiClient {
                     reasoning_effort,
                     params.on_retry,
                     params.cancel_rx,
+                    route,
                     &mut on_event,
                 )
             }

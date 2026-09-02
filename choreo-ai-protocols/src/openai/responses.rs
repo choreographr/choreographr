@@ -420,7 +420,8 @@ pub(crate) fn responses_request(
     // temporary would be dropped before the retry call below (E0716).
     let mut no_retry = None;
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, None);
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
+    // No session identity on the plain prompt API — no gateway routing headers.
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, None)?;
     let payload: ResponsesResponse = response
         .into_body()
         .read_json()
@@ -474,7 +475,8 @@ where
     // temporary would be dropped before the retry call below (E0716).
     let mut no_retry = None;
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, Some(&mut deadline));
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
+    // No session identity on the plain prompt API — no gateway routing headers.
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, None)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // Reader thread decouples the blocking socket read from cancellation
     // polling (see `crate::stream`); the abort flag on `sse` stops the thread
@@ -531,6 +533,9 @@ pub(crate) fn responses_request_with_tools(
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     programmatic_tool_calling: bool,
+    // Gateway routing identity (session_id, request_id) for the opencode
+    // zen/go providers; `None` when the caller has no session (prompt API).
+    route: Option<(&str, &str)>,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
     let start = std::time::Instant::now();
 
@@ -557,7 +562,7 @@ pub(crate) fn responses_request_with_tools(
 
     let retry = retry::retry_config_from_config(config);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
     let payload: ResponsesResponse = response
         .into_body()
         .read_json()
@@ -835,6 +840,9 @@ pub(crate) fn responses_request_streaming_with_tools<F>(
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     programmatic_tool_calling: bool,
+    // Gateway routing identity (session_id, request_id) for the opencode
+    // zen/go providers; `None` when the caller has no session (prompt API).
+    route: Option<(&str, &str)>,
     on_event: &mut F,
 ) -> Result<ChatTurnResult, super::OpenAiError>
 where
@@ -864,7 +872,7 @@ where
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
 
     let mut has_any_output = false;
     let mut full_content = String::new();

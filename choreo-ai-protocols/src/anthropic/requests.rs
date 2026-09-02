@@ -93,6 +93,10 @@ pub(super) fn messages_request(
     stream: bool,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    // Gateway routing identity (session_id, request_id) for the opencode
+    // zen/go providers (the gateway reads x-opencode-* before protocol
+    // dispatch, so the Anthropic wire format routes identically).
+    route: Option<(&str, &str)>,
 ) -> Result<ChatTurnResult, AnthropicError> {
     let url = endpoint_url(&config.base_url, MESSAGES_PATH)?;
     let retry_cfg = retry::RetryConfig::new(
@@ -132,13 +136,23 @@ pub(super) fn messages_request(
     .map_err(io::Error::other)?;
 
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
+    // Gateway headers (empty for non-gateway providers — see the shared
+    // helper); applied alongside the auth headers inside the retry closure.
+    let extra_headers = route
+        .map(|(session_id, request_id)| {
+            crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
+        })
+        .unwrap_or_default();
     let response = retry::retry_loop(
         || {
-            agent
+            let mut request = agent
                 .post(&url)
                 .header("x-api-key", api_key.trim())
-                .header("anthropic-version", &config.api_version)
-                .send_json(body.clone())
+                .header("anthropic-version", &config.api_version);
+            for (name, value) in &extra_headers {
+                request = request.header(*name, value.as_str());
+            }
+            request.send_json(body.clone())
         },
         &retry_cfg,
         &mut ctx,
@@ -165,6 +179,9 @@ pub(super) fn messages_request_streaming<F>(
     thinking_effort: &str,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    // Gateway routing identity (session_id, request_id) — same semantics as
+    // the non-streaming `messages_request` route parameter.
+    route: Option<(&str, &str)>,
     mut on_event: F,
 ) -> Result<ChatTurnResult, AnthropicError>
 where
@@ -209,13 +226,23 @@ where
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
+    // Gateway headers (empty for non-gateway providers — see the shared
+    // helper); applied alongside the auth headers inside the retry closure.
+    let extra_headers = route
+        .map(|(session_id, request_id)| {
+            crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
+        })
+        .unwrap_or_default();
     let response = retry::retry_loop(
         || {
-            agent
+            let mut request = agent
                 .post(&url)
                 .header("x-api-key", api_key.trim())
-                .header("anthropic-version", &config.api_version)
-                .send_json(body.clone())
+                .header("anthropic-version", &config.api_version);
+            for (name, value) in &extra_headers {
+                request = request.header(*name, value.as_str());
+            }
+            request.send_json(body.clone())
         },
         &retry_cfg,
         &mut ctx,
