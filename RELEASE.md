@@ -58,7 +58,7 @@ built nowhere.
 | `linux-musl` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` + `.rpm` (via `scripts/release.sh`; `rpmbuild` is apt-installed in the job, since it is not preinstalled) |
 | `macos-arm64` | macos-latest | native `aarch64-apple-darwin` tarball (via `scripts/release.sh`) |
 | `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the four `.exe` files |
-| `android-termux` | ubuntu-latest + NDK | `aarch64-linux-android` Termux tarball (via `scripts/build-android.sh --features metrics,blockchain`) |
+| `android-termux` | ubuntu-latest + NDK | `aarch64-linux-android` Termux tarball (via `scripts/build-android.sh --features metrics,blockchain`) + the Termux-native `.deb` (via `scripts/build-deb-termux.sh`, structural smoke-test only — no Termux on the runner) |
 
 Every job builds the same four binaries (`choreographr choreo-tui choreo-im
 choreo-acp`) with `--features metrics,blockchain` on the **stable** toolchain,
@@ -305,8 +305,9 @@ a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
 ## Phase 3 — Build binaries (two machines, or CI on tag push)
 
 > **CI path:** pushing the `vX.Y.Z` tag triggers `.github/workflows/release.yml`,
-> which builds the musl/macOS/Windows/Termux artifacts (including the `.deb`
-> and `.rpm`), smoke-tests them, and creates the GitHub release automatically
+> which builds the musl/macOS/Windows/Termux artifacts (including the desktop
+> `.deb`/`.rpm` and the Termux `.deb`), smoke-tests them, and creates the
+> GitHub release automatically
 > (see [CI builds](#ci-builds-github-actions)). The manual flow below remains
 > the fallback and is still required for the macOS daemon smoke test.
 

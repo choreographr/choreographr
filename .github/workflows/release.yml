@@ -32,7 +32,9 @@
 #                   artifact is a zip; build flags still match release.sh.
 #   android-termux  scripts/build-android.sh on ubuntu + NDK — aarch64
 #                   Termux executables via cargo-ndk (choreo-gui is NOT built:
-#                   its APK payload is a dx/gradle flow, out of scope here).
+#                   its APK payload is a dx/gradle flow, out of scope here),
+#                   then scripts/build-deb-termux.sh packages the same
+#                   binaries into the Termux-native .deb (no rebuild).
 #
 # choreo-gui is deliberately absent from every job: it is a stub and is not
 # part of the shipped release set (see scripts/release.sh's header comment).
@@ -280,7 +282,7 @@ jobs:
           # metrics,blockchain) so the Termux suite behaves identically.
           ./scripts/build-android.sh --features metrics,blockchain
 
-      - name: Package + sanity-check
+      - name: Package + sanity-check (tarball)
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           # A wrong-target Android build still "works" on the runner and only
@@ -290,10 +292,31 @@ jobs:
           tar czf "dist/choreographr-${VERSION}-aarch64-linux-android.tar.gz" \
               -C dist/android/arm64-v8a choreographr choreo-tui choreo-im choreo-acp
 
+      - name: Package the Termux .deb (no rebuild)
+        run: |
+          # Consumes the binaries build-android.sh staged above — packaging
+          # never recompiles (single build of record per artifact kind).
+          # dpkg-deb is preinstalled on ubuntu runners. The script's own
+          # structural validation (control fields, contents, exec bits) runs
+          # inside; this step adds the smoke-test pass on top.
+          ./scripts/build-deb-termux.sh
+
+      - name: Smoke-test the .deb (structural)
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          # Structural ceiling only — there is no Termux on the runner, so the
+          # Android binaries inside cannot be executed (see smoke-test.sh's
+          # header). On-device install is the user's smoke test.
+          ./scripts/smoke-test.sh "dist/choreographr-termux_${VERSION}_aarch64.deb"
+
       - uses: actions/upload-artifact@v7
         with:
           name: android-aarch64-termux
-          path: dist/choreographr-*.tar.gz
+          # Broad glob (not per-artifact literals) so every packaged format the
+          # android job produces — the tarball AND the Termux .deb — rides in
+          # one artifact, and future additions need no workflow edit. The
+          # release job's combined SHA256SUMS picks the deb up automatically.
+          path: dist/choreographr-*
           if-no-files-found: error
 
   release:

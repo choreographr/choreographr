@@ -306,20 +306,30 @@ Alternatives:
 
 ### Windows & Android (Termux)
 
-No package managers for these — grab the release asset and put the four
-binaries on your `PATH`:
+Windows has no package manager for this — grab the release asset and put the
+four binaries on your `PATH`. Termux ships `pkg`/`dpkg`, so it gets a proper
+`.deb` package (plus the tarball as a fallback):
 
 - **Windows (x86_64)** — download
   `choreographr-<version>-x86_64-pc-windows-msvc.zip` from the
   [releases page](https://github.com/choreographr/choreographr/releases) and
   add the extracted `.exe` files to your `PATH`.
-- **Android (Termux, aarch64)** — download
-  `choreographr-<version>-aarch64-linux-android.tar.gz`, extract it inside a
-  Termux shell, and copy the four binaries into Termux's bin directory:
-  `cp choreographr choreo-tui choreo-im choreo-acp $PREFIX/bin/ &&
-  chmod +x $PREFIX/bin/{choreographr,choreo-tui,choreo-im,choreo-acp}`. The
-  binaries are plain NDK/bionic executables — no root, no Termux packages
-  beyond the basics.
+- **Android (Termux, aarch64)** — two options:
+  - **`.deb` package (recommended)** — download
+    `choreographr-termux_<version>_aarch64.deb` from the
+    [releases page](https://github.com/choreographr/choreographr/releases)
+    and install it inside the Termux shell:
+    `pkg install ./choreographr-termux_<version>_aarch64.deb`. The four
+    binaries land in `$PREFIX/bin`; the package declares no dependencies (the
+    binaries are static NDK/bionic executables) and runs no maintainer scripts
+    (Termux's dpkg runs as the app uid, no root).
+  - **Tarball fallback** — download
+    `choreographr-<version>-aarch64-linux-android.tar.gz`, extract it inside a
+    Termux shell, and copy the four binaries into Termux's bin directory:
+    `cp choreographr choreo-tui choreo-im choreo-acp $PREFIX/bin/ &&
+    chmod +x $PREFIX/bin/{choreographr,choreo-tui,choreo-im,choreo-acp}`. The
+    binaries are plain NDK/bionic executables — no root, no Termux packages
+    beyond the basics.
 
 ### Running the daemon
 
@@ -932,8 +942,12 @@ is on `PATH`.
 The four suite binaries (`choreographr`, `choreo-tui`, `choreo-im`,
 `choreo-acp`) run under Termux on Android. `scripts/build-android.sh`
  cross-builds them via [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) and
-stages them in `dist/android/<abi>/` for `adb push` into Termux's
-`$PREFIX/bin`. It temporarily strips the workspace's per-profile `rustflags`
+stages them in `dist/android/<abi>/` — the staging tree that BOTH Termux
+release channels consume: `scripts/build-deb-termux.sh` packages it into the
+Termux-native `.deb` (`Architecture: aarch64`, files at `./bin/`, no
+`Depends:`, no maintainer scripts — the release-page artifact), and the raw
+`adb push` flow below remains the tarball fallback. It temporarily strips the
+workspace's per-profile `rustflags`
 (same mechanism as `just build-stable`) — profile rustflags apply regardless of
 `--target`, and `-C target-cpu=native` would emit host-CPU code that traps on
 Android devices. The scripts auto-detect common package-manager layouts
@@ -993,12 +1007,20 @@ day-to-day workflow.
 just android-check                        # dry run: verify prerequisites, print what would run
 just android-binaries                     # build aarch64 (arm64-v8a)
 just android-binaries -- --emulator       # also build x86_64 for the emulator
+just package-deb-termux                   # package dist/android/arm64-v8a into the Termux .deb (no rebuild)
 just gui-android                          # choreo-gui via `dx build --platform android` (cdylib, NOT part of build-android.sh)
 ```
 
 Deploying the suite binaries to a Termux device:
 
 ```bash
+# Option 1 — the .deb (built by `just package-deb-termux`; what the release
+# page ships). Push it, then install inside the Termux shell:
+adb push dist/choreographr-termux_*.deb /sdcard/choreo/
+# inside the Termux shell (adb cannot write Termux's private app dir):
+pkg install /sdcard/choreo/choreographr-termux_*.deb   # binaries land in $PREFIX/bin
+
+# Option 2 — the raw tarball fallback:
 adb push dist/android/arm64-v8a/* /sdcard/choreo/
 # then inside the Termux shell (adb cannot write Termux's private app dir):
 cp /sdcard/choreo/* $PREFIX/bin/ && chmod +x \

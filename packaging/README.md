@@ -34,11 +34,24 @@ correctly once the user loads it, but loading is always the user's action.
 
 | Asset | What it is | Where it is published |
 |---|---|---|
-| `choreographr.service` | systemd **user** unit (runs `~/.local/bin/choreographr`, `Restart=on-failure`) | inside the release tarball, the `.deb`, and the `.rpm`; installed by `scripts/install.sh` |
+| `choreographr.service` | systemd **user** unit (runs `~/.local/bin/choreographr`, `Restart=on-failure`) | inside the release tarball, the desktop `.deb`, and the `.rpm`; installed by `scripts/install.sh`. NOT in the Termux `.deb` — there is no systemd on Android |
 | `com.choreographr.daemon.plist` | launchd agent for **non-Homebrew** macOS installs (logs to `/tmp/choreographr.log`) | inside the release tarball; installed by `scripts/install.sh`. Homebrew installs use the formula's `service do` block instead |
 | `homebrew/choreographr.rb` | Homebrew formula — prebuilt tarball variant, no build toolchain | the `choreographr/homebrew-choreographr` tap |
 | `aur/PKGBUILD` + `aur/.SRCINFO` | Arch package `choreographr-bin` (prebuilt, empty `depends=` — static binaries) | the AUR |
 | `rpm/choreographr.spec` | RPM spec for the fat package (four binaries + systemd unit) | consumed by `scripts/build-rpm.sh`; the resulting `.rpm` ships in the GitHub release |
+
+**Termux `.deb` — no tracked asset.** The Termux package's control file is
+generated inline by `scripts/build-deb-termux.sh` because it shares nothing
+with the desktop package: package `choreographr` with `Architecture: aarch64`
+(Termux's tag — NOT Debian's `arm64`), files at `./bin/<name>` (Termux's dpkg
+maps that onto `$PREFIX/bin`; zero absolute paths — there is no `/usr` on
+Android), no `Depends:` (the binaries are static bionic executables linking
+only Android system libs), and no maintainer scripts or conffiles — Termux has
+no root (dpkg runs as the app uid) and nothing to configure; runtime state
+lives in `~/.local/share/choreographr/`, unpackaged. The "installed, never
+auto-enabled" policy above degenerates to "never auto-enabled" here: there is
+no init system on Android, so the user starts `choreographr` themselves inside
+the Termux session.
 
 ## Release tarball
 

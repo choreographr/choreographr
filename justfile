@@ -411,6 +411,11 @@ package-deb:
 package-rpm:
     ./scripts/build-rpm.sh
 
+# Build the Termux .deb from existing dist/android/arm64-v8a binaries
+# (Linux only; build those first with `just android-binaries`)
+package-deb-termux:
+    ./scripts/build-deb-termux.sh
+
 # Pass flags through, e.g. `just install -- --uninstall`.
 # Run the pinned-version installer locally (instead of curl|sh).
 install args="":
