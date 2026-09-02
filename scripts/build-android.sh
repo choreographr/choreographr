@@ -297,7 +297,29 @@ trap 'exit 143' TERM HUP
 # config.toml rustflags (build + cfg-target) that the manifest strip cannot
 # reach. Exported (not per-command) so it also covers any nested cargo
 # invocation cargo-ndk makes.
-export RUSTFLAGS="-C target-cpu=generic"
+#
+# TLS ALIGNMENT (bionic requirement): bionic's loader refuses to start an
+# executable whose PT_TLS segment has p_align < 64 on arm64 ("executable's
+# TLS segment is underaligned ... needs to be at least 64 for ARM64 Bionic")
+# — and lld derives PT_TLS alignment from the .tdata/.tbss input sections,
+# which rust/LLVM emit at 8, so every Rust aarch64-linux-android binary with
+# any thread-local aborts at startup on Android 10+ (observed on-device,
+# 2026-09-02; rust-lang/rust PR #118613 to switch Android to emutls was never
+# merged, so no compiler fix exists). The fix is a linker-script fragment that
+# re-aligns the TLS output sections to 64 during the link — this lifts BOTH
+# p_align and the section vaddr to 64-multiples (a post-link p_align patch
+# alone cannot work: the vaddr would keep a nonzero skew and bionic checks
+# that too). Harmless on targets without TLS (empty output section) and on
+# x86_64 (64 is a valid superset of its requirement).
+mkdir -p target/android
+TLS_ALIGN_LDS="$(pwd)/target/android/tls-align.lds"
+cat > "$TLS_ALIGN_LDS" <<'EOF'
+SECTIONS {
+  .tdata : ALIGN(64) { *(.tdata .tdata.*) }
+  .tbss  : ALIGN(64) { *(.tbss .tbss.*) }
+} INSERT AFTER .bss;
+EOF
+export RUSTFLAGS="-C target-cpu=generic -C link-arg=-Wl,-T,$TLS_ALIGN_LDS"
 
 # Staging root for the per-ABI binaries. Under target/ (cargo's scratch space,
 # gitignored), NOT under dist/: dist/ is reserved for final, publishable
@@ -347,6 +369,29 @@ done
 
 # The binaries were copied from target/<triple>/dist/ above; verify the
 # layout and print the push commands the Termux side needs.
+#
+# TLS-alignment gate (see the RUSTFLAGS comment above): fail HERE, not on the
+# user's phone — a bionic-unsafe PT_TLS (p_align < 64, or vaddr not 64-aligned
+# on arm64) is exactly the failure that shipped before this check existed.
+# Mirrors the structural-validation philosophy of build-deb-termux.sh; x86_64
+# is emulator-only so it is not gated.
+for abi in $TARGETS; do
+    [ "$abi" = "arm64-v8a" ] || continue
+    for bin in $BINS; do
+        bin_path="target/android/$abi/$bin"
+        # Each TLS line: "Type Offset VirtAddr ... Align" → print align + vaddr.
+        # Parsed in bash (not awk's strtonum) so BSD awk on macOS works too.
+        while read -r align vaddr; do
+            [ -n "$align" ] || continue
+            # bash arithmetic accepts the 0x-prefixed hex readelf prints.
+            if (( align < 64 )) || (( vaddr % 64 != 0 )); then
+                echo "error: $bin_path PT_TLS is bionic-unsafe: align=$align vaddr=$vaddr (need align>=64 and vaddr%64==0)" >&2
+                exit 1
+            fi
+        done <<< "$(readelf -lW "$bin_path" | awk '/^  TLS/ {print $NF, $3}')"
+    done
+done
+
 log "binaries ready:"
 for bin in $BINS; do
     for abi in $TARGETS; do
