@@ -67,6 +67,16 @@ if [[ "$TARBALL" == *.deb ]]; then
     else
         echo "  ok: no Depends"
     fi
+    # Archive members must be xz, not zstd: Termux's dpkg has no zstd support
+    # (it searches control.tar{xz,lzma,} only), and dpkg >= 1.22 build hosts
+    # default to zstd — exactly the failure seen on-device 2026-09-02.
+    MEMBERS="$(ar t "$TARBALL")"
+    if [ "$MEMBERS" = "$(printf 'debian-binary\ncontrol.tar.xz\ndata.tar.xz')" ]; then
+        echo "  ok: members are xz (debian-binary + control.tar.xz + data.tar.xz)"
+    else
+        echo "  FAIL: archive members not the Termux-compatible xz set: $MEMBERS" >&2
+        FAIL=1
+    fi
     # No maintainer scripts / conffiles: the control archive holds only the
     # control file itself (plus tar's "./" root entry).
     CTRL_TAR="$(dpkg-deb --ctrl-tarfile "$TARBALL" | tar -t)"

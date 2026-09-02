@@ -48,7 +48,11 @@ maps that onto `$PREFIX/bin`; zero absolute paths — there is no `/usr` on
 Android), no `Depends:` (the binaries are static bionic executables linking
 only Android system libs), and no maintainer scripts or conffiles — Termux has
 no root (dpkg runs as the app uid) and nothing to configure; runtime state
-lives in `~/.local/share/choreographr/`, unpackaged. The "installed, never
+lives in `~/.local/share/choreographr/`, unpackaged. The archive is forced to
+xz compression (`-Zxz`): Termux's dpkg build has no zstd support, while
+`dpkg-deb` on the ubuntu runners defaults to zstd since 1.22 — a zstd package
+fails on-device with `could not locate member control.tar{xz,lzma,}`. The
+"installed, never
 auto-enabled" policy above degenerates to "never auto-enabled" here: there is
 no init system on Android, so the user starts `choreographr` themselves inside
 the Termux session.

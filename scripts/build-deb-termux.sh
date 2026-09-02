@@ -26,6 +26,13 @@
 #   - No systemd unit: there is no systemd on Android (the "installed, never
 #     auto-enabled" policy degenerates to "never auto-enabled" — the user
 #     starts the daemon themselves).
+#   - Compression: -Zxz, NOT dpkg-deb's default. dpkg >= 1.22 defaults to
+#     zstd (control.tar.zst/data.tar.zst), but Termux's dpkg build has no
+#     zstd support — it searches only for control.tar{xz,lzma,} and rejects
+#     the package with "could not locate member control.tar{xz,lzma,}"
+#     (observed on-device, 2026-09-02). xz is universally supported by every
+#     dpkg, so it is forced explicitly; the validation below also asserts the
+#     members are xz so a future dpkg default flip fails HERE, not on-device.
 #
 # Validation ceiling: there is no Termux on the build machine (and CI runners
 # are x86_64), so the checks below are STRUCTURAL ONLY — dpkg-deb field and
@@ -104,7 +111,9 @@ DEB="$REPO_ROOT/dist/choreographr-termux_${VERSION}_${ARCH}.deb"
 # --root-owner-group stamps the archive files as root:root regardless of who
 # builds — non-root builders otherwise get chown failures (and CI runners are
 # always non-root), and the field is meaningless on Termux (single-uid app).
-dpkg-deb --build --root-owner-group "$STAGE" "$DEB"
+# -Zxz: see the header's compression bullet — Termux's dpkg cannot read zstd,
+# which is the dpkg >= 1.22 default on the ubuntu runners.
+dpkg-deb --build --root-owner-group -Zxz "$STAGE" "$DEB"
 
 # ── structural validation (the CI ceiling — see the header comment) ──────────
 # Field values via dpkg-deb --info's verbatim control dump (fields are indented
@@ -115,6 +124,21 @@ log() { echo "==> $*"; }
 
 log "verifying $DEB"
 INFO="$(dpkg-deb --info "$DEB")"
+
+# Archive members must be the xz flavor: dpkg-deb's compression default is a
+# moving target (zstd since 1.22 on ubuntu runners), and Termux's dpkg cannot
+# decompress zstd — a .zst member here means an uninstallable-on-Termux
+# package, so assert instead of trusting the -Zxz flag above.
+MEMBERS="$(ar t "$DEB")"
+MEMBERS_OK=1
+[ "$MEMBERS" = "$(printf 'debian-binary\ncontrol.tar.xz\ndata.tar.xz')" ] || MEMBERS_OK=0
+if [ "$MEMBERS_OK" -ne 1 ]; then
+    echo "error: $DEB archive members are not the Termux-compatible xz set, found:" >&2
+    echo "$MEMBERS" >&2
+    echo "  (Termux's dpkg supports control.tar{xz,lzma,} only — no zstd)" >&2
+    exit 1
+fi
+echo "  ok: members are debian-binary + control.tar.xz + data.tar.xz (no zstd)"
 
 check_field() {
     # check_field <field> <expected-value> — anchored at line start in the
