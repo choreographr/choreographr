@@ -68,7 +68,7 @@ Never use `expect()`, `unwrap()`, or `panic!()` in production code. These create
 
 All crates in the workspace (`choreographr`, `choreo-client-core`, `choreo-keystore`, `choreo-im`, `choreo-gui`, `choreo-markdown`, `choreo-proto`, `choreo-tui`) must log extensively using the `tracing` crate. Every module should emit `tracing` events (`info!`, `warn!`, `error!`, `debug!`, `trace!`) at appropriate levels to provide observability into key operations, state transitions, and error conditions.
 
-In the `choreo-tui` crate specifically, do not use `eprintln!` for diagnostics — output goes to `/tmp/choreo-tui.log`.
+In the `choreo-tui` crate specifically, do not use `eprintln!` for diagnostics — output goes to the per-process log file `$TMPDIR/choreo-tui-<pid>.log` (`std::env::temp_dir()`, so it works on Termux/Android too). A failure to create that log file must degrade to no logging, never abort the TUI.
 
 ## Thread Communication
 

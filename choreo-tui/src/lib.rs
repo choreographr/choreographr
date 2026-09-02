@@ -366,8 +366,6 @@ fn confirm_first_contact(
 /// The root `choreographr` package declares `choreo-tui` as a thin binary
 /// that calls this function, so the TUI lives entirely in this library crate.
 pub fn main() -> anyhow::Result<()> {
-    use tracing_subscriber::prelude::*;
-
     let cli = Cli::parse();
 
     let mode = if let Some(addr) = cli.tcp_addr {
@@ -380,15 +378,48 @@ pub fn main() -> anyhow::Result<()> {
         choreo_client_core::ConnectionMode::UnixSocket(choreo_proto::socket_path())
     };
 
-    let log_path = format!("/tmp/choreo-tui-{}.log", std::process::id());
-    let log_file = std::fs::File::create(&log_path)?;
+    let log_path = init_file_logging();
+    let _ = log_path; // path is diagnostics only; run_app does not need it
+
+    connection::run_app(mode)?;
+    Ok(())
+}
+
+/// Initialize file logging to `$TMPDIR/choreo-tui-<pid>.log` and return the
+/// path, or `None` when the log file cannot be created.
+///
+/// The platform temp dir (not a hardcoded `/tmp`) is essential: on
+/// Android/Termux there is no writable `/tmp`, and a bare `?` on the
+/// log-file create used to kill the TUI before it started with a context-
+/// free "Permission denied (os error 13)" — logging is auxiliary
+/// diagnostics and must never be a startup precondition. `env::temp_dir()`
+/// respects `TMPDIR` (Termux sets it to its prefix tmp dir); any remaining
+/// failure degrades this run to no file logging (tracing events are then
+/// simply dropped — no subscriber is installed).
+fn init_file_logging() -> Option<std::path::PathBuf> {
+    use tracing_subscriber::prelude::*;
+
+    let log_path = log_file_path();
+    let log_file = match std::fs::File::create(&log_path) {
+        Ok(file) => file,
+        // No panic, no error exit: a missing log must not take the TUI down
+        // (the observed Termux failure mode). Diagnostics for THIS decision
+        // cannot go through tracing (no subscriber yet) — the silent
+        // degradation is documented here and pinned by the tests below.
+        Err(_) => return None,
+    };
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(log_file)
         .with_ansi(false);
     tracing_subscriber::registry().with(file_layer).init();
+    Some(log_path)
+}
 
-    connection::run_app(mode)?;
-    Ok(())
+/// The per-process log file path: under the PLATFORM temp dir (respects
+/// `TMPDIR` — critical on Termux/Android where `/tmp` is not writable),
+/// named with the pid so parallel instances do not clobber each other.
+fn log_file_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("choreo-tui-{}.log", std::process::id()))
 }
 
 #[cfg(test)]
@@ -567,6 +598,40 @@ mod cli_tests {
             msg.contains("could not be read"),
             "the missing key must be mentioned, got: {msg}"
         );
+    }
+
+    // ── File logging setup (the Termux /tmp regression) ────
+
+    /// The log file must live under the PLATFORM temp dir — never a
+    /// hardcoded `/tmp`. On Android/Termux `/tmp` is not writable and the
+    /// hardcoded path killed the TUI with a bare "Permission denied (os
+    /// error 13)" before the UI started.
+    #[test]
+    fn log_file_path_is_under_the_platform_temp_dir() {
+        let path = log_file_path();
+        assert_eq!(
+            path.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "the log must be under env::temp_dir() (TMPDIR-aware), got {path:?}"
+        );
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf8 name");
+        assert!(
+            name.starts_with("choreo-tui-") && name.ends_with(".log"),
+            "the log name must be choreo-tui-<pid>.log, got {name}"
+        );
+    }
+
+    /// A writable temp dir must yield a created, writable log file (the
+    /// happy path). Sole caller of `init_file_logging` in the test suite:
+    /// it installs the process-global tracing subscriber, which must only
+    /// happen once per process.
+    #[test]
+    fn init_file_logging_creates_the_log_file() {
+        let path = init_file_logging().expect("a writable temp dir must yield a log file");
+        assert!(path.exists(), "the log file must have been created");
     }
 }
 
