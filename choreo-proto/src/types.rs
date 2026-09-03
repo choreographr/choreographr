@@ -460,7 +460,12 @@ pub enum ClientMessage {
     AddCredential {
         service: String,
         encrypted_payload: Vec<u8>,
-        unlock_key: Option<Vec<u8>>,
+        // Required (not Option): the credential blob is encrypted with the
+        // unlock key client-side, so the daemon must be able to
+        // test-decrypt + implicitly unlock on receipt (TOFU per-daemon
+        // keystore binding). An omitted key would leave an undecryptable
+        // blob persisted, breaking the whole keystore.
+        unlock_key: Vec<u8>,
     },
     RemoveCredential {
         service: String,
@@ -1036,6 +1041,46 @@ mod tests {
         assert_eq!(decoded, turn);
         assert!(decoded.reasoning_artifact.is_none());
         assert!(decoded.reasoning_producer.is_none());
+    }
+
+    #[test]
+    fn add_credential_round_trips_with_required_unlock_key() {
+        // unlock_key is now REQUIRED (per-daemon keystore TOFU design): the
+        // client encrypts the blob with the derived pubkey, so the daemon
+        // cannot do anything useful without the key. Pin both wire formats
+        // and assert the key survives byte-for-byte so a future serde change
+        // cannot silently make it optional or drop it.
+        let msg = ClientMessage::AddCredential {
+            service: "openai".to_string(),
+            encrypted_payload: vec![1u8, 2, 3, 4, 5],
+            unlock_key: vec![9u8; 32],
+        };
+
+        let bytes = rmp_serde::to_vec_named(&msg).expect("encode");
+        let decoded: ClientMessage = rmp_serde::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, msg, "MessagePack round-trip must keep the key");
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: ClientMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, msg, "JSON round-trip must keep the key");
+    }
+
+    #[test]
+    fn add_credential_without_unlock_key_fails_to_decode() {
+        // The old wire shape carried an absent/None key; the new required
+        // field must REJECT such payloads rather than silently decoding with
+        // an empty key (postcard/named-msgpack would misinterpret a missing
+        // field). Pin the rejection so the requirement is enforced on the
+        // wire, not just in the type system.
+        let bytes = rmp_serde::to_vec_named(&serde_json::json!({
+            "AddCredential": {
+                "service": "openai",
+                "encrypted_payload": [1, 2, 3]
+            }
+        }))
+        .expect("encode legacy-shaped payload");
+        let result: Result<ClientMessage, _> = rmp_serde::from_slice(&bytes);
+        assert!(result.is_err(), "missing unlock_key must not decode");
     }
 
     #[test]

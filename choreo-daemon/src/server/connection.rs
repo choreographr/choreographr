@@ -1145,7 +1145,9 @@ fn handle_add_credential_sync(
     ctx: &mut ClientCtx,
     service: String,
     encrypted_payload: Vec<u8>,
-    unlock_key: Option<Vec<u8>>,
+    // REQUIRED since the per-daemon keystore TOFU design (Task 1 made the
+    // proto field non-optional): the credential must be usable immediately.
+    unlock_key: Vec<u8>,
 ) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::SaveCredential {
         service: service.clone(),
@@ -1155,6 +1157,12 @@ fn handle_add_credential_sync(
     });
     match result {
         Ok(Ok(())) => {
+            // The daemon performed the IMPLICIT UNLOCK as part of the save
+            // (adopt-or-verify → test-decrypt → persist → unlock tail), so a
+            // successful AddCredential leaves the daemon unlocked exactly
+            // like a successful `Unlock`: mirror `handle_unlock_sync` by
+            // emitting `Unlocked` alongside `CredentialAdded`.
+            send_to_writer(ctx, DaemonMessage::Unlocked);
             send_to_writer(ctx, DaemonMessage::CredentialAdded { service });
         }
         Ok(Err(e)) => {

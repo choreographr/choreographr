@@ -33,8 +33,18 @@
 //! their writes but the SECOND write clobbers the FIRST's new entry
 //! (last-writer-wins). That is acceptable for a known_hosts analogue (the
 //! store is small, per-user, and a vanished pin degrades to a re-confirmed
-//! first contact — never silent trust), but it is why this store must not
-//! grow into a general-purpose mutable registry.
+//! first contact — never silent trust), but it is why this store carries
+//! only its two sanctioned mutable fields (the transport pin and the
+//! per-daemon keystore unlock key) and must not grow into a
+//! general-purpose mutable registry.
+//!
+//! Unlock keys: each daemon's credential keystore is governed by one
+//! keypair whose private half is held CLIENT-side, one per daemon (TOFU —
+//! the daemon adopts the first presented key and verifies every later
+//! one). This store is that client-side home: `unlock_key` is the base64
+//! 32-byte X25519 private key for the daemon at `addr`. Unix-socket
+//! connections have no transport key to pin, so their entries exist purely
+//! to carry the unlock key (`pubkey = None`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -51,10 +61,18 @@ use crate::error::ClientError;
 /// whose address changes re-enters first contact under its new address).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KnownServerEntry {
-    /// Dial address (`host:port`) this key was pinned under.
+    /// Dial address (`host:port`, or the unix socket path for unix
+    /// connections — see the module docs on unlock-key carriers).
     pub addr: String,
     /// Base64 (standard alphabet) of the confirmed 32-byte server static.
-    pub pubkey: String,
+    /// `None` for unix-socket entries, which carry no transport pin — they
+    /// exist only to hold the per-daemon unlock key.
+    #[serde(default)]
+    pub pubkey: Option<String>,
+    /// Base64 (standard alphabet, same conventions as `pubkey`) of the
+    /// 32-byte per-daemon keystore unlock key for this daemon.
+    #[serde(default)]
+    pub unlock_key: Option<String>,
     /// Unix epoch seconds when the pin was confirmed (bookkeeping only —
     /// never used in trust decisions).
     #[serde(default)]
@@ -86,17 +104,17 @@ pub fn known_servers_path() -> Result<PathBuf, ClientError> {
 ///
 /// Returns `Err` on invalid base64 or a decoded length other than 32 —
 /// callers treat that as "entry is garbage, skip it", never as "no pin".
-fn decode_pubkey(b64: &str) -> Result<[u8; 32], ClientError> {
+fn decode_key(b64: &str, what: &str) -> Result<[u8; 32], ClientError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
-        .map_err(|e| ClientError::CredentialParse(format!("invalid pubkey base64: {e}")))?;
-    bytes
-        .try_into()
-        .map_err(|_| ClientError::CredentialParse("pubkey must decode to exactly 32 bytes".into()))
+        .map_err(|e| ClientError::CredentialParse(format!("invalid {what} base64: {e}")))?;
+    bytes.try_into().map_err(|_| {
+        ClientError::CredentialParse(format!("{what} must decode to exactly 32 bytes"))
+    })
 }
 
 /// Encode a raw 32-byte key as the store's base64 form.
-fn encode_pubkey(pk: &[u8; 32]) -> String {
+fn encode_key(pk: &[u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(pk)
 }
 
@@ -152,12 +170,78 @@ impl KnownServers {
     /// `Ok(None)` = no pin (first contact); `Ok(Some(pk))` = pin exists, the
     /// caller must run IK against it and treat any mismatch as a hard
     /// error. Individual unparseable entries never surface here (they were
-    /// dropped at load time with a warning).
+    /// dropped at load time with a warning). An entry WITHOUT a pubkey (a
+    /// unix-socket unlock-key carrier) also yields `Ok(None)`: TCP callers
+    /// see that as "unpinned", which is exactly the first-contact
+    /// semantics they already handle.
     pub fn lookup(&self, addr: &str) -> Result<Option<[u8; 32]>, ClientError> {
         match self.entries.iter().find(|e| e.addr == addr) {
             None => Ok(None),
-            Some(entry) => Ok(Some(decode_pubkey(&entry.pubkey)?)),
+            Some(entry) => match &entry.pubkey {
+                None => Ok(None),
+                Some(b64) => Ok(Some(decode_key(b64, "pubkey")?)),
+            },
         }
+    }
+
+    /// The stored per-daemon unlock key for `addr`, if one exists.
+    /// Returns `Ok(None)` when the entry has no unlock_key (or no entry at
+    /// all) — callers fall back to the legacy local key or generate a fresh
+    /// one. Entries whose stored unlock_key does not decode to 32 bytes are
+    /// dropped at load time, so this never surfaces garbage.
+    pub fn unlock_key(&self, addr: &str) -> Result<Option<[u8; 32]>, ClientError> {
+        match self
+            .entries
+            .iter()
+            .find(|e| e.addr == addr)
+            .and_then(|e| e.unlock_key.as_deref())
+        {
+            None => Ok(None),
+            Some(b64) => Ok(Some(decode_key(b64, "unlock_key")?)),
+        }
+    }
+
+    /// Record the per-daemon unlock key for `addr`, persisting immediately
+    /// under the same advisory file lock as `pin`. If no entry exists for
+    /// `addr` one is created with `pubkey: None` — that is the
+    /// unix-socket carrier case (unix connections have nothing to pin;
+    /// TCP daemons already have a pinned entry by the time a credential
+    /// flow runs, so the existing entry is updated in place, keeping its
+    /// pin intact).
+    pub fn set_unlock_key(&mut self, addr: &str, key: &[u8; 32]) -> Result<(), ClientError> {
+        let b64 = encode_key(key);
+        match self.entries.iter_mut().find(|e| e.addr == addr) {
+            Some(existing) => {
+                // Replace only the unlock key — never clobber a transport
+                // pin that a human already confirmed.
+                existing.unlock_key = Some(b64);
+                // Record when the carrier was written (bookkeeping only).
+                if existing.first_seen_unix.is_none() {
+                    existing.first_seen_unix = Some(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                    );
+                }
+            }
+            None => {
+                self.entries.push(KnownServerEntry {
+                    addr: addr.to_string(),
+                    pubkey: None,
+                    unlock_key: Some(b64),
+                    first_seen_unix: Some(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                    ),
+                });
+            }
+        }
+        self.persist()?;
+        info!(addr, "recorded per-daemon keystore unlock key");
+        Ok(())
     }
 
     /// Pin `pk` as the confirmed server key for `addr`, persisting
@@ -171,7 +255,10 @@ impl KnownServers {
     pub fn pin(&mut self, addr: &str, pk: &[u8; 32]) -> Result<(), ClientError> {
         let entry = KnownServerEntry {
             addr: addr.to_string(),
-            pubkey: encode_pubkey(pk),
+            pubkey: Some(encode_key(pk)),
+            // Pinning does not touch any unlock key — the transport pin and
+            // the keystore unlock key are independent fields.
+            unlock_key: None,
             first_seen_unix: Some(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -280,9 +367,11 @@ struct StoreFile {
 }
 
 /// Parse the store text. Unparseable WHOLE file -> empty + warning (the
-/// load-time tolerant policy); individual entries whose pubkey does not
-/// decode to 32 bytes are dropped with a warning and the healthy rest is
-/// kept — one corrupted line must not unpin every server.
+/// load-time tolerant policy); individual entries whose PRESENT pubkey
+/// does not decode to 32 bytes are dropped with a warning, while entries
+/// with NO pubkey are kept (unix-socket unlock-key carriers) and entries
+/// whose unlock_key is corrupt have just that field dropped — one bad
+/// line must not unpin or unlock-wipe every server.
 fn parse_store(text: &str) -> Vec<KnownServerEntry> {
     let parsed: StoreFile = match toml::from_str(text) {
         Ok(p) => p,
@@ -294,21 +383,46 @@ fn parse_store(text: &str) -> Vec<KnownServerEntry> {
     parsed
         .server
         .into_iter()
-        .filter_map(|entry| match decode_pubkey(&entry.pubkey) {
+        .filter_map(|entry| {
             // Re-encode canonically: a hand-edited entry with stray
-            // whitespace round-trips into the normalized form.
-            Ok(pk) => Some(KnownServerEntry {
-                pubkey: encode_pubkey(&pk),
+            // whitespace round-trips into the normalized form. A present-
+            // but-invalid pubkey means the entry is garbage (its trust
+            // decision cannot be honored) — drop it. A present-but-invalid
+            // unlock_key is more forgiving: drop just that field, keeping
+            // the pin, so the caller re-resolves/re-records the key.
+            let pubkey = match &entry.pubkey {
+                Some(b64) => match decode_key(b64, "pubkey") {
+                    Ok(pk) => Some(encode_key(&pk)),
+                    Err(e) => {
+                        warn!(
+                            addr = %entry.addr,
+                            error = %e,
+                            "skipping invalid known_servers entry"
+                        );
+                        return None;
+                    }
+                },
+                None => None,
+            };
+            let unlock_key = match &entry.unlock_key {
+                Some(b64) => match decode_key(b64, "unlock_key") {
+                    Ok(key) => Some(encode_key(&key)),
+                    Err(e) => {
+                        warn!(
+                            addr = %entry.addr,
+                            error = %e,
+                            "dropping corrupt unlock_key from known_servers entry (pin kept); the key will be re-resolved"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            Some(KnownServerEntry {
+                pubkey,
+                unlock_key,
                 ..entry
-            }),
-            Err(e) => {
-                warn!(
-                    addr = %entry.addr,
-                    error = %e,
-                    "skipping invalid known_servers entry"
-                );
-                None
-            }
+            })
         })
         .collect()
 }
@@ -418,7 +532,7 @@ mod tests {
             format!(
                 "[[server]]\naddr = \"bad:1\"\npubkey = \"not-base64!!!\"\n\n\
                  [[server]]\naddr = \"good:1\"\npubkey = \"{}\"\n",
-                encode_pubkey(&[6u8; 32])
+                encode_key(&[6u8; 32])
             ),
         )
         .expect("write mixed store");

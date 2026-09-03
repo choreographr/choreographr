@@ -1,7 +1,7 @@
 use super::{SessionUpdateRouting, route_session_update};
 use crate::state::{App, Page, ProviderInfo, merge_token_usage};
 use crate::terminal_progress;
-use choreo_client_core::{ClientError, dispatch_daemon_message};
+use choreo_client_core::{ClientError, dispatch_daemon_message, record_unlock_key};
 use choreo_proto::{ClientMessage, DaemonMessage, RefreshStatus, SessionEvent};
 
 pub(crate) fn handle_daemon_message(
@@ -153,6 +153,9 @@ pub(crate) fn handle_daemon_message(
         // pre-credential state until the user leaves and re-enters the page.
         DaemonMessage::CredentialAdded { service } => {
             app.status = Some(format!("[daemon] credential added: {service}"));
+            // The daemon accepted the unlock key this credential carried —
+            // record it per-daemon on CONFIRMED success only (never on send).
+            record_confirmed_unlock_key(app);
             let _ = client_tx.send(ClientMessage::ListAccounts);
         }
         DaemonMessage::CredentialRemoved { service } => {
@@ -596,10 +599,42 @@ pub(crate) fn handle_daemon_message(
             );
             return Ok(());
         }
+        // A successful unlock (explicit /unlock or the connect-time
+        // auto-unlock) means the daemon ACCEPTED the pending key — record it
+        // per-daemon on confirmed success only. Deliberately no early return:
+        // the generic dispatch below still emits the "keystore unlocked" status.
+        DaemonMessage::Unlocked => {
+            record_confirmed_unlock_key(app);
+        }
         _ => {}
     }
 
     // Dispatch remaining variants through the generic turn-event handler.
     dispatch_daemon_message(&message, app);
     Ok(())
+}
+
+/// Record the daemon-confirmed unlock key per-daemon, exactly once.
+///
+/// The pending key (`app.pending_unlock_key`) is stored when an `Unlock` or
+/// `AddCredential` is SENT (see `run_app`'s auto-unlock and the chat/credential
+/// handlers). A daemon that accepts the key replies `Unlocked` / `CredentialAdded`
+/// — and only then do we persist it into the daemon's known_servers entry. This
+/// is the TOFU core of the per-daemon keystore design: a key the daemon REJECTS
+/// (misbound keystore) is never recorded.
+fn record_confirmed_unlock_key(app: &mut App) {
+    let Some(key) = app.pending_unlock_key.take() else {
+        return;
+    };
+    match record_unlock_key(&app.connection_addr, &key) {
+        Ok(()) => {
+            tracing::info!(
+                addr = %app.connection_addr,
+                "recorded daemon-confirmed unlock key per-daemon"
+            );
+        }
+        Err(e) => {
+            app.error = Some(format!("[error] failed to record unlock key: {e}"));
+        }
+    }
 }

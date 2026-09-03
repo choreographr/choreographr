@@ -1,10 +1,10 @@
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{
     ClientError, ConnectionMode, ShellCommand, build_add_credential_message,
-    dispatch_daemon_message, parse_input_line, resolve_private_key,
+    dispatch_daemon_message, parse_input_line, record_unlock_key, resolve_private_key,
     run_daemon_connection_with_mode, shell_command_echo,
 };
-use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
+use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, socket_path};
 use dioxus::prelude::*;
 use futures_channel::mpsc::UnboundedSender;
 
@@ -45,6 +45,21 @@ pub(crate) fn submit_input(
     handle_shell_command(&mut state.write(), daemon_tx, command);
 }
 
+/// The address string used to key per-daemon unlock keys in known_servers:
+/// the actual dial address for TCP, the unix socket path otherwise. This is
+/// the same address the daemon's keystore binding is recorded against, so
+/// every `Unlock`/`AddCredential`/record must use it consistently.
+fn connection_addr() -> String {
+    match crate::CONNECTION_MODE.get() {
+        Some(ConnectionMode::UnixSocket(path)) => path.clone(),
+        Some(ConnectionMode::Tcp { addr, .. }) => addr.clone(),
+        Some(ConnectionMode::TcpPinned(addr)) => addr.clone(),
+        // Unset (e.g. unit tests, or a mis-wired launcher): default to the
+        // unix socket path, which is what a local default-mode connection uses.
+        None => socket_path(),
+    }
+}
+
 pub(crate) fn handle_shell_command(
     state: &mut AppState,
     daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
@@ -57,8 +72,11 @@ pub(crate) fn handle_shell_command(
             .push(format!("invalid request id: {value}")),
         ShellCommand::UnknownCommand(error) => state.status_texts.push(error),
         ShellCommand::Send(message) => send_client_message(state, daemon_tx, message),
-        ShellCommand::Unlock { method } => match resolve_private_key(&method) {
+        ShellCommand::Unlock { method } => match resolve_private_key(&method, &connection_addr()) {
             Ok(private_key) => {
+                // Hold the key until the daemon confirms the unlock, then
+                // record it per-daemon (see [`record_pending_unlock_key`]).
+                state.pending_unlock_key = Some(private_key.clone());
                 send_client_message(state, daemon_tx, ClientMessage::Unlock { private_key });
             }
             Err(e) => {
@@ -69,11 +87,20 @@ pub(crate) fn handle_shell_command(
             service,
             credential_type,
             fields,
-            unlock,
-        } => match build_add_credential_message(service, credential_type, fields, unlock) {
-            Ok(msg) => send_client_message(state, daemon_tx, msg),
-            Err(e) => state.status_texts.push(format!("[error] {e}")),
-        },
+        } => {
+            match build_add_credential_message(&connection_addr(), service, credential_type, fields)
+            {
+                Ok((msg, key)) => {
+                    // Record the key only after the daemon CONFIRMS it
+                    // (CredentialAdded / Unlocked); the daemon may reject the
+                    // key (misbound keystore) and we must not persist a rejected
+                    // key. Hold it pending here, clear on error/confirmation.
+                    state.pending_unlock_key = Some(key);
+                    send_client_message(state, daemon_tx, msg);
+                }
+                Err(e) => state.status_texts.push(format!("[error] {e}")),
+            }
+        }
         ShellCommand::AclAdd { pubkey } => {
             // The daemon enforces local-only; forward like any other command
             // and surface the refusal if this GUI connection is remote.
@@ -228,6 +255,23 @@ pub(crate) fn apply_daemon_message(
 ) -> Result<(), ClientError> {
     if handle_session_message(state, &daemon_tx, &message) {
         return Ok(());
+    }
+
+    // The daemon CONFIRMED an unlock key (explicit Unlock or an
+    // AddCredential that implicitly unlocked). Record the pending key
+    // per-daemon NOW — the whole point of the per-daemon keystore design
+    // is that a key is only trusted/recorded after the daemon accepts it
+    // (TOFU adopt, or a binding match). A rejected key never reaches here.
+    if let Some(key) = state.pending_unlock_key.take()
+        && matches!(
+            &message,
+            DaemonMessage::Unlocked | DaemonMessage::CredentialAdded { .. }
+        )
+        && let Err(e) = record_unlock_key(&connection_addr(), &key)
+    {
+        state
+            .status_texts
+            .push(format!("[error] failed to record unlock key: {e}"));
     }
 
     dispatch_daemon_message(&message, state);

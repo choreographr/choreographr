@@ -3,7 +3,7 @@ use choreo_client_core::{
     ShellCommand, build_add_credential_message, parse_input_line, resolve_private_key,
 };
 use choreo_markdown::render_markdown_html;
-use choreo_proto::ClientMessage;
+use choreo_proto::{ClientMessage, socket_path};
 use std::cell::Cell;
 use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -127,7 +127,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: crate::tg_api::Message)
                 warn!("failed to send error message to telegram: {e}");
             }
         }
-        ShellCommand::Unlock { method } => match resolve_private_key(&method) {
+        ShellCommand::Unlock { method } => match resolve_private_key(&method, &socket_path()) {
             Ok(private_key) => {
                 if let Err(e) = state.bridge_tx.send(ClientMessage::Unlock { private_key }) {
                     warn!("failed to send unlock to bridge: {e}");
@@ -141,9 +141,8 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: crate::tg_api::Message)
             service,
             credential_type,
             fields,
-            unlock,
-        } => match build_add_credential_message(service, credential_type, fields, unlock) {
-            Ok(msg) => {
+        } => match build_add_credential_message(&socket_path(), service, credential_type, fields) {
+            Ok((msg, _key)) => {
                 if let Err(e) = state.bridge_tx.send(msg) {
                     warn!("failed to send add credential to bridge: {e}");
                 }

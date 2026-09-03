@@ -84,11 +84,13 @@ choreo-tui is entirely event driven, and runs in immediate mode. The terminal is
 ### Encrypted Keystore
 
 Credentials are encrypted per-credential with ECDH (X25519) + HKDF +
-AES-256-GCM before being stored in the `redb` database, so only the holder
-of the daemon's private key can decrypt them. Identity keys live in
-`~/.config/choreographr/` — `identity.pk` (private), `public.pk` (public),
-and optionally `identity.pk.enc` (passphrase-encrypted). The daemon starts
-locked and only decrypts credentials into memory after `/unlock`.
+AES-256-GCM before being stored in the `redb` database. Each daemon's
+keystore is governed by ONE client-held unlock key (the daemon stores only
+the derived public binding, adopted on first insertion — TOFU). A client
+holds one unlock key per daemon in `known_servers.toml`, and the legacy
+`identity.pk` / `identity.pk.enc` files are used only as a one-time migration
+source. The daemon starts locked and only decrypts credentials into memory
+after an unlock.
 
 ### Maximum model compatibility
 
@@ -438,7 +440,7 @@ data model.
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
 | `choreo-sanitize` | Internal leaf crate — the single source of truth for the Unicode "spoofing" predicates (bidi/ZWSP escaping) and the shared tool-output byte budget + `...[truncated]` marker, used by the daemon, TUI, blockchain tools, and client |
 | `choreo-image` | Leaf crate — the single raster decode path (EXIF orientation baked in) and HEIC/HEIF decode (with a pre-decode allocation guard), shared by the daemon and the TUI so the model and UI paths cannot drift |
-| `choreo-keystore` | X25519 keypair + ECDH/AES-256-GCM crypto library for encrypted credentials |
+| `choreo-keystore` | X25519 + ECDH/AES-256-GCM crypto library for the per-daemon unlock-key keystore |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
 | `choreo-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio |
 | `choreo-acp` | ACP (Agent Communication Protocol) bridge — translates JSON-RPC 2.0 over stdin/stdout into `choreo-proto` messages so ACP-compatible editors can drive sessions |
@@ -563,11 +565,11 @@ disable_claude_code_prompt = false
 > timeouts, endpoint paths, request format, etc.) have moved to per-account
 > overrides in `accounts.toml`. They are no longer read from `config.toml`.
 
-Credentials are encrypted per-credential with the daemon's X25519 public key
-and stored in the `redb` database. Identity keys reside in
-`~/.config/choreographr/identity.pk` (private),
-`~/.config/choreographr/public.pk` (public), and optionally
-`~/.config/choreographr/identity.pk.enc` (passphrase-encrypted private key).
+Credentials are encrypted per-credential with the daemon's keystore X25519
+public key (derived from the client-held unlock key) and stored in the `redb`
+database. Each daemon's keystore is bound to one unlock key held client-side; the
+legacy `identity.pk` / `identity.pk.enc` files exist only as a one-time migration
+source.
 
 The socket path defaults to `/tmp/Choreographr.sock` (override with
 `CHOREOGRAPHR_SOCKET_PATH`). The database path defaults to
@@ -716,10 +718,10 @@ In `choreo-tui`:
 - `/session switch <id>` — switch to a different session
 - `/session info <id>` — show info for a specific session
 - `/cancel <request-id>` — cancel a running request
-- `/unlock [passphrase]` — unlock the daemon (reads `identity.pk` or decrypts `identity.pk.enc`)
+- `/unlock [passphrase]` — unlock the daemon (uses the stored per-daemon unlock key; `[passphrase]` decrypts the legacy `identity.pk.enc` during migration)
 - `/lock` — lock the daemon, clearing credentials from memory
-- `/add-key <service> <api_key> [unlock]` — add an API key credential (service name must be `[a-z0-9_-]`)
-- `/add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ [unlock]` — add an X credential (service name must be `[a-z0-9_-]`)
+- `/add-key <service> <api_key>` — add an API key credential (service name must be `[a-z0-9_-]`)
+- `/add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_` — add an X credential (service name must be `[a-z0-9_-]`)
 - `/acl add <base64-pubkey>` — enroll a new client's transport public key in the daemon's ACL (local/Unix-socket connections only; takes effect immediately via the ACL hot-reload)
 - `/remove-key <service>` — remove a credential
 - `/account list` — list configured AI provider accounts
@@ -745,16 +747,19 @@ daemon without requesting daemon shutdown.
 
 ## Security model
 
-The daemon starts **locked**. Clients resolve the private key (reading
-`identity.pk` directly, or decrypting `identity.pk.enc` with a passphrase) and
-send it to the daemon via `ClientMessage::Unlock`. The daemon then decrypts all
-stored credential blobs into memory.
+The daemon starts **locked**. Clients resolve their per-daemon unlock key (the
+stored per-daemon key, else the legacy `identity.pk` / `identity.pk.enc` during
+migration) and send it via `ClientMessage::Unlock`. The daemon verifies it against
+the keystore binding (adopting it on an unbound keystore — TOFU) and decrypts
+all stored credential blobs into memory. `AddCredential` also carries the unlock
+key and implicitly unlocks on a valid blob.
 
 - Credentials are encrypted per-credential with ECDH (X25519) + HKDF +
-  AES-256-GCM; only the holder of the private key can decrypt them.
+  AES-256-GCM to the daemon's keystore pubkey; the daemon refuses to persist a
+  blob it cannot test-decrypt with its bound key.
 - `/lock` destroys all in-memory credentials and returns the daemon to the
   locked state.
-- The private key is zeroized after use; lock/unlock does not interrupt session
+- The unlock key is zeroized after use; lock/unlock does not interrupt session
   browsing — credentials are only needed at prompt time.
 - Remote connections (over TCP) use the Noise IK handshake with X25519 key
   agreement, giving an authenticated, encrypted transport for clients like

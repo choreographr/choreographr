@@ -472,22 +472,29 @@ the `meta`/`iinf`/`iprp`/`ipco` containers and is careful about **full boxes**
 `mdat` raw media data, so arbitrary payload bytes cannot cause a false
 rejection.
 
-### `choreo-keystore` — Identity keypair & credential crypto
+### `choreo-keystore` — Per-daemon unlock-key keystore crypto
 
 Provides the cryptographic primitives for credential management. No longer a standalone
 CLI binary — it is a library used by `choreo-client-core` and `choreo-daemon`.
 
-**Identity keypair (X25519):**
-The daemon's identity is an X25519 keypair stored as two files:
-- `~/.config/choreographr/identity.pk` — raw 32-byte private key
-- `~/.config/choreographr/public.pk` — raw 32-byte public key
+**Per-daemon unlock key (X25519):**
+Each daemon's credential keystore is governed by ONE X25519 keypair belonging to
+that daemon. The daemon stores only the *binding* — the public key derived from
+that pair — and the private half (the "unlock key") is held CLIENT-side, one per
+daemon, in the client's `known_servers.toml`. The binding is established by first
+insertion (TOFU): the first valid unlock/credential-add against an unbound
+daemon ADOPTS the presented key; every later one must match the binding or it is
+rejected.
 
-The private key can be stored encrypted at rest:
-- `~/.config/choreographr/identity.pk.enc` — Argon2 + AES-256-GCM encrypted private key
+The legacy `identity.pk` / `public.pk` client keypair (and `ensure_keypair`)
+have been **removed**. Two legacy files remain only as a one-time migration
+source, deleted after the client records the daemon-confirmed key:
+- `~/.config/choreographr/identity.pk` — raw 32-byte legacy private key
+- `~/.config/choreographr/identity.pk.enc` — Argon2 + AES-256-GCM encrypted legacy private key
 
 **Credential encryption pipeline (client-side):**
 ```
-credential ──► postcard serialize ──► ECDH (ephemeral + recipient pubkey)
+credential ──► postcard serialize ──► ECDH (ephemeral + daemon-unlock-key pubkey)
   ──► HKDF ──► AES-256-GCM encrypt ──► encrypted payload
 ```
 
@@ -497,15 +504,17 @@ eph_public(32) || salt(32) || nonce(12) || ciphertext(rest)
 ```
 
 Credentials are encrypted per-credential, using ECDH key agreement so only the
-daemon (holder of the private key) can decrypt them. The encrypted blobs are stored
-in the `redb` database alongside sessions.
+authorized holder of the unlock key can test-decrypt them. The encrypted blobs are
+stored in the `redb` database alongside sessions, and the daemon refuses to
+persist a blob it cannot test-decrypt with its bound key (enforcing that every
+credential in a keystore shares one key).
 
 **Modules:**
 
 | Module | Purpose |
 |---|---|
-| `crypto.rs` | X25519 keypair generation, ECDH + HKDF + AES-256-GCM encrypt/decrypt, passphrase-based private key encryption; shared AES-256-GCM helpers |
-| `paths.rs` | Resolves filesystem paths for identity key files |
+| `crypto.rs` | X25519 keypair generation, ECDH + HKDF + AES-256-GCM encrypt/decrypt, passphrase-based key encryption; shared AES-256-GCM helpers |
+| `paths.rs` | Resolves filesystem paths for the legacy key files (migration source only) |
 | `error.rs` | `KeystoreError` enum |
 
 **Credential types:** `ApiKey` (OpenAI), `X` (Twitter OAuth 1.0a credentials)
@@ -544,7 +553,7 @@ Used by `choreo-tui`, `choreo-gui`, and `choreo-im`.
 | `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
 | `dispatch.rs` | `TurnEventHandler` trait + `dispatch_daemon_message()` — splits the v4 `DaemonMessage` into its two families before any per-arm work: `dispatch_session_event` (the inner `SessionEvent` of the `Session` envelope, with the origin resolved exactly once; the six None-capable events — `Failed`, `Cancelled`, `ModelSelectionFailed`, `ReasoningEffortSet`/`Failed`, `SessionFailed` — are pre-handled so a `None` origin (connection-level reply with no session) surfaces its status/error instead of being dropped, while every other event hard-requires `Some` via a guard that `warn!`s if a producer ever emits a session-scoped event without an origin) and `dispatch_flat_message` (all 23 flat connection/reply/global variants enumerated explicitly — no wildcard arm — so a new `DaemonMessage` variant must be triaged at compile time, matching the no-`#[non_exhaustive]` wire-contract rule). Used by all UI clients (TUI, GUI, IM bridge) to avoid duplicating the routing logic. |
 | `connection.rs` | Daemon connection helpers: `run_daemon_connection()` (Unix socket), `run_daemon_tcp_connection()` (Noise IK with the wire-v5 mode preamble), `run_daemon_tcp_connection_xx_first_contact()` (Noise XX first contact — the trust gate: the session/writer threads only start after the caller's `on_first_contact` callback approves the server key learned from the handshake, so an `Unlock` can never flow to an unconfirmed server), `probe_server_key()` (XX handshake-ONLY probe: learn the server's static and drop the stream — the building block UIs use to run the fingerprint confirmation synchronously before any TUI/GUI starts), `run_daemon_tcp_connection_pinned()` (IK against the `known_servers.toml` pin; the DIAL is a separate step so a network-down daemon is a plain connect error, and on HANDSHAKE failure the error carries the pinned fingerprint plus the explicit re-pair guidance, so a changed server key is loud — the guidance attaches only to the handshake-failure case, never to a dial failure or a mid-session disconnect), `run_daemon_connection_with_mode()` (dispatch), `run_daemon_reader()` (blocking reader). The IK path's preamble+handshake+serve tail is shared by both TCP modes in `ik_handshake_and_serve`, so they cannot drift. `ConnectionMode` enum (`UnixSocket` | `Tcp` | `TcpPinned`) selects the transport. |
-| `known_servers.rs` | The client's pinned server public keys — the SSH `known_hosts` analogue. `KnownServers` loads `known_servers.toml` (`[[server]]` entries: `addr`, base64 `pubkey`, `first_seen_unix`), `lookup(addr)` returns the pinned key for IK connections (pinned-but-changed server keys are the CALLER's hard error), `pin(addr, pk)` persists the human-confirmed first-contact key (re-pinning an address replaces the entry — the deliberate re-pairing path), `remove(addr)` is the documented recovery path. Failure policy: tolerant on load (missing/corrupt/garbage file → empty store + warning — the worst case is a re-confirmed XX first contact, never silent trust; individually unparseable entries are dropped while healthy ones survive) and strict on write (whole-file rewrite under an advisory exclusive file lock, same discipline as `ensure_transport_keypair` — the lock prevents tearing, not lost updates: concurrent processes are last-writer-wins, and a vanished pin degrades to a re-confirmed first contact, never silent trust). Path resolves through `choreo_keystore::paths::config_dir()` so test overrides agree with the rest of the config family. |
+| `known_servers.rs` | The client's pinned server keys + per-daemon unlock keys — the SSH `known_hosts` analogue extended with the keystore unlock key. `KnownServers` loads `known_servers.toml` (`[[server]]` entries: `addr`, optional base64 `pubkey` (absent for unix-socket unlock-key carriers), optional base64 `unlock_key`, `first_seen_unix`), `lookup(addr)` returns the pinned key for IK connections (pinned-but-changed server keys are the CALLER's hard error), `unlock_key(addr)` / `set_unlock_key(addr, key)` resolve/record the per-daemon keystore unlock key (recorded ONLY on daemon-confirmed success, never on send — a rejected key is not persisted; `set_unlock_key` creates a pubkey-less entry for unix-socket daemons), `pin(addr, pk)` persists the human-confirmed first-contact key, `remove(addr)` is the documented recovery path. Failure policy: tolerant on load (missing/corrupt/garbage file → empty store + warning — the worst case is a re-confirmed XX first contact, never silent trust; entries with a PRESENT-but-invalid pubkey are dropped, entries with no pubkey are kept, a corrupt unlock_key drops just that field) and strict on write (whole-file rewrite under an advisory exclusive file lock, same discipline as `ensure_transport_keypair`). Path resolves through `choreo_keystore::paths::config_dir()` so test overrides agree with the rest of the config family. |
 
 `TurnEventHandler` is the `choreo-client-core` dispatch sink; the `ClientError` type used by the connection layer is a thiserror enum — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `PrivateKeyEncRead`, `PrivateKeyDecrypt`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Postcard`, `Encryption`.
 
@@ -553,8 +562,8 @@ Used by `choreo-tui`, `choreo-gui`, and `choreo-im`.
 
 The TCP enrollment model is a deliberate ASYMMETRY — the SSH `known_hosts`
 pattern, not symmetric TOFU. It exists so that the first-contact window (the
-only moment a MITM could strike) can never observe the daemon's private key,
-which clients send inside `Unlock`. Every key arrives over a channel the
+only moment a MITM could strike) can never observe the daemon's keystore
+unlock key, which clients send inside `Unlock`. Every key arrives over a channel the
 operator already trusts, or is confirmed by a human comparing fingerprints:
 
 - **Client keys → daemon: out of band, always.** A client's transport public
@@ -577,7 +586,7 @@ operator already trusts, or is confirmed by a human comparing fingerprints:
   Noise IK (`PREAMBLE_IK`) against the pin; a changed server key fails LOUDLY
   with the pinned fingerprint and re-pair guidance, never a silent re-prompt.
 - **Why not symmetric OOB, and why not blind TOFU:** blind TOFU would let a
-  first-contact MITM harvest an `Unlock` (the daemon's master private key) —
+  first-contact MITM harvest an `Unlock` (the daemon keystore's unlock key) —
   strictly worse than a phished SSH password. The XX + fingerprint flow keeps
   the single out-of-band artifact to one fingerprint readout while
   eliminating the client-side file handling of a symmetric exchange. The
@@ -1437,23 +1446,36 @@ Telegram user → teloxide polling → handle_message()
 
 ### Lock/Unlock flow
 
-The daemon starts in a **locked** state. The client resolves the private key (reading
-`identity.pk` directly or decrypting `identity.pk.enc` with a passphrase) and sends
-it to the daemon via `ClientMessage::Unlock { private_key }`.
+Each daemon's credential keystore is governed by a keypair whose private half (the
+**unlock key**) is held client-side, one per daemon, in the client's
+`known_servers.toml`. The daemon stores only the public half as a **binding**, and
+it starts **locked** with no credentials in memory. The first unlock/credential-add
+against an unbound keystore ADOPTS the presented key (TOFU, logged loudly); every
+later one must match the binding or it is rejected (`LockedError`).
+
+A client sends `ClientMessage::Unlock { private_key }` (resolved as its stored
+per-daemon unlock key, else the legacy `identity.pk` / `identity.pk.enc` during
+migration). `AddCredential` now REQUIRES the unlock key and, on a valid blob,
+**implicitly unlocks** the daemon (decrypts all blobs into memory). The client
+records the key per-daemon only after the daemon confirms (`Unlocked` /
+`CredentialAdded`).
 
 ```
-startup                    /unlock [passphrase]
-   │                              │
-   │  locked                      │  read identity.pk (or decrypt identity.pk.enc)
-   │  (no credentials)            │  decrypt all credential blobs from database
-   │                              │  load accounts from accounts.toml
-   │                              │  resolve InferenceProvider per account (in-memory only)
-   │                              │  → Unlocked (ready)
-   ▼                              ▼
+startup                    /unlock [passphrase]     AddCredential{... unlock_key}
+   │                              │                          │
+   │  locked                      │  resolve unlock key       │ adopt-or-verify
+   │  (no credentials)            │  decrypt all credential   │ = binding; test-decrypt
+   │                              │  blobs from database      │ the blob (reject if bad)
+   │                              │  load accounts            │ then run the SAME unlock
+   │                              │  resolve provider per acct│ tail (decrypt-all, …)
+   │                              │  → Unlocked (ready)       │ → Unlock + CredentialAdded
+   ▼                              ▼                          ▼
 ```
 
-- Credentials are encrypted per-credential with ECDH (X25519) + HKDF + AES-256-GCM
-- The private key is sent over the Unix socket; zeroized after use by the daemon
+- Credentials are encrypted per-credential with ECDH (X25519) + HKDF + AES-256-GCM, keyed
+  to the daemon's unlock-key pubkey; the daemon test-decrypts every incoming blob with its
+  bound key and refuses to persist one that does not decrypt (one key per keystore).
+- The unlock key is sent over the channel; zeroized after use by the daemon
 - `/lock` destroys all in-memory credentials, returning to locked state
 - `LockedError` is sent if any client attempts a request that requires credentials while locked
 - Session lifecycle operations (CreateSession, AttachSession, ListSessions, etc.) succeed even
@@ -2520,7 +2542,7 @@ context_file_max_bytes = 32768
 
 > **Note:** Provider-level settings (`base_url`, `streaming`, `retry_*`, timeouts, endpoint paths, request format) have moved to per-account overrides in `accounts.toml`. See `README.md` for the full list.
 
-**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Identity keys reside in `~/.config/choreographr/identity.pk` (private), `~/.config/choreographr/public.pk` (public), and optionally `~/.config/choreographr/identity.pk.enc` (passphrase-encrypted private key).
+**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Each daemon's keystore is bound to one client-held unlock key (the daemon stores only the derived public binding); the legacy `identity.pk` / `public.pk` pair is removed, and the legacy `identity.pk` / `identity.pk.enc` files are used only as a one-time migration source, deleted after the key is recorded per-daemon.
 
 **Database:** `~/.local/share/choreographr/state.redb` (override via `CHOREOGRAPHR_DB_PATH` env var)
 

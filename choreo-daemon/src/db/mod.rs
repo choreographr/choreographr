@@ -1277,6 +1277,74 @@ pub fn get_catalog_etag(db: &redb::Database) -> io::Result<Option<String>> {
     }
 }
 
+// ── Keystore binding table ─────────────────────────────────────────────────────
+
+/// Per-daemon keystore binding (TOFU design, DESIGN-keystore-unlock.md):
+/// key `"binding"` → the 32-byte X25519 public key derived from the daemon's
+/// unlock (keystore private) key. Created lazily on first write, so adding
+/// the table is purely additive — no schema version bump and no migration.
+const KEYSTORE: TableDefinition<&str, &[u8]> = TableDefinition::new("keystore");
+/// The single key under which the keystore binding is stored in [`KEYSTORE`].
+const KEYSTORE_BINDING_KEY: &str = "binding";
+
+/// Read the stored keystore binding: `None` when the daemon's keystore is
+/// still UNBOUND (first contact — the presented key is adopted). A stored
+/// value with the wrong length is logged and treated as absent (the same
+/// tolerant policy as the catalog getters): the binding would be re-adopted
+/// from the next presented key, which is the only sane recovery for a
+/// corrupt/truncated write — the keystore is unusable otherwise.
+pub fn get_keystore_binding(db: &redb::Database) -> io::Result<Option<[u8; 32]>> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+    let table = match read_txn.open_table(KEYSTORE) {
+        Ok(table) => table,
+        // No table yet ⇒ the keystore has never been bound (fresh DB, or a
+        // database upgraded from a build before the keystore table existed).
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(db_err(format!("redb open keystore: {e}"))),
+    };
+    let Some(guard) = table
+        .get(KEYSTORE_BINDING_KEY)
+        .map_err(|e| db_err(format!("redb get keystore binding: {e}")))?
+    else {
+        return Ok(None);
+    };
+    match <[u8; 32]>::try_from(guard.value()) {
+        Ok(key) => Ok(Some(key)),
+        Err(_) => {
+            warn!(
+                stored_len = guard.value().len(),
+                "keystore binding has an invalid length; treating as unbound"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Persist the keystore binding (32-byte X25519 public key). Called exactly
+/// once per daemon lifetime — on the first TOFU adoption — and never again
+/// afterwards, so callers race nowhere in practice; the write is atomic in
+/// a single redb transaction.
+pub fn set_keystore_binding(db: &redb::Database, public_key: &[u8; 32]) -> io::Result<()> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+    {
+        let mut table = write_txn
+            .open_table(KEYSTORE)
+            .map_err(|e| db_err(format!("redb open keystore: {e}")))?;
+        table
+            .insert(KEYSTORE_BINDING_KEY, public_key.as_slice())
+            .map_err(|e| db_err(format!("redb set keystore binding: {e}")))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| db_err(format!("redb commit keystore binding: {e}")))?;
+    info!("persisted keystore binding (TOFU adoption)");
+    Ok(())
+}
+
 // ── Session KV table ───────────────────────────────────────────────────────────
 
 /// Insert or overwrite a key-value pair for the given session.
@@ -2106,6 +2174,43 @@ mod tests {
             write_txn.commit().unwrap();
         }
         assert_eq!(get_catalog_last_attempt_ms(&db).unwrap(), None);
+    }
+
+    #[test]
+    fn keystore_binding_adopts_and_round_trips() {
+        // TOFU contract: a fresh database reads as UNBOUND (None); the first
+        // set_keystore_binding persists the binding; a re-read returns the
+        // exact 32-byte public key. The table is created lazily on first
+        // write, so no schema bump or migration is needed.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+
+        assert_eq!(get_keystore_binding(&db).unwrap(), None);
+
+        let pubkey = [7u8; 32];
+        set_keystore_binding(&db, &pubkey).unwrap();
+        assert_eq!(get_keystore_binding(&db).unwrap(), Some(pubkey));
+    }
+
+    #[test]
+    fn keystore_binding_corrupt_length_treated_as_absent() {
+        // A stored binding with the wrong length (interrupted/foreign write)
+        // must be treated as UNBOUND with a warning, never an error — the
+        // same tolerant policy as the catalog getters. The next presented
+        // key re-adopts the binding, the only usable recovery.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(KEYSTORE).unwrap();
+                table
+                    .insert(KEYSTORE_BINDING_KEY, b"short".as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        assert_eq!(get_keystore_binding(&db).unwrap(), None);
     }
 
     #[test]

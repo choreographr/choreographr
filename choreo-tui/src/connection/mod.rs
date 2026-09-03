@@ -4,7 +4,6 @@ use crate::render::render;
 use crate::state::{AccountWizardStep, App, Page, UiEvent};
 use crate::terminal_progress;
 use choreo_client_core::{ClientError, ConnectionMode, run_daemon_connection_with_mode};
-use choreo_keystore::ensure_keypair;
 use choreo_proto::ClientMessage;
 use crossbeam::channel;
 use crossbeam::select;
@@ -161,15 +160,17 @@ fn notify_disconnected(rx: &channel::Receiver<()>) -> bool {
 
 pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     tracing::info!("[choreo-tui] run_app starting");
-    // Ensure the keystore keypair exists before we try to connect to the
-    // daemon.  If no keypair has been generated yet, this creates one on the
-    // fly so the client can unlock the daemon without requiring a manual
-    // setup step.
-    if let Err(e) = ensure_keypair() {
-        tracing::error!("[choreo-tui] failed to ensure keystore keypair: {e}");
-    }
 
     let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
+    // The address that keys this daemon's unlock key in known_servers: the
+    // actual dial address for TCP, the unix socket path otherwise. Derived
+    // up front (by reference) because `mode` is moved into the connection
+    // task below.
+    let connection_addr = match &mode {
+        ConnectionMode::UnixSocket(path) => path.clone(),
+        ConnectionMode::Tcp { addr, .. } => addr.clone(),
+        ConnectionMode::TcpPinned(addr) => addr.clone(),
+    };
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
     let (ui_tx, ui_rx) = channel::unbounded::<UiEvent>();
 
@@ -514,20 +515,25 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // The probe ran before the reader thread spawned (see above); thread the
     // result into App so key handlers and hints know which selector key works.
     app.keyboard_enhanced = keyboard_enhanced;
+    // The address that keys this daemon's unlock key in known_servers (see
+    // the derivation up top — `mode` is moved by now).
+    app.connection_addr = connection_addr;
 
     // ── Auto-unlock the daemon on connect ──────────────────────────
     //
-    // Resolve the private key (raw key file, or encrypted key with
-    // TAI_PASSPHRASE env var) and send an Unlock message immediately.
-    // The daemon starts locked; this transparently unlocks it so the
-    // user never needs to think about lock state.  If no key is
-    // available the daemon stays locked — session operations (create,
-    // browse, delete) still work; only inference requires unlocking.
-    if let Some(private_key) = choreo_client_core::try_auto_unlock_key() {
+    // Resolve the per-daemon unlock key (stored key, else the legacy local
+    // key) and send an Unlock message immediately.  The daemon starts
+    // locked; this transparently unlocks it so the user never needs to think
+    // about lock state.  If no key resolves the daemon stays locked — session
+    // operations (create, browse, delete) still work; only inference
+    // requires unlocking. The key is held pending and recorded once the
+    // daemon CONFIRMS (`Unlocked`), so a rejected key is never persisted.
+    if let Some(private_key) = choreo_client_core::try_auto_unlock_key(&app.connection_addr) {
         tracing::info!("[choreo-tui] auto-unlocking daemon on connect");
+        app.pending_unlock_key = Some(private_key.clone());
         let _ = client_tx.send(ClientMessage::Unlock { private_key });
     } else {
-        tracing::info!("[choreo-tui] no private key available — daemon starts locked");
+        tracing::info!("[choreo-tui] no unlock key available — daemon starts locked");
     }
 
     client_tx

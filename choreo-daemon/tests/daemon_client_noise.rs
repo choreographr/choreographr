@@ -563,12 +563,34 @@ fn noise_large_message_through_daemon() {
     // 1 MiB encrypted credential blob — 17 wire fragments — far beyond the
     // 65518-byte single-fragment cap, so the sender must split it and
     // the daemon's reader must glue the fragments back before the command
-    // loop ever sees the message.
+    // loop ever sees the message. The blob is genuinely encrypted with a
+    // throwaway unlock key (AddCredential now test-decrypts the blob and
+    // REJECTS anything that does not decrypt), so it must decrypt cleanly
+    // for the CredentialAdded reply to come back.
+    let unlock_key: [u8; 32] = std::array::from_fn(|i| (i * 7) as u8);
+    let derived_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(unlock_key));
+    // AddCredential test-decrypts the blob AND expects the plaintext to
+    // decode as a ServiceCredential, so encrypt a real (postcard-serialized)
+    // credential padded with filler bytes to keep the 1 MiB wire size.
+    let mut plaintext = postcard::to_allocvec(&choreo_keystore::ServiceCredential::ApiKey {
+        key: "sk-test".into(),
+    })
+    .expect("test credential must serialize");
+    plaintext.resize(1024 * 1024, 0x42);
+    let blob = choreo_keystore::crypto::encrypt_with_public_key(derived_pub.as_bytes(), &plaintext)
+        .expect("test blob must encrypt");
     client.send(ClientMessage::AddCredential {
         service: "big-blob".into(),
-        encrypted_payload: vec![0x42u8; 1024 * 1024],
-        unlock_key: None,
+        encrypted_payload: blob,
+        unlock_key: unlock_key.to_vec(),
     });
+    match client.recv() {
+        // A successful AddCredential now implicitly unlocks the keystore, so
+        // the daemon emits `Unlocked` before `CredentialAdded` (mirroring a
+        // successful `Unlock`).
+        DaemonMessage::Unlocked => {}
+        other => panic!("expected Unlocked, got {other:?}"),
+    }
     match client.recv() {
         DaemonMessage::CredentialAdded { service } => assert_eq!(service, "big-blob"),
         other => panic!("expected CredentialAdded, got {other:?}"),

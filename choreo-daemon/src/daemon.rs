@@ -153,7 +153,12 @@ pub enum DaemonCommand {
     SaveCredential {
         service: String,
         encrypted_blob: Vec<u8>,
-        unlock_key: Option<Vec<u8>>,
+        /// REQUIRED (per-daemon keystore TOFU design): the raw X25519 private
+        /// key the credential blob was encrypted with. The daemon adopts it
+        /// (first contact) or verifies it against the stored binding, uses it
+        /// to test-decrypt + persist the blob, and then performs the implicit
+        /// unlock (same tail as `Unlock`).
+        unlock_key: Vec<u8>,
         reply: mpsc::Sender<Result<(), String>>,
     },
     RemoveCredentialCmd {
@@ -1233,46 +1238,118 @@ impl DaemonState {
     }
 
     /// Save an encrypted credential blob for a service.
+    ///
+    /// `unlock_key` is REQUIRED (per-daemon keystore TOFU design): the flow
+    /// is adopt-or-verify the key against the keystore binding, TEST-DECRYPT
+    /// the incoming blob with the key (a blob that does not decrypt is
+    /// rejected and never persisted — this enforces "the credential was
+    /// encrypted with the same key as the rest of the keystore"), persist,
+    /// then run the IMPLICIT UNLOCK (shared tail) — so a valid AddCredential
+    /// to a locked daemon unlocks it. The caller (connection layer) replies
+    /// `CredentialAdded` and emits `Unlocked` exactly like a successful
+    /// `Unlock`.
     fn handle_save_credential(
         &mut self,
         service: String,
         encrypted_blob: Vec<u8>,
-        unlock_key: Option<Vec<u8>>,
+        unlock_key: Vec<u8>,
         reply: mpsc::Sender<Result<(), String>>,
     ) {
-        // Write to DB
-        if let Err(e) = db::set_credential_blob(&self.db, &service, &encrypted_blob) {
-            let _ = reply.send(Err(format!("failed to save credential: {e}")));
+        // Reject anything that is not exactly 32 bytes up front: the X25519
+        // key derivation (and every crypto helper below) needs [u8; 32], and
+        // a shorter/longer key can never be a valid unlock key.
+        let mut key: [u8; 32] = match unlock_key.as_slice().try_into() {
+            Ok(k) => k,
+            Err(_) => {
+                let _ = reply.send(Err(
+                    "invalid unlock_key: expected exactly 32 bytes".to_string()
+                ));
+                return;
+            }
+        };
+
+        // Adopt-or-verify BEFORE anything is written: a wrong key must not
+        // persist a blob the daemon could later read with an attacker's key
+        // silently adopted. Mirrors handle_unlock_inner (shared helper — the
+        // two paths cannot drift).
+        if let Err(e) = adopt_or_verify_keystore_binding(self, &key) {
+            key.zeroize();
+            let _ = reply.send(Err(e.to_string()));
             return;
         }
-        // Optionally decrypt into memory
-        if let Some(mut uk) = unlock_key {
-            let key: [u8; 32] = match uk.as_slice().try_into() {
-                Ok(k) => k,
-                Err(_) => {
-                    uk.zeroize();
-                    let _ = reply.send(Ok(()));
+
+        // TEST-DECRYPT the incoming blob. A blob that fails to decrypt (or
+        // whose plaintext does not decode as a ServiceCredential) is REJECTED
+        // and never persisted: storing an unreadable blob would poison the
+        // keystore — the next unlock's bulk decrypt would log a failure
+        // forever, and the credential would look saved but be unusable.
+        let plaintext =
+            match choreo_keystore::crypto::decrypt_with_private_key(&key, &encrypted_blob) {
+                Ok(pt) => pt,
+                Err(e) => {
+                    key.zeroize();
+                    warn!(
+                        service = %service,
+                        error = %e,
+                        "AddCredential: blob failed test-decrypt with the presented unlock key; \
+                         rejecting without persisting"
+                    );
+                    let _ = reply.send(Err(format!(
+                        "credential blob failed to decrypt with the provided unlock key: {e}"
+                    )));
                     return;
                 }
             };
-            uk.zeroize();
-            if let Ok(plaintext) =
-                choreo_keystore::crypto::decrypt_with_private_key(&key, &encrypted_blob)
-                && let Ok(cred) = postcard::from_bytes::<ServiceCredential>(&plaintext)
-            {
-                // Update in-memory state
-                if matches!(&cred, ServiceCredential::X { .. }) && service == "twitter" {
-                    self.x_credentials = Some(cred.clone());
-                }
-                self.credentials.insert(service.clone(), cred.clone());
-                // Resolve the provider (in-memory only, no I/O) for any
-                // account matching this service name; the model list warms
-                // in the background when a session joins the account.
-                if let ServiceCredential::ApiKey { key: api_key } = &cred {
-                    self.resolve_account_provider(&service, Some(api_key.clone()));
-                }
+        let cred: ServiceCredential = match postcard::from_bytes(&plaintext) {
+            Ok(c) => c,
+            Err(e) => {
+                key.zeroize();
+                let _ = reply.send(Err(format!(
+                    "credential payload is not a valid ServiceCredential: {e}"
+                )));
+                return;
             }
+        };
+
+        // Persist to DB only after both checks passed.
+        if let Err(e) = db::set_credential_blob(&self.db, &service, &encrypted_blob) {
+            key.zeroize();
+            let _ = reply.send(Err(format!("failed to save credential: {e}")));
+            return;
         }
+
+        // Update in-memory state (same bookkeeping the old optional-key path
+        // did), then run the shared implicit-unlock tail: bulk-decrypt ALL
+        // blobs, load accounts, resolve providers. The tail re-decrypts the
+        // blob just persisted — slightly redundant but keeps one code path
+        // for "daemon is unlocked with this key" semantics.
+        if matches!(&cred, ServiceCredential::X { .. }) && service == "twitter" {
+            self.x_credentials = Some(cred.clone());
+        }
+        if let ServiceCredential::ApiKey { key: api_key } = &cred {
+            // Resolve immediately too (in-memory only): so an AddCredential
+            // for a known account works before the tail re-resolves.
+            self.resolve_account_provider(&service, Some(api_key.clone()));
+        }
+        let result = unlock_tail(self, &key);
+        key.zeroize();
+        if let Err(e) = result {
+            // The blob IS persisted and the binding holds — only the tail
+            // (accounts load / bulk decrypt) failed. Report it rather than
+            // lying with a silent success: the caller surfaces the error to
+            // the client even though the credential was stored.
+            error!(
+                service = %service,
+                error = %e,
+                "AddCredential: persisted credential but implicit unlock failed"
+            );
+            let _ = reply.send(Err(format!("credential saved but unlock failed: {e}")));
+            return;
+        }
+        info!(
+            service = %service,
+            "AddCredential: persisted, tested, and implicitly unlocked the keystore"
+        );
         let _ = reply.send(Ok(()));
     }
 
@@ -2172,6 +2249,67 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
         .map_err(|_| io::Error::other("invalid private key: expected 32 bytes"))?;
     drop(private_key);
 
+    // TOFU adopt-or-verify against the persisted keystore binding. A locked
+    // daemon presents its key on every Unlock; once a key is bound, any key
+    // whose derived public key differs is REJECTED (surfaces as LockedError)
+    // instead of unlocking with wrong credentials.
+    adopt_or_verify_keystore_binding(state, &key)?;
+
+    // Shared bulk-decrypt + accounts-load + provider-resolve tail — the same
+    // code path `AddCredential` runs as its implicit unlock, so the two
+    // paths cannot drift.
+    let result = unlock_tail(state, &key);
+    key.zeroize();
+    result
+}
+
+/// TOFU keystore-binding enforcement, shared by `Unlock` and
+/// `AddCredential` (factored into one helper so the two paths cannot drift).
+///
+/// * Unbound keystore (no stored binding): ADOPT the presented key — derive
+///   its X25519 public key and persist it. This is a one-time,
+///   security-relevant event, so the log is deliberately LOUD.
+/// * Bound keystore: derive the presented key's public key and compare
+///   against the binding; a mismatch is an error (LockedError for Unlock,
+///   CredentialAddFailed for AddCredential).
+pub(crate) fn adopt_or_verify_keystore_binding(
+    state: &DaemonState,
+    key: &[u8; 32],
+) -> io::Result<()> {
+    let binding = db::get_keystore_binding(&state.db)
+        .map_err(|e| io::Error::other(format!("failed to read keystore binding: {e}")))?;
+    // x25519_dalek: the public key is what the binding stores (and what the
+    // CLIENT used to encrypt credential blobs), never the private key itself.
+    let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*key));
+    match binding {
+        None => {
+            db::set_keystore_binding(&state.db, derived.as_bytes()).map_err(|e| {
+                io::Error::other(format!("failed to persist keystore binding: {e}"))
+            })?;
+            // One-time, security-relevant event: LOUD on purpose. Operators
+            // must be able to see when a daemon's keystore became bound to a
+            // key (any later unlock requires exactly that key).
+            info!(
+                "KEYSTORE BOUND: adopted unlock key on first contact (TOFU); \
+                 public key (hex) = {} — all future Unlock/AddCredential \
+                 attempts must present this key, others are rejected",
+                hex::encode(derived.as_bytes())
+            );
+            Ok(())
+        }
+        Some(stored) if stored == *derived.as_bytes() => Ok(()),
+        Some(_) => Err(io::Error::other(
+            "unlock key does not match the daemon's keystore binding",
+        )),
+    }
+}
+
+/// The unlock TAIL shared by `handle_unlock_inner` and the implicit unlock
+/// in `handle_save_credential`: bulk-decrypt every stored credential blob
+/// with `key` into `state.credentials`, load accounts from TOML, and resolve
+/// providers (in-memory, no I/O beyond the account file). Factored out so
+/// the Unlock path and the AddCredential-implicit-unlock path cannot drift.
+pub(crate) fn unlock_tail(state: &mut DaemonState, key: &[u8; 32]) -> io::Result<()> {
     let blobs = db::get_all_credential_blobs(&state.db)
         .map_err(|e| io::Error::other(format!("failed to read credentials from database: {e}")))?;
 
@@ -2180,7 +2318,7 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
     let mut credentials = HashMap::new();
     let mut decrypt_failures = 0usize;
     for (service, blob) in &blobs {
-        match choreo_keystore::crypto::decrypt_with_private_key(&key, blob) {
+        match choreo_keystore::crypto::decrypt_with_private_key(key, blob) {
             Ok(plaintext) => match postcard::from_bytes::<ServiceCredential>(&plaintext) {
                 Ok(cred) => {
                     credentials.insert(service.clone(), cred);
@@ -2270,7 +2408,6 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
         state.providers.keys().collect::<Vec<_>>()
     );
 
-    key.zeroize();
     Ok(())
 }
 

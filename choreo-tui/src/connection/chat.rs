@@ -199,27 +199,35 @@ pub(super) fn handle_chat_event(
                             // and miss the new content arriving at the bottom.
                             app.scroll_to(0);
                         }
-                        ShellCommand::Unlock { method } => match resolve_private_key(&method) {
-                            Ok(private_key) => {
-                                let _ = client_tx.send(ClientMessage::Unlock { private_key });
+                        ShellCommand::Unlock { method } => {
+                            match resolve_private_key(&method, &app.connection_addr) {
+                                Ok(private_key) => {
+                                    // Hold the key until the daemon CONFIRMS
+                                    // the unlock, then record it per-daemon.
+                                    app.pending_unlock_key = Some(private_key.clone());
+                                    let _ = client_tx.send(ClientMessage::Unlock { private_key });
+                                }
+                                Err(e) => {
+                                    tracing::warn!("[choreo-tui] unlock failed: {e}");
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!("[choreo-tui] unlock failed: {e}");
-                            }
-                        },
+                        }
                         ShellCommand::AddCredential {
                             ref service,
                             ref credential_type,
                             ref fields,
-                            unlock,
                         } => {
                             match build_add_credential_message(
+                                &app.connection_addr,
                                 service.clone(),
                                 credential_type.clone(),
                                 fields.clone(),
-                                unlock,
                             ) {
-                                Ok(msg) => {
+                                Ok((msg, key)) => {
+                                    // Record only after the daemon CONFIRMS
+                                    // (CredentialAdded / Unlocked) — see
+                                    // `record_confirmed_unlock_key`.
+                                    app.pending_unlock_key = Some(key);
                                     let _ = client_tx.send(msg);
                                 }
                                 Err(e) => {

@@ -12,7 +12,7 @@ use choreo_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use choreo_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
 use choreo_proto::{
     AccountInfo, ClientMessage, OutputStream, ReasoningCapability, SessionStatus, SessionSummary,
-    TokenUsage, ToolResultRecord, Turn,
+    TokenUsage, ToolResultRecord, Turn, socket_path,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::text::Line;
@@ -399,6 +399,19 @@ pub(crate) struct App {
     pub(crate) error: Option<String>,
     pub(crate) session_displays: HashMap<u64, SessionDisplayState>,
     pub(crate) active_session_id: Option<u64>,
+    /// The address string this session talks to (dial addr for TCP, unix
+    /// socket path otherwise). It keys the per-daemon unlock key in
+    /// known_servers, so every `Unlock`/`AddCredential`/record must use it
+    /// consistently. Set by `run_app` from the connection mode; defaults to
+    /// the socket path so tests (which bypass run_app) still have a valid
+    /// value.
+    pub(crate) connection_addr: String,
+    /// The unlock key sent in the most recent `Unlock` or `AddCredential`,
+    /// held until the daemon CONFIRMS it (an `Unlocked` or `CredentialAdded`
+    /// reply) and then recorded per-daemon via `record_unlock_key`. Never
+    /// persisted on send — only on confirmed success. Cleared once recorded
+    /// (and when a send fails to avoid recording a stale key later).
+    pub(crate) pending_unlock_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -533,6 +546,8 @@ impl App {
             terminal_resized: false,
             session_displays: HashMap::new(),
             active_session_id: None,
+            connection_addr: socket_path(),
+            pending_unlock_key: None,
         }
     }
 

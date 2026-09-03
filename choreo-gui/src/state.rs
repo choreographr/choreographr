@@ -20,6 +20,12 @@ pub(crate) struct AppState {
     pub(crate) status_texts: Vec<String>,
     pub(crate) pending_cancel: String,
     pub(crate) attached_session_id: Option<u64>,
+    /// The strengthen-unlock key sent in the most recent `Unlock` or
+    /// `AddCredential`, held until the daemon CONFIRMS it (an `Unlocked` or
+    /// `CredentialAdded` reply) and then recorded via
+    /// [`choreo_client_core::record_unlock_key`]. Never persisted on send —
+    /// only on confirmed success. Cleared once recorded (or on any send).
+    pub(crate) pending_unlock_key: Option<Vec<u8>>,
 }
 
 impl AppState {
@@ -31,6 +37,7 @@ impl AppState {
             status_texts: vec![format!("Connected to Choreographr at {socket_path}")],
             pending_cancel: String::new(),
             attached_session_id: None,
+            pending_unlock_key: None,
         }
     }
 }

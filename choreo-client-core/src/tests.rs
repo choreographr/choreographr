@@ -260,14 +260,15 @@ fn parses_add_key() {
             service: "openai".to_string(),
             credential_type: "api_key".to_string(),
             fields: vec!["sk-abc123".to_string()],
-            unlock: false,
         }
     );
     assert_eq!(next, 3);
 }
 
 #[test]
-fn parses_add_key_with_unlock() {
+fn ignores_trailing_unlock_arg_for_add_key() {
+    // The `[unlock]` argument was removed with the per-daemon unlock-key
+    // design: key resolution is per-addr inside build_add_credential_message.
     let mut next = 3;
     assert_eq!(
         parse_input_line("/add-key openai sk-abc123 unlock", &mut next, None),
@@ -275,7 +276,6 @@ fn parses_add_key_with_unlock() {
             service: "openai".to_string(),
             credential_type: "api_key".to_string(),
             fields: vec!["sk-abc123".to_string()],
-            unlock: true,
         }
     );
     assert_eq!(next, 3);
@@ -306,7 +306,6 @@ fn parses_add_x() {
                 "ats".to_string(),
                 "-".to_string(),
             ],
-            unlock: false,
         }
     );
     assert_eq!(next, 3);
@@ -327,7 +326,6 @@ fn parses_add_x_with_bearer() {
                 "ats".to_string(),
                 "mybearer".to_string(),
             ],
-            unlock: false,
         }
     );
     assert_eq!(next, 3);
@@ -338,7 +336,7 @@ fn rejects_add_x_without_enough_args() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/add-x twitter ck cs", &mut next, None),
-        ShellCommand::UnknownCommand("usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ [unlock]".to_string())
+        ShellCommand::UnknownCommand("usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_".to_string())
     );
     assert_eq!(next, 3);
 }

@@ -60,10 +60,6 @@ pub fn private_key_enc_path() -> Result<PathBuf, KeystoreError> {
     Ok(config_dir()?.join("identity.pk.enc"))
 }
 
-pub fn public_key_path() -> Result<PathBuf, KeystoreError> {
-    Ok(config_dir()?.join("public.pk"))
-}
-
 /// Path to the authorized clients ACL file (~/.config/choreographr/authorized_clients.toml)
 pub fn authorized_clients_path() -> Result<PathBuf, KeystoreError> {
     Ok(config_dir()?.join("authorized_clients.toml"))
@@ -93,21 +89,13 @@ mod tests {
     }
 
     #[test]
-    fn public_key_path_ends_with_public_pk() {
-        let path = public_key_path().unwrap();
-        assert!(path.ends_with("public.pk"));
-    }
-
-    #[test]
     fn all_paths_share_same_config_dir() {
         let pk = private_key_path().unwrap();
         let enc = private_key_enc_path().unwrap();
-        let pubk = public_key_path().unwrap();
         let cfg = config_dir().unwrap();
 
         assert!(pk.starts_with(&cfg));
         assert!(enc.starts_with(&cfg));
-        assert!(pubk.starts_with(&cfg));
     }
 
     #[test]

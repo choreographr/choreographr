@@ -22,7 +22,6 @@ pub enum ShellCommand {
         service: String,
         credential_type: String,
         fields: Vec<String>,
-        unlock: bool,
     },
     RemoveCredential {
         service: String,
@@ -284,16 +283,13 @@ fn parse_command(
             return ShellCommand::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
         }
         let key = parts[1].to_string();
-        let unlock = parts
-            .get(2)
-            .copied()
-            .map(|s| s.to_lowercase() == "unlock")
-            .unwrap_or(false);
+        // The unlock key is always resolved per-addr by
+        // `build_add_credential_message` (stored → legacy → fresh), so the
+        // shell takes no `unlock` argument anymore.
         return ShellCommand::AddCredential {
             service,
             credential_type: "api_key".to_string(),
             fields: vec![key],
-            unlock,
         };
     }
 
@@ -301,7 +297,7 @@ fn parse_command(
         let parts: Vec<&str> = args.split_whitespace().collect();
         if parts.len() < 6 {
             return ShellCommand::UnknownCommand(
-                "usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ [unlock]".to_string(),
+                "usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_".to_string(),
             );
         }
         let service = parts[0].to_string();
@@ -313,11 +309,9 @@ fn parse_command(
         let access_token = parts[3].to_string();
         let access_token_secret = parts[4].to_string();
         let bearer_token = parts[5].to_string();
-        let unlock = parts
-            .get(6)
-            .copied()
-            .map(|s| s.to_lowercase() == "unlock")
-            .unwrap_or(false);
+        // The unlock key is always resolved per-addr by
+        // `build_add_credential_message` (stored → legacy → fresh), so the
+        // shell takes no `unlock` argument anymore.
         return ShellCommand::AddCredential {
             service,
             credential_type: "x".to_string(),
@@ -328,7 +322,6 @@ fn parse_command(
                 access_token_secret,
                 bearer_token,
             ],
-            unlock,
         };
     }
 
@@ -445,12 +438,7 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
         // Non-Send shell commands: echo the raw line so the user can see
         // what they typed even though no ClientMessage is sent.
         ShellCommand::Unlock { .. } => Some("> /unlock".to_string()),
-        ShellCommand::AddCredential {
-            service, unlock, ..
-        } => {
-            let suffix = if *unlock { " (with unlock)" } else { "" };
-            Some(format!("> /add-key {service}{suffix}"))
-        }
+        ShellCommand::AddCredential { service, .. } => Some(format!("> /add-key {service}")),
         ShellCommand::RemoveCredential { service } => Some(format!("> /remove-key {service}")),
         ShellCommand::AclAdd { pubkey } => Some(format!("> /acl add {pubkey}")),
         ShellCommand::Undo => Some("> undo".to_string()),

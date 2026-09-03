@@ -2,11 +2,10 @@ use crate::state::{
     AccountWizardStep, App, Page, PolkadotImportStep, ai_providers_list_click_index,
     apply_selector_left_click,
 };
-use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name, read_public_key_bytes};
+use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name};
 use choreo_proto::ClientMessage;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use tui_prompts::State;
-use zeroize::Zeroize;
 
 pub(super) fn handle_ai_providers_event(
     event: Event,
@@ -212,14 +211,17 @@ pub(super) fn handle_credential_modal_event(
             app.ai_providers.credential.error = None;
 
             // Build and send the encrypted credential, auto-unlocking
-            // the daemon so the credential is immediately usable.
+            // the daemon so the credential is immediately usable. The unlock
+            // key is held pending and recorded only once the daemon CONFIRMS
+            // (`CredentialAdded`).
             match choreo_client_core::build_add_credential_message(
+                &app.connection_addr,
                 account_name.clone(),
                 "api_key".to_string(),
                 vec![api_key],
-                true,
             ) {
-                Ok(msg) => {
+                Ok((msg, key)) => {
+                    app.pending_unlock_key = Some(key);
                     tracing::info!(account_name, "credential encrypted and sent");
                     let _ = client_tx.send(msg);
                     app.status = Some(format!(
@@ -360,40 +362,36 @@ fn submit_polkadot_import(
         let view = credential
             .as_substrate()
             .ok_or("decrypted credential is not a Substrate account".to_string())?;
+        // Capture the account id as an OWNED value so `credential` can be
+        // moved into the builder below without the borrow held by `view`
+        // outliving it.
+        let account_id = view.account_id.to_string();
 
-        // Encrypt the serialized Substrate credential with the daemon identity
-        // public key and bundle the identity private key so the daemon can
-        // decrypt it into memory immediately (same transport as the API-key
-        // modal).
-        let mut plaintext = postcard::to_allocvec(&credential)
-            .map_err(|e| format!("failed to serialize credential: {e}"))?;
-        let pub_key = read_public_key_bytes()
-            .map_err(|e| format!("failed to read identity public key: {e}"))?;
-        let encrypted_payload =
-            choreo_keystore::crypto::encrypt_with_public_key(&pub_key, &plaintext)
-                .map_err(|e| format!("failed to encrypt credential: {e}"))?;
-        plaintext.zeroize();
-        let unlock_key = choreo_keystore::paths::private_key_path()
-            .ok()
-            .and_then(|p| std::fs::read(p).ok())
-            .filter(|d| d.len() == 32);
+        // Encrypt the serialized Substrate credential with the daemon's
+        // keystore public key (derived from the unlock key) and send it over
+        // the same `AddCredential` path as the API-key modal — the daemon
+        // decrypts it into memory immediately (implicit unlock) and we record
+        // the key per-daemon once it confirms.
+        let (msg, key) = choreo_client_core::build_add_credential_from_credential(
+            &app.connection_addr,
+            name.clone(),
+            credential,
+        )
+        .map_err(|e| format!("failed to build AddCredential: {e}"))?;
 
         tracing::info!(
-            account_id = %view.account_id,
+            account_id = %account_id,
             name,
             "sent encrypted Substrate credential to daemon"
         );
+        app.pending_unlock_key = Some(key);
         client_tx
-            .send(ClientMessage::AddCredential {
-                service: name.clone(),
-                encrypted_payload,
-                unlock_key,
-            })
+            .send(msg)
             .map_err(broken_pipe)
             .map_err(|e| e.to_string())?;
         Ok(format!(
             "[daemon] Substrate account '{name}' stored ({}); unlock the daemon to sign with it",
-            view.account_id
+            account_id
         ))
     })();
 

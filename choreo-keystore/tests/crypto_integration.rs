@@ -127,9 +127,13 @@ fn decrypt_too_short_data_fails() {
 
 #[test]
 #[ignore]
-fn ensure_keypair_idempotent() {
-    // Uses the real config dir — verifies that ensure_keypair succeeds
-    // even when keys already exist or don't exist yet.
-    let result = choreo_keystore::ensure_keypair();
-    assert!(result.is_ok(), "ensure_keypair should succeed");
+fn keystore_crypto_helpers_available() {
+    // A smoke test that the core crypto helpers (used by the per-daemon
+    // keystore unlock-key design) are exported and round-trip, in the real
+    // config environment. The identity-keypair generation is gone, but the
+    // encryption helpers remain.
+    let (secret, public) = choreo_keystore::crypto::generate_keypair();
+    let enc = choreo_keystore::crypto::encrypt_with_public_key(&public, b"hello").expect("encrypt");
+    let dec = choreo_keystore::crypto::decrypt_with_private_key(&secret, &enc).expect("decrypt");
+    assert_eq!(dec, b"hello");
 }
