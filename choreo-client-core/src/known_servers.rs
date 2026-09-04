@@ -39,8 +39,9 @@
 //!
 //! Unlock keys: each daemon's credential keystore is governed by one
 //! keypair whose private half is held CLIENT-side, one per daemon (TOFU —
-//! the daemon adopts the first presented key and verifies every later
-//! one). This store is that client-side home: `unlock_key` is the base64
+//! the daemon adopts a key only via `ClientMessage::BindKeystore`, sent by
+//! the client's auto-bind; `Unlock`/`AddCredential` are verify-only). This
+//! store is that client-side home: `unlock_key` is the base64
 //! 32-byte X25519 private key for the daemon at `addr`. Unix-socket
 //! connections have no transport key to pin, so their entries exist purely
 //! to carry the unlock key (`pubkey = None`).

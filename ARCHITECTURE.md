@@ -348,7 +348,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 | Type | Purpose |
 |---|---|
 | `ClientMessage` | Enum of all messages a client can send |
-| `DaemonMessage` | Enum of all messages the daemon can send. Split into a `Session { session_id: Option<u64>, event }` **envelope** carrying the 29 session-scoped [`SessionEvent`]s (next row) plus 23 flat connection/reply/global variants (`Sessions`, `Pong`, `Models`, keystore + account replies, `ModelsRefreshed`/`ModelsRefreshFailed`, `CatalogUpdated`, `ShuttingDown`, `Evicted`, …). No `#[non_exhaustive]` — the variant set IS the wire contract, so every consumer match enumerates it fully. |
+| `DaemonMessage` | Enum of all messages the daemon can send. Split into a `Session { session_id: Option<u64>, event }` **envelope** carrying the 29 session-scoped [`SessionEvent`]s (next row) plus 25 flat connection/reply/global variants (`Sessions`, `Pong`, `Models`, keystore + account replies, `ModelsRefreshed`/`ModelsRefreshFailed`, `CatalogUpdated`, `ShuttingDown`, `Evicted`, `Bound`, `KeystoreUnbound`, …). No `#[non_exhaustive]` — the variant set IS the wire contract, so every consumer match enumerates it fully. |
 | `SessionEvent` | Enum of the 29 session-scoped events (`SessionCreated`, `SessionAttached`, `SessionState`, `SessionStatusChanged`, `TurnAppended`, `TurnsUndone`/`TurnsRedone`, `Started`, `OutputChunk`, `ToolCallStarted`/`Finished`/`Failed`, `ToolResultChunk`, `Done`, `Failed`, `Cancelled`, `TokenUsageUpdate`, `LiveOutputTokenCount`, `ModelSelected`/`ModelSelectionFailed`, `SessionAccountSet`, `ContextWindowResolved`, `SessionWorkingDirSet`, `SessionTitleSet`, `ReasoningEffortSet`/`Failed`, …). Events do NOT carry a `session_id` — it is hoisted onto the [`DaemonMessage::Session`] envelope's `Option<u64>` field, so every event has an origin session **by construction** (`Some(id)` for session-scoped broadcasts; `None` for the connection-level replies the daemon synthesizes with no session, e.g. "no session attached" failures) — it can never be forgotten, mismatched, or duplicated; the wire nests the event inside the envelope, so the origin is present on the wire too. |
 | `SessionMessage` | A single turn in a conversation with `message_id: u32` (monotonically increasing per-session), `parent_id: Option<u32>` (links to the triggering user/ATU message for undo subtree traversal), `deleted: bool` (soft-delete for undo), a `created_at: TimestampMs` field and a `kind: SessionMessageKind` enum. Variants (`SessionMessageKind`): `SystemText`, `UserText`, `AssistantText`, `AssistantToolUse`, `ToolResult`, `DisplayedImage` (persisted image replay) |
 | `ImageMetadata` | Mime type, dimensions, byte length for streamed images |
@@ -365,14 +365,15 @@ Defines all shared message types and framing. No dependencies on other workspace
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
 `TestImage`, `Cancel`, `Ping`, `GetCredential`, `ListModels`, `SetModel`, `Unlock`,
-`Lock`, `AddCredential`, `RemoveCredential`, `AddAccount`, `RemoveAccount`,
+`Lock`, `BindKeystore`, `AddCredential`, `RemoveCredential`, `AddAccount`, `RemoveAccount`,
 `ListAccounts`, `SetSessionAccount`, `SetReasoningEffort`, `GetReasoningEffort`,
 `Undo`, `Redo`, `ContinueGeneration`
 - `CreateSession` now carries optional `context_config`, `account_name`, `selected_model`, and `reasoning_effort` (slug string) fields
+- `BindKeystore` establishes the keystore binding (the ONLY wire path that can create it — see the Security model's Lock/Unlock flow); `AddCredential` requires the unlock key
 
 `DaemonMessage` variants — split into two families:
 - **Session-scoped events** ride the `Session { session_id: Option<u64>, event: SessionEvent }` envelope: `Some(id)` for every event broadcast by a session task (the origin by construction), `None` for the connection-level replies the daemon synthesizes without a session task ("no session attached" failures, create/attach/set-account errors). Inner [`SessionEvent`]s: `SessionCreated`, `SessionAttached`, `SessionState`, `SessionStatusChanged`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`, `TurnAppended`, `TurnsUndone`, `TurnsRedone`, `Started`, `OutputChunk`, `ToolCallStarted`, `ToolCallFinished`, `ToolCallFailed`, `ToolResultChunk`, `Done`, `Failed`, `Cancelled`, `TokenUsageUpdate`, `LiveOutputTokenCount`, `ModelSelected`, `ModelSelectionFailed`, `SessionAccountSet`, `ContextWindowResolved`, `SessionWorkingDirSet`, `SessionTitleSet`, `ReasoningEffortSet`, `ReasoningEffortSetFailed`
-- **Flat variants** (connection/reply/global — no session scope): `Sessions`, `Pong`, `Models`, `ModelsFailed`, `Unlocked`, `Locked`, `LockedError`, `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`, `AccountAdded`, `AccountAddFailed`, `AccountRemoved`, `AccountRemoveFailed`, `Accounts`, `AccountListFailed`, `ModelsRefreshed`/`ModelsRefreshFailed` (with `RefreshStatus`: `UpToDate`/`Updated`/`Forced`), `CatalogUpdated`, `ShuttingDown`, `Evicted` (best-effort advisory sent just before a lag-eviction disconnect; clients use it to distinguish eviction from a crash)
+- **Flat variants** (connection/reply/global — no session scope): `Sessions`, `Pong`, `Models`, `ModelsFailed`, `Unlocked`, `Locked`, `LockedError`, `Bound` (targeted confirmation that an unbound keystore adopted a `BindKeystore` key — distinct from `Unlocked` so the client can tell "I just created this binding" from "I verified an existing one"), `KeystoreUnbound` (targeted error for Unlock/AddCredential/BindKeystore against a keystore with NO binding — distinct from `LockedError`, which means "bound but wrong key", so the client knows it can AUTO-BIND instead of replaying a key that can never match), `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`, `AccountAdded`, `AccountAddFailed`, `AccountRemoved`, `AccountRemoveFailed`, `Accounts`, `AccountListFailed`, `ModelsRefreshed`/`ModelsRefreshFailed` (with `RefreshStatus`: `UpToDate`/`Updated`/`Forced`), `CatalogUpdated`, `ShuttingDown`, `Evicted` (best-effort advisory sent just before a lag-eviction disconnect; clients use it to distinguish eviction from a crash)
 
 **Wire format:**
 
@@ -481,17 +482,23 @@ CLI binary — it is a library used by `choreo-client-core` and `choreo-daemon`.
 Each daemon's credential keystore is governed by ONE X25519 keypair belonging to
 that daemon. The daemon stores only the *binding* — the public key derived from
 that pair — and the private half (the "unlock key") is held CLIENT-side, one per
-daemon, in the client's `known_servers.toml`. The binding is established by first
-insertion (TOFU): the first valid unlock/credential-add against an unbound
-daemon ADOPTS the presented key; every later one must match the binding or it is
-rejected.
+daemon, in the client's `known_servers.toml`. The binding is created by exactly
+ONE wire path, `ClientMessage::BindKeystore` (TOFU): on an unbound keystore it
+ADOPTS the presented key (loud `KEYSTORE BOUND` log) and implies unlock; on an
+already-bound keystore it verifies only. `Unlock` and `AddCredential` are
+strictly VERIFY-ONLY — they never create a binding (an unbound keystore answers
+`KeystoreUnbound`, a bound one answers `LockedError` on a mismatch). Binding
+keys are always freshly generated client-side at bind time; pre-held keys
+(stored known_servers key or the legacy file) verify existing bindings and never
+create new ones. Binding is TOFU-once — there is no rotation.
 
 The legacy `identity.pk` / `public.pk` client keypair (and `ensure_keypair`)
 have been **removed**. One legacy file remains as a fallback unlock-key source:
 - `~/.config/choreographr/identity.pk` — raw 32-byte legacy private key. Used
-  ONLY when no unlock key is stored for the addr; the file's key is COPIED into
-  `known_servers.toml` on first use (the store is the single source of truth;
-  the file is never deleted). Encrypted-key resolution (`identity.pk.enc` +
+  ONLY as an unlock-VERIFICATION fallback when no unlock key is stored for the
+  addr — it NEVER creates a binding and is NEVER deleted; the file's key is
+  COPIED into `known_servers.toml` on first use (the store is the single source
+  of truth). Encrypted-key resolution (`identity.pk.enc` +
   `CHOREOGRAPHR_KEYSTORE_PASSPHRASE`) has been **removed** entirely.
 
 **Credential encryption pipeline (client-side):**
@@ -515,7 +522,7 @@ credential in a keystore shares one key).
 
 | Module | Purpose |
 |---|---|
-| `crypto.rs` | X25519 keypair generation, ECDH + HKDF + AES-256-GCM encrypt/decrypt, passphrase-based key encryption; shared AES-256-GCM helpers |
+| `crypto.rs` | X25519 keypair generation, ECDH + HKDF + AES-256-GCM encrypt/decrypt; shared AES-256-GCM helpers |
 | `paths.rs` | Resolves filesystem paths for the legacy key files (migration source only) |
 | `error.rs` | `KeystoreError` enum |
 
@@ -549,15 +556,15 @@ Used by `choreo-tui`, `choreo-gui`, and `choreo-im`.
 | Module | Purpose |
 |---|---|---|
 | `shell.rs` | Parses terminal input into `ShellCommand`: `/ping`, `/models`, `/model` (alias), `/cancel`, `/unlock`, `/lock`, `/image`, `/add-key`, `/add-x`, `/remove-key`, or `RunInput(prompt)`. All commands use `/` prefix exclusively; `parse_command()` is the single dispatch point. |
-| `credentials.rs` | Shared helpers: `resolve_private_key()` (resolve the unlock key: stored known_servers key, legacy raw `identity.pk` fallback copied into the store, or a caller-supplied base64 key recorded before send), `build_add_credential_message()` (encrypt and package a credential for the daemon), `read_public_key_bytes()`. Eliminates duplicated logic across `choreo-tui`, `choreo-gui`, and `choreo-im`. |
+| `credentials.rs` | Shared helpers: `resolve_private_key()` (verify-only unlock-key resolution: stored known_servers key, legacy raw `identity.pk` fallback copied into the store, or a caller-supplied base64 key decoded WRITE-FREE — recording happens only on the daemon's targeted confirmation, never on send), `bind_fresh_daemon()` (mint a fresh CSPRNG binding key + record it into known_servers PRE-SEND + return the `ClientMessage::BindKeystore` — the ONLY key-creation path), `build_add_credential_message()` (encrypt and package a credential for the daemon; verify-only key resolution, `NoUnlockKey` when nothing resolves — no fresh-mint fallback), `record_unlock_key()` (persist a daemon-confirmed key). Eliminates duplicated logic across `choreo-tui`, `choreo-gui`, and `choreo-im`. |
 | `image.rs` | `ImageAssembler` — kept for legacy `choreo-im` use. No longer used by TUI/Dioxus (images delivered mid-turn as `DisplayedImage` via `SessionMessageAppended`). |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text, structured diffs) |
 | `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
-| `dispatch.rs` | `TurnEventHandler` trait + `dispatch_daemon_message()` — splits the v4 `DaemonMessage` into its two families before any per-arm work: `dispatch_session_event` (the inner `SessionEvent` of the `Session` envelope, with the origin resolved exactly once; the six None-capable events — `Failed`, `Cancelled`, `ModelSelectionFailed`, `ReasoningEffortSet`/`Failed`, `SessionFailed` — are pre-handled so a `None` origin (connection-level reply with no session) surfaces its status/error instead of being dropped, while every other event hard-requires `Some` via a guard that `warn!`s if a producer ever emits a session-scoped event without an origin) and `dispatch_flat_message` (all 23 flat connection/reply/global variants enumerated explicitly — no wildcard arm — so a new `DaemonMessage` variant must be triaged at compile time, matching the no-`#[non_exhaustive]` wire-contract rule). Used by all UI clients (TUI, GUI, IM bridge) to avoid duplicating the routing logic. |
+| `dispatch.rs` | `TurnEventHandler` trait + `dispatch_daemon_message()` — splits the v4 `DaemonMessage` into its two families before any per-arm work: `dispatch_session_event` (the inner `SessionEvent` of the `Session` envelope, with the origin resolved exactly once; the six None-capable events — `Failed`, `Cancelled`, `ModelSelectionFailed`, `ReasoningEffortSet`/`Failed`, `SessionFailed` — are pre-handled so a `None` origin (connection-level reply with no session) surfaces its status/error instead of being dropped, while every other event hard-requires `Some` via a guard that `warn!`s if a producer ever emits a session-scoped event without an origin) and `dispatch_flat_message` (all 25 flat connection/reply/global variants enumerated explicitly — no wildcard arm — so a new `DaemonMessage` variant must be triaged at compile time, matching the no-`#[non_exhaustive]` wire-contract rule). Used by all UI clients (TUI, GUI, IM bridge) to avoid duplicating the routing logic. |
 | `connection.rs` | Daemon connection helpers: `run_daemon_connection()` (Unix socket), `run_daemon_tcp_connection()` (Noise IK with the wire-v5 mode preamble), `run_daemon_tcp_connection_xx_first_contact()` (Noise XX first contact — the trust gate: the session/writer threads only start after the caller's `on_first_contact` callback approves the server key learned from the handshake, so an `Unlock` can never flow to an unconfirmed server), `probe_server_key()` (XX handshake-ONLY probe: learn the server's static and drop the stream — the building block UIs use to run the fingerprint confirmation synchronously before any TUI/GUI starts), `run_daemon_tcp_connection_pinned()` (IK against the `known_servers.toml` pin; the DIAL is a separate step so a network-down daemon is a plain connect error, and on HANDSHAKE failure the error carries the pinned fingerprint plus the explicit re-pair guidance, so a changed server key is loud — the guidance attaches only to the handshake-failure case, never to a dial failure or a mid-session disconnect), `run_daemon_connection_with_mode()` (dispatch), `run_daemon_reader()` (blocking reader). The IK path's preamble+handshake+serve tail is shared by both TCP modes in `ik_handshake_and_serve`, so they cannot drift. `ConnectionMode` enum (`UnixSocket` | `Tcp` | `TcpPinned`) selects the transport. |
-| `known_servers.rs` | The client's pinned server keys + per-daemon unlock keys — the SSH `known_hosts` analogue extended with the keystore unlock key. `KnownServers` loads `known_servers.toml` (`[[server]]` entries: `addr`, optional base64 `pubkey` (absent for unix-socket unlock-key carriers), optional base64 `unlock_key`), `lookup(addr)` returns the pinned key for IK connections (pinned-but-changed server keys are the CALLER's hard error), `unlock_key(addr)` / `set_unlock_key(addr, key)` resolve/record the per-daemon keystore unlock key (`set_unlock_key` creates a pubkey-less entry for unix-socket daemons; a FRESH key minted by `build_add_credential` is optimistically recorded before send so a lost `CredentialAdded` confirmation cannot orphan the binding — and the record SURVIVES a daemon rejection: there is NO programmatic revert, because the binding is TOFU-once and never rotates (a confirmed record can never be wrong), the daemon reports transient failures through the same rejection error (deleting could erase a good key), and a rejected fresh key has no fallback to re-derive from anyway — manual re-pair via `remove(addr)` is the one recovery path), `pin(addr, pk)` persists the human-confirmed first-contact key (updating ONLY the pin in place, preserving any stored unlock key — the two fields are independent), `remove(addr)` removes the whole entry (pin and unlock key together). Failure policy: tolerant on load (missing/corrupt/garbage file → empty store + warning — the worst case is a re-confirmed XX first contact, never silent trust; entries with a PRESENT-but-invalid pubkey are dropped, entries with no pubkey are kept, a corrupt unlock_key drops just that field) and strict on write (whole-file rewrite under an advisory exclusive file lock, same discipline as `ensure_transport_keypair`). Path resolves through `choreo_keystore::paths::config_dir()` so test overrides agree with the rest of the config family. |
+| `known_servers.rs` | The client's pinned server keys + per-daemon unlock keys — the SSH `known_hosts` analogue extended with the keystore unlock key. `KnownServers` loads `known_servers.toml` (`[[server]]` entries: `addr`, optional base64 `pubkey` (absent for unix-socket unlock-key carriers), optional base64 `unlock_key`), `lookup(addr)` returns the pinned key for IK connections (pinned-but-changed server keys are the CALLER's hard error), `unlock_key(addr)` / `set_unlock_key(addr, key)` resolve/record the per-daemon keystore unlock key (`set_unlock_key` creates a pubkey-less entry for unix-socket daemons; the ONLY pre-send record is the fresh key minted by `bind_fresh_daemon` — MANDATORY there, because an unbound daemon adopts whatever key arrives first, so even a lost `Bound` confirmation leaves the recorded key matching the binding (nothing to overwrite). All other keys (unlock, AddCredential, `/unlock <key>`) are recorded via `record_unlock_key` ONLY on the daemon's targeted confirmation (`Unlocked`/`Bound`/`CredentialAdded`), so a key the daemon rejects never pollutes the store. Records are NEVER auto-deleted — the store semantics are "unlock_key = the key the client intends to use, provisionally until the daemon confirms it"; provisional records persist benignly, the binding is TOFU-once and never rotates (a confirmed record can never be wrong), the daemon reports transient failures through the same rejection error (deleting could erase a good key), and manual re-pair via `remove(addr)` is the one recovery path), `pin(addr, pk)` persists the human-confirmed first-contact key (updating ONLY the pin in place, preserving any stored unlock key — the two fields are independent), `remove(addr)` removes the whole entry (pin and unlock key together). Failure policy: tolerant on load (missing/corrupt/garbage file → empty store + warning — the worst case is a re-confirmed XX first contact, never silent trust; entries with a PRESENT-but-invalid pubkey are dropped, entries with no pubkey are kept, a corrupt unlock_key drops just that field) and strict on write (whole-file rewrite under an advisory exclusive file lock, same discipline as `ensure_transport_keypair`). Path resolves through `choreo_keystore::paths::config_dir()` so test overrides agree with the rest of the config family. |
 
-`TurnEventHandler` is the `choreo-client-core` dispatch sink; the `ClientError` type used by the connection layer is a thiserror enum — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `PrivateKeyEncRead`, `PrivateKeyDecrypt`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Postcard`, `Encryption`.
+`TurnEventHandler` is the `choreo-client-core` dispatch sink; the `ClientError` type used by the connection layer is a thiserror enum — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `NoUnlockKey`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Postcard`, `Encryption`.
 
 
 ## Enrollment & transport trust
@@ -793,7 +800,7 @@ alloy/subxt clients, and the daemon calls their synchronous `execute_*` entry po
 | `server/lifecycle.rs` | Accept loop (blocking `UnixListener` + signal-wakeup), signal handling, shutdown orchestration. On graceful shutdown, `DaemonMessage::ShuttingDown` is routed through each connection's single writer thread (via a `client_writers` registry in the daemon command loop); the writer thread flushes it and closes its own socket, so a client observes the notification before the EOF. The accept-loop thread never writes to or closes client sockets — there are no retained stream clones and no backstop close pass, so the notification cannot be lost to a race with a socket close. With the lossless unbounded writer channels an enqueue can never be `Full` (the old bounded round-robin fan-out for full channels is dead code); a wedged writer is bounded by its 5 s socket write timeout plus the writer-join grace. The writer channel is created and REGISTERED with the daemon before the connection thread is spawned (see the `server/connection.rs` row's `register_client_writer`), so a connection accepted concurrently with shutdown is guaranteed to be in the registry when the broadcast is processed — the register is ordered before the broadcast on the FIFO command channel (Unix: same thread; TCP: the accept thread is joined before the broadcast). Before returning, `run_server` also waits — bounded, 5 s — for the TCP accept thread (woken by a probe connect to the listener's actual bound address, falling back to loopback for unspecified `0.0.0.0`/`::` binds, so a concrete non-loopback bind is woken too; the probe's own connect is bounded by a 1 s `connect_timeout` so a full accept backlog cannot stall shutdown on the kernel's SYN-retry timeout) and then for each connection thread (Unix handles tracked directly, TCP handles ferried back over a channel) and, through it, its writer thread, to flush the notification and close its own socket, so notify-before-EOF holds even when `run_server` is embedded in-process rather than exiting the process. Connection handles are pruned eagerly once the retained Vec grows past 64, so a long-running daemon does not accumulate one `JoinHandle` per connection ever accepted (pinned by a unit test). Live connections are also capped at 256 (`MAX_CONCURRENT_CONNECTIONS`, both transports combined, pinned by unit tests + an integration test): at the cap a newly-accepted connection is dropped immediately (bare EOF) so wedged-but-open clients cannot exhaust thread/FD resources. `cleanup_client`'s writer join is bounded (5 s `WRITER_JOIN_GRACE`) so a writer wedged in a blocking socket write cannot hang its connection thread's cleanup; a timed-out writer is detached and the shutdown drain remains the backstop. The cap is enforced with a daemon-wide `Arc<AtomicUsize>` live-connection counter (RAII `ConnectionSlot`) shared across both accept paths and every connection thread's exit — a single-purpose, lock-free resource-accounting exception to the workspace's message-passing rule (documented in AGENTS.md). Signal handling is channel-driven on both platforms: Unix blocks in `signal_hook`'s iterator (self-pipe); Windows has no sigwait/iterator, so `low_level::register` forwards SIGINT/SIGTERM as channel messages and the handler thread blocks in `recv()` — both wake the accept loop via a connect to the daemon's own socket, with no flag polling. |
 | `server/connection.rs` | Per-client `client_thread` (Unix) and `tcp_client_thread` (TCP/Noise) — read `ClientMessages` from the socket, dispatch via `daemon_tx` mpsc channel. Single-writer discipline: each connection has exactly one writer thread draining its `writer_rx`; `ShuttingDown` AND `Evicted` are special-cased messages that make the writer flush, close the socket, and stop draining (notify-before-EOF / advisory-before-EOF), and no other thread ever writes to the socket. The writer loops of both transports share one implementation (a `ConnectionWriter` trait + `writer_thread`), so the sole-writer contract and the special-case closes live in exactly one place — pinned by unit tests with a mock `ConnectionWriter` (flush `ShuttingDown`, flush `Evicted`, stop on send error, end cleanly on disconnect). The writer channel is an UNBOUNDED crossbeam channel (the connection's `SubscriberSink`), created and registered with the daemon by `register_client_writer`, called by the acceptor BEFORE the connection thread spawns (see the `server/lifecycle.rs` row) — a failed TCP handshake unregisters via `ClientDisconnected` so the registry stays honest. The writer thread decrements the sink's in-flight byte counter (and the daemon-wide `global_lag`) on every dequeue, the exact counterpart of the producers' enqueue increment; on a send error (broken pipe, or the 5 s `WRITER_WRITE_TIMEOUT` on a wedged client whose receive window is zero) it shuts the socket down itself — unblocking the reader's blocking read so `cleanup_client` reaps the connection. Replies are written through `send_to_writer`, an unbounded `send_accounted` call that still increments (and self-corrects on a dead receiver) the byte counters (replies were never dropped — a blocking send just blocked; with unbounded channels they can no longer block either). Session-summary subscription is an explicit client decision on both transports: a client opts into `SessionCreated`/`SessionStatusChanged`/`SessionDeleted` push broadcasts with `SubscribeSessionsSummary` (previously `tcp_client_thread` auto-registered every Noise client on connect; the GUI now sends the subscribe message at connect to keep its session list live). `cleanup_client` joins the connection's writer thread with a 5 s bound (`WRITER_JOIN_GRACE`) so a writer wedged in a blocking socket write cannot hang the connection thread's cleanup — a timed-out writer is detached and exits on its own once the client goes away. |
 | `server/acl.rs` | The client-key ACL for Noise authentication, and its hot-reloadable holder. `Acl` parses `authorized_clients.toml` (`[[client]]` base64 pubkeys; invalid entries are skipped, `#[serde(default)]` makes an EMPTY file parse as an intentional deny-all rather than a missing-field error). `SharedAcl` pairs the file path with an `arc_swap::ArcSwap<Acl>` — the sanctioned shared-state exception #4 shape, exactly like the provider catalog: every TCP handshake READS a consistent snapshot lock-free on its own connection thread, and the daemon command loop is the STRICT single writer via `SharedAcl::reload` on `DaemonCommand::AclReload` (forwarded by `spawn_acl_watcher`, which mirrors the accounts watcher: coalescing consumer thread, transport-only). Reload failure policy is deliberately DIFFERENT from initial load: a missing/unreadable/unparseable file KEEPS the current keys (a torn editor save must never un-authorize live clients; restart re-evaluates), while a valid file with zero entries swaps in as an intentional deny-all; the parse-compare gate means byte-different-but-logically-identical saves are no-ops, which also makes watcher noise and the self-writes from `/acl add` and `choreographr acl-add` harmless (both enroll through the SHARED `append_key_locked` lock-discipline write; the socket path refuses TCP clients at the connection layer via `ClientCtx::is_unix`, and the IM bridge declines the command outright as inherently remote). The dedicated config watcher watches the ACL's OWN parent directory — the file the SharedAcl holds — not the general config dir, so tests (and a future `--acl-path`) work unchanged. Pinned by unit tests (add/remove apply, garbage/missing keeps current, empty-file deny-all, no-change no-op) and the full-path `acl_hot_reload` integration test (edit the file, a newly-authorized client connects WITHOUT a daemon restart, previously-authorized clients unaffected). |
-| `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management (incl. `AccountsReload`, the external-edit watcher consumer: re-reads `accounts.toml`, parse-compares against the in-memory manager, applies a real change, drops cached providers for removed accounts and rebuilds them for modified ones, and broadcasts the fresh list), and the runtime catalog swap (`CatalogBaseChanged` → `replace_catalog`, the single writer of the `PROVIDER_CATALOG` ArcSwap), `CatalogUpdated` broadcasts, and `/refresh-models` plumbing (the fetch is delegated to the maintenance thread, never run here). Model lists are likewise warmed off the command loop: a detached prefetch thread runs on session join/attach/account-switch (`maybe_spawn_model_prefetch`, gated by the shared `MODEL_CACHE_TTL` freshness + a per-account in-flight dedup guard) and reports back via the `ModelPrefetchResult` command, which is the loop's cache insert — unlock and credential/account mutations resolve providers in-memory only, with no network I/O. `DaemonState` is owned by this thread only (no shared state). The per-client subscriber/eviction methods — registration, the lossless broadcast fan-outs, lag eviction, shutdown notification, and disconnect cleanup — live in the child module `daemon/subscriber_handlers.rs` (`pub(super)` methods on `DaemonState`; `handle_command` dispatches their `DaemonCommand` variants here) so this file stays focused on core command handling. |
+| `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management (incl. `AccountsReload`, the external-edit watcher consumer: re-reads `accounts.toml`, parse-compares against the in-memory manager, applies a real change, drops cached providers for removed accounts and rebuilds them for modified ones, and broadcasts the fresh list), and the runtime catalog swap (`CatalogBaseChanged` → `replace_catalog`, the single writer of the `PROVIDER_CATALOG` ArcSwap), `CatalogUpdated` broadcasts, and `/refresh-models` plumbing (the fetch is delegated to the maintenance thread, never run here). Model lists are likewise warmed off the command loop: a detached prefetch thread runs on session join/attach/account-switch (`maybe_spawn_model_prefetch`, gated by the shared `MODEL_CACHE_TTL` freshness + a per-account in-flight dedup guard) and reports back via the `ModelPrefetchResult` command, which is the loop's cache insert — unlock and credential/account mutations resolve providers in-memory only, with no network I/O. **Keystore binding lives here too**: the `Unlock`/`BindKeystore`/`AddCredential` handlers enforce the verify-only vs bind split (`handle_unlock_inner` / `handle_bind_keystore_inner` — the latter is the ONLY adoption path, TOFU on an unbound keystore) and run the shared `unlock_tail` (bulk-decrypt, load accounts, resolve providers, clear `locked`). These `DaemonCommand`s carry the acting client's `SubscriberSink` so the command loop can enqueue the targeted reply (`Unlocked`/`Bound`/`KeystoreUnbound`/`LockedError`/`CredentialAdded`) via `send_targeted` BEFORE any lock-state transition broadcast — the ORDERING INVARIANT the client's key-recording correctness keys on (pinned by `unix_targeted_reply_precedes_lock_state_broadcast`). `DaemonState` is owned by this thread only (no shared state). The per-client subscriber/eviction methods — registration, the lossless broadcast fan-outs, lag eviction, shutdown notification, and disconnect cleanup — live in the child module `daemon/subscriber_handlers.rs` (`pub(super)` methods on `DaemonState`; `handle_command` dispatches their `DaemonCommand` variants here) so this file stays focused on core command handling. |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `save` is **deterministic** (accounts sorted by name) and **atomic** (temp + fsync + rename via `write_file_atomic`), so the config watcher can never observe a torn file and identical logical state always serializes to identical bytes. `spawn_accounts_watcher` is the thin consumer that forwards `accounts.toml` edits surfaced by the config transport to the daemon command loop as `DaemonCommand::AccountsReload` (it does no reading itself). `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` (including `total_timeout_secs`) and converts the shared fields into `ProviderOverrides` for the other protocols. `AccountConfig::validate()` is Layer 3 of the retry budget: it rejects `retry_max_backoff_ms` past the 1 h ceiling (`MAX_BACKOFF_MS`, re-exported from `choreo-ai-protocols`), `retry_initial_backoff_ms` past the same ceiling even when no `max` is set (otherwise the library clamp would silently widen the budget gate), and inverted `retry_initial_backoff_ms > retry_max_backoff_ms` at accounts-file load and at `add`, so a typo'd config is refused with a pinpointed message (see the `retry.rs` row for the other two layers). |
 | `config.rs` | Daemon-level configuration: `DaemonConfig` (`max_turns`, `[context]`), `config_path()`, `load_daemon_config()`, and the deprecated `load_service_config()`. (Previously lived in `openai/config.rs`; it is daemon config, not provider config.) |
 | `config_watch.rs` | The **unified config-file watching transport**: ONE `notify` watcher on the config directory (`$XDG_CONFIG_HOME/choreographr`) fanned out per-basename to consumers over their own crossbeam channels (`ConfigWatcher::subscribe`, `ConfigChange`/`ChangeKind`). It is **transport only, no policy** — it owns the config-dir creation (so the watch installs first-time on a fresh system), the directory watch (rename-safe), the re-arm retry while unarmed, and basename + coarse-kind filtering (`classify` strips `Access`/`Other` noise); it never reads a file or mutates any state. Consumers (the catalog overlay reload, the accounts watcher, and the ACL watcher — the latter over a DEDICATED watcher instance on the ACL file's own directory, since the ACL path is a parameter, not a fixed config-dir member) subscribe to the basenames they care about and own their reload policy, forwarding reload requests to the daemon command loop — the single writer of whatever they govern. Spawned once by `run_server` before the consumers. |
@@ -1439,7 +1446,7 @@ not host CLI styling) and `ColorChoice::Auto` (color only on a TTY).
 
 **Credentials:** The daemon serves platform credentials via the `GetCredential` wire
 message. The admin stores credentials via `/add-key` or `/add-x` at runtime, which
-encrypts them with the daemon's public key. On unlock (`/unlock`) the daemon decrypts
+encrypts them with the derived unlock-key public key. On unlock (`/unlock`) the daemon decrypts
 all stored credentials into memory using its private key.
 
 **Module breakdown:**
@@ -1470,28 +1477,51 @@ Telegram user → teloxide polling → handle_message()
 Each daemon's credential keystore is governed by a keypair whose private half (the
 **unlock key**) is held client-side, one per daemon, in the client's
 `known_servers.toml`. The daemon stores only the public half as a **binding**, and
-it starts **locked** with no credentials in memory. The first unlock/credential-add
-against an unbound keystore ADOPTS the presented key (TOFU, logged loudly); every
-later one must match the binding or it is rejected (`LockedError`).
+it starts **locked** with no credentials in memory. The binding is created by
+exactly ONE wire path, `ClientMessage::BindKeystore` (TOFU): on an unbound
+keystore it ADOPTS the presented key (loud `KEYSTORE BOUND` log), runs the shared
+unlock tail, and replies the targeted `DaemonMessage::Bound` — bind implies
+unlock; on an already-bound keystore it verifies only (a mismatch is the usual
+wrong-key rejection, never an overwrite). `Unlock` and `AddCredential` are
+strictly VERIFY-ONLY: against an unbound keystore they answer the targeted
+`DaemonMessage::KeystoreUnbound` (deliberately distinct from `LockedError`,
+which means "bound but wrong key") and never adopt anything. Binding keys are
+ALWAYS freshly generated by the client's CSPRNG at bind time (auto-bind — there
+is no `/bind-key` command); pre-held keys (stored known_servers key or the
+legacy raw `identity.pk` file) verify existing bindings and never create new
+ones. Binding is TOFU-once — rotation is not implemented.
 
-A client sends `ClientMessage::Unlock { private_key }` (resolved as its stored
-per-daemon unlock key, else the legacy raw `identity.pk` file — copied into the
-store on first use; a caller-supplied base64 key from `/unlock <key>` is
-recorded into the store BEFORE sending). `AddCredential` now REQUIRES the unlock key and, on a valid blob,
-**implicitly unlocks** the daemon (decrypts all blobs into memory). The client
-records the key per-daemon only after the daemon confirms (`Unlocked` /
-`CredentialAdded`).
+A client sends `ClientMessage::Unlock { private_key }` (resolved verify-only as
+its stored per-daemon unlock key, else the legacy raw `identity.pk` file —
+copied into the store on first use; a caller-supplied base64 key from
+`/unlock <key>` is decoded WRITE-FREE — recording happens only on the daemon's
+targeted confirmation). `AddCredential` REQUIRES the unlock key and, on a valid
+blob, **implicitly unlocks** the daemon (decrypts all blobs into memory). The
+client records the key per-daemon ONLY after the daemon's targeted confirmation
+(`Unlocked` / `Bound` / `CredentialAdded`) — except the auto-bind key, which is
+recorded PRE-SEND (mandatory: an unbound daemon adopts whatever key arrives
+first, so even a lost confirmation leaves the recorded key matching the
+binding). Nothing is ever auto-deleted; `KnownServers::remove(addr)` re-pair is
+the only removal path.
+
+**ORDERING INVARIANT:** the targeted reply to Unlock/BindKeystore/AddCredential
+is enqueued by the daemon command loop into the acting client's writer sink
+BEFORE any lock-state transition broadcast — both travel the same per-client
+FIFO writer queue, so the broadcast can never overtake the reply. Client
+key-recording correctness keys on this (implemented via `DaemonCommand`
+carrying the client's `SubscriberSink`; pinned by the integration test
+`unix_targeted_reply_precedes_lock_state_broadcast`).
 
 ```
-startup                    /unlock [passphrase]     AddCredential{... unlock_key}
-   │                              │                          │
-   │  locked                      │  resolve unlock key       │ adopt-or-verify
-   │  (no credentials)            │  decrypt all credential   │ = binding; test-decrypt
-   │                              │  blobs from database      │ the blob (reject if bad)
-   │                              │  load accounts            │ then run the SAME unlock
-   │                              │  resolve provider per acct│ tail (decrypt-all, …)
-   │                              │  → Unlocked (ready)       │ → Unlock + CredentialAdded
-   ▼                              ▼                          ▼
+startup              connect→unbound?        /unlock [key]            AddCredential{... unlock_key}
+   │                       │                       │                          │
+   │  locked               │  AUTO-BIND (once per  │ verify-only resolve      │ verify = binding;
+   │  (no credentials)     │  connection): mint    │ unlock key; unbound →    │ test-decrypt the blob
+   │                       │  fresh key, record    │ KeystoreUnbound →        │ (reject if bad); unbound
+   │                       │  PRE-SEND, BindKeystore│ auto-bind; match →      │ → KeystoreUnbound;
+   │                       │  → Bound (implies     │ decrypt all credential   │ then run the SAME unlock
+   │                       │  unlock)              │ blobs, load accounts     │ tail → Unlock + CredentialAdded
+   ▼                       ▼                       ▼                          ▼
 ```
 
 - Credentials are encrypted per-credential with ECDH (X25519) + HKDF + AES-256-GCM, keyed
@@ -1500,12 +1530,13 @@ startup                    /unlock [passphrase]     AddCredential{... unlock_key
 - The unlock key is sent over the channel; zeroized after use by the daemon
 - `/lock` destroys all in-memory credentials, returning to locked state
 - **The locked state is authoritative and broadcast.** `DaemonState` keeps a single
-  `locked: bool` (starts `true`; `false` after a successful Unlock or AddCredential
-  implicit unlock — the shared `unlock_tail` is the one place it is cleared; `true`
+  `locked: bool` (starts `true`; `false` after a successful Unlock, BindKeystore,
+  or AddCredential implicit unlock — the shared `unlock_tail` is the one place it is
+  cleared; `true`
   again on `/lock`, which clears in-memory credentials/providers). On a REAL
   lock-state transition the daemon broadcasts the current state to ALL activity
   subscribers (`DaemonMessage::Unlocked` / `DaemonMessage::Locked` — the existing
-  flat variants, no wire change) via `handle_broadcast_activity`, and a
+  flat variants, no wire change) via `broadcast_lock_state`, and a
   freshly-connecting activity subscriber is sent the CURRENT state immediately
   (alongside the send-on-subscribe `CatalogUpdated`), so a client that connects to
   an already-locked daemon learns so without waiting for a transition. The acting
@@ -1513,6 +1544,7 @@ startup                    /unlock [passphrase]     AddCredential{... unlock_key
   `Unlocked`/`Locked`/`LockedError`); receiving the broadcast too is idempotent.
   This is what makes client B's unlock re-latch client A's banner.
 - `LockedError` is sent if any client attempts a request that requires credentials while locked
+- **Multi-client provisioning:** the first client to connect to a fresh (unbound) daemon auto-binds it with a minted key; other clients get `LockedError` until the key is shared out-of-band (add `unlock_key` to their `known_servers.toml`, or `/unlock <base64-key>`). A daemon DB reset invalidates its binding; the next connect auto-binds a fresh key (the stale stored key is replaced by the new bind's pre-send record).
 - Session lifecycle operations (CreateSession, AttachSession, ListSessions, etc.) succeed even
   when locked — credentials are only needed at RunInput time. Provider resolution is lazy:
   when RunInput is called, the session thread resolves the InferenceProvider from the daemon's
@@ -2577,7 +2609,7 @@ context_file_max_bytes = 32768
 
 > **Note:** Provider-level settings (`base_url`, `streaming`, `retry_*`, timeouts, endpoint paths, request format) have moved to per-account overrides in `accounts.toml`. See `README.md` for the full list.
 
-**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Each daemon's keystore is bound to one client-held unlock key (the daemon stores only the derived public binding); the legacy `identity.pk` / `public.pk` pair is removed, and the legacy raw `identity.pk` file is a fallback that is copied into `known_servers.toml` on first use (never deleted).
+**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Each daemon's keystore is bound to one client-held unlock key (the daemon stores only the derived public binding, created once via the `BindKeystore` wire path — TOFU-once, no rotation); the legacy `identity.pk` / `public.pk` pair is removed, and the legacy raw `identity.pk` file is an unlock-verification fallback that is copied into `known_servers.toml` on first use (never deleted, never binds).
 
 **Database:** `~/.local/share/choreographr/state.redb` (override via `CHOREOGRAPHR_DB_PATH` env var)
 
@@ -2988,9 +3020,9 @@ counts survive the attach instead of regressing.
    versioned. Length-prefixed framing avoids parsing ambiguities. Version field allows protocol
    evolution.
 
-3. **Lock/Unlock security** — the daemon starts without credentials in memory. The private key is
-   sent over the Unix socket and zeroized after use. Credentials are encrypted per-credential so
-   they can be stored in the database without a global passphrase.
+3. **Lock/Unlock security** — the daemon starts without credentials in memory. The unlock key travels
+   only over authenticated transport and is zeroized after use. Credentials are encrypted per-credential so
+   they can be stored in the database without a global passphrase. The keystore binding is established once (TOFU) via the `BindKeystore` wire path — the only message that can create it; Unlock/AddCredential are verify-only.
 
 4. **Sessions, not per-client state** — sessions are independent from client connections. A
     session has its own model, working directory, and messages. Clients subscribe/unsubscribe from sessions
