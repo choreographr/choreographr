@@ -569,6 +569,19 @@ fn noise_large_message_through_daemon() {
     // for the CredentialAdded reply to come back.
     let unlock_key: [u8; 32] = std::array::from_fn(|i| (i * 7) as u8);
     let derived_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(unlock_key));
+
+    // BIND first: the daemon's keystore starts unbound and AddCredential is
+    // verify-only, so the fresh daemon must be bound (the ONLY adopt path)
+    // before any credential can be added.
+    client.send(ClientMessage::BindKeystore {
+        key: unlock_key.to_vec(),
+    });
+    match client.recv() {
+        DaemonMessage::Bound => {}
+        other => panic!("expected Bound, got {other:?}"),
+    }
+    // (No lock-state broadcast is expected here: this Noise client is not an
+    // activity subscriber, so the bind's transition broadcast has no route.)
     // AddCredential test-decrypts the blob AND expects the plaintext to
     // decode as a ServiceCredential, so encrypt a real (postcard-serialized)
     // credential padded with filler bytes to keep the 1 MiB wire size.

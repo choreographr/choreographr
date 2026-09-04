@@ -117,6 +117,34 @@ pub struct DaemonState {
     pub catalog_paths: CatalogPaths,
 }
 
+/// Failure of a keystore unlock/bind/add-credential operation, with the
+/// UNBOUND case carried structurally so the connection layer can answer with
+/// the distinct `DaemonMessage::KeystoreUnbound` (guiding the client to
+/// auto-bind) instead of the generic wrong-key `LockedError`. Kept as an enum
+/// rather than a string sentinel because string matching on error text is how
+/// such distinctions silently rot.
+#[derive(Debug)]
+pub enum KeystoreOpError {
+    /// The daemon's keystore has no binding at all: verify-only operations
+    /// (Unlock / AddCredential) must not adopt a key, so they fail with this.
+    Unbound,
+    /// Any other failure (wrong key, DB I/O, invalid key length, …).
+    Other(String),
+}
+
+impl std::fmt::Display for KeystoreOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeystoreOpError::Unbound => write!(
+                f,
+                "keystore not initialized — no key is bound to this daemon yet; \
+                 it will be bound automatically on next client connect"
+            ),
+            KeystoreOpError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 pub enum DaemonCommand {
     Shutdown,
     CreateSession {
@@ -157,7 +185,25 @@ pub enum DaemonCommand {
     },
     Unlock {
         private_key: Vec<u8>,
-        reply: std::sync::mpsc::Sender<Result<(), String>>,
+        /// The acting client's writer sink, cloned from the connection. The
+        /// TARGETED reply is enqueued here directly by the daemon command
+        /// loop — before any lock-state broadcast — because routing the reply
+        /// through the connection thread's mpsc handoff does not order
+        /// against a broadcast enqueued by THIS thread into the same sink.
+        /// See ORDERING INVARIANT in `handle_unlock`.
+        client_writer: Option<SubscriberSink>,
+        reply: std::sync::mpsc::Sender<()>,
+    },
+    /// Establish (TOFU-bind) the keystore binding. The ONLY path that can
+    /// create the binding: on an unbound keystore the key is adopted (loud
+    /// `KEYSTORE BOUND` log) and the shared unlock tail runs; on an
+    /// already-bound keystore the key is verified against the binding and a
+    /// mismatch is rejected without unlocking or overwriting.
+    BindKeystore {
+        key: Vec<u8>,
+        /// See `Unlock.client_writer` for why the targeted reply rides here.
+        client_writer: Option<SubscriberSink>,
+        reply: mpsc::Sender<()>,
     },
     /// Lock the daemon's keystore: clear all decrypted in-memory credentials
     /// (and their cached providers) and flip `locked` back to `true`. The
@@ -172,13 +218,16 @@ pub enum DaemonCommand {
     SaveCredential {
         service: String,
         encrypted_blob: Vec<u8>,
-        /// REQUIRED (per-daemon keystore TOFU design): the raw X25519 private
-        /// key the credential blob was encrypted with. The daemon adopts it
-        /// (first contact) or verifies it against the stored binding, uses it
-        /// to test-decrypt + persist the blob, and then performs the implicit
-        /// unlock (same tail as `Unlock`).
+        /// REQUIRED (per-daemon keystore design): the raw X25519 private
+        /// key the credential blob was encrypted with. The daemon VERIFY-ONLY
+        /// checks it against the stored binding (an unbound keystore is
+        /// rejected — binding happens exclusively via `BindKeystore`), uses
+        /// it to test-decrypt + persist the blob, and then performs the
+        /// implicit unlock (same tail as `Unlock`).
         unlock_key: Vec<u8>,
-        reply: mpsc::Sender<Result<(), String>>,
+        /// See `Unlock.client_writer` for why the targeted reply rides here.
+        client_writer: Option<SubscriberSink>,
+        reply: mpsc::Sender<()>,
     },
     RemoveCredentialCmd {
         service: String,
@@ -482,14 +531,30 @@ impl DaemonState {
             DaemonCommand::SessionDeleteFinalized { session_id } => {
                 self.handle_session_delete_finalized(session_id)
             }
-            DaemonCommand::Unlock { private_key, reply } => self.handle_unlock(private_key, reply),
+            DaemonCommand::Unlock {
+                private_key,
+                client_writer,
+                reply,
+            } => self.handle_unlock(private_key, client_writer, reply),
+            DaemonCommand::BindKeystore {
+                key,
+                client_writer,
+                reply,
+            } => self.handle_bind_keystore(key, client_writer, reply),
             DaemonCommand::Lock { reply } => self.handle_lock(reply),
             DaemonCommand::SaveCredential {
                 service,
                 encrypted_blob,
                 unlock_key,
+                client_writer,
                 reply,
-            } => self.handle_save_credential(service, encrypted_blob, unlock_key, reply),
+            } => self.handle_save_credential(
+                service,
+                encrypted_blob,
+                unlock_key,
+                client_writer,
+                reply,
+            ),
             DaemonCommand::RemoveCredentialCmd { service, reply } => {
                 self.handle_remove_credential(service, reply)
             }
@@ -1245,11 +1310,38 @@ impl DaemonState {
         self.deleted_sessions.remove(&session_id);
     }
 
+    /// Enqueue a TARGETED reply directly into the acting client's writer
+    /// sink. This is the mechanism that makes the ORDERING INVARIANT real:
+    /// the connection thread learns of the reply via an mpsc handoff, which
+    /// does NOT order against a broadcast this thread makes to the same sink
+    /// — so the reply must be enqueued HERE, by this thread, into the same
+    /// FIFO queue the broadcast uses, BEFORE the broadcast.
+    fn send_targeted(
+        writer: &Option<SubscriberSink>,
+        global_lag: &Arc<AtomicUsize>,
+        msg: DaemonMessage,
+    ) {
+        if let Some(w) = writer {
+            w.send_accounted(&msg, global_lag);
+        } else {
+            warn!(
+                ?msg,
+                "no client writer for targeted keystore reply; dropping reply"
+            );
+        }
+    }
+
     /// Attempt to unlock the daemon with the given private key.
+    ///
+    /// VERIFY-ONLY: on an unbound keystore this must NOT adopt the key — the
+    /// client gets `KeystoreUnbound` and auto-binds instead (binding happens
+    /// exclusively via `BindKeystore`). On a bound keystore the key is
+    /// verified and the shared unlock tail runs.
     fn handle_unlock(
         &mut self,
         private_key: Vec<u8>,
-        reply: std::sync::mpsc::Sender<Result<(), String>>,
+        client_writer: Option<SubscriberSink>,
+        reply: std::sync::mpsc::Sender<()>,
     ) {
         info!("Unlock attempt");
         // Capture the pre-unlock lock state so the transition broadcast below
@@ -1258,16 +1350,64 @@ impl DaemonState {
         // repeat). `handle_unlock_inner` -> `unlock_tail` clears `locked` on
         // success.
         let was_locked = self.locked;
-        let result = handle_unlock_inner(self, private_key).map_err(|e| e.to_string());
+        let result = handle_unlock_inner(self, private_key);
+        // ORDERING INVARIANT: the targeted reply MUST be serialized to the
+        // acting client's socket BEFORE the lock-state broadcast — the
+        // client's key-recording correctness keys on the targeted reply. Both
+        // travel in the SAME per-client FIFO writer queue, and the reply is
+        // enqueued first HERE, so the broadcast can never overtake it.
+        let reply_msg = match &result {
+            Ok(()) => DaemonMessage::Unlocked,
+            Err(KeystoreOpError::Unbound) => DaemonMessage::KeystoreUnbound {
+                error: KeystoreOpError::Unbound.to_string(),
+            },
+            Err(KeystoreOpError::Other(e)) => DaemonMessage::LockedError { error: e.clone() },
+        };
+        Self::send_targeted(&client_writer, &self.global_lag, reply_msg);
+        let _ = reply.send(());
         // A successful unlock is a lock-state transition: fan it out to ALL
-        // activity subscribers (not just the acting client, which also gets its
-        // `send_to_writer` `Unlocked` reply) so every connected UI clears its
-        // lock banner — e.g. client B unlocking updates client A's status bar.
+        // activity subscribers (the acting client already has its targeted
+        // `Unlocked` queued; the duplicate is idempotent) so every connected
+        // UI clears its lock banner — e.g. client B unlocking updates client
+        // A's status bar.
         if result.is_ok() && was_locked {
             self.broadcast_lock_state();
         }
         info!("Unlock result: success={}", result.is_ok());
-        let _ = reply.send(result);
+    }
+
+    /// Establish (TOFU-bind) the keystore binding — the ONLY path that can
+    /// create it (`ClientMessage::BindKeystore`). On an unbound keystore the
+    /// presented key is ADOPTED (loud `KEYSTORE BOUND` log) and the shared
+    /// unlock tail runs (bulk decrypt is a no-op on a fresh keystore, loads
+    /// accounts, sets locked=false); on an already-bound keystore the key is
+    /// verified with the existing wrong-key rejection semantics — no unlock,
+    /// no overwrite.
+    fn handle_bind_keystore(
+        &mut self,
+        key: Vec<u8>,
+        client_writer: Option<SubscriberSink>,
+        reply: mpsc::Sender<()>,
+    ) {
+        info!("BindKeystore attempt");
+        let was_locked = self.locked;
+        let result = handle_bind_keystore_inner(self, key);
+        // ORDERING INVARIANT (see handle_unlock): the targeted `Bound`
+        // confirmation is enqueued BEFORE the lock-state broadcast — the
+        // client records the fresh bind key on this targeted reply.
+        let reply_msg = match &result {
+            Ok(()) => DaemonMessage::Bound,
+            Err(KeystoreOpError::Unbound) => DaemonMessage::KeystoreUnbound {
+                error: KeystoreOpError::Unbound.to_string(),
+            },
+            Err(KeystoreOpError::Other(e)) => DaemonMessage::LockedError { error: e.clone() },
+        };
+        Self::send_targeted(&client_writer, &self.global_lag, reply_msg);
+        let _ = reply.send(());
+        if result.is_ok() && was_locked {
+            self.broadcast_lock_state();
+        }
+        info!("BindKeystore result: success={}", result.is_ok());
     }
 
     /// Lock the daemon's keystore (`/lock`): clear every decrypted in-memory
@@ -1305,21 +1445,23 @@ impl DaemonState {
 
     /// Save an encrypted credential blob for a service.
     ///
-    /// `unlock_key` is REQUIRED (per-daemon keystore TOFU design): the flow
-    /// is adopt-or-verify the key against the keystore binding, TEST-DECRYPT
-    /// the incoming blob with the key (a blob that does not decrypt is
-    /// rejected and never persisted — this enforces "the credential was
-    /// encrypted with the same key as the rest of the keystore"), persist,
-    /// then run the IMPLICIT UNLOCK (shared tail) — so a valid AddCredential
-    /// to a locked daemon unlocks it. The caller (connection layer) replies
-    /// `CredentialAdded` and emits `Unlocked` exactly like a successful
-    /// `Unlock`.
+    /// `unlock_key` is REQUIRED (per-daemon keystore design): the flow is
+    /// VERIFY-ONLY against the keystore binding (an unbound keystore is
+    /// rejected — binding happens exclusively via `BindKeystore`),
+    /// TEST-DECRYPT the incoming blob with the key (a blob that does not
+    /// decrypt is rejected and never persisted — this enforces "the
+    /// credential was encrypted with the same key as the rest of the
+    /// keystore"), persist, then run the IMPLICIT UNLOCK (shared tail) — so a
+    /// valid AddCredential to a locked daemon unlocks it. The caller
+    /// (connection layer) replies `CredentialAdded` and emits `Unlocked`
+    /// exactly like a successful `Unlock`.
     fn handle_save_credential(
         &mut self,
         service: String,
         encrypted_blob: Vec<u8>,
         mut unlock_key: Vec<u8>,
-        reply: mpsc::Sender<Result<(), String>>,
+        client_writer: Option<SubscriberSink>,
+        reply: mpsc::Sender<()>,
     ) {
         // Capture the pre-operations lock state so the implicit-unlock
         // transition broadcast below fires only on a REAL locked→unlocked
@@ -1327,20 +1469,26 @@ impl DaemonState {
         let was_locked = self.locked;
         // Reject anything that is not exactly 32 bytes up front: the X25519
         // key derivation (and every crypto helper below) needs [u8; 32], and
-        // a shorter/longer key can never be a valid unlock key.
-        // Zeroizing makes the wipe structural: the array is zeroed on EVERY
-        // exit — the early-return error paths below, `?`, even a panic — so no
-        // per-path zeroize call can be forgotten by a future edit (this
-        // mirrors handle_unlock_inner).
+        // a shorter/longer key can never be a valid unlock key. Zeroizing
+        // makes the wipe structural: the array is zeroed on EVERY exit — the
+        // early-return error paths below, `?`, even a panic — so no per-path
+        // zeroize call can be forgotten by a future edit (this mirrors
+        // handle_unlock_inner).
         let key = Zeroizing::new(match unlock_key.as_slice().try_into() {
             Ok(k) => k,
             Err(_) => {
                 // The rejected bytes are still secret material — wipe them so
                 // a failed add does not leave the key in a freed allocation.
                 unlock_key.zeroize();
-                let _ = reply.send(Err(
-                    "invalid unlock_key: expected exactly 32 bytes".to_string()
-                ));
+                Self::send_targeted(
+                    &client_writer,
+                    &self.global_lag,
+                    DaemonMessage::CredentialAddFailed {
+                        service: service.clone(),
+                        error: "invalid unlock_key: expected exactly 32 bytes".to_string(),
+                    },
+                );
+                let _ = reply.send(());
                 return;
             }
         });
@@ -1348,12 +1496,26 @@ impl DaemonState {
         // and the Zeroizing wrapper wipes it on every exit path.
         unlock_key.zeroize();
 
-        // Adopt-or-verify BEFORE anything is written: a wrong key must not
-        // persist a blob the daemon could later read with an attacker's key
-        // silently adopted. Mirrors handle_unlock_inner (shared helper — the
-        // two paths cannot drift).
-        if let Err(e) = adopt_or_verify_keystore_binding(self, &key) {
-            let _ = reply.send(Err(e.to_string()));
+        // VERIFY-ONLY check BEFORE anything is written: a wrong key must not
+        // persist a blob, and an UNBOUND keystore must not be adopted here —
+        // binding happens exclusively via BindKeystore. (This used to
+        // adopt-or-verify; the adopt half moved to the bind path so Unlock
+        // and AddCredential can never silently create a binding.)
+        if let Err(e) = verify_keystore_binding(self, &key) {
+            // ORDERING INVARIANT (see handle_unlock): the targeted error
+            // reply is enqueued by THIS thread before anything else touches
+            // the client's writer queue.
+            let reply_msg = match e {
+                KeystoreOpError::Unbound => DaemonMessage::KeystoreUnbound {
+                    error: KeystoreOpError::Unbound.to_string(),
+                },
+                KeystoreOpError::Other(e) => DaemonMessage::CredentialAddFailed {
+                    service: service.clone(),
+                    error: e,
+                },
+            };
+            Self::send_targeted(&client_writer, &self.global_lag, reply_msg);
+            let _ = reply.send(());
             return;
         }
 
@@ -1362,35 +1524,59 @@ impl DaemonState {
         // and never persisted: storing an unreadable blob would poison the
         // keystore — the next unlock's bulk decrypt would log a failure
         // forever, and the credential would look saved but be unusable.
-        let plaintext =
-            match choreo_keystore::crypto::decrypt_with_private_key(&key, &encrypted_blob) {
-                Ok(pt) => pt,
-                Err(e) => {
-                    warn!(
-                        service = %service,
-                        error = %e,
-                        "AddCredential: blob failed test-decrypt with the presented unlock key; \
-                         rejecting without persisting"
-                    );
-                    let _ = reply.send(Err(format!(
-                        "credential blob failed to decrypt with the provided unlock key: {e}"
-                    )));
-                    return;
-                }
-            };
+        let plaintext = match choreo_keystore::crypto::decrypt_with_private_key(
+            &key,
+            &encrypted_blob,
+        ) {
+            Ok(pt) => pt,
+            Err(e) => {
+                warn!(
+                    service = %service,
+                    error = %e,
+                    "AddCredential: blob failed test-decrypt with the presented unlock key; \
+                     rejecting without persisting"
+                );
+                Self::send_targeted(
+                    &client_writer,
+                    &self.global_lag,
+                    DaemonMessage::CredentialAddFailed {
+                        service: service.clone(),
+                        error: format!(
+                            "credential blob failed to decrypt with the provided unlock key: {e}"
+                        ),
+                    },
+                );
+                let _ = reply.send(());
+                return;
+            }
+        };
         let cred: ServiceCredential = match postcard::from_bytes(&plaintext) {
             Ok(c) => c,
             Err(e) => {
-                let _ = reply.send(Err(format!(
-                    "credential payload is not a valid ServiceCredential: {e}"
-                )));
+                Self::send_targeted(
+                    &client_writer,
+                    &self.global_lag,
+                    DaemonMessage::CredentialAddFailed {
+                        service: service.clone(),
+                        error: format!("credential payload is not a valid ServiceCredential: {e}"),
+                    },
+                );
+                let _ = reply.send(());
                 return;
             }
         };
 
         // Persist to DB only after both checks passed.
         if let Err(e) = db::set_credential_blob(&self.db, &service, &encrypted_blob) {
-            let _ = reply.send(Err(format!("failed to save credential: {e}")));
+            Self::send_targeted(
+                &client_writer,
+                &self.global_lag,
+                DaemonMessage::CredentialAddFailed {
+                    service: service.clone(),
+                    error: format!("failed to save credential: {e}"),
+                },
+            );
+            let _ = reply.send(());
             return;
         }
 
@@ -1418,20 +1604,39 @@ impl DaemonState {
                 error = %e,
                 "AddCredential: persisted credential but implicit unlock failed"
             );
-            let _ = reply.send(Err(format!("credential saved but unlock failed: {e}")));
+            Self::send_targeted(
+                &client_writer,
+                &self.global_lag,
+                DaemonMessage::CredentialAddFailed {
+                    service: service.clone(),
+                    error: format!("credential saved but unlock failed: {e}"),
+                },
+            );
+            let _ = reply.send(());
             return;
         }
         info!(
             service = %service,
             "AddCredential: persisted, tested, and implicitly unlocked the keystore"
         );
+        // ORDERING INVARIANT: the targeted Unlocked+CredentialAdded replies
+        // are enqueued HERE, by this thread, BEFORE the lock-state broadcast
+        // (see handle_unlock) — the acting client keys its key-recording on
+        // the CredentialAdded confirmation, so the broadcast must never
+        // overtake it on the same writer queue.
+        Self::send_targeted(&client_writer, &self.global_lag, DaemonMessage::Unlocked);
+        Self::send_targeted(
+            &client_writer,
+            &self.global_lag,
+            DaemonMessage::CredentialAdded { service },
+        );
+        let _ = reply.send(());
         // A valid AddCredential to a locked daemon IS a lock-state transition
         // (implicit unlock): fan out the newly-unlocked state to ALL activity
         // subscribers so every connected UI clears its lock banner.
         if was_locked && !self.locked {
             self.broadcast_lock_state();
         }
-        let _ = reply.send(Ok(()));
     }
 
     /// Remove a stored credential for a service.
@@ -2323,73 +2528,145 @@ impl DaemonState {
     }
 }
 
-fn handle_unlock_inner(state: &mut DaemonState, mut private_key: Vec<u8>) -> io::Result<()> {
-    // Zeroizing makes the wipe structural: the stack array is zeroed on EVERY
-    // exit — early returns, the `?` operator, even a panic — so no per-path
-    // zeroize call can be forgotten by a future edit.
-    let key = Zeroizing::new(match private_key.as_slice().try_into() {
-        Ok(k) => k,
-        Err(_) => {
-            // The presented bytes are unusable, but still secret material —
-            // wipe the heap copy before returning so a failed unlock does not
-            // leave the key lying in a freed allocation.
-            private_key.zeroize();
-            return Err(io::Error::other("invalid private key: expected 32 bytes"));
-        }
-    });
+fn handle_unlock_inner(
+    state: &mut DaemonState,
+    mut private_key: Vec<u8>,
+) -> Result<(), KeystoreOpError> {
+    let key = zeroized_key_or_wipe(&mut private_key)?;
     // Wipe the heap `Vec` copy as soon as the stack array exists; only `key`
     // is used below and the Zeroizing wrapper wipes it on every exit path.
     private_key.zeroize();
 
-    // TOFU adopt-or-verify against the persisted keystore binding. A locked
-    // daemon presents its key on every Unlock; once a key is bound, any key
-    // whose derived public key differs is REJECTED (surfaces as LockedError)
-    // instead of unlocking with wrong credentials.
-    adopt_or_verify_keystore_binding(state, &key)?;
+    // VERIFY-ONLY enforcement against the persisted keystore binding. An
+    // UNBOUND keystore is an error (no adoption — binding is exclusively the
+    // BindKeystore path); a bound keystore rejects any key whose derived
+    // public key differs (surfaces as LockedError).
+    verify_keystore_binding(state, &key)?;
 
     // Shared bulk-decrypt + accounts-load + provider-resolve tail — the same
     // code path `AddCredential` runs as its implicit unlock, so the two
     // paths cannot drift.
-    unlock_tail(state, &key)
+    unlock_tail(state, &key).map_err(|e| KeystoreOpError::Other(e.to_string()))
 }
 
-/// TOFU keystore-binding enforcement, shared by `Unlock` and
-/// `AddCredential` (factored into one helper so the two paths cannot drift).
-///
-/// * Unbound keystore (no stored binding): ADOPT the presented key — derive
-///   its X25519 public key and persist it. This is a one-time,
-///   security-relevant event, so the log is deliberately LOUD.
-/// * Bound keystore: derive the presented key's public key and compare
-///   against the binding; a mismatch is an error (LockedError for Unlock,
-///   CredentialAddFailed for AddCredential).
-pub(crate) fn adopt_or_verify_keystore_binding(
-    state: &DaemonState,
-    key: &[u8; 32],
-) -> io::Result<()> {
+/// `BindKeystore` inner: validate + zeroize the key, then TOFU-adopt (unbound
+/// keystore) or verify (bound keystore), then run the shared unlock tail.
+/// On a fresh keystore the bulk decrypt is a no-op, but running the tail
+/// unconditionally keeps "bound and unlocked with this key" one code path.
+fn handle_bind_keystore_inner(
+    state: &mut DaemonState,
+    mut key: Vec<u8>,
+) -> Result<(), KeystoreOpError> {
+    // Validate + zeroize-on-exit the stack array, then wipe the heap `Vec`
+    // copy (same discipline as the unlock path): the heap bytes must not
+    // survive in a freed allocation, so they are zeroized BEFORE the
+    // Zeroizing array takes over the `key` name below.
+    let key = {
+        let arr = zeroized_key_or_wipe(&mut key)?;
+        key.zeroize();
+        arr
+    };
+
+    // Adopt-if-unbound-else-verify: the ONLY adopt path in the daemon.
+    bind_keystore(state, &key)?;
+
+    // Same tail as Unlock/AddCredential-implicit-unlock: loads accounts and
+    // clears `locked`, so a successful bind leaves the daemon unlocked.
+    unlock_tail(state, &key).map_err(|e| KeystoreOpError::Other(e.to_string()))
+}
+
+/// Validate a raw key Vec as exactly 32 bytes, returning it zeroized on the
+/// stack. Shared by the unlock/bind inners so the length check and the
+/// zeroize-on-error discipline cannot drift between the two paths.
+fn zeroized_key_or_wipe(key: &mut Vec<u8>) -> Result<Zeroizing<[u8; 32]>, KeystoreOpError> {
+    // Zeroizing makes the wipe structural: the stack array is zeroed on EVERY
+    // exit — early returns, the `?` operator, even a panic — so no per-path
+    // zeroize call can be forgotten by a future edit.
+    match key.as_slice().try_into() {
+        Ok(k) => Ok(Zeroizing::new(k)),
+        Err(_) => {
+            // The presented bytes are unusable, but still secret material —
+            // wipe the heap copy before returning so a failed operation does
+            // not leave the key lying in a freed allocation.
+            key.zeroize();
+            Err(KeystoreOpError::Other(
+                "invalid key: expected exactly 32 bytes".to_string(),
+            ))
+        }
+    }
+}
+
+/// TOFU keystore binding ADOPTION — used ONLY by the `BindKeystore` path.
+/// Unbound keystore (no stored binding): ADOPT the presented key — derive its
+/// X25519 public key and persist it. This is a one-time, security-relevant
+/// event, so the log is deliberately LOUD. A bound keystore is verified
+/// instead: a mismatching key is rejected (no overwrite, no unlock).
+fn bind_keystore(state: &DaemonState, key: &[u8; 32]) -> Result<(), KeystoreOpError> {
     let binding = db::get_keystore_binding(&state.db)
-        .map_err(|e| io::Error::other(format!("failed to read keystore binding: {e}")))?;
+        .map_err(|e| KeystoreOpError::Other(format!("failed to read keystore binding: {e}")))?;
     // x25519_dalek: the public key is what the binding stores (and what the
     // CLIENT used to encrypt credential blobs), never the private key itself.
     let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*key));
     match binding {
         None => {
             db::set_keystore_binding(&state.db, derived.as_bytes()).map_err(|e| {
-                io::Error::other(format!("failed to persist keystore binding: {e}"))
+                KeystoreOpError::Other(format!("failed to persist keystore binding: {e}"))
             })?;
             // One-time, security-relevant event: LOUD on purpose. Operators
             // must be able to see when a daemon's keystore became bound to a
             // key (any later unlock requires exactly that key).
             info!(
-                "KEYSTORE BOUND: adopted unlock key on first contact (TOFU); \
+                "KEYSTORE BOUND: adopted unlock key via BindKeystore (TOFU); \
                  public key (hex) = {} — all future Unlock/AddCredential \
                  attempts must present this key, others are rejected",
                 hex::encode(derived.as_bytes())
             );
             Ok(())
         }
+        Some(stored) if stored == *derived.as_bytes() => {
+            // Re-bind with the already-bound key: idempotent success (the
+            // unlock tail below still runs, which is the useful part).
+            debug!("BindKeystore: key matches the existing binding");
+            Ok(())
+        }
+        Some(_) => Err(KeystoreOpError::Other(
+            "keystore is already bound and the presented key does not match; \
+             refusing to overwrite the binding"
+                .to_string(),
+        )),
+    }
+}
+
+/// VERIFY-ONLY keystore-binding enforcement, shared by `Unlock` and
+/// `AddCredential` (factored into one helper so the two paths cannot drift).
+/// Neither path may CREATE a binding anymore:
+///
+/// * Unbound keystore (no stored binding): `KeystoreOpError::Unbound` — the
+///   connection layer answers `KeystoreUnbound` and the client auto-binds
+///   with a fresh key instead of this path silently adopting whatever was
+///   presented.
+/// * Bound keystore: derive the presented key's public key and compare
+///   against the binding; a mismatch is `KeystoreOpError::Other`
+///   (LockedError for Unlock, CredentialAddFailed for AddCredential).
+pub(crate) fn verify_keystore_binding(
+    state: &DaemonState,
+    key: &[u8; 32],
+) -> Result<(), KeystoreOpError> {
+    let binding = db::get_keystore_binding(&state.db)
+        .map_err(|e| KeystoreOpError::Other(format!("failed to read keystore binding: {e}")))?;
+    // x25519_dalek: the public key is what the binding stores (and what the
+    // CLIENT used to encrypt credential blobs), never the private key itself.
+    let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*key));
+    match binding {
+        None => {
+            debug!(
+                "verify_keystore_binding: keystore has no binding; refusing verify-only operation"
+            );
+            Err(KeystoreOpError::Unbound)
+        }
         Some(stored) if stored == *derived.as_bytes() => Ok(()),
-        Some(_) => Err(io::Error::other(
-            "unlock key does not match the daemon's keystore binding",
+        Some(_) => Err(KeystoreOpError::Other(
+            "unlock key does not match the daemon's keystore binding".to_string(),
         )),
     }
 }

@@ -347,8 +347,12 @@ impl DaemonMessage {
                     + option_str_len(selected_model)
             }
             Self::ModelsFailed { error } => named_field_overhead(1) + error.len(),
-            Self::Unlocked | Self::Locked | Self::ShuttingDown | Self::Evicted => OVERHEAD,
-            Self::LockedError { error } => named_field_overhead(1) + error.len(),
+            Self::Unlocked | Self::Locked | Self::Bound | Self::ShuttingDown | Self::Evicted => {
+                OVERHEAD
+            }
+            Self::LockedError { error } | Self::KeystoreUnbound { error } => {
+                named_field_overhead(1) + error.len()
+            }
             Self::CredentialAdded { service } => named_field_overhead(1) + service.len(),
             Self::CredentialAddFailed { service, error } => {
                 named_field_overhead(2) + service.len() + error.len()

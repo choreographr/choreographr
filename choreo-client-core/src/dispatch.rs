@@ -180,6 +180,18 @@ fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandle
         DaemonMessage::LockedError { error } => {
             handler.handle_error(format!("[daemon] locked: {error}"));
         }
+        // Targeted reply to a successful BindKeystore: the binding was
+        // created and the daemon unlocked. Text only — the caller that SENT
+        // the bind records the key on this confirmation.
+        DaemonMessage::Bound => {
+            handler.handle_status_text("[daemon] keystore bound and unlocked".to_string());
+        }
+        // Verify-only operation against an unbound keystore: distinct from
+        // LockedError so callers can distinguish "never bound — auto-bind
+        // with a fresh key" from "bound but wrong key".
+        DaemonMessage::KeystoreUnbound { error } => {
+            handler.handle_error(format!("[daemon] {error}"));
+        }
         DaemonMessage::CredentialAdded { service } => {
             handler.handle_status_text(format!("[daemon] credential added: {service}"));
         }

@@ -457,6 +457,18 @@ pub enum ClientMessage {
         private_key: Vec<u8>,
     },
     Lock,
+    /// Establish (TOFU-bind) the daemon's keystore binding with the 32-byte
+    /// X25519 private unlock key. This is the ONLY wire path that can create
+    /// the binding: on an unbound keystore the daemon adopts the key (loud
+    /// `KEYSTORE BOUND` log), runs the shared unlock tail (same code path as
+    /// AddCredential's implicit unlock), and replies
+    /// [`DaemonMessage::Bound`]. On an ALREADY-bound keystore the key is
+    /// verified against the binding — a mismatch is rejected with the usual
+    /// wrong-key semantics (no unlock, no overwrite). Unlock and AddCredential
+    /// are strictly VERIFY-ONLY and cannot create a binding.
+    BindKeystore {
+        key: Vec<u8>,
+    },
     AddCredential {
         service: String,
         encrypted_payload: Vec<u8>,
@@ -777,6 +789,24 @@ pub enum DaemonMessage {
     Unlocked,
     Locked,
     LockedError {
+        error: String,
+    },
+    /// Targeted reply to [`ClientMessage::BindKeystore`] when an unbound
+    /// keystore adopted the presented key and the implicit unlock succeeded.
+    /// Distinct from [`DaemonMessage::Unlocked`] so the client can tell "I just
+    /// created this binding" from "I verified an existing one". Ordering
+    /// contract: the daemon serializes this targeted reply to the acting
+    /// client's socket BEFORE the lock-state transition broadcast, so the
+    /// client can key-record on this message knowing the broadcast cannot
+    /// overtake it.
+    Bound,
+    /// Error reply for Unlock / AddCredential / BindKeystore against a daemon
+    /// whose keystore has NO binding yet. Deliberately distinct from
+    /// [`DaemonMessage::LockedError`] (which means "bound but wrong key") so
+    /// the client knows this daemon has never been bound and can AUTO-BIND it
+    /// with a freshly generated key instead of replaying a stored key that
+    /// can never match a nonexistent binding.
+    KeystoreUnbound {
         error: String,
     },
     CredentialAdded {

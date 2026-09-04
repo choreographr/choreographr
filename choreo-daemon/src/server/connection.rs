@@ -468,6 +468,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             info!("client {}: Unlock", ctx.client_id);
             handle_unlock_sync(ctx, private_key);
         }
+        ClientMessage::BindKeystore { key } => {
+            info!("client {}: BindKeystore", ctx.client_id);
+            handle_bind_keystore_sync(ctx, key);
+        }
         ClientMessage::Lock => {
             info!("client {}: Lock", ctx.client_id);
             handle_lock_sync(ctx);
@@ -1032,18 +1036,37 @@ fn request_daemon<R>(
 }
 
 fn handle_unlock_sync(ctx: &mut ClientCtx, private_key: Vec<u8>) {
+    // The daemon command loop enqueues the targeted reply (Unlocked /
+    // KeystoreUnbound / LockedError) DIRECTLY into this client's writer sink
+    // BEFORE its lock-state broadcast — see ORDERING INVARIANT in
+    // `DaemonState::handle_unlock`. This thread only waits for the ack so a
+    // dropped daemon channel is reported.
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::Unlock {
         private_key,
+        client_writer: Some(ctx.writer.clone()),
         reply,
     });
-    match result {
-        Ok(Ok(())) => {
-            send_to_writer(ctx, DaemonMessage::Unlocked);
-        }
-        Ok(Err(e)) => {
-            send_to_writer(ctx, DaemonMessage::LockedError { error: e });
-        }
-        Err(_) => warn!("daemon disconnected while handling unlock"),
+    if result.is_err() {
+        warn!("daemon disconnected while handling unlock");
+    }
+}
+
+/// Handle `ClientMessage::BindKeystore`: the ONLY path that can create the
+/// keystore binding. On an unbound keystore the daemon adopts the key (loud
+/// TOFU log), runs the shared unlock tail, and the client gets the targeted
+/// `DaemonMessage::Bound` reply (sent by the daemon loop into this client's
+/// sink BEFORE the lock-state broadcast — see ORDERING INVARIANT in
+/// `handle_unlock`); on an already-bound keystore a wrong key is rejected
+/// with the existing wrong-key semantics (LockedError) — no unlock, no
+/// overwrite.
+fn handle_bind_keystore_sync(ctx: &mut ClientCtx, key: Vec<u8>) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::BindKeystore {
+        key,
+        client_writer: Some(ctx.writer.clone()),
+        reply,
+    });
+    if result.is_err() {
+        warn!("daemon disconnected while handling bind keystore");
     }
 }
 
@@ -1172,29 +1195,19 @@ fn handle_add_credential_sync(
     // proto field non-optional): the credential must be usable immediately.
     unlock_key: Vec<u8>,
 ) {
+    // The daemon command loop enqueues the targeted replies (Unlocked +
+    // CredentialAdded, or the failure variant) DIRECTLY into this client's
+    // writer sink BEFORE its lock-state broadcast — see ORDERING INVARIANT in
+    // `DaemonState::handle_unlock`. This thread only waits for the ack.
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::SaveCredential {
         service: service.clone(),
         encrypted_blob: encrypted_payload,
         unlock_key,
+        client_writer: Some(ctx.writer.clone()),
         reply,
     });
-    match result {
-        Ok(Ok(())) => {
-            // The daemon performed the IMPLICIT UNLOCK as part of the save
-            // (adopt-or-verify → test-decrypt → persist → unlock tail), so a
-            // successful AddCredential leaves the daemon unlocked exactly
-            // like a successful `Unlock`: mirror `handle_unlock_sync` by
-            // emitting `Unlocked` alongside `CredentialAdded`.
-            send_to_writer(ctx, DaemonMessage::Unlocked);
-            send_to_writer(ctx, DaemonMessage::CredentialAdded { service });
-        }
-        Ok(Err(e)) => {
-            send_to_writer(
-                ctx,
-                DaemonMessage::CredentialAddFailed { service, error: e },
-            );
-        }
-        Err(_) => warn!("daemon disconnected while handling add credential"),
+    if result.is_err() {
+        warn!("daemon disconnected while handling add credential");
     }
 }
 
@@ -1632,9 +1645,21 @@ mod tests {
             client_id: 0,
             is_unix: true,
         };
+        // The daemon command loop now enqueues the targeted reply itself:
+        // the stub simulates that by sending Unlocked into the client_writer
+        // sink BEFORE the ack (the ORDERING INVARIANT shape).
+        let lag = Arc::clone(&global_lag);
         std::thread::spawn(move || {
-            if let Ok(DaemonCommand::Unlock { reply, .. }) = daemon_rx.recv() {
-                let _ = reply.send(Ok(()));
+            if let Ok(DaemonCommand::Unlock {
+                client_writer,
+                reply,
+                ..
+            }) = daemon_rx.recv()
+            {
+                if let Some(w) = &client_writer {
+                    w.send_accounted(&DaemonMessage::Unlocked, &lag);
+                }
+                let _ = reply.send(());
             }
         });
         handle_unlock_sync(&mut ctx, vec![0u8; 32]);
@@ -1658,9 +1683,25 @@ mod tests {
             client_id: 0,
             is_unix: true,
         };
+        // The daemon command loop enqueues the targeted LockedError itself;
+        // the stub simulates that (see the ordering-invariant note above).
+        let lag = Arc::clone(&global_lag);
         std::thread::spawn(move || {
-            if let Ok(DaemonCommand::Unlock { reply, .. }) = daemon_rx.recv() {
-                let _ = reply.send(Err("wrong password".into()));
+            if let Ok(DaemonCommand::Unlock {
+                client_writer,
+                reply,
+                ..
+            }) = daemon_rx.recv()
+            {
+                if let Some(w) = &client_writer {
+                    w.send_accounted(
+                        &DaemonMessage::LockedError {
+                            error: "wrong password".to_string(),
+                        },
+                        &lag,
+                    );
+                }
+                let _ = reply.send(());
             }
         });
         handle_unlock_sync(&mut ctx, vec![0u8; 32]);
@@ -1740,6 +1781,8 @@ mod tests {
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::Lock { reply }) = daemon_rx.recv() {
+                // Lock's reply channel still carries a plain String error:
+                // /lock is not a binding-verification operation.
                 let _ = reply.send(Err("cannot lock".into()));
             }
         });

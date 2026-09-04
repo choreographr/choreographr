@@ -363,3 +363,180 @@ fn unix_connection_cap_rejects_over_limit_with_eof() {
     // out the bounded drain grace for 256 wedged connections.
     drop(streams);
 }
+
+// ── Keystore bind/verify redesign (integration) ──────────────────────────
+
+/// Receive the next message that is NOT an asynchronous `CatalogUpdated`
+/// broadcast. The daemon's catalog-maintenance thread performs a startup
+/// models.dev fetch (a fresh test DB is always "stale"), and on completion the
+/// command loop broadcasts an extra `CatalogUpdated` to every activity
+/// subscriber — at ANY moment relative to the test's request/reply flow. The
+/// wire protocol is designed for clients to tolerate these async broadcasts,
+/// so tests must skip them rather than assert strict message adjacency against
+/// them; only messages produced by the request under test carry ordering
+/// guarantees (per-client sink FIFO). Panics with the offending message if
+/// anything other than `CatalogUpdated` fails `keep`.
+fn recv_until_not_catalog(client: &Client, what: &str) -> DaemonMessage {
+    loop {
+        let msg = client.recv();
+        if !matches!(msg, DaemonMessage::CatalogUpdated { .. }) {
+            return msg;
+        }
+        tracing::debug!(what, "skipping interleaved async CatalogUpdated broadcast");
+    }
+}
+
+/// Drain the subscribe-time push (CatalogUpdated + lock state), tolerating
+/// extra async `CatalogUpdated` broadcasts racing with the drain.
+fn drain_subscribe_push(client: &Client) {
+    let first = client.recv();
+    assert!(
+        matches!(first, DaemonMessage::CatalogUpdated { .. }),
+        "{first:?}"
+    );
+    let second = recv_until_not_catalog(client, "subscribe-time lock state");
+    assert!(matches!(second, DaemonMessage::Locked), "{second:?}");
+}
+
+/// BindKeystore on an unbound daemon adopts the key, replies the targeted
+/// `Bound`, and the daemon is unlocked afterwards (a follow-up AddCredential
+/// succeeds without any adoption).
+#[test]
+#[ignore]
+fn unix_bind_keystore_adopts_and_replies_bound() {
+    let mut daemon = common::SpawnedDaemon::start(&[]);
+    let client = Client::connect(&daemon.socket_str());
+    client.send(ClientMessage::SubscribeAllActivity);
+    drain_subscribe_push(&client);
+
+    let key: [u8; 32] = std::array::from_fn(|i| (i * 11) as u8);
+    client.send(ClientMessage::BindKeystore { key: key.to_vec() });
+    match recv_until_not_catalog(&client, "bind reply") {
+        DaemonMessage::Bound => {}
+        other => panic!("expected Bound, got {other:?}"),
+    }
+    // The bind's implicit unlock transition broadcast follows the targeted
+    // reply on the same socket (ORDERING: reply first — asserted strictly
+    // here by the order of the recvs — interleaved async catalog broadcasts
+    // are skipped, but the RELATIVE order of Bound before Unlocked is still
+    // asserted strictly (FIFO per-client sink).
+    match recv_until_not_catalog(&client, "Unlocked broadcast") {
+        DaemonMessage::Unlocked => {}
+        other => panic!("expected Unlocked broadcast after Bound, got {other:?}"),
+    }
+
+    // The binding is real: a second bind with a DIFFERENT key is rejected
+    // with the wrong-key semantics (no overwrite).
+    client.send(ClientMessage::BindKeystore { key: vec![9u8; 32] });
+    match recv_until_not_catalog(&client, "wrong-key rejection") {
+        DaemonMessage::LockedError { error } => {
+            assert!(error.contains("already bound"), "got: {error}");
+        }
+        other => panic!("expected LockedError rejection, got {other:?}"),
+    }
+
+    daemon.shutdown();
+    client.assert_closed_ok();
+}
+
+/// Unlock on an unbound daemon is VERIFY-ONLY: it must NOT adopt the key.
+/// The client gets the distinct `KeystoreUnbound` (not LockedError), and a
+/// subsequent AddCredential is refused too — proving no binding was created.
+#[test]
+#[ignore]
+fn unix_unlock_on_unbound_keystore_is_refused_without_adopting() {
+    let mut daemon = common::SpawnedDaemon::start(&[]);
+    let client = Client::connect(&daemon.socket_str());
+
+    let key: [u8; 32] = std::array::from_fn(|i| (i * 13) as u8);
+    client.send(ClientMessage::Unlock {
+        private_key: key.to_vec(),
+    });
+    match client.recv() {
+        DaemonMessage::KeystoreUnbound { error } => {
+            assert!(
+                error.contains("not initialized"),
+                "the error must guide the client to auto-bind, got: {error}"
+            );
+        }
+        other => panic!("expected KeystoreUnbound, got {other:?}"),
+    }
+
+    // AddCredential on the still-unbound keystore is refused as well: the
+    // unlock above must not have adopted the key.
+    let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(key));
+    let blob = choreo_keystore::crypto::encrypt_with_public_key(
+        derived.as_bytes(),
+        &postcard::to_allocvec(&choreo_keystore::ServiceCredential::ApiKey { key: "sk".into() })
+            .unwrap(),
+    )
+    .unwrap();
+    client.send(ClientMessage::AddCredential {
+        service: "svc".into(),
+        encrypted_payload: blob,
+        unlock_key: key.to_vec(),
+    });
+    match client.recv() {
+        DaemonMessage::KeystoreUnbound { .. } => {}
+        other => panic!("expected KeystoreUnbound, got {other:?}"),
+    }
+
+    daemon.shutdown();
+    client.assert_closed_ok();
+}
+
+/// ORDERING INVARIANT: the targeted reply to a keystore operation MUST be
+/// serialized to the client's socket BEFORE the lock-state transition
+/// broadcast reaches that client. A client that is an activity subscriber
+/// receives BOTH on the same socket, and its key-recording correctness keys
+/// on the targeted reply coming first.
+#[test]
+#[ignore]
+fn unix_targeted_reply_precedes_lock_state_broadcast() {
+    let mut daemon = common::SpawnedDaemon::start(&[]);
+    let client = Client::connect(&daemon.socket_str());
+    // Become an activity subscriber so the transition broadcast is routed to
+    // this same client's socket.
+    client.send(ClientMessage::SubscribeAllActivity);
+    drain_subscribe_push(&client);
+
+    let key: [u8; 32] = std::array::from_fn(|i| (i * 17) as u8);
+    client.send(ClientMessage::BindKeystore { key: key.to_vec() });
+    // STRICT order (modulo skipped async CatalogUpdated broadcasts): the
+    // targeted Bound confirmation first, the Unlocked broadcast second. If the
+    // broadcast ever overtook the reply, the client keying on "first
+    // Unlocked-style message" would mis-attribute the key.
+    assert!(matches!(
+        recv_until_not_catalog(&client, "bind reply"),
+        DaemonMessage::Bound
+    ));
+    assert!(matches!(
+        recv_until_not_catalog(&client, "Unlocked broadcast"),
+        DaemonMessage::Unlocked
+    ));
+
+    // Same invariant for Unlock: lock, then unlock again.
+    client.send(ClientMessage::Lock);
+    assert!(matches!(
+        recv_until_not_catalog(&client, "lock reply"),
+        DaemonMessage::Locked
+    ));
+    assert!(matches!(
+        recv_until_not_catalog(&client, "Locked broadcast"),
+        DaemonMessage::Locked
+    ));
+    client.send(ClientMessage::Unlock {
+        private_key: key.to_vec(),
+    });
+    assert!(matches!(
+        recv_until_not_catalog(&client, "unlock reply"),
+        DaemonMessage::Unlocked
+    ));
+    assert!(matches!(
+        recv_until_not_catalog(&client, "Unlocked broadcast"),
+        DaemonMessage::Unlocked
+    ));
+
+    daemon.shutdown();
+    client.assert_closed_ok();
+}

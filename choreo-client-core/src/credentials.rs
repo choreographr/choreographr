@@ -3,7 +3,7 @@ use choreo_keystore::ServiceCredential;
 use choreo_proto::ClientMessage;
 use tracing::{debug, info, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::ClientError;
 use crate::known_servers::KnownServers;
@@ -20,10 +20,9 @@ use crate::shell::UnlockMethod;
 /// neither source has a key.
 ///
 /// For `UnlockMethod::Key(key)`, the argument IS the unlock key (base64 of
-/// the 32 raw bytes): it is decoded, recorded into known_servers.toml for
-/// `addr` BEFORE the Unlock is sent, and returned. Recording before send is
-/// safe under the survivor semantics (see `resolve_keystore_key`): a wrong
-/// key simply replays its daemon rejection until manually replaced.
+/// the 32 raw bytes): it is decoded, validated, and returned — WRITE-FREE.
+/// The caller records it via [`record_unlock_key`] ONLY when the daemon
+/// confirms (`Unlocked` reply); nothing is written to known_servers on send.
 pub fn resolve_private_key(method: &UnlockMethod, addr: &str) -> Result<Vec<u8>, ClientError> {
     match method {
         UnlockMethod::Raw => {
@@ -34,27 +33,28 @@ pub fn resolve_private_key(method: &UnlockMethod, addr: &str) -> Result<Vec<u8>,
         }
         UnlockMethod::Key(key) => {
             info!(addr, "unlocking with caller-supplied base64 unlock key");
+            // WRITE-FREE: decode + validate only. Recording happens on the
+            // daemon's targeted confirmation (record_unlock_key), so a key
+            // the daemon rejects never pollutes the store.
             let key = decode_base64_unlock_key(key)?;
-            // Record BEFORE sending: the user explicitly supplied this key,
-            // so it belongs in the store regardless of how the unlock goes
-            // (survivor semantics — there is no revert-on-rejection).
-            KnownServers::load()?.set_unlock_key(addr, &key)?;
-            info!(
-                addr,
-                "recorded caller-supplied unlock key into known_servers"
-            );
             Ok(key.to_vec())
         }
     }
 }
 
 /// Decode a caller-supplied base64 unlock key into exactly 32 raw bytes
-/// (the same encoding `known_servers.toml` stores).
+/// (the same encoding `known_servers.toml` stores). The decoded bytes are
+/// zeroized if validation fails, so a bad key never lingers in a freed
+/// allocation.
 fn decode_base64_unlock_key(key: &str) -> Result<[u8; 32], ClientError> {
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(key.trim())
-        .map_err(|_| ClientError::PrivateKeyInvalid)?;
-    raw.try_into().map_err(|_| ClientError::PrivateKeyInvalid)
+    let raw = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(key.trim())
+            .map_err(|_| ClientError::PrivateKeyInvalid)?,
+    );
+    raw.as_slice()
+        .try_into()
+        .map_err(|_| ClientError::PrivateKeyInvalid)
 }
 
 /// Read and validate the raw private key file (`identity.pk`).
@@ -216,62 +216,55 @@ fn parse_credential(
     }
 }
 
-/// Resolve the per-daemon keystore unlock key for `addr`.
+/// Resolve the per-daemon keystore unlock key for `addr` — VERIFY-ONLY
+/// resolution: the stored known_servers key for `addr`, falling back to the
+/// legacy raw `identity.pk` file (which `stored_or_adopted_unlock_key` copies
+/// into the store).
 ///
-/// Order (per-daemon TOFU design, DESIGN-keystore-unlock.md):
-/// 1. the key ALREADY associated with `addr` — the stored per-daemon key in
-///    the known_servers entry, falling back to the legacy raw `identity.pk`
-///    file (which `stored_or_adopted_unlock_key` copies into the store),
-/// 2. failing both, a FRESH random key — and it is OPTIMISTICALLY recorded in
-///    known_servers for `addr` immediately.
-///
-/// The optimistic fresh record closes the lost-confirmation orphan (bug 2 of
-/// the design review): a fresh key is adopted TOFU by an unbound daemon, so if
-/// the `CredentialAdded` reply is lost the key must already be on disk or the
-/// next connect would mint a DIFFERENT fresh key and be locked out of the now-
-/// bound keystore. If the daemon turns out to be ALREADY bound it rejects the
-/// fresh key — the record STAYS (see the rationale on [`resolve_keystore_key`]).
+/// There is NO fresh-mint fallback anymore: a new design reserves key
+/// creation for the explicit bind flow ([`bind_fresh_daemon`]) — stored and
+/// legacy keys are unlock-VERIFICATION keys only and must never be used to
+/// establish a binding. When neither source has a key the caller gets
+/// [`ClientError::NoUnlockKey`] and the frontend surfaces it.
 fn resolve_keystore_key(addr: &str) -> Result<[u8; 32], ClientError> {
-    if let Some(key) = stored_or_adopted_unlock_key(addr)? {
-        return Ok(key);
-    }
+    stored_or_adopted_unlock_key(addr)?.ok_or_else(|| ClientError::NoUnlockKey(addr.to_string()))
+}
+
+/// Prepare an AUTO-BIND of a freshly connected daemon whose keystore is
+/// unbound (learned from the subscribe-time lock state, or from a
+/// `KeystoreUnbound` reply to an auto-unlock attempt).
+///
+/// A brand-new 32-byte CSPRNG key is minted with `rand` and recorded into
+/// known_servers for `addr` BEFORE the `BindKeystore` message is returned —
+/// pre-send recording is CORRECT for bind (unlike unlock/add): an unbound
+/// daemon adopts whatever key arrives first, so if the confirmation is lost
+/// the recorded key still matches the binding, and there is nothing to
+/// overwrite. The returned `(key, message)` pair is sent as-is; the caller
+/// MUST confirm on the targeted `DaemonMessage::Bound` reply via
+/// [`record_unlock_key`] (a no-op-safe re-record of the already-persisted
+/// key) to keep the pending-flow contract uniform.
+///
+/// Pre-held keys (stored or legacy) are NEVER used to bind: the binding must
+/// always be fresh so a recorded key is provably the one the daemon adopted.
+/// If the key cannot be persisted pre-send the bind is REFUSED — sending an
+/// unrecorded bind key risks an unrecoverable orphaned binding.
+pub fn bind_fresh_daemon(addr: &str) -> Result<([u8; 32], ClientMessage), ClientError> {
+    // CSPRNG via rand's thread-local generator: the binding key is the root
+    // of the daemon's credential confidentiality, so it must never be
+    // predictable or reused.
     let fresh: [u8; 32] = rand::random();
     info!(
         addr,
-        "no stored or legacy unlock key; generated fresh random key for daemon (TOFU adopt on first use)"
+        "minted fresh random keystore binding key for unbound daemon"
     );
-    // Best-effort persist so an interrupted confirmation cannot orphan the
-    // binding. A store we cannot write is not worth failing the add over: the
-    // caller records the key again on confirmed success anyway.
-    if let Err(e) = KnownServers::load().and_then(|mut s| s.set_unlock_key(addr, &fresh)) {
-        warn!(
-            addr,
-            error = %e,
-            "could not optimistically record fresh unlock key; it will be recorded on daemon confirmation"
-        );
-    }
-    Ok(fresh)
+    // Pre-send record is MANDATORY here (not best-effort): see doc above.
+    KnownServers::load()?.set_unlock_key(addr, &fresh)?;
+    debug!(addr, "recorded fresh bind key into known_servers pre-send");
+    let msg = ClientMessage::BindKeystore {
+        key: fresh.to_vec(),
+    };
+    Ok((fresh, msg))
 }
-
-// Why a daemon REJECTION does not delete the optimistic record: the unlock
-// key is only ever DELETED by an explicit `KnownServers::remove(addr)`
-// (documented re-pair path). The reasoning:
-//
-// 1. A CONFIRMED record can never be "wrong" later — the daemon's keystore
-//    binding is TOFU-once and never rotates, so a key the daemon once
-//    accepted keeps matching its binding forever (and if the daemon's DB is
-//    wiped it becomes unbound again and re-adopts the stored key).
-// 2. The daemon surfaces EVERY unlock-path error (including transient
-//    failures like a database read error) as `LockedError` / a rejection, so
-//    a rejection is NOT proof the key is bad. Deleting on rejection could
-//    erase a perfectly good confirmed record — and with the legacy files
-//    already deleted by migration there may be no way back.
-// 3. For the one genuinely-wrong case (an optimistic fresh key rejected by
-//    an already-bound daemon) deletion recovers nothing: a fresh key is
-//    minted precisely because no stored OR legacy key exists, so after a
-//    clear the next attempt mints yet another fresh key that is also
-//    rejected. Manual recovery via `remove(addr)` is the fix in both
-//    worlds, so the simpler survivor semantics win.
 
 /// Build an `AddCredential` message from typed field strings: parse the
 /// credential, then delegate to the shared builder (see
@@ -305,16 +298,16 @@ pub fn build_add_credential_message(
 /// resolving the daemon's unlock key and encrypting the serialized blob to the
 /// public key derived from that key.
 ///
+/// VERIFY-ONLY key resolution: the stored per-daemon key or the legacy file —
+/// NEVER a fresh key (fresh keys are minted exclusively by [`bind_fresh_daemon`]).
+/// When neither source has a key this errors with [`ClientError::NoUnlockKey`]
+/// and the frontend surfaces it (the daemon's keystore is either unbound —
+/// in which case the client auto-binds first — or bound to a key this client
+/// does not hold).
+///
 /// Returns the message AND the unlock key used, so the caller can call
 /// [`record_unlock_key`] once the daemon CONFIRMS success (`CredentialAdded` /
-/// `Unlocked` reply) — never on send. (A freshly minted key is additionally
-/// optimistic-recorded inside [`resolve_keystore_key`], so a lost confirmation
-/// cannot orphan it. That record is PROVISIONAL until the daemon confirms, but
-/// a daemon rejection does NOT delete it — see the survivor-semantics
-/// rationale above [`resolve_keystore_key`].
-///
-/// The caller must call [`record_unlock_key`] on confirmed success or the next
-/// add could mint a key the now-bound daemon rejects.
+/// `Unlocked` reply) — never on send.
 pub fn build_add_credential_from_credential(
     addr: &str,
     service: String,
@@ -503,10 +496,11 @@ mod tests {
     }
 
     /// `/unlock <key>`: the argument IS the unlock key (base64 of the 32 raw
-    /// bytes) — it is recorded into known_servers.toml BEFORE the Unlock is
-    /// sent and returned for the wire message.
+    /// bytes) — WRITE-FREE: it is decoded, validated, and returned, but NOT
+    /// recorded pre-send. Recording happens only on the daemon's targeted
+    /// confirmation (`record_unlock_key`).
     #[test]
-    fn resolve_key_records_supplied_key_into_store() {
+    fn resolve_key_does_not_record_supplied_key_into_store() {
         let dir = tempfile::tempdir().unwrap();
         let _guard =
             choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
@@ -518,9 +512,10 @@ mod tests {
             resolve_private_key(&UnlockMethod::Key(b64), "d:1").unwrap(),
             key.to_vec()
         );
-        // Recorded before send: a fresh load sees it.
+        // Write-free: even a fresh load sees nothing recorded for the addr —
+        // a rejected key must never pollute the store.
         let store = KnownServers::load().unwrap();
-        assert_eq!(store.unlock_key("d:1").unwrap(), Some(key));
+        assert_eq!(store.unlock_key("d:1").unwrap(), None);
     }
 
     /// A supplied key that is not base64 — or not exactly 32 bytes once
@@ -602,24 +597,45 @@ mod tests {
         assert_eq!(key, sk.to_vec());
     }
 
-    /// With nothing stored and no legacy files, a FRESH random key is
-    /// generated (TOFU) and the blob decrypts with the key that was
-    /// returned.
+    /// Verify-only resolution: with nothing stored and no legacy files, the
+    /// add FAILS with NoUnlockKey — no fresh key is minted on the add path
+    /// (fresh keys are minted exclusively by `bind_fresh_daemon`).
     #[test]
-    fn build_add_credential_generates_fresh_key_and_blob_decrypts() {
+    fn build_add_credential_without_any_key_is_a_clear_error() {
         let dir = tempfile::tempdir().unwrap();
         let _guard =
             choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
         std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
 
+        assert!(matches!(
+            build_add_credential_message("d:1", "svc".into(), "api_key".into(), vec!["k".into()]),
+            Err(ClientError::NoUnlockKey(_))
+        ));
+        // And nothing was optimistically recorded by the failed attempt.
+        assert_eq!(
+            KnownServers::load().unwrap().unlock_key("d:1").unwrap(),
+            None
+        );
+    }
+
+    /// The blob encrypts to the pubkey derived from the RESOLVED (stored)
+    /// key — the daemon-side test-decrypt contract — and the returned key
+    /// equals the stored one.
+    #[test]
+    fn build_add_credential_blob_decrypts_with_stored_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard =
+            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
+
+        let stored: [u8; 32] = [4u8; 32];
+        let mut store = KnownServers::load().unwrap();
+        store.set_unlock_key("d:1", &stored).unwrap();
+
         let (msg, key) =
             build_add_credential_message("d:1", "svc".into(), "api_key".into(), vec!["k".into()])
                 .unwrap();
-        assert_eq!(key.len(), 32);
-        assert_eq!(msg_unlock_key(&msg), key);
-
-        // The blob must decrypt with the derived public key — this is the
-        // daemon-side test-decrypt contract.
+        assert_eq!(key, stored.to_vec());
         let ClientMessage::AddCredential {
             service,
             encrypted_payload,
@@ -629,47 +645,65 @@ mod tests {
             panic!("expected AddCredential");
         };
         assert_eq!(service, "svc");
-        // The blob was encrypted to the pubkey derived from this key.
-        // decrypt_with_private_key takes the raw 32-byte secret + ciphertext.
-        let mut sk_arr = [0u8; 32];
-        sk_arr.copy_from_slice(&key);
         let plaintext =
-            choreo_keystore::crypto::decrypt_with_private_key(&sk_arr, encrypted_payload)
-                .expect("blob must decrypt with the chosen unlock key");
+            choreo_keystore::crypto::decrypt_with_private_key(&stored, encrypted_payload)
+                .expect("blob must decrypt with the stored unlock key");
         let cred: ServiceCredential = postcard::from_bytes(&plaintext).unwrap();
         assert!(matches!(cred, ServiceCredential::ApiKey { ref key, .. } if key == "k"));
     }
 
-    /// Bug-2 regression: a freshly minted key is OPTIMISTICALLY recorded in
-    /// known_servers immediately (so an interrupted `CredentialAdded` reply
-    /// cannot orphan the binding), and the record SURVIVES — a daemon
-    /// rejection must not delete it (the rejection may be a transient daemon
-    /// failure misreported as a key error, and a fresh key has no fallback to
-    /// re-derive from anyway). `KnownServers::remove(addr)` is the only wipe.
+    /// `bind_fresh_daemon`: mints a FRESH CSPRNG key (never the stored or
+    /// legacy key), records it into known_servers PRE-SEND (so a lost
+    /// confirmation cannot orphan the binding), and returns the
+    /// `BindKeystore` message carrying exactly that key.
     #[test]
-    fn fresh_key_is_optimistically_recorded_and_survives_a_rejection() {
+    fn bind_fresh_daemon_mints_fresh_key_records_pre_send_and_returns_message() {
         let dir = tempfile::tempdir().unwrap();
         let _guard =
             choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
         std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-        // Ensure no legacy files exist so resolution must mint a fresh key.
-        assert!(!dir.path().join("choreographr/identity.pk").exists());
 
-        let (msg, key) =
-            build_add_credential_message("d:1", "svc".into(), "api_key".into(), vec!["k".into()])
-                .unwrap();
-        assert_eq!(msg_unlock_key(&msg), key, "message carries the minted key");
+        // Pre-existing stored + legacy keys: bind must NOT use either.
+        let stored: [u8; 32] = [30u8; 32];
+        let mut store = KnownServers::load().unwrap();
+        store.set_unlock_key("d:1", &stored).unwrap();
+        let (_, legacy_sk) = choreo_keystore::crypto::generate_keypair();
+        std::fs::write(dir.path().join("choreographr/identity.pk"), legacy_sk).unwrap();
 
-        // The optimistic record is on disk before any daemon confirmation.
-        let store = KnownServers::load().unwrap();
-        let recorded: [u8; 32] = store.unlock_key("d:1").unwrap().expect("must be recorded");
-        let key_arr: [u8; 32] = key.as_slice().try_into().unwrap();
-        assert_eq!(recorded, key_arr);
+        let (key, msg) = bind_fresh_daemon("d:1").unwrap();
+        assert_ne!(key, stored, "bind must NEVER reuse a stored key");
+        assert_ne!(key, legacy_sk, "bind must NEVER reuse the legacy key");
+        match &msg {
+            ClientMessage::BindKeystore { key: wire_key } => {
+                assert_eq!(wire_key, &key.to_vec(), "message carries the minted key");
+            }
+            other => panic!("expected BindKeystore, got {other:?}"),
+        }
+        // Pre-send record: on disk BEFORE any daemon confirmation.
+        let recorded = KnownServers::load().unwrap().unlock_key("d:1").unwrap();
+        assert_eq!(recorded, Some(key));
 
-        // There is no revert API: a reload (what the next client attempt
-        // does) still resolves the SAME key, rather than minting a new one.
-        let reloaded = KnownServers::load().unwrap();
-        assert_eq!(reloaded.unlock_key("d:1").unwrap(), Some(key_arr));
+        // The pending-flow contract: confirming on the targeted `Bound` reply
+        // via record_unlock_key re-records the SAME key (idempotent).
+        record_unlock_key("d:1", &key).unwrap();
+        assert_eq!(
+            KnownServers::load().unwrap().unlock_key("d:1").unwrap(),
+            Some(key)
+        );
+    }
+
+    /// Two consecutive binds of the same addr mint DIFFERENT keys (fresh
+    /// CSPRNG every time — never a cached/reused value).
+    #[test]
+    fn bind_fresh_daemon_always_mints_a_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard =
+            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
+
+        let (k1, _) = bind_fresh_daemon("d:1").unwrap();
+        let (k2, _) = bind_fresh_daemon("d:1").unwrap();
+        assert_ne!(k1, k2, "each bind must mint a fresh key");
     }
 
     // ── record_unlock_key tests ────────────────────────────────────
