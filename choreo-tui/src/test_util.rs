@@ -4,6 +4,13 @@ use choreo_proto::Turn;
 /// Create an `App` for testing.
 pub fn test_app() -> App {
     let mut app = App::new();
+    // The test harness represents a connected TUI whose daemon has confirmed
+    // the keystore is UNLOCKED (the real app latches this from the daemon's
+    // lock-state broadcasts / subscribe-time push; a fresh `App::new` assumes
+    // locked). Setting it unlocked here keeps the many prompt-submission,
+    // draft-clear and scroll-to-bottom tests behaving as before, while the
+    // dedicated lock-state tests set `keystore_locked` explicitly.
+    app.keystore_locked = false;
     // Set up a default active session so tests can access SessionDisplayState.
     // `0` is a HARNESS-ONLY display anchor: the daemon never assigns session
     // id 0 (ids start at 1, and `None` — not `0` — marks "no origin session"

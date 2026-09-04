@@ -759,6 +759,17 @@ key and implicitly unlocks on a valid blob.
   blob it cannot test-decrypt with its bound key.
 - `/lock` destroys all in-memory credentials and returns the daemon to the
   locked state.
+- **Lock state is broadcast to every client.** The daemon tracks an
+  authoritative `locked` state and broadcasts the current state to all activity
+  subscribers on every transition (`Unlocked` after a successful unlock or
+  `AddCredential` implicit unlock; `Locked` on `/lock`), and pushes it to each
+  freshly-connecting client at subscribe time. The TUI latches this into a
+  persistent `keystore_locked` flag that drives a status-bar banner
+  (`🔒 keystore locked`) which survives every keypress, shows the locked state
+  at startup, reject prompts to a locked daemon with clear "daemon is locked —
+  unlock it first" feedback instead of silent failure, and suppresses the
+  `X / ?` context readout while credentials are not loaded. So one client
+  unlocking (or locking) updates every other connected UI immediately.
 - The unlock key is zeroized after use; lock/unlock does not interrupt session
   browsing — credentials are only needed at prompt time.
 - Remote connections (over TCP) use the Noise IK handshake with X25519 key

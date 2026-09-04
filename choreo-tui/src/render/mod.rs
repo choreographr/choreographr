@@ -38,6 +38,13 @@ use self::session_manager::render_session_manager;
 
 pub(crate) const BG_SHADE: Color = Color::Rgb(53, 53, 53);
 
+/// The persistent status-bar banner shown while the daemon's credential
+/// keystore is locked (see `App::keystore_locked`). Small and non-intrusive:
+/// a lock marker that leads the status bar until the daemon reports unlocked.
+/// The fuller how-to-unlock guidance ("/unlock <passphrase> or /add-key")
+/// appears in the startup status and the submit-time prompt rejection.
+pub(crate) const KEYS_LOCKED_MARKER: &str = "🔒 keystore locked";
+
 pub(crate) fn mouse_in_history_box(column: u16, row: u16, vp_width: u16, vp_height: u16) -> bool {
     column < vp_width && row < vp_height
 }
@@ -339,7 +346,22 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     // ── Status bar (single line) ───────────────────────────────
     let has_session = app.attached_session_id.is_some();
 
-    let status_line = if has_session {
+    let mut spans: Vec<Span> = Vec::new();
+    // PERSISTENT lock banner: when the daemon's keystore is locked, lead the
+    // status bar with a lock marker. Driven directly by the latched
+    // `keystore_locked` flag (set by the daemon's lock-state broadcasts and
+    // the subscribe-time push in `handle_daemon_message`), so it is NOT
+    // cleared by the per-keypress transient status/error clear — the lock
+    // indication survives every keystroke until the daemon reports unlocked.
+    if app.keystore_locked {
+        spans.push(Span::styled(
+            KEYS_LOCKED_MARKER,
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::raw(" | "));
+    }
+
+    if has_session {
         // Session-identity values (wd, provider, model, reasoning) — stable
         // across the session — go first (left side) so the bar's leading edge
         // stays fixed.  Runtime metrics (tokens, context fill) follow on the
@@ -363,28 +385,38 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             Some(usage) => status_token_readout(usage),
             None => String::new(),
         };
-        let context = match (
-            app.active_display_ref().and_then(|d| d.context_window),
-            app.active_display_ref().and_then(|d| d.last_prompt_tokens),
-        ) {
-            (Some(limit), Some(current)) => {
-                let ratio = if limit > 0 {
-                    current as f64 / limit as f64
-                } else {
-                    0.0
-                };
-                format!(
-                    "{} / {} ({})",
-                    humfmt::number(current),
-                    humfmt::number(limit),
-                    humfmt::percent(ratio),
-                )
+        // `?` cleanup: while the keystore is locked the context window is not
+        // loaded into memory (credentials are undecrypted), so `last_prompt_tokens`
+        // being `Some` alongside a `None` context_window would render a
+        // misleading `X / ?`. Render NO context readout at all when locked — the
+        // lock banner already reports the state, and there is no sensibly
+        // interpretable fill percentage.
+        let context = if app.keystore_locked {
+            String::new()
+        } else {
+            match (
+                app.active_display_ref().and_then(|d| d.context_window),
+                app.active_display_ref().and_then(|d| d.last_prompt_tokens),
+            ) {
+                (Some(limit), Some(current)) => {
+                    let ratio = if limit > 0 {
+                        current as f64 / limit as f64
+                    } else {
+                        0.0
+                    };
+                    format!(
+                        "{} / {} ({})",
+                        humfmt::number(current),
+                        humfmt::number(limit),
+                        humfmt::percent(ratio),
+                    )
+                }
+                (Some(limit), None) => {
+                    format!("0 / {} ({})", humfmt::number(limit), humfmt::percent(0.0))
+                }
+                (None, Some(current)) => format!("{} / ?", humfmt::number(current)),
+                (None, None) => String::new(),
             }
-            (Some(limit), None) => {
-                format!("0 / {} ({})", humfmt::number(limit), humfmt::percent(0.0))
-            }
-            (None, Some(current)) => format!("{} / ?", humfmt::number(current)),
-            (None, None) => String::new(),
         };
 
         // Tool groups can change at runtime via load_tools/unload_tools.
@@ -395,16 +427,14 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         // disappear; tools in the middle; runtime metrics (tokens, context
         // window fill, active status) on the right.
         // ── Session identity (always present, default to "-") ──
-        let mut spans: Vec<Span> = vec![
-            Span::raw(" "),
-            Span::styled(wd, Style::default().fg(Color::White)),
-            Span::raw(" | "),
-            Span::styled(provider, Style::default().fg(Color::White)),
-            Span::raw(" | "),
-            Span::styled(model, Style::default().fg(Color::White)),
-            Span::raw(" | "),
-            Span::styled(reasoning, Style::default().fg(Color::White)),
-        ];
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(wd, Style::default().fg(Color::White)));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(provider, Style::default().fg(Color::White)));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(model, Style::default().fg(Color::White)));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(reasoning, Style::default().fg(Color::White)));
 
         // ── Tool groups (conditionally present) ──
         if !tool_groups.is_empty() {
@@ -429,12 +459,9 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(label, Style::default().fg(color)));
         }
+    }
 
-        Line::from(spans)
-    } else {
-        Line::from("")
-    };
-    let status_bar = Paragraph::new(status_line).style(Style::default().bg(Color::Reset));
+    let status_bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Reset));
     frame.render_widget(status_bar, status_bar_area);
 }
 

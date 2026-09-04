@@ -67,6 +67,8 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         providers: HashMap::new(),
         credentials: HashMap::new(),
         x_credentials: None,
+        // Test daemons start locked, matching the production daemon.
+        locked: true,
         db,
         tool_registry,
         daemon_tx,

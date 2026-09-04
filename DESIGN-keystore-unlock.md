@@ -49,12 +49,17 @@ This document is the confirmed design. All implementation must follow it.
         `CHOREOGRAPHR_KEYSTORE_PASSPHRASE` (migration for existing local setups —
         the daemon adopts it on first unlock, all existing blobs keep decrypting);
      3. (AddCredential only) generate a FRESH random 32-byte key.
-   - **Recording**: after the daemon CONFIRMS success (`Unlocked` reply or
-     `CredentialAdded` reply), the client persists the key it used into the
-     known_servers entry for that addr (`set_unlock_key`), replacing any legacy
-     value. When the recorded key came from the legacy fallback, the client ALSO
-     deletes `identity.pk` and `identity.pk.enc` (migration complete). Record only
-     on confirmed success — never on send.
+   - **Recording**: normally the client persists the key ONLY after the daemon
+     CONFIRMS success (`Unlocked` / `CredentialAdded` reply) — replacing any
+     legacy value and, when it came from the legacy fallback, deleting
+     `identity.pk` / `identity.pk.enc`. The one exception is a FRESH key minted at
+     step 3: it is OPTIMISTICALLY recorded immediately, because a fresh key is
+     adopted TOFU by an unbound daemon and a LOST confirmation would otherwise
+     strand the client with no way to recover the binding. That optimistic record
+     is PROVISIONAL: a daemon rejection (`LockedError` / `CredentialAddFailed`)
+     reverts it via `clear_unlock_key` so an already-bound keystore is never
+     poisoned by a key it refused. (Similarly, `known_servers.pin` preserves any
+     stored unlock key on a re-pin — the two fields are independent.)
    - Blob encryption: client derives the public key from the unlock key locally
      (`x25519_dalek::PublicKey::from(&StaticSecret::from(key))`) and encrypts the
      serialized credential with `encrypt_with_public_key(&derived_pub, &plaintext)`.
@@ -81,7 +86,7 @@ Unix-socket connections have no pinned transport key. Their known_servers entry
 `pubkey = None` (see below) — the entry exists purely to carry the unlock key.
 The IK/pin lookup path (`KnownServers::lookup`) is only called for TCP; make
 `pubkey` an `Option<String>` so unix entries are representable:
-- `KnownServerEntry { addr, pubkey: Option<String>, unlock_key: Option<String>, first_seen_unix }`
+- `KnownServerEntry { addr, pubkey: Option<String>, unlock_key: Option<String> }`
 - `parse_store`: entries with a `pubkey` that fails to decode to 32 bytes are
   still dropped; entries with NO pubkey are kept (unix-socket unlock-key carriers).
 - `lookup(addr)`: entry with `Some(valid pk)` decodes as today; `None` pubkey
@@ -156,3 +161,31 @@ The IK/pin lookup path (`KnownServers::lookup`) is only called for TCP; make
 - After each crate change run: `cargo nextest run -p <crate>` (NOT the
   `cargo test-*` aliases, which are workspace-wide).
 - Refactor opportunistically where the change touches existing structure.
+
+## Follow-up: keystore-lock awareness (persistent client banner)
+
+Confirmed design addition (implemented): clients must know whether the daemon's
+keystore is locked. The daemon tracks an authoritative `DaemonState.locked: bool`
+(starts `true`; `false` after a successful Unlock or AddCredential implicit
+unlock — cleared once, in the shared `unlock_tail`; `true` again on `/lock`,
+which clears in-memory credentials/providers), broadcasts the current state to
+ALL activity subscribers on every real transition (`DaemonMessage::Unlocked` /
+`DaemonMessage::Locked` — the existing flat variants, no proto schema/profile
+churn — via `handle_broadcast_activity`), and pushes the CURRENT state to each
+freshly-connecting activity subscriber at subscribe time (alongside the existing
+send-on-subscribe `CatalogUpdated`), so a client that connects to an
+already-locked daemon learns so without waiting for a transition. The acting
+client keeps its existing `send_to_writer` per-action reply; receiving the
+broadcast too is idempotent.
+
+Client-side (`choreo-tui`): `App::keystore_locked` latches `false` on
+`Unlocked`, `true` on `Locked`/`LockedError` (in `handle_daemon_message`),
+defaults to `true` (assume locked until told otherwise), and is NOT cleared by
+the per-keypress transient status/error clear — so it drives a PERSISTENT
+status-bar banner (`🔒 keystore locked`) until the daemon reports unlocked.
+Startup sets a "daemon is locked — use /unlock …" status when no unlock key
+resolves; submitting a `RunInput` to a locked daemon is rejected client-side
+with a clear "daemon is locked — unlock it first" status instead of sending a
+message that would silently fail (`/lock` re-latches the banner via the
+`Locked` broadcast). While locked the status-bar context readout is suppressed,
+dropping the misleading `X / ?` (the context window isn't loaded into memory).

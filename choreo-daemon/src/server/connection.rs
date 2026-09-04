@@ -468,6 +468,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             info!("client {}: Unlock", ctx.client_id);
             handle_unlock_sync(ctx, private_key);
         }
+        ClientMessage::Lock => {
+            info!("client {}: Lock", ctx.client_id);
+            handle_lock_sync(ctx);
+        }
         ClientMessage::AddCredential {
             service,
             encrypted_payload,
@@ -1040,6 +1044,25 @@ fn handle_unlock_sync(ctx: &mut ClientCtx, private_key: Vec<u8>) {
             send_to_writer(ctx, DaemonMessage::LockedError { error: e });
         }
         Err(_) => warn!("daemon disconnected while handling unlock"),
+    }
+}
+
+/// Reply to a `ClientMessage::Lock` (`/lock`): the daemon clears its
+/// in-memory credentials, flips to the locked state, and broadcasts `Locked`
+/// to every activity subscriber. This per-action reply confirms the wipe to
+/// the acting client directly; the transition broadcast reaches it too (it
+/// is an activity subscriber), harmlessly idempotent — the TUI latches
+/// `keystore_locked` either way.
+fn handle_lock_sync(ctx: &mut ClientCtx) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::Lock { reply });
+    match result {
+        Ok(Ok(())) => {
+            send_to_writer(ctx, DaemonMessage::Locked);
+        }
+        Ok(Err(e)) => {
+            send_to_writer(ctx, DaemonMessage::LockedError { error: e });
+        }
+        Err(_) => warn!("daemon disconnected while handling lock"),
     }
 }
 
@@ -1667,6 +1690,62 @@ mod tests {
         drop(daemon_rx);
         handle_unlock_sync(&mut ctx, vec![0u8; 32]);
         assert!(writer_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn handle_lock_sync_ok_replies_locked() {
+        // `/lock` (ClientMessage::Lock) routes a Lock command and, on success,
+        // replies `Locked` to the acting client; the daemon separately
+        // broadcasts `Locked` to every activity subscriber (the acting client
+        // included, harmlessly idempotent).
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer: &sink,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            is_unix: true,
+        };
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::Lock { reply }) = daemon_rx.recv() {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        handle_lock_sync(&mut ctx);
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(msg, DaemonMessage::Locked));
+    }
+
+    #[test]
+    fn handle_lock_sync_err_replies_locked_error() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer: &sink,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            is_unix: true,
+        };
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::Lock { reply }) = daemon_rx.recv() {
+                let _ = reply.send(Err("cannot lock".into()));
+            }
+        });
+        handle_lock_sync(&mut ctx);
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(msg, DaemonMessage::LockedError { .. }));
     }
 
     #[test]

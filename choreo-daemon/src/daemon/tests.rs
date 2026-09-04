@@ -25,6 +25,8 @@ fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
         providers: HashMap::new(),
         credentials: HashMap::new(),
         x_credentials: None,
+        // Test states start locked, matching the production daemon.
+        locked: true,
         db,
         tool_registry,
         daemon_tx,
@@ -471,13 +473,10 @@ fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribe
         client_id: 2,
         writer: tx2,
     });
-    // Drain the send-on-subscribe CatalogUpdated so only the status change
-    // (or its absence) is observed below.
-    let sent = rx2.recv().unwrap();
-    assert!(
-        matches!(&sent, DaemonMessage::CatalogUpdated { providers } if !providers.is_empty()),
-        "expected the send-on-subscribe CatalogUpdated, got {sent:?}"
-    );
+    // Drain the send-on-subscribe messages so only the status change (or
+    // its absence) is observed below: activity registration pushes the
+    // provider list then the keystore lock state.
+    drain_send_on_subscribe(&rx2);
 
     // Client 3: plain summary subscriber, not attached, not activity — the
     // summary fan-out is its ONLY delivery path.
@@ -1426,15 +1425,22 @@ fn handle_unload_tools_nonexistent_session_replies_error() {
 
 // ── Activity subscriber tests ───────────────────────────────────────
 
-/// Drain the send-on-subscribe `CatalogUpdated` that registering an
-/// activity subscriber delivers to the fresh client, so tests can assert
-/// on the messages that follow registration.
+/// Drain the send-on-subscribe messages that registering an activity
+/// subscriber delivers to the fresh client, so tests can assert on the
+/// messages that follow registration. Registration pushes TWO flat control
+/// messages in order: the current provider list (`CatalogUpdated`) and the
+/// current keystore lock state (`Locked`/`Unlocked`). Both are drained and
+/// asserted so a later `recv`/`try_recv` sees only post-registration traffic.
 fn drain_send_on_subscribe(rx: &crossbeam_channel::Receiver<DaemonMessage>) {
     let msg = rx.recv().unwrap();
     assert!(
         matches!(&msg, DaemonMessage::CatalogUpdated { providers } if !providers.is_empty()),
         "expected the send-on-subscribe CatalogUpdated, got {msg:?}",
     );
+    match rx.recv().unwrap() {
+        DaemonMessage::Locked | DaemonMessage::Unlocked => {}
+        other => panic!("expected the send-on-subscribe lock state, got {other:?}"),
+    }
 }
 
 // ── AclAdd (the /acl add enrollment path) ──────────────────────────────────
@@ -2659,6 +2665,135 @@ fn activity_subscriber_gets_current_provider_list_on_register() {
         }
         other => panic!("expected CatalogUpdated, got {other:?}"),
     }
+}
+
+// ── Keystore lock-state broadcast (persistent TUI banner) ────────────────
+
+#[test]
+fn activity_subscriber_gets_current_lock_state_on_register() {
+    // A freshly-subscribed client must receive the CURRENT keystore lock
+    // state immediately (send-on-subscribe Locked/Unlocked) so it can show
+    // the startup lock banner without waiting for the next lock-state
+    // *transition* — a client connecting to an already-locked daemon has no
+    // other reason to latch `locked`.
+    let (mut state, _rx) = make_daemon_state();
+    let (writer_tx, writer_rx) = test_sink();
+
+    // Test state starts locked → the subscribe push is `Locked`.
+    state.handle_register_activity_subscriber(1, writer_tx);
+    let msg = writer_rx.recv().unwrap(); // CatalogUpdated
+    assert!(matches!(&msg, DaemonMessage::CatalogUpdated { .. }));
+    match writer_rx.recv().unwrap() {
+        DaemonMessage::Locked => {}
+        other => panic!("expected subscribe-time Locked, got {other:?}"),
+    }
+
+    // After unlocking, a fresh subscriber is told `Unlocked`.
+    state.locked = false;
+    let (writer_tx2, writer_rx2) = test_sink();
+    state.handle_register_activity_subscriber(2, writer_tx2);
+    let _ = writer_rx2.recv().unwrap(); // CatalogUpdated
+    match writer_rx2.recv().unwrap() {
+        DaemonMessage::Unlocked => {}
+        other => panic!("expected subscribe-time Unlocked, got {other:?}"),
+    }
+}
+
+#[test]
+fn broadcast_lock_state_sends_current_state_to_all_activity_subscribers() {
+    // The transition helper fans the CURRENT lock state out to every activity
+    // subscriber on a locked→unlocked (Unlock / AddCredential) or
+    // unlocked→locked (/lock) transition, so client B's unlock re-latches
+    // client A's banner.
+    let (mut state, _rx) = make_daemon_state();
+    let (writer_a, rx_a) = test_sink();
+    let (writer_b, rx_b) = test_sink();
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 1,
+        writer: writer_a,
+    });
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 2,
+        writer: writer_b,
+    });
+    drain_send_on_subscribe(&rx_a);
+    drain_send_on_subscribe(&rx_b);
+
+    // Both clients are notified of the transitioned state.
+    state.locked = false;
+    state.broadcast_lock_state();
+    assert!(matches!(rx_a.recv().unwrap(), DaemonMessage::Unlocked));
+    assert!(matches!(rx_b.recv().unwrap(), DaemonMessage::Unlocked));
+
+    state.locked = true;
+    state.broadcast_lock_state();
+    assert!(matches!(rx_a.recv().unwrap(), DaemonMessage::Locked));
+    assert!(matches!(rx_b.recv().unwrap(), DaemonMessage::Locked));
+}
+
+#[test]
+fn handle_lock_clears_credentials_latches_locked_and_broadcasts() {
+    let (mut state, _rx) = make_daemon_state();
+    let (writer, writer_rx) = test_sink();
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 1,
+        writer,
+    });
+    drain_send_on_subscribe(&writer_rx);
+
+    // Simulate an unlocked daemon holding decrypted credentials + providers.
+    state.locked = false;
+    state.credentials.insert(
+        "openai".to_string(),
+        ServiceCredential::ApiKey {
+            key: "sk-secret".to_string(),
+        },
+    );
+    state
+        .providers
+        .insert("openai".to_string(), make_test_provider());
+    state.x_credentials = Some(ServiceCredential::ApiKey {
+        key: "x-secret".to_string(),
+    });
+
+    let (reply, reply_rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::Lock { reply });
+
+    // The wipe is confirmed, the state is latched locked, and the cleartext
+    // credentials (and their providers) are gone from memory.
+    assert!(reply_rx.recv().unwrap().is_ok());
+    assert!(state.locked, "/lock must latch the locked state");
+    assert!(state.credentials.is_empty(), "credentials cleared");
+    assert!(state.providers.is_empty(), "providers cleared");
+    assert!(state.x_credentials.is_none(), "x credential cleared");
+    // The transition was broadcast to every activity subscriber.
+    match writer_rx.recv().unwrap() {
+        DaemonMessage::Locked => {}
+        other => panic!("expected Locked transition broadcast, got {other:?}"),
+    }
+}
+
+#[test]
+fn handle_lock_when_already_locked_does_not_rebroadcast() {
+    // Locking an already-locked daemon is a no-op transition: no spammy
+    // repeat broadcast (the TUI banner is already latched).
+    let (mut state, _rx) = make_daemon_state();
+    let (writer, writer_rx) = test_sink();
+    state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+        client_id: 1,
+        writer,
+    });
+    drain_send_on_subscribe(&writer_rx);
+
+    let (reply, reply_rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::Lock { reply });
+
+    assert!(reply_rx.recv().unwrap().is_ok());
+    assert!(state.locked);
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "locking an already-locked daemon must not re-broadcast the Locked state"
+    );
 }
 
 // ── Background model prefetch ────────────────────────────────────────────

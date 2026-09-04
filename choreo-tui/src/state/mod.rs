@@ -353,6 +353,15 @@ pub(crate) struct App {
     pub(crate) attached_provider_slug: Option<String>,
     pub(crate) attached_status: Option<SessionStatus>,
     pub(crate) attached_tool_groups: Vec<String>,
+    /// Persistent latch of whether the daemon's credential keystore is locked.
+    /// Latched from the daemon's lock-state broadcasts (`Locked`/`Unlocked`)
+    /// and the subscribe-time lock-state push in `handle_daemon_message`;
+    /// drives the persistent lock banner and the submit-time prompt guard.
+    /// Defaults to `true` (assume locked until told otherwise — the safest
+    /// reading for a client that has not yet heard the daemon's state). Not
+    /// cleared by the per-keypress transient status/error clear, so the lock
+    /// indication survives every keystroke.
+    pub(crate) keystore_locked: bool,
     pub(crate) page: Page,
     pub(crate) show_ctrl_help: bool,
     /// Whether the terminal implemented the kitty keyboard protocol we push
@@ -511,6 +520,9 @@ impl App {
             attached_provider_slug: None,
             attached_status: None,
             attached_tool_groups: Vec::new(),
+            // Assume locked until the daemon tells us otherwise (via the
+            // subscribe-time lock-state push or a transition broadcast).
+            keystore_locked: true,
             page: Page::Chat,
             show_ctrl_help: true,
             keyboard_enhanced: true,

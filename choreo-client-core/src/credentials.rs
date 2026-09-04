@@ -1,6 +1,7 @@
 use choreo_keystore::ServiceCredential;
 use choreo_proto::ClientMessage;
 use tracing::{debug, info, warn};
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 use crate::error::ClientError;
@@ -25,7 +26,7 @@ pub fn resolve_private_key(method: &UnlockMethod, addr: &str) -> Result<Vec<u8>,
             // migrated (the daemon adopts the legacy key on first unlock,
             // after which `record_unlock_key` stores it per-addr).
             if let Some(key) = stored_unlock_key(addr) {
-                return Ok(key);
+                return Ok(key.to_vec());
             }
             read_raw_private_key()
         }
@@ -64,12 +65,12 @@ fn read_encrypted_private_key(passphrase: &str) -> Result<Vec<u8>, ClientError> 
 /// Internal helper: failures to LOAD the store or DECODE a stored key are
 /// non-fatal for the resolution chain (we just fall through to the legacy
 /// path), so they are swallowed with a warning here rather than propagated.
-fn stored_unlock_key(addr: &str) -> Option<Vec<u8>> {
+fn stored_unlock_key(addr: &str) -> Option<[u8; 32]> {
     match KnownServers::load() {
         Ok(store) => match store.unlock_key(addr) {
             Ok(Some(key)) => {
                 info!(addr, "using stored per-daemon unlock key");
-                Some(key.to_vec())
+                Some(key)
             }
             Ok(None) => None,
             Err(e) => {
@@ -126,7 +127,7 @@ fn legacy_auto_unlock_key() -> Option<Vec<u8>> {
 /// without unlocking.  Only inference (RunInput) requires credentials.
 pub fn try_auto_unlock_key(addr: &str) -> Option<Vec<u8>> {
     if let Some(key) = stored_unlock_key(addr) {
-        return Some(key);
+        return Some(key.to_vec());
     }
     let legacy = legacy_auto_unlock_key();
     if legacy.is_none() {
@@ -303,20 +304,63 @@ fn parse_credential(
     }
 }
 
-use x25519_dalek::{PublicKey, StaticSecret};
+/// Resolve the per-daemon keystore unlock key for `addr`.
+///
+/// Order (per-daemon TOFU design, DESIGN-keystore-unlock.md):
+/// 1. the stored per-daemon key in the known_servers entry for `addr`,
+/// 2. the LEGACY local key (`identity.pk` / `identity.pk.enc` + env
+///    passphrase) — the one-time migration source,
+/// 3. failing both, a FRESH random key — and it is OPTIMISTICALLY recorded in
+///    known_servers for `addr` immediately.
+///
+/// The optimistic fresh record closes the lost-confirmation orphan (bug 2 of
+/// the design review): a fresh key is adopted TOFU by an unbound daemon, so if
+/// the `CredentialAdded` reply is lost the key must already be on disk or the
+/// next connect would mint a DIFFERENT fresh key and be locked out of the now-
+/// bound keystore. If the daemon turns out to be ALREADY bound it rejects the
+/// fresh key, and the caller reverts the optimistic record via
+/// [`clear_unlock_key`] on that rejection, so a poison key is never left in
+/// the store.
+fn resolve_keystore_key(addr: &str) -> Result<[u8; 32], ClientError> {
+    if let Some(key) = stored_unlock_key(addr) {
+        return Ok(key);
+    }
+    if let Some(key) = legacy_auto_unlock_key() {
+        return key.try_into().map_err(|_| ClientError::PrivateKeyInvalid);
+    }
+    let fresh: [u8; 32] = rand::random();
+    info!(
+        addr,
+        "no stored or legacy unlock key; generated fresh random key for daemon (TOFU adopt on first use)"
+    );
+    // Best-effort persist so an interrupted confirmation cannot orphan the
+    // binding. A store we cannot write is not worth failing the add over: the
+    // caller records the key again on confirmed success anyway.
+    if let Err(e) = KnownServers::load().and_then(|mut s| s.set_unlock_key(addr, &fresh)) {
+        warn!(
+            addr,
+            error = %e,
+            "could not optimistically record fresh unlock key; it will be recorded on daemon confirmation"
+        );
+    }
+    Ok(fresh)
+}
 
-/// Build an `AddCredential` message by resolving the daemon's unlock key,
-/// constructing the credential from the given type and fields, serialising,
-/// and encrypting with the public key derived from that key.
-///
-/// Returns the message AND the unlock key used, so the caller can call
-/// [`record_unlock_key`] once the daemon CONFIRMS success (`CredentialAdded`
-/// reply) — never on send.
-///
-/// Key resolution order: the stored per-daemon unlock key for `addr`
-/// (known_servers), then the legacy local key (`identity.pk` /
-/// `identity.pk.enc` + env passphrase), then a FRESH random 32-byte key
-/// (first contact with a brand-new daemon — the daemon adopts it TOFU).
+/// Drop the stored per-daemon unlock key for `addr` (keeps any transport
+/// pin). Call this when the daemon REJECTS a presented key (a `LockedError`
+/// or `CredentialAddFailed` reply) so the next resolution re-derives from the
+/// legacy files instead of replaying a key the daemon refused — in particular
+/// it un-poisons the optimistic fresh record [`resolve_keystore_key`] makes
+/// against an already-bound daemon. Returns whether the store changed.
+pub fn clear_unlock_key(addr: &str) -> Result<bool, ClientError> {
+    KnownServers::load()?.clear_unlock_key(addr)
+}
+
+/// Build an `AddCredential` message from typed field strings: parse the
+/// credential, then delegate to the shared builder (see
+/// [`build_add_credential_from_credential`] for the full key-resolution and
+/// encryption semantics). The caller-supplied field strings (which may hold a
+/// secret, e.g. the API key) are zeroized once parsing has consumed them.
 pub fn build_add_credential_message(
     addr: &str,
     service: String,
@@ -340,22 +384,19 @@ pub fn build_add_credential_message(
     result
 }
 
-/// Build an `AddCredential` message from an already-parsed credential by
-/// resolving the daemon's unlock key and encrypting the blob to the public
-/// key derived from it.
+/// Build an `AddCredential` message from an already-parsed credential, by
+/// resolving the daemon's unlock key and encrypting the serialized blob to the
+/// public key derived from that key.
 ///
 /// Returns the message AND the unlock key used, so the caller can call
-/// [`record_unlock_key`] once the daemon CONFIRMS success (`CredentialAdded`
-/// reply) — never on send.
+/// [`record_unlock_key`] once the daemon CONFIRMS success (`CredentialAdded` /
+/// `Unlocked` reply) — never on send. (A freshly minted key is additionally
+/// optimistic-recorded inside [`resolve_keystore_key`], so a lost confirmation
+/// cannot orphan it; treat that record as provisional until the daemon
+/// confirms, and revert it via [`clear_unlock_key`] if the daemon rejects.)
 ///
-/// Key resolution order: the stored per-daemon unlock key for `addr`
-/// (known_servers), then the legacy local key (`identity.pk` /
-/// `identity.pk.enc` + env passphrase), then a FRESH random 32-byte key
-/// (first contact with a brand-new daemon — the daemon adopts it TOFU). This
-/// variants takes the credential directly so paths that build a credential
-/// programmatically (e.g. the TUI's Substrate keystore import, where the
-/// password is client-only) share the identical resolve/encrypt/zeroize logic
-/// with the field-based builder.
+/// The caller must call [`record_unlock_key`] on confirmed success or the next
+/// add could mint a key the now-bound daemon rejects.
 pub fn build_add_credential_from_credential(
     addr: &str,
     service: String,
@@ -365,22 +406,7 @@ pub fn build_add_credential_from_credential(
         addr,
         service, "building add credential message from parsed credential"
     );
-    // Resolution order per the per-daemon keystore design: stored key,
-    // legacy fallback, then generate fresh. A fresh key is correct because
-    // the daemon ADOPTS the first presented key (TOFU) — but the caller
-    // must record it on confirmed success or the next add would mint a
-    // key the daemon now rejects.
-    let unlock_key: [u8; 32] = if let Some(key) = stored_unlock_key(addr) {
-        key.try_into().map_err(|_| ClientError::PrivateKeyInvalid)?
-    } else if let Some(key) = legacy_auto_unlock_key() {
-        key.try_into().map_err(|_| ClientError::PrivateKeyInvalid)?
-    } else {
-        info!(
-            addr,
-            "no stored or legacy unlock key; generating fresh random key for daemon (TOFU adopt on first use)"
-        );
-        rand::random()
-    };
+    let mut unlock_key = resolve_keystore_key(addr)?;
     let derived_pub = PublicKey::from(&StaticSecret::from(unlock_key));
 
     let mut plaintext =
@@ -395,14 +421,17 @@ pub fn build_add_credential_from_credential(
     // own stored copy, so this closes the remaining gap on the send path).
     plaintext.zeroize();
 
-    Ok((
-        ClientMessage::AddCredential {
-            service,
-            encrypted_payload,
-            unlock_key: unlock_key.to_vec(),
-        },
-        unlock_key.to_vec(),
-    ))
+    let msg = ClientMessage::AddCredential {
+        service,
+        encrypted_payload,
+        unlock_key: unlock_key.to_vec(),
+    };
+    // Wipe the stack key after building: the two `Vec` copies (in `msg` and
+    // the returned key) are the ones that travel on, and the local array is
+    // then redundant.
+    let result = (msg, unlock_key.to_vec());
+    unlock_key.zeroize();
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -694,6 +723,39 @@ mod tests {
                 .expect("blob must decrypt with the chosen unlock key");
         let cred: ServiceCredential = postcard::from_bytes(&plaintext).unwrap();
         assert!(matches!(cred, ServiceCredential::ApiKey { ref key, .. } if key == "k"));
+    }
+
+    /// Bug-2 regression: a freshly minted key is OPTIMISTICALLY recorded in
+    /// known_servers immediately (so an interrupted `CredentialAdded` reply
+    /// cannot orphan the binding), and `clear_unlock_key` reverts that record
+    /// — which is what the UI does on a daemon rejection so an already-bound
+    /// keystore is never poisoned by a fresh key it refused.
+    #[test]
+    fn fresh_key_is_optimistically_recorded_and_clear_reverts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard =
+            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
+        // Ensure no legacy files exist so resolution must mint a fresh key.
+        assert!(!dir.path().join("choreographr/identity.pk").exists());
+
+        let (msg, key) =
+            build_add_credential_message("d:1", "svc".into(), "api_key".into(), vec!["k".into()])
+                .unwrap();
+        assert_eq!(msg_unlock_key(&msg), key, "message carries the minted key");
+
+        // Optimistic record is on disk before any daemon confirmation.
+        let store = KnownServers::load().unwrap();
+        let recorded: [u8; 32] = store.unlock_key("d:1").unwrap().expect("must be recorded");
+        let key_arr: [u8; 32] = key.as_slice().try_into().unwrap();
+        assert_eq!(recorded, key_arr);
+
+        // The UI clears this provisional record when the daemon rejects it.
+        assert!(clear_unlock_key("d:1").unwrap());
+        assert_eq!(
+            KnownServers::load().unwrap().unlock_key("d:1").unwrap(),
+            None
+        );
     }
 
     // ── record_unlock_key tests ────────────────────────────────────

@@ -328,6 +328,9 @@ pub fn main() -> anyhow::Result<()> {
         providers: HashMap::new(),
         credentials: std::collections::HashMap::new(),
         x_credentials: None,
+        // The daemon starts locked: credentials are only decrypted into memory
+        // once a client presents the valid unlock key.
+        locked: true,
         db,
         tool_registry,
         summary_subscribers: std::collections::HashMap::new(),

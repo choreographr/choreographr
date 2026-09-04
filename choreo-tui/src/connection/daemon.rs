@@ -1,7 +1,9 @@
 use super::{SessionUpdateRouting, route_session_update};
 use crate::state::{App, Page, ProviderInfo, merge_token_usage};
 use crate::terminal_progress;
-use choreo_client_core::{ClientError, dispatch_daemon_message, record_unlock_key};
+use choreo_client_core::{
+    ClientError, clear_unlock_key, dispatch_daemon_message, record_unlock_key,
+};
 use choreo_proto::{ClientMessage, DaemonMessage, RefreshStatus, SessionEvent};
 
 pub(crate) fn handle_daemon_message(
@@ -601,11 +603,38 @@ pub(crate) fn handle_daemon_message(
         }
         // A successful unlock (explicit /unlock or the connect-time
         // auto-unlock) means the daemon ACCEPTED the pending key — record it
-        // per-daemon on confirmed success only. Deliberately no early return:
-        // the generic dispatch below still emits the "keystore unlocked" status.
+        // per-daemon on confirmed success only. Latch the keystore as
+        // UNLOCKED (clears the persistent lock banner). Deliberately no early
+        // return: the generic dispatch below still emits the "keystore
+        // unlocked" status.
         DaemonMessage::Unlocked => {
+            app.keystore_locked = false;
             record_confirmed_unlock_key(app);
         }
+        // The daemon (re-)locked its keystore (/lock) or a freshly-connecting
+        // client latched the subscribe-time lock-state push: set the
+        // persistent lock flag so the banner reappears. An `Unlock` that
+        // auto-locked temporarily is also confirmed here (a failed unlock
+        // does NOT change lock state, so the subscribe-time `Locked` push —
+        // not a transition broadcast — is what a locked daemon sends a fresh
+        // client). No early return: the generic dispatch still prints the
+        // "keystore locked" status.
+        DaemonMessage::Locked => {
+            app.keystore_locked = true;
+        }
+        // The daemon REJECTED the pending unlock key (misbound keystore on an
+        // Unlock or AddCredential). Revert its optimistic per-daemon record and
+        // drop the pending key so the next resolution re-derives from the
+        // legacy files instead of replaying a key the daemon refused — and so a
+        // later, unrelated confirmation cannot attribute this rejection back.
+        // Keep the lock flag latched locked (a rejection means the daemon is
+        // still locked). No early return: the generic dispatch still surfaces
+        // the error text.
+        DaemonMessage::LockedError { .. } => {
+            app.keystore_locked = true;
+            forget_rejected_unlock_key(app);
+        }
+        DaemonMessage::CredentialAddFailed { .. } => forget_rejected_unlock_key(app),
         _ => {}
     }
 
@@ -636,5 +665,123 @@ fn record_confirmed_unlock_key(app: &mut App) {
         Err(e) => {
             app.error = Some(format!("[error] failed to record unlock key: {e}"));
         }
+    }
+}
+
+/// The daemon REJECTED the pending unlock key (binding mismatch on an Unlock
+/// or AddCredential). Revert the optimistic per-daemon record so the next
+/// resolution re-derives from the legacy files instead of replaying a key the
+/// daemon refused — otherwise a freshly minted key the daemon rejected would
+/// poison the store (a fresh key is optimistic-recorded by the credential
+/// builder so a LOST confirmation cannot orphan the binding; reverting here
+/// covers the opposite failure — an APPARENT-but-rejected key). The pending
+/// key is dropped so a later, unrelated confirmation cannot attribute it.
+fn forget_rejected_unlock_key(app: &mut App) {
+    if app.pending_unlock_key.take().is_none() {
+        return;
+    }
+    match clear_unlock_key(&app.connection_addr) {
+        Ok(_) => tracing::info!(
+            addr = %app.connection_addr,
+            "cleared unlock key after daemon rejection; will re-resolve on next attempt"
+        ),
+        Err(e) => tracing::warn!(
+            addr = %app.connection_addr,
+            error = %e,
+            "failed to clear rejected unlock key"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::test_app;
+
+    /// Drive one daemon message through `handle_daemon_message`. The generic
+    /// dispatch's status/error handling needs a sender, but none of the
+    /// lock-state messages send anything, so a disconnected sender works.
+    fn dispatch(message: DaemonMessage, app: &mut App) {
+        let (tx, _rx) = std::sync::mpsc::channel::<ClientMessage>();
+        handle_daemon_message(message, app, &tx).expect("handle_daemon_message");
+    }
+
+    #[test]
+    fn app_defaults_to_keystore_locked() {
+        // Safest default: assume locked until the daemon reports otherwise.
+        assert!(App::new().keystore_locked);
+    }
+
+    #[test]
+    fn unlocked_message_clears_the_lock_flag() {
+        let mut app = App::new(); // fresh App starts locked
+        assert!(app.keystore_locked, "starts locked");
+        dispatch(DaemonMessage::Unlocked, &mut app);
+        assert!(
+            !app.keystore_locked,
+            "Unlocked must clear the persistent lock flag"
+        );
+    }
+
+    #[test]
+    fn locked_message_latches_true_from_unlocked() {
+        let mut app = test_app();
+        app.keystore_locked = false; // simulate an unlocked daemon
+        dispatch(DaemonMessage::Locked, &mut app);
+        assert!(
+            app.keystore_locked,
+            "Locked (transition or subscribe push) must set the flag"
+        );
+    }
+
+    #[test]
+    fn locked_error_latches_true_and_rejects_pending_key() {
+        let mut app = test_app();
+        app.keystore_locked = false;
+        // An unconfirmed key (e.g. the optimistic fresh-key record) is being
+        // rejected: it must be reverted and the lock flag kept latched.
+        app.pending_unlock_key = Some(vec![7u8; 32]);
+        dispatch(
+            DaemonMessage::LockedError {
+                error: "unlock key does not match the keystore binding".into(),
+            },
+            &mut app,
+        );
+        assert!(
+            app.keystore_locked,
+            "a rejected unlock means the daemon is still locked"
+        );
+        // The rejection drops the pending key so a later, unrelated
+        // confirmation cannot attribute it (see forget_rejected_unlock_key).
+        assert!(app.pending_unlock_key.is_none());
+    }
+
+    #[test]
+    fn locked_broadcast_does_not_touch_a_pending_unlock_key() {
+        // A `Locked` broadcast (subscribe-time push or /lock transition) is
+        // NOT a key rejection: it must latch the flag but leave the pending
+        // auto-unlock key alone, so the Unlock reply (Unlocked/LockedError)
+        // — which arrives next on the wire — decides the key's fate.
+        let mut app = test_app();
+        app.keystore_locked = true;
+        let key = vec![9u8; 32];
+        app.pending_unlock_key = Some(key.clone());
+        dispatch(DaemonMessage::Locked, &mut app);
+        assert!(app.keystore_locked);
+        assert_eq!(
+            app.pending_unlock_key,
+            Some(key),
+            "Locked must not drop the pending unlock key"
+        );
+    }
+
+    #[test]
+    fn unlock_then_lock_roundtrip_updates_the_flag() {
+        // A full lock lifecycle: unlock clears the banner, /lock re-latches it.
+        let mut app = test_app();
+        dispatch(DaemonMessage::Unlocked, &mut app);
+        assert!(!app.keystore_locked);
+        dispatch(DaemonMessage::Locked, &mut app);
+        assert!(app.keystore_locked);
     }
 }

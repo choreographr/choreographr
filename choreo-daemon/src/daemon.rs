@@ -60,6 +60,15 @@ pub struct DaemonState {
     pub providers: HashMap<String, InferenceProvider>,
     pub credentials: HashMap<String, ServiceCredential>,
     pub x_credentials: Option<ServiceCredential>,
+    /// Whether the credential keystore is currently locked (no decrypted
+    /// credentials in memory). Starts `true` at daemon startup — the keystore
+    /// is only decrypted into memory once a valid unlock key is presented —
+    /// flips to `false` on a successful Unlock / AddCredential implicit
+    /// unlock, and back to `true` on `/lock`. This is the authoritative
+    /// daemon-side lock state: it is broadcast to all activity subscribers on
+    /// every transition and pushed to each fresh activity subscriber at
+    /// subscribe time, so client UIs latch the real state instead of guessing.
+    pub locked: bool,
     pub db: Arc<redb::Database>,
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
@@ -149,6 +158,16 @@ pub enum DaemonCommand {
     Unlock {
         private_key: Vec<u8>,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    /// Lock the daemon's keystore: clear all decrypted in-memory credentials
+    /// (and their cached providers) and flip `locked` back to `true`. The
+    /// cleartext is wiped from memory; the encrypted blobs stay in the DB.
+    /// Broadcasts the `Locked` state to all activity subscribers so every
+    /// connected client's lock banner reappears. Sessions themselves are
+    /// untouched — they remain browsable, only inference is disabled until the
+    /// next unlock.
+    Lock {
+        reply: mpsc::Sender<Result<(), String>>,
     },
     SaveCredential {
         service: String,
@@ -464,6 +483,7 @@ impl DaemonState {
                 self.handle_session_delete_finalized(session_id)
             }
             DaemonCommand::Unlock { private_key, reply } => self.handle_unlock(private_key, reply),
+            DaemonCommand::Lock { reply } => self.handle_lock(reply),
             DaemonCommand::SaveCredential {
                 service,
                 encrypted_blob,
@@ -1232,9 +1252,53 @@ impl DaemonState {
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     ) {
         info!("Unlock attempt");
+        // Capture the pre-unlock lock state so the transition broadcast below
+        // fires only on a REAL locked→unlocked change (a re-unlock of an
+        // already-unlocked daemon is a no-op for the banner, not a spammy
+        // repeat). `handle_unlock_inner` -> `unlock_tail` clears `locked` on
+        // success.
+        let was_locked = self.locked;
         let result = handle_unlock_inner(self, private_key).map_err(|e| e.to_string());
+        // A successful unlock is a lock-state transition: fan it out to ALL
+        // activity subscribers (not just the acting client, which also gets its
+        // `send_to_writer` `Unlocked` reply) so every connected UI clears its
+        // lock banner — e.g. client B unlocking updates client A's status bar.
+        if result.is_ok() && was_locked {
+            self.broadcast_lock_state();
+        }
         info!("Unlock result: success={}", result.is_ok());
         let _ = reply.send(result);
+    }
+
+    /// Lock the daemon's keystore (`/lock`): clear every decrypted in-memory
+    /// credential and its cached provider, flip `locked` back to `true`, and
+    /// broadcast the `Locked` state to all activity subscribers.
+    ///
+    /// This is intentionally soft/cooperative: sessions are untouched (they
+    /// stay browsable — only inference requires credentials), so locking just
+    /// drops cleartext from memory and re-latches the banner. The encrypted
+    /// blobs remain in the DB and re-decrypt on the next Unlock.
+    fn handle_lock(&mut self, reply: mpsc::Sender<Result<(), String>>) {
+        let was_locked = self.locked;
+        // Wipe decrypted credentials (and their derived providers) from memory
+        // now that the keystore is locked. `credentials` holds the plaintext
+        // ServiceCredentials; dropping them is what "locked" means for this
+        // daemon.
+        self.credentials.clear();
+        self.providers.clear();
+        self.x_credentials = None;
+        self.locked = true;
+        info!(
+            credentials_cleared = 0,
+            "keystore locked: in-memory credentials cleared"
+        );
+        // The acting client gets its `send_to_writer` `Locked` reply from the
+        // connection layer; this transition broadcast reaches every connected
+        // client (the acting one included, harmlessly idempotent).
+        if !was_locked {
+            self.broadcast_lock_state();
+        }
+        let _ = reply.send(Ok(()));
     }
 
     /// Save an encrypted credential blob for a service.
@@ -1252,21 +1316,31 @@ impl DaemonState {
         &mut self,
         service: String,
         encrypted_blob: Vec<u8>,
-        unlock_key: Vec<u8>,
+        mut unlock_key: Vec<u8>,
         reply: mpsc::Sender<Result<(), String>>,
     ) {
+        // Capture the pre-operations lock state so the implicit-unlock
+        // transition broadcast below fires only on a REAL locked→unlocked
+        // change (`unlock_tail` clears `locked` on a successful save tail).
+        let was_locked = self.locked;
         // Reject anything that is not exactly 32 bytes up front: the X25519
         // key derivation (and every crypto helper below) needs [u8; 32], and
         // a shorter/longer key can never be a valid unlock key.
         let mut key: [u8; 32] = match unlock_key.as_slice().try_into() {
             Ok(k) => k,
             Err(_) => {
+                // The rejected bytes are still secret material — wipe them so
+                // a failed add does not leave the key in a freed allocation.
+                unlock_key.zeroize();
                 let _ = reply.send(Err(
                     "invalid unlock_key: expected exactly 32 bytes".to_string()
                 ));
                 return;
             }
         };
+        // Wipe the heap `Vec` copy; only the stack `key` array is used below
+        // and it is zeroized on every exit path.
+        unlock_key.zeroize();
 
         // Adopt-or-verify BEFORE anything is written: a wrong key must not
         // persist a blob the daemon could later read with an attacker's key
@@ -1350,6 +1424,12 @@ impl DaemonState {
             service = %service,
             "AddCredential: persisted, tested, and implicitly unlocked the keystore"
         );
+        // A valid AddCredential to a locked daemon IS a lock-state transition
+        // (implicit unlock): fan out the newly-unlocked state to ALL activity
+        // subscribers so every connected UI clears its lock banner.
+        if was_locked && !self.locked {
+            self.broadcast_lock_state();
+        }
         let _ = reply.send(Ok(()));
     }
 
@@ -2242,18 +2322,31 @@ impl DaemonState {
     }
 }
 
-fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Result<()> {
-    let mut key: [u8; 32] = private_key
-        .as_slice()
-        .try_into()
-        .map_err(|_| io::Error::other("invalid private key: expected 32 bytes"))?;
-    drop(private_key);
+fn handle_unlock_inner(state: &mut DaemonState, mut private_key: Vec<u8>) -> io::Result<()> {
+    let mut key: [u8; 32] = match private_key.as_slice().try_into() {
+        Ok(k) => k,
+        Err(_) => {
+            // The presented bytes are unusable, but still secret material —
+            // wipe the heap copy before returning so a failed unlock does not
+            // leave the key lying in a freed allocation.
+            private_key.zeroize();
+            return Err(io::Error::other("invalid private key: expected 32 bytes"));
+        }
+    };
+    // Wipe the heap `Vec` copy as soon as the stack array exists; only `key`
+    // is used below and it is zeroized on every exit path.
+    private_key.zeroize();
 
     // TOFU adopt-or-verify against the persisted keystore binding. A locked
     // daemon presents its key on every Unlock; once a key is bound, any key
     // whose derived public key differs is REJECTED (surfaces as LockedError)
     // instead of unlocking with wrong credentials.
-    adopt_or_verify_keystore_binding(state, &key)?;
+    if let Err(e) = adopt_or_verify_keystore_binding(state, &key) {
+        // Guard the early return so `key` is wiped even when the binding
+        // rejects this key.
+        key.zeroize();
+        return Err(e);
+    }
 
     // Shared bulk-decrypt + accounts-load + provider-resolve tail — the same
     // code path `AddCredential` runs as its implicit unlock, so the two
@@ -2407,6 +2500,12 @@ pub(crate) fn unlock_tail(state: &mut DaemonState, key: &[u8; 32]) -> io::Result
         "Unlock: providers resolved: {:?}",
         state.providers.keys().collect::<Vec<_>>()
     );
+
+    // The keystore is now fully decrypted into memory (credentials, accounts,
+    // providers): this is the single authoritative unlocked point shared by
+    // the `Unlock` path and the `AddCredential` implicit-unlock path. The
+    // caller methods broadcast `Unlocked` on the locked→unlocked transition.
+    state.locked = false;
 
     Ok(())
 }

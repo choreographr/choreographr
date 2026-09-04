@@ -251,6 +251,11 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
                 break;
             }
             choreo_proto::DaemonMessage::CatalogUpdated { .. } => continue,
+            // The daemon pushes its current lock state to every activity
+            // subscriber on subscribe (like CatalogUpdated) and re-broadcasts
+            // it on any lock-state change, so an unsolicited Locked/Unlocked
+            // can arrive mid-wait — treat it as informational and keep going.
+            choreo_proto::DaemonMessage::Locked | choreo_proto::DaemonMessage::Unlocked => continue,
             other => panic!("expected AclAddResult, got {other:?}"),
         }
     }

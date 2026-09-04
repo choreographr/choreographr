@@ -553,7 +553,7 @@ Used by `choreo-tui`, `choreo-gui`, and `choreo-im`.
 | `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
 | `dispatch.rs` | `TurnEventHandler` trait + `dispatch_daemon_message()` — splits the v4 `DaemonMessage` into its two families before any per-arm work: `dispatch_session_event` (the inner `SessionEvent` of the `Session` envelope, with the origin resolved exactly once; the six None-capable events — `Failed`, `Cancelled`, `ModelSelectionFailed`, `ReasoningEffortSet`/`Failed`, `SessionFailed` — are pre-handled so a `None` origin (connection-level reply with no session) surfaces its status/error instead of being dropped, while every other event hard-requires `Some` via a guard that `warn!`s if a producer ever emits a session-scoped event without an origin) and `dispatch_flat_message` (all 23 flat connection/reply/global variants enumerated explicitly — no wildcard arm — so a new `DaemonMessage` variant must be triaged at compile time, matching the no-`#[non_exhaustive]` wire-contract rule). Used by all UI clients (TUI, GUI, IM bridge) to avoid duplicating the routing logic. |
 | `connection.rs` | Daemon connection helpers: `run_daemon_connection()` (Unix socket), `run_daemon_tcp_connection()` (Noise IK with the wire-v5 mode preamble), `run_daemon_tcp_connection_xx_first_contact()` (Noise XX first contact — the trust gate: the session/writer threads only start after the caller's `on_first_contact` callback approves the server key learned from the handshake, so an `Unlock` can never flow to an unconfirmed server), `probe_server_key()` (XX handshake-ONLY probe: learn the server's static and drop the stream — the building block UIs use to run the fingerprint confirmation synchronously before any TUI/GUI starts), `run_daemon_tcp_connection_pinned()` (IK against the `known_servers.toml` pin; the DIAL is a separate step so a network-down daemon is a plain connect error, and on HANDSHAKE failure the error carries the pinned fingerprint plus the explicit re-pair guidance, so a changed server key is loud — the guidance attaches only to the handshake-failure case, never to a dial failure or a mid-session disconnect), `run_daemon_connection_with_mode()` (dispatch), `run_daemon_reader()` (blocking reader). The IK path's preamble+handshake+serve tail is shared by both TCP modes in `ik_handshake_and_serve`, so they cannot drift. `ConnectionMode` enum (`UnixSocket` | `Tcp` | `TcpPinned`) selects the transport. |
-| `known_servers.rs` | The client's pinned server keys + per-daemon unlock keys — the SSH `known_hosts` analogue extended with the keystore unlock key. `KnownServers` loads `known_servers.toml` (`[[server]]` entries: `addr`, optional base64 `pubkey` (absent for unix-socket unlock-key carriers), optional base64 `unlock_key`, `first_seen_unix`), `lookup(addr)` returns the pinned key for IK connections (pinned-but-changed server keys are the CALLER's hard error), `unlock_key(addr)` / `set_unlock_key(addr, key)` resolve/record the per-daemon keystore unlock key (recorded ONLY on daemon-confirmed success, never on send — a rejected key is not persisted; `set_unlock_key` creates a pubkey-less entry for unix-socket daemons), `pin(addr, pk)` persists the human-confirmed first-contact key, `remove(addr)` is the documented recovery path. Failure policy: tolerant on load (missing/corrupt/garbage file → empty store + warning — the worst case is a re-confirmed XX first contact, never silent trust; entries with a PRESENT-but-invalid pubkey are dropped, entries with no pubkey are kept, a corrupt unlock_key drops just that field) and strict on write (whole-file rewrite under an advisory exclusive file lock, same discipline as `ensure_transport_keypair`). Path resolves through `choreo_keystore::paths::config_dir()` so test overrides agree with the rest of the config family. |
+| `known_servers.rs` | The client's pinned server keys + per-daemon unlock keys — the SSH `known_hosts` analogue extended with the keystore unlock key. `KnownServers` loads `known_servers.toml` (`[[server]]` entries: `addr`, optional base64 `pubkey` (absent for unix-socket unlock-key carriers), optional base64 `unlock_key`), `lookup(addr)` returns the pinned key for IK connections (pinned-but-changed server keys are the CALLER's hard error), `unlock_key(addr)` / `set_unlock_key(addr, key)` / `clear_unlock_key(addr)` resolve/record/revert the per-daemon keystore unlock key (recorded on daemon-confirmed success, never on send — except a FRESH key which is optimistically recorded to survive a lost confirmation, then reverted by `clear_unlock_key` on a daemon rejection so a rejected key is never left in the store; `set_unlock_key` creates a pubkey-less entry for unix-socket daemons, `clear_unlock_key` keeps any transport pin but drops a pubkey-less carrier), `pin(addr, pk)` persists the human-confirmed first-contact key (preserving any stored unlock key on a re-pin — the two fields are independent), `remove(addr)` is the documented recovery path. Failure policy: tolerant on load (missing/corrupt/garbage file → empty store + warning — the worst case is a re-confirmed XX first contact, never silent trust; entries with a PRESENT-but-invalid pubkey are dropped, entries with no pubkey are kept, a corrupt unlock_key drops just that field) and strict on write (whole-file rewrite under an advisory exclusive file lock, same discipline as `ensure_transport_keypair`). Path resolves through `choreo_keystore::paths::config_dir()` so test overrides agree with the rest of the config family. |
 
 `TurnEventHandler` is the `choreo-client-core` dispatch sink; the `ClientError` type used by the connection layer is a thiserror enum — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `PrivateKeyEncRead`, `PrivateKeyDecrypt`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Postcard`, `Encryption`.
 
@@ -1364,6 +1364,25 @@ while !app.should_quit:
      attached session, or clear/indeterminate if no data)
 ```
 
+**Keystore-lock awareness (persistent banner).** The TUI latches the daemon's
+keystore locked state in `App::keystore_locked`, defaulting to `true` (assume
+locked until told otherwise). It is latched from the daemon's lock-state
+transition broadcasts and the subscribe-time push (`Unlocked` → `false`;
+`Locked`/`LockedError` → `true`) in `connection/daemon.rs`
+(`handle_daemon_message`), and — unlike the transient `status`/`error` lines a
+keypress clears — it is NOT reset by the per-keypress clear, so it drives a
+PERSISTENT status-bar banner (`🔒 keystore locked`, `render/mod.rs`) that
+survives every keystroke until the daemon reports unlocked, and makes client
+B's unlock update client A's banner. Startup surfaces the locked state
+(`run_app` sets a "daemon is locked — use /unlock …" status when no unlock key
+resolves and the auto-unlock is skipped). Submitting a prompt (`RunInput`) to
+a locked daemon is rejected CLIENT-SIDE with a clear "daemon is locked —
+unlock it first" status instead of sending a message that would silently fail
+at inference time (the client-driven guard beats waiting for a transient
+`Failed`); while locked the status-bar context readout is suppressed (no
+misleading `X / ?` fill when the context window isn't loaded), and `/lock`
+(re-)latches the banner via a `Locked` broadcast.
+
 **Module breakdown:**
 
 | Module | Purpose |
@@ -1477,6 +1496,19 @@ startup                    /unlock [passphrase]     AddCredential{... unlock_key
   bound key and refuses to persist one that does not decrypt (one key per keystore).
 - The unlock key is sent over the channel; zeroized after use by the daemon
 - `/lock` destroys all in-memory credentials, returning to locked state
+- **The locked state is authoritative and broadcast.** `DaemonState` keeps a single
+  `locked: bool` (starts `true`; `false` after a successful Unlock or AddCredential
+  implicit unlock — the shared `unlock_tail` is the one place it is cleared; `true`
+  again on `/lock`, which clears in-memory credentials/providers). On a REAL
+  lock-state transition the daemon broadcasts the current state to ALL activity
+  subscribers (`DaemonMessage::Unlocked` / `DaemonMessage::Locked` — the existing
+  flat variants, no wire change) via `handle_broadcast_activity`, and a
+  freshly-connecting activity subscriber is sent the CURRENT state immediately
+  (alongside the send-on-subscribe `CatalogUpdated`), so a client that connects to
+  an already-locked daemon learns so without waiting for a transition. The acting
+  client additionally keeps its existing `send_to_writer` per-action reply (an
+  `Unlocked`/`Locked`/`LockedError`); receiving the broadcast too is idempotent.
+  This is what makes client B's unlock re-latch client A's banner.
 - `LockedError` is sent if any client attempts a request that requires credentials while locked
 - Session lifecycle operations (CreateSession, AttachSession, ListSessions, etc.) succeed even
   when locked — credentials are only needed at RunInput time. Provider resolution is lazy:

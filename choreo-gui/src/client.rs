@@ -1,6 +1,6 @@
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{
-    ClientError, ConnectionMode, ShellCommand, build_add_credential_message,
+    ClientError, ConnectionMode, ShellCommand, build_add_credential_message, clear_unlock_key,
     dispatch_daemon_message, parse_input_line, record_unlock_key, resolve_private_key,
     run_daemon_connection_with_mode, shell_command_echo,
 };
@@ -257,21 +257,39 @@ pub(crate) fn apply_daemon_message(
         return Ok(());
     }
 
-    // The daemon CONFIRMED an unlock key (explicit Unlock or an
-    // AddCredential that implicitly unlocked). Record the pending key
-    // per-daemon NOW — the whole point of the per-daemon keystore design
-    // is that a key is only trusted/recorded after the daemon accepts it
-    // (TOFU adopt, or a binding match). A rejected key never reaches here.
-    if let Some(key) = state.pending_unlock_key.take()
-        && matches!(
-            &message,
-            DaemonMessage::Unlocked | DaemonMessage::CredentialAdded { .. }
-        )
-        && let Err(e) = record_unlock_key(&connection_addr(), &key)
-    {
-        state
-            .status_texts
-            .push(format!("[error] failed to record unlock key: {e}"));
+    // Unlock/AddCredential outcome (per-daemon keystore): resolve what the
+    // daemon did with the pending key — the key carried by the most recent
+    // `Unlock`/`AddCredential` — and reconcile the client-side record with it.
+    match &message {
+        // CONFIRMED success (explicit Unlock or an AddCredential that
+        // implicitly unlocked). Record the pending key per-daemon NOW — the
+        // whole point of the per-daemon keystore design is that a key is only
+        // trusted/recorded after the daemon accepts it (TOFU adopt, or a
+        // binding match). A rejected key never reaches here.
+        DaemonMessage::Unlocked | DaemonMessage::CredentialAdded { .. } => {
+            if let Some(key) = state.pending_unlock_key.take()
+                && let Err(e) = record_unlock_key(&connection_addr(), &key)
+            {
+                state
+                    .status_texts
+                    .push(format!("[error] failed to record unlock key: {e}"));
+            }
+        }
+        // REJECTED (misbound keystore). Revert the optimistic per-daemon
+        // record and drop the pending key so the next resolution re-derives
+        // from the legacy files instead of replaying a key the daemon refused
+        // — a rejected fresh key would otherwise poison the store and lock the
+        // client out.
+        DaemonMessage::LockedError { .. } | DaemonMessage::CredentialAddFailed { .. } => {
+            if state.pending_unlock_key.take().is_some()
+                && let Err(e) = clear_unlock_key(&connection_addr())
+            {
+                state
+                    .status_texts
+                    .push(format!("[error] failed to clear rejected unlock key: {e}"));
+            }
+        }
+        _ => {}
     }
 
     dispatch_daemon_message(&message, state);

@@ -534,6 +534,13 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         let _ = client_tx.send(ClientMessage::Unlock { private_key });
     } else {
         tracing::info!("[choreo-tui] no unlock key available — daemon starts locked");
+        // Useful startup feedback: surface the locked state immediately. The
+        // persistent status-bar banner (driven by the latched `keystore_locked`
+        // flag, set when the daemon's subscribe-time lock-state push arrives a
+        // moment later) keeps this visible; the transient status offers the
+        // how-to-unlock guidance.
+        app.status =
+            Some("daemon is locked — use /unlock <passphrase> or /add-key to unlock".to_string());
     }
 
     client_tx

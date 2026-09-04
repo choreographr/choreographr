@@ -15,8 +15,8 @@ pub use connection::{
     verify_daemon_authorization,
 };
 pub use credentials::{
-    build_add_credential_from_credential, build_add_credential_message, record_unlock_key,
-    resolve_private_key, try_auto_unlock_key,
+    build_add_credential_from_credential, build_add_credential_message, clear_unlock_key,
+    record_unlock_key, resolve_private_key, try_auto_unlock_key,
 };
 pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 pub use dispatch::{SessionStateData, ToolCallEvent, TurnEventHandler, dispatch_daemon_message};

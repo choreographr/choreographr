@@ -255,6 +255,19 @@ impl DaemonState {
             &self.lag_limits,
             &self.global_lag,
         );
+        // Send the CURRENT keystore lock state so a freshly-connecting client
+        // learns immediately whether the daemon is locked — this is what makes
+        // the startup banner possible without waiting for the next
+        // lock-state *transition* (a client that connects to an already-
+        // locked daemon would otherwise have no reason to latch `locked`).
+        // Mirrors the send-on-subscribe catalog: flat control message, lossless
+        // enqueue, outcome ignored (a fresh subscription cannot be over lag).
+        let lock_msg = if self.locked {
+            DaemonMessage::Locked
+        } else {
+            DaemonMessage::Unlocked
+        };
+        let _ = writer.enqueue(&lock_msg, &self.lag_limits, &self.global_lag);
     }
 
     /// Unregister a client from all session activity broadcasts.
@@ -272,6 +285,28 @@ impl DaemonState {
     pub(super) fn handle_unregister_activity_subscriber(&mut self, client_id: u64) {
         debug!("unregistering activity subscriber: client_id={}", client_id);
         self.activity_subscribers.remove(&client_id);
+    }
+
+    /// Broadcast the daemon's CURRENT keystore lock state to every activity
+    /// subscriber, reusing the flat `Locked`/`Unlocked` variants (no wire
+    /// change).
+    ///
+    /// Called on a REAL lock-state TRANSITION (locked→unlocked after a
+    /// successful Unlock / AddCredential implicit unlock; unlocked→locked on
+    /// `/lock`) so every connected client re-latches its banner — client B
+    /// unlocking updates client A's status bar. `None` provenance (a flat,
+    /// empty-variant control message) rides the standard lossless
+    /// activity fan-out; the acting client, if it is an activity subscriber,
+    /// receives this in addition to its own `send_to_writer` reply — that
+    /// duplicate is idempotent (latching the same state twice) and cheap, so
+    /// keeping one shared broadcast path beats special-casing it away.
+    pub(super) fn broadcast_lock_state(&mut self) {
+        let msg = if self.locked {
+            DaemonMessage::Locked
+        } else {
+            DaemonMessage::Unlocked
+        };
+        self.handle_broadcast_activity(None, msg);
     }
 
     /// Register a connection's writer channel so the shutdown path can route

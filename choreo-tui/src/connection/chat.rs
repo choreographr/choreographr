@@ -120,6 +120,31 @@ pub(super) fn handle_chat_event(
                         }
                         ShellCommand::UnknownCommand(error) => app.status = Some(error),
                         ShellCommand::Send(message) => {
+                            // Client-side guard: submitting a prompt (RunInput)
+                            // to a locked daemon does nothing at inference time
+                            // (no credentials in memory), so reject it
+                            // immediately with clear feedback instead of sending
+                            // a message that silently fails — the daemon's
+                            // "no credential stored" `Failed` would only render
+                            // as a transient status a keypress clears, and the
+                            // persistent lock banner is the always-visible
+                            // guidance. When the daemon IS unlocked (or this
+                            // is a non-session command like /models) the
+                            // message is sent normally.
+                            if matches!(&message, ClientMessage::RunInput { .. })
+                                && app.keystore_locked
+                            {
+                                tracing::debug!(
+                                    "[choreo-tui] prompt rejected client-side: daemon keystore locked"
+                                );
+                                app.status = Some(
+                                    "daemon is locked — unlock it first (/unlock <passphrase> or \
+                                     /add-key)"
+                                        .to_string(),
+                                );
+                                app.error = None;
+                                return Ok(());
+                            }
                             // Client-side validation: reject reasoning slugs that
                             // the attached model's capability set does not include.
                             // This provides faster feedback than waiting for the

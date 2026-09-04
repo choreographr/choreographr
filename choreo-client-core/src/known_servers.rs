@@ -15,7 +15,6 @@
 //! [[server]]
 //! addr = "192.168.1.20:9443"
 //! pubkey = "<base64 of the 32-byte transport.pub>"
-//! first_seen_unix = 1756735200
 //! ```
 //!
 //! Failure policy is deliberately tolerant on LOAD and strict on WRITE:
@@ -48,7 +47,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use tracing::{debug, info, warn};
@@ -73,10 +71,6 @@ pub struct KnownServerEntry {
     /// 32-byte per-daemon keystore unlock key for this daemon.
     #[serde(default)]
     pub unlock_key: Option<String>,
-    /// Unix epoch seconds when the pin was confirmed (bookkeeping only —
-    /// never used in trust decisions).
-    #[serde(default)]
-    pub first_seen_unix: Option<i64>,
 }
 
 /// The in-memory view of `known_servers.toml`, plus the path it persists to.
@@ -215,27 +209,12 @@ impl KnownServers {
                 // Replace only the unlock key — never clobber a transport
                 // pin that a human already confirmed.
                 existing.unlock_key = Some(b64);
-                // Record when the carrier was written (bookkeeping only).
-                if existing.first_seen_unix.is_none() {
-                    existing.first_seen_unix = Some(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0),
-                    );
-                }
             }
             None => {
                 self.entries.push(KnownServerEntry {
                     addr: addr.to_string(),
                     pubkey: None,
                     unlock_key: Some(b64),
-                    first_seen_unix: Some(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0),
-                    ),
                 });
             }
         }
@@ -247,30 +226,29 @@ impl KnownServers {
     /// Pin `pk` as the confirmed server key for `addr`, persisting
     /// immediately under an advisory file lock.
     ///
-    /// Pinning an address that already has an entry REPLACES it — that is
-    /// the deliberate re-pairing path after a legitimate server key
-    /// rotation: the human confirms the NEW fingerprint, then pins, and
-    /// only then does IK succeed again. There is no in-code path that
-    /// replaces a pin without this explicit call.
+    /// Pinning an address that already has an entry replaces ONLY its
+    /// transport pin — the deliberate re-pairing path after a legitimate
+    /// server key rotation: the human confirms the NEW fingerprint, then a
+    /// re-pin, and only then does IK succeed again. The per-daemon keystore
+    /// unlock key is an INDEPENDENT field and must survive a re-pin — an
+    /// entry that carries both a pin and an unlock key (a TCP daemon after
+    /// the first set_unlock_key) would otherwise silently lose the unlock
+    /// key, locking the operator out of a now-misbound keystore. There is
+    /// no in-code path that replaces a pin without this explicit call.
     pub fn pin(&mut self, addr: &str, pk: &[u8; 32]) -> Result<(), ClientError> {
-        let entry = KnownServerEntry {
-            addr: addr.to_string(),
-            pubkey: Some(encode_key(pk)),
-            // Pinning does not touch any unlock key — the transport pin and
-            // the keystore unlock key are independent fields.
-            unlock_key: None,
-            first_seen_unix: Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    // Clock before 1970 is absurd but not worth failing a
-                    // trust decision over — the timestamp is bookkeeping.
-                    .unwrap_or(0),
-            ),
-        };
         match self.entries.iter_mut().find(|e| e.addr == addr) {
-            Some(existing) => *existing = entry,
-            None => self.entries.push(entry),
+            // Update the existing entry in place: swap the pin but leave
+            // `unlock_key` untouched (see the doc comment above).
+            Some(existing) => {
+                existing.pubkey = Some(encode_key(pk));
+            }
+            None => self.entries.push(KnownServerEntry {
+                addr: addr.to_string(),
+                pubkey: Some(encode_key(pk)),
+                // A brand-new entry inherits nothing, so there is no unlock
+                // key to preserve yet.
+                unlock_key: None,
+            }),
         }
         self.persist()?;
         info!(
@@ -279,6 +257,37 @@ impl KnownServers {
             "pinned server public key"
         );
         Ok(())
+    }
+
+    /// Drop the stored per-daemon unlock key for `addr` (leaving any
+    /// transport pin intact), persisting immediately under the same advisory
+    /// lock. Returns whether the store changed.
+    ///
+    /// This is the REVERT/recovery path: a daemon that REJECTS a presented
+    /// key (binding mismatch on Unlock/AddCredential) tells us the stored key
+    /// is wrong — clearing it lets the next resolution re-derive from the
+    /// legacy files instead of replaying a key the daemon refused forever. In
+    /// particular it un-poisons the OPTIMISTIC record `build_add_credential`
+    /// makes of a freshly minted key against an already-bound daemon.
+    pub fn clear_unlock_key(&mut self, addr: &str) -> Result<bool, ClientError> {
+        let Some(entry) = self.entries.iter_mut().find(|e| e.addr == addr) else {
+            return Ok(false);
+        };
+        if entry.unlock_key.is_none() {
+            return Ok(false);
+        }
+        entry.unlock_key = None;
+        // A unix-socket carrier entry has no pin, so with its unlock key gone
+        // it is an empty shell — drop it rather than leave a dead row behind.
+        if entry.pubkey.is_none() {
+            self.entries.retain(|e| e.addr != addr);
+        }
+        self.persist()?;
+        info!(
+            addr,
+            "cleared per-daemon keystore unlock key (rejected by daemon)"
+        );
+        Ok(true)
     }
 
     /// Remove the pin for `addr` (the "server key changed, delete the
@@ -481,9 +490,9 @@ mod tests {
         assert_eq!(reloaded.lookup("host2:9443").expect("decode"), Some(pk_b));
     }
 
-    /// Re-pinning an address REPLACES the entry (the deliberate re-pairing
-    /// path after a legitimate server key rotation) and persists the
-    /// replacement.
+    /// Re-pinning an address replaces its transport pin in place (the
+    /// deliberate re-pairing path after a legitimate server key rotation) and
+    /// persists the replacement without duplicating the entry.
     #[test]
     fn pin_replaces_existing_entry() {
         let (_temp, _guard, dir) = use_temp_config_root();
@@ -498,6 +507,87 @@ mod tests {
         let reloaded = KnownServers::load_from(&path).expect("reload");
         assert_eq!(reloaded.entries().len(), 1, "re-pin must not duplicate");
         assert_eq!(reloaded.lookup("host:9443").expect("decode"), Some(pk_new));
+    }
+
+    /// Bug-1 regression: re-pinning an entry that also carries a stored
+    /// per-daemon UNLOCK KEY must NOT wipe it — the two fields are
+    /// independent, and dropping the key on a routine server-key rotation
+    /// would lock the operator out of a now-misbound keystore.
+    #[test]
+    fn pin_preserves_stored_unlock_key() {
+        let (_temp, _guard, dir) = use_temp_config_root();
+        let path = dir.join("choreographr").join("known_servers.toml");
+        let mut store = KnownServers::load_from(&path).expect("load");
+
+        let unlock: [u8; 32] = [9u8; 32];
+        let pk_old = [3u8; 32];
+        let pk_new = [4u8; 32];
+        store.pin("host:9443", &pk_old).expect("pin old");
+        store
+            .set_unlock_key("host:9443", &unlock)
+            .expect("set unlock key");
+
+        // The re-pin (deliberate re-pairing) changes only the transport pin.
+        store.pin("host:9443", &pk_new).expect("pin new");
+
+        let reloaded = KnownServers::load_from(&path).expect("reload");
+        assert_eq!(
+            reloaded.lookup("host:9443").expect("decode"),
+            Some(pk_new),
+            "the new pin must be recorded"
+        );
+        assert_eq!(
+            reloaded.unlock_key("host:9443").expect("decode"),
+            Some(unlock),
+            "re-pin must preserve the per-daemon unlock key"
+        );
+    }
+
+    /// `clear_unlock_key` removes only the unlock key: a TCP entry keeps its
+    /// transport pin, while a pubkey-less unix-socket carrier is dropped
+    /// entirely once its sole payload is gone.
+    #[test]
+    fn clear_unlock_key_keeps_tcp_pin_and_reports_change() {
+        let (_temp, _guard, dir) = use_temp_config_root();
+        let path = dir.join("choreographr").join("known_servers.toml");
+        let mut store = KnownServers::load_from(&path).expect("load");
+
+        let pk = [3u8; 32];
+        let unlock: [u8; 32] = [9u8; 32];
+        store.pin("host:9443", &pk).expect("pin");
+        store.set_unlock_key("host:9443", &unlock).expect("set");
+
+        assert!(
+            store.clear_unlock_key("host:9443").expect("clear"),
+            "clearing an existing key reports a change"
+        );
+        // No key remains, but the transport pin is untouched.
+        assert_eq!(store.unlock_key("host:9443").expect("decode"), None);
+        assert_eq!(store.lookup("host:9443").expect("decode"), Some(pk));
+
+        // Clearing again is a no-op (no entry keyed there or none left).
+        assert!(!store.clear_unlock_key("host:9443").expect("clear again"));
+        assert!(!store.clear_unlock_key("absent:1").expect("clear absent"));
+    }
+
+    #[test]
+    fn clear_unlock_key_drops_empty_unix_carrier() {
+        let (_temp, _guard, dir) = use_temp_config_root();
+        let path = dir.join("choreographr").join("known_servers.toml");
+        let mut store = KnownServers::load_from(&path).expect("load");
+
+        let unlock: [u8; 32] = [9u8; 32];
+        // Unix-socket carrier: no pin, exists only to hold the unlock key.
+        store
+            .set_unlock_key("/tmp/choreo.sock", &unlock)
+            .expect("set carrier");
+        assert_eq!(store.entries().len(), 1);
+
+        assert!(store.clear_unlock_key("/tmp/choreo.sock").expect("clear"));
+        assert!(
+            store.entries().is_empty(),
+            "a key-and-pubkey-less carrier is dropped, not left as a dead row"
+        );
     }
 
     /// Torn / garbage store files load as EMPTY (never an error, never a
