@@ -538,9 +538,12 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         // persistent status-bar banner (driven by the latched `keystore_locked`
         // flag, set when the daemon's subscribe-time lock-state push arrives a
         // moment later) keeps this visible; the transient status offers the
-        // how-to-unlock guidance.
+        // how-to-unlock guidance. A FRESH daemon (no binding yet) needs none
+        // of this: it answers `KeystoreUnbound` and the message handler
+        // auto-binds it with a minted key (see `handle_daemon_message`).
         app.status = Some(
-            "daemon is locked — use /unlock, or /unlock <base64 unlock-key> to supply one"
+            "daemon is locked — use /unlock, or /unlock <base64 unlock-key> to supply one \
+             (a fresh daemon binds automatically)"
                 .to_string(),
         );
     }

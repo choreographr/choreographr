@@ -362,6 +362,14 @@ pub(crate) struct App {
     /// cleared by the per-keypress transient status/error clear, so the lock
     /// indication survives every keystroke.
     pub(crate) keystore_locked: bool,
+    /// Whether a `BindKeystore` has been sent on THIS connection. Auto-bind
+    /// is a once-per-connection action: the unbound state is discovered from
+    /// either the subscribe-time lock-state push or a `KeystoreUnbound` reply
+    /// to the auto-unlock attempt, and if the bind's own `Bound` confirmation
+    /// is lost (or another `KeystoreUnbound` somehow arrives) re-binding would
+    /// mint and record a new key against a daemon we no longer understand —
+    /// so the second report only surfaces an error.
+    pub(crate) keystore_bind_attempted: bool,
     pub(crate) page: Page,
     pub(crate) show_ctrl_help: bool,
     /// Whether the terminal implemented the kitty keyboard protocol we push
@@ -523,6 +531,8 @@ impl App {
             // Assume locked until the daemon tells us otherwise (via the
             // subscribe-time lock-state push or a transition broadcast).
             keystore_locked: true,
+            // No bind sent yet on this connection (see the field docs).
+            keystore_bind_attempted: false,
             page: Page::Chat,
             show_ctrl_help: true,
             keyboard_enhanced: true,

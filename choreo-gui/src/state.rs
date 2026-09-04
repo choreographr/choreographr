@@ -26,6 +26,11 @@ pub(crate) struct AppState {
     /// [`choreo_client_core::record_unlock_key`]. Never persisted on send —
     /// only on confirmed success. Cleared once recorded (or on any send).
     pub(crate) pending_unlock_key: Option<Vec<u8>>,
+    /// Whether a `BindKeystore` was already sent on this connection — the
+    /// auto-bind of an unbound keystore happens AT MOST ONCE per connection
+    /// (a repeat `KeystoreUnbound` after the bind was sent is surfaced as an
+    /// error, never a re-bind).
+    pub(crate) keystore_bind_attempted: bool,
 }
 
 impl AppState {
@@ -38,6 +43,7 @@ impl AppState {
             pending_cancel: String::new(),
             attached_session_id: None,
             pending_unlock_key: None,
+            keystore_bind_attempted: false,
         }
     }
 }

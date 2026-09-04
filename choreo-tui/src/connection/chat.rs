@@ -138,8 +138,8 @@ pub(super) fn handle_chat_event(
                                     "[choreo-tui] prompt rejected client-side: daemon keystore locked"
                                 );
                                 app.status = Some(
-                                    "daemon is locked — unlock it first (/unlock, or /unlock \
-                                     <base64 unlock-key>)"
+                                    "daemon keystore is locked — unlock with /unlock, or /unlock \
+                                     <base64 unlock-key> (a fresh daemon binds automatically)"
                                         .to_string(),
                                 );
                                 app.error = None;

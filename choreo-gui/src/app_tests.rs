@@ -228,3 +228,87 @@ fn handle_redo_sends_redo_message() {
     let msg = rx.recv().expect("should send Redo");
     assert_eq!(msg, ClientMessage::Redo);
 }
+
+// ── Keystore bind/unlock flow ─────────────────────────────────────
+
+/// Isolate known_servers writes (bind pre-send recording and the Bound
+/// confirmation record) in a temp config root. Returns the TempDir AND the
+/// override guard — the guard must stay alive for the whole test or the
+/// thread-local override resets and writes hit the real config dir.
+fn isolate_config() -> (tempfile::TempDir, choreo_keystore::paths::TestConfigGuard) {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+    std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
+    (dir, guard)
+}
+
+#[test]
+fn bound_message_records_the_pending_key() {
+    let (_dir, _guard) = isolate_config();
+    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    state.pending_unlock_key = Some(vec![3u8; 32]);
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    apply_daemon_message(&mut state, DaemonMessage::Bound, Some(tx)).unwrap();
+
+    assert!(state.pending_unlock_key.is_none(), "pending key consumed");
+    let store = choreo_client_core::KnownServers::load().unwrap();
+    let addr = crate::client::connection_addr();
+    assert_eq!(
+        store.unlock_key(&addr).unwrap(),
+        Some([3u8; 32]),
+        "the confirmed key is recorded per-daemon"
+    );
+    assert!(rx.try_recv().is_err(), "Bound sends no client messages");
+}
+
+#[test]
+fn keystore_unbound_auto_binds_once() {
+    let (_dir, _guard) = isolate_config();
+    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    // A stale verify-only pending key must be discarded by the unbound arm.
+    state.pending_unlock_key = Some(vec![5u8; 32]);
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    apply_daemon_message(
+        &mut state,
+        DaemonMessage::KeystoreUnbound {
+            error: "no binding".into(),
+        },
+        Some(tx.clone()),
+    )
+    .unwrap();
+    assert!(state.keystore_bind_attempted, "bind attempt latched");
+    assert!(
+        state.pending_unlock_key.is_some(),
+        "minted key held pending"
+    );
+    let ClientMessage::BindKeystore { key } = rx.recv().expect("bind sent") else {
+        panic!("auto-bind must send BindKeystore");
+    };
+    let store = choreo_client_core::KnownServers::load().unwrap();
+    let addr = crate::client::connection_addr();
+    assert_eq!(
+        store.unlock_key(&addr).unwrap(),
+        Some(key.as_slice().try_into().unwrap()),
+        "the minted key is recorded pre-send"
+    );
+
+    // A second KeystoreUnbound must NOT re-bind.
+    apply_daemon_message(
+        &mut state,
+        DaemonMessage::KeystoreUnbound {
+            error: "still unbound".into(),
+        },
+        Some(tx),
+    )
+    .unwrap();
+    assert!(rx.try_recv().is_err(), "no second bind attempt");
+    assert!(
+        state
+            .status_texts
+            .iter()
+            .any(|t| t.contains("still unbound")),
+        "the repeat unbound report is surfaced"
+    );
+}

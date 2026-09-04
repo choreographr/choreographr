@@ -47,6 +47,9 @@ choreo-markdown.workspace = true
 choreo-proto.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 # Android-only entry glue (see android_main in lib.rs): android-activity gives
 # us the `AndroidApp` argument type of the `android_main` symbol the native
 # runtime calls, and blitz-shell (dioxus-native's shell layer) exposes the

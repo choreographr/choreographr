@@ -2954,6 +2954,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "humfmt",
+ "tempfile",
  "tracing",
  "zeroize",
 ]

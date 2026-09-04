@@ -1,6 +1,6 @@
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{
-    ClientError, ConnectionMode, ShellCommand, build_add_credential_message,
+    ClientError, ConnectionMode, ShellCommand, bind_fresh_daemon, build_add_credential_message,
     dispatch_daemon_message, parse_input_line, record_unlock_key, resolve_private_key,
     run_daemon_connection_with_mode, shell_command_echo,
 };
@@ -50,7 +50,7 @@ pub(crate) fn submit_input(
 /// the actual dial address for TCP, the unix socket path otherwise. This is
 /// the same address the daemon's keystore binding is recorded against, so
 /// every `Unlock`/`AddCredential`/record must use it consistently.
-fn connection_addr() -> String {
+pub(crate) fn connection_addr() -> String {
     match crate::CONNECTION_MODE.get() {
         Some(ConnectionMode::UnixSocket(path)) => path.clone(),
         Some(ConnectionMode::Tcp { addr, .. }) => addr.clone(),
@@ -262,18 +262,60 @@ pub(crate) fn apply_daemon_message(
     // daemon did with the pending key — the key carried by the most recent
     // `Unlock`/`AddCredential` — and reconcile the client-side record with it.
     match &message {
-        // CONFIRMED success (explicit Unlock or an AddCredential that
-        // implicitly unlocked). Record the pending key per-daemon NOW — the
-        // whole point of the per-daemon keystore design is that a key is only
-        // trusted/recorded after the daemon accepts it (TOFU adopt, or a
-        // binding match). A rejected key never reaches here.
-        DaemonMessage::Unlocked | DaemonMessage::CredentialAdded { .. } => {
+        // CONFIRMED success (explicit Unlock, an AddCredential that
+        // implicitly unlocked, or our auto-bind of an unbound daemon).
+        // Record the pending key per-daemon NOW — the whole point of the
+        // per-daemon keystore design is that a key is only trusted/recorded
+        // after the daemon accepts it (TOFU adopt, or a binding match). A
+        // rejected key never reaches here.
+        DaemonMessage::Unlocked | DaemonMessage::Bound | DaemonMessage::CredentialAdded { .. } => {
             if let Some(key) = state.pending_unlock_key.take()
                 && let Err(e) = record_unlock_key(&connection_addr(), &key)
             {
                 state
                     .status_texts
                     .push(format!("[error] failed to record unlock key: {e}"));
+            }
+        }
+        // Verify-only operation against an UNBOUND keystore (the daemon has
+        // no binding at all — the pending key was a verify attempt that can
+        // never succeed). Drop the pending key, then AUTO-BIND once per
+        // connection: `bind_fresh_daemon` mints a fresh CSPRNG key, records
+        // it into known_servers PRE-SEND, and returns the `BindKeystore`
+        // message; the daemon replies `Bound`, which the arm above treats
+        // exactly like `Unlocked`. A second `KeystoreUnbound` after the bind
+        // was sent is surfaced as an error, never a re-bind (bind-loop guard).
+        DaemonMessage::KeystoreUnbound { .. } => {
+            if let Some(mut key) = state.pending_unlock_key.take() {
+                key.zeroize();
+                tracing::info!(
+                    "daemon keystore is unbound; discarding the verify-only pending key"
+                );
+            }
+            if state.keystore_bind_attempted {
+                tracing::warn!("keystore still unbound after a bind attempt; not re-binding");
+                state.status_texts.push(
+                    "[daemon] keystore still unbound after bind attempt — reconnect to \
+                           retry"
+                        .to_string(),
+                );
+            } else {
+                state.keystore_bind_attempted = true;
+                match bind_fresh_daemon(&connection_addr()) {
+                    Ok((key, msg)) => {
+                        tracing::info!("auto-binding unbound daemon with a fresh key");
+                        // Same pending-confirm flow as Unlock/AddCredential:
+                        // the `Bound` reply records the minted key.
+                        state.pending_unlock_key = Some(key.to_vec());
+                        send_client_message(state, daemon_tx, msg);
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "auto-bind failed");
+                        state
+                            .status_texts
+                            .push(format!("[error] auto-bind failed: {e}"));
+                    }
+                }
             }
         }
         // REJECTED (Unlock/AddCredential failure). Drop the pending key
