@@ -262,11 +262,7 @@ impl DaemonState {
         // locked daemon would otherwise have no reason to latch `locked`).
         // Mirrors the send-on-subscribe catalog: flat control message, lossless
         // enqueue, outcome ignored (a fresh subscription cannot be over lag).
-        let lock_msg = if self.locked {
-            DaemonMessage::Locked
-        } else {
-            DaemonMessage::Unlocked
-        };
+        let lock_msg = self.current_lock_message();
         let _ = writer.enqueue(&lock_msg, &self.lag_limits, &self.global_lag);
     }
 
@@ -287,6 +283,18 @@ impl DaemonState {
         self.activity_subscribers.remove(&client_id);
     }
 
+    /// The flat control message representing the daemon's CURRENT keystore
+    /// lock state (no wire change — the existing `Locked`/`Unlocked`
+    /// variants). One construction site so the subscribe-time push and the
+    /// transition broadcast cannot drift.
+    pub(super) fn current_lock_message(&self) -> DaemonMessage {
+        if self.locked {
+            DaemonMessage::Locked
+        } else {
+            DaemonMessage::Unlocked
+        }
+    }
+
     /// Broadcast the daemon's CURRENT keystore lock state to every activity
     /// subscriber, reusing the flat `Locked`/`Unlocked` variants (no wire
     /// change).
@@ -301,11 +309,7 @@ impl DaemonState {
     /// duplicate is idempotent (latching the same state twice) and cheap, so
     /// keeping one shared broadcast path beats special-casing it away.
     pub(super) fn broadcast_lock_state(&mut self) {
-        let msg = if self.locked {
-            DaemonMessage::Locked
-        } else {
-            DaemonMessage::Unlocked
-        };
+        let msg = self.current_lock_message();
         self.handle_broadcast_activity(None, msg);
     }
 

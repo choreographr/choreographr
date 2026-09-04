@@ -2967,6 +2967,7 @@ dependencies = [
  "futures-util",
  "humfmt",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

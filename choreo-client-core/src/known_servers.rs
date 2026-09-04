@@ -259,37 +259,6 @@ impl KnownServers {
         Ok(())
     }
 
-    /// Drop the stored per-daemon unlock key for `addr` (leaving any
-    /// transport pin intact), persisting immediately under the same advisory
-    /// lock. Returns whether the store changed.
-    ///
-    /// This is the REVERT/recovery path: a daemon that REJECTS a presented
-    /// key (binding mismatch on Unlock/AddCredential) tells us the stored key
-    /// is wrong — clearing it lets the next resolution re-derive from the
-    /// legacy files instead of replaying a key the daemon refused forever. In
-    /// particular it un-poisons the OPTIMISTIC record `build_add_credential`
-    /// makes of a freshly minted key against an already-bound daemon.
-    pub fn clear_unlock_key(&mut self, addr: &str) -> Result<bool, ClientError> {
-        let Some(entry) = self.entries.iter_mut().find(|e| e.addr == addr) else {
-            return Ok(false);
-        };
-        if entry.unlock_key.is_none() {
-            return Ok(false);
-        }
-        entry.unlock_key = None;
-        // A unix-socket carrier entry has no pin, so with its unlock key gone
-        // it is an empty shell — drop it rather than leave a dead row behind.
-        if entry.pubkey.is_none() {
-            self.entries.retain(|e| e.addr != addr);
-        }
-        self.persist()?;
-        info!(
-            addr,
-            "cleared per-daemon keystore unlock key (rejected by daemon)"
-        );
-        Ok(true)
-    }
-
     /// Remove the pin for `addr` (the "server key changed, delete the
     /// known_hosts entry to re-pair" path). Returns whether an entry was
     /// removed; persists only when something changed.
@@ -543,11 +512,15 @@ mod tests {
         );
     }
 
-    /// `clear_unlock_key` removes only the unlock key: a TCP entry keeps its
-    /// transport pin, while a pubkey-less unix-socket carrier is dropped
-    /// entirely once its sole payload is gone.
+    /// A stored unlock key SURVIVES everything short of an explicit
+    /// `remove(addr)`: there is no programmatic path that erases one (a
+    /// daemon REJECTING the key must not delete the record — the rejection
+    /// may be a transient daemon-side failure misreported as a key error,
+    /// and the keystore binding is TOFU-immortal so a confirmed record can
+    /// never be 'wrong'). `remove` is the one deliberate wipe, and it takes
+    /// the transport pin with it.
     #[test]
-    fn clear_unlock_key_keeps_tcp_pin_and_reports_change() {
+    fn stored_unlock_key_survives_rejections_and_is_removed_only_explicitly() {
         let (_temp, _guard, dir) = use_temp_config_root();
         let path = dir.join("choreographr").join("known_servers.toml");
         let mut store = KnownServers::load_from(&path).expect("load");
@@ -557,37 +530,19 @@ mod tests {
         store.pin("host:9443", &pk).expect("pin");
         store.set_unlock_key("host:9443", &unlock).expect("set");
 
-        assert!(
-            store.clear_unlock_key("host:9443").expect("clear"),
-            "clearing an existing key reports a change"
+        // A reload (what a client restart does) still resolves the key.
+        let reloaded = KnownServers::load_from(&path).expect("reload");
+        assert_eq!(
+            reloaded.unlock_key("host:9443").expect("decode"),
+            Some(unlock)
         );
-        // No key remains, but the transport pin is untouched.
-        assert_eq!(store.unlock_key("host:9443").expect("decode"), None);
-        assert_eq!(store.lookup("host:9443").expect("decode"), Some(pk));
 
-        // Clearing again is a no-op (no entry keyed there or none left).
-        assert!(!store.clear_unlock_key("host:9443").expect("clear again"));
-        assert!(!store.clear_unlock_key("absent:1").expect("clear absent"));
-    }
-
-    #[test]
-    fn clear_unlock_key_drops_empty_unix_carrier() {
-        let (_temp, _guard, dir) = use_temp_config_root();
-        let path = dir.join("choreographr").join("known_servers.toml");
-        let mut store = KnownServers::load_from(&path).expect("load");
-
-        let unlock: [u8; 32] = [9u8; 32];
-        // Unix-socket carrier: no pin, exists only to hold the unlock key.
-        store
-            .set_unlock_key("/tmp/choreo.sock", &unlock)
-            .expect("set carrier");
-        assert_eq!(store.entries().len(), 1);
-
-        assert!(store.clear_unlock_key("/tmp/choreo.sock").expect("clear"));
-        assert!(
-            store.entries().is_empty(),
-            "a key-and-pubkey-less carrier is dropped, not left as a dead row"
-        );
+        // The explicit removal path wipes the whole entry (pin included).
+        let mut store2 = KnownServers::load_from(&path).expect("load 2");
+        assert!(store2.remove("host:9443").expect("remove"));
+        let after = KnownServers::load_from(&path).expect("reload after remove");
+        assert_eq!(after.lookup("host:9443").expect("decode"), None);
+        assert_eq!(after.unlock_key("host:9443").expect("decode"), None);
     }
 
     /// Torn / garbage store files load as EMPTY (never an error, never a

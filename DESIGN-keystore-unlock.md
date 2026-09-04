@@ -56,9 +56,23 @@ This document is the confirmed design. All implementation must follow it.
      step 3: it is OPTIMISTICALLY recorded immediately, because a fresh key is
      adopted TOFU by an unbound daemon and a LOST confirmation would otherwise
      strand the client with no way to recover the binding. That optimistic record
-     is PROVISIONAL: a daemon rejection (`LockedError` / `CredentialAddFailed`)
-     reverts it via `clear_unlock_key` so an already-bound keystore is never
-     poisoned by a key it refused. (Similarly, `known_servers.pin` preserves any
+     is PROVISIONAL but PERMANENT-until-replaced: a daemon rejection
+     (`LockedError` / `CredentialAddFailed`) does NOT delete it. There is NO
+     programmatic revert, deliberately:
+     (a) the keystore binding is TOFU-once and never rotates, so a CONFIRMED
+     record can never be wrong later;
+     (b) the daemon surfaces EVERY unlock-path error (including transient
+     failures like a database read error) as the same rejection, so a rejection
+     is not proof the key is bad — deleting could erase a good confirmed key
+     with no legacy fallback left;
+     (c) for the one genuinely-wrong case (a fresh key rejected by an
+     already-bound daemon) deletion recovers nothing — the next attempt mints
+     yet another fresh key that is also rejected. The wrong key simply sits in
+     `known_servers.toml` replaying its rejection until the operator replaces
+     it: manual re-pair via `KnownServers::remove(addr)` (or editing the file)
+     is the one recovery path. Clients drop the in-flight pending key on a
+     rejection (zeroized) so a later confirmation cannot mis-attribute it.
+     (Similarly, `known_servers.pin` preserves any
      stored unlock key on a re-pin — the two fields are independent.)
    - Blob encryption: client derives the public key from the unlock key locally
      (`x25519_dalek::PublicKey::from(&StaticSecret::from(key))`) and encrypts the

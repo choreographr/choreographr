@@ -1,10 +1,9 @@
 use super::{SessionUpdateRouting, route_session_update};
 use crate::state::{App, Page, ProviderInfo, merge_token_usage};
 use crate::terminal_progress;
-use choreo_client_core::{
-    ClientError, clear_unlock_key, dispatch_daemon_message, record_unlock_key,
-};
+use choreo_client_core::{ClientError, dispatch_daemon_message, record_unlock_key};
 use choreo_proto::{ClientMessage, DaemonMessage, RefreshStatus, SessionEvent};
+use zeroize::Zeroize;
 
 pub(crate) fn handle_daemon_message(
     message: DaemonMessage,
@@ -622,19 +621,23 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::Locked => {
             app.keystore_locked = true;
         }
-        // The daemon REJECTED the pending unlock key (misbound keystore on an
-        // Unlock or AddCredential). Revert its optimistic per-daemon record and
-        // drop the pending key so the next resolution re-derives from the
-        // legacy files instead of replaying a key the daemon refused — and so a
-        // later, unrelated confirmation cannot attribute this rejection back.
-        // Keep the lock flag latched locked (a rejection means the daemon is
-        // still locked). No early return: the generic dispatch still surfaces
-        // the error text.
+        // The daemon REJECTED the pending unlock key (Unlock path). Drop the
+        // pending key (zeroized) so a later, unrelated confirmation cannot
+        // attribute this rejection back — but do NOT touch the known_servers
+        // record: a rejection is not proof the key is bad (the daemon maps
+        // transient failures onto the same error), and the binding is
+        // TOFU-immortal so a confirmed record can never be wrong. The stored
+        // key is replaced only via the explicit re-pair path
+        // (`KnownServers::remove(addr)`). Keep the lock flag latched locked
+        // (a rejection means the daemon is still locked). No early return:
+        // the generic dispatch still surfaces the error text.
         DaemonMessage::LockedError { .. } => {
             app.keystore_locked = true;
-            forget_rejected_unlock_key(app);
+            discard_rejected_unlock_key(app);
         }
-        DaemonMessage::CredentialAddFailed { .. } => forget_rejected_unlock_key(app),
+        // Same pending-key discipline for a rejected AddCredential: drop the
+        // in-flight key, leave the store alone.
+        DaemonMessage::CredentialAddFailed { .. } => discard_rejected_unlock_key(app),
         _ => {}
     }
 
@@ -668,28 +671,21 @@ fn record_confirmed_unlock_key(app: &mut App) {
     }
 }
 
-/// The daemon REJECTED the pending unlock key (binding mismatch on an Unlock
-/// or AddCredential). Revert the optimistic per-daemon record so the next
-/// resolution re-derives from the legacy files instead of replaying a key the
-/// daemon refused — otherwise a freshly minted key the daemon rejected would
-/// poison the store (a fresh key is optimistic-recorded by the credential
-/// builder so a LOST confirmation cannot orphan the binding; reverting here
-/// covers the opposite failure — an APPARENT-but-rejected key). The pending
-/// key is dropped so a later, unrelated confirmation cannot attribute it.
-fn forget_rejected_unlock_key(app: &mut App) {
-    if app.pending_unlock_key.take().is_none() {
-        return;
-    }
-    match clear_unlock_key(&app.connection_addr) {
-        Ok(_) => tracing::info!(
+/// The daemon REJECTED the pending unlock key (an Unlock or AddCredential
+/// failure). Drop the in-flight key — zeroized, since it is secret material —
+/// so a later, unrelated confirmation cannot attribute it. Deliberately does
+/// NOT delete the known_servers record: see the survivor-semantics rationale
+/// in `choreo-client-core` (`resolve_keystore_key`) — the stored key may be a
+/// valid confirmed key (the daemon reports transient failures through the
+/// same error), and manual re-pair (`remove(addr)`) is the recovery path for
+/// a genuinely wrong one.
+fn discard_rejected_unlock_key(app: &mut App) {
+    if let Some(mut key) = app.pending_unlock_key.take() {
+        key.zeroize();
+        tracing::info!(
             addr = %app.connection_addr,
-            "cleared unlock key after daemon rejection; will re-resolve on next attempt"
-        ),
-        Err(e) => tracing::warn!(
-            addr = %app.connection_addr,
-            error = %e,
-            "failed to clear rejected unlock key"
-        ),
+            "daemon rejected the presented unlock key; the known_servers record is kept"
+        );
     }
 }
 
@@ -752,7 +748,7 @@ mod tests {
             "a rejected unlock means the daemon is still locked"
         );
         // The rejection drops the pending key so a later, unrelated
-        // confirmation cannot attribute it (see forget_rejected_unlock_key).
+        // confirmation cannot attribute it (see discard_rejected_unlock_key).
         assert!(app.pending_unlock_key.is_none());
     }
 

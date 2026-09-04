@@ -1,12 +1,13 @@
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{
-    ClientError, ConnectionMode, ShellCommand, build_add_credential_message, clear_unlock_key,
+    ClientError, ConnectionMode, ShellCommand, build_add_credential_message,
     dispatch_daemon_message, parse_input_line, record_unlock_key, resolve_private_key,
     run_daemon_connection_with_mode, shell_command_echo,
 };
 use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, socket_path};
 use dioxus::prelude::*;
 use futures_channel::mpsc::UnboundedSender;
+use zeroize::Zeroize;
 
 pub(crate) fn run_client(
     mode: ConnectionMode,
@@ -275,18 +276,20 @@ pub(crate) fn apply_daemon_message(
                     .push(format!("[error] failed to record unlock key: {e}"));
             }
         }
-        // REJECTED (misbound keystore). Revert the optimistic per-daemon
-        // record and drop the pending key so the next resolution re-derives
-        // from the legacy files instead of replaying a key the daemon refused
-        // — a rejected fresh key would otherwise poison the store and lock the
-        // client out.
+        // REJECTED (Unlock/AddCredential failure). Drop the pending key
+        // (zeroized — it is secret material) so a later, unrelated
+        // confirmation cannot attribute the rejection back. Deliberately does
+        // NOT delete the known_servers record: a rejection is not proof the
+        // key is bad (the daemon reports transient failures through the same
+        // error), and the keystore binding is TOFU-immortal so a confirmed
+        // record can never be wrong. Manual re-pair (`remove(addr)`) is the
+        // recovery path for a genuinely wrong key.
         DaemonMessage::LockedError { .. } | DaemonMessage::CredentialAddFailed { .. } => {
-            if state.pending_unlock_key.take().is_some()
-                && let Err(e) = clear_unlock_key(&connection_addr())
-            {
-                state
-                    .status_texts
-                    .push(format!("[error] failed to clear rejected unlock key: {e}"));
+            if let Some(mut key) = state.pending_unlock_key.take() {
+                key.zeroize();
+                tracing::info!(
+                    "daemon rejected the presented unlock key; the known_servers record is kept"
+                );
             }
         }
         _ => {}

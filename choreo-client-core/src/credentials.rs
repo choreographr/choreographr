@@ -2,7 +2,7 @@ use choreo_keystore::ServiceCredential;
 use choreo_proto::ClientMessage;
 use tracing::{debug, info, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::ClientError;
 use crate::known_servers::KnownServers;
@@ -318,15 +318,19 @@ fn parse_credential(
 /// the `CredentialAdded` reply is lost the key must already be on disk or the
 /// next connect would mint a DIFFERENT fresh key and be locked out of the now-
 /// bound keystore. If the daemon turns out to be ALREADY bound it rejects the
-/// fresh key, and the caller reverts the optimistic record via
-/// [`clear_unlock_key`] on that rejection, so a poison key is never left in
-/// the store.
+/// fresh key — the record STAYS (see the rationale on [`resolve_keystore_key`]).
 fn resolve_keystore_key(addr: &str) -> Result<[u8; 32], ClientError> {
     if let Some(key) = stored_unlock_key(addr) {
         return Ok(key);
     }
-    if let Some(key) = legacy_auto_unlock_key() {
-        return key.try_into().map_err(|_| ClientError::PrivateKeyInvalid);
+    // The legacy key is secret material: wrap it so the heap Vec is wiped on
+    // EVERY exit — including the try_into failure path, which previously
+    // dropped the Vec un-zeroized.
+    if let Some(key) = legacy_auto_unlock_key().map(Zeroizing::new) {
+        return key
+            .as_slice()
+            .try_into()
+            .map_err(|_| ClientError::PrivateKeyInvalid);
     }
     let fresh: [u8; 32] = rand::random();
     info!(
@@ -346,15 +350,25 @@ fn resolve_keystore_key(addr: &str) -> Result<[u8; 32], ClientError> {
     Ok(fresh)
 }
 
-/// Drop the stored per-daemon unlock key for `addr` (keeps any transport
-/// pin). Call this when the daemon REJECTS a presented key (a `LockedError`
-/// or `CredentialAddFailed` reply) so the next resolution re-derives from the
-/// legacy files instead of replaying a key the daemon refused — in particular
-/// it un-poisons the optimistic fresh record [`resolve_keystore_key`] makes
-/// against an already-bound daemon. Returns whether the store changed.
-pub fn clear_unlock_key(addr: &str) -> Result<bool, ClientError> {
-    KnownServers::load()?.clear_unlock_key(addr)
-}
+// Why a daemon REJECTION does not delete the optimistic record: the unlock
+// key is only ever DELETED by an explicit `KnownServers::remove(addr)`
+// (documented re-pair path). The reasoning:
+//
+// 1. A CONFIRMED record can never be "wrong" later — the daemon's keystore
+//    binding is TOFU-once and never rotates, so a key the daemon once
+//    accepted keeps matching its binding forever (and if the daemon's DB is
+//    wiped it becomes unbound again and re-adopts the stored key).
+// 2. The daemon surfaces EVERY unlock-path error (including transient
+//    failures like a database read error) as `LockedError` / a rejection, so
+//    a rejection is NOT proof the key is bad. Deleting on rejection could
+//    erase a perfectly good confirmed record — and with the legacy files
+//    already deleted by migration there may be no way back.
+// 3. For the one genuinely-wrong case (an optimistic fresh key rejected by
+//    an already-bound daemon) deletion recovers nothing: a fresh key is
+//    minted precisely because no stored OR legacy key exists, so after a
+//    clear the next attempt mints yet another fresh key that is also
+//    rejected. Manual recovery via `remove(addr)` is the fix in both
+//    worlds, so the simpler survivor semantics win.
 
 /// Build an `AddCredential` message from typed field strings: parse the
 /// credential, then delegate to the shared builder (see
@@ -392,8 +406,9 @@ pub fn build_add_credential_message(
 /// [`record_unlock_key`] once the daemon CONFIRMS success (`CredentialAdded` /
 /// `Unlocked` reply) — never on send. (A freshly minted key is additionally
 /// optimistic-recorded inside [`resolve_keystore_key`], so a lost confirmation
-/// cannot orphan it; treat that record as provisional until the daemon
-/// confirms, and revert it via [`clear_unlock_key`] if the daemon rejects.)
+/// cannot orphan it. That record is PROVISIONAL until the daemon confirms, but
+/// a daemon rejection does NOT delete it — see the survivor-semantics
+/// rationale above [`resolve_keystore_key`].
 ///
 /// The caller must call [`record_unlock_key`] on confirmed success or the next
 /// add could mint a key the now-bound daemon rejects.
@@ -727,11 +742,12 @@ mod tests {
 
     /// Bug-2 regression: a freshly minted key is OPTIMISTICALLY recorded in
     /// known_servers immediately (so an interrupted `CredentialAdded` reply
-    /// cannot orphan the binding), and `clear_unlock_key` reverts that record
-    /// — which is what the UI does on a daemon rejection so an already-bound
-    /// keystore is never poisoned by a fresh key it refused.
+    /// cannot orphan the binding), and the record SURVIVES — a daemon
+    /// rejection must not delete it (the rejection may be a transient daemon
+    /// failure misreported as a key error, and a fresh key has no fallback to
+    /// re-derive from anyway). `KnownServers::remove(addr)` is the only wipe.
     #[test]
-    fn fresh_key_is_optimistically_recorded_and_clear_reverts_it() {
+    fn fresh_key_is_optimistically_recorded_and_survives_a_rejection() {
         let dir = tempfile::tempdir().unwrap();
         let _guard =
             choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
@@ -744,18 +760,16 @@ mod tests {
                 .unwrap();
         assert_eq!(msg_unlock_key(&msg), key, "message carries the minted key");
 
-        // Optimistic record is on disk before any daemon confirmation.
+        // The optimistic record is on disk before any daemon confirmation.
         let store = KnownServers::load().unwrap();
         let recorded: [u8; 32] = store.unlock_key("d:1").unwrap().expect("must be recorded");
         let key_arr: [u8; 32] = key.as_slice().try_into().unwrap();
         assert_eq!(recorded, key_arr);
 
-        // The UI clears this provisional record when the daemon rejects it.
-        assert!(clear_unlock_key("d:1").unwrap());
-        assert_eq!(
-            KnownServers::load().unwrap().unlock_key("d:1").unwrap(),
-            None
-        );
+        // There is no revert API: a reload (what the next client attempt
+        // does) still resolves the SAME key, rather than minting a new one.
+        let reloaded = KnownServers::load().unwrap();
+        assert_eq!(reloaded.unlock_key("d:1").unwrap(), Some(key_arr));
     }
 
     // ── record_unlock_key tests ────────────────────────────────────

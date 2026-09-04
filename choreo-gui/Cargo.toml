@@ -30,6 +30,8 @@ path = "src/bin/choreo-gui.rs"
 [dependencies]
 base64.workspace = true
 clap.workspace = true
+# Wipe the pending unlock key (secret material) when a rejection discards it.
+zeroize.workspace = true
 # Dioxus 0.7 Native renderer (Blitz/wgpu) instead of the desktop/webview
 # renderer: it is ALSO the Android renderer, so one renderer serves desktop and
 # aarch64-linux-android alike — there is no webview (webkit2gtk, etc.) anywhere

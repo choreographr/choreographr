@@ -25,7 +25,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 mod subscriber_handlers;
 
@@ -1283,13 +1283,15 @@ impl DaemonState {
         // Wipe decrypted credentials (and their derived providers) from memory
         // now that the keystore is locked. `credentials` holds the plaintext
         // ServiceCredentials; dropping them is what "locked" means for this
-        // daemon.
+        // daemon. Capture the count BEFORE the clear so the log reports what
+        // was actually wiped, not a hardcoded zero.
+        let credentials_cleared = self.credentials.len();
         self.credentials.clear();
         self.providers.clear();
         self.x_credentials = None;
         self.locked = true;
         info!(
-            credentials_cleared = 0,
+            credentials_cleared,
             "keystore locked: in-memory credentials cleared"
         );
         // The acting client gets its `send_to_writer` `Locked` reply from the
@@ -1326,7 +1328,11 @@ impl DaemonState {
         // Reject anything that is not exactly 32 bytes up front: the X25519
         // key derivation (and every crypto helper below) needs [u8; 32], and
         // a shorter/longer key can never be a valid unlock key.
-        let mut key: [u8; 32] = match unlock_key.as_slice().try_into() {
+        // Zeroizing makes the wipe structural: the array is zeroed on EVERY
+        // exit — the early-return error paths below, `?`, even a panic — so no
+        // per-path zeroize call can be forgotten by a future edit (this
+        // mirrors handle_unlock_inner).
+        let key = Zeroizing::new(match unlock_key.as_slice().try_into() {
             Ok(k) => k,
             Err(_) => {
                 // The rejected bytes are still secret material — wipe them so
@@ -1337,9 +1343,9 @@ impl DaemonState {
                 ));
                 return;
             }
-        };
+        });
         // Wipe the heap `Vec` copy; only the stack `key` array is used below
-        // and it is zeroized on every exit path.
+        // and the Zeroizing wrapper wipes it on every exit path.
         unlock_key.zeroize();
 
         // Adopt-or-verify BEFORE anything is written: a wrong key must not
@@ -1347,7 +1353,6 @@ impl DaemonState {
         // silently adopted. Mirrors handle_unlock_inner (shared helper — the
         // two paths cannot drift).
         if let Err(e) = adopt_or_verify_keystore_binding(self, &key) {
-            key.zeroize();
             let _ = reply.send(Err(e.to_string()));
             return;
         }
@@ -1361,7 +1366,6 @@ impl DaemonState {
             match choreo_keystore::crypto::decrypt_with_private_key(&key, &encrypted_blob) {
                 Ok(pt) => pt,
                 Err(e) => {
-                    key.zeroize();
                     warn!(
                         service = %service,
                         error = %e,
@@ -1377,7 +1381,6 @@ impl DaemonState {
         let cred: ServiceCredential = match postcard::from_bytes(&plaintext) {
             Ok(c) => c,
             Err(e) => {
-                key.zeroize();
                 let _ = reply.send(Err(format!(
                     "credential payload is not a valid ServiceCredential: {e}"
                 )));
@@ -1387,7 +1390,6 @@ impl DaemonState {
 
         // Persist to DB only after both checks passed.
         if let Err(e) = db::set_credential_blob(&self.db, &service, &encrypted_blob) {
-            key.zeroize();
             let _ = reply.send(Err(format!("failed to save credential: {e}")));
             return;
         }
@@ -1406,7 +1408,6 @@ impl DaemonState {
             self.resolve_account_provider(&service, Some(api_key.clone()));
         }
         let result = unlock_tail(self, &key);
-        key.zeroize();
         if let Err(e) = result {
             // The blob IS persisted and the binding holds — only the tail
             // (accounts load / bulk decrypt) failed. Report it rather than
@@ -2323,7 +2324,10 @@ impl DaemonState {
 }
 
 fn handle_unlock_inner(state: &mut DaemonState, mut private_key: Vec<u8>) -> io::Result<()> {
-    let mut key: [u8; 32] = match private_key.as_slice().try_into() {
+    // Zeroizing makes the wipe structural: the stack array is zeroed on EVERY
+    // exit — early returns, the `?` operator, even a panic — so no per-path
+    // zeroize call can be forgotten by a future edit.
+    let key = Zeroizing::new(match private_key.as_slice().try_into() {
         Ok(k) => k,
         Err(_) => {
             // The presented bytes are unusable, but still secret material —
@@ -2332,28 +2336,21 @@ fn handle_unlock_inner(state: &mut DaemonState, mut private_key: Vec<u8>) -> io:
             private_key.zeroize();
             return Err(io::Error::other("invalid private key: expected 32 bytes"));
         }
-    };
+    });
     // Wipe the heap `Vec` copy as soon as the stack array exists; only `key`
-    // is used below and it is zeroized on every exit path.
+    // is used below and the Zeroizing wrapper wipes it on every exit path.
     private_key.zeroize();
 
     // TOFU adopt-or-verify against the persisted keystore binding. A locked
     // daemon presents its key on every Unlock; once a key is bound, any key
     // whose derived public key differs is REJECTED (surfaces as LockedError)
     // instead of unlocking with wrong credentials.
-    if let Err(e) = adopt_or_verify_keystore_binding(state, &key) {
-        // Guard the early return so `key` is wiped even when the binding
-        // rejects this key.
-        key.zeroize();
-        return Err(e);
-    }
+    adopt_or_verify_keystore_binding(state, &key)?;
 
     // Shared bulk-decrypt + accounts-load + provider-resolve tail — the same
     // code path `AddCredential` runs as its implicit unlock, so the two
     // paths cannot drift.
-    let result = unlock_tail(state, &key);
-    key.zeroize();
-    result
+    unlock_tail(state, &key)
 }
 
 /// TOFU keystore-binding enforcement, shared by `Unlock` and
