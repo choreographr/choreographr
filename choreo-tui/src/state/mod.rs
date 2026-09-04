@@ -362,14 +362,12 @@ pub(crate) struct App {
     /// cleared by the per-keypress transient status/error clear, so the lock
     /// indication survives every keystroke.
     pub(crate) keystore_locked: bool,
-    /// Whether a `BindKeystore` has been sent on THIS connection. Auto-bind
-    /// is a once-per-connection action: the unbound state is discovered from
-    /// either the subscribe-time lock-state push or a `KeystoreUnbound` reply
-    /// to the auto-unlock attempt, and if the bind's own `Bound` confirmation
-    /// is lost (or another `KeystoreUnbound` somehow arrives) re-binding would
-    /// mint and record a new key against a daemon we no longer understand —
-    /// so the second report only surfaces an error.
-    pub(crate) keystore_bind_attempted: bool,
+    /// Once-per-connection keystore auto-bind state machine (shared policy in
+    /// `choreo_client_core`, so TUI and GUI cannot drift): the first
+    /// `KeystoreUnbound` report mints+sends a bind, later ones surface an
+    /// error instead of re-minting (bind-loop guard — see
+    /// [`choreo_client_core::KeystoreAutoBind`]).
+    pub(crate) keystore_auto_bind: choreo_client_core::KeystoreAutoBind,
     pub(crate) page: Page,
     pub(crate) show_ctrl_help: bool,
     /// Whether the terminal implemented the kitty keyboard protocol we push
@@ -531,8 +529,12 @@ impl App {
             // Assume locked until the daemon tells us otherwise (via the
             // subscribe-time lock-state push or a transition broadcast).
             keystore_locked: true,
-            // No bind sent yet on this connection (see the field docs).
-            keystore_bind_attempted: false,
+            // No bind sent yet on this connection (see the field docs). The
+            // latch lives for the whole `App` — `App::new()` runs once per
+            // `run_app` (per process, i.e. per daemon connection), and the
+            // UI loop does not rebuild `App` on reader errors, so
+            // re-connecting means restarting the TUI with fresh state.
+            keystore_auto_bind: choreo_client_core::KeystoreAutoBind::new(),
             page: Page::Chat,
             show_ctrl_help: true,
             keyboard_enhanced: true,

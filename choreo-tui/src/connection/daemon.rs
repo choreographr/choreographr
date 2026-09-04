@@ -1,9 +1,7 @@
 use super::{SessionUpdateRouting, route_session_update};
 use crate::state::{App, Page, ProviderInfo, merge_token_usage};
 use crate::terminal_progress;
-use choreo_client_core::{
-    ClientError, bind_fresh_daemon, dispatch_daemon_message, record_unlock_key,
-};
+use choreo_client_core::{ClientError, dispatch_daemon_message, record_unlock_key};
 use choreo_proto::{ClientMessage, DaemonMessage, RefreshStatus, SessionEvent};
 use zeroize::Zeroize;
 
@@ -666,44 +664,45 @@ pub(crate) fn handle_daemon_message(
         // `Bound`, which the arm above treats like `Unlocked`.
         DaemonMessage::KeystoreUnbound { .. } => {
             app.keystore_locked = true;
+            // The stale verify key belongs to THIS frontend's pending-key
+            // lifecycle: drop it (zeroized) BEFORE the shared state machine
+            // runs, so the minted bind key can be held pending afterwards.
             discard_rejected_unlock_key(app);
             // Distinct guidance: this is not "wrong key" but "never bound" —
             // the fix is automatic, not something the user must do.
             app.status = Some(
                 "keystore not initialized — a binding will be created automatically".to_string(),
             );
-            if app.keystore_bind_attempted {
-                // Bind-loop guard: one bind attempt per connection. A second
-                // `KeystoreUnbound` after our bind was sent means the
-                // confirmation was lost or the daemon re-keyed — re-minting
-                // would churn bindings unpredictably, so surface an error
-                // and leave the connection as-is.
-                tracing::warn!("keystore still unbound after a bind attempt; not re-binding");
-                app.error = Some(
-                    "[daemon] keystore still unbound after bind attempt — reconnect to retry"
-                        .to_string(),
-                );
-            } else {
-                app.keystore_bind_attempted = true;
-                match bind_fresh_daemon(&app.connection_addr) {
-                    Ok((key, msg)) => {
-                        tracing::info!(
-                            addr = %app.connection_addr,
-                            "auto-binding unbound daemon with a fresh key"
-                        );
-                        // The minted key is held pending so the `Bound`
-                        // confirmation records it through the SAME path as an
-                        // `Unlocked` — one confirm flow for all three senders.
-                        app.pending_unlock_key = Some(key.to_vec());
-                        let _ = client_tx.send(msg);
-                    }
-                    Err(e) => {
-                        // Persist failure (refused pre-send) or store errors:
-                        // the daemon stays unbound and locked; the user can
-                        // reconnect to retry.
-                        tracing::warn!(addr = %app.connection_addr, %e, "auto-bind failed");
-                        app.error = Some(format!("[error] auto-bind failed: {e}"));
-                    }
+            // The once-per-connection latch and the mint+pre-send-record live
+            // in the shared `choreo_client_core` state machine so the TUI and
+            // GUI cannot drift on the bind-loop policy.
+            match app.keystore_auto_bind.on_unbound(&app.connection_addr) {
+                Ok(Some((key, msg))) => {
+                    tracing::info!(
+                        addr = %app.connection_addr,
+                        "auto-binding unbound daemon with a fresh key"
+                    );
+                    // The minted key is held pending so the `Bound`
+                    // confirmation records it through the SAME path as an
+                    // `Unlocked` — one confirm flow for all three senders.
+                    app.pending_unlock_key = Some(key.to_vec());
+                    let _ = client_tx.send(msg);
+                }
+                // Bind-loop guard: a second `KeystoreUnbound` after our bind
+                // was sent means the confirmation was lost or the daemon
+                // re-keyed — surface an error, leave the connection as-is.
+                Ok(None) => {
+                    app.error = Some(
+                        "[daemon] keystore still unbound after bind attempt — reconnect to retry"
+                            .to_string(),
+                    );
+                }
+                // Persist failure (refused pre-send) or store errors: the
+                // daemon stays unbound and locked; the user can reconnect
+                // to retry.
+                Err(e) => {
+                    tracing::warn!(addr = %app.connection_addr, %e, "auto-bind failed");
+                    app.error = Some(format!("[error] auto-bind failed: {e}"));
                 }
             }
         }
@@ -853,21 +852,9 @@ mod tests {
 
     // ── auto-bind (Bound / KeystoreUnbound) tests ──────────────────────
 
-    /// Isolate known_servers writes (the bind confirm path persists the
-    /// pending key) in a temp config root. Returns the TempDir AND the
-    /// override guard — the guard must stay alive for the whole test or the
-    /// thread-local override resets and writes hit the real config dir.
-    fn isolate_config() -> (tempfile::TempDir, choreo_keystore::paths::TestConfigGuard) {
-        let dir = tempfile::tempdir().unwrap();
-        let guard =
-            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-        (dir, guard)
-    }
-
     #[test]
     fn bound_message_clears_lock_and_records_pending_key() {
-        let (_dir, _guard) = isolate_config();
+        let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
         let mut app = test_app();
         app.keystore_locked = true;
         app.connection_addr = "bound-test:1".to_string();
@@ -891,7 +878,7 @@ mod tests {
 
     #[test]
     fn keystore_unbound_auto_binds_once_per_connection() {
-        let (_dir, _guard) = isolate_config();
+        let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
         let mut app = test_app();
         app.keystore_locked = false; // daemon had been thought unlocked
         app.connection_addr = "unbound-test:1".to_string();
@@ -910,7 +897,7 @@ mod tests {
         .unwrap();
 
         assert!(app.keystore_locked, "unbound latches the lock-ish banner");
-        assert!(app.keystore_bind_attempted, "the bind is latched");
+        assert!(app.keystore_auto_bind.attempted(), "the bind is latched");
         assert!(app.pending_unlock_key.is_some(), "minted key held pending");
         // Exactly one BindKeystore sent, carrying the key that was recorded
         // into known_servers PRE-SEND.
@@ -948,7 +935,7 @@ mod tests {
         // The full connect-time unbound flow: KeystoreUnbound mints+sends the
         // bind, the daemon replies Bound, and the connection ends up unlocked
         // with the minted key recorded.
-        let (_dir, _guard) = isolate_config();
+        let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
         let mut app = test_app();
         app.connection_addr = "e2e-bind:1".to_string();
 

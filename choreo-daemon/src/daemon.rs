@@ -123,28 +123,18 @@ pub struct DaemonState {
 /// auto-bind) instead of the generic wrong-key `LockedError`. Kept as an enum
 /// rather than a string sentinel because string matching on error text is how
 /// such distinctions silently rot.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum KeystoreOpError {
     /// The daemon's keystore has no binding at all: verify-only operations
     /// (Unlock / AddCredential) must not adopt a key, so they fail with this.
+    #[error(
+        "keystore not initialized — no key is bound to this daemon yet; it will be bound automatically on next client connect"
+    )]
     Unbound,
     /// Any other failure (wrong key, DB I/O, invalid key length, …).
+    #[error("{0}")]
     Other(String),
 }
-
-impl std::fmt::Display for KeystoreOpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KeystoreOpError::Unbound => write!(
-                f,
-                "keystore not initialized — no key is bound to this daemon yet; \
-                 it will be bound automatically on next client connect"
-            ),
-            KeystoreOpError::Other(e) => write!(f, "{e}"),
-        }
-    }
-}
-
 pub enum DaemonCommand {
     Shutdown,
     CreateSession {

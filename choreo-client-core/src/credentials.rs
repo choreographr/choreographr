@@ -294,6 +294,82 @@ pub fn build_add_credential_message(
     result
 }
 
+/// One-per-connection keystore AUTO-BIND state machine, shared by the TUI and
+/// GUI frontends so they cannot drift apart on the bind-loop policy.
+///
+/// WHY a latch at all: a `KeystoreUnbound` report can arrive twice on one
+/// connection (subscribe-time lock-state push, then the reply to a failed
+/// auto-unlock). Minting a fresh key per report would churn bindings against
+/// a daemon we no longer understand, so only the FIRST report triggers a
+/// bind; later ones are surfaced by the caller as an error — reconnecting is
+/// the retry path, not re-minting.
+///
+/// The latch lives HERE, not in the frontend state, because the policy
+/// ("at most one bind attempt per connection") is shared and easy to get
+/// subtly wrong — exactly the kind of duplication the hoist exists to kill.
+/// `Clone`/`Copy` so frontends whose state types derive them can embed it;
+/// the latch is a plain bool, so clones behave exactly as expected.
+#[derive(Clone, Copy, Debug)]
+pub struct KeystoreAutoBind {
+    /// Whether a `BindKeystore` has already been minted on this connection.
+    /// Single-bit, never reset: the connection must be re-established to
+    /// clear it (the frontends hold this struct in per-connection state).
+    attempted: bool,
+}
+
+impl Default for KeystoreAutoBind {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeystoreAutoBind {
+    /// Fresh state for a new connection: no bind attempted yet.
+    pub fn new() -> Self {
+        Self { attempted: false }
+    }
+
+    /// Test/diagnostic accessor: has a bind already been attempted?
+    pub fn attempted(&self) -> bool {
+        self.attempted
+    }
+
+    /// Handle a `KeystoreUnbound` report from the daemon.
+    ///
+    /// - `Ok(Some((key, message)))` — FIRST report on this connection: a
+    ///   fresh key was minted and recorded into known_servers PRE-SEND (see
+    ///   [`bind_fresh_daemon`] for why pre-send recording is mandatory) and
+    ///   the caller MUST send `message` and hold `key` pending for the
+    ///   targeted `Bound` confirmation.
+    /// - `Ok(None)` — a bind was already attempted; do NOT re-bind (the
+    ///   bind-loop guard). The caller surfaces its own error UI.
+    /// - `Err(ClientError)` — the pre-send store write was refused; no
+    ///   `BindKeystore` exists, so sending nothing is the only safe outcome.
+    ///   The latch stays set: a store that refused once is not going to
+    ///   accept on the next report, and the caller's reconnect path retries
+    ///   with fresh state.
+    pub fn on_unbound(
+        &mut self,
+        addr: &str,
+    ) -> Result<Option<([u8; 32], ClientMessage)>, ClientError> {
+        if self.attempted {
+            // Bind-loop guard: never re-mint against a daemon that is still
+            // unbound after one bind. Re-minting could overwrite a binding
+            // whose confirmation was merely lost in flight.
+            warn!(
+                addr,
+                "keystore still unbound after a bind attempt; not re-binding"
+            );
+            return Ok(None);
+        }
+        // Set the latch BEFORE the mint: a bind is "attempted" from the
+        // moment we commit to one, so a failure path still counts as the
+        // connection's one attempt.
+        self.attempted = true;
+        bind_fresh_daemon(addr).map(Some)
+    }
+}
+
 /// Build an `AddCredential` message from an already-parsed credential, by
 /// resolving the daemon's unlock key and encrypting the serialized blob to the
 /// public key derived from that key.
@@ -762,5 +838,74 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
 
         assert!(record_unlock_key("d:1", b"short").is_err());
+    }
+
+    // ── KeystoreAutoBind tests ─────────────────────────────────────
+
+    #[test]
+    fn auto_bind_first_call_binds_and_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard =
+            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
+
+        let mut bind = KeystoreAutoBind::new();
+        assert!(!bind.attempted());
+        let (key, msg) = bind
+            .on_unbound("bind-test:1")
+            .unwrap()
+            .expect("first call binds");
+        assert!(bind.attempted(), "the latch is set after the first report");
+
+        // The minted key is recorded into known_servers PRE-SEND, and the
+        // returned message carries exactly that key.
+        let ClientMessage::BindKeystore { key: sent } = msg else {
+            panic!("auto-bind must produce BindKeystore");
+        };
+        assert_eq!(sent, key.to_vec());
+        let store = KnownServers::load().unwrap();
+        assert_eq!(store.unlock_key("bind-test:1").unwrap(), Some(key));
+    }
+
+    #[test]
+    fn auto_bind_second_call_never_rebinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard =
+            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
+
+        let mut bind = KeystoreAutoBind::new();
+        let (first_key, _) = bind
+            .on_unbound("bind-test:2")
+            .unwrap()
+            .expect("first call binds");
+
+        // A second report must return Ok(None) — no re-bind, and the
+        // known_servers record is untouched (same key as the first bind).
+        assert!(bind.on_unbound("bind-test:2").unwrap().is_none());
+        let store = KnownServers::load().unwrap();
+        assert_eq!(
+            store.unlock_key("bind-test:2").unwrap(),
+            Some(first_key),
+            "the recorded key is never replaced by a second report"
+        );
+    }
+
+    #[test]
+    fn auto_bind_store_failure_propagates_and_latches() {
+        // Point the config root at an existing FILE: config_dir() resolves to
+        // `<file>/choreographr`, which cannot be created, so the mandatory
+        // pre-send store write fails and the bind is refused.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        let _guard = choreo_keystore::paths::TestConfigGuard::set_root(Some(blocker.clone()));
+
+        let mut bind = KeystoreAutoBind::new();
+        // The error must propagate, not be swallowed into a bind.
+        let _err = bind.on_unbound("bind-fail:1").unwrap_err();
+        // The failed attempt still consumed the connection's one bind.
+        assert!(bind.attempted());
+        assert!(bind.on_unbound("bind-fail:1").unwrap().is_none());
     }
 }

@@ -28,3 +28,6 @@ ammonia.workspace = true
 # unstable); see the workspace-level comment. Unix-only builds never compile it.
 [target.'cfg(windows)'.dependencies]
 uds_windows.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

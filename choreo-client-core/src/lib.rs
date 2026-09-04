@@ -7,6 +7,12 @@ pub mod history;
 pub mod known_servers;
 pub mod shell;
 
+// Test-only fixtures, compiled solely when a dependent crate opts into the
+// `test-support` feature (see the module docs for why it must stay off in
+// production builds).
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 pub use choreo_transport::key::{fingerprint, read_server_pk};
 pub use connection::{
     ConnectionMode, PreflightError, own_transport_pubkey, probe_server_key, run_daemon_connection,
@@ -15,8 +21,8 @@ pub use connection::{
     verify_daemon_authorization,
 };
 pub use credentials::{
-    bind_fresh_daemon, build_add_credential_from_credential, build_add_credential_message,
-    record_unlock_key, resolve_private_key, try_auto_unlock_key,
+    KeystoreAutoBind, bind_fresh_daemon, build_add_credential_from_credential,
+    build_add_credential_message, record_unlock_key, resolve_private_key, try_auto_unlock_key,
 };
 pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 pub use dispatch::{SessionStateData, ToolCallEvent, TurnEventHandler, dispatch_daemon_message};

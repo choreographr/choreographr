@@ -49,6 +49,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Pulls in the shared test-only config-root fixture from choreo-client-core.
+choreo-client-core = { workspace = true, features = ["test-support"] }
 
 # Android-only entry glue (see android_main in lib.rs): android-activity gives
 # us the `AndroidApp` argument type of the `android_main` symbol the native

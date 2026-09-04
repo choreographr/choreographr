@@ -1,6 +1,6 @@
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{
-    ClientError, ConnectionMode, ShellCommand, bind_fresh_daemon, build_add_credential_message,
+    ClientError, ConnectionMode, ShellCommand, build_add_credential_message,
     dispatch_daemon_message, parse_input_line, record_unlock_key, resolve_private_key,
     run_daemon_connection_with_mode, shell_command_echo,
 };
@@ -286,35 +286,42 @@ pub(crate) fn apply_daemon_message(
         // exactly like `Unlocked`. A second `KeystoreUnbound` after the bind
         // was sent is surfaced as an error, never a re-bind (bind-loop guard).
         DaemonMessage::KeystoreUnbound { .. } => {
+            // The stale verify key belongs to THIS frontend's pending-key
+            // lifecycle: drop it (zeroized) BEFORE the shared state machine
+            // runs, so the minted bind key can be held pending afterwards.
             if let Some(mut key) = state.pending_unlock_key.take() {
                 key.zeroize();
                 tracing::info!(
                     "daemon keystore is unbound; discarding the verify-only pending key"
                 );
             }
-            if state.keystore_bind_attempted {
-                tracing::warn!("keystore still unbound after a bind attempt; not re-binding");
-                state.status_texts.push(
-                    "[daemon] keystore still unbound after bind attempt — reconnect to \
-                           retry"
-                        .to_string(),
-                );
-            } else {
-                state.keystore_bind_attempted = true;
-                match bind_fresh_daemon(&connection_addr()) {
-                    Ok((key, msg)) => {
-                        tracing::info!("auto-binding unbound daemon with a fresh key");
-                        // Same pending-confirm flow as Unlock/AddCredential:
-                        // the `Bound` reply records the minted key.
-                        state.pending_unlock_key = Some(key.to_vec());
-                        send_client_message(state, daemon_tx, msg);
-                    }
-                    Err(e) => {
-                        tracing::warn!(%e, "auto-bind failed");
-                        state
-                            .status_texts
-                            .push(format!("[error] auto-bind failed: {e}"));
-                    }
+            // The once-per-connection latch and the mint+pre-send-record live
+            // in the shared `choreo_client_core` state machine so the TUI and
+            // GUI cannot drift on the bind-loop policy.
+            match state.keystore_auto_bind.on_unbound(&connection_addr()) {
+                Ok(Some((key, msg))) => {
+                    tracing::info!("auto-binding unbound daemon with a fresh key");
+                    // Same pending-confirm flow as Unlock/AddCredential:
+                    // the `Bound` reply records the minted key.
+                    state.pending_unlock_key = Some(key.to_vec());
+                    send_client_message(state, daemon_tx, msg);
+                }
+                // Bind-loop guard: a second `KeystoreUnbound` after our bind
+                // was sent means the confirmation was lost or the daemon
+                // re-keyed — surface an error, leave the connection as-is.
+                Ok(None) => {
+                    state.status_texts.push(
+                        "[daemon] keystore still unbound after bind attempt — reconnect to retry"
+                            .to_string(),
+                    );
+                }
+                // Persist failure (refused pre-send) or store errors: the
+                // daemon stays unbound; the user can reconnect to retry.
+                Err(e) => {
+                    tracing::warn!(%e, "auto-bind failed");
+                    state
+                        .status_texts
+                        .push(format!("[error] auto-bind failed: {e}"));
                 }
             }
         }

@@ -1,4 +1,6 @@
-use choreo_client_core::{SessionStateData, SessionView, ToolCallEvent, TurnEventHandler};
+use choreo_client_core::{
+    KeystoreAutoBind, SessionStateData, SessionView, ToolCallEvent, TurnEventHandler,
+};
 use choreo_proto::{OutputStream, SessionStatus, TokenUsage, Turn};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -26,11 +28,12 @@ pub(crate) struct AppState {
     /// [`choreo_client_core::record_unlock_key`]. Never persisted on send —
     /// only on confirmed success. Cleared once recorded (or on any send).
     pub(crate) pending_unlock_key: Option<Vec<u8>>,
-    /// Whether a `BindKeystore` was already sent on this connection — the
-    /// auto-bind of an unbound keystore happens AT MOST ONCE per connection
-    /// (a repeat `KeystoreUnbound` after the bind was sent is surfaced as an
-    /// error, never a re-bind).
-    pub(crate) keystore_bind_attempted: bool,
+    /// Once-per-connection keystore auto-bind state machine (shared policy in
+    /// `choreo_client_core`, so TUI and GUI cannot drift): the first
+    /// `KeystoreUnbound` report mints+sends a bind, later ones surface an
+    /// error instead of re-minting (bind-loop guard — see
+    /// [`choreo_client_core::KeystoreAutoBind`]).
+    pub(crate) keystore_auto_bind: KeystoreAutoBind,
 }
 
 impl AppState {
@@ -43,7 +46,12 @@ impl AppState {
             pending_cancel: String::new(),
             attached_session_id: None,
             pending_unlock_key: None,
-            keystore_bind_attempted: false,
+            // No bind sent yet on this connection (see the field docs). The
+            // latch lives for the whole `AppState` — it is constructed once
+            // in the root component's `use_signal` (per process, i.e. per
+            // daemon connection) and is not rebuilt if the reader thread
+            // fails; re-connecting means relaunching with fresh state.
+            keystore_auto_bind: KeystoreAutoBind::new(),
         }
     }
 }

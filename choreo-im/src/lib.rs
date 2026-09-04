@@ -74,111 +74,10 @@ pub fn main() -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
 
-    // Auto-unlock with the key ALREADY associated with this daemon: the
-    // stored known_servers unlock_key (falling back to the legacy raw
-    // identity.pk file, which is copied into the store). There is no
-    // passphrase unlock here — identity.pk.enc decryption was removed.
-    //
-    // Unlock is VERIFY-ONLY: on an unbound daemon it answers
-    // `KeystoreUnbound` (a supplied key can never create the binding), and
-    // this bridge then AUTO-BINDS — `bind_fresh_daemon` mints a fresh key,
-    // records it into known_servers PRE-SEND, and the daemon replies `Bound`
-    // once it adopted the key and unlocked.
-    //
-    // With NO key available we still PROBE with a fresh bind: `BindKeystore`
-    // on an already-bound keystore is verify-only (a mismatch is rejected
-    // with `LockedError`, the binding is never overwritten), so this is safe
-    // — it only ever creates a binding that did not exist, and pre-send
-    // recording cannot clobber a key that does not resolve anyway.
-    if let Some(private_key) = choreo_client_core::try_auto_unlock_key(&path) {
-        info!("unlocking daemon with stored unlock key");
-        write_message(&mut writer, &ClientMessage::Unlock { private_key })
-            .context("failed to send unlock message")?;
-        writer.flush().context("failed to flush unlock message")?;
-        match read_message::<_, DaemonMessage>(&mut reader) {
-            Ok(DaemonMessage::Unlocked) => {
-                info!("daemon unlocked");
-            }
-            Ok(DaemonMessage::KeystoreUnbound { error }) => {
-                // Unbound daemon: the stored key was a verify attempt that
-                // cannot succeed. Mint a fresh binding key and send it.
-                info!(%error, "daemon keystore unbound — auto-binding with a fresh key");
-                let (_key, bind_msg) = choreo_client_core::bind_fresh_daemon(&path)
-                    .context("failed to mint and record a fresh bind key")?;
-                write_message(&mut writer, &bind_msg).context("failed to send bind message")?;
-                writer.flush().context("failed to flush bind message")?;
-                match read_message::<_, DaemonMessage>(&mut reader) {
-                    // `Bound` is the unlock confirmation for a bind (the
-                    // daemon ran the shared unlock tail after adopting the
-                    // key) — accept it exactly like `Unlocked`.
-                    Ok(DaemonMessage::Bound) => {
-                        info!("daemon keystore bound and unlocked");
-                    }
-                    Ok(DaemonMessage::KeystoreUnbound { error: bind_err }) => {
-                        error!(%bind_err, "bind failed: keystore still unbound");
-                        bail!("bind failed: {bind_err}");
-                    }
-                    Ok(DaemonMessage::LockedError { error: bind_err }) => {
-                        error!(%bind_err, "bind failed");
-                        bail!("bind failed: {bind_err}");
-                    }
-                    Ok(other) => {
-                        error!(?other, "unexpected response to bind");
-                        bail!("unexpected response to bind: {other:?}");
-                    }
-                    Err(e) => {
-                        error!(%e, "failed to read bind response");
-                        bail!("failed to read bind response: {e}");
-                    }
-                }
-            }
-            Ok(DaemonMessage::LockedError { error: unlock_err }) => {
-                error!(%unlock_err, "unlock failed");
-                bail!(
-                    "unlock failed: {unlock_err} — the daemon is bound to a key this client \
-                     does not hold; re-pair it via the TUI"
-                );
-            }
-            Ok(other) => {
-                error!(?other, "unexpected response to unlock");
-                bail!("unexpected response to unlock: {other:?}");
-            }
-            Err(e) => {
-                error!(%e, "failed to read unlock response");
-                bail!("failed to read unlock response: {e}");
-            }
-        }
-    } else {
-        // No stored/legacy key: probe the daemon with a fresh bind. An
-        // UNBOUND daemon adopts it and replies `Bound` (now unlocked); a
-        // BOUND daemon rejects the mismatch and stays locked — we fall
-        // through to GetCredential, which fails with the unlock guidance.
-        let (_key, bind_msg) = choreo_client_core::bind_fresh_daemon(&path)
-            .context("failed to mint and record a fresh bind key")?;
-        info!("no stored unlock key — probing daemon with a fresh bind");
-        write_message(&mut writer, &bind_msg).context("failed to send bind message")?;
-        writer.flush().context("failed to flush bind message")?;
-        match read_message::<_, DaemonMessage>(&mut reader) {
-            Ok(DaemonMessage::Bound) => {
-                info!("daemon keystore bound and unlocked");
-            }
-            Ok(DaemonMessage::LockedError { error }) => {
-                info!(%error, "daemon is bound to a key this client does not hold");
-            }
-            Ok(DaemonMessage::KeystoreUnbound { error }) => {
-                error!(%error, "bind rejected against an unbound keystore");
-                bail!("bind failed: {error}");
-            }
-            Ok(other) => {
-                error!(?other, "unexpected response to bind probe");
-                bail!("unexpected response to bind probe: {other:?}");
-            }
-            Err(e) => {
-                error!(%e, "failed to read bind probe response");
-                bail!("failed to read bind probe response: {e}");
-            }
-        }
-    }
+    // Establish the keystore (auto-unlock / auto-bind / probe-bind) before
+    // asking for a credential; extracted verbatim from this function so the
+    // flow is testable over any socket pair.
+    establish_keystore(&path, &mut reader, &mut writer)?;
 
     info!(%platform, "requesting credential from daemon");
     write_message(
@@ -213,6 +112,127 @@ pub fn main() -> anyhow::Result<()> {
         Err(e) => {
             error!(%e, "failed to read credential response");
             bail!("failed to read credential response: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Connect-time keystore establishment: auto-unlock with the stored/legacy
+/// key (verify-only), auto-bind on `KeystoreUnbound`, probe-bind when no key
+/// resolves. Returns once the daemon is unlocked or the probe fell through.
+///
+/// Generic over the socket's read/write halves so both std and `uds_windows`
+/// Unix streams fit (they implement the same std traits); this keeps the code
+/// cfg-independent instead of forking on `#[cfg(windows)]`.
+pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
+    addr: &str,
+    mut reader: &mut BufReader<R>,
+    mut writer: &mut BufWriter<W>,
+) -> anyhow::Result<()> {
+    // Auto-unlock with the key ALREADY associated with this daemon: the
+    // stored known_servers unlock_key (falling back to the legacy raw
+    // identity.pk file, which is copied into the store). There is no
+    // passphrase unlock here — identity.pk.enc decryption was removed.
+    //
+    // Unlock is VERIFY-ONLY: on an unbound daemon it answers
+    // `KeystoreUnbound` (a supplied key can never create the binding), and
+    // this bridge then AUTO-BINDS — `bind_fresh_daemon` mints a fresh key,
+    // records it into known_servers PRE-SEND, and the daemon replies `Bound`
+    // once it adopted the key and unlocked.
+    //
+    // With NO key available we still PROBE with a fresh bind: `BindKeystore`
+    // on an already-bound keystore is verify-only (a mismatch is rejected
+    // with `LockedError`, the binding is never overwritten), so this is safe
+    // — it only ever creates a binding that did not exist, and pre-send
+    // recording cannot clobber a key that does not resolve anyway.
+    if let Some(private_key) = choreo_client_core::try_auto_unlock_key(addr) {
+        info!("unlocking daemon with stored unlock key");
+        write_message(&mut writer, &ClientMessage::Unlock { private_key })
+            .context("failed to send unlock message")?;
+        writer.flush().context("failed to flush unlock message")?;
+        match read_message::<_, DaemonMessage>(&mut reader) {
+            Ok(DaemonMessage::Unlocked) => {
+                info!("daemon unlocked");
+            }
+            Ok(DaemonMessage::KeystoreUnbound { error }) => {
+                // Unbound daemon: the stored key was a verify attempt that
+                // cannot succeed. Mint a fresh binding key and send it.
+                info!(%error, "daemon keystore unbound — auto-binding with a fresh key");
+                let (_key, bind_msg) = choreo_client_core::bind_fresh_daemon(addr)
+                    .context("failed to mint and record a fresh bind key")?;
+                write_message(&mut writer, &bind_msg).context("failed to send bind message")?;
+                writer.flush().context("failed to flush bind message")?;
+                match read_message::<_, DaemonMessage>(&mut reader) {
+                    // `Bound` is the unlock confirmation for a bind (the
+                    // daemon ran the shared unlock tail after adopting the
+                    // key) — accept it exactly like `Unlocked`.
+                    Ok(DaemonMessage::Bound) => {
+                        info!("daemon keystore bound and unlocked");
+                    }
+                    Ok(DaemonMessage::KeystoreUnbound { error: bind_err }) => {
+                        error!(%bind_err, "bind failed: keystore still unbound");
+                        bail!("bind failed: {bind_err}");
+                    }
+                    Ok(DaemonMessage::LockedError { error: bind_err }) => {
+                        error!(%bind_err, "bind failed");
+                        bail!("bind failed: {bind_err}");
+                    }
+                    Ok(other) => {
+                        error!(?other, "unexpected response to bind");
+                        bail!("unexpected response to bind: {other:?}");
+                    }
+                    Err(e) => {
+                        error!(%e, "failed to read bind response");
+                        bail!("failed to read bind response: {e}");
+                    }
+                }
+            }
+            Ok(DaemonMessage::LockedError { error: unlock_err }) => {
+                error!(%unlock_err, "unlock failed");
+                bail!(
+                    "unlock failed: {unlock_err} — the daemon is bound to a key this client \
+                 does not hold; re-pair it via the TUI"
+                );
+            }
+            Ok(other) => {
+                error!(?other, "unexpected response to unlock");
+                bail!("unexpected response to unlock: {other:?}");
+            }
+            Err(e) => {
+                error!(%e, "failed to read unlock response");
+                bail!("failed to read unlock response: {e}");
+            }
+        }
+    } else {
+        // No stored/legacy key: probe the daemon with a fresh bind. An
+        // UNBOUND daemon adopts it and replies `Bound` (now unlocked); a
+        // BOUND daemon rejects the mismatch and stays locked — we fall
+        // through to GetCredential, which fails with the unlock guidance.
+        let (_key, bind_msg) = choreo_client_core::bind_fresh_daemon(addr)
+            .context("failed to mint and record a fresh bind key")?;
+        info!("no stored unlock key — probing daemon with a fresh bind");
+        write_message(&mut writer, &bind_msg).context("failed to send bind message")?;
+        writer.flush().context("failed to flush bind message")?;
+        match read_message::<_, DaemonMessage>(&mut reader) {
+            Ok(DaemonMessage::Bound) => {
+                info!("daemon keystore bound and unlocked");
+            }
+            Ok(DaemonMessage::LockedError { error }) => {
+                info!(%error, "daemon is bound to a key this client does not hold");
+            }
+            Ok(DaemonMessage::KeystoreUnbound { error }) => {
+                error!(%error, "bind rejected against an unbound keystore");
+                bail!("bind failed: {error}");
+            }
+            Ok(other) => {
+                error!(?other, "unexpected response to bind probe");
+                bail!("unexpected response to bind probe: {other:?}");
+            }
+            Err(e) => {
+                error!(%e, "failed to read bind probe response");
+                bail!("failed to read bind probe response: {e}");
+            }
         }
     }
 

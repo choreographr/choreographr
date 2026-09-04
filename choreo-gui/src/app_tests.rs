@@ -231,20 +231,9 @@ fn handle_redo_sends_redo_message() {
 
 // ── Keystore bind/unlock flow ─────────────────────────────────────
 
-/// Isolate known_servers writes (bind pre-send recording and the Bound
-/// confirmation record) in a temp config root. Returns the TempDir AND the
-/// override guard — the guard must stay alive for the whole test or the
-/// thread-local override resets and writes hit the real config dir.
-fn isolate_config() -> (tempfile::TempDir, choreo_keystore::paths::TestConfigGuard) {
-    let dir = tempfile::tempdir().unwrap();
-    let guard = choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-    std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-    (dir, guard)
-}
-
 #[test]
 fn bound_message_records_the_pending_key() {
-    let (_dir, _guard) = isolate_config();
+    let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
     let mut state = AppState::new("/tmp/choreographr.sock".to_string());
     state.pending_unlock_key = Some(vec![3u8; 32]);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -264,7 +253,7 @@ fn bound_message_records_the_pending_key() {
 
 #[test]
 fn keystore_unbound_auto_binds_once() {
-    let (_dir, _guard) = isolate_config();
+    let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
     let mut state = AppState::new("/tmp/choreographr.sock".to_string());
     // A stale verify-only pending key must be discarded by the unbound arm.
     state.pending_unlock_key = Some(vec![5u8; 32]);
@@ -278,7 +267,7 @@ fn keystore_unbound_auto_binds_once() {
         Some(tx.clone()),
     )
     .unwrap();
-    assert!(state.keystore_bind_attempted, "bind attempt latched");
+    assert!(state.keystore_auto_bind.attempted(), "bind attempt latched");
     assert!(
         state.pending_unlock_key.is_some(),
         "minted key held pending"

@@ -64,3 +64,5 @@ tempfile.workspace = true
 # Unit tests construct `PreflightError::Rejected(TransportError)` to pin the
 # preflight failure message's wording without a network.
 choreo-transport.workspace = true
+# Pulls in the shared test-only config-root fixture from choreo-client-core.
+choreo-client-core = { workspace = true, features = ["test-support"] }
