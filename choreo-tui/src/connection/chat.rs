@@ -138,8 +138,8 @@ pub(super) fn handle_chat_event(
                                     "[choreo-tui] prompt rejected client-side: daemon keystore locked"
                                 );
                                 app.status = Some(
-                                    "daemon is locked — unlock it first (/unlock <passphrase> or \
-                                     /add-key)"
+                                    "daemon is locked — unlock it first (/unlock, or /unlock \
+                                     <base64 unlock-key>)"
                                         .to_string(),
                                 );
                                 app.error = None;
@@ -234,6 +234,12 @@ pub(super) fn handle_chat_event(
                                 }
                                 Err(e) => {
                                     tracing::warn!("[choreo-tui] unlock failed: {e}");
+                                    // Surface the failure (e.g. NoUnlockKey, or a
+                                    // malformed base64 key from /unlock <key>) in
+                                    // the status bar — a warn-only log would look
+                                    // like the command silently did nothing.
+                                    app.status = Some(format!("[error] {e}"));
+                                    app.error = None;
                                 }
                             }
                         }

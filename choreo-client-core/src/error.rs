@@ -11,14 +11,14 @@ pub enum ClientError {
     #[error(transparent)]
     Utf8(#[from] std::string::FromUtf8Error),
 
+    #[error(
+        "no unlock key available for {0}: add `unlock_key` (base64) to known_servers.toml, or run /unlock <base64 unlock-key>"
+    )]
+    NoUnlockKey(String),
     #[error("failed to read private key: {0}")]
     PrivateKeyRead(String),
     #[error("invalid private key file: expected 32 bytes")]
     PrivateKeyInvalid,
-    #[error("failed to read encrypted private key: {0}")]
-    PrivateKeyEncRead(String),
-    #[error("failed to decrypt private key: {0}")]
-    PrivateKeyDecrypt(String),
     #[error("failed to read public key: {0}")]
     PublicKeyRead(String),
     #[error("invalid public key file")]
@@ -45,10 +45,9 @@ impl From<ClientError> for io::Error {
             ClientError::Proto(proto) => io::Error::from(proto),
             ClientError::Io(io) => io,
             ClientError::Utf8(e) => io::Error::new(io::ErrorKind::InvalidData, e),
-            ClientError::PrivateKeyRead(_)
+            ClientError::NoUnlockKey(_)
+            | ClientError::PrivateKeyRead(_)
             | ClientError::PrivateKeyInvalid
-            | ClientError::PrivateKeyEncRead(_)
-            | ClientError::PrivateKeyDecrypt(_)
             | ClientError::PublicKeyRead(_)
             | ClientError::PublicKeyInvalid
             | ClientError::CredentialParse(_)

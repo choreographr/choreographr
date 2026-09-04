@@ -1,8 +1,9 @@
+use base64::Engine as _;
 use choreo_keystore::ServiceCredential;
 use choreo_proto::ClientMessage;
 use tracing::{debug, info, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use crate::error::ClientError;
 use crate::known_servers::KnownServers;
@@ -11,30 +12,49 @@ use crate::shell::UnlockMethod;
 /// Resolve a private key for an unlock attempt against the daemon at
 /// `addr`.
 ///
-/// For `UnlockMethod::Raw`, the stored per-daemon unlock key (known_servers
-/// entry) is preferred, falling back to the legacy raw `identity.pk` file.
-/// For `UnlockMethod::Passphrase`, the legacy encrypted `identity.pk.enc`
-/// file is decrypted with the passphrase (unchanged semantics — a
-/// passphrase unlock is inherently a legacy-migration action: the recorded
-/// per-daemon key needs no passphrase).
+/// For `UnlockMethod::Raw`, unlock with the key ALREADY associated with this
+/// daemon: the stored known_servers `unlock_key`, falling back to the legacy
+/// raw `identity.pk` file — which is then COPIED into known_servers.toml so
+/// the store becomes the single source of truth (the legacy file is never
+/// deleted, merely superseded). Errors with [`ClientError::NoUnlockKey`] when
+/// neither source has a key.
+///
+/// For `UnlockMethod::Key(key)`, the argument IS the unlock key (base64 of
+/// the 32 raw bytes): it is decoded, recorded into known_servers.toml for
+/// `addr` BEFORE the Unlock is sent, and returned. Recording before send is
+/// safe under the survivor semantics (see `resolve_keystore_key`): a wrong
+/// key simply replays its daemon rejection until manually replaced.
 pub fn resolve_private_key(method: &UnlockMethod, addr: &str) -> Result<Vec<u8>, ClientError> {
     match method {
         UnlockMethod::Raw => {
-            info!(addr, "resolving raw unlock key for addr");
-            // Stored per-daemon key first (the TOFU target state); the
-            // legacy raw file only serves setups that have not yet
-            // migrated (the daemon adopts the legacy key on first unlock,
-            // after which `record_unlock_key` stores it per-addr).
-            if let Some(key) = stored_unlock_key(addr) {
-                return Ok(key.to_vec());
-            }
-            read_raw_private_key()
+            info!(addr, "resolving stored unlock key for addr");
+            stored_or_adopted_unlock_key(addr)?
+                .map(|k| k.to_vec())
+                .ok_or_else(|| ClientError::NoUnlockKey(addr.to_string()))
         }
-        UnlockMethod::Passphrase(passphrase) => {
-            info!(addr, "reading encrypted private key with passphrase");
-            read_encrypted_private_key(passphrase)
+        UnlockMethod::Key(key) => {
+            info!(addr, "unlocking with caller-supplied base64 unlock key");
+            let key = decode_base64_unlock_key(key)?;
+            // Record BEFORE sending: the user explicitly supplied this key,
+            // so it belongs in the store regardless of how the unlock goes
+            // (survivor semantics — there is no revert-on-rejection).
+            KnownServers::load()?.set_unlock_key(addr, &key)?;
+            info!(
+                addr,
+                "recorded caller-supplied unlock key into known_servers"
+            );
+            Ok(key.to_vec())
         }
     }
+}
+
+/// Decode a caller-supplied base64 unlock key into exactly 32 raw bytes
+/// (the same encoding `known_servers.toml` stores).
+fn decode_base64_unlock_key(key: &str) -> Result<[u8; 32], ClientError> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(key.trim())
+        .map_err(|_| ClientError::PrivateKeyInvalid)?;
+    raw.try_into().map_err(|_| ClientError::PrivateKeyInvalid)
 }
 
 /// Read and validate the raw private key file (`identity.pk`).
@@ -47,18 +67,6 @@ fn read_raw_private_key() -> Result<Vec<u8>, ClientError> {
         return Err(ClientError::PrivateKeyInvalid);
     }
     Ok(data)
-}
-
-/// Read and decrypt the encrypted private key file (`identity.pk.enc`)
-/// using the given passphrase.
-fn read_encrypted_private_key(passphrase: &str) -> Result<Vec<u8>, ClientError> {
-    let enc_path = choreo_keystore::paths::private_key_enc_path()
-        .map_err(|e| ClientError::PrivateKeyEncRead(e.to_string()))?;
-    let data =
-        std::fs::read(&enc_path).map_err(|e| ClientError::PrivateKeyEncRead(e.to_string()))?;
-    let key = choreo_keystore::crypto::decrypt_private_key(&data, passphrase)
-        .map_err(|e| ClientError::PrivateKeyDecrypt(e.to_string()))?;
-    Ok(key.to_vec())
 }
 
 /// Read the stored per-daemon unlock key for `addr` from known_servers.
@@ -85,31 +93,47 @@ fn stored_unlock_key(addr: &str) -> Option<[u8; 32]> {
     }
 }
 
-/// The LEGACY half of unlock-key resolution: raw `identity.pk`, then
-/// `identity.pk.enc` + `CHOREOGRAPHR_KEYSTORE_PASSPHRASE`.
-fn legacy_auto_unlock_key() -> Option<Vec<u8>> {
+/// Resolve the unlock key ALREADY associated with `addr`: the stored
+/// known_servers `unlock_key`, falling back to the legacy raw `identity.pk`
+/// file. A legacy hit is COPIED into the store (best-effort) so that
+/// known_servers.toml becomes the single source of truth — the legacy file
+/// is NEVER deleted, merely superseded. `Ok(None)` when neither source has
+/// a usable key (daemon stays locked; all session operations still work).
+fn stored_or_adopted_unlock_key(addr: &str) -> Result<Option<[u8; 32]>, ClientError> {
+    if let Some(key) = stored_unlock_key(addr) {
+        return Ok(Some(key));
+    }
     match read_raw_private_key() {
         Ok(key) => {
-            info!("auto-unlock: using legacy raw private key");
-            return Some(key);
+            let key: [u8; 32] = key
+                .as_slice()
+                .try_into()
+                .map_err(|_| ClientError::PrivateKeyInvalid)?;
+            info!(
+                addr,
+                "using legacy raw private key; copying into known_servers.toml"
+            );
+            // Best-effort copy: if the store cannot be written the unlock
+            // still proceeds with the legacy key, and the daemon-confirmed
+            // `record_unlock_key` persists it later.
+            if let Err(e) = KnownServers::load().and_then(|mut s| s.set_unlock_key(addr, &key)) {
+                warn!(
+                    addr,
+                    error = %e,
+                    "could not copy legacy unlock key into known_servers; it will be recorded on daemon confirmation"
+                );
+            }
+            Ok(Some(key))
         }
         Err(ClientError::PrivateKeyInvalid) => {
-            warn!("auto-unlock: legacy private key file exists but is not 32 bytes");
+            warn!(
+                addr,
+                "legacy private key file exists but is not 32 bytes; ignoring"
+            );
+            Ok(None)
         }
-        Err(_) => {
-            // No raw key available — fall through to encrypted path.
-        }
+        Err(_) => Ok(None), // file absent — nothing to fall back to
     }
-
-    if let Ok(passphrase) = std::env::var("CHOREOGRAPHR_KEYSTORE_PASSPHRASE")
-        && !passphrase.is_empty()
-        && let Ok(key) = read_encrypted_private_key(&passphrase)
-    {
-        info!("auto-unlock: using legacy encrypted private key with env passphrase");
-        return Some(key);
-    }
-
-    None
 }
 
 /// Try to resolve the unlock key for automatic unlock on connect to the
@@ -117,151 +141,39 @@ fn legacy_auto_unlock_key() -> Option<Vec<u8>> {
 ///
 /// Resolution order (per-daemon keystore TOFU design):
 /// 1. The stored `unlock_key` from the known_servers entry for `addr`.
-/// 2. LEGACY fallback: raw `identity.pk`, or `identity.pk.enc` decrypted
-///    with `CHOREOGRAPHR_KEYSTORE_PASSPHRASE` (migration for existing
-///    local setups — the daemon adopts the legacy key on first unlock and
-///    all existing blobs keep decrypting).
+/// 2. LEGACY fallback: the raw `identity.pk` file, COPIED into
+///    known_servers.toml on first use (the legacy file is never deleted).
 ///
 /// Returns `None` if no key can be resolved, which is fine — the daemon
 /// starts locked but all session operations (create, browse, delete) work
 /// without unlocking.  Only inference (RunInput) requires credentials.
 pub fn try_auto_unlock_key(addr: &str) -> Option<Vec<u8>> {
-    if let Some(key) = stored_unlock_key(addr) {
-        return Some(key.to_vec());
+    match stored_or_adopted_unlock_key(addr) {
+        Ok(Some(key)) => Some(key.to_vec()),
+        Ok(None) => {
+            debug!(
+                addr,
+                "auto-unlock: no key available (daemon will start locked)"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(addr, error = %e, "auto-unlock: key resolution failed");
+            None
+        }
     }
-    let legacy = legacy_auto_unlock_key();
-    if legacy.is_none() {
-        debug!(
-            addr,
-            "auto-unlock: no key available (daemon will start locked)"
-        );
-    }
-    legacy
 }
 
 /// Persist the per-daemon unlock key for `addr` into the known_servers
-/// store, and complete the legacy migration: when the recorded key is the
-/// same one held in the legacy `identity.pk` / `identity.pk.enc` files,
-/// those files are DELETED (the per-daemon record has replaced them; the
-/// daemon's binding already adopted this key, so keeping the legacy copy
-/// adds no access, only risk of confusion). A key that does not match the
-/// legacy files — or a case where the comparison is impossible (no env
-/// passphrase for the encrypted file) — leaves the files alone, since we
-/// cannot prove they are redundant.
+/// store. Legacy files are NEVER touched: no comparison, no deletion —
+/// known_servers.toml simply supersedes them once it holds the key.
 ///
 /// Callers MUST only invoke this after the daemon CONFIRMED the key (an
 /// `Unlocked` or `CredentialAdded` reply) — never on send.
 pub fn record_unlock_key(addr: &str, key: &[u8]) -> Result<(), ClientError> {
     let key: [u8; 32] = key.try_into().map_err(|_| ClientError::PrivateKeyInvalid)?;
     KnownServers::load()?.set_unlock_key(addr, &key)?;
-
-    // ── Legacy migration cleanup ────────────────────────────────────
-    // Read the raw legacy file (if any) and compare. Only delete when the
-    // legacy content provably equals the recorded key.
-    let legacy_raw_matches = match legacy_raw_private_key_bytes() {
-        Ok(Some(raw)) => Some(raw == key),
-        Ok(None) => None, // no raw file — check the encrypted one below
-        // Unreadable/corrupt raw file: we cannot prove redundancy, so the
-        // conservative choice is to keep it and let the caller see why.
-        Err(e) => {
-            warn!(addr, error = %e, "record_unlock_key: could not read legacy identity.pk; leaving legacy files in place");
-            None
-        }
-    };
-
-    if legacy_raw_matches != Some(true) {
-        // Raw file absent, corrupt, or different: only the encrypted file
-        // could still hold this key. Compare by decrypting with the env
-        // passphrase when available; if that is impossible, keep everything
-        // (the migration can complete on a later record_unlock_key call).
-        match legacy_encrypted_private_key_bytes() {
-            Ok(Some(enc)) => match std::env::var("CHOREOGRAPHR_KEYSTORE_PASSPHRASE") {
-                Ok(passphrase) if !passphrase.is_empty() => {
-                    match choreo_keystore::crypto::decrypt_private_key(&enc, &passphrase) {
-                        Ok(dec) if dec == key => {
-                            info!(
-                                addr,
-                                "record_unlock_key: encrypted legacy key matches recorded key; migrating (deleting legacy files)"
-                            );
-                            delete_legacy_key_files(addr);
-                        }
-                        Ok(_) => {
-                            info!(
-                                addr,
-                                "record_unlock_key: legacy encrypted key differs from recorded key; leaving legacy files in place"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(addr, error = %e, "record_unlock_key: could not decrypt legacy identity.pk.enc to compare; leaving legacy files in place");
-                        }
-                    }
-                }
-                _ => {
-                    warn!(
-                        addr,
-                        "record_unlock_key: CHOREOGRAPHR_KEYSTORE_PASSPHRASE not set; cannot compare legacy identity.pk.enc — legacy files left in place"
-                    );
-                }
-            },
-            Ok(None) => {
-                // No legacy files at all — nothing to migrate.
-                debug!(addr, "record_unlock_key: no legacy key files present");
-            }
-            Err(e) => {
-                warn!(addr, error = %e, "record_unlock_key: could not read legacy identity.pk.enc; leaving legacy files in place");
-            }
-        }
-    } else {
-        info!(
-            addr,
-            "record_unlock_key: legacy raw key matches recorded key; migrating (deleting legacy files)"
-        );
-        delete_legacy_key_files(addr);
-    }
-
     Ok(())
-}
-
-/// Delete the legacy `identity.pk` and `identity.pk.enc` files, logging
-/// whichever existed. Missing files are the normal end-state, not errors.
-fn delete_legacy_key_files(addr: &str) {
-    if let Ok(path) = choreo_keystore::paths::private_key_path()
-        && std::fs::remove_file(&path).is_ok()
-    {
-        info!(addr, path = %path.display(), "removed legacy identity.pk (migration complete)");
-    }
-    if let Ok(path) = choreo_keystore::paths::private_key_enc_path()
-        && std::fs::remove_file(&path).is_ok()
-    {
-        info!(addr, path = %path.display(), "removed legacy identity.pk.enc (migration complete)");
-    }
-}
-
-/// Raw bytes of the legacy raw private key file: `Ok(None)` when the file
-/// simply does not exist, `Err` on any other read problem. Distinct from
-/// [`read_raw_private_key`] because `record_unlock_key` must distinguish
-/// "absent" from "unreadable" when deciding whether migration is provable.
-fn legacy_raw_private_key_bytes() -> Result<Option<Vec<u8>>, ClientError> {
-    let path = choreo_keystore::paths::private_key_path()
-        .map_err(|e| ClientError::PrivateKeyRead(e.to_string()))?;
-    match std::fs::read(&path) {
-        Ok(data) => Ok(Some(data)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(ClientError::PrivateKeyRead(e.to_string())),
-    }
-}
-
-/// Encrypted bytes of the legacy `identity.pk.enc`: `Ok(None)` when the
-/// file does not exist, `Err` on any other read problem (same distinction
-/// as [`legacy_raw_private_key_bytes`]).
-fn legacy_encrypted_private_key_bytes() -> Result<Option<Vec<u8>>, ClientError> {
-    let path = choreo_keystore::paths::private_key_enc_path()
-        .map_err(|e| ClientError::PrivateKeyEncRead(e.to_string()))?;
-    match std::fs::read(&path) {
-        Ok(data) => Ok(Some(data)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(ClientError::PrivateKeyEncRead(e.to_string())),
-    }
 }
 
 fn parse_credential(
@@ -307,10 +219,10 @@ fn parse_credential(
 /// Resolve the per-daemon keystore unlock key for `addr`.
 ///
 /// Order (per-daemon TOFU design, DESIGN-keystore-unlock.md):
-/// 1. the stored per-daemon key in the known_servers entry for `addr`,
-/// 2. the LEGACY local key (`identity.pk` / `identity.pk.enc` + env
-///    passphrase) — the one-time migration source,
-/// 3. failing both, a FRESH random key — and it is OPTIMISTICALLY recorded in
+/// 1. the key ALREADY associated with `addr` — the stored per-daemon key in
+///    the known_servers entry, falling back to the legacy raw `identity.pk`
+///    file (which `stored_or_adopted_unlock_key` copies into the store),
+/// 2. failing both, a FRESH random key — and it is OPTIMISTICALLY recorded in
 ///    known_servers for `addr` immediately.
 ///
 /// The optimistic fresh record closes the lost-confirmation orphan (bug 2 of
@@ -320,17 +232,8 @@ fn parse_credential(
 /// bound keystore. If the daemon turns out to be ALREADY bound it rejects the
 /// fresh key — the record STAYS (see the rationale on [`resolve_keystore_key`]).
 fn resolve_keystore_key(addr: &str) -> Result<[u8; 32], ClientError> {
-    if let Some(key) = stored_unlock_key(addr) {
+    if let Some(key) = stored_or_adopted_unlock_key(addr)? {
         return Ok(key);
-    }
-    // The legacy key is secret material: wrap it so the heap Vec is wiped on
-    // EVERY exit — including the try_into failure path, which previously
-    // dropped the Vec un-zeroized.
-    if let Some(key) = legacy_auto_unlock_key().map(Zeroizing::new) {
-        return key
-            .as_slice()
-            .try_into()
-            .map_err(|_| ClientError::PrivateKeyInvalid);
     }
     let fresh: [u8; 32] = rand::random();
     info!(
@@ -453,28 +356,6 @@ pub fn build_add_credential_from_credential(
 mod tests {
     use super::*;
 
-    /// Shared helper: set `CHOREOGRAPHR_KEYSTORE_PASSPHRASE` for the test body
-    /// and restore the previous value on drop. The env var is process-global;
-    /// tests using it must not run in parallel with other tests that read it,
-    /// which the existing suite already assumes.
-    struct PassphraseGuard;
-
-    impl PassphraseGuard {
-        fn set(pass: &str) -> Self {
-            // SAFETY: single-threaded test context; restore-on-drop keeps other
-            // tests unaffected even on a panicking assert.
-            unsafe { std::env::set_var("CHOREOGRAPHR_KEYSTORE_PASSPHRASE", pass) };
-            PassphraseGuard
-        }
-    }
-
-    impl Drop for PassphraseGuard {
-        fn drop(&mut self) {
-            // SAFETY: same single-threaded test context as `set`.
-            unsafe { std::env::remove_var("CHOREOGRAPHR_KEYSTORE_PASSPHRASE") };
-        }
-    }
-
     #[test]
     fn parse_credential_api_key() {
         let cred = parse_credential("api_key", &["sk-test".into()]).unwrap();
@@ -545,6 +426,12 @@ mod tests {
         std::fs::write(dir.path().join("choreographr/identity.pk"), sk).unwrap();
 
         assert_eq!(try_auto_unlock_key("local.sock"), Some(sk.to_vec()));
+
+        // The legacy raw key is COPIED into known_servers.toml on first use
+        // (the store becomes the single source of truth; the file stays).
+        let store = KnownServers::load().unwrap();
+        assert_eq!(store.unlock_key("local.sock").unwrap(), Some(sk));
+        assert!(dir.path().join("choreographr/identity.pk").exists());
     }
 
     #[test]
@@ -556,31 +443,6 @@ mod tests {
 
         // Write a file that isn't 32 bytes
         std::fs::write(dir.path().join("choreographr/identity.pk"), b"not 32 bytes").unwrap();
-
-        assert!(try_auto_unlock_key("local.sock").is_none());
-    }
-
-    #[test]
-    fn try_auto_unlock_key_with_encrypted_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard =
-            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-
-        let (_, sk) = choreo_keystore::crypto::generate_keypair();
-        let encrypted = choreo_keystore::crypto::encrypt_private_key(&sk, "hunter2").unwrap();
-        std::fs::write(dir.path().join("choreographr/identity.pk.enc"), &encrypted).unwrap();
-
-        let _pass = PassphraseGuard::set("hunter2");
-        assert_eq!(try_auto_unlock_key("local.sock"), Some(sk.to_vec()));
-    }
-
-    #[test]
-    fn try_auto_unlock_key_with_no_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard =
-            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
 
         assert!(try_auto_unlock_key("local.sock").is_none());
     }
@@ -640,21 +502,59 @@ mod tests {
         );
     }
 
+    /// `/unlock <key>`: the argument IS the unlock key (base64 of the 32 raw
+    /// bytes) — it is recorded into known_servers.toml BEFORE the Unlock is
+    /// sent and returned for the wire message.
     #[test]
-    fn resolve_passphrase_decrypts_encrypted_key() {
+    fn resolve_key_records_supplied_key_into_store() {
         let dir = tempfile::tempdir().unwrap();
         let _guard =
             choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
         std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
 
-        let (_, sk) = choreo_keystore::crypto::generate_keypair();
-        let encrypted = choreo_keystore::crypto::encrypt_private_key(&sk, "hunter2").unwrap();
-        std::fs::write(dir.path().join("choreographr/identity.pk.enc"), &encrypted).unwrap();
-
+        let key: [u8; 32] = [21u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key);
         assert_eq!(
-            resolve_private_key(&UnlockMethod::Passphrase("hunter2".into()), "d:1").unwrap(),
-            sk.to_vec()
+            resolve_private_key(&UnlockMethod::Key(b64), "d:1").unwrap(),
+            key.to_vec()
         );
+        // Recorded before send: a fresh load sees it.
+        let store = KnownServers::load().unwrap();
+        assert_eq!(store.unlock_key("d:1").unwrap(), Some(key));
+    }
+
+    /// A supplied key that is not base64 — or not exactly 32 bytes once
+    /// decoded — is rejected.
+    #[test]
+    fn resolve_key_rejects_bad_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard =
+            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
+
+        assert!(resolve_private_key(&UnlockMethod::Key("not base64!!!".into()), "d:1").is_err());
+        let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        assert!(resolve_private_key(&UnlockMethod::Key(short), "d:1").is_err());
+        // Nothing was recorded for the rejected inputs.
+        assert_eq!(
+            KnownServers::load().unwrap().unlock_key("d:1").unwrap(),
+            None
+        );
+    }
+
+    /// `/unlock` (Raw) with neither a stored key nor a legacy file is a
+    /// clear NoUnlockKey error, not a silent failure.
+    #[test]
+    fn resolve_raw_without_any_key_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard =
+            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
+
+        assert!(matches!(
+            resolve_private_key(&UnlockMethod::Raw, "d:1"),
+            Err(ClientError::NoUnlockKey(_))
+        ));
     }
 
     // ── build_add_credential_message tests ─────────────────────────
@@ -799,27 +699,10 @@ mod tests {
         assert!(entry.pubkey.is_none(), "carrier entry must have no pin");
     }
 
+    /// Legacy files are NEVER deleted by record_unlock_key (or anything
+    /// else): known_servers.toml supersedes them, but they stay on disk.
     #[test]
-    fn record_unlock_key_removes_matching_legacy_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard =
-            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-
-        let (_, sk) = choreo_keystore::crypto::generate_keypair();
-        std::fs::write(dir.path().join("choreographr/identity.pk"), sk).unwrap();
-
-        record_unlock_key("d:1", &sk).unwrap();
-
-        // The legacy file matched the recorded key, so the migration
-        // deletes it; the per-daemon record is in place.
-        assert!(!dir.path().join("choreographr/identity.pk").exists());
-        let store = KnownServers::load().unwrap();
-        assert_eq!(store.unlock_key("d:1").unwrap(), Some(sk));
-    }
-
-    #[test]
-    fn record_unlock_key_keeps_mismatched_legacy_files() {
+    fn record_unlock_key_never_touches_legacy_files() {
         let dir = tempfile::tempdir().unwrap();
         let _guard =
             choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
@@ -831,44 +714,10 @@ mod tests {
         let other: [u8; 32] = [12u8; 32];
         record_unlock_key("d:1", &other).unwrap();
 
-        // The legacy file does NOT match the recorded key, so it stays.
+        // The record is in place and the legacy file is untouched.
         assert!(dir.path().join("choreographr/identity.pk").exists());
-    }
-
-    #[test]
-    fn record_unlock_key_removes_matching_encrypted_legacy_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard =
-            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-
-        let (_, sk) = choreo_keystore::crypto::generate_keypair();
-        let encrypted = choreo_keystore::crypto::encrypt_private_key(&sk, "hunter2").unwrap();
-        std::fs::write(dir.path().join("choreographr/identity.pk.enc"), &encrypted).unwrap();
-
-        let _pass = PassphraseGuard::set("hunter2");
-        record_unlock_key("d:1", &sk).unwrap();
-        assert!(!dir.path().join("choreographr/identity.pk.enc").exists());
-    }
-
-    #[test]
-    fn record_unlock_key_keeps_encrypted_file_without_passphrase() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard =
-            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-
-        let (_, sk) = choreo_keystore::crypto::generate_keypair();
-        let encrypted = choreo_keystore::crypto::encrypt_private_key(&sk, "hunter2").unwrap();
-        std::fs::write(dir.path().join("choreographr/identity.pk.enc"), &encrypted).unwrap();
-
-        // No passphrase available: the comparison is impossible, so the
-        // key is still recorded but the legacy file is left alone.
-        let _pass = PassphraseGuard::set("");
-        record_unlock_key("d:1", &sk).unwrap();
-        assert!(dir.path().join("choreographr/identity.pk.enc").exists());
         let store = KnownServers::load().unwrap();
-        assert_eq!(store.unlock_key("d:1").unwrap(), Some(sk));
+        assert_eq!(store.unlock_key("d:1").unwrap(), Some(other));
     }
 
     #[test]

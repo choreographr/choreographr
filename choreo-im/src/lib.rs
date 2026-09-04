@@ -68,31 +68,20 @@ pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let platform = cli.platform;
 
-    let unlock_passphrase = env::var("CHOREOGRAPHR_KEYSTORE_PASSPHRASE").ok();
-
     let path = socket_path();
     let stream = UnixStream::connect(&path).context("failed to connect to daemon")?;
 
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
 
-    if let Some(ref passphrase) = unlock_passphrase {
-        info!("unlocking daemon with private key");
-        // Read the encrypted private key and decrypt it with the passphrase
-        let enc_path = choreo_keystore::paths::private_key_enc_path()
-            .context("failed to determine encrypted private key path")?;
-        let enc_data =
-            std::fs::read(&enc_path).context("failed to read encrypted private key file")?;
-        let private_key = choreo_keystore::crypto::decrypt_private_key(&enc_data, passphrase)
-            .context("failed to decrypt private key")?;
-        let private_key_vec: Vec<u8> = private_key.to_vec();
-        write_message(
-            &mut writer,
-            &ClientMessage::Unlock {
-                private_key: private_key_vec,
-            },
-        )
-        .context("failed to send unlock message")?;
+    // Auto-unlock with the key ALREADY associated with this daemon: the
+    // stored known_servers unlock_key (falling back to the legacy raw
+    // identity.pk file, which is copied into the store). There is no
+    // passphrase unlock here — identity.pk.enc decryption was removed.
+    if let Some(private_key) = choreo_client_core::try_auto_unlock_key(&path) {
+        info!("unlocking daemon with stored unlock key");
+        write_message(&mut writer, &ClientMessage::Unlock { private_key })
+            .context("failed to send unlock message")?;
         writer.flush().context("failed to flush unlock message")?;
         match read_message::<_, DaemonMessage>(&mut reader) {
             Ok(DaemonMessage::Unlocked) => {
@@ -133,13 +122,9 @@ pub fn main() -> anyhow::Result<()> {
             run_platform(&platform, bot_token, reader, writer).context("platform bridge failed")?;
         }
         Ok(DaemonMessage::Credential { key: None, .. }) => {
-            if unlock_passphrase.is_none() {
-                bail!(
-                    "daemon is locked. unlock the daemon via TUI first, or set CHOREOGRAPHR_KEYSTORE_PASSPHRASE env var"
-                );
-            } else {
-                bail!("no '{platform}' credential found in keystore");
-            }
+            bail!(
+                "daemon is locked, or no '{platform}' credential found in keystore — unlock via the TUI (/unlock) first"
+            );
         }
         Ok(other) => {
             error!(?other, "unexpected response to GetCredential");

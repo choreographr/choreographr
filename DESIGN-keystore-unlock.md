@@ -45,14 +45,16 @@ This document is the confirmed design. All implementation must follow it.
      addr key (see "Unix socket" note below).
    - Key resolution order for any Unlock/AddCredential to daemon at `addr`:
      1. stored `unlock_key` from known_servers entry for that addr;
-     2. LEGACY fallback: raw `identity.pk`, or `identity.pk.enc` decrypted with
-        `CHOREOGRAPHR_KEYSTORE_PASSPHRASE` (migration for existing local setups —
-        the daemon adopts it on first unlock, all existing blobs keep decrypting);
+     2. LEGACY fallback: the raw `identity.pk` file — whose key is COPIED
+        into the known_servers entry on first use (the store becomes the
+        single source of truth; the legacy file is NEVER deleted).
+        (`identity.pk.enc` + `CHOREOGRAPHR_KEYSTORE_PASSPHRASE` decryption
+        has been REMOVED entirely.)
      3. (AddCredential only) generate a FRESH random 32-byte key.
    - **Recording**: normally the client persists the key ONLY after the daemon
      CONFIRMS success (`Unlocked` / `CredentialAdded` reply) — replacing any
-     legacy value and, when it came from the legacy fallback, deleting
-     `identity.pk` / `identity.pk.enc`. The one exception is a FRESH key minted at
+     legacy value. Legacy files are never deleted (no comparison, no cleanup:
+     the store supersedes them once it holds the key). The one exception is a FRESH key minted at
      step 3: it is OPTIMISTICALLY recorded immediately, because a fresh key is
      adopted TOFU by an unbound daemon and a LOST confirmation would otherwise
      strand the client with no way to recover the binding. That optimistic record
@@ -113,11 +115,13 @@ The IK/pin lookup path (`KnownServers::lookup`) is only called for TCP; make
 ## Client-core API changes (`choreo-client-core/src/credentials.rs`)
 
 - `try_auto_unlock_key(addr: &str) -> Option<Vec<u8>>` — stored unlock_key, else
-  legacy raw/enc fallback (current logic becomes the legacy half).
+  the legacy raw `identity.pk` fallback (COPIED into the store on first use).
 - `resolve_private_key(method: &UnlockMethod, addr: &str) -> Result<Vec<u8>>` —
-  `UnlockMethod::Passphrase(p)` decrypts legacy `identity.pk.enc` with `p`
-  (unchanged semantics); `UnlockMethod::Raw` = stored unlock_key else legacy raw
-  `identity.pk`. (shell.rs `/unlock` keeps its shape.)
+  `UnlockMethod::Raw` = stored unlock_key else legacy raw `identity.pk`
+  (adopted into the store), erroring with `NoUnlockKey` when neither exists;
+  `UnlockMethod::Key(b64)` = the caller-supplied base64 32-byte unlock key,
+  recorded into known_servers for `addr` BEFORE the Unlock is sent.
+  (`UnlockMethod::Passphrase` — identity.pk.enc decryption — was removed.)
 - `build_add_credential_message(addr: &str, service, credential_type, fields)
   -> Result<(ClientMessage, Vec<u8>)>` — returns the message AND the unlock key
   used (resolution order above; generates fresh when nothing else available).

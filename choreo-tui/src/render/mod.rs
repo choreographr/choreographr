@@ -41,7 +41,7 @@ pub(crate) const BG_SHADE: Color = Color::Rgb(53, 53, 53);
 /// The persistent status-bar banner shown while the daemon's credential
 /// keystore is locked (see `App::keystore_locked`). Small and non-intrusive:
 /// a lock marker that leads the status bar until the daemon reports unlocked.
-/// The fuller how-to-unlock guidance ("/unlock <passphrase> or /add-key")
+/// The fuller how-to-unlock guidance ("/unlock, or /unlock <base64 unlock-key>")
 /// appears in the startup status and the submit-time prompt rejection.
 pub(crate) const KEYS_LOCKED_MARKER: &str = "🔒 keystore locked";
 

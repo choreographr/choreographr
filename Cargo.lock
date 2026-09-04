@@ -1127,18 +1127,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "argon2"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
-dependencies = [
- "base64ct",
- "blake2",
- "cpufeatures 0.2.17",
- "password-hash",
-]
-
-[[package]]
 name = "ark-bls12-377"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3004,7 +2992,6 @@ name = "choreo-keystore"
 version = "0.1.0"
 dependencies = [
  "aes-gcm 0.11.1",
- "argon2",
  "base64 0.23.1",
  "crypto_secretbox",
  "dirs",

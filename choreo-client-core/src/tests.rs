@@ -54,24 +54,12 @@ fn parses_unlock_raw() {
 }
 
 #[test]
-fn parses_unlock_with_passphrase() {
+fn parses_unlock_with_base64_key() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line("/unlock mypass", &mut next, None),
+        parse_input_line("/unlock aGVsbG8=", &mut next, None),
         ShellCommand::Unlock {
-            method: UnlockMethod::Passphrase("mypass".to_string()),
-        }
-    );
-    assert_eq!(next, 3);
-}
-
-#[test]
-fn parses_unlock_with_spaced_passphrase() {
-    let mut next = 3;
-    assert_eq!(
-        parse_input_line("/unlock my pass phrase", &mut next, None),
-        ShellCommand::Unlock {
-            method: UnlockMethod::Passphrase("my pass phrase".to_string()),
+            method: UnlockMethod::Key("aGVsbG8=".to_string()),
         }
     );
     assert_eq!(next, 3);

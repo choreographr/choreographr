@@ -487,10 +487,12 @@ daemon ADOPTS the presented key; every later one must match the binding or it is
 rejected.
 
 The legacy `identity.pk` / `public.pk` client keypair (and `ensure_keypair`)
-have been **removed**. Two legacy files remain only as a one-time migration
-source, deleted after the client records the daemon-confirmed key:
-- `~/.config/choreographr/identity.pk` — raw 32-byte legacy private key
-- `~/.config/choreographr/identity.pk.enc` — Argon2 + AES-256-GCM encrypted legacy private key
+have been **removed**. One legacy file remains as a fallback unlock-key source:
+- `~/.config/choreographr/identity.pk` — raw 32-byte legacy private key. Used
+  ONLY when no unlock key is stored for the addr; the file's key is COPIED into
+  `known_servers.toml` on first use (the store is the single source of truth;
+  the file is never deleted). Encrypted-key resolution (`identity.pk.enc` +
+  `CHOREOGRAPHR_KEYSTORE_PASSPHRASE`) has been **removed** entirely.
 
 **Credential encryption pipeline (client-side):**
 ```
@@ -547,7 +549,7 @@ Used by `choreo-tui`, `choreo-gui`, and `choreo-im`.
 | Module | Purpose |
 |---|---|---|
 | `shell.rs` | Parses terminal input into `ShellCommand`: `/ping`, `/models`, `/model` (alias), `/cancel`, `/unlock`, `/lock`, `/image`, `/add-key`, `/add-x`, `/remove-key`, or `RunInput(prompt)`. All commands use `/` prefix exclusively; `parse_command()` is the single dispatch point. |
-| `credentials.rs` | Shared helpers: `resolve_private_key()` (read or decrypt the identity key), `build_add_credential_message()` (encrypt and package a credential for the daemon), `read_public_key_bytes()`. Eliminates duplicated logic across `choreo-tui`, `choreo-gui`, and `choreo-im`. |
+| `credentials.rs` | Shared helpers: `resolve_private_key()` (resolve the unlock key: stored known_servers key, legacy raw `identity.pk` fallback copied into the store, or a caller-supplied base64 key recorded before send), `build_add_credential_message()` (encrypt and package a credential for the daemon), `read_public_key_bytes()`. Eliminates duplicated logic across `choreo-tui`, `choreo-gui`, and `choreo-im`. |
 | `image.rs` | `ImageAssembler` — kept for legacy `choreo-im` use. No longer used by TUI/Dioxus (images delivered mid-turn as `DisplayedImage` via `SessionMessageAppended`). |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text, structured diffs) |
 | `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
@@ -1473,8 +1475,9 @@ against an unbound keystore ADOPTS the presented key (TOFU, logged loudly); ever
 later one must match the binding or it is rejected (`LockedError`).
 
 A client sends `ClientMessage::Unlock { private_key }` (resolved as its stored
-per-daemon unlock key, else the legacy `identity.pk` / `identity.pk.enc` during
-migration). `AddCredential` now REQUIRES the unlock key and, on a valid blob,
+per-daemon unlock key, else the legacy raw `identity.pk` file — copied into the
+store on first use; a caller-supplied base64 key from `/unlock <key>` is
+recorded into the store BEFORE sending). `AddCredential` now REQUIRES the unlock key and, on a valid blob,
 **implicitly unlocks** the daemon (decrypts all blobs into memory). The client
 records the key per-daemon only after the daemon confirms (`Unlocked` /
 `CredentialAdded`).
@@ -2574,7 +2577,7 @@ context_file_max_bytes = 32768
 
 > **Note:** Provider-level settings (`base_url`, `streaming`, `retry_*`, timeouts, endpoint paths, request format) have moved to per-account overrides in `accounts.toml`. See `README.md` for the full list.
 
-**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Each daemon's keystore is bound to one client-held unlock key (the daemon stores only the derived public binding); the legacy `identity.pk` / `public.pk` pair is removed, and the legacy `identity.pk` / `identity.pk.enc` files are used only as a one-time migration source, deleted after the key is recorded per-daemon.
+**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Each daemon's keystore is bound to one client-held unlock key (the daemon stores only the derived public binding); the legacy `identity.pk` / `public.pk` pair is removed, and the legacy raw `identity.pk` file is a fallback that is copied into `known_servers.toml` on first use (never deleted).
 
 **Database:** `~/.local/share/choreographr/state.redb` (override via `CHOREOGRAPHR_DB_PATH` env var)
 

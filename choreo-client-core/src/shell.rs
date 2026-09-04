@@ -6,10 +6,16 @@ const INVALID_ACCOUNT_NAME: &str =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnlockMethod {
-    /// Read identity.pk directly (no passphrase).
+    /// Unlock with the key ALREADY associated with this daemon: the stored
+    /// known_servers unlock_key, falling back to the legacy raw `identity.pk`
+    /// file (which is then COPIED into known_servers.toml so the store becomes
+    /// the single source of truth).
     Raw,
-    /// Decrypt identity.pk.enc with the given passphrase.
-    Passphrase(String),
+    /// Unlock with the base64-encoded 32-byte key given by the user. The key
+    /// is recorded into known_servers.toml for `addr` BEFORE the Unlock is
+    /// sent (survivor semantics: a wrong key simply replays its rejection
+    /// until manually replaced).
+    Key(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,13 +264,18 @@ fn parse_command(
         return ShellCommand::Send(ClientMessage::Ping);
     }
 
-    if let Some(passphrase) = rest.strip_prefix("unlock ") {
-        let trimmed = passphrase.trim();
+    if let Some(key) = rest.strip_prefix("unlock ") {
+        let trimmed = key.trim();
         if trimmed.is_empty() {
-            return ShellCommand::UnknownCommand("usage: /unlock [passphrase]".to_string());
+            return ShellCommand::UnknownCommand("usage: /unlock [base64-unlock-key]".to_string());
         }
+        // The argument is the UNLOCK KEY ITSELF (base64 of the 32 raw bytes),
+        // not a passphrase: /unlock <key> records it into known_servers.toml
+        // and then unlocks with it. Decoding/validation happens in
+        // `resolve_private_key` (which owns the store), so the parser stays a
+        // pure syntax layer.
         return ShellCommand::Unlock {
-            method: UnlockMethod::Passphrase(trimmed.to_string()),
+            method: UnlockMethod::Key(trimmed.to_string()),
         };
     }
     if rest == "unlock" {

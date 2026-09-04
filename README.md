@@ -87,10 +87,10 @@ Credentials are encrypted per-credential with ECDH (X25519) + HKDF +
 AES-256-GCM before being stored in the `redb` database. Each daemon's
 keystore is governed by ONE client-held unlock key (the daemon stores only
 the derived public binding, adopted on first insertion — TOFU). A client
-holds one unlock key per daemon in `known_servers.toml`, and the legacy
-`identity.pk` / `identity.pk.enc` files are used only as a one-time migration
-source. The daemon starts locked and only decrypts credentials into memory
-after an unlock.
+holds one unlock key per daemon in `known_servers.toml` (the legacy raw
+`identity.pk` file is a fallback that is copied into the store on first
+use; it is never deleted). The daemon starts locked and only decrypts
+credentials into memory after an unlock.
 
 ### Maximum model compatibility
 
@@ -568,8 +568,8 @@ disable_claude_code_prompt = false
 Credentials are encrypted per-credential with the daemon's keystore X25519
 public key (derived from the client-held unlock key) and stored in the `redb`
 database. Each daemon's keystore is bound to one unlock key held client-side; the
-legacy `identity.pk` / `identity.pk.enc` files exist only as a one-time migration
-source.
+legacy raw `identity.pk` file is a fallback that is copied into
+`known_servers.toml` on first use (never deleted).
 
 The socket path defaults to `/tmp/Choreographr.sock` (override with
 `CHOREOGRAPHR_SOCKET_PATH`). The database path defaults to
@@ -718,7 +718,8 @@ In `choreo-tui`:
 - `/session switch <id>` — switch to a different session
 - `/session info <id>` — show info for a specific session
 - `/cancel <request-id>` — cancel a running request
-- `/unlock [passphrase]` — unlock the daemon (uses the stored per-daemon unlock key; `[passphrase]` decrypts the legacy `identity.pk.enc` during migration)
+- `/unlock` — unlock the daemon using the stored per-daemon unlock key (falls back to the legacy raw `identity.pk` file, which is copied into `known_servers.toml`)
+- `/unlock <base64 unlock-key>` — record the given 32-byte unlock key (base64) into `known_servers.toml` and unlock with it
 - `/lock` — lock the daemon, clearing credentials from memory
 - `/add-key <service> <api_key>` — add an API key credential (service name must be `[a-z0-9_-]`)
 - `/add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_` — add an X credential (service name must be `[a-z0-9_-]`)
@@ -748,8 +749,9 @@ daemon without requesting daemon shutdown.
 ## Security model
 
 The daemon starts **locked**. Clients resolve their per-daemon unlock key (the
-stored per-daemon key, else the legacy `identity.pk` / `identity.pk.enc` during
-migration) and send it via `ClientMessage::Unlock`. The daemon verifies it against
+stored per-daemon key, else the legacy raw `identity.pk` file, which is copied
+into the store on first use) and send it via `ClientMessage::Unlock`. The daemon
+verifies it against
 the keystore binding (adopting it on an unbound keystore — TOFU) and decrypts
 all stored credential blobs into memory. `AddCredential` also carries the unlock
 key and implicitly unlocks on a valid blob.

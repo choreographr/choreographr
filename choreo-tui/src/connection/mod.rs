@@ -539,8 +539,10 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         // flag, set when the daemon's subscribe-time lock-state push arrives a
         // moment later) keeps this visible; the transient status offers the
         // how-to-unlock guidance.
-        app.status =
-            Some("daemon is locked — use /unlock <passphrase> or /add-key to unlock".to_string());
+        app.status = Some(
+            "daemon is locked — use /unlock, or /unlock <base64 unlock-key> to supply one"
+                .to_string(),
+        );
     }
 
     client_tx

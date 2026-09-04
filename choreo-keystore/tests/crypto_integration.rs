@@ -4,8 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use choreo_keystore::KeystoreError;
 use choreo_keystore::crypto::{
-    decrypt_private_key, decrypt_with_private_key, encrypt_private_key, encrypt_with_public_key,
-    generate_keypair,
+    decrypt_with_private_key, encrypt_with_public_key, generate_keypair,
 };
 
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -54,46 +53,6 @@ fn encrypt_decrypt_credential_round_trip_with_key_files() {
     assert_eq!(decrypted, plaintext, "decrypted must match original");
 
     let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-#[ignore]
-fn encrypt_decrypt_private_key_with_passphrase_round_trip() {
-    let mut key = [0u8; 32];
-    for (i, byte) in key.iter_mut().enumerate() {
-        *byte = i as u8;
-    }
-    let passphrase = "test-passphrase-for-integration-test";
-
-    let encrypted =
-        encrypt_private_key(&key, passphrase).expect("private key encryption should succeed");
-    assert!(
-        encrypted.len() > 32 + 12,
-        "encrypted output should have salt + nonce + ciphertext"
-    );
-
-    let decrypted =
-        decrypt_private_key(&encrypted, passphrase).expect("private key decryption should succeed");
-    assert_eq!(decrypted, key, "decrypted key must match original");
-}
-
-#[test]
-#[ignore]
-fn decrypt_private_key_with_wrong_passphrase_fails() {
-    let mut key = [0u8; 32];
-    for (i, byte) in key.iter_mut().enumerate() {
-        *byte = i as u8;
-    }
-
-    let encrypted =
-        encrypt_private_key(&key, "correct-passphrase").expect("encryption should succeed");
-    let result = decrypt_private_key(&encrypted, "wrong-passphrase");
-
-    assert!(
-        matches!(result, Err(KeystoreError::DecryptionFailed)),
-        "expected DecryptionFailed, got {:?}",
-        result
-    );
 }
 
 #[test]
