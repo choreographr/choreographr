@@ -303,6 +303,9 @@ jobs:
           # artifacts); packaging consumes it without rebuilding.
           file target/android/arm64-v8a/*
           file target/android/arm64-v8a/* | grep -q 'ARM aarch64'
+          # The other jobs create dist/ when they build into it; this job
+          # only stages tarballs, so create it explicitly before packaging.
+          mkdir -p dist
           tar czf "dist/choreographr-${VERSION}-aarch64-linux-android.tar.gz" \
               -C target/android/arm64-v8a choreographr choreo-tui
 
