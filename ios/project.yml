@@ -40,8 +40,13 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.choreographr.gui
         PRODUCT_NAME: choreo-gui
         # Rust artifacts staged by scripts/build-ios.sh (relative to ios/).
+        # Hardcoded `debug` (the script's default PROFILE), NOT $(CONFIGURATION):
+        # cargo's target dir is lowercase `debug` while Xcode's Debug config
+        # expands to `Debug` — the case mismatch would silently miss the lib
+        # search path. A release-configured app build must pass PROFILE=dist
+        # to build-ios.sh and point this at `dist` instead.
         LIBRARY_SEARCH_PATHS:
-          - "$(SRCROOT)/../target/ios/aarch64-apple-ios/$(CONFIGURATION)"
+          - "$(SRCROOT)/../target/ios/aarch64-apple-ios/debug"
         OTHER_LDFLAGS:
           - -lchoreo_gui
           - -lring_core_0_17_14_

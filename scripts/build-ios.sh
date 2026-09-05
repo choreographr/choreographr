@@ -15,7 +15,10 @@
 #   target/ios/aarch64-apple-ios/<profile>/      libchoreo_gui.rlib + *.a
 #   target/ios/aarch64-apple-ios-sim/<profile>/  same, simulator slice
 #
-# Prerequisites (Mac): rustup targets aarch64-apple-ios[ -sim], Xcode.
+# Prerequisites (Mac): rustup targets aarch64-apple-ios[ -sim], Xcode. Set
+# IOS_BUILD_STABLE=1 to build with the stable toolchain (CI mode — the
+# manifest's nightly-only profile-rustflags block is stripped per-invocation
+# via build-stable.sh); default runs use the workspace's pinned nightly.
 # Prerequisites (Linux): same rustup targets, zig >= 0.13 on PATH.
 #
 # NOTE (the -C target-cpu=native trap): the workspace's profile rustflags and
@@ -39,7 +42,11 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 # ── Prerequisite checks ──────────────────────────────────────────────────────
 command -v cargo >/dev/null || fail "cargo not found"
-command -v zig   >/dev/null || fail "zig not found (Linux shim path; install zig)"
+# zig is only needed for the non-Mac shim path (Xcode's toolchain serves C
+# compilation natively when xcrun is present).
+if ! command -v xcrun >/dev/null 2>&1; then
+    command -v zig >/dev/null || fail "no xcrun and no zig — install zig for the shim path"
+fi
 
 for target in aarch64-apple-ios aarch64-apple-ios-sim; do
     if ! rustup target list --installed | grep -qx "$target"; then
@@ -103,6 +110,20 @@ export RUSTC="$SHIM_DIR/rustc" CC="$SHIM_DIR/cc" CXX="$SHIM_DIR/cxx" AR="zig ar"
 export SDKROOT="$FAKE_SDK"
 unset RUSTFLAGS || true # env RUSTFLAGS would poison cross codegen anyway
 
+# Stable mode (IOS_BUILD_STABLE=1, used by CI): the workspace manifest's
+# nightly-only [unstable] profile-rustflags block hard-blocks stable Cargo,
+# so the build below is routed through scripts/build-stable.sh, which strips
+# exactly those keys for the command's duration (the RUSTC shim then has no
+# target-cpu=native to strip — it stays installed because it is harmless and
+# the script is toolchain-agnostic).
+run_cargo() {
+    if [ "${IOS_BUILD_STABLE:-}" = 1 ]; then
+        ./scripts/build-stable.sh "$@"
+    else
+        cargo "$@"
+    fi
+}
+
 # ── Build + stage ────────────────────────────────────────────────────────────
 STAGE_ROOT="$REPO_ROOT/target/ios"
 build_one() {
@@ -121,7 +142,7 @@ build_one() {
     # is exactly the step this script must NOT attempt on a non-Mac host.
     # Restricting the crate-type to `lib` (the rlib) makes the build end at
     # codegen, which needs no external linker.
-    cargo rustc -p choreo-gui --lib --crate-type lib --target "$triple" "${profile_args[@]}" \
+    run_cargo rustc -p choreo-gui --lib --crate-type lib --target "$triple" "${profile_args[@]}" \
         || fail "build failed for $triple (see output above)"
     stage="$STAGE_ROOT/$triple/$profile"
     mkdir -p "$stage"
@@ -134,7 +155,14 @@ build_one() {
     cp "$rlib" "$stage/libchoreo_gui.rlib"
     # C static archives the rlib depends on (ring, secp256k1) so the Mac link
     # has everything in one directory — cc-rs leaves them in its out/ dirs.
-    find "$out/build/ring" "$out/build/secp256k1-sys" -name '*.a' -exec cp {} "$stage/" \; 2>/dev/null || true
+    # Layout note: nightly (share-generics) nests them under build/<crate>/<hash>/,
+    # stable under build/<crate>-<hash>/ — match by name across both.
+    find "$out/build" \( -path '*ring*' -o -path '*secp256k1*' \) -name '*.a' \
+        -exec cp {} "$stage/" \; 2>/dev/null || true
+    # The link inputs are the whole point of staging — a missing archive would
+    # only surface as an opaque undefined-symbol error on the Mac, so fail here.
+    [ -e "$stage/libring_core_0_17_14_.a" ] || fail "ring static archive not staged under $stage"
+    [ -e "$stage/libsecp256k1.a" ] || fail "secp256k1 static archive not staged under $stage"
     log "staged $stage"
 }
 

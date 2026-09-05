@@ -467,46 +467,66 @@ jobs:
           path: dist/choreographr-*
           if-no-files-found: error
 
-  ios-check:
-    # choreo-gui iOS compile gate (the ONLY crate that ships to iOS — the
+  ios-build:
+    # choreo-gui iOS build + link gate (the ONLY crate that ships to iOS — the
     # daemon/TUI/bridges are desktop/Termux-only; see choreo-gui/Cargo.toml).
-    # A compile check, not a release job: iOS artifacts are produced from a
-    # Mac by scripts/build-ios.sh + the ios/ Xcode scaffold, because the
-    # final Apple link needs the iOS SDK (no Linux/CI Linux host can link it).
-    # This job keeps the cfg(target_os = "ios") code path — trampoline,
-    # TcpPinned connection default — compiling on current Blitz/winit so it
-    # cannot silently rot between device-test sessions. macOS runner because
-    # cc-rs resolves the Apple SDK via xcrun there (scripts/check-ios.sh's
-    # zig-shim path is the Linux alternative for laptop development).
-    name: ios aarch64 (compile check)
+    # This runner IS a Mac with the full Xcode/iOS SDK, so this job does what
+    # no Linux host can: the real build (device + simulator slices) AND the
+    # actual app link via the ios/ Xcode scaffold — phase 0b's link-surface
+    # question (does project.yml's library/framework list cover wgpu/Metal +
+    # winit/UIKit?) answered on every push. Deliberately NO artifact upload:
+    # choreo-gui is a stub and never ships in a release (the release job only
+    # publishes dist/choreographr-* from the four build jobs); a failing link
+    # here is diagnosed from the log.
+    name: ios aarch64 (build + link)
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
       - name: Install stable toolchain + iOS rust targets
         run: |
+          # STABLE ONLY: this job must never touch the workspace's pinned
+          # nightly. build-ios.sh with IOS_BUILD_STABLE=1 and the checks below
+          # route through build-stable.sh, which strips the manifest's
+          # nightly-only profile-rustflags keys per invocation (bare
+          # `cargo +stable` cannot even parse the manifest — observed in CI
+          # 1.98.1: "feature `profile-rustflags` is required").
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Compile check (device target, lib only)
-        # Same crate-type restriction as scripts/build-ios.sh: the rlib only —
-        # the cdylib needs the Apple linker and is linked on-device builds by
-        # Xcode, not here.
-        #
-        # MUST go through build-stable.sh, NOT bare `cargo +stable`: the
-        # workspace manifest carries the nightly-only [unstable]
-        # profile-rustflags opt-in, which stable Cargo refuses to even parse
-        # (observed: CI 1.98.1 "feature `profile-rustflags` is required").
-        # build-stable.sh strips exactly those keys for the command's
-        # duration and restores them; every other stable build in this
-        # pipeline (release.sh, android job) uses the same wrapper.
-        run: ./scripts/build-stable.sh check -p choreo-gui --lib --target aarch64-apple-ios
+      - name: Compile check (both targets, rlib only)
+        # Same crate-type restriction as build-ios.sh: the rlib only — the
+        # cdylib needs Apple's linker and is not the target Xcode links.
+        run: |
+          ./scripts/build-stable.sh check -p choreo-gui --lib --target aarch64-apple-ios
+          ./scripts/build-stable.sh check -p choreo-gui --lib --target aarch64-apple-ios-sim
 
-      - name: Compile check (simulator target)
-        run: ./scripts/build-stable.sh check -p choreo-gui --lib --target aarch64-apple-ios-sim
+      - name: Build + stage link inputs (device + simulator)
+        run: IOS_BUILD_STABLE=1 ./scripts/build-ios.sh
+
+      - name: Generate the Xcode project
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      - name: Link the app (simulator SDK, Debug)
+        # The phase 0b link: consumes target/ios/aarch64-apple-ios/debug/
+        # (project.yml's LIBRARY_SEARCH_PATHS). A failure here is the
+        # actionable signal — the undefined symbols name the framework/flag
+        # to add to project.yml's OTHER_LDFLAGS.
+        # Destination: resolved dynamically (runner images cycle device names,
+        # so a hardcoded "iPhone 16" would rot); grab the first available
+        # simulator UDID instead.
+        run: |
+          set -o pipefail
+          DEST="$(xcrun simctl list devices available | grep -m1 -oE '[A-F0-9-]{36}')"
+          [ -n "$DEST" ] || { echo "error: no available simulator found" >&2; exit 1; }
+          xcodebuild -project ios/Choreographr.xcodeproj -scheme Choreographr \
+            -configuration Debug -sdk iphonesimulator -destination "id=$DEST" \
+            build CODE_SIGNING_ALLOWED=NO
 
   release:
     name: create GitHub release
