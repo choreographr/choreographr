@@ -32,9 +32,10 @@ class Choreographr < Formula
   end
 
   def install
-    # All four release binaries sit at the tarball root (see scripts/release.sh).
-    # (choreo-mcp is a library-only crate — it ships no binary.)
-    bin.install "choreographr", "choreo-tui", "choreo-im", "choreo-acp"
+    # The shipped release binaries sit at the tarball root (see
+    # scripts/release.sh). The IM/ACP bridges are feature-gated and not in the
+    # tarball; choreo-mcp is a library-only crate — it ships no binary.
+    bin.install "choreographr", "choreo-tui"
   end
 
   # Homebrew-managed launchd service (`brew services start choreographr`).

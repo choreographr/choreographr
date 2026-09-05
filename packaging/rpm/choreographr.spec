@@ -1,4 +1,4 @@
-# choreographr.spec — RPM spec for the "fat" package: the four prebuilt
+# choreographr.spec — RPM spec for the "fat" package: the prebuilt
 # binaries plus the systemd user unit.
 #
 # Staging assumption (why): nothing is compiled here. The binaries are prebuilt
@@ -32,15 +32,12 @@ BuildArch:      x86_64
 
 %description
 Choreographr is an agentic coding assistant: a local daemon (choreographr)
-with a terminal UI (choreo-tui), an instant-messaging bridge (choreo-im),
-and an ACP bridge (choreo-acp). This package ships the prebuilt
+with a terminal UI (choreo-tui). This package ships the prebuilt
 0.1.0 binaries and the systemd user unit (installed, never auto-enabled).
 
 %files
 /usr/bin/choreographr
 /usr/bin/choreo-tui
-/usr/bin/choreo-im
-/usr/bin/choreo-acp
 /usr/lib/systemd/user/choreographr.service
 
 %changelog

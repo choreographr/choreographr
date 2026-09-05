@@ -15,8 +15,11 @@ default-run = "choreographr"
 [dependencies]
 choreo-daemon = { path = "choreo-daemon", version = "0.1" }
 choreo-tui = { path = "choreo-tui", version = "0.1" }
-choreo-im = { path = "choreo-im", version = "0.1" }
-choreo-acp = { path = "choreo-acp", version = "0.1" }
+# Bridges are feature-gated (off by default): a plain `cargo build` produces
+# only the daemon + TUI binaries. Opt in with `--features im,acp` (or either
+# alone) to build the messaging/ACP bridge executables.
+choreo-im = { path = "choreo-im", version = "0.1", optional = true }
+choreo-acp = { path = "choreo-acp", version = "0.1", optional = true }
 anyhow.workspace = true
 mimalloc = { version = "0.1", optional = true }
 
@@ -38,6 +41,15 @@ content = ["choreo-daemon/content"]
 # static-musl rationale); a source build with `--features avif` enables it for
 # both the daemon (read_image / display_image) and the TUI (display decode).
 avif = ["choreo-daemon/avif", "choreo-tui/avif"]
+# Instant-messaging bridge (`choreo-im` binary). Off by default; opt in with
+# `--features im` to build the choreo-im executable.
+im = ["dep:choreo-im"]
+# Agent-Client-Protocol bridge (`choreo-acp` binary). Off by default; opt in
+# with `--features acp` to build the choreo-acp executable.
+acp = ["dep:choreo-acp"]
+# MCP tool group in the daemon (dynamic tools from stdio MCP server
+# subprocesses). Off by default; forwards to choreo-daemon/mcp.
+mcp = ["choreo-daemon/mcp"]
 # mimalloc — process-wide allocator, enabled ONLY by the static musl tarball
 # build in scripts/release.sh (musl's default malloc is weaker; mimalloc's
 # per-thread heaps replace it). Off by default so crates.io / `cargo install`
@@ -52,13 +64,18 @@ path = "src/bin/choreographr.rs"
 name = "choreo-tui"
 path = "src/bin/choreo-tui.rs"
 
+# Bridge binaries are feature-gated via required-features: a default build
+# (and every release artifact) skips them entirely; `--features im` / `acp`
+# pulls in the bridge crate and enables the target.
 [[bin]]
 name = "choreo-im"
 path = "src/bin/choreo-im.rs"
+required-features = ["im"]
 
 [[bin]]
 name = "choreo-acp"
 path = "src/bin/choreo-acp.rs"
+required-features = ["acp"]
 
 # cargo-binstall metadata: lets `cargo binstall choreographr` resolve our
 # GitHub release asset naming (`choreographr-<version>-<target>.<ext>`) from

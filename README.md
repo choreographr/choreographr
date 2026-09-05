@@ -39,8 +39,8 @@ Currently the primary client is **`choreo-tui`** - a fullscreen terminal UI.
 Other clients being developed: 
 
 - **`choreo-gui`** — Desktop/Android GUI built with [Dioxus](https://dioxuslabs.com/) on the Dioxus Native (Blitz) renderer — one renderer for both desktop and Android, no webview. Built as a lib+cdylib so dx/gradle can package it as an APK.
-- **`choreo-im`** — instant-messaging bridge (Telegram, more platforms coming) - chat with your agent on the go!
-- **`choreo-acp`** — ACP bridge so ACP-compatible editors (Claude Code, Cline, …) can drive Choreographr sessions over JSON-RPC.
+- **`choreo-im`** — instant-messaging bridge (Telegram, more platforms coming) - chat with your agent on the go! Feature-gated (`--features im`); not part of the prebuilt release binaries.
+- **`choreo-acp`** — ACP bridge so ACP-compatible editors (Claude Code, Cline, …) can drive Choreographr sessions over JSON-RPC. Feature-gated (`--features acp`); not part of the prebuilt release binaries.
 - **`choreographr`** — Choreographr servers will be able to connect to other servers to deploy work elsewhere.
 
 ### RISC-V Virtual Machine
@@ -253,9 +253,10 @@ parallel and can be interacted with independently. How the other agents compare:
 
 ## Install
 
-Prebuilt releases ship exactly four binaries — `choreographr choreo-tui
-choreo-im choreo-acp` (`choreo-mcp` is a library-only crate and ships no
-binary) — for **x86_64 Linux**, **macOS (Apple Silicon)**, **Windows (x86_64)**,
+Prebuilt releases ship exactly two binaries — `choreographr choreo-tui`
+(`choreo-mcp` is a library-only crate and ships no binary; the `choreo-im`
+and `choreo-acp` bridges are feature-gated and ship only in source builds
+via `--features im,acp`) — for **x86_64 Linux**, **macOS (Apple Silicon)**, **Windows (x86_64)**,
 and **Android/Termux (aarch64)**. All installs below use prebuilt binaries; no
 Rust or Zig toolchain is required. (The binaries are built by the GitHub
 Actions `release` workflow on every `vX.Y.Z` tag — see RELEASE.md's
@@ -280,7 +281,7 @@ Alternatives:
 - **GitHub Releases tarball** — download
   `choreographr-0.1.0-aarch64-apple-darwin.tar.gz` from the
   [releases page](https://github.com/choreographr/choreographr/releases) and
-  put the four binaries on your `PATH`. The binaries are unsigned, so
+  put the shipped binaries on your `PATH`. The binaries are unsigned, so
   Gatekeeper quarantines them: clear the attribute with
   `xattr -dr com.apple.quarantine /path/to/choreographr`, or right-click →
   Open once.
@@ -306,13 +307,13 @@ Alternatives:
   `cargo binstall choreographr` (prebuilt, no toolchain — fetches the static
   musl tarball from GitHub Releases; the binstall manifest maps glibc x86_64
   hosts to the musl asset, so no `--target` is needed) ·
-  `cargo install choreographr` (source build, needs Zig — installs the whole
-  suite: `choreographr`, `choreo-tui`, `choreo-im`, `choreo-acp`)
+  `cargo install choreographr` (source build, needs Zig — installs the
+  daemon + TUI; add `--features im,acp` for the bridge binaries)
 
 ### Windows & Android (Termux)
 
 Windows has no package manager for this — grab the release asset and put the
-four binaries on your `PATH`. Termux ships `pkg`/`dpkg`, so it gets a proper
+shipped binaries on your `PATH`. Termux ships `pkg`/`dpkg`, so it gets a proper
 `.deb` package (plus the tarball as a fallback):
 
 - **Windows (x86_64)** — download
@@ -324,15 +325,15 @@ four binaries on your `PATH`. Termux ships `pkg`/`dpkg`, so it gets a proper
     `choreographr-termux_<version>_aarch64.deb` from the
     [releases page](https://github.com/choreographr/choreographr/releases)
     and install it inside the Termux shell:
-    `pkg install ./choreographr-termux_<version>_aarch64.deb`. The four
+    `pkg install ./choreographr-termux_<version>_aarch64.deb`. The
     binaries land in `$PREFIX/bin`; the package declares no dependencies (the
     binaries are static NDK/bionic executables) and runs no maintainer scripts
     (Termux's dpkg runs as the app uid, no root).
   - **Tarball fallback** — download
     `choreographr-<version>-aarch64-linux-android.tar.gz`, extract it inside a
-    Termux shell, and copy the four binaries into Termux's bin directory:
-    `cp choreographr choreo-tui choreo-im choreo-acp $PREFIX/bin/ &&
-    chmod +x $PREFIX/bin/{choreographr,choreo-tui,choreo-im,choreo-acp}`. The
+    Termux shell, and copy the shipped binaries into Termux's bin directory:
+    `cp choreographr choreo-tui $PREFIX/bin/ &&
+    chmod +x $PREFIX/bin/{choreographr,choreo-tui}`. The
     binaries are plain NDK/bionic executables — no root, no Termux packages
     beyond the basics.
 
@@ -350,7 +351,8 @@ choreographr                                     # ...or just run it in a termin
 
 The non-Homebrew launchd plist expects `/opt/homebrew/bin/choreographr` —
 edit its `ProgramArguments` if your binaries live elsewhere. Once the daemon
-is up, attach a client (`choreo-tui`, `choreo-im`, `choreo-acp`) and follow
+is up, attach a client (`choreo-tui`; the bridges via `--features im,acp`)
+and follow
 [First conversation](#first-conversation) below. The daemon listens on the
 Unix socket `/tmp/Choreographr.sock` and stores its data under
 `~/.local/share/choreographr/` (see [Configuration](#configuration)).
@@ -400,8 +402,8 @@ the GUI is a separate crate (`choreo-gui`):
 ```bash
 cargo run --release -p choreographr --bin choreo-tui                 # terminal UI
 cargo run --release -p choreo-gui                                    # desktop app
-cargo run --release -p choreographr --bin choreo-im                  # IM bridge
-cargo run --release -p choreographr --bin choreo-acp                 # ACP bridge for editors
+cargo run --release -p choreographr --features im --bin choreo-im    # IM bridge
+cargo run --release -p choreographr --features acp --bin choreo-acp  # ACP bridge for editors
 ```
 
 ### First conversation
@@ -436,7 +438,7 @@ data model.
 
 | Crate | Description |
 |---|---|
-| `choreographr` | Workspace root — the suite installer. Declares the four binaries (`choreographr choreo-tui choreo-im choreo-acp`); `cargo run -p choreographr` / `cargo install choreographr` default to the daemon binary via `default-run` |
+| `choreographr` | Workspace root — the suite installer. Declares the binaries (`choreographr choreo-tui`, plus the feature-gated bridges `choreo-im`/`choreo-acp` behind `im`/`acp`); `cargo run -p choreographr` / `cargo install choreographr` default to the daemon binary via `default-run` |
 | `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
 | `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (208 providers) |
 | `choreo-blockchain` | Blockchain tools — EVM (alloy) and Substrate/Polkadot (subxt) read-only queries plus the tokio sidecar runtime they run on; pulled in by the daemon's `blockchain` feature (off by default) |
@@ -445,7 +447,7 @@ data model.
 | `choreo-image` | Leaf crate — the single raster decode path (EXIF orientation baked in) and HEIC/HEIF decode (with a pre-decode allocation guard), shared by the daemon and the TUI so the model and UI paths cannot drift |
 | `choreo-keystore` | X25519 + ECDH/AES-256-GCM crypto library for the per-daemon unlock-key keystore |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
-| `choreo-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio |
+| `choreo-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio. Library-only, linked via the daemon's `mcp` feature (off by default) |
 | `choreo-acp` | ACP (Agent Communication Protocol) bridge — translates JSON-RPC 2.0 over stdin/stdout into `choreo-proto` messages so ACP-compatible editors can drive sessions |
 | `choreo-tui` | Full-screen terminal UI client (ratatui + crossterm) |
 | `choreo-gui` | Desktop/Android GUI client (Dioxus Native / Blitz renderer — no webview) |
@@ -979,8 +981,8 @@ is on `PATH`.
 
 ### Android (Termux) binaries
 
-The four suite binaries (`choreographr`, `choreo-tui`, `choreo-im`,
-`choreo-acp`) run under Termux on Android. `scripts/build-android.sh`
+The suite binaries (`choreographr`, `choreo-tui`) run under Termux on
+Android. `scripts/build-android.sh`
  cross-builds them via [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) and
 stages them in `target/android/<abi>/` — the staging tree that BOTH Termux
 release channels consume: `scripts/build-deb-termux.sh` packages it into the
@@ -1069,7 +1071,7 @@ pkg install /sdcard/choreo/choreographr-termux_*.deb   # binaries land in $PREFI
 adb push target/android/arm64-v8a/* /sdcard/choreo/
 # then inside the Termux shell (adb cannot write Termux's private app dir):
 cp /sdcard/choreo/* $PREFIX/bin/ && chmod +x \
-  $PREFIX/bin/choreographr $PREFIX/bin/choreo-tui $PREFIX/bin/choreo-im $PREFIX/bin/choreo-acp
+  $PREFIX/bin/choreographr $PREFIX/bin/choreo-tui
 ```
 
 ### Supply-chain security
@@ -1138,9 +1140,10 @@ scripts/smoke-test.sh dist/choreographr-0.1.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 Prebuilt installs (no Rust toolchain needed) use `scripts/install.sh`, which
-pins the version and verifies a SHA-256 checksum before extracting the four
-binaries (`choreographr choreo-tui choreo-im choreo-acp` — `choreo-mcp` is a
-library-only crate and ships no binary). The systemd unit / launchd agent is
+pins the version and verifies a SHA-256 checksum before extracting the
+shipped binaries (`choreographr choreo-tui` — `choreo-mcp` is a library-only
+crate and ships no binary; the `choreo-im`/`choreo-acp` bridges are
+feature-gated and source-build only). The systemd unit / launchd agent is
 installed but **never auto-enabled** — the daemon is a user service and
 starting it is an explicit choice (`systemctl --user enable --now
 choreographr`).

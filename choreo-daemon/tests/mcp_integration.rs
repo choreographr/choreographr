@@ -1,3 +1,6 @@
+// Only compiled with the `mcp` feature: the whole test exercises the real
+// MCP stack (McpManager + choreo-mcp), which does not exist in a plain build.
+#![cfg(feature = "mcp")]
 use choreo_daemon::tools::ToolOutputFormat;
 /// Integration test for MCP server spawning, tool discovery, and tool
 /// execution through the full Choreographr stack (McpManager + ToolRegistry).

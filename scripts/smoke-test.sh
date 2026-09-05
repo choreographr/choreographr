@@ -3,7 +3,7 @@
 # pipeline. Two artifact kinds, dispatched on the filename suffix:
 #
 #   *.tar.gz  — scripts/release.sh's release tarball: extracts it, checks the
-#               four binaries are present and executable, verifies each
+#               shipped binaries are present and executable, verifies each
 #               binary's `--version` reports the release version, and confirms
 #               each binary's `--help` exits 0.
 #   *.deb     — scripts/build-deb-termux.sh's Termux package: STRUCTURAL
@@ -33,7 +33,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -n1)"
 VERSION="${VERSION:-0.1.0}"
 
-BINARIES=(choreographr choreo-tui choreo-im choreo-acp)
+BINARIES=(choreographr choreo-tui)
 FAIL=0
 
 # ── Termux .deb path (structural only — see the header comment) ──────────────
@@ -92,7 +92,7 @@ if [[ "$TARBALL" == *.deb ]]; then
         FAIL=1
     fi
 
-    echo "==> checking contents (the four binaries in Termux's \$PREFIX/bin, mode 0755)"
+    echo "==> checking contents (the shipped binaries in Termux's \$PREFIX/bin, mode 0755)"
     # Termux's dpkg installs against / with no chroot, so the package carries
     # the real on-device path of $PREFIX (like Termux's own repo packages).
     TERMUX_BIN='\./data/data/com\.termux/files/usr/bin'
@@ -127,7 +127,7 @@ trap 'rm -rf "$TMP"' EXIT
 echo "==> extracting $TARBALL"
 tar -xzf "$TARBALL" -C "$TMP"
 
-echo "==> checking the four binaries exist and are executable (tarball path)"
+echo "==> checking the shipped binaries exist and are executable (tarball path)"
 for b in "${BINARIES[@]}"; do
     if [ -x "$TMP/$b" ]; then
         echo "  ok: $b"
@@ -137,7 +137,7 @@ for b in "${BINARIES[@]}"; do
     fi
 done
 
-echo "==> --version must report $VERSION (all four binaries)"
+echo "==> --version must report $VERSION (all shipped binaries)"
 for b in "${BINARIES[@]}"; do
     VER_OUT="$(run_guarded "$TMP/$b" --version 2>&1)" || {
         echo "  FAIL: $b --version exited non-zero" >&2
@@ -153,9 +153,9 @@ for b in "${BINARIES[@]}"; do
     esac
 done
 
-# All four binaries are clap clients, so --help is safe on every one of
+# All shipped binaries are clap clients, so --help is safe on every one of
 # them: clap handles it before any daemon connection attempt.
-echo "==> --help must exit 0 without hanging (all four binaries)"
+echo "==> --help must exit 0 without hanging (all shipped binaries)"
 for b in "${BINARIES[@]}"; do
     if run_guarded "$TMP/$b" --help >/dev/null 2>&1; then
         echo "  ok: $b --help"

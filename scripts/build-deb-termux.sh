@@ -22,7 +22,7 @@
 #     read-only device root (on-device failure, 2026-09-02). This hardcodes
 #     the official Termux app id (com.termux); forks with a different app id
 #     have a different private dir and need a rebuilt package.
-#   - No `Depends:`: the four binaries are static-bionic executables linking
+#   - No `Depends:`: the shipped binaries are static-bionic executables linking
 #     only Android system libs (interpreter /system/bin/linker64), so there is
 #     nothing in Termux's package universe to depend on.
 #   - No maintainer scripts (postinst et al.) and no conffiles: Termux has no
@@ -46,7 +46,7 @@
 # (and documented in README's Termux section); a green CI run proves the
 # package is well-formed, not that Termux accepts it.
 #
-# Prerequisites: the four binaries in target/android/arm64-v8a/ (see
+# Prerequisites: the shipped binaries in target/android/arm64-v8a/ (see
 # scripts/build-android.sh) and dpkg-deb (preinstalled on ubuntu runners; on
 # Arch install with: pacman -S dpkg).
 set -euo pipefail
@@ -57,7 +57,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -n1)"
 [ -n "$VERSION" ] || { echo "error: could not read version from Cargo.toml" >&2; exit 1; }
 
-BINARIES=(choreographr choreo-tui choreo-im choreo-acp)
+BINARIES=(choreographr choreo-tui)
 # Termux's architecture tag. NOT Debian's `arm64` — dpkg compares this string
 # against Termux's own dpkg architecture and rejects any other spelling.
 ARCH="aarch64"
@@ -188,7 +188,7 @@ if [ "$CTRL_OK" -ne 1 ]; then
 fi
 echo "  ok: no maintainer scripts or conffiles"
 
-# Contents + exec bits: all four binaries at Termux's $PREFIX/bin (the real
+# Contents + exec bits: all shipped binaries at Termux's $PREFIX/bin (the real
 # on-device path — see the header), mode -rwxr-xr-x (dpkg-deb --contents
 # prints the staging tree's modes verbatim).
 CONTENTS="$(dpkg-deb --contents "$DEB")"
@@ -203,7 +203,7 @@ for b in "${BINARIES[@]}"; do
 done
 
 # Nothing else may be in the data archive — the only directory chain allowed
-# is Termux's $PREFIX path (+ its parents), plus the four binaries. An explicit
+# is Termux's $PREFIX path (+ its parents), plus the shipped binaries. An explicit
 # whitelist loop (not a regex) so an unbalanced pattern can't silently invert
 # the check.
 STRAY_OK=1
@@ -211,7 +211,7 @@ while IFS= read -r entry; do
     # The archive path is the entry's last whitespace-separated field.
     case "${entry##* }" in
         ./|./data/|./data/data/|./data/data/com.termux/|./data/data/com.termux/files/|./data/data/com.termux/files/usr/|./data/data/com.termux/files/usr/bin/) ;;
-        ./data/data/com.termux/files/usr/bin/choreographr|./data/data/com.termux/files/usr/bin/choreo-tui|./data/data/com.termux/files/usr/bin/choreo-im|./data/data/com.termux/files/usr/bin/choreo-acp) ;;
+        ./data/data/com.termux/files/usr/bin/choreographr|./data/data/com.termux/files/usr/bin/choreo-tui) ;;
         *) STRAY_OK=0 ;;
     esac
 done <<<"$CONTENTS"

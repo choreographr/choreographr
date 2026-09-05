@@ -47,7 +47,7 @@ for arg in "$@"; do
     esac
 done
 
-# The release build links the four large binaries in one go; linking can open
+# The release build links the large binaries in one go; linking can open
 # thousands of files at once, and on machines with a low default soft fd limit
 # (e.g. 1024) the link dies with "ProcessFdQuotaExceeded". Raise the soft
 # limit best-effort — the hard limit is typically far higher (here 1048576).
@@ -94,14 +94,18 @@ case "$(uname -s)-$(uname -m)" in
         ;;
 esac
 
-# The four release binaries (must match scripts/install.sh and the formula).
-BINARIES=(choreographr choreo-tui choreo-im choreo-acp)
+# The release binaries (must match scripts/install.sh and the formula). The
+# IM and ACP bridges are feature-gated (`im` / `acp`) and NOT built for
+# release — release binaries ship only the daemon + TUI suite.
+BINARIES=(choreographr choreo-tui)
 
 echo "==> building release binaries (root package)"
-# Build only the four shipped binaries: `-p choreographr` pulls in the daemon,
-# TUI, IM, and ACP transitively but NOT choreo-gui (its dioxus/webkit2gtk stack
+# Build only the shipped binaries: `-p choreographr` pulls in the daemon and
+# TUI transitively but NOT choreo-gui (its dioxus/webkit2gtk stack
 # is not shipped and must not be a build requirement of the release machine).
-# `--features metrics,blockchain` enables the Prometheus `/metrics` endpoint and
+# The bridge binaries (`choreo-im`, `choreo-acp`) are required-features-gated
+# and therefore skipped by this build. `--features metrics,blockchain` enables
+# the Prometheus `/metrics` endpoint and
 # the EVM/Substrate blockchain tools for the shipped binaries — both are off by
 # default so the published crates.io manifests stay lean (the metrics machinery
 # and the optional `choreo-blockchain` crate, which pulls tokio/alloy/subxt into
@@ -156,7 +160,7 @@ else
     TARBALL_BIN_DIR="target/dist"
 fi
 
-# Stage the tarball contents: the four binaries plus both service files, all
+# Stage the tarball contents: the shipped binaries plus both service files, all
 # at the top level of the archive (no bin/ prefix) so install.sh and the
 # Homebrew formula can reference them directly. tar preserves exec bits.
 mkdir -p dist

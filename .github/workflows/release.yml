@@ -26,7 +26,7 @@
 #                   its Zig source with `zig cc` on every host target).
 #   windows-msvc    hand-rolled: build-stable.sh host build (same --profile
 #                   dist shipped-artifact profile as release.sh) + zip of the
-#                   four .exe files. release.sh is not reused here because its
+#                   .exe files. release.sh is not reused here because its
 #                   staging is a POSIX tar.gz with the service files
 #                   (systemd/launchd mean nothing on Windows) and the Windows
 #                   artifact is a zip; build flags still match release.sh.
@@ -224,13 +224,13 @@ jobs:
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           STAGE="$(mktemp -d)"
-          for b in choreographr choreo-tui choreo-im choreo-acp; do
+          for b in choreographr choreo-tui; do
               cp "target/dist/$b.exe" "$STAGE/$b.exe"
           done
-          # Smoke (mirrors scripts/smoke-test.sh): the TUI/IM/ACP clients
+          # Smoke (mirrors scripts/smoke-test.sh): the TUI client
           # cannot run fully headless, but --version must print the release
           # version and exit 0 — never hang or crash.
-          for b in choreographr choreo-tui choreo-im choreo-acp; do
+          for b in choreographr choreo-tui; do
               "$STAGE/$b.exe" --version
           done
           mkdir -p dist
@@ -304,7 +304,7 @@ jobs:
           file target/android/arm64-v8a/*
           file target/android/arm64-v8a/* | grep -q 'ARM aarch64'
           tar czf "dist/choreographr-${VERSION}-aarch64-linux-android.tar.gz" \
-              -C target/android/arm64-v8a choreographr choreo-tui choreo-im choreo-acp
+              -C target/android/arm64-v8a choreographr choreo-tui
 
       - name: Package the Termux .deb (no rebuild)
         run: |

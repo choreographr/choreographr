@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# scripts/build-android.sh — cross-build the four suite binaries for Android
+# scripts/build-android.sh — cross-build the suite binaries for Android
 # (Termux) via cargo-ndk.
 #
-# The four suite binaries (choreographr, choreo-tui, choreo-im, choreo-acp)
+# The shipped suite binaries (choreographr, choreo-tui). The IM/ACP bridges
+# are feature-gated (`im` / `acp`) and are NOT part of the release set.
 # are the Termux runtime targets: they run as plain executables inside a Termux
 # shell, so they are built as regular cargo binaries against the Android NDK's
 # bionic toolchain and pushed into `$PREFIX/bin` with adb.
@@ -204,8 +205,9 @@ done
 TARGETS="arm64-v8a"
 [ "$EMULATOR" = 1 ] && TARGETS="$TARGETS x86_64"
 
-# The four suite binaries, as cargo -p/-bin names (all live in the root package).
-BINS="choreographr choreo-tui choreo-im choreo-acp"
+# The shipped suite binaries, as cargo -p/-bin names (all live in the root
+# package); the feature-gated bridge binaries are excluded.
+BINS="choreographr choreo-tui"
 
 if [ "$CHECK" = 1 ]; then
     # Dry run: report what WOULD happen and exit before touching the manifest.
@@ -221,7 +223,7 @@ if [ "$CHECK" = 1 ]; then
             log "      -p choreographr --bin $bin"
         done
     done
-    log "staging layout: target/android/<abi>/{choreographr,choreo-tui,choreo-im,choreo-acp}"
+    log "staging layout: target/android/<abi>/{choreographr,choreo-tui}"
     exit 0
 fi
 
@@ -343,8 +345,8 @@ for abi in $TARGETS; do
     triple="$(abi_to_triple "$abi")"
     log "building suite binaries for $abi ($triple)"
     # cargo ndk syntax verified against `cargo ndk --help` (cargo-ndk 3.x):
-    # `-t` takes the Android ABI name, cargo args follow after `--`. All four
-    # bins live in the root package, so one invocation per ABI builds them
+    # `-t` takes the Android ABI name, cargo args follow after `--`. Both
+    # shipped bins live in the root package, so one invocation per ABI builds them
     # against shared artifacts.
     PKG_ARGS=()
     for bin in $BINS; do PKG_ARGS+=("-p" choreographr "--bin" "$bin"); done
@@ -407,6 +409,6 @@ cat <<EOF
   adb push target/android/arm64-v8a/* /sdcard/choreo/
   # then inside the Termux shell:
   cp /sdcard/choreo/* \$PREFIX/bin/ && chmod +x \
-    \$PREFIX/bin/choreographr \$PREFIX/bin/choreo-tui \$PREFIX/bin/choreo-im \$PREFIX/bin/choreo-acp
+    \$PREFIX/bin/choreographr \$PREFIX/bin/choreo-tui
 EOF
 log "done"

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Choreographr installer — fetches the prebuilt release tarball, verifies its
-# SHA-256 checksum, and installs the four binaries plus the platform service
+# SHA-256 checksum, and installs the shipped binaries plus the platform service
 # file (systemd user unit on Linux, launchd agent on macOS).
 #
 # Dependencies: curl + tar (+ sha256sum on Linux / shasum on macOS). Nothing
@@ -30,9 +30,10 @@ VERSION="0.1.0" # embedded release version — bump with every release
 : "${CHOREOGRAPHR_BASE_URL:=https://choreographr.com/download/${VERSION}/}"
 BASE="${CHOREOGRAPHR_BASE_URL%/}" # normalize: no trailing slash
 
-# The four release binaries (must match scripts/release.sh). choreo-mcp is a
-# library-only crate (no binary); the shipped set is these four.
-BINARIES="choreographr choreo-tui choreo-im choreo-acp"
+# The release binaries (must match scripts/release.sh). The IM/ACP bridges
+# are feature-gated and not part of the shipped set; choreo-mcp is a
+# library-only crate (no binary).
+BINARIES="choreographr choreo-tui"
 
 usage() {
     cat <<EOF
@@ -41,7 +42,7 @@ Usage: $0 [--uninstall] [--help]
 Install (default) or remove the Choreographr release binaries and the
 platform service file. The service file is installed but never auto-enabled.
 
-  --uninstall   remove the four binaries and the service file
+  --uninstall   remove the shipped binaries and the service file
   --help        show this help
 
 Environment:

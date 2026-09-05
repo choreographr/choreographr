@@ -57,11 +57,12 @@ built nowhere.
 |---|---|---|
 | `linux-musl` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` + `.rpm` (via `scripts/release.sh`; `rpmbuild` is apt-installed in the job, since it is not preinstalled) |
 | `macos-arm64` | macos-latest | native `aarch64-apple-darwin` tarball (via `scripts/release.sh`) |
-| `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the four `.exe` files |
+| `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the shipped `.exe` files |
 | `android-termux` | ubuntu-latest + NDK | `aarch64-linux-android` Termux tarball (via `scripts/build-android.sh --features metrics,blockchain`) + the Termux-native `.deb` (via `scripts/build-deb-termux.sh`, structural smoke-test only — no Termux on the runner) |
 
-Every job builds the same four binaries (`choreographr choreo-tui choreo-im
-choreo-acp`) with `--features metrics,blockchain` on the **stable** toolchain,
+Every job builds the same shipped binaries (`choreographr choreo-tui` — the
+`choreo-im`/`choreo-acp` bridges are feature-gated and excluded from release
+artifacts) with `--features metrics,blockchain` on the **stable** toolchain,
 smoke-tests its artifact, and uploads it; the `release` job only runs for tag
 pushes. Windows/Termux artifacts ship **in addition to** the Homebrew/AUR
 channels — those package the same tarballs CI produces.

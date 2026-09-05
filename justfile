@@ -343,13 +343,15 @@ tui args="": _require-zig
 gui args="": _require-zig
     cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-gui -- {{ args }}
 
-# Run the instant-messaging bridge (e.g. `just im telegram`)
+# Run the instant-messaging bridge (e.g. `just im telegram`).
+# Feature-gated: pulls in the `im` feature (the binary is required-features-gated).
 im args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --bin choreo-im -- {{ args }}
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --features im --bin choreo-im -- {{ args }}
 
-# Run the ACP bridge for ACP-compatible editors
+# Run the ACP bridge for ACP-compatible editors.
+# Feature-gated: pulls in the `acp` feature (the binary is required-features-gated).
 acp args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --bin choreo-acp -- {{ args }}
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --features acp --bin choreo-acp -- {{ args }}
 
 # Run any workspace crate's binary. e.g. `just run choreographr -v`
 run crate args="": _require-zig

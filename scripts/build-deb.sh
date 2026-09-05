@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# build-deb.sh — builds the single "fat" .deb containing the four release
+# build-deb.sh — builds the single "fat" .deb containing the release
 # binaries plus the systemd user unit.
 #
 # Prerequisites:
 #   - dist-profile artifacts in target/dist/ — produced by scripts/release.sh
 #     or `./scripts/build-stable.sh build --locked --profile dist --workspace`
-#     (binaries: choreographr choreo-tui choreo-im choreo-acp)
+#     (binaries: choreographr choreo-tui)
 #   - packaging/choreographr.service
 #   - dpkg-deb (install on Arch with: pacman -S dpkg)
 #
@@ -17,7 +17,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -n1)"
 [ -n "$VERSION" ] || { echo "error: could not read version from Cargo.toml" >&2; exit 1; }
 
-BINARIES=(choreographr choreo-tui choreo-im choreo-acp)
+BINARIES=(choreographr choreo-tui)
 
 command -v dpkg-deb >/dev/null 2>&1 || {
     echo "error: dpkg-deb not found — install it with: pacman -S dpkg" >&2

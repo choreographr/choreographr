@@ -1,21 +1,37 @@
+// Real implementation (spawn/handshake/discover/shutdown over stdio) is
+// compiled only with the `mcp` feature. Without it, the module below degrades
+// to a no-op stub (see the `#[cfg(not(feature = "mcp"))]` block) so the
+// manager's call sites in cli.rs / daemon.rs / server/lifecycle.rs compile
+// unchanged in both configurations.
+#[cfg(feature = "mcp")]
 pub mod config;
+#[cfg(feature = "mcp")]
 pub mod tool;
 
+#[cfg(feature = "mcp")]
 use crate::tools::{ToolDyn, ToolRegistry};
+#[cfg(feature = "mcp")]
 use anyhow::{Context, Result};
+#[cfg(feature = "mcp")]
 use choreo_mcp::{McpClient, McpServerConfig};
+#[cfg(feature = "mcp")]
 use std::collections::HashMap;
+#[cfg(feature = "mcp")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "mcp")]
 use tool::McpToolWrapper;
+#[cfg(feature = "mcp")]
 use tracing::{debug, error, info, warn};
 
 /// Manages all MCP server subprocesses and their registered tools.
+#[cfg(feature = "mcp")]
 pub struct McpManager {
     /// MCP client per server, keyed by server slug. Arc<Mutex<>> so
     /// McpToolWrapper instances can share the same client reference.
     clients: HashMap<String, Arc<Mutex<McpClient>>>,
 }
 
+#[cfg(feature = "mcp")]
 impl McpManager {
     /// Spawn a single MCP server subprocess and perform the initialize handshake.
     fn spawn_server(cfg: &McpServerConfig) -> Result<McpClient> {
@@ -175,13 +191,47 @@ impl McpManager {
     }
 }
 
+#[cfg(feature = "mcp")]
 impl Drop for McpManager {
     fn drop(&mut self) {
         self.shutdown_all();
     }
 }
 
+// Feature-off stub: mirrors the metrics-module stub convention. The manager
+// holds no clients (there is nothing to manage without the choreo-mcp
+// dependency), so construction, teardown, and Drop are all no-ops. The API
+// surface matches the real manager exactly — same method signatures — so
+// callers cannot tell the difference, and no call site needs feature cfgs.
+#[cfg(not(feature = "mcp"))]
+mod imp {
+    use crate::tools::ToolRegistry;
+
+    /// No-op stand-in for the real McpManager (see the module-level cfg note).
+    pub struct McpManager;
+
+    impl McpManager {
+        /// Stub: no MCP config is loaded and no servers are spawned.
+        pub fn from_config(_registry: &mut ToolRegistry) -> Self {
+            Self
+        }
+
+        /// Stub: there are no servers to shut down.
+        pub fn shutdown_all(&mut self) {}
+
+        /// Stub: creates an empty manager (same seam the real one exposes for
+        /// tests).
+        pub fn empty() -> Self {
+            Self
+        }
+    }
+}
+
+#[cfg(not(feature = "mcp"))]
+pub use imp::McpManager;
+
 #[cfg(test)]
+#[cfg(feature = "mcp")]
 mod tests {
     use super::*;
 

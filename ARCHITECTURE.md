@@ -32,9 +32,10 @@ package plus fifteen members:
 
 ```
 Choreographr (workspace)
-├── choreographr          Workspace root — the suite installer: declares the four
-│                       binaries (choreographr choreo-tui choreo-im choreo-acp;
-│                       the desktop GUI is a separate crate, choreo-gui)
+├── choreographr          Workspace root — the suite installer: declares the
+│                       binaries (choreographr choreo-tui; the choreo-im/
+│                       choreo-acp bridges behind the im/acp features; the
+│                       desktop GUI is a separate crate, choreo-gui)
 ├── choreo-proto           Wire protocol (shared types + framing)
 ├── choreo-sanitize        Leaf crate — shared Unicode "spoofing" predicates
 │                       and the tool-output byte budget + truncation marker
@@ -47,6 +48,7 @@ Choreographr (workspace)
 │                       plus a LaTeX math → Unicode pretty-printer (`render_math_pretty`)
 ├── choreo-mcp             MCP (Model Context Protocol) client — spawns subprocess servers,
 │                       discovers tools, and dispatches tool calls over JSON-RPC stdio
+│                       (linked only via the daemon's `mcp` feature, off by default)
 ├── choreo-ai-protocols    Provider protocols — OpenAI-compatible, Anthropic Messages, and
 │                       Google Gemini clients, the ProviderClient trait, and the provider
 │                       catalog (models.dev base + bundled overlay, embedded postcard)
@@ -56,6 +58,7 @@ Choreographr (workspace)
 │                       (JSON-RPC over stdin/stdout) into choreo-proto messages over the
 │                       daemon's Unix socket, enabling ACP-compatible editors (Claude
 │                       Code, Cline, etc.) to interact with Choreographr sessions
+│                       (feature-gated `acp` root-package feature, off by default)
 ├── choreo-content           Choreographr Coordination Platform client — Substrate
 │                       chain writes (subxt via a tokio sidecar), indexer reads,
 │                       IPFS add/cat, content protobuf encode/decode, and the
@@ -65,7 +68,8 @@ Choreographr (workspace)
 ├── choreo-gui             Desktop/Android GUI client (Dioxus Native / Blitz
 │                       renderer — no webview; built as lib+cdylib for dx/gradle
 │                       APK packaging)
-└── choreo-im              IM platform bridge (Telegram)
+└── choreo-im              IM platform bridge (Telegram; feature-gated `im`
+                        root-package feature, off by default)
 ```
 
 ### Dependency graph
@@ -139,17 +143,20 @@ README).
 
 ### Shipped artifacts
 
-Exactly **four binaries** ship in every artifact (tarball, `.deb`, `.rpm`,
+Exactly **two binaries** ship in every artifact (tarball, `.deb`, `.rpm`,
 Homebrew, AUR):
 
 - `choreographr` — the daemon
 - `choreo-tui` — terminal UI client
-- `choreo-im` — IM bridge
-- `choreo-acp` — ACP bridge
 
-`choreo-mcp` is a **library-only crate** (the MCP client the daemon spawns
-for tool servers) — it has no `[[bin]]` target and is never shipped as a
-binary. `choreo-gui` is built separately (desktop via `cargo run -p choreo-gui`,
+The `choreo-im` and `choreo-acp` bridges are **feature-gated** (root-package
+`im` / `acp` features, off by default) and are NOT built for release —
+release.sh / the CI workflow build only the two shipped binaries; the
+bridges are source-build extras via `--features im,acp`.
+
+`choreo-mcp` is a **library-only crate** (the MCP client the daemon's
+feature-gated `mcp` module uses to spawn tool servers) — it has no `[[bin]]`
+target and is never shipped as a binary. `choreo-gui` is built separately (desktop via `cargo run -p choreo-gui`,
 Android via `dx build --platform android`) and is not shipped either.
 
 The shipped target set is exactly two; `release.sh` and `install.sh` hardcode
@@ -269,15 +276,15 @@ with `systemctl --user enable --now choreographr` (Linux) or
 
 | Script | Role |
 |---|---|
-| `install.sh` | curl\|sh installer — downloads the pinned-version tarball, verifies its SHA-256 against the `SHA256SUMS` fetched over the same TLS channel (no trust-on-first-use, no eval), extracts only the four binaries via an explicit member list, installs the platform service file, and never auto-enables. `--uninstall` removes everything; `CHOREOGRAPHR_BASE_URL` overrides the download base for testing/mirrors only. |
-| `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing all four binaries plus the systemd user unit, from existing `target/dist/` artifacts. The `.deb` forces xz archive members (`-Zxz`) — dpkg ≥ 1.22 defaults to zstd, which older-dpkg distros the package targets (e.g. Ubuntu 22.04) cannot read |
+| `install.sh` | curl\|sh installer — downloads the pinned-version tarball, verifies its SHA-256 against the `SHA256SUMS` fetched over the same TLS channel (no trust-on-first-use, no eval), extracts only the shipped binaries via an explicit member list, installs the platform service file, and never auto-enables. `--uninstall` removes everything; `CHOREOGRAPHR_BASE_URL` overrides the download base for testing/mirrors only. |
+| `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing the shipped binaries plus the systemd user unit, from existing `target/dist/` artifacts. The `.deb` forces xz archive members (`-Zxz`) — dpkg ≥ 1.22 defaults to zstd, which older-dpkg distros the package targets (e.g. Ubuntu 22.04) cannot read |
 | `build-deb-termux.sh` | Build the **Termux-native** `.deb` from the already-cross-built `target/android/arm64-v8a/` binaries (NO rebuild) — package `choreographr`, `Architecture: aarch64` (Termux's tag, not Debian's `arm64`), files at `./data/data/com.termux/files/usr/bin/<name>` — Termux's dpkg installs against `/` with no chroot, so the package must carry the real on-device path of the fixed `$PREFIX` (as upstream Termux packages do; the earlier `./bin/` convention made dpkg try to write `/bin` at the read-only device root), no maintainer scripts / conffiles (Termux dpkg runs as the app uid, no root). Built with `dpkg-deb --build --root-owner-group -Zxz` — xz is forced because dpkg ≥ 1.22 on the ubuntu runners defaults to zstd and Termux's dpkg has no zstd support (it only finds `control.tar{xz,lzma,}` members; the on-device failure this caused is what the in-script member assertion guards against); validates control fields, archive members, contents, and exec bits in-script — structural only, since there is no Termux on the build host. Output: `dist/choreographr-termux_<ver>_aarch64.deb` (the `-termux-` infix disambiguates it from the desktop `.deb` on the release page). Wired into the release workflow's android job only — deliberately NOT into `release.sh` |
-| `smoke-test.sh` | Dispatches on the artifact suffix: a release tarball is extracted, the four binaries' presence/exec bits/`--version`/`--help` are checked; a `.deb` (the Termux package) is validated structurally via `dpkg-deb` — control fields, no `Depends:`/maintainer scripts, the four binaries at Termux's `$PREFIX` path (`./data/data/com.termux/files/usr/bin/`) with 0755 modes — the structural ceiling since no Termux exists on the host |
+| `smoke-test.sh` | Dispatches on the artifact suffix: a release tarball is extracted, the shipped binaries' presence/exec bits/`--version`/`--help` are checked; a `.deb` (the Termux package) is validated structurally via `dpkg-deb` — control fields, no `Depends:`/maintainer scripts, the shipped binaries at Termux's `$PREFIX` path (`./data/data/com.termux/files/usr/bin/`) with 0755 modes — the structural ceiling since no Termux exists on the host |
 | `release.sh` | The release orchestrator — local builds (its CI counterpart is `.github/workflows/release.yml`, which runs it on the Linux/macOS runners); dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard (CI passes it: a checkout IS the pushed commit, so the uncommitted-edits threat model cannot apply) |
 | `publish-stable.sh` | The crates.io publish wrapper (RELEASE.md Phase 2) — strips the nightly-only per-profile `rustflags` and the `[unstable]` config opt-in for the duration of `cargo release publish` (masking the two edited files from cargo-release's clean-tree gate via `git update-index --skip-worktree`, and always passing `--exclude choreo-gui`, which cargo-release 1.1.5 won't drop on its own via `publish = false`), so published manifests stay buildable by stable `cargo install`, then restores both files and clears the masks |
 | `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine (the CI release workflow ships the tarballs but does not touch the tap) |
 | `check-supply-chain.sh` | The dependency supply-chain gate — runs `cargo deny check advisories bans sources` against `deny.toml` (falling back to `cargo-audit` + a literal lockfile scan when cargo-deny is absent), after scanning the local `~/.cargo/registry` cache for the `.crate` files deleted during the 2026-08-20 `arrayref` attack (RUSTSEC-2026-0260). Wired into `just pre-commit` / `just ci`; see the **Dependency supply chain** subsection under **Security model** |
-| `build-android.sh` | Cross-builds the four suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run) under `--profile dist` (the shipped-artifact profile — matches the desktop release pipeline), stages them in `target/android/<abi>/` (cargo's target/ tree — `dist/` is reserved for final publishable artifacts), and prints the `adb push` guidance for Termux `$PREFIX/bin`. Its output is the input for the Termux packaging step (`scripts/build-deb-termux.sh`, CI android job): packaging never rebuilds. Links the four binaries with a linker-script fragment that re-aligns the TLS output sections to 64 bytes — bionic's loader rejects arm64 executables whose `PT_TLS` has `p_align < 64` (rust/LLVM emit 8, and the emutls-for-Android rust PR was never merged), which aborted every Rust binary with thread-locals at startup on Android 10+; a post-build `readelf` gate fails the build rather than shipping a binary that dies on-device. Strips the per-profile `rustflags` from the manifest for the duration (persistent backups under `target/` + EXIT-trap restore, plus a next-run self-heal that recovers a tree left stripped by a hard-killed predecessor — the trap-reliant restore alone was not kill-safe; see `build-stable.sh`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
+| `build-android.sh` | Cross-builds the shipped suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run) under `--profile dist` (the shipped-artifact profile — matches the desktop release pipeline), stages them in `target/android/<abi>/` (cargo's target/ tree — `dist/` is reserved for final publishable artifacts), and prints the `adb push` guidance for Termux `$PREFIX/bin`. Its output is the input for the Termux packaging step (`scripts/build-deb-termux.sh`, CI android job): packaging never rebuilds. Links the four binaries with a linker-script fragment that re-aligns the TLS output sections to 64 bytes — bionic's loader rejects arm64 executables whose `PT_TLS` has `p_align < 64` (rust/LLVM emit 8, and the emutls-for-Android rust PR was never merged), which aborted every Rust binary with thread-locals at startup on Android 10+; a post-build `readelf` gate fails the build rather than shipping a binary that dies on-device. Strips the per-profile `rustflags` from the manifest for the duration (persistent backups under `target/` + EXIT-trap restore, plus a next-run self-heal that recovers a tree left stripped by a hard-killed predecessor — the trap-reliant restore alone was not kill-safe; see `build-stable.sh`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
 
 ### Distribution channels (0.1)
 
@@ -610,7 +617,9 @@ operator already trusts, or is confirmed by a human comparing fingerprints:
 ### `choreo-mcp` — MCP client (Model Context Protocol)
 
 Communicates with MCP server subprocesses over JSON-RPC 2.0 stdio transport.
-Used by `choreo-daemon` to spawn external MCP servers and register their tools.
+Used by `choreo-daemon` to spawn external MCP servers and register their tools
+(behind the daemon's `mcp` cargo feature, off by default — a plain build
+excludes the crate and the daemon's `mcp/` module compiles to a no-op stub).
 
 | Module | Purpose |
 |---|---|
@@ -704,6 +713,10 @@ the daemon channel fail harmlessly once the command loop is gone.
 
 
 ### `choreo-acp` — ACP bridge (Agent Communication Protocol)
+
+Feature-gated: the root package builds this bridge only with `--features acp`
+(the binary is `required-features = ["acp"]`), so default and release builds
+exclude it entirely.
 
 Entry point: `src/main.rs` → initializes logging, connects to the daemon's Unix socket,
 spawns I/O threads, runs the main event loop.
@@ -822,7 +835,7 @@ alloy/subxt clients, and the daemon calls their synchronous `execute_*` entry po
 | `tools/glob_util.rs` | `GlobFilter` — shared glob-matching utility used by `delete_files` and `grep` that follows gitignore conventions (patterns without `/` match basename, patterns with `/` match full path). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`ChoreographrSyscall`) for tool dispatch. |
 | `tools/shell_util.rs` | Shared child-process spawning for the shell/exec tools (`spawn_with_watchdog` / `spawn_with_streaming`): env sanitization, output caps, the timeout watchdog, and process-tree isolation — process-group + pidfd kill on Unix, a Windows Job Object (`ChildJob`) with blocking reads bounded by job termination on Windows. All waits are channel-driven (`recv_timeout` on the watchdog and on every drain's completion channel — no polling), each bounded by a completion grace that detaches a wedged drain rather than hanging the tool; the `Arc<ChildJob>` shared by the watchdog and drain threads is the fifth sanctioned shared-state exception (AGENTS.md). |
-| `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json`, spawns subprocesses via `McpClient`, wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) and registers them in the `ToolRegistry` under a `mcp/<slug>` group. |
+| `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json`, spawns subprocesses via `McpClient`, wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) and registers them in the `ToolRegistry` under a `mcp/<slug>` group. Compiled only with the `mcp` cargo feature (off by default); without it the module degrades to a no-op `McpManager` stub so call sites compile unchanged. |
 
 ### Provider Architecture
 
@@ -1434,6 +1447,10 @@ auto-registering TCP clients as summary subscribers.
 
 
 ### `choreo-im` — IM platform bridge
+
+Feature-gated: the root package builds this bridge only with `--features im`
+(the binary is `required-features = ["im"]`), so default and release builds
+exclude it entirely.
 
 Entry point: `src/lib.rs` (the root package's `src/bin/choreo-im.rs` is a thin wrapper calling `choreo_im::main()`)
 
@@ -2124,6 +2141,7 @@ via `fn group() -> &'static str` on the `Tool` trait. Groups are:
 | `vm` | off | RISC-V sandboxed code execution |
 | `content` | off | Choreographr Coordination Platform (publish/retract items, revisions, profiles, account pins; IPFS + indexer + Substrate) — only present when the `content` cargo feature is enabled (the tool group was previously named `coord`) |
 | `blockchain` | off | EVM and Substrate/Polkadot blockchain queries (alloy/subxt) — only present when the `blockchain` cargo feature is enabled |
+| `mcp` | off | Dynamic tools from stdio MCP server subprocesses (`mcp/<slug>` groups via `McpManager`) — only present when the `mcp` cargo feature is enabled |
 | `debug` | off | Read-only diagnostics and request dry-runs (`session_inspect`) — opt-in via `load_tools`, never on by default |
 
 The system prompt lists all groups and their descriptions. The model uses `load_tools` to

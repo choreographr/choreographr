@@ -29,12 +29,10 @@ source=("https://github.com/choreographr/choreographr/releases/download/v0.1.0/c
 sha256sums=('SKIP')
 
 package() {
-    # Release tarball layout: the four binaries at the top level, exec bits
-    # preserved (see scripts/release.sh). choreo-mcp is a library-only crate
-    # (no binary) and is not in the tarball.
+    # Release tarball layout: the shipped binaries at the top level, exec bits
+    # preserved (see scripts/release.sh). The IM/ACP bridges are feature-gated
+    # and not in the tarball; choreo-mcp is a library-only crate (no binary).
     cd "$srcdir"
     install -Dm755 choreographr "$pkgdir/usr/bin/choreographr"
     install -Dm755 choreo-tui      "$pkgdir/usr/bin/choreo-tui"
-    install -Dm755 choreo-im       "$pkgdir/usr/bin/choreo-im"
-    install -Dm755 choreo-acp      "$pkgdir/usr/bin/choreo-acp"
 }

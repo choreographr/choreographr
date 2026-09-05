@@ -65,7 +65,14 @@ choreo-keystore.workspace = true
 # this crate's synchronous `execute_*` entry points) and pulls in the crate's
 # subxt/chain-client dependency tree that a plain build has no use for.
 choreo-content = { workspace = true, optional = true }
-choreo-mcp.workspace = true
+# MCP client-protocol primitives (stdio subprocess spawn, JSON-RPC tool
+# listing/calls). Behind the `mcp` feature (off by default): enabling it
+# compiles in the daemon's `mcp` tool group (McpManager + dynamic tool
+# wrappers) and pulls in the choreo-mcp dependency tree that a plain build
+# has no use for. The module's public API degrades to no-op stubs when
+# disabled, so McpManager call sites (cli.rs, daemon.rs, lifecycle.rs)
+# compile unchanged in both configurations.
+choreo-mcp = { workspace = true, optional = true }
 choreo-proto.workspace = true
 choreo-sanitize.workspace = true
 choreo-image.workspace = true
@@ -123,6 +130,10 @@ blockchain = ["dep:choreo-blockchain"]
 # with `--features content` (or the root package's `content` feature, which
 # forwards here).
 content = ["dep:choreo-content"]
+# MCP tool group (dynamic tools from stdio MCP server subprocesses, managed
+# by src/mcp/). Off by default; opt in with `--features mcp` (or the root
+# package's `mcp` feature, which forwards here).
+mcp = ["dep:choreo-mcp"]
 # Opt-in AVIF decode via `image/avif-native` (dav1d, a C library). OFF by
 # default so the default/release build stays C-free (see the release.sh
 # static-musl rationale and the workspace `image` comment). A source build with
