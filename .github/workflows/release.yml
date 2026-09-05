@@ -495,10 +495,18 @@ jobs:
         # Same crate-type restriction as scripts/build-ios.sh: the rlib only —
         # the cdylib needs the Apple linker and is linked on-device builds by
         # Xcode, not here.
-        run: cargo +stable check -p choreo-gui --lib --target aarch64-apple-ios
+        #
+        # MUST go through build-stable.sh, NOT bare `cargo +stable`: the
+        # workspace manifest carries the nightly-only [unstable]
+        # profile-rustflags opt-in, which stable Cargo refuses to even parse
+        # (observed: CI 1.98.1 "feature `profile-rustflags` is required").
+        # build-stable.sh strips exactly those keys for the command's
+        # duration and restores them; every other stable build in this
+        # pipeline (release.sh, android job) uses the same wrapper.
+        run: ./scripts/build-stable.sh check -p choreo-gui --lib --target aarch64-apple-ios
 
       - name: Compile check (simulator target)
-        run: cargo +stable check -p choreo-gui --lib --target aarch64-apple-ios-sim
+        run: ./scripts/build-stable.sh check -p choreo-gui --lib --target aarch64-apple-ios-sim
 
   release:
     name: create GitHub release
