@@ -3384,7 +3384,7 @@ truncation, and non-interactive stdin.
 
 Sandboxing (shared across all shell/exec tools via `shell_util.rs`):
 
-1. **Timeout** — the command is killed after a configurable timeout (default 30s, max 300s). A watchdog thread enforces the inner timeout; the outer tool loop timeout is extended to 300s for this tool.
+1. **Timeout** — the command is killed after a configurable timeout (default 30s). A watchdog thread enforces the inner timeout; the outer tool loop timeout is a 300s floor that the tool's requested `timeout` raises when longer.
 
 2. **Resource limits** — set via `setrlimit` in the child (pre-exec): `RLIMIT_AS` (4 GB) prevents runaway memory allocation, `RLIMIT_FSIZE` (100 MB) prevents disk-filling writes.
 

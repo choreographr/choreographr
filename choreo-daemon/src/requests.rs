@@ -760,7 +760,8 @@ pub(crate) fn run_agent_loop(
                     }
 
                     let tool_timeout =
-                        determine_tool_timeout(&tool_call.name).unwrap_or(Duration::from_secs(60));
+                        determine_tool_timeout(&tool_call.name, &tool_call.arguments_json)
+                            .unwrap_or(Duration::from_secs(60));
 
                     if ctx
                         .cmd_tx
@@ -918,7 +919,8 @@ pub(crate) fn run_agent_loop(
                     // of wait-loop threads that died before delivering.
                     let mut call_infos: Vec<CallInfo> = Vec::with_capacity(concurrent.len());
                     for tool_call in concurrent.into_iter() {
-                        let timeout = determine_tool_timeout(&tool_call.name);
+                        let timeout =
+                            determine_tool_timeout(&tool_call.name, &tool_call.arguments_json);
                         let invocation_description = description_by_call
                             .get(&tool_call.id)
                             .cloned()

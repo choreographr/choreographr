@@ -2281,14 +2281,14 @@ fn forwarding_thread_honors_kill_while_output_is_still_alive() {
 
 #[test]
 fn determine_tool_timeout_subsession_none() {
-    assert!(determine_tool_timeout("spawn_subsession").is_none());
+    assert!(determine_tool_timeout("spawn_subsession", "{}").is_none());
 }
 
 #[test]
 fn determine_tool_timeout_shell_300() {
     for name in &["sh", "nushell", "fish", "exec"] {
         assert_eq!(
-            determine_tool_timeout(name),
+            determine_tool_timeout(name, "{}"),
             Some(Duration::from_secs(300)),
             "tool {name} should have 300s timeout",
         );
@@ -2305,11 +2305,55 @@ fn determine_tool_timeout_default_60() {
         "http_request",
     ] {
         assert_eq!(
-            determine_tool_timeout(name),
+            determine_tool_timeout(name, "{}"),
             Some(Duration::from_secs(60)),
             "tool {name} should have 60s timeout",
         );
     }
+}
+
+#[test]
+fn determine_tool_timeout_requested_below_base_keeps_base() {
+    // The name-based default is a FLOOR: a shell tool requesting its default
+    // (or anything below it) still gets the full 300s outer deadline.
+    assert_eq!(
+        determine_tool_timeout("sh", r#"{"timeout": 30000}"#),
+        Some(Duration::from_secs(300)),
+    );
+}
+
+#[test]
+fn determine_tool_timeout_requested_above_base_raises_deadline() {
+    // A long legitimate command (a full workspace build) must be allowed to
+    // run to its requested timeout: the outer deadline is raised to the
+    // request plus the teardown grace (5s).
+    assert_eq!(
+        determine_tool_timeout("sh", r#"{"timeout": 1800000}"#),
+        Some(Duration::from_millis(1_800_000) + TOOL_TIMEOUT_GRACE),
+    );
+}
+
+#[test]
+fn determine_tool_timeout_missing_or_malformed_falls_back_to_base() {
+    // Missing field, non-numeric, zero, and non-JSON args all fall back to
+    // the name-based default — the guard always exists.
+    for args in ["{}", r#"{"timeout": 0}"#, r#"{"timeout": "big"}"#, "oops"] {
+        assert_eq!(
+            determine_tool_timeout("sh", args),
+            Some(Duration::from_secs(300)),
+            "args {args} should fall back to the 300s default",
+        );
+    }
+}
+
+#[test]
+fn determine_tool_timeout_ignored_for_non_shell_tools() {
+    // Non-shell tools have no `timeout` field in their schema; a stray field
+    // (if a model ever sends one) must not raise their deadline.
+    assert_eq!(
+        determine_tool_timeout("grep", r#"{"timeout": 999999999}"#),
+        Some(Duration::from_secs(60)),
+    );
 }
 
 // -- spawn_single_tool tests ---------------------------------------

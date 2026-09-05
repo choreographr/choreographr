@@ -48,7 +48,7 @@ pub struct ShArgs {
     pub shell: Shell,
     /// Working directory for the command (relative to the session working directory, or absolute)
     pub workdir: Option<String>,
-    /// Timeout in milliseconds (default 30000; capped by outer tool deadline)
+    /// Timeout in milliseconds (default 30000; the daemon's outer deadline is raised to cover this when longer)
     pub timeout: Option<u64>,
 }
 

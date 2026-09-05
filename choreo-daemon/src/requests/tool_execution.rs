@@ -9,6 +9,12 @@ use choreo_ai_protocols::{ChatToolCall, ToolResultItem};
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{DaemonMessage, DisplayedImageRecord, ImageMetadata, SessionEvent, TokenUsage};
 
+/// Extra time added on top of a tool's requested `timeout` when raising the
+/// outer deadline: the inner watchdog kills the child at exactly the
+/// requested instant, and the grace covers killing the (possibly deep)
+/// process tree, draining buffered output, and serializing the result.
+pub(crate) const TOOL_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
+
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -221,22 +227,61 @@ pub(crate) fn broadcast_token_usage(ctx: &RequestContext, session: &SessionState
     });
 }
 
-/// Resolve the execution timeout for a tool by name.
+/// Resolve the execution timeout for a tool by name and arguments.
 ///
 /// Returns `None` for sub-sessions (run indefinitely) and `Some(duration)`
 /// for all other tools so that hanging tools are eventually killed.
-pub(crate) fn determine_tool_timeout(name: &str) -> Option<Duration> {
+///
+/// The name-based defaults act as a FLOOR, not a cap: shell tools accept a
+/// per-invocation `timeout` argument in milliseconds, and long legitimate
+/// commands (full workspace builds, release packaging) exceed the 300s
+/// shell default. When the tool's arguments request a larger timeout, the
+/// outer deadline is raised to cover it plus [`TOOL_TIMEOUT_GRACE`] — the
+/// inner watchdog kills the child at the requested instant; the grace only
+/// covers result serialization and teardown after that kill. A missing,
+/// malformed, or zero `timeout` argument falls back to the name-based
+/// default, so the guard always exists.
+pub(crate) fn determine_tool_timeout(name: &str, arguments_json: &str) -> Option<Duration> {
     if name == "spawn_subsession" {
         // Sub-sessions run their own agent loop which may need many
         // turns across multiple LLM calls — no wall-clock timeout.
-        None
-    } else if matches!(name, "sh" | "nushell" | "fish" | "exec") {
+        return None;
+    }
+    let base = if matches!(name, "sh" | "nushell" | "fish" | "exec") {
         // Shell commands may involve compilation, tests, or long-running
         // processes that need more time than the default.
-        Some(Duration::from_secs(300))
+        Duration::from_secs(300)
     } else {
-        Some(Duration::from_secs(60))
+        Duration::from_secs(60)
+    };
+    // The tool's own requested timeout raises the outer deadline when (and
+    // only when) it exceeds the base: parse the `timeout` field out of the
+    // raw args JSON without deserializing the tool's full arg type (this
+    // function runs before dispatch and must not depend on any tool's
+    // schema). ONLY shell tools accept a `timeout` argument — a stray field
+    // sent to a tool whose schema lacks it must not raise that tool's
+    // deadline, so the raise is gated on the shell-tool set.
+    let requested = if matches!(name, "sh" | "nushell" | "fish" | "exec") {
+        serde_json::from_str::<serde_json::Value>(arguments_json)
+            .ok()
+            .and_then(|args| args.get("timeout").and_then(|t| t.as_u64()))
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    } else {
+        None
+    };
+    let effective = requested
+        .map(|r| r + TOOL_TIMEOUT_GRACE)
+        .map_or(base, |raised| raised.max(base));
+    if effective > base {
+        debug!(
+            tool = name,
+            requested_ms = requested.map(|r| r.as_millis() as u64),
+            effective_secs = effective.as_secs(),
+            "outer tool deadline raised to cover the requested timeout"
+        );
     }
+    Some(effective)
 }
 
 /// Aggregated result of a single concurrent tool execution, including any
