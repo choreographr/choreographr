@@ -209,6 +209,15 @@ fn current_schema_version(db: &redb::Database) -> io::Result<u64> {
         .unwrap_or(0))
 }
 
+/// Read the current schema version of an open database: the value stamped in
+/// `meta`, or `0` for an unversioned database. Public wrapper over the private
+/// [`current_schema_version`] so callers outside this module (the CLI's
+/// open→version→drop→backup→reopen startup sequence) can read the version
+/// without depending on the internal table layout.
+pub fn schema_version(db: &redb::Database) -> io::Result<u64> {
+    current_schema_version(db)
+}
+
 /// Persist `version` under `SCHEMA_VERSION_KEY` in [`META`]. Opening the
 /// table inside a write transaction creates it on first use, so this also
 /// initializes the `meta` table on a fresh database.
@@ -231,28 +240,81 @@ fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Snapshot the database file before a migration rewrites it:
-/// `path` → `path.bak-v{from}`, where `from` is the schema version of the
-/// file being snapshotted (the version being migrated away from). Naming the
-/// backup after its *source* version — not the migration target — keeps
-/// restore semantics unambiguous: a `bak-v2` file IS a v2 database, so
-/// restoring it rolls back to exactly the state the migration started from.
-///
-/// The path is injected (the caller resolves [`db_path`]) so the naming
-/// behavior is unit-testable without touching the real data directory.
-/// Fires only before a real migration writes (never for the pure 0 → 1
-/// initialization stamp): one backup per source schema version, taken before
-/// any write, so a failed migration can always be rolled back from disk. The
-/// active 1 → 2 migration therefore snapshots a v1 file to `bak-v1`. Safe to
-/// `fs::copy` the open file because this runs at startup, single-threaded,
-/// before any migration writes — the database is quiescent, so the on-disk
-/// image reflects the last committed transaction.
-fn backup_db_file(path: &std::path::Path, from: u64) -> io::Result<()> {
+/// Compute the backup path [`backup_db_file`] and [`backup_database`] share:
+/// `path.bak-v{from}`, named after the version being migrated FROM. Extracted
+/// so the naming cannot drift between the pre-lock copy (CLI startup) and the
+/// in-runner copy (fallback).
+fn backup_path_for(path: &std::path::Path, from: u64) -> std::path::PathBuf {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "state.redb".to_string());
-    let backup_path = path.with_file_name(format!("{file_name}.bak-v{from}"));
+    path.with_file_name(format!("{file_name}.bak-v{from}"))
+}
+
+/// Snapshot the database file at `path` to `{file_name}.bak-v{from_version}`
+/// (the same name [`backup_db_file`] uses), where `from_version` is the schema
+/// version being migrated away from.
+///
+/// # Why this exists as a separate pre-lock entry point
+///
+/// redb takes a whole-file exclusive lock (`fs4`/`LockFileEx`) on the database
+/// file while a `redb::Database` handle is open. On Windows a byte-range
+/// exclusive lock blocks `ReadFile` from ANY handle — including another handle
+/// in the SAME process — so `fs::copy` of the open file fails with os error 33
+/// ("The process cannot access the file because another process has locked a
+/// portion of the file"). Linux POSIX locks are advisory, so the copy only
+/// ever failed on Windows (first observed in windows-latest CI). The copy
+/// therefore has to happen BEFORE redb opens/locks the file: the caller must
+/// read [`schema_version`], DROP the `Database` handle, call this, and only
+/// then reopen and run the migrations. Never call this while holding an open
+/// `redb::Database` on `path` — that is precisely the bug this function exists
+/// to avoid.
+///
+/// Note that copying an unopened file is still safe and consistent: redb only
+/// extends/rewrites the file on committed transactions, and this runs at
+/// startup, single-threaded, before any migration writes — the on-disk image
+/// reflects the last committed transaction.
+pub fn backup_database(path: &std::path::Path, from_version: u64) -> io::Result<()> {
+    let backup_path = backup_path_for(path, from_version);
+    fs::copy(path, &backup_path)?;
+    info!(
+        from = %path.display(),
+        to = %backup_path.display(),
+        "backed up database before applying migrations (taken before the database lock)"
+    );
+    Ok(())
+}
+
+/// Snapshot the database file before a migration rewrites it:
+/// `path` → `path.bak-v{from}` (naming rationale: see [`backup_path_for`]).
+///
+/// Fires only before a real migration writes (never for the pure 0 → 1
+/// initialization stamp): one backup per source schema version, taken before
+/// any write, so a failed migration can always be rolled back from disk. The
+/// active 1 → 2 migration therefore snapshots a v1 file to `bak-v1`.
+///
+/// # Skip-if-exists
+///
+/// The production startup path (cli.rs) now takes the backup BEFORE redb
+/// opens/locks the file, because on Windows redb's whole-file exclusive lock
+/// makes reading the open file fail outright (os error 33 — see
+/// [`backup_database`]). By the time `run_migrations_to` runs, the backup
+/// already exists; overwriting it here would read the locked file and fail on
+/// Windows. So if the backup is already present, it is treated as the
+/// authoritative pre-migration snapshot and left untouched. Direct callers of
+/// `run_migrations_to` (the unit tests) that did NOT pre-copy still get the
+/// `fs::copy` fallback, so the copy path stays exercised.
+fn backup_db_file(path: &std::path::Path, from: u64) -> io::Result<()> {
+    let backup_path = backup_path_for(path, from);
+    if backup_path.exists() {
+        info!(
+            path = %backup_path.display(),
+            "pre-migration backup already exists (created before the database lock was taken); \
+             skipping the copy and leaving it untouched"
+        );
+        return Ok(());
+    }
     fs::copy(path, &backup_path)?;
     info!(
         from = %path.display(),
@@ -260,6 +322,42 @@ fn backup_db_file(path: &std::path::Path, from: u64) -> io::Result<()> {
         "backed up database before applying migrations"
     );
     Ok(())
+}
+
+/// Decide whether the pending migration would create a pre-migration backup,
+/// and if so return the schema version the backup must be named after (the
+/// source version). Returns `Ok(Some(version))` in EXACTLY the situations
+/// where [`run_migrations_to`] reaches `backup_db_file` for the production
+/// chain (`MIGRATIONS`, target [`SCHEMA_VERSION`]), and `Ok(None)` otherwise:
+///
+/// - version 0: the 0 → 1 (or 0 → stamp) path is pure initialization — no
+///   migration writes, no backup;
+/// - version == [`SCHEMA_VERSION`]: the idempotent fast path, nothing runs;
+/// - version > [`SCHEMA_VERSION`]: `run_migrations_to` refuses the database
+///   BEFORE any write, so no backup is taken;
+/// - the migration chain is empty or not contiguous over `1..SCHEMA_VERSION`:
+///   `run_migrations_to` hard-errors before the backup in that case.
+///
+/// This is the single source of truth shared by the CLI's pre-lock backup
+/// decision and (via the skip-if-exists check in `backup_db_file`) the
+/// runner's own backup step, so the two can never disagree about whether a
+/// backup exists before the migration runs.
+pub(crate) fn migration_backup_version(db: &redb::Database) -> io::Result<Option<u64>> {
+    let current = schema_version(db)?;
+    debug!(current, "checking whether a pre-migration backup is needed");
+    if current == 0 || current >= SCHEMA_VERSION || MIGRATIONS.is_empty() {
+        return Ok(None);
+    }
+    // Mirror run_migrations_to's chain validation: a broken/empty chain makes
+    // the runner error out BEFORE the backup, so no pre-copy must happen
+    // either (the gates above already cover the empty case; this covers
+    // non-contiguity).
+    let expected: Vec<u64> = (1..SCHEMA_VERSION).collect();
+    let provided: Vec<u64> = MIGRATIONS.iter().map(|m| m.from).collect();
+    if provided != expected {
+        return Ok(None);
+    }
+    Ok(Some(current))
 }
 
 /// Bring the database up to [`SCHEMA_VERSION`]. Idempotent; safe to call on
@@ -2520,6 +2618,125 @@ mod tests {
                 "no migration may run when the chain is rejected"
             );
         }
+    }
+
+    #[test]
+    fn backup_database_produces_versioned_name_and_identical_content() {
+        // The public pre-lock backup entry point must use the SAME naming
+        // scheme as the in-runner backup (bak-v{source}) and copy the file
+        // byte-for-byte — the CLI's pre-copy is only equivalent to the old
+        // in-runner copy if the artifacts are indistinguishable.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        fs::write(&db_path, b"database bytes v1").unwrap();
+
+        backup_database(&db_path, 1).unwrap();
+        let backup_path = db_path.with_file_name("state.redb.bak-v1");
+        assert!(backup_path.exists());
+        assert_eq!(fs::read(&backup_path).unwrap(), b"database bytes v1");
+    }
+
+    #[test]
+    fn run_migrations_to_does_not_overwrite_pre_existing_backup() {
+        // The production path (cli.rs) now takes the backup BEFORE the
+        // database file is opened/locked (redb's whole-file exclusive lock
+        // blocks same-process reads on Windows). run_migrations_to must
+        // therefore treat an existing backup as authoritative and never
+        // overwrite it — this test pre-creates the backup with sentinel
+        // content and asserts the sentinel survives the migration.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = redb::Database::create(&db_path).unwrap();
+        stamp_schema_version(&db, 1).unwrap();
+        let backup_path = db_path.with_file_name("state.redb.bak-v1");
+        fs::write(&backup_path, b"pre-lock sentinel").unwrap();
+
+        run_migrations_to(&db, SCHEMA_VERSION, MIGRATIONS, &db_path).unwrap();
+
+        assert_eq!(
+            fs::read(&backup_path).unwrap(),
+            b"pre-lock sentinel",
+            "the pre-existing backup must not be overwritten by the runner"
+        );
+        assert_eq!(current_schema_version(&db).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_version_accessor_returns_stamped_version() {
+        // The public accessor the CLI startup sequence relies on must report
+        // the stamped version of a fresh database (open_db stamps
+        // INITIAL_SCHEMA_VERSION at creation; here a v1 stamp is applied
+        // directly to keep the test independent of db_path()).
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        stamp_schema_version(&db, 1).unwrap();
+        assert_eq!(schema_version(&db).unwrap(), 1);
+    }
+
+    #[test]
+    fn migration_backup_version_matches_run_migrations_to_backup_conditions() {
+        // The version-gating helper must return Some exactly when
+        // run_migrations_to would take a backup for the production chain:
+        // Some(1) for a pending real migration from v1; None for version 0
+        // (pure initialization stamp, no backup), for version ==
+        // SCHEMA_VERSION (fast path), and for a newer-than-supported version
+        // (the runner refuses before any write). Keeping both sides pinned to
+        // one helper is what prevents the CLI's pre-lock backup decision from
+        // drifting away from the runner's own backup step.
+        let dir = tempfile::tempdir().unwrap();
+
+        let make_db_at = |version: u64| {
+            let db =
+                redb::Database::create(dir.path().join(format!("test-{version}.redb"))).unwrap();
+            if version > 0 {
+                stamp_schema_version(&db, version).unwrap();
+            }
+            db
+        };
+
+        assert_eq!(migration_backup_version(&make_db_at(1)).unwrap(), Some(1));
+        assert_eq!(migration_backup_version(&make_db_at(0)).unwrap(), None);
+        assert_eq!(
+            migration_backup_version(&make_db_at(SCHEMA_VERSION)).unwrap(),
+            None
+        );
+        assert_eq!(
+            migration_backup_version(&make_db_at(SCHEMA_VERSION + 1)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn production_orchestration_pre_backs_up_then_migrates() {
+        // The full production sequence (open → read version → drop the handle
+        // → backup_database → reopen → run migrations), exercised with an
+        // injected path instead of open_db()'s real db_path(). The runner's
+        // skip-if-exists check must leave the pre-created backup untouched
+        // while the migration still succeeds — the contract the Windows-safe
+        // startup path depends on.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+
+        let opened = redb::Database::create(&db_path).unwrap();
+        stamp_schema_version(&opened, 1).unwrap();
+        let version = migration_backup_version(&opened)
+            .unwrap()
+            .expect("a pending v1 migration must be reported as needing a backup");
+        drop(opened); // release redb's lock before the copy (the Windows fix)
+
+        backup_database(&db_path, version).unwrap();
+        let backup_path = db_path.with_file_name("state.redb.bak-v1");
+        let backup_before = fs::read(&backup_path).unwrap();
+
+        let reopened = redb::Database::open(&db_path).unwrap();
+        run_migrations_to(&reopened, SCHEMA_VERSION, MIGRATIONS, &db_path).unwrap();
+
+        assert_eq!(current_schema_version(&reopened).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            fs::read(&backup_path).unwrap(),
+            backup_before,
+            "the pre-lock backup must survive the migration untouched"
+        );
     }
 
     #[test]

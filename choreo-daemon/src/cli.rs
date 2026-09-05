@@ -249,13 +249,46 @@ pub fn main() -> anyhow::Result<()> {
     info!(max_turns, "tool loop iteration limit");
     info!("choreographr starting (locked)");
 
-    let db = Arc::new(crate::db::open_db().context("failed to open database")?);
+    // Windows-safe startup sequence: redb holds a whole-file exclusive lock
+    // on the database for as long as a `redb::Database` handle is open, and on
+    // Windows that lock blocks even same-process reads of the file (os error
+    // 33). The pre-migration backup therefore must be taken BEFORE the file is
+    // opened/locked. Sequence: open → read the schema version → drop the
+    // handle (releasing the lock) → if a real migration is pending
+    // (migration_backup_version returns Some exactly when run_migrations_to
+    // would back up), copy the backup from the unlocked file → reopen →
+    // migrate. The in-runner backup step is a no-op then (skip-if-exists);
+    // its fs::copy fallback only fires for direct callers that did not
+    // pre-copy (the unit tests).
+    let db_path = crate::db::db_path().context("failed to resolve database path")?;
+    let db = Arc::new({
+        let opened = crate::db::open_db().context("failed to open database")?;
+        match crate::db::migration_backup_version(&opened)
+            .context("failed to read database schema version")?
+        {
+            Some(version) => {
+                // Release redb's whole-file exclusive lock before the copy —
+                // reading the open file is exactly what fails on Windows.
+                drop(opened);
+                crate::db::backup_database(&db_path, version).with_context(|| {
+                    format!("failed to back up database (pre-migration snapshot of v{version})")
+                })?;
+                crate::db::open_db()
+                    .context("failed to reopen database after pre-migration backup")?
+            }
+            // No pending real migration (fresh DB, up-to-date, newer-version
+            // refusal, or unversioned): keep the original handle.
+            None => opened,
+        }
+    });
 
     // Bring the database up to the current schema version before any table
     // access: open_db already stamped a fresh database at creation (0 → 1
     // initialization); run_migrations applies any pending migrations from
     // there up to SCHEMA_VERSION (a no-op today), and refuses a
-    // newer-version database before any code can read or write it.
+    // newer-version database before any code can read or write it. The
+    // pre-migration backup, when one was needed, was already taken above
+    // before the file was locked.
     crate::db::run_migrations(&db).context("failed to migrate database")?;
 
     // Purge any sessions that were deleted while their still-shutting-down

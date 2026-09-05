@@ -421,13 +421,12 @@ jobs:
                   echo "error: not running as aarch64: $(uname -m)" >&2; exit 1;
               }
               echo "container identity: $(id)"
-              # Preferred: a real install through Termux's own dpkg (database
+              # Preferred: a real install through Termux-owned dpkg (database
               # updates, dependency resolution, $PREFIX layout) — the closest
               # match to on-device `pkg install`.
               # Observed in CI: dpkg -i fails with "requested operation
-              # requires superuser privilege" even under --user 0 (Termux's
-              # patched dpkg/user semantics in the image are not worth
-              # fighting further), so the install is opportunistic. The
+              # requires superuser privilege" even under --user 0 (the image
+              # user semantics are not worth fighting further), so the install is opportunistic. The
               # fallback is dpkg-deb -x — extraction-only, no package
               # database or lock involved, but still TERMUX TOOLING decoding
               # the archive (including our xz members) into the real
