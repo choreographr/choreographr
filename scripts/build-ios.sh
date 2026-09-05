@@ -42,6 +42,25 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 # ── Prerequisite checks ──────────────────────────────────────────────────────
 command -v cargo >/dev/null || fail "cargo not found"
+# Toolchain resolution: stable mode (IOS_BUILD_STABLE=1) runs the build under
+# `cargo +stable` (via build-stable.sh), so EVERYTHING below — the rustup
+# target check AND the RUSTC shim's real path — must resolve against stable,
+# not the workspace's rust-toolchain.toml-pinned nightly. Getting either wrong
+# is a CI-visible failure class: targets installed on stable are invisible to
+# a default-toolchain `rustup target list --installed` (observed on the
+# runner: "rustup target not installed: aarch64-apple-ios"), and a nightly
+# rustc under a stable cargo invocation would silently mislabel the build.
+TOOLCHAIN_FLAG=""
+if [ "${IOS_BUILD_STABLE:-}" = 1 ]; then
+    TOOLCHAIN_FLAG="stable"
+fi
+
+# rustup is toolchain-selectable per command; cargo is not — the shim's `real`
+# path pins the compiler binary cargo's RUSTC env override will use.
+RUSTUP="rustup"
+[ -n "$TOOLCHAIN_FLAG" ] && RUSTUP="rustup +$TOOLCHAIN_FLAG"
+RUSTC_REAL="$(rustc ${TOOLCHAIN_FLAG:++$TOOLCHAIN_FLAG} --print sysroot)/bin/rustc"
+
 # zig is only needed for the non-Mac shim path (Xcode's toolchain serves C
 # compilation natively when xcrun is present).
 if ! command -v xcrun >/dev/null 2>&1; then
@@ -49,14 +68,10 @@ if ! command -v xcrun >/dev/null 2>&1; then
 fi
 
 for target in aarch64-apple-ios aarch64-apple-ios-sim; do
-    if ! rustup target list --installed | grep -qx "$target"; then
-        fail "rustup target not installed: $target — run: rustup target add $target"
+    if ! $RUSTUP target list --installed | grep -qx "$target"; then
+        fail "rustup target not installed for ${TOOLCHAIN_FLAG:-default} toolchain: $target — run: rustup target add ${TOOLCHAIN_FLAG:+--toolchain $TOOLCHAIN_FLAG }$target"
     fi
 done
-
-# Toolchain: the workspace pins nightly (rust-toolchain.toml); cross builds run
-# through it as-is — the shims below neutralize the host-only flags.
-RUSTC_REAL="$(rustc --print sysroot)/bin/rustc"
 
 # ── Shim setup ───────────────────────────────────────────────────────────────
 SHIM_DIR="$REPO_ROOT/target/ios-shims"
