@@ -15,18 +15,17 @@
 # redirected into a scratch dir:
 #
 #   * CHOREOGRAPHR_SOCKET_PATH → scratch socket (choreo-proto/src/io.rs)
-#   * XDG_CONFIG_HOME / APPDATA → scratch config dir (transport keypair
+#   * XDG_CONFIG_HOME / HOME → scratch config dir on POSIX (transport keypair
 #     transport.sec/pub, authorized_clients.toml, config.toml, accounts.toml
-#     all resolve under dirs::config_dir()/choreographr) — POSIX honors this
-#     fully; on Windows dirs resolves via the known-folder API and may ignore
-#     the override (see the CHOREOGRAPHR_DB_PATH note below for the
-#     consequence and the mitigation)
-#   * CHOREOGRAPHR_DB_PATH → scratch DB (Windows only — the daemon's data dir
-#     resolves through dirs::data_dir(), which on Windows uses
-#     SHGetKnownFolderPath and does not honor env redirects; without this the
-#     boot fails with "could not determine data directory")
-#   * HOME / USERPROFILE → scratch too, belt-and-braces against anything that
-#     bypasses dirs and reads $HOME directly
+#     all resolve under dirs::config_dir()/choreographr)
+#   * On WINDOWS hermeticity is deliberately relaxed: dirs resolves config/
+#     data dirs through the known-folder API, which ignores env redirects, and
+#     redirecting APPDATA/USERPROFILE proved flaky-fatal in CI. The runner
+#     profile is ephemeral, so the keypair/config land there; only the paths
+#     the daemon supports overriding via env are pinned (socket +
+#     CHOREOGRAPHR_DB_PATH), converted to native Windows paths with cygpath.
+#   * HOME / USERPROFILE → scratch on POSIX, belt-and-braces against anything
+#     that bypasses dirs and reads $HOME directly
 #
 # Scope of the "prove serve" check (deliberate, not laziness): the shipped
 # artifact set is the daemon (a server) and choreo-tui — and the TUI has NO
@@ -117,11 +116,18 @@ esac
 # extensionless ELF/Mach-O binaries.
 if [ "$OS" = windows ]; then
     DAEMON="$TMP/choreographr.exe"
-    # Windows resolves config_dir() from %APPDATA% (FOLDERID_RoamingAppData is
-    # not env-driven, but dirs falls back to %APPDATA% when the known-folder
-    # API is unavailable in this context) — set it alongside USERPROFILE.
-    export APPDATA="$SCRATCH_CONFIG"
-    export USERPROFILE="$TMP"
+    # Windows config-dir resolution: dirs::config_dir() resolves through the
+    # known-folder API (%APPDATA% redirect is NOT honored, and overriding
+    # APPDATA/USERPROFILE proved flaky-fatal in CI — runs alternated between
+    # "could not determine data directory" and "could not determine config
+    # directory" depending on which resolution path the binary took). The
+    # runner profile is ephemeral, so hermeticity is relaxed on Windows: the
+    # keypair/config land in the runner's throwaway profile. Only the paths
+    # the daemon supports overriding via env (DB, socket) are pinned — and
+    # converted to NATIVE Windows paths with cygpath, because Git Bash passes
+    # arbitrary env vars to native processes verbatim (a "/tmp/..." value
+    # would resolve relative to the current drive, not to the MSYS temp dir).
+    export CHOREOGRAPHR_DB_PATH="$(cygpath -w "$TMP/choreographr.redb")"
 else
     DAEMON="$TMP/choreographr"
     # macOS has no XDG_CONFIG_HOME by default but dirs::config_dir() honors it
@@ -130,6 +136,9 @@ else
     export HOME="$TMP"
 fi
 export CHOREOGRAPHR_SOCKET_PATH="$TMP/choreographr.sock"
+if [ "$OS" = windows ]; then
+    export CHOREOGRAPHR_SOCKET_PATH="$(cygpath -w "$CHOREOGRAPHR_SOCKET_PATH")"
+fi
 # Pin the log level: the readiness check greps for the daemon's own
 # "choreographr listening" line, which the default (info) filter emits —
 # setting RUST_LOG explicitly keeps that contract independent of flag defaults.

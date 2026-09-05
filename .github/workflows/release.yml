@@ -405,12 +405,14 @@ jobs:
           # image has no checkout of the repo, so it cannot read Cargo.toml.
           # dist/ is mounted read-only — nothing in this step should write
           # back into the artifact tree.
-          # -u 0: the image's default user is NOT root (first CI run failed
-          # with "dpkg: error: requested operation requires superuser
-          # privilege"), and dpkg -i is inherently a root operation — the
-          # rootfs is throwaway, so running as root is the intended mode for
-          # image-based Termux package testing.
-          docker run --rm --user 0 --platform linux/arm64 \
+          # -u 0 + --entrypoint bash: the image's default ENTRYPOINT drops
+          # privileges and resets the environment — CI observed the container
+          # running as uid=1000(system) DESPITE --user 0, and -e VERSION was
+          # wiped (dpkg got an empty version in the archive name). Bypassing
+          # the entrypoint makes both take effect. The rootfs is throwaway,
+          # so root is the intended mode for image-based Termux package
+          # testing.
+          docker run --rm --user 0 --entrypoint bash --platform linux/arm64 \
               -v "$PWD/dist:/dist:ro" -e VERSION="$VERSION" \
               termux/termux-docker:latest bash -ec '
               # Sanity-check that we are really executing under emulation on
