@@ -98,8 +98,12 @@ done
 exec "\$real" "\${args[@]+"\${args[@]}"}"
 EOF
 
-# 2. cc wrapper: rewrite cc-rs's iOS C target args to zig's macOS target
-#    (zig bundles macOS darwin libc headers, not iOS ones — compile-only).
+# 2. cc wrapper (NO-MAC PATH ONLY): rewrite cc-rs's iOS C target args to
+#    zig's macOS target (zig bundles macOS darwin libc headers, not iOS ones —
+#    compile-only). NEVER installed/exported when xcrun is present: the Mac's
+#    native clang + real iOS SDK are the correct tools, and the shim breaks
+#    them (observed on the runner: "exec: zig: not found" — the shim was
+#    exported unconditionally).
 for name in cc cxx; do
     cat > "$SHIM_DIR/$name" <<EOF
 #!/bin/bash
@@ -111,19 +115,27 @@ for a in "\$@"; do
     *) args+=("\$a") ;;
   esac
 done
-exec zig $([ "$name" = cxx ] && echo c++ || echo cc) -target aarch64-macos "\${args[@]+\"\${args[@]}\"}"
+exec zig $([ "$name" = cxx ] && echo c++ || echo cc) -target aarch64-macos "\${args[@]+"\${args[@]}"}"
 EOF
 done
 chmod +x "$SHIM_DIR/rustc" "$SHIM_DIR/cc" "$SHIM_DIR/cxx"
 
-# Fake SDK root: cc-rs demands an SDKROOT that (a) exists, (b) doesn't look
-# like a mismatched-platform SDK; zig cc tolerates -isysroot pointing at it.
-FAKE_SDK="$REPO_ROOT/target/ios-fake-sdk"
-mkdir -p "$FAKE_SDK/iPhoneOS.platform"
-
-export RUSTC="$SHIM_DIR/rustc" CC="$SHIM_DIR/cc" CXX="$SHIM_DIR/cxx" AR="zig ar"
-export SDKROOT="$FAKE_SDK"
+export RUSTC="$SHIM_DIR/rustc"
 unset RUSTFLAGS || true # env RUSTFLAGS would poison cross codegen anyway
+if command -v xcrun >/dev/null 2>&1; then
+    # Mac: native toolchain — do NOT touch CC/CXX/SDKROOT. cc-rs resolves the
+    # iOS SDK itself via xcrun; overriding it with the zig shim (or the fake
+    # SDK) is what broke the runner build.
+    log "using the native Apple C toolchain (no cc shims exported)"
+else
+    # Linux shim path: fake SDK root satisfies cc-rs's SDK probe (it wants an
+    # SDKROOT that exists and doesn't look like a mismatched platform); zig cc
+    # tolerates -isysroot pointing at it.
+    FAKE_SDK="$REPO_ROOT/target/ios-fake-sdk"
+    mkdir -p "$FAKE_SDK/iPhoneOS.platform"
+    export CC="$SHIM_DIR/cc" CXX="$SHIM_DIR/cxx" AR="zig ar"
+    export SDKROOT="$FAKE_SDK"
+fi
 
 # Stable mode (IOS_BUILD_STABLE=1, used by CI): the workspace manifest's
 # nightly-only [unstable] profile-rustflags block hard-blocks stable Cargo,

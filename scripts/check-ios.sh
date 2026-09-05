@@ -109,19 +109,25 @@ for a in "\$@"; do
     *) args+=("\$a") ;;
   esac
 done
-exec zig $([ "$name" = cxx ] && echo c++ || echo cc) -target aarch64-macos "\${args[@]+\"\${args[@]}\"}"
+exec zig $([ "$name" = cxx ] && echo c++ || echo cc) -target aarch64-macos "\${args[@]+"\${args[@]}"}"
 EOF
     done
     chmod +x "$SHIM_DIR/rustc" "$SHIM_DIR/cc" "$SHIM_DIR/cxx"
 
-    FAKE_SDK="$REPO_ROOT/target/ios-fake-sdk"
-    mkdir -p "$FAKE_SDK/iPhoneOS.platform"
-
-    export RUSTC="$SHIM_DIR/rustc" CC="$SHIM_DIR/cc" CXX="$SHIM_DIR/cxx" AR="zig ar"
-    export SDKROOT="$FAKE_SDK"
+    export RUSTC="$SHIM_DIR/rustc"
     unset RUSTFLAGS 2>/dev/null || true
+    # cc shims + fake SDKROOT are for the NO-MAC path only (see build-ios.sh):
+    # on a Mac the native clang + real iOS SDK are correct, and exporting the
+    # shim over them breaks cc-rs ("exec: zig: not found").
+    if command -v xcrun >/dev/null 2>&1; then
+        log "using the native Apple C toolchain (no cc shims exported)"
+    else
+        FAKE_SDK="$REPO_ROOT/target/ios-fake-sdk"
+        mkdir -p "$FAKE_SDK/iPhoneOS.platform"
+        export CC="$SHIM_DIR/cc" CXX="$SHIM_DIR/cxx" AR="zig ar"
+        export SDKROOT="$FAKE_SDK"
+    fi
 }
-[ "${SHIM_ENV:-}" = shims ] && setup_shims
 
 # ── Stage 1: check (THE gate) ───────────────────────────────────────────────
 stage 1 "cargo check — aarch64-apple-ios (+ sim)"
