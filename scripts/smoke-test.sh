@@ -7,10 +7,16 @@
 #               binary's `--version` reports the release version, and confirms
 #               each binary's `--help` exits 0.
 #   *.deb     — scripts/build-deb-termux.sh's Termux package: STRUCTURAL
-#               validation only (control fields, file list, exec bits) — there
-#               is no Termux on the host, so the Android binaries inside cannot
-#               be executed here; the tarball path is where --version/--help
-#               get exercised, and on-device install is the user's smoke test.
+#               validation only IN THIS SCRIPT (control fields, file list,
+#               exec bits) — there is no Termux on the host, so the Android
+#               binaries inside cannot be executed here. Executing them is
+#               the release workflow's job: the release.yml android-termux
+#               job installs the .deb and runs the binaries under qemu-user
+#               in a Termux aarch64 rootfs (see release.yml); on-device
+#               install remains the final smoke test. For host-native
+#               tarballs, daemon bring-up is covered by scripts/daemon-smoke.sh
+#               (release.yml's native jobs); this script covers the
+#               --version/--help clap surface.
 #
 # Why the timeout guard: the TUI/ACP/IM clients cannot run fully headless
 # (they try to connect to the daemon), but --help/--version must never hang
@@ -39,7 +45,9 @@ FAIL=0
 # ── Termux .deb path (structural only — see the header comment) ──────────────
 # Runs on the CI android job (ubuntu: dpkg-deb preinstalled) and locally; it
 # validates whatever .deb is handed to it, so it also catches a partially
-# rebuilt or hand-edited package, not just a freshly built one.
+# rebuilt or hand-edited package, not just a freshly built one. Execution of
+# the packaged binaries happens later in the release workflow (qemu in a
+# Termux rootfs — see release.yml), not here.
 if [[ "$TARBALL" == *.deb ]]; then
     command -v dpkg-deb >/dev/null 2>&1 || {
         echo "error: dpkg-deb not found — needed to inspect $TARBALL (pacman -S dpkg)" >&2

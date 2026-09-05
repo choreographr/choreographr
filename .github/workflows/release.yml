@@ -20,6 +20,13 @@
 #                   .deb and .rpm: dpkg-deb is preinstalled on the runner and
 #                   rpmbuild is apt-installed below, so release.sh's best-effort
 #                   step builds both.
+#
+# Every desktop job additionally runs scripts/daemon-smoke.sh on its artifact
+# (after smoke-test.sh): smoke-test.sh only exercises the clap --version/--help
+# paths, while daemon-smoke.sh actually BOOTS the shipped daemon with all state
+# (socket, config dir) redirected into a scratch dir and proves the listener
+# comes up — the release binary equivalent of `cargo run` and wait for the
+# "listening" log line.
 #   macos-arm64     scripts/release.sh on the arm64 macOS runner — native
 #                   aarch64-apple-darwin tarball (.deb/.rpm skipped as on the
 #                   MacBook; zig is still required — zlob's build.rs compiles
@@ -36,7 +43,13 @@
 #                   NOT built: its APK payload is a dx/gradle flow, out of
 #                   scope here),
 #                   then scripts/build-deb-termux.sh packages the same
-#                   binaries into the Termux-native .deb (no rebuild).
+#                   binaries into the Termux-native .deb (no rebuild),
+#                   then EXECUTES them under qemu-user inside a Termux
+#                   aarch64 rootfs container (setup-qemu-action +
+#                   termux/termux-docker) — closing the "never executed
+#                   before release" gap: until this step the Android
+#                   artifacts had only ever been structurally inspected,
+#                   never run.
 #
 # choreo-gui is deliberately absent from every job: it is a stub and is not
 # part of the shipped release set (see scripts/release.sh's header comment).
@@ -127,6 +140,14 @@ jobs:
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
 
+      - name: Daemon smoke-test the tarball
+        run: |
+          # Boot the shipped daemon hermetically (scratch socket + config dir,
+          # see scripts/daemon-smoke.sh's header) — smoke-test.sh above only
+          # exercises --version/--help, which never touches the listener.
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          ./scripts/daemon-smoke.sh "dist/choreographr-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+
       - uses: actions/upload-artifact@v7
         with:
           name: linux-x86_64-musl
@@ -176,6 +197,14 @@ jobs:
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-aarch64-apple-darwin.tar.gz"
+
+      - name: Daemon smoke-test the tarball
+        run: |
+          # Boot the shipped daemon hermetically (scratch socket + config dir,
+          # see scripts/daemon-smoke.sh's header) — smoke-test.sh above only
+          # exercises --version/--help, which never touches the listener.
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          ./scripts/daemon-smoke.sh "dist/choreographr-${VERSION}-aarch64-apple-darwin.tar.gz"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -239,6 +268,17 @@ jobs:
           /c/Windows/System32/tar.exe -a -cf \
               "dist/choreographr-${VERSION}-x86_64-pc-windows-msvc.zip" \
               -C "$STAGE" .
+
+      - name: Daemon smoke-test the zip
+        run: |
+          # Boot the shipped daemon hermetically (scratch APPDATA + socket,
+          # see scripts/daemon-smoke.sh's header) — the inline --version loop
+          # above never touches the listener. On Windows the daemon binds via
+          # uds_windows (a file-path Unix-socket emulation, NOT a named pipe),
+          # and the forced shutdown's exit code is not asserted (see the
+          # script's shutdown comment for why).
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          ./scripts/daemon-smoke.sh "dist/choreographr-${VERSION}-x86_64-pc-windows-msvc.zip"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -321,10 +361,79 @@ jobs:
       - name: Smoke-test the .deb (structural)
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          # Structural ceiling only — there is no Termux on the runner, so the
-          # Android binaries inside cannot be executed (see smoke-test.sh's
-          # header). On-device install is the user's smoke test.
+          # Structural validation only — executing the packaged binaries is
+          # NOT possible on this bare runner; the next steps (setup-qemu + the
+          # termux/termux-docker run) install the .deb and run the binaries in
+          # a Termux aarch64 rootfs instead. On-device install remains the
+          # final smoke test.
           ./scripts/smoke-test.sh "dist/choreographr-termux_${VERSION}_aarch64.deb"
+
+      # Registers aarch64 binfmt handlers on the runner so the host kernel can
+      # launch ARM64 ELF binaries via qemu-user (version convention: the repo
+      # pins action MAJORS only — checkout@v7, upload-artifact@v7 — so v3 is
+      # the matching pin here).
+      - uses: docker/setup-qemu-action@v3
+        with:
+          # Only arm64 is needed: the Android artifacts are aarch64 and no
+          # other job in this workflow uses cross-arch containers.
+          platforms: arm64
+
+      - name: Execute the binaries in a Termux rootfs (qemu)
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          # The binaries are plain userspace programs (no Binder/Ashmem),
+          # bionic-linked and Termux-patched to find their libs under the
+          # Termux $PREFIX — exactly what the documented termux/termux-docker
+          # rootfs image provides (`latest` is the image's documented tag;
+          # --platform linux/arm64 selects the aarch64 variant and the
+          # setup-qemu step above makes the runner kernel able to execute
+          # it). Running INSIDE Termux's own rootfs also exercises the real
+          # dpkg install path: the .deb is installed with Termux's dpkg into
+          # the same /data/data/com.termux/files/usr prefix a phone uses.
+          #
+          # Smoke-level by design: qemu-user emulation can't cover what the
+          # Android framework provides (no Binder/Ashmem, no GUI, no
+          # on-device timing), so this proves the shipped binaries LOAD,
+          # LINK, and answer --version/--help — the same clap surface
+          # smoke-test.sh checks on the desktop artifacts, which until now
+          # the Android builds had never had. Timing-sensitive behaviour and
+          # real device interaction remain on-device responsibilities.
+          #
+          # VERSION is computed on the HOST and passed via -e: the container
+          # image has no checkout of the repo, so it cannot read Cargo.toml.
+          # dist/ is mounted read-only — nothing in this step should write
+          # back into the artifact tree.
+          docker run --rm --platform linux/arm64 \
+              -v "$PWD/dist:/dist:ro" -e VERSION="$VERSION" \
+              termux/termux-docker:latest bash -ec '
+              # Sanity-check that we are really executing under emulation on
+              # an aarch64 rootfs — if binfmt registration silently failed,
+              # everything below would test the wrong thing.
+              [ "$(uname -m)" = aarch64 ] || {
+                  echo "error: not running as aarch64: $(uname -m)" >&2; exit 1;
+              }
+              # Real on-device-path install: Termux's own dpkg unpacks and
+              # configures our package (dependency resolution, maintainer
+              # scripts, $PREFIX path layout) — much stronger than the
+              # structural smoke-test on the host.
+              dpkg -i /dist/choreographr-termux_${VERSION}_aarch64.deb
+              # `timeout` lives in coreutils and may be absent from the
+              # minimal rootfs; install it best-effort (network is available
+              # on ubuntu runners) so a hanging binary cannot stall the job
+              # to the workflow timeout. If the install fails (e.g. a mirror
+              # hiccup), fall back to running without the guard — the
+              # --version/--help invocations below are non-interactive.
+              pkg install -y coreutils >/dev/null 2>&1 || true
+              # The shipped binaries must answer --version with the exact
+              # release version — proves the bionic ELF actually loads,
+              # links against the Termux $PREFIX libs, and runs (the core
+              # "never executed before release" check).
+              timeout 60 "$PREFIX/bin/choreographr" --version | grep -q "$VERSION"
+              timeout 60 "$PREFIX/bin/choreo-tui" --version
+              # --help exercises the full clap parser construction (more
+              # code paths than --version) and must exit 0.
+              timeout 60 "$PREFIX/bin/choreographr" --help >/dev/null
+          '
 
       - uses: actions/upload-artifact@v7
         with:
