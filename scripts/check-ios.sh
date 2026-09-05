@@ -95,7 +95,7 @@ for a in "\$@"; do
   fi
   args+=("\$a")
 done
-exec "\$real" "\${args[@]}"
+exec "\$real" "\${args[@]+"\${args[@]}"}"
 EOF
 
     for name in cc cxx; do
@@ -109,7 +109,7 @@ for a in "\$@"; do
     *) args+=("\$a") ;;
   esac
 done
-exec zig $([ "$name" = cxx ] && echo c++ || echo cc) -target aarch64-macos "\${args[@]}"
+exec zig $([ "$name" = cxx ] && echo c++ || echo cc) -target aarch64-macos "\${args[@]+\"\${args[@]}\"}"
 EOF
     done
     chmod +x "$SHIM_DIR/rustc" "$SHIM_DIR/cc" "$SHIM_DIR/cxx"

@@ -95,7 +95,7 @@ for a in "\$@"; do
   fi
   args+=("\$a")
 done
-exec "\$real" "\${args[@]}"
+exec "\$real" "\${args[@]+"\${args[@]}"}"
 EOF
 
 # 2. cc wrapper: rewrite cc-rs's iOS C target args to zig's macOS target
@@ -111,7 +111,7 @@ for a in "\$@"; do
     *) args+=("\$a") ;;
   esac
 done
-exec zig $([ "$name" = cxx ] && echo c++ || echo cc) -target aarch64-macos "\${args[@]}"
+exec zig $([ "$name" = cxx ] && echo c++ || echo cc) -target aarch64-macos "\${args[@]+\"\${args[@]}\"}"
 EOF
 done
 chmod +x "$SHIM_DIR/rustc" "$SHIM_DIR/cc" "$SHIM_DIR/cxx"
@@ -157,7 +157,8 @@ build_one() {
     # is exactly the step this script must NOT attempt on a non-Mac host.
     # Restricting the crate-type to `lib` (the rlib) makes the build end at
     # codegen, which needs no external linker.
-    run_cargo rustc -p choreo-gui --lib --crate-type lib --target "$triple" "${profile_args[@]}" \
+    run_cargo rustc -p choreo-gui --lib --crate-type lib --target "$triple" \
+        "${profile_args[@]+"${profile_args[@]}"}" \
         || fail "build failed for $triple (see output above)"
     stage="$STAGE_ROOT/$triple/$profile"
     mkdir -p "$stage"
