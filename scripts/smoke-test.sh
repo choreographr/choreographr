@@ -46,8 +46,8 @@ FAIL=0
 # Runs on the CI android job (ubuntu: dpkg-deb preinstalled) and locally; it
 # validates whatever .deb is handed to it, so it also catches a partially
 # rebuilt or hand-edited package, not just a freshly built one. Execution of
-# the packaged binaries happens later in the release workflow (qemu in a
-# Termux rootfs — see release.yml), not here.
+# the packaged binaries happens later in the release workflow (dpkg-deb
+# extraction under qemu — see release.yml), not here.
 if [[ "$TARBALL" == *.deb ]]; then
     command -v dpkg-deb >/dev/null 2>&1 || {
         echo "error: dpkg-deb not found — needed to inspect $TARBALL (pacman -S dpkg)" >&2

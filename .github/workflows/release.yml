@@ -44,9 +44,9 @@
 #                   scope here),
 #                   then scripts/build-deb-termux.sh packages the same
 #                   binaries into the Termux-native .deb (no rebuild),
-#                   then EXECUTES them under qemu-user inside a Termux
-#                   aarch64 rootfs container (setup-qemu-action +
-#                   termux/termux-docker) — closing the "never executed
+#                   then EXECUTES them under qemu-user against an unpacked
+#                   Termux aarch64 rootfs (skopeo fetches the image layers;
+#                   no docker) — closing the "never executed
 #                   before release" gap: until this step the Android
 #                   artifacts had only ever been structurally inspected,
 #                   never run.
@@ -364,34 +364,31 @@ jobs:
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           # Structural validation only — executing the packaged binaries is
-          # NOT possible on this bare runner; the next steps (setup-qemu + the
-          # termux/termux-docker run) install the .deb and run the binaries in
-          # a Termux aarch64 rootfs instead. On-device install remains the
-          # final smoke test.
+          # NOT possible on this bare runner; the next step unpacks a Termux
+          # aarch64 rootfs and runs the binaries under qemu-user instead.
+          # On-device install remains the final smoke test.
           ./scripts/smoke-test.sh "dist/choreographr-termux_${VERSION}_aarch64.deb"
 
-      # Registers aarch64 binfmt handlers on the runner so the host kernel can
-      # launch ARM64 ELF binaries via qemu-user (version convention: the repo
-      # pins action MAJORS only — checkout@v7, upload-artifact@v7 — so v3 is
-      # the matching pin here).
-      - uses: docker/setup-qemu-action@v3
-        with:
-          # Only arm64 is needed: the Android artifacts are aarch64 and no
-          # other job in this workflow uses cross-arch containers.
-          platforms: arm64
-
-      - name: Execute the binaries in a Termux rootfs (qemu)
+      - name: Execute the binaries in a Termux rootfs (qemu-user)
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           # The binaries are plain userspace programs (no Binder/Ashmem),
           # bionic-linked and Termux-patched to find their libs under the
-          # Termux $PREFIX — exactly what the documented termux/termux-docker
-          # rootfs image provides (`latest` is the image's documented tag;
-          # --platform linux/arm64 selects the aarch64 variant and the
-          # setup-qemu step above makes the runner kernel able to execute
-          # it). Running INSIDE Termux's own rootfs also exercises the real
-          # dpkg install path: the .deb is installed with Termux's dpkg into
-          # the same /data/data/com.termux/files/usr prefix a phone uses.
+          # Termux $PREFIX. This step executes them under qemu-user against
+          # the official Termux aarch64 rootfs — the closest thing to a
+          # on-device run without a device.
+          #
+          # No docker: a containerized attempt was abandoned after several CI
+          # iterations (the image's ENTRYPOINT drops privileges and resets
+          # env; bypassing it breaks emulation of the container's own bash).
+          # Instead: skopeo (no daemon) fetches the OCI image layers, which
+          # are unpacked into a scratch rootfs, and every binary is invoked
+          # through an EXPLICIT qemu-aarch64-static -L <rootfs> call — no
+          # binfmt registration, no entrypoint, no env surprises. The
+          # rootfs's own dpkg-deb (run under the same emulation) extracts the
+          # .deb, so Termux tooling still decodes the archive — including our
+          # xz members — into the real on-device $PREFIX layout. No root is
+          # needed: we own the scratch rootfs.
           #
           # Smoke-level by design: qemu-user emulation can't cover what the
           # Android framework provides (no Binder/Ashmem, no GUI, no
@@ -400,62 +397,65 @@ jobs:
           # smoke-test.sh checks on the desktop artifacts, which until now
           # the Android builds had never had. Timing-sensitive behaviour and
           # real device interaction remain on-device responsibilities.
-          #
-          # VERSION is computed on the HOST and passed via -e: the container
-          # image has no checkout of the repo, so it cannot read Cargo.toml.
-          # dist/ is mounted read-only — nothing in this step should write
-          # back into the artifact tree.
-          # -u 0 + --entrypoint bash: the image's default ENTRYPOINT drops
-          # privileges and resets the environment — CI observed the container
-          # running as uid=1000(system) DESPITE --user 0, and -e VERSION was
-          # wiped (dpkg got an empty version in the archive name). Bypassing
-          # the entrypoint makes both take effect. The rootfs is throwaway,
-          # so root is the intended mode for image-based Termux package
-          # testing.
-          docker run --rm --user 0 --entrypoint bash --platform linux/arm64 \
-              -v "$PWD/dist:/dist:ro" -e VERSION="$VERSION" \
-              termux/termux-docker:latest bash -ec '
-              # Sanity-check that we are really executing under emulation on
-              # an aarch64 rootfs — if binfmt registration silently failed,
-              # everything below would test the wrong thing. id(1) is printed
-              # as a diagnostic for the dpkg privilege question.
-              [ "$(uname -m)" = aarch64 ] || {
-                  echo "error: not running as aarch64: $(uname -m)" >&2; exit 1;
-              }
-              echo "container identity: $(id)"
-              # Preferred: a real install through Termux-owned dpkg (database
-              # updates, dependency resolution, $PREFIX layout) — the closest
-              # match to on-device `pkg install`.
-              # Observed in CI: dpkg -i fails with "requested operation
-              # requires superuser privilege" even under --user 0 (the image
-              # user semantics are not worth fighting further), so the install is opportunistic. The
-              # fallback is dpkg-deb -x — extraction-only, no package
-              # database or lock involved, but still TERMUX TOOLING decoding
-              # the archive (including our xz members) into the real
-              # on-device $PREFIX layout, which is what the binaries need.
-              # Either way the goal — the binaries present under $PREFIX/bin —
-              # is guaranteed.
-              if ! dpkg -i /dist/choreographr-termux_${VERSION}_aarch64.deb; then
-                  echo "warning: dpkg -i failed; falling back to dpkg-deb -x" >&2
-                  dpkg-deb -x /dist/choreographr-termux_${VERSION}_aarch64.deb /
-              fi
-              # `timeout` lives in coreutils and may be absent from the
-              # minimal rootfs; install it best-effort (network is available
-              # on ubuntu runners) so a hanging binary cannot stall the job
-              # to the workflow timeout. If the install fails (e.g. a mirror
-              # hiccup), fall back to running without the guard — the
-              # --version/--help invocations below are non-interactive.
-              pkg install -y coreutils >/dev/null 2>&1 || true
-              # The shipped binaries must answer --version with the exact
-              # release version — proves the bionic ELF actually loads,
-              # links against the Termux $PREFIX libs, and runs (the core
-              # "never executed before release" check).
-              timeout 60 "$PREFIX/bin/choreographr" --version | grep -q "$VERSION"
-              timeout 60 "$PREFIX/bin/choreo-tui" --version
-              # --help exercises the full clap parser construction (more
-              # code paths than --version) and must exit 0.
-              timeout 60 "$PREFIX/bin/choreographr" --help >/dev/null
-          '
+          sudo apt-get install -y -qq skopeo qemu-user-static
+
+          ROOTFS=/tmp/termux-rootfs
+          mkdir -p "$ROOTFS"
+
+          # Fetch the official Termux aarch64 rootfs as OCI layers (skopeo's
+          # dir transport writes the manifest and per-digest layer files).
+          IMG=/tmp/termux-img
+          skopeo copy --override-os linux --override-arch arm64 \
+              docker://termux/termux-docker:latest "dir:$IMG"
+          # Unpack the layers in manifest order (later layers overlay earlier
+          # ones). tar auto-detects the layer compression. The manifest file
+          # name differs between skopeo versions/transports (OCI layout writes
+          # "manifest", docker-schema2 writes "manifest.json" — verified
+          # locally with skopeo 1.24); layer files are named by the bare hex
+          # digest (colon stripped).
+          MANIFEST="$IMG/manifest"
+          [ -f "$MANIFEST" ] || MANIFEST="$IMG/manifest.json"
+          for digest in $(jq -r '.layers[].digest' "$MANIFEST"); do
+              tar -xf "$IMG/${digest#*:}" -C "$ROOTFS"
+          done
+
+          PREFIX="$ROOTFS/data/data/com.termux/files/usr"
+          # Sanity checks before anything else: the emulation scaffold (the
+          # bionic loader the binaries reference as /system/bin/linker64) and
+          # the Termux tooling must both exist in the unpacked rootfs, or
+          # everything below would fail for the wrong reason.
+          [ -e "$ROOTFS/system/bin/linker64" ] || {
+              echo "error: linker64 missing from the rootfs — cannot run bionic binaries" >&2
+              exit 1
+          }
+          [ -x "$PREFIX/bin/dpkg-deb" ] || {
+              echo "error: dpkg-deb missing from the rootfs" >&2
+              exit 1
+          }
+
+          # Extract the .deb with TERMUX'S OWN dpkg-deb, running under the
+          # same qemu — exercises Termux tooling decoding our archive (the
+          # xz members smoke-test.sh checks structurally) into the real
+          # on-device $PREFIX layout. Glob, not a VERSION-expanded name: no
+          # env must cross the emulation boundary.
+          DEB=$(echo dist/choreographr-termux_*_aarch64.deb)
+          [ -f "$DEB" ] || { echo "error: no Termux .deb in dist/" >&2; exit 1; }
+          qemu-aarch64-static -L "$ROOTFS" "$PREFIX/bin/dpkg-deb" -x "$DEB" "$ROOTFS"
+
+          # The shipped binaries must answer --version with the exact release
+          # version — proves the bionic ELF actually loads, links against the
+          # Termux $PREFIX libs, and runs (the core "never executed before
+          # release" check). timeout(1) is the HOST's coreutils — the guards
+          # work natively here, unlike inside a container.
+          timeout 60 qemu-aarch64-static -L "$ROOTFS" "$PREFIX/bin/choreographr" --version | grep -q "$VERSION"
+          timeout 60 qemu-aarch64-static -L "$ROOTFS" "$PREFIX/bin/choreo-tui" --version
+          # --help exercises the full clap parser construction (more
+          # code paths than --version) and must exit 0.
+          timeout 60 qemu-aarch64-static -L "$ROOTFS" "$PREFIX/bin/choreographr" --help >/dev/null
+
+          # Keep the workspace clean: the scratch rootfs is large and must
+          # never leak into the artifact upload.
+          rm -rf "$ROOTFS" "$IMG"
 
       - uses: actions/upload-artifact@v7
         with:
