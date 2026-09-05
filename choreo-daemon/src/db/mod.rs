@@ -927,7 +927,6 @@ pub fn write_turn(
         let mut attachments = write_txn
             .open_table(SESSION_ATTACHMENTS)
             .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
-        let mut attachments_written = 0usize;
         for (i, img) in turn.displayed_images.iter().enumerate() {
             if img.data.is_empty() {
                 continue; // nothing to persist
@@ -936,7 +935,6 @@ pub fn write_turn(
             attachments
                 .insert((session_id, turn_id, slot), img.data.as_slice())
                 .map_err(|e| db_err(format!("redb insert display attachment: {e}")))?;
-            attachments_written += 1;
         }
         for tr in &turn.tool_results {
             if let Some(image) = &tr.image
@@ -946,13 +944,11 @@ pub fn write_turn(
                 attachments
                     .insert((session_id, turn_id, slot), image.data.as_slice())
                     .map_err(|e| db_err(format!("redb insert result attachment: {e}")))?;
-                attachments_written += 1;
             }
         }
-        debug!(
-            session_id,
-            turn_id, attachments_written, "split image bytes into session_attachments"
-        );
+        // No per-turn log here: this fires on every turn write (often with zero
+        // attachments) and is pure noise at DEBUG. Storage anomalies surface as
+        // errors from the inserts above.
         let mut table = write_txn
             .open_table(SESSION_TURNS)
             .map_err(|e| db_err(format!("redb open turns: {e}")))?;
