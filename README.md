@@ -38,7 +38,7 @@ Currently the primary client is **`choreo-tui`** - a fullscreen terminal UI.
 
 Other clients being developed: 
 
-- **`choreo-gui`** — Desktop/Android GUI built with [Dioxus](https://dioxuslabs.com/) on the Dioxus Native (Blitz) renderer — one renderer for both desktop and Android, no webview. Built as a lib+cdylib so dx/gradle can package it as an APK.
+- **`choreo-gui`** — Desktop/Android/iOS GUI built with [Dioxus](https://dioxuslabs.com/) on the Dioxus Native (Blitz) renderer — one renderer for desktop, Android and iOS, no webview. Built as a lib+cdylib so dx/gradle can package it as an APK; iOS builds via `scripts/build-ios.sh` + the `ios/` Xcode scaffold.
 - **`choreo-im`** — instant-messaging bridge (Telegram, more platforms coming) - chat with your agent on the go! Feature-gated (`--features im`); not part of the prebuilt release binaries.
 - **`choreo-acp`** — ACP bridge so ACP-compatible editors (Claude Code, Cline, …) can drive Choreographr sessions over JSON-RPC. Feature-gated (`--features acp`); not part of the prebuilt release binaries.
 - **`choreographr`** — Choreographr servers will be able to connect to other servers to deploy work elsewhere.

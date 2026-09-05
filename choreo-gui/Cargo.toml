@@ -21,6 +21,10 @@ publish = false
 # The cdylib exists solely for the Android gradle/dx scaffold, which loads the
 # crate as a `.so` via `System.loadLibrary` to drive the Dioxus Native app. It
 # is inert on desktop builds (nothing links against the dynamic target there).
+# iOS does NOT use this target: the Xcode scaffold (scripts/build-ios.sh) links
+# the static `lib` (rlib) target via a C bootstrap (ios/main.m) that calls the
+# `choreo_gui_ios_main` trampoline — so no `staticlib` crate-type is added
+# today; revisit only if the Xcode link needs one.
 [lib]
 crate-type = ["lib", "cdylib"]
 [[bin]]
@@ -33,10 +37,11 @@ clap.workspace = true
 # Wipe the pending unlock key (secret material) when a rejection discards it.
 zeroize.workspace = true
 # Dioxus 0.7 Native renderer (Blitz/wgpu) instead of the desktop/webview
-# renderer: it is ALSO the Android renderer, so one renderer serves desktop and
-# aarch64-linux-android alike — there is no webview (webkit2gtk, etc.) anywhere
-# in the dependency tree. The platform-agnostic `launch` facade maps to
-# dioxus_native under the `native` cfg, so no per-platform entry code is needed.
+# renderer: it is ALSO the Android and iOS renderer, so one renderer serves
+# desktop and aarch64-linux-android alike — there is no webview (webkit2gtk,
+# etc.) anywhere in the dependency tree. The platform-agnostic `launch`
+# facade maps to dioxus_native under the `native` cfg, so no per-platform
+# entry code is needed.
 dioxus = { version = "0.7", features = ["native"] }
 futures-channel.workspace = true
 futures-util.workspace = true

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for the Choreographr GUI iOS app (xcodegen consumes this via
+  ios/project.yml). Only choreo-gui ships to iOS — the daemon/TUI/bridges do
+  not (the GUI dials the daemon over TCP/Noise-IK; see the TcpPinned mode in
+  choreo-gui/src/lib.rs).
+
+  NSLocalNetworkUsageDescription is required by iOS 14+ for TCP connections
+  to a LAN daemon (the 127.0.0.1 default works without it, but a daemon on
+  another host does not). UILaunchScreen dict (empty) opts out of the
+  legacy launch-storyboard requirement.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Choreographr</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>choreo-gui</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>MinimumOSVersion</key>
+    <string>14.0</string>
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Choreographr connects to your Choreographr daemon over the local network.</string>
+</dict>
+</plist>

@@ -1,0 +1,54 @@
+# xcodegen project definition for the Choreographr GUI iOS app.
+#
+# Generates Choreographr.xcodeproj from this file + ios/Info.plist +
+# ios/main.m plus the Rust artifacts staged by scripts/build-ios.sh under
+# target/ios/aarch64-apple-ios/<profile>/ (libchoreo_gui.rlib plus the
+# native libs its build scripts produced: ring, secp256k1).
+#
+# On a Mac:
+#   ./scripts/build-ios.sh            # build + stage (device target)
+#   brew install xcodegen
+#   cd ios && xcodegen generate
+#   open Choreographr.xcodeproj       # then run on simulator/device
+#
+# The rlib is linked directly rather than via a `staticlib` crate-type: the
+# Xcode "Other Linker" entry consumes it together with the C-compiled
+# static archives staged alongside (see build-ios.sh's STAGE layout). If the
+# Xcode link proves happier with a staticlib, add `staticlib` to choreo-gui's
+# crate-type list and switch LIBRARIES below — one-line change either way.
+#
+# PHASE 0B: unverified on a Mac — expect iteration on the framework list
+# (wgpu/Metal pulls QuartzCore/CoreGraphics/Metal; winit pulls UIKit/
+# Foundation) and on the deployment-target floor (winit requires iOS 10+;
+# 14.0 chosen conservatively for the local-network permission API).
+
+name: Choreographr
+options:
+  bundleIdPrefix: com.choreographr
+  deploymentTarget:
+    iOS: "14.0"
+targets:
+  Choreographr:
+    type: application
+    platform: iOS
+    sources:
+      - path: main.m
+    info:
+      path: Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.choreographr.gui
+        PRODUCT_NAME: choreo-gui
+        # Rust artifacts staged by scripts/build-ios.sh (relative to ios/).
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/../target/ios/aarch64-apple-ios/$(CONFIGURATION)"
+        OTHER_LDFLAGS:
+          - -lchoreo_gui
+          - -lring_core_0_17_14_
+          - -lsecp256k1
+          - -lobjc
+        # wgpu/Metal + winit/UIKit framework surface; extend if the Xcode link
+        # reports missing symbols (phase 0b).
+        OTHER_LDFLAGS_2: []
+        CLANG_ENABLE_MODULES: YES
+        SWIFT_VERSION: "5.0"

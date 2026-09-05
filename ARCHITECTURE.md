@@ -13,7 +13,8 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 │  (terminal)  │                    │              │                ├──────────────────────┤
 ├──────────────┤                    │  choreographr  │◄──────────────►│  Anthropic Messages   │
 │ choreo-gui       │◄──────────────────►│              │                ├──────────────────────┤
-│ (desktop/Android)│    Unix socket     │              │◄──────────────►│  Google Gemini API    │
+│ (desktop/mobile) │  Unix socket or    │              │◄──────────────►│  Google Gemini API    │
+│                  │  TCP/Noise-IK      │              │                │                      │
 ├──────────────┤                    │              │                ├──────────────────────┤
 │   choreo-im     │◄──────────────────►│              │◄──────────────►│  Mistral API          │
 │ (IM bridge)  │    Unix socket     │              │                ├──────────────────────┤
@@ -65,9 +66,10 @@ Choreographr (workspace)
 │                       publish-time image mipmap pipeline behind the `content` tools
 │                       (feature-gated `content` cargo feature, off by default)
 ├── choreo-tui             Terminal UI client (ratatui + crossterm)
-├── choreo-gui             Desktop/Android GUI client (Dioxus Native / Blitz
-│                       renderer — no webview; built as lib+cdylib for dx/gradle
-│                       APK packaging)
+├── choreo-gui             Desktop/Android/iOS GUI client (Dioxus Native / Blitz
+│                       renderer — no webview; lib+cdylib for dx/gradle APK
+│                       packaging; iOS via scripts/build-ios.sh + the ios/
+│                       Xcode scaffold)
 └── choreo-im              IM platform bridge (Telegram; feature-gated `im`
                         root-package feature, off by default)
 ```
@@ -157,7 +159,8 @@ bridges are source-build extras via `--features im,acp`.
 `choreo-mcp` is a **library-only crate** (the MCP client the daemon's
 feature-gated `mcp` module uses to spawn tool servers) — it has no `[[bin]]`
 target and is never shipped as a binary. `choreo-gui` is built separately (desktop via `cargo run -p choreo-gui`,
-Android via `dx build --platform android`) and is not shipped either.
+Android via `dx build --platform android`, iOS via `scripts/build-ios.sh` +
+the `ios/` Xcode scaffold) and is not shipped either.
 
 The shipped target set is exactly two; `release.sh` and `install.sh` hardcode
 this pair and refuse any other platform ("ships Linux x86_64 and macOS arm64
@@ -285,6 +288,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 | `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine (the CI release workflow ships the tarballs but does not touch the tap) |
 | `check-supply-chain.sh` | The dependency supply-chain gate — runs `cargo deny check advisories bans sources` against `deny.toml` (falling back to `cargo-audit` + a literal lockfile scan when cargo-deny is absent), after scanning the local `~/.cargo/registry` cache for the `.crate` files deleted during the 2026-08-20 `arrayref` attack (RUSTSEC-2026-0260). Wired into `just pre-commit` / `just ci`; see the **Dependency supply chain** subsection under **Security model** |
 | `build-android.sh` | Cross-builds the shipped suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run) under `--profile dist` (the shipped-artifact profile — matches the desktop release pipeline), stages them in `target/android/<abi>/` (cargo's target/ tree — `dist/` is reserved for final publishable artifacts), and prints the `adb push` guidance for Termux `$PREFIX/bin`. Its output is the input for the Termux packaging step (`scripts/build-deb-termux.sh`, CI android job): packaging never rebuilds. Links the four binaries with a linker-script fragment that re-aligns the TLS output sections to 64 bytes — bionic's loader rejects arm64 executables whose `PT_TLS` has `p_align < 64` (rust/LLVM emit 8, and the emutls-for-Android rust PR was never merged), which aborted every Rust binary with thread-locals at startup on Android 10+; a post-build `readelf` gate fails the build rather than shipping a binary that dies on-device. Strips the per-profile `rustflags` from the manifest for the duration (persistent backups under `target/` + EXIT-trap restore, plus a next-run self-heal that recovers a tree left stripped by a hard-killed predecessor — the trap-reliant restore alone was not kill-safe; see `build-stable.sh`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
+| `build-ios.sh` | Compiles `choreo-gui` (the ONLY crate that ships to iOS) for `aarch64-apple-ios` (+ the `-sim` slice when run on a Mac) and stages the link inputs the `ios/` Xcode scaffold consumes (`target/ios/<triple>/<profile>/`: `libchoreo_gui.rlib` plus the ring/secp256k1 static archives). Runs on ANY host: with Xcode it is a full build; without one (the Linux check laptop) it installs shims under `target/ios-shims/` — a `RUSTC` wrapper stripping `-C target-cpu=native` (profile rustflags are not suppressible via `RUSTFLAGS` env, the same trap `build-android.sh` documents) and cc wrappers routing cc-rs through `zig cc` with a fake `SDKROOT` so cc-rs never needs `xcrun` (zig ships macOS darwin libc headers but not iOS ones, so cc-rs's iOS C target is rewritten to zig's macOS target — compile-only; the final Apple dylib/app link happens on the Mac, and the script builds the rlib via `cargo rustc --crate-type lib` so the cdylib's Apple link is never attempted). The `ios/` directory (main.m UIApplication bootstrap + xcodegen `project.yml` + Info.plist) is the Xcode-side counterpart; see the phase 0b caveat comments there about the winit/blitz-shell iOS event-loop wiring, the one piece no non-Mac host can verify |
 
 ### Distribution channels (0.1)
 
