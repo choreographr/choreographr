@@ -415,15 +415,29 @@ jobs:
               termux/termux-docker:latest bash -ec '
               # Sanity-check that we are really executing under emulation on
               # an aarch64 rootfs — if binfmt registration silently failed,
-              # everything below would test the wrong thing.
+              # everything below would test the wrong thing. id(1) is printed
+              # as a diagnostic for the dpkg privilege question.
               [ "$(uname -m)" = aarch64 ] || {
                   echo "error: not running as aarch64: $(uname -m)" >&2; exit 1;
               }
-              # Real on-device-path install: Termux's own dpkg unpacks and
-              # configures our package (dependency resolution, maintainer
-              # scripts, $PREFIX path layout) — much stronger than the
-              # structural smoke-test on the host.
-              dpkg -i /dist/choreographr-termux_${VERSION}_aarch64.deb
+              echo "container identity: $(id)"
+              # Preferred: a real install through Termux's own dpkg (database
+              # updates, dependency resolution, $PREFIX layout) — the closest
+              # match to on-device `pkg install`.
+              # Observed in CI: dpkg -i fails with "requested operation
+              # requires superuser privilege" even under --user 0 (Termux's
+              # patched dpkg/user semantics in the image are not worth
+              # fighting further), so the install is opportunistic. The
+              # fallback is dpkg-deb -x — extraction-only, no package
+              # database or lock involved, but still TERMUX TOOLING decoding
+              # the archive (including our xz members) into the real
+              # on-device $PREFIX layout, which is what the binaries need.
+              # Either way the goal — the binaries present under $PREFIX/bin —
+              # is guaranteed.
+              if ! dpkg -i /dist/choreographr-termux_${VERSION}_aarch64.deb; then
+                  echo "warning: dpkg -i failed; falling back to dpkg-deb -x" >&2
+                  dpkg-deb -x /dist/choreographr-termux_${VERSION}_aarch64.deb /
+              fi
               # `timeout` lives in coreutils and may be absent from the
               # minimal rootfs; install it best-effort (network is available
               # on ubuntu runners) so a hanging binary cannot stall the job

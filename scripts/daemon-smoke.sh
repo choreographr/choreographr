@@ -163,37 +163,76 @@ case "$VER_OUT" in
         ;;
 esac
 
-echo "==> booting daemon (socket: $CHOREOGRAPHR_SOCKET_PATH, config: $SCRATCH_CONFIG)"
-# stdout+stderr both go to the log: tracing writes to stdout, and the "listen"
-# line plus any startup panic land here for the readiness check and dump_log.
-"$DAEMON" >"$DAEMON_LOG" 2>&1 &
-DAEMON_PID=$!
+# Boot with a bounded retry: on GitHub's Windows runners, Defender's
+# real-time scanner transiently byte-range-locks freshly created files in
+# Temp, which the daemon's DB migration hits as "os error 33" (observed in
+# CI: create + version stamp succeeded, the migration's first write failed).
+# The DB here is a throwaway scratch file, so retrying the whole boot with a
+# clean DB absorbs the transient lock without touching daemon semantics —
+# a real user's daemon retrying a migration would be wrong; a smoke test
+# re-running itself is just a flake guard. POSIX boots are deterministic and
+# will simply pass on attempt 1.
+BOOT_OK=0
+for ATTEMPT in 1 2 3; do
+    [ "$ATTEMPT" -gt 1 ] && {
+        echo "==> retrying daemon boot (attempt $ATTEMPT/3)"
+        # A failed migration can leave the scratch DB in a half-written or
+        # still-locked state; it is disposable, so remove it (and a stale
+        # socket) before retrying.
+        # (CHOREOGRAPHR_DB_PATH is Windows-only, hence the :- default under
+        # set -u.)
+        rm -f "${CHOREOGRAPHR_DB_PATH:-}" "$CHOREOGRAPHR_SOCKET_PATH" 2>/dev/null || true
+    }
 
-# Readiness poll — bounded (100 × 0.1s = 10s ceiling), NOT a fixed sleep.
-# Each iteration first checks the process is still alive: a daemon that exits
-# during startup must fail IMMEDIATELY with its log dumped, not after the full
-# timeout. (See the header comment for why a sleep-based poll is acceptable
-# here.)
-SOCKET_UP=0
-for _ in $(seq 1 100); do
-    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+    echo "==> booting daemon (attempt $ATTEMPT; socket: $CHOREOGRAPHR_SOCKET_PATH, config: $SCRATCH_CONFIG)"
+    # stdout+stderr both go to the log: tracing writes to stdout, and the
+    # "listen" line plus any startup panic land here for the readiness check
+    # and dump_log.
+    "$DAEMON" >"$DAEMON_LOG" 2>&1 &
+    DAEMON_PID=$!
+
+    # Readiness poll — bounded (100 × 0.1s = 10s ceiling), NOT a fixed sleep.
+    # Each iteration first checks the process is still alive: a daemon that
+    # exits during startup must fail IMMEDIATELY with its log dumped, not
+    # after the full timeout. (See the header comment for why a sleep-based
+    # poll is acceptable here.)
+    SOCKET_UP=0
+    DAEMON_DIED=0
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+            DAEMON_DIED=1
+            break
+        fi
+        # Unix: the bind creates a real socket inode. Windows: uds_windows
+        # creates a regular rendezvous FILE at the path (not a named pipe),
+        # so test -e.
+        if [ "$OS" = windows ]; then
+            if [ -e "$CHOREOGRAPHR_SOCKET_PATH" ]; then SOCKET_UP=1; break; fi
+        else
+            if [ -S "$CHOREOGRAPHR_SOCKET_PATH" ]; then SOCKET_UP=1; break; fi
+        fi
+        sleep 0.1
+    done
+
+    if [ "$SOCKET_UP" -eq 1 ]; then
+        BOOT_OK=1
+        break
+    fi
+
+    if [ "$DAEMON_DIED" -eq 1 ]; then
         echo "  FAIL: daemon exited during startup (before socket appeared)" >&2
-        dump_log
+    else
+        echo "  FAIL: socket did not appear within 10s" >&2
+    fi
+    dump_log
+    # Only a startup-time death is retried (the transient-lock case); a
+    # timeout with the process still alive is a genuine hang and is fatal.
+    if [ "$DAEMON_DIED" -ne 1 ] || [ "$ATTEMPT" -eq 3 ]; then
+        [ "$DAEMON_DIED" -ne 1 ] && kill "$DAEMON_PID" 2>/dev/null || true
         exit 1
     fi
-    # Unix: the bind creates a real socket inode. Windows: uds_windows creates
-    # a regular rendezvous FILE at the path (not a named pipe), so test -e.
-    if [ "$OS" = windows ]; then
-        if [ -e "$CHOREOGRAPHR_SOCKET_PATH" ]; then SOCKET_UP=1; break; fi
-    else
-        if [ -S "$CHOREOGRAPHR_SOCKET_PATH" ]; then SOCKET_UP=1; break; fi
-    fi
-    sleep 0.1
 done
-
-if [ "$SOCKET_UP" -ne 1 ]; then
-    echo "  FAIL: socket did not appear within 10s" >&2
-    dump_log
+if [ "$BOOT_OK" -ne 1 ]; then
     exit 1
 fi
 echo "  ok: socket endpoint exists; daemon alive"
