@@ -271,12 +271,14 @@ jobs:
 
       - name: Daemon smoke-test the zip
         run: |
-          # Boot the shipped daemon hermetically (scratch APPDATA + socket,
+          # Boot the shipped daemon hermetically (scratch socket + DB path,
           # see scripts/daemon-smoke.sh's header) — the inline --version loop
           # above never touches the listener. On Windows the daemon binds via
           # uds_windows (a file-path Unix-socket emulation, NOT a named pipe),
-          # and the forced shutdown's exit code is not asserted (see the
-          # script's shutdown comment for why).
+          # the DB path is pinned via CHOREOGRAPHR_DB_PATH (dirs::data_dir()
+          # ignores env redirects there — first CI run failed with "could not
+          # determine data directory"), and the forced shutdown's exit code is
+          # not asserted (see the script's shutdown comment for why).
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           ./scripts/daemon-smoke.sh "dist/choreographr-${VERSION}-x86_64-pc-windows-msvc.zip"
 
@@ -403,7 +405,12 @@ jobs:
           # image has no checkout of the repo, so it cannot read Cargo.toml.
           # dist/ is mounted read-only — nothing in this step should write
           # back into the artifact tree.
-          docker run --rm --platform linux/arm64 \
+          # -u 0: the image's default user is NOT root (first CI run failed
+          # with "dpkg: error: requested operation requires superuser
+          # privilege"), and dpkg -i is inherently a root operation — the
+          # rootfs is throwaway, so running as root is the intended mode for
+          # image-based Termux package testing.
+          docker run --rm --user 0 --platform linux/arm64 \
               -v "$PWD/dist:/dist:ro" -e VERSION="$VERSION" \
               termux/termux-docker:latest bash -ec '
               # Sanity-check that we are really executing under emulation on

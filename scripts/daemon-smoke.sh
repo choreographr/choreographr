@@ -17,7 +17,14 @@
 #   * CHOREOGRAPHR_SOCKET_PATH → scratch socket (choreo-proto/src/io.rs)
 #   * XDG_CONFIG_HOME / APPDATA → scratch config dir (transport keypair
 #     transport.sec/pub, authorized_clients.toml, config.toml, accounts.toml
-#     all resolve under dirs::config_dir()/choreographr)
+#     all resolve under dirs::config_dir()/choreographr) — POSIX honors this
+#     fully; on Windows dirs resolves via the known-folder API and may ignore
+#     the override (see the CHOREOGRAPHR_DB_PATH note below for the
+#     consequence and the mitigation)
+#   * CHOREOGRAPHR_DB_PATH → scratch DB (Windows only — the daemon's data dir
+#     resolves through dirs::data_dir(), which on Windows uses
+#     SHGetKnownFolderPath and does not honor env redirects; without this the
+#     boot fails with "could not determine data directory")
 #   * HOME / USERPROFILE → scratch too, belt-and-braces against anything that
 #     bypasses dirs and reads $HOME directly
 #
@@ -127,6 +134,19 @@ export CHOREOGRAPHR_SOCKET_PATH="$TMP/choreographr.sock"
 # "choreographr listening" line, which the default (info) filter emits —
 # setting RUST_LOG explicitly keeps that contract independent of flag defaults.
 export RUST_LOG=info
+
+# Windows additionally needs the DB path pinned explicitly: the daemon's DB
+# directory resolves through dirs::data_dir(), which on Windows goes through
+# the SHGetKnownFolderPath API and does NOT honor the APPDATA override —
+# observed in CI as "could not determine data directory" when only the env
+# vars were redirected. The daemon has a first-class CHOREOGRAPHR_DB_PATH
+# override (choreo-daemon/src/db/mod.rs), so use that. The config dir has no
+# equivalent override; on Windows dirs may therefore resolve it to the
+# runner's real profile — acceptable here because the runner is ephemeral
+# and the smoke run only auto-generates a throwaway keypair there.
+if [ "$OS" = windows ]; then
+    export CHOREOGRAPHR_DB_PATH="$TMP/choreographr.redb"
+fi
 
 [ -x "$DAEMON" ] || { echo "error: $DAEMON missing or not executable after extraction" >&2; exit 1; }
 
