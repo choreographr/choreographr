@@ -46,7 +46,7 @@ pub(crate) const BG_SHADE: Color = Color::Rgb(53, 53, 53);
 /// `Bound` reply); a bound-but-locked daemon is unlocked with `/unlock` or
 /// `/unlock <base64 unlock-key>` (the fuller guidance also appears in the
 /// startup status and the submit-time prompt rejection).
-pub(crate) const KEYS_LOCKED_MARKER: &str = "🔒 keystore locked";
+pub(crate) const KEYS_LOCKED_MARKER: &str = " 🔒 keystore locked";
 
 pub(crate) fn mouse_in_history_box(column: u16, row: u16, vp_width: u16, vp_height: u16) -> bool {
     column < vp_width && row < vp_height
