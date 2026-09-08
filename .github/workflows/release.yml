@@ -550,11 +550,14 @@ jobs:
         # stays alive.
         #
         # PASS criterion for the stub is deliberately LOW BAR: the process is
-        # ALIVE after 30s. Expected behavior: the app dials TcpPinned
-        # (127.0.0.1:9443), the connect fails on the runner (no daemon), and
-        # the channel-based UI keeps running showing the error status —
-        # "connect failed but UI alive" is the design working. A crash or
-        # hang (exit/absent process) is the phase 0b failure signal.
+        # ALIVE after 30s. Expected behavior: main() opens the EMBEDDED
+        # in-process daemon (Mobile tool policy) over plain channels — the
+        # connect succeeds in-process and the UI shows the live session list.
+        # Only if the embedded open FAILS does the app fall back to dialing
+        # TcpPinned (127.0.0.1:9443), which fails on the runner (no remote
+        # daemon) while the UI stays alive showing the error status — either
+        # way "UI alive" is the design working. A crash or hang (exit/absent
+        # process) is the phase 0b failure signal.
         # continue-on-error: the destination/simulator plumbing on CI is
         # itself unproven (headless boot quirks); promote to a hard gate
         # after it has proven stable.
