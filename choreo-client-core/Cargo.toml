@@ -27,6 +27,11 @@ toml.workspace = true
 base64.workspace = true
 # KnownServerEntry derives Serialize/Deserialize for the TOML store.
 serde.workspace = true
+# In-process transport (ConnectionMode::InProcess): the raw crossbeam channel
+# ends from an embedded daemon's EmbeddedLink are moved in as values; the pump
+# forwards messages without any codec. Already a workspace dependency (the
+# TUI and the daemon's embedded transport use it).
+crossbeam-channel.workspace = true
 # Feature-gated test-only helpers (src/test_support.rs): a regular OPTIONAL
 # dependency (not a dev-dependency) because other crates' test builds consume
 # it through their dev-dependency feature request on this crate.

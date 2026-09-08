@@ -55,6 +55,9 @@ pub(crate) fn connection_addr() -> String {
         Some(ConnectionMode::UnixSocket(path)) => path.clone(),
         Some(ConnectionMode::Tcp { addr, .. }) => addr.clone(),
         Some(ConnectionMode::TcpPinned(addr)) => addr.clone(),
+        // In-process (embedded daemon): LOCAL trust domain, keyed the same
+        // as the unix socket path (see the TUI's matching arm).
+        Some(ConnectionMode::InProcess { .. }) => socket_path(),
         // Unset (e.g. unit tests, or a mis-wired launcher): default to the
         // unix socket path, which is what a local default-mode connection uses.
         None => socket_path(),

@@ -186,6 +186,10 @@ fn App() -> Element {
             // Pinned mode also dials an address — display it exactly like
             // the explicit-key Tcp variant (the pin itself is not secret).
             Some(ConnectionMode::TcpPinned(addr)) => addr.clone(),
+            // In-process (embedded daemon): no dial address; show the unix
+            // socket path, matching the LOCAL trust domain the keystore keys
+            // this daemon under (see client.rs's `connection_addr`).
+            Some(ConnectionMode::InProcess { .. }) => socket_path(),
             None => socket_path(),
         };
         AppState::new(display_path)

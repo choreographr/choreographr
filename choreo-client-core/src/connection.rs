@@ -5,6 +5,11 @@ use choreo_transport::handshake::{
     PREAMBLE_IK, PREAMBLE_XX, handshake_initiator, handshake_initiator_xx,
 };
 use choreo_transport::key::ensure_transport_keypair;
+// In-process transport: raw channel ends from an `choreo_daemon::embedded::EmbeddedLink`.
+// Pure values — client-core never depends on choreo-daemon; the GUI creates
+// the link and stuffs the ends into `ConnectionMode::InProcess`.
+use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
+use std::fmt;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -115,7 +120,11 @@ pub fn run_daemon_connection(
 }
 
 /// Selects the transport for connecting to a daemon.
-#[derive(Clone, Debug)]
+///
+// Clone stays derived: crossbeam channel ends are `Clone`, so a cloned mode
+// shares the same underlying channel pair (fine — cloning a mode is only used
+// to stash it for `connection_addr`-style display lookups).
+#[derive(Clone)]
 pub enum ConnectionMode {
     /// Connect via Unix domain socket at the given path.
     UnixSocket(String),
@@ -128,6 +137,40 @@ pub enum ConnectionMode {
     /// the re-pair guidance, so a server key change is loud instead of an
     /// opaque connection error (the known_hosts behavior).
     TcpPinned(String),
+    /// Connect to an EMBEDDED daemon in the same process: `daemon_tx` is the
+    /// client→daemon channel end, `daemon_rx` the daemon→client end (the raw
+    /// pair from `choreo_daemon::embedded::EmbeddedLink`, moved here as
+    /// values). Messages travel as VALUES — no codec, no socket. Channel
+    /// close IS the EOF in both directions, exactly like the daemon-side
+    /// embedded path. client-core never links choreo-daemon: the GUI (the
+    /// owner of the `EmbeddedDaemon`) creates the link and hands over the ends.
+    InProcess {
+        daemon_tx: CrossbeamSender<ClientMessage>,
+        daemon_rx: CrossbeamReceiver<DaemonMessage>,
+    },
+}
+
+// Manual Debug instead of a derive: crossbeam channel ends are not `Debug`,
+// and the embedded link carries no printable identity — it is rendered as a
+// placeholder. Every other variant formats EXACTLY as the derive output would
+// (`UnixSocket("path")`, `Tcp { addr: "…", server_pk: [..] }`,
+// `TcpPinned("addr")`) so log/error messages keep their previous shape.
+impl fmt::Debug for ConnectionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectionMode::UnixSocket(path) => f.debug_tuple("UnixSocket").field(path).finish(),
+            ConnectionMode::Tcp { addr, server_pk } => f
+                .debug_struct("Tcp")
+                .field("addr", addr)
+                .field("server_pk", server_pk)
+                .finish(),
+            ConnectionMode::TcpPinned(addr) => f.debug_tuple("TcpPinned").field(addr).finish(),
+            // The ends are opaque by design: printing channel internals would
+            // leak nothing useful and might suggest a stable identity that
+            // does not exist.
+            ConnectionMode::InProcess { .. } => f.write_str("InProcess(<embedded link>)"),
+        }
+    }
 }
 
 impl Default for ConnectionMode {
@@ -566,6 +609,100 @@ pub fn run_daemon_tcp_connection_pinned(
     })
 }
 
+/// Serve a connection over an in-process channel pair (the
+/// [`ConnectionMode::InProcess`] mode).
+///
+/// Structure mirrors `serve_noise_connection` EXACTLY, with channels
+/// replacing the transport:
+/// - Reader (the CALLING thread — callers already run this on a spawned
+///   thread): `for message in daemon_rx` forwards each value straight to
+///   `handle_daemon_message`; the loop ends when the daemon drops its sender
+///   (channel close IS the EOF — mapped to the same clean `Ok(())` the unix
+///   path returns on EOF, so `UiEvent::ReaderClosed` semantics are identical).
+/// - Writer: a dedicated thread draining `from_ui` (std mpsc) into
+///   `daemon_tx` — the same `recv_timeout` + shutdown-flag structure the
+///   socket modes use. Dropping `from_ui` ends the writer, which drops the
+///   last client-side `daemon_tx` end — the daemon's embedded connection sees
+///   channel close (= EOF) and runs its normal cleanup.
+///
+/// Shutdown is COOPERATIVE in-process (a deliberate difference from the TCP
+/// path, where `Shutdown::Both` force-kills the socket): an external
+/// `shutdown_rx` signal stops the writer thread via the internal
+/// writer-shutdown channel, but the daemon-side channel can never be
+/// force-closed from here — the reader ends when the EMBEDDED DAEMON closes
+/// its end (its `EmbeddedDaemon::shutdown()` delivers `ShuttingDown` as a
+/// value, then closes the channel, which unblocks this reader exactly the
+/// way a daemon EOF unblocks the socket reader).
+fn run_daemon_connection_in_process(
+    daemon_tx: CrossbeamSender<ClientMessage>,
+    daemon_rx: CrossbeamReceiver<DaemonMessage>,
+    mut handle_daemon_message: impl FnMut(DaemonMessage),
+    from_ui: mpsc::Receiver<ClientMessage>,
+    shutdown_rx: Option<mpsc::Receiver<()>>,
+) -> Result<(), ClientError> {
+    info!("serving in-process (embedded daemon) connection");
+
+    // Internal writer-shutdown channel — same shape as the socket modes: the
+    // reader signals it when it finishes, and the optional external
+    // shutdown signal fans into it too (cooperative stop for the writer
+    // only; see the function doc for why the reader cannot be force-closed).
+    let (writer_shutdown_tx, writer_shutdown_rx) = mpsc::channel::<()>();
+    const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    // Writer thread: drains `from_ui` into `daemon_tx` — the identical
+    // recv_timeout + shutdown-check loop the socket writer threads run; a
+    // crossbeam send of a value replaces the socket write, and a failed send
+    // (all daemon-side receivers dropped) is the broken-pipe analogue.
+    let writer_handle = thread::spawn(move || {
+        loop {
+            match from_ui.recv_timeout(SHUTDOWN_POLL_INTERVAL) {
+                Ok(msg) => {
+                    if daemon_tx.send(msg).is_err() {
+                        warn!("writer thread: daemon receiver gone (embedded connection closed)");
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Poll the shutdown signal periodically so we don't hang
+                    // indefinitely on recv() when the daemon disconnects.
+                    if writer_shutdown_rx.try_recv().is_ok() {
+                        break;
+                    }
+                }
+                // `from_ui` closed: the UI is done sending. Dropping
+                // `daemon_tx` (owned by this thread) is what delivers EOF to
+                // the daemon's embedded connection.
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    // Optional external shutdown: no socket exists to `Shutdown::Both`, so
+    // the signal only stops the WRITER (cooperative; documented above).
+    if let Some(shutdown_rx) = shutdown_rx {
+        // Clone the sender BEFORE the closure: the reader tail below keeps
+        // its own end to stop the writer when the loop ends.
+        let writer_tx = writer_shutdown_tx.clone();
+        thread::spawn(move || {
+            // A send failure here is benign: the reader finished first and
+            // dropped the writer-shutdown sender side.
+            let _ = shutdown_rx.recv().map(|_| writer_tx.send(()));
+        });
+    }
+
+    // Reader loop: the calling thread. Channel close = clean EOF, exactly the
+    // `Ok(())` the unix path returns on `UnexpectedEof`.
+    for message in daemon_rx {
+        handle_daemon_message(message);
+    }
+    info!("daemon reader loop ended normally (embedded daemon closed its channel)");
+
+    // Signal the writer to stop and wait for it (same tail as the unix path).
+    let _ = writer_shutdown_tx.send(());
+    let _ = writer_handle.join();
+    Ok(())
+}
+
 /// Connect to a daemon using the given connection mode.
 /// Dispatches to the appropriate connection function.
 pub fn run_daemon_connection_with_mode(
@@ -588,5 +725,253 @@ pub fn run_daemon_connection_with_mode(
         ConnectionMode::TcpPinned(addr) => {
             run_daemon_tcp_connection_pinned(&addr, handle_daemon_message, from_ui, shutdown_rx)
         }
+        ConnectionMode::InProcess {
+            daemon_tx,
+            daemon_rx,
+        } => run_daemon_connection_in_process(
+            daemon_tx,
+            daemon_rx,
+            handle_daemon_message,
+            from_ui,
+            shutdown_rx,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod in_process_tests {
+    use super::*;
+    use choreo_proto::SessionSummary;
+
+    /// Bare in-process link — two crossbeam channels, NO real daemon. The
+    /// fake-daemon threads below play the daemon side of an `EmbeddedLink`:
+    /// they receive forwarded `ClientMessage`s from `client_rx`, reply
+    /// through their `daemon_tx` end (the daemon→client channel), and
+    /// DROPPING that end is the EOF the reader observes — exactly how the
+    /// real embedded daemon signals disconnect.
+    fn make_link() -> (
+        ConnectionMode,
+        mpsc::Sender<ClientMessage>,
+        mpsc::Receiver<ClientMessage>,
+        crossbeam_channel::Receiver<ClientMessage>,
+        crossbeam_channel::Sender<DaemonMessage>,
+    ) {
+        let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let (from_ui_tx, from_ui_rx) = mpsc::channel::<ClientMessage>();
+        let mode = ConnectionMode::InProcess {
+            daemon_tx: client_tx,
+            daemon_rx,
+        };
+        (mode, from_ui_tx, from_ui_rx, client_rx, daemon_tx)
+    }
+
+    /// Run the connection on a dedicated thread (mirroring production: the
+    /// pump's READER is its calling thread) and return its result plus a
+    /// receiver of every `DaemonMessage` it handled, in order.
+    fn spawn_connection(
+        mode: ConnectionMode,
+        from_ui: mpsc::Receiver<ClientMessage>,
+        handle: impl FnMut(DaemonMessage) + Send + 'static,
+    ) -> thread::JoinHandle<(
+        Result<(), ClientError>,
+        crossbeam_channel::Receiver<DaemonMessage>,
+    )> {
+        // Bounded crossbeam channel between the handler closure and the test:
+        // join-driven, no sleeps anywhere. Capacity is generous enough that
+        // the reader never blocks on it before the daemon closes its end.
+        let (seen_tx, seen_rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        thread::spawn(move || {
+            let mut handle = handle;
+            let result = run_daemon_connection_with_mode(
+                mode,
+                |message| {
+                    let _ = seen_tx.send(message.clone());
+                    handle(message);
+                },
+                from_ui,
+                None,
+            );
+            (result, seen_rx)
+        })
+    }
+
+    /// One reply per request, in order: the fake daemon echoes a distinct
+    /// `DaemonMessage` per `ClientMessage` variant, then closes its channel
+    /// (EOF). The reader must receive every reply, in order, and end cleanly.
+    #[test]
+    fn in_process_replies_arrive_in_order_and_close_cleanly() {
+        let (mode, from_ui_tx, from_ui_rx, client_rx, daemon_tx) = make_link();
+        thread::spawn(move || {
+            for msg in client_rx {
+                let reply = match msg {
+                    ClientMessage::Ping => DaemonMessage::Pong,
+                    ClientMessage::ListModels => DaemonMessage::Models {
+                        models: vec!["m1".to_string()],
+                        selected_model: None,
+                    },
+                    ClientMessage::Lock => DaemonMessage::Locked,
+                    _ => continue,
+                };
+                if daemon_tx.send(reply).is_err() {
+                    break;
+                }
+            }
+            // Dropping `daemon_tx` (and the writer's client-side end) is the
+            // daemon-side EOF.
+        });
+
+        let requests = [
+            ClientMessage::Ping,
+            ClientMessage::ListModels,
+            ClientMessage::Lock,
+        ];
+        for request in &requests {
+            from_ui_tx.send(request.clone()).expect("from_ui open");
+        }
+        // Close `from_ui`: the writer drains everything, then exits, which
+        // closes the client→daemon channel and lets the daemon-side thread
+        // end and close the daemon→client channel.
+        drop(from_ui_tx);
+
+        let (result, seen_rx) = spawn_connection(mode, from_ui_rx, |_| {})
+            .join()
+            .expect("join");
+        result.expect("in-process connection must end cleanly on channel close");
+
+        // Every reply arrived, in order, before the clean EOF.
+        let replies: Vec<DaemonMessage> = seen_rx.into_iter().collect();
+        assert_eq!(
+            replies,
+            vec![
+                DaemonMessage::Pong,
+                DaemonMessage::Models {
+                    models: vec!["m1".to_string()],
+                    selected_model: None,
+                },
+                DaemonMessage::Locked,
+            ]
+        );
+    }
+
+    /// The writer forwards EVERY `from_ui` message — verified from the
+    /// daemon side: the fake daemon counts what it receives and reports the
+    /// sequence back as `Sessions` replies before closing.
+    #[test]
+    fn in_process_writer_forwards_every_message() {
+        let (mode, from_ui_tx, from_ui_rx, client_rx, daemon_tx) = make_link();
+        thread::spawn(move || {
+            let mut pings = 0usize;
+            for msg in client_rx {
+                if matches!(msg, ClientMessage::Ping) {
+                    pings += 1;
+                    let _ = daemon_tx.send(DaemonMessage::Sessions {
+                        sessions: vec![SessionSummary {
+                            session_id: pings as u64,
+                            title: None,
+                            selected_model: None,
+                            parent_session_id: None,
+                            working_dir: None,
+                            created_at: 0,
+                            last_modified: 0,
+                            turn_count: 0,
+                            status: choreo_proto::SessionStatus::Inactive,
+                            active_tool_groups: vec![],
+                            account_name: None,
+                            reasoning_effort: None,
+                            token_usage: None,
+                            context_window: None,
+                            last_prompt_tokens: None,
+                        }],
+                    });
+                }
+            }
+        });
+
+        // Multiple messages through the writer while it is alive.
+        for _ in 0..5 {
+            from_ui_tx.send(ClientMessage::Ping).expect("from_ui open");
+        }
+        drop(from_ui_tx);
+
+        let (result, seen_rx) = spawn_connection(mode, from_ui_rx, |_| {})
+            .join()
+            .expect("join");
+        result.expect("clean end after from_ui close");
+        let replies: Vec<u64> = seen_rx
+            .into_iter()
+            .map(|m| match m {
+                DaemonMessage::Sessions { sessions } => sessions[0].session_id,
+                other => panic!("unexpected message: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            vec![1, 2, 3, 4, 5],
+            "every forwarded Ping must be answered, in order"
+        );
+    }
+
+    /// Daemon-side close ends the connection cleanly even while the UI is
+    /// still open: the reader ends on `daemon_rx` exhaustion (the EOF), the
+    /// writer is stopped through the internal shutdown channel and joined.
+    #[test]
+    fn in_process_daemon_close_ends_connection_while_ui_open() {
+        let (mode, from_ui_tx, from_ui_rx, client_rx, daemon_tx) = make_link();
+        thread::spawn(move || {
+            // One advisory message, then the daemon drops its end: the
+            // channel-close EOF. `client_rx` is dropped un-received — the
+            // daemon may vanish while client messages are still in flight.
+            let _ = client_rx;
+            let _ = daemon_tx.send(DaemonMessage::ShuttingDown);
+            drop(daemon_tx);
+        });
+
+        // The UI sender stays OPEN for the whole test: the connection must
+        // still end because the daemon side is gone.
+        from_ui_tx.send(ClientMessage::Ping).expect("from_ui open");
+
+        let (result, seen_rx) = spawn_connection(mode, from_ui_rx, |_| {})
+            .join()
+            .expect("join");
+        result.expect("daemon-side close must be a clean EOF");
+        let replies: Vec<DaemonMessage> = seen_rx.into_iter().collect();
+        assert_eq!(replies, vec![DaemonMessage::ShuttingDown]);
+        // The pump must NOT have closed `from_ui` itself (it only ever
+        // drains it): a late send is delivered into the channel — it simply
+        // has no consumer. It must not panic or error.
+        let _ = from_ui_tx.send(ClientMessage::Ping);
+    }
+
+    /// The manual `Debug` impl must keep the derived shapes for the socket
+    /// variants (log/error messages rely on them) and render the embedded
+    /// link as an opaque placeholder.
+    #[test]
+    fn debug_output_matches_previous_derive_shapes() {
+        assert_eq!(
+            format!("{:?}", ConnectionMode::UnixSocket("/tmp/sock".to_string())),
+            r#"UnixSocket("/tmp/sock")"#
+        );
+        let mut pk = [0u8; 32];
+        pk[0] = 1;
+        pk[31] = 255;
+        assert_eq!(
+            format!(
+                "{:?}",
+                ConnectionMode::Tcp {
+                    addr: "127.0.0.1:9443".to_string(),
+                    server_pk: pk
+                }
+            ),
+            format!("Tcp {{ addr: \"127.0.0.1:9443\", server_pk: {:?} }}", pk)
+        );
+        assert_eq!(
+            format!("{:?}", ConnectionMode::TcpPinned("a:1".to_string())),
+            r#"TcpPinned("a:1")"#
+        );
+        let (mode, _from_ui_tx, _from_ui_rx, _client_rx, daemon_tx) = make_link();
+        assert_eq!(format!("{mode:?}"), "InProcess(<embedded link>)");
+        // The ends themselves are opaque and dropped with the mode.
+        drop(daemon_tx);
     }
 }

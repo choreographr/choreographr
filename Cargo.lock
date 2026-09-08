@@ -2829,6 +2829,7 @@ dependencies = [
  "choreo-proto",
  "choreo-sanitize",
  "choreo-transport",
+ "crossbeam-channel",
  "postcard",
  "rand 0.10.2",
  "serde",

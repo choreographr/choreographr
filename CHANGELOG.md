@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ConnectionMode::InProcess` (step 4 of the embedded-daemon refactor):
+  `choreo-client-core` gains an in-process connection mode carrying the raw
+  crossbeam channel ends of an embedded daemon's `EmbeddedLink` (as values —
+  client-core takes NO dependency on choreo-daemon). The pump mirrors the
+  Noise/TCP structure exactly: the calling thread drains `daemon_rx` into
+  `handle_daemon_message` (channel close = clean EOF, so the GUI's
+  `UiEvent::ReaderClosed` behaves identically), and a dedicated writer thread
+  forwards `from_ui` into `daemon_tx` (same `recv_timeout` + shutdown-flag
+  structure as the socket modes; closing `from_ui` delivers EOF to the
+  daemon's embedded connection). In-process shutdown is cooperative: the
+  external shutdown signal stops the writer only — the reader ends when the
+  embedded daemon closes its channel. `ConnectionMode` switched to a manual
+  `Debug` impl (channel ends are not `Debug`) that reproduces the derived
+  output for the socket variants and renders `InProcess(<embedded link>)`.
 - Embedded daemon transport (step 3 of the embedded-daemon refactor): the new
   `choreo_daemon::embedded` module spawns the daemon core in-process
   (`spawn_embedded`) and connects clients over plain channels — `ClientMessage`

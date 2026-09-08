@@ -170,6 +170,11 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         ConnectionMode::UnixSocket(path) => path.clone(),
         ConnectionMode::Tcp { addr, .. } => addr.clone(),
         ConnectionMode::TcpPinned(addr) => addr.clone(),
+        // In-process (embedded daemon): no dial address exists; key the
+        // keystore records against the unix socket path — the same LOCAL
+        // trust domain the daemon's embedded connection reports (`is_unix:
+        // true`), so per-daemon keys stay consistent.
+        ConnectionMode::InProcess { .. } => choreo_proto::socket_path(),
     };
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
     let (ui_tx, ui_rx) = channel::unbounded::<UiEvent>();
