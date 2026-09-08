@@ -83,4 +83,4 @@ blitz-shell = "0.2"
 # mobile daemon has no use for a desktop PDF parser anyway. Everything else
 # the embedded daemon needs (DB, accounts, catalog, tools, transport) is
 # unconditional.
-choreo-daemon = { workspace = true, default-features = false }
+choreo-daemon = { workspace = true }
