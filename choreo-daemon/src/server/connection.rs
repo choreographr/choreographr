@@ -601,6 +601,98 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
     Ok(())
 }
 
+/// Transport-agnostic per-connection protocol state machine.
+///
+/// Owns everything the read loop used to thread through per-message borrowed
+/// `ClientCtx` constructions: the daemon command channel, the delivery sink,
+/// the daemon-wide lag counter, the attachment state, and the writer thread's
+/// join handle (so `finish()` can run the bounded writer join). The two
+/// socket threads (Unix and TCP/Noise) differ only in HOW they read one
+/// message off the wire and classify transport errors; everything between
+/// message read and teardown lives here.
+struct ClientConn {
+    daemon_tx: mpsc::Sender<DaemonCommand>,
+    /// This connection's delivery sink (see `send_to_writer`).
+    writer: crate::broadcast::SubscriberSink,
+    /// Daemon-wide lag counter, shared by every connection; kept so replies
+    /// can increment it in balance with the writer thread's per-dequeue
+    /// decrement (see `send_to_writer`).
+    global_lag: Arc<AtomicUsize>,
+    client_id: u64,
+    /// Whether this connection arrived over the local Unix socket (vs the
+    /// TCP/Noise listener). Trust-boundary input for local-only commands
+    /// (see `ClientCtx::is_unix`).
+    is_unix: bool,
+    attached_session_id: Option<u64>,
+    attached_session_tx: Option<mpsc::Sender<SessionCommand>>,
+    /// Handle to the writer thread spawned in `new`; joined (with a bound) by
+    /// `finish()` via `cleanup_client`, exactly as the pre-refactor loops did.
+    writer_handle: std::thread::JoinHandle<()>,
+}
+
+impl ClientConn {
+    /// Build a connection and spawn its writer thread over the given
+    /// transport-specific writer buffer. Spawning here keeps the socket
+    /// threads to just: set write timeout, clone the stream into a writer
+    /// buffer, call this, then read/dispatch/finish.
+    fn new<W: ConnectionWriter + Send + 'static>(
+        daemon_tx: mpsc::Sender<DaemonCommand>,
+        writer: crate::broadcast::SubscriberSink,
+        writer_buf: W,
+        writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
+        global_lag: Arc<AtomicUsize>,
+        client_id: u64,
+        is_unix: bool,
+    ) -> Self {
+        // The writer thread decrements the SAME per-client byte counter the
+        // daemon's sinks increment on enqueue, plus the daemon-wide counter.
+        let bytes = Arc::clone(&writer.bytes_in_flight);
+        let global = Arc::clone(&global_lag);
+        let writer_handle =
+            std::thread::spawn(move || writer_thread(writer_buf, writer_rx, bytes, global));
+        Self {
+            daemon_tx,
+            writer,
+            global_lag,
+            client_id,
+            is_unix,
+            attached_session_id: None,
+            attached_session_tx: None,
+            writer_handle,
+        }
+    }
+
+    /// Dispatch one decoded client message through the shared handlers.
+    /// Constructs the borrowed `ClientCtx` view the handler functions expect.
+    /// Returns an error only when the daemon has disconnected (caller should
+    /// terminate the connection) — identical to the pre-refactor per-message
+    /// `ClientCtx` construction + `dispatch_client_message` call.
+    fn dispatch(&mut self, msg: ClientMessage) -> io::Result<()> {
+        let mut ctx = ClientCtx {
+            writer: &self.writer,
+            global_lag: &self.global_lag,
+            daemon_tx: &self.daemon_tx,
+            attached_session_id: &mut self.attached_session_id,
+            attached_session_tx: &mut self.attached_session_tx,
+            client_id: self.client_id,
+            is_unix: self.is_unix,
+        };
+        dispatch_client_message(msg, &mut ctx)
+    }
+
+    /// Tear the connection down: detach from any attached session, notify the
+    /// daemon, drop the sink, and join the writer thread with a bound.
+    fn finish(self) {
+        cleanup_client(
+            self.attached_session_tx,
+            self.client_id,
+            &self.daemon_tx,
+            self.writer,
+            self.writer_handle,
+        );
+    }
+}
+
 pub(crate) fn client_thread(
     stream: UnixStream,
     daemon_tx: mpsc::Sender<DaemonCommand>,
@@ -617,15 +709,10 @@ pub(crate) fn client_thread(
     let reader = BufReader::new(stream.try_clone()?);
     let writer_buf = BufWriter::new(stream);
 
-    // The writer thread decrements the SAME per-client byte counter the
-    // daemon's sinks increment on enqueue, plus the daemon-wide counter.
-    let bytes = Arc::clone(&writer.bytes_in_flight);
-    let global = Arc::clone(&global_lag);
-    let writer_handle =
-        std::thread::spawn(move || writer_thread(writer_buf, writer_rx, bytes, global));
+    let mut conn = ClientConn::new(
+        daemon_tx, writer, writer_buf, writer_rx, global_lag, client_id, true,
+    );
 
-    let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
-    let mut attached_session_id: Option<u64> = None;
     // The writer channel was registered with the daemon by the acceptor
     // (register_client_writer) before this thread was spawned, so the shutdown
     // path can route `ShuttingDown` through this single writer thread instead
@@ -637,16 +724,7 @@ pub(crate) fn client_thread(
     loop {
         match read_message::<_, ClientMessage>(&mut reader) {
             Ok(msg) => {
-                let mut ctx = ClientCtx {
-                    writer: &writer,
-                    global_lag: &global_lag,
-                    daemon_tx: &daemon_tx,
-                    attached_session_id: &mut attached_session_id,
-                    attached_session_tx: &mut attached_session_tx,
-                    client_id,
-                    is_unix: true,
-                };
-                if let Err(e) = dispatch_client_message(msg, &mut ctx) {
+                if let Err(e) = conn.dispatch(msg) {
                     debug!("daemon disconnected: {e}");
                     break;
                 }
@@ -667,13 +745,7 @@ pub(crate) fn client_thread(
         }
     }
 
-    cleanup_client(
-        attached_session_tx,
-        client_id,
-        &daemon_tx,
-        writer,
-        writer_handle,
-    );
+    conn.finish();
     Ok(())
 }
 
@@ -784,19 +856,15 @@ pub(crate) fn tcp_client_thread(
         .set_write_timeout(Some(WRITER_WRITE_TIMEOUT))?;
     let writer_buf = noise.try_clone()?;
 
-    let bytes = Arc::clone(&writer.bytes_in_flight);
-    let global = Arc::clone(&global_lag);
-    let writer_handle =
-        std::thread::spawn(move || writer_thread(writer_buf, writer_rx, bytes, global));
+    let mut conn = ClientConn::new(
+        daemon_tx, writer, writer_buf, writer_rx, global_lag, client_id, false,
+    );
 
-    let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
-    let mut attached_session_id: Option<u64> = None;
     // The writer channel was registered with the daemon by the acceptor
     // (register_client_writer) before this thread was spawned, so the shutdown
     // path can route `ShuttingDown` through this single writer thread (see
     // client_thread). The NoiseStream's TransportState lock is only safe to
     // take per-message because this is the sole sender.
-    let mut reader = noise;
     info!("TCP client connected: id={}", client_id);
     crate::metrics::record_client_connected();
 
@@ -806,19 +874,11 @@ pub(crate) fn tcp_client_thread(
     // dispatch_client_message). Previously every TCP connection was
     // auto-registered here, which pushed broadcasts about other clients'
     // sessions to clients that never asked.
+    let mut reader = noise;
     loop {
         match reader.recv_client_message() {
             Ok(msg) => {
-                let mut ctx = ClientCtx {
-                    writer: &writer,
-                    global_lag: &global_lag,
-                    daemon_tx: &daemon_tx,
-                    attached_session_id: &mut attached_session_id,
-                    attached_session_tx: &mut attached_session_tx,
-                    client_id,
-                    is_unix: false,
-                };
-                if let Err(e) = dispatch_client_message(msg, &mut ctx) {
+                if let Err(e) = conn.dispatch(msg) {
                     debug!("daemon disconnected: {e}");
                     break;
                 }
@@ -834,13 +894,7 @@ pub(crate) fn tcp_client_thread(
         }
     }
 
-    cleanup_client(
-        attached_session_tx,
-        client_id,
-        &daemon_tx,
-        writer,
-        writer_handle,
-    );
+    conn.finish();
     Ok(())
 }
 

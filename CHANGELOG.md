@@ -91,6 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Refactor(daemon): extracted the per-connection protocol state machine into
+  a transport-agnostic `ClientConn` (owns sink, lag counter, attachment
+  state, and writer-thread join handle with `dispatch`/`finish`); the Unix
+  and TCP/Noise read loops now differ only in transport read and error
+  classification. Behavior-preserving.
 - TUI status bar shows the attached session's account slug instead of the
   inference provider slug.
 - Protocol rework: `DaemonMessage` split into a `SessionEvent` bus behind a
