@@ -1,5 +1,6 @@
 use crate::daemon::{DaemonCommand, DaemonState};
-use crate::sessions::SessionCommand;
+use crate::server::core::{CoreOptions, start_daemon_core};
+
 use choreo_transport::key::TransportSecretKey;
 // The signal constants are consumed by the Unix iterator thread; the Windows
 // flag thread imports them locally (signal-hook's iterator module is unix-only).
@@ -194,7 +195,7 @@ fn handle_accept_error(e: io::Error) {
 
 pub fn run_server(
     socket_path: &str,
-    mut state: DaemonState,
+    state: DaemonState,
     metrics_addr: Option<String>,
     tcp_addr: Option<String>,
     transport_sk: TransportSecretKey,
@@ -220,85 +221,29 @@ pub fn run_server(
     })?;
     info!(%socket_path, "choreographr listening");
 
-    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
-    state.daemon_tx = daemon_tx.clone();
-
-    // Install the shared ACL into the state BEFORE the command loop takes
-    // ownership: the command loop becomes its single WRITER (AclReload),
-    // while the TCP accept path below keeps a clone for lock-free reads.
-    // One Arc, two roles — see the SharedAcl docs for the exception-#4
-    // rationale.
-    let acl_path = acl.path().to_path_buf();
-    state.acl = Some(acl.clone());
-
-    // Dedicated config watcher for the ACL file. It watches the ACL's OWN
-    // parent directory, not the general config dir: in production they are
-    // the same directory, but tests (and any future --acl-path override)
-    // place the ACL elsewhere — and the watcher must follow the file the
-    // SharedAcl actually holds, not where the catalog overlay happens to
-    // live. The basename subscription keeps unrelated files in that dir
-    // from triggering reloads.
-    if let Some(acl_dir) = acl_path.parent() {
-        let mut acl_watcher = crate::config_watch::ConfigWatcher::new(acl_dir.to_path_buf());
-        let acl_rx = acl_watcher.subscribe(
-            acl_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .as_deref()
-                .unwrap_or("authorized_clients.toml"),
-        );
-        acl_watcher.spawn();
-        crate::server::acl::spawn_acl_watcher(daemon_tx.clone(), acl_rx);
-    } else {
-        warn!(
-            path = %acl_path.display(),
-            "ACL path has no parent directory; ACL hot-reload disabled"
-        );
-    }
-
-    // Shared config-file watching transport: ONE notify watcher on the config
-    // directory, fanned out per-basename to consumers (the catalog overlay,
-    // accounts, and future files). Spawned before the consumers that react to
-    // its events. Degrades gracefully to no transport (and no auto-reload)
-    // when the config dir cannot be resolved.
-    let overlay_rx = match state.catalog_paths.overlay.parent().map(Path::to_path_buf) {
-        Some(config_dir) => {
-            let mut config_watcher = crate::config_watch::ConfigWatcher::new(config_dir);
-            // The catalog maintenance thread reacts to overlay edits; the
-            // accounts watcher reacts to accounts.toml edits. Each consumer
-            // owns its reload policy (see `handle_accounts_reload` and the
-            // maintenance loop's overlay arm).
-            let overlay_rx = config_watcher.subscribe(crate::catalog::USER_OVERLAY_NAME);
-            let accounts_rx = config_watcher.subscribe(crate::accounts::ACCOUNTS_TOML_NAME);
-            config_watcher.spawn();
-            crate::accounts::spawn_accounts_watcher(daemon_tx.clone(), accounts_rx);
-            overlay_rx
-        }
-        None => {
-            warn!("config directory not resolvable; config-file auto-reload disabled");
-            // A never-delivering receiver so the maintenance thread still runs
-            // (it just has no overlay events to react to).
-            crossbeam_channel::never()
-        }
-    };
-
-    // Spawn the ONE background catalog-maintenance thread (S4) before the
-    // command loop is moved into its own thread: it loads the cache, does the
-    // startup models.dev conditional GET, reacts to user-overlay edits from
-    // the config transport, and serves `/refresh-models` requests — all over
-    // channels, and never mutating the catalog itself (every change goes
-    // through `DaemonCommand::CatalogBaseChanged` back to the command loop,
-    // the single writer of the catalog ArcSwap). Spawned before the accept
-    // loop so the startup swap lands promptly.
-    let maintenance_tx = crate::catalog::spawn_catalog_maintenance(
-        daemon_tx.clone(),
-        state.db.clone(),
-        state.catalog_paths.clone(),
-        overlay_rx,
-    );
-    state.maintenance_tx = Some(maintenance_tx);
-
-    let shutdown = Arc::new(AtomicBool::new(false));
+    // Transport-independent assembly (command channel, ACL install +
+    // watcher, config watchers, catalog-maintenance thread, shutdown flag,
+    // connection counter, command-loop thread). The shipped binary always
+    // passes the ACL and enables the config watchers; the Option/flag exist
+    // for the future embedded daemon (see CoreOptions). Behavior is identical
+    // to the pre-split inline assembly — the moved code is verbatim.
+    let core = start_daemon_core(
+        state,
+        CoreOptions {
+            acl: Some(Arc::clone(&acl)),
+            config_watchers: true,
+        },
+    )?;
+    // Local clone of the core's command sender: the accept paths below clone
+    // per connection and the shutdown drain sends over this one, then drops
+    // it to close the command loop. `core.daemon_tx` itself stays in `core`.
+    let daemon_tx = core.daemon_tx.clone();
+    // Local clones of the core's shared state for the adapter code below,
+    // keeping the moved bodies verbatim (`shutdown`/`global_lag`/`conn_count`
+    // names as before the split).
+    let shutdown = Arc::clone(&core.shutdown);
+    let global_lag = Arc::clone(&core.global_lag);
+    let conn_count = Arc::clone(&core.conn_count);
 
     // Signal handler thread: sets the shutdown flag and connects to our own
     // socket to unblock the blocking accept() call on the main thread.
@@ -374,67 +319,8 @@ pub fn run_server(
         });
     }
 
-    // Clone the daemon-wide lag counter for the accept paths BEFORE `state`
-    // moves into the command-loop thread below: `register_client_writer`
-    // hands it to every connection's writer thread so dequeue-side accounting
-    // decrements the SAME counter the command loop and session threads
-    // increment on enqueue.
-    let global_lag = Arc::clone(&state.global_lag);
-
-    // Daemon command handler thread.
-    let cmd_handle = thread::spawn(move || {
-        loop {
-            match daemon_rx.recv() {
-                Ok(DaemonCommand::Shutdown) => {
-                    // Announce the stage: everything after this line is
-                    // teardown (session joins, MCP shutdown), and each stage
-                    // below logs its completion — the last line printed
-                    // under a wedged Ctrl+C identifies the culprit.
-                    info!("command loop: shutdown command received; beginning teardown");
-                    break;
-                }
-                Ok(cmd) => state.handle_command(cmd),
-                Err(mpsc::RecvError) => {
-                    info!("command loop: all daemon command senders dropped");
-                    break;
-                }
-            }
-        }
-        let active_sessions = std::mem::take(&mut state.active_sessions);
-        info!(
-            active_sessions = active_sessions.len(),
-            "command loop teardown: signalling session threads"
-        );
-        for entry in active_sessions.values() {
-            let _ = entry.cmd_tx.send(SessionCommand::Shutdown);
-        }
-        // Join each session thread with a bounded grace period: a request
-        // worker stuck in an LLM provider read (which a cancel cannot
-        // interrupt promptly) must not hang the daemon's shutdown.  The
-        // graceful path exits promptly because the worker responds to the
-        // cancel; only pathological cases hit the grace deadline.
-        //
-        // Join the session threads concurrently (bounded by
-        // SESSION_SHUTDOWN_GRACE per session) so N stuck sessions cost ~one
-        // grace period instead of N × grace.
-        let joiners: Vec<_> = active_sessions
-            .into_iter()
-            .map(|(session_id, entry)| {
-                std::thread::spawn(move || {
-                    crate::sessions::join_session_shutdown(entry.handle, session_id)
-                })
-            })
-            .collect();
-        for joiner in joiners {
-            let _ = joiner.join();
-        }
-        info!("command loop teardown: session threads drained");
-        // Shut down MCP servers after all sessions have exited.
-        // `shutdown_all` logs its begin/end; a wedge between those two lines
-        // means an MCP client lock is held by a stuck tool call.
-        state.mcp_manager.shutdown_all();
-        info!("command loop teardown: complete");
-    });
+    // (Cloned from the core above — see DaemonCore::global_lag for why the
+    // SAME counter must reach the accept paths.)
 
     // Initialize the metrics registry so that instrumented code throughout
     // the daemon can safely call record_* functions (they no-op when
@@ -462,10 +348,9 @@ pub fn run_server(
     let mut client_threads: Vec<thread::JoinHandle<()>> = Vec::new();
     let (tcp_client_tx, tcp_client_rx) = mpsc::channel::<thread::JoinHandle<()>>();
 
-    // Daemon-wide live-connection counter backing MAX_CONCURRENT_CONNECTIONS.
-    // Both accept paths take a slot per accepted connection, so the cap is
-    // enforced across the Unix main thread and the TCP accept thread.
-    let conn_count = Arc::new(AtomicUsize::new(0));
+    // Daemon-wide live-connection counter backing MAX_CONCURRENT_CONNECTIONS
+    // (created in start_daemon_core — see DaemonCore::conn_count for why it
+    // must exist before either accept path is spawned).
 
     // TCP listener for Noise IK clients. The `ShuttingDown` notification is
     // routed through the daemon's client_writers registry, exactly as on the
@@ -683,7 +568,7 @@ pub fn run_server(
     let _ = daemon_tx.send(DaemonCommand::BroadcastShuttingDown);
     let _ = daemon_tx.send(DaemonCommand::Shutdown);
     drop(daemon_tx);
-    cmd_handle.join().unwrap_or_else(|e| {
+    core.cmd_handle.join().unwrap_or_else(|e| {
         error!("command thread panicked: {e:?}");
     });
     info!("command loop thread joined");

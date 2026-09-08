@@ -91,6 +91,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Refactor(daemon): split `run_server` (step 2 of the embedded-daemon
+  refactor) into a transport-independent `start_daemon_core` in the new
+  `server/core.rs` (command channel, ACL install + watcher, config watchers,
+  catalog-maintenance thread, shutdown flag, live-connection counter,
+  command-loop thread, returned as a `DaemonCore` bundle) plus the transport
+  adapters (bind, signal threads, metrics, accept loops, shutdown drain)
+  which stay in `server/lifecycle.rs` over `&DaemonCore`. `CoreOptions`
+  plumbs `acl: Option<_>` and `config_watchers: bool` for the future
+  embedded daemon; the shipped binary passes `Some(acl)` / `true`, so
+  behavior is unchanged.
 - Refactor(daemon): extracted the per-connection protocol state machine into
   a transport-agnostic `ClientConn` (owns sink, lag counter, attachment
   state, and writer-thread join handle with `dispatch`/`finish`); the Unix
