@@ -81,8 +81,16 @@ pub struct EmbeddedDaemon {
     /// accept thread in `lifecycle.rs`): the accept path here is `connect()`
     /// itself, spawning on the CALLER's thread, so handles are sent over the
     /// channel and drained by `shutdown()`.
-    handle_tx: mpsc::Sender<thread::JoinHandle<()>>,
-    handle_rx: Option<mpsc::Receiver<thread::JoinHandle<()>>>,
+    ///
+    /// crossbeam per the workspace's channel-selection convention (this is
+    /// new code in choreo-daemon): the cloneable Sender matters here — every
+    /// `connect()` clones its own sender — and the Receiver's Sync keeps the
+    /// whole struct `Sync`-shareable for embedders that stash the handle in a
+    /// static. The `daemon_tx` field stays std `mpsc` because it mirrors the
+    /// pre-existing `DaemonState::daemon_tx` field type (converted
+    /// opportunistically only, per the convention).
+    handle_tx: crossbeam_channel::Sender<thread::JoinHandle<()>>,
+    handle_rx: Option<crossbeam_channel::Receiver<thread::JoinHandle<()>>>,
     /// Set by `shutdown()` so `Drop` can tell "clean drain" from the
     /// documented defect (drop without shutdown).
     shut_down: bool,
@@ -114,7 +122,9 @@ pub fn spawn_embedded(state: DaemonState, _opts: EmbeddedOptions) -> io::Result<
     // JoinHandle ferry: connect() sends each connection thread's handle here;
     // shutdown() drains and bounded-joins them (same pattern as the TCP
     // accept thread's `tcp_client_tx`/`tcp_client_rx` in lifecycle.rs).
-    let (handle_tx, handle_rx) = mpsc::channel();
+    // Unbounded crossbeam: the ferry is a bookkeeping queue whose depth is
+    // bounded by the live-connection cap anyway; nothing to backpressure.
+    let (handle_tx, handle_rx) = crossbeam_channel::unbounded();
     info!("embedded daemon core started");
     Ok(EmbeddedDaemon {
         core: Some(core),
@@ -200,10 +210,7 @@ impl EmbeddedDaemon {
         });
         // Ferry the handle for the shutdown drain (same pattern as the TCP
         // accept thread). A send to a live `handle_tx` cannot fail while the
-        // struct is alive: a sender clone is held for its lifetime. The
-        // clone is taken BEFORE the closure so the closure captures only the
-        // Sender (a Receiver is not Sync and cannot be shared into the
-        // spawn's `&self` reference).
+        // struct is alive: a sender clone is held for its lifetime.
         let handle_tx = self.handle_tx.clone();
         let _ = handle_tx.send(handle);
         Ok(EmbeddedLink {

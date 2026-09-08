@@ -646,7 +646,12 @@ fn run_daemon_connection_in_process(
     // reader signals it when it finishes, and the optional external
     // shutdown signal fans into it too (cooperative stop for the writer
     // only; see the function doc for why the reader cannot be force-closed).
-    let (writer_shutdown_tx, writer_shutdown_rx) = mpsc::channel::<()>();
+    // crossbeam per the workspace's channel-selection convention (this is
+    // new code in choreo-client-core): a one-shot flag channel needs no
+    // payload or backpressure, but new channels default to crossbeam here.
+    // The `from_ui` parameter itself stays std `mpsc`: its type is the
+    // pre-existing public signature shared with the socket modes.
+    let (writer_shutdown_tx, writer_shutdown_rx) = crossbeam_channel::bounded::<()>(0);
     const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
     // Writer thread: drains `from_ui` into `daemon_tx` — the identical
@@ -665,8 +670,12 @@ fn run_daemon_connection_in_process(
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Poll the shutdown signal periodically so we don't hang
                     // indefinitely on recv() when the daemon disconnects.
-                    if writer_shutdown_rx.try_recv().is_ok() {
-                        break;
+                    // `try_recv` on a zero-capacity channel is the rendezvous-
+                    // free obvious check; a success (the reader's send landed)
+                    // means stop. `Empty` is the normal in-service case.
+                    match writer_shutdown_rx.try_recv() {
+                        Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                        Err(crossbeam_channel::TryRecvError::Empty) => {}
                     }
                 }
                 // `from_ui` closed: the UI is done sending. Dropping

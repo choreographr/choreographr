@@ -220,8 +220,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`/unlock` uses it; `/unlock <key>` records it); rejected-unlock-key
   revert semantics replaced by survivor semantics.
 
+### Added
+
+- Review follow-ups for the embedded-daemon series: (1) the CI `ios aarch64`
+  release job now installs zig like the other jobs (zlob, via choreo-daemon,
+  compiles its Zig source with `zig cc` in build.rs on every host — the job
+  previously only claimed to, commit 40fada9 changed a comment); (2) the
+  cc/cxx shim generators duplicated byte-identically in `build-ios.sh` and
+  `check-ios.sh` are extracted to the shared `scripts/lib/ios-cc-shims.sh`
+  (one generator so they cannot drift; generated files are stamped with the
+  current generator's name), with the CLI executor line emitted via `printf`
+  so the runtime arg-forwarding expression cannot be corrupted by heredoc
+  escaping (the generated shims are byte-identical to the previous output);
+  (3) a consumer notice on the workspace `choreo-daemon` dependency:
+  `default-features = false` lives there, so a NEW consumer must re-enable
+  `features = ["pdf"]` or it silently gets a PDF-less daemon.
+
 ### Fixed
 
+- Embedded daemon teardown leaks on the embedder side: the GUI's
+  `EMBEDDED_DAEMON` static is now `Mutex<Option<EmbeddedDaemon>>` instead of
+  a `OnceLock<Mutex<…>>`, so a (never-expected but reachable) double-startup
+  drains the stale daemon through its ordered `shutdown()` instead of
+  leaking both daemons detached; and a `connect()` failure after
+  `spawn_embedded` succeeded now runs the ordered drain instead of dropping
+  the running core detached (no `ShuttingDown` broadcast, no bounded joins).
+- Channel-selection convention applied to the new code of the same series:
+  `EmbeddedDaemon`'s JoinHandle ferry and the in-process pump's internal
+  writer-shutdown channel now use `crossbeam_channel` (the
+  `DaemonState::daemon_tx` field and the pre-existing `from_ui` public
+  signature stay std `mpsc`, converted opportunistically only).
 - Release workflow: the manifest rejected `choreo-gui`'s `choreo-daemon = { workspace = true, default-features = false }` on stable cargo (a workspace member cannot override `default-features` of an inherited dependency; nightly cargo tolerates it, which is why local builds passed). `default-features = false` now lives on the workspace dependency definition itself, and the root package explicitly re-enables the default `pdf` feature (`choreo-daemon = { workspace = true, features = ["pdf"] }`); choreo-gui inherits the feature-less default, keeping the iOS build C-dylib-free.
 - iOS bootstrap launch ordering (resolves the PHASE 0B event-loop-handshake
   caveat): the Xcode host bootstrap no longer calls `UIApplicationMain` from

@@ -134,6 +134,9 @@ impl DaemonState {
             // Placeholder command channel: `start_daemon_core` overwrites
             // `daemon_tx` with the real command-loop channel before any
             // consumer exists, so the dropped receiver here never matters.
+            // std `mpsc` deliberately: this must match the pre-existing
+            // `DaemonState::daemon_tx` field type (the convention converts
+            // existing std channels opportunistically only).
             daemon_tx: mpsc::channel().0,
             // Derive the next session ID from the highest existing record so a
             // fresh daemon never collides with a persisted session.

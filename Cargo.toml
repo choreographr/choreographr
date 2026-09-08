@@ -280,6 +280,14 @@ rpath = false
 [workspace.dependencies]
 # Promoted now that choreo-gui consumes it too (iOS-only, target-gated there):
 # per AGENTS.md, a crate used by two members lives here.
+#
+# CONSUMER NOTICE — default-features = false lives HERE (stable cargo rejects
+# a member overriding an inherited dep's default-features), which means every
+# NEW consumer inherits a PDF-less daemon unless it re-enables the feature.
+# Only the iOS GUI build wants that (pdf-inspector cannot link for the Apple
+# target on the Linux validation shim); any OTHER consumer should add
+# `features = ["pdf"]` like the root package does, or its daemon silently
+# lacks the native PDF tools (pdf_classify / pdf_to_markdown).
 choreo-daemon = { path = "choreo-daemon", version = "0.1", default-features = false }
 anyhow = "1"
 thiserror = "2"

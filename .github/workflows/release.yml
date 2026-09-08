@@ -495,6 +495,14 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim
 
+      - uses: mlugg/setup-zig@v2
+        # The macOS aarch64 job above documents the same need: zlob (via
+        # choreo-daemon) compiles its Zig source with `zig cc` in build.rs on
+        # EVERY host — and since choreo-daemon entered the iOS build (step 5
+        # of the embedded-daemon refactor), that includes THIS job. The shims
+        # are never installed here (xcrun is present on macos-latest), so the
+        # bare `zig` invocation must resolve from PATH itself.
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Compile check (both targets, rlib only)

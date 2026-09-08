@@ -52,21 +52,28 @@ const IOS_DEFAULT_TCP_ADDR: &str = "127.0.0.1:9443";
 
 /// The kept-alive embedded daemon (iOS only).
 ///
-/// Why a static `OnceLock` and not a Drop'd owner: the Dioxus Native lifecycle
-/// has no daemon-shutdown hook — the event loop runs until the process dies,
-/// so there is no natural point to call `choreo_daemon::EmbeddedDaemon::shutdown`
-/// (which consumes `self`) and no graceful-drain window to await anyway.
-/// Deliberately: shutdown happens at process teardown; the `Drop` warn in
-/// `choreo_daemon::embedded` ("dropped without shutdown") is EXPECTED there and
-/// harmless — iOS reaps the whole process. No polling and no background
-/// shutdown thread is added for this.
+/// Why a process-lifetime static and not a Drop'd owner: the Dioxus Native
+/// lifecycle has no daemon-shutdown hook — the event loop runs until the
+/// process dies, so there is no natural point to call
+/// `choreo_daemon::EmbeddedDaemon::shutdown` (which consumes `self`) and no
+/// graceful-drain window to await anyway. Deliberately: shutdown happens at
+/// process teardown; the `Drop` warn in `choreo_daemon::embedded` ("dropped
+/// without shutdown") is EXPECTED there and harmless — iOS reaps the whole
+/// process. No polling and no background shutdown thread is added for this.
 ///
-/// Why the `Mutex`: `EmbeddedDaemon` is `Send` but not `Sync` (it holds an
-/// `mpsc::Receiver` JoinHandle ferry), and a `static OnceLock<T>` requires
-/// `T: Sync`. The mutex is never contended — the value is written once at
-/// startup and only the process reaper ever touches it again.
+/// Why a `Mutex<Option<_>>` and not a `OnceLock`: the underlying
+/// `EmbeddedDaemon` is now `Sync` (its JoinHandle ferry is a crossbeam
+/// channel, whose ends are `Sync`), but the OPTION is the point: on the
+/// (never-expected, but reachable) double-startup path, a `OnceLock` would
+/// have to DROP the freshly-spawned daemon detached — the Drop warn's
+/// "core left detached" defect, with the stale daemon ALSO left immortal.
+/// With `Mutex<Option<_>>` the double-startup path can instead do the
+/// RIGHT thing: `shutdown()` the stale daemon (ordered drain: ShuttingDown
+/// broadcast, command-loop join, bounded connection-thread joins) and store
+/// the new one whose link the session is about to use.
 #[cfg(target_os = "ios")]
-static EMBEDDED_DAEMON: OnceLock<std::sync::Mutex<choreo_daemon::EmbeddedDaemon>> = OnceLock::new();
+static EMBEDDED_DAEMON: std::sync::Mutex<Option<choreo_daemon::EmbeddedDaemon>> =
+    std::sync::Mutex::new(None);
 
 /// Build the embedded-daemon `ConnectionMode::InProcess` (iOS only).
 ///
@@ -130,18 +137,36 @@ fn embedded_connection_mode() -> Option<ConnectionMode> {
         Err(e) => {
             tracing::error!(error = %e, "embedded daemon: connect failed; \
                 falling back to TcpPinned remote daemon");
+            // The core is already RUNNING behind this handle (spawn_embedded
+            // returned Ok). Dropping it detached would be the Drop-warn defect
+            // (no ShuttingDown broadcast, no bounded joins); run the ordered
+            // drain instead — there are no connections to wait out yet, so
+            // this is prompt (command-loop join + empty drain), and the
+            // fallback TcpPinned mode starts from a fully stopped process.
+            daemon.shutdown();
             return None;
         }
     };
     // Keep the daemon handle alive for the whole process (see EMBEDDED_DAEMON:
     // no graceful-shutdown hook exists — teardown is process death).
-    if EMBEDDED_DAEMON.set(std::sync::Mutex::new(daemon)).is_err() {
-        // Unreachable in practice: embedded_connection_mode runs once from
-        // main() before the event loop. set() failing means a daemon already
-        // exists, which would mean double-startup — log and still wire the
-        // (already-returned) link so the session proceeds.
-        tracing::warn!("embedded daemon: EMBEDDED_DAEMON already set; using the new link anyway");
+    // Poisoned-mutex fallback per the workspace's error-handling rules (this
+    // runs on the single startup thread, so poisoning cannot arise in
+    // practice — but never unwrap in production code).
+    let mut guard = EMBEDDED_DAEMON.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(stale) = guard.take() {
+        // Double-startup (never expected: embedded_connection_mode runs once
+        // from main() before the event loop, but reachable in principle). The
+        // session is about to use the NEW link, so the NEW daemon must be the
+        // one that keeps running: drain the stale one through its ordered
+        // shutdown, and store the new one. A OnceLock could not do this — it
+        // would leak BOTH daemons (see the static's doc).
+        tracing::warn!(
+            "embedded daemon: EMBEDDED_DAEMON already held a daemon; draining the stale one"
+        );
+        stale.shutdown();
     }
+    *guard = Some(daemon);
+    drop(guard);
     tracing::info!("embedded daemon: in-process connection established");
     Some(ConnectionMode::InProcess {
         daemon_tx: link.client_tx,
