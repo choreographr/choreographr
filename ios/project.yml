@@ -16,9 +16,11 @@
 # object formats are INCOMPATIBLE (ld64: "built for 'iOS', but building for
 # 'iOS-simulator'"), hence the $(PLATFORM_NAME) stage split.
 #
-# PHASE 0B: the link is CI-verified (ios-build job); runtime boot still
-# needs a Mac/device — expect iteration on the event-loop wiring
-# (winit/blitz-shell iOS handshake, see ios/main.m) if launch misbehaves.
+# The host bootstrap (main.m) no longer calls UIApplicationMain: winit 0.30's
+# EventLoop::run_app does that itself and asserts sharedApplication is still
+# nil, so main.m just hands control to the Rust staticlib (see the header
+# comment in main.m for the full rationale). The link is CI-verified
+# (ios-build job); runtime boot still needs a Mac/device.
 
 name: Choreographr
 options:

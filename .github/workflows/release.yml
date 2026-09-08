@@ -542,12 +542,12 @@ jobs:
           echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
 
       - name: "Smoke: boot the app in the simulator"
-        # Phase 0b runtime check — the LAST unverified link in the iOS chain:
-        # whether main.m's UIApplication → didFinishLaunching →
-        # choreo_gui_ios_main → dioxus::launch → winit's iOS event-loop wiring
-        # actually boots (blitz-shell 0.2 has no set_ios_app slot like
-        # set_android_app, so this wiring is a design assumption, not a
-        # verified fact).
+        # Runtime check on the launch-ordering fix: main.m hands control
+        # straight to choreo_gui_ios_main, and winit's EventLoop::run_app
+        # calls UIApplicationMain itself (asserting sharedApplication is
+        # still nil — so any bootstrap that starts UIApplication first dies
+        # at launch). This job verifies the fixed wiring actually boots and
+        # stays alive.
         #
         # PASS criterion for the stub is deliberately LOW BAR: the process is
         # ALIVE after 30s. Expected behavior: the app dials TcpPinned

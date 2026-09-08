@@ -116,6 +116,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- iOS bootstrap launch ordering (resolves the PHASE 0B event-loop-handshake
+  caveat): the Xcode host bootstrap no longer calls `UIApplicationMain` from
+  a custom `UIApplicationDelegate` — winit 0.30's `EventLoop::run_app` calls
+  `UIApplicationMain` itself and asserts `sharedApplication` is still nil, so
+  the old ordering (Rust event loop started from
+  `application:didFinishLaunchingWithOptions:`) would have died at launch.
+  `ios/main.m` now hands control straight to the `choreo_gui_ios_main`
+  trampoline; contract documented in `main.m` and `choreo-gui/src/lib.rs`.
 - Retry: hand-built configs hardened, validation gap closed, retry budget
   bounded against pathological configurations.
 - Empty assistant messages are never shipped after a model switch

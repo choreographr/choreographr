@@ -150,26 +150,26 @@ fn android_main(app: android_activity::AndroidApp) {
 // ── iOS entry glue ───────────────────────────────────────────────────────────
 //
 // WHY THIS EXISTS: unlike Android, iOS does not call a C symbol directly —
-// the UIApplication runtime starts from `main()` in the Xcode project's host
-// bootstrap (see ios/main.m in the scaffold produced by scripts/build-ios.sh),
-// which is responsible for starting the UIKit application and handing control
-// to winit's iOS event loop before it calls into this crate. This trampoline
-// is the crate-side half of that contract: a C-callable no_mangle entry the
-// bootstrap invokes once the UIKit application is up, which then runs the
-// exact same `main()` the desktop and Android builds use (the `native`
-// renderer serves desktop, Android and iOS with one code path — there is
-// deliberately no per-platform UI entry here). The connection story differs:
-// the iOS sandbox has no usable Unix-socket daemon path, so `main()` resolves
-// to the TcpPinned mode (see default_connection_mode) without any branching
+// winit 0.30's iOS backend owns the UIKit launch: its `EventLoop::run_app`
+// calls UIApplicationMain itself (with None for both the application class
+// and the delegate, so no ObjC bootstrap delegate is needed) and asserts
+// that UIApplication::sharedApplication is still nil when it does. The host
+// bootstrap (ios/main.m) therefore just calls this trampoline from main();
+// it must NEVER call UIApplicationMain first, or the assert below fires and
+// the app dies at launch. This trampoline is the crate-side half of that
+// contract: a C-callable no_mangle entry that runs the exact same `main()`
+// the desktop and Android builds use (the `native` renderer serves desktop,
+// Android and iOS with one code path — there is deliberately no
+// per-platform UI entry here). The connection story differs: the iOS
+// sandbox has no usable Unix-socket daemon path, so `main()` resolves to
+// the TcpPinned mode (see default_connection_mode) without any branching
 // beyond the cfg there.
 //
-// PHASE 0B CAVEAT (must be verified on a Mac, not on the Linux check laptop):
-// whether blitz-shell needs an explicit iOS app-handle slot the way
-// `set_android_app` exists for Android is unconfirmed — blitz-shell 0.2 has
-// no documented `set_ios_app`, and winit's iOS backend may require the event
-// loop to be constructed inside `applicationDidFinishLaunching`. The host
-// bootstrap and this trampoline are the places to adjust if so; everything
-// else in the crate is unchanged.
+// The event loop is constructed on the main thread (main.m calls us from
+// main(), satisfying winit's MainThreadMarker requirement), and blitz-shell
+// creates the app's window from ApplicationHandler::resumed — the point
+// winit's docs require window creation to happen at, after UIApplicationMain
+// has done the UIKit init all UI code needs (rust-windowing/winit#1705).
 #[cfg(target_os = "ios")]
 #[unsafe(no_mangle)] // edition 2024: no_mangle is an unsafe attribute
 pub extern "C" fn choreo_gui_ios_main() {

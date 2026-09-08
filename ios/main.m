@@ -1,52 +1,37 @@
 /*
  * iOS host bootstrap for the Choreographr GUI.
  *
- * iOS applications do not call a Rust/C symbol directly the way Android's
- * `android_main` does: the UIApplication runtime starts from this `main()`,
- * and winit's iOS backend requires the event loop to be constructed on the
- * main thread once UIKit is running. This bootstrap therefore:
+ * OWNERSHIP OF LAUNCH (the PHASE 0B fix): winit 0.30's iOS event loop
+ * *itself* calls UIApplicationMain from EventLoop::run_app, and it asserts
+ * at that point that UIApplication::sharedApplication is still nil
+ * ("`EventLoop` cannot be `run` after a call to `UIApplicationMain` on
+ * iOS"). It deliberately passes None for both the application class and the
+ * delegate, so that the embedder can supply a custom delegate via Info.plist
+ * if ever needed — no delegate is required for a plain app.
  *
- *   1. registers the Rust staticlib's `choreo_gui_ios_main` trampoline
- *      (choreo-gui/src/lib.rs) to be invoked from the application delegate's
- *      `application:didFinishLaunchingWithOptions:`,
- *   2. calls `UIApplicationMain` to start the UIKit run loop.
- *
- * PHASE 0B CAVEAT: the exact
- * handshake between the delegate and winit's iOS event loop must be verified
- * on a Mac with Xcode (blitz-shell 0.2 has no documented `set_ios_app` slot,
- * unlike its `set_android_app`); this file is deliberately kept minimal so
- * the fix lands in one place if the wiring differs.
+ * That means this bootstrap must NOT call UIApplicationMain (the previous
+ * PHASE 0B design did, from a custom UIApplicationDelegate, and the Rust
+ * event loop launched inside application:didFinishLaunchingWithOptions:
+ * would hit winit's sharedApplication assert and die at launch). Instead
+ * `main()` simply hands control to the Rust staticlib immediately: the
+ * Dioxus Native / blitz-shell stack creates the winit event loop on the
+ * main thread and run_app starts UIApplicationMain itself. All UI-relevant
+ * UIKit init (winit issue #1705) has happened by the time the app's windows
+ * are created — blitz-shell does that from ApplicationHandler::resumed,
+ * which is the point the docs require window creation to happen at.
  *
  * The staticlib is produced by scripts/build-ios.sh from the workspace rlib;
  * link it into this app target via the Xcode project (project.yml).
  */
 
-#import <UIKit/UIKit.h>
-
 /* Provided by the Rust staticlib (choreo-gui, cfg(target_os = "ios")). */
 extern void choreo_gui_ios_main(void);
 
-@interface ChoreographrAppDelegate : UIResponder <UIApplicationDelegate>
-@end
-
-@implementation ChoreographrAppDelegate
-
-- (BOOL)application:(UIApplication *)application
-    didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    (void)application;
-    (void)launchOptions;
-    /* Hand control to the Dioxus Native app. If winit's iOS backend requires
-     * the event loop to be created synchronously inside this callback (the
-     * phase 0b open question), this is the line to adjust. */
-    choreo_gui_ios_main();
-    return YES;
-}
-
-@end
-
 int main(int argc, char *argv[]) {
-    @autoreleasepool {
-        return UIApplicationMain(argc, argv, nil,
-                                 NSStringFromClass([ChoreographrAppDelegate class]));
-    }
+    /* argc/argv are forwarded implicitly: winit's EventLoop::run pulls them
+     * from _NSGetArgc/_NSGetArgv when it calls UIApplicationMain. */
+    (void)argc;
+    (void)argv;
+    choreo_gui_ios_main();
+    return 0;
 }
