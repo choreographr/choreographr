@@ -101,16 +101,29 @@ tempfile.workspace = true
 postcard.workspace = true
 rmp-serde.workspace = true
 structured-zstd.workspace = true
-# Native PDF parsing (pdf_classify / pdf_to_markdown) — a plain, unconditional
-# registry dependency. No security pin or feature gate: the old pin/fork existed
-# because upstream 0.1.x shipped lopdf ^0.41.0, vulnerable to RUSTSEC-2026-0187
-# (a ~21 KB crafted PDF with ~10,000-deep nested objects aborts the process via
-# stack overflow, a SIGABRT `catch_unwind` cannot intercept). 1.15.0 ships
-# lopdf >= 0.42 (MAX_NESTING_DEPTH), so the documented revert path was applied:
-# the `[patch.crates-io]` redirect and the `pdf` feature were removed.
-pdf-inspector = "1"
+# Native PDF parsing (pdf_classify / pdf_to_markdown). Behind the `pdf`
+# feature, which is in `default` so every desktop consumer keeps the tools
+# unchanged. The iOS embedded-daemon build opts OUT (`default-features =
+# false` in choreo-gui): pdf-inspector's build script links a C dylib for
+# the Apple target, which the Linux compile-validation shim path (zig, no
+# Apple SDK stub dylibs such as iconv) cannot perform, and a mobile daemon
+# has no use for a desktop PDF parser anyway. See the RUSTSEC note below:
+# pdf-inspector 1.15.0 ships lopdf >= 0.42 (MAX_NESTING_DEPTH), fixing
+# RUSTSEC-2026-0187 (a ~21 KB crafted PDF with ~10,000-deep nested objects
+# aborts the process via stack overflow, a SIGABRT `catch_unwind` cannot
+# intercept). The old `[patch.crates-io]` redirect stays removed.
+pdf-inspector = { version = "1", optional = true }
 
 [features]
+# Default features: the `pdf` tool group. Consumers that cannot use the
+# C-dylib-building pdf-inspector (the iOS GUI build) opt out via
+# `default-features = false`.
+default = ["pdf"]
+# Native PDF tools (pdf_classify / pdf_to_markdown). Off only for the iOS
+# embedded-daemon build (see the pdf-inspector comment above); the module's
+# registration is feature-gated in tools/mod.rs and its public re-exports
+# in lib.rs compile to nothing when disabled.
+pdf = ["dep:pdf-inspector"]
 # Prometheus/OpenMetrics instrumentation and the `/metrics` HTTP server
 # (src/metrics.rs). Off by default: a plain build compiles it out entirely
 # (no prometheus/tiny_http dependencies), and release binaries opt in via

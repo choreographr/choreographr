@@ -18,29 +18,160 @@ use std::sync::OnceLock;
 /// Global connection mode, set once at startup from CLI args.
 static CONNECTION_MODE: OnceLock<ConnectionMode> = OnceLock::new();
 
-/// Default TCP/Noise-IK daemon address for platforms without a usable Unix
-/// socket (iOS only today; the Android build keeps the Unix-socket default
-/// because Termux exposes one). `TcpPinned` resolves the server key from
-/// `known_servers.toml` at connect time, so the pin lives in the app's own
-/// config dir (the iOS sandbox) and no `~/.config/.../transport.pub` file —
-/// which the sandbox cannot read — is needed. The same-address pin can be
-/// established by any choreographr client on the same host (TUI first-use
-/// flow); until then the connect fails loudly with the re-pair guidance.
+/// Default TCP/Noise-IK daemon address for iOS's DEGRADED fallback mode: the
+/// remote daemon the embedded daemon degrades to when in-process construction
+/// fails (see `embedded_connection_mode`). The Android build keeps the
+/// Unix-socket default because Termux exposes one. `TcpPinned` resolves the
+/// server key from `known_servers.toml` at connect time, so the pin lives in
+/// the app's own config dir (the iOS sandbox) and no
+/// `~/.config/.../transport.pub` file — which the sandbox cannot read — is
+/// needed. The same-address pin can be established by any choreographr client
+/// on the same host (TUI first-use flow); until then the connect fails loudly
+/// with the re-pair guidance.
+// Desktop/Android never reference the fallback constant (only the iOS body of
+// `default_connection_mode` does), so silence the dead_code warning there —
+// the constant is deliberately shared, not cfg-duplicated.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
 const IOS_DEFAULT_TCP_ADDR: &str = "127.0.0.1:9443";
+
+// ── iOS embedded daemon ────────────────────────────────────────────────────
+//
+// On iOS (and ONLY iOS — see the `cfg` below; the desktop and Android builds
+// never compile or link any of this) the GUI runs the daemon in-process:
+// `DaemonState::open` with the sandbox-safe `choreo_daemon::ToolPolicy::Mobile`
+// (no shell/exec/RISC-V tools, no MCP subprocess spawning) feeds
+// `choreo_daemon::spawn_embedded`, whose `EmbeddedLink` ends become the
+// `ConnectionMode::InProcess` channel pair. Messages travel as values — no
+// codec, no socket — and the same `ClientConn` state machine serves the
+// connection that the Unix/TCP transports use.
+//
+// The construction is fallible (DB open, catalog paths): every failure is
+// logged and degrades to the previous `TcpPinned` remote-daemon mode, which
+// remains the fallback path. No `unwrap`/`expect`/`panic` anywhere — the GUI
+// must launch even when the embedded daemon cannot.
+
+/// The kept-alive embedded daemon (iOS only).
+///
+/// Why a static `OnceLock` and not a Drop'd owner: the Dioxus Native lifecycle
+/// has no daemon-shutdown hook — the event loop runs until the process dies,
+/// so there is no natural point to call `choreo_daemon::EmbeddedDaemon::shutdown`
+/// (which consumes `self`) and no graceful-drain window to await anyway.
+/// Deliberately: shutdown happens at process teardown; the `Drop` warn in
+/// `choreo_daemon::embedded` ("dropped without shutdown") is EXPECTED there and
+/// harmless — iOS reaps the whole process. No polling and no background
+/// shutdown thread is added for this.
+///
+/// Why the `Mutex`: `EmbeddedDaemon` is `Send` but not `Sync` (it holds an
+/// `mpsc::Receiver` JoinHandle ferry), and a `static OnceLock<T>` requires
+/// `T: Sync`. The mutex is never contended — the value is written once at
+/// startup and only the process reaper ever touches it again.
+#[cfg(target_os = "ios")]
+static EMBEDDED_DAEMON: OnceLock<std::sync::Mutex<choreo_daemon::EmbeddedDaemon>> = OnceLock::new();
+
+/// Build the embedded-daemon `ConnectionMode::InProcess` (iOS only).
+///
+/// Returns `None` (after logging) on any construction failure; the caller
+/// falls back to `IOS_DEFAULT_TCP_ADDR`'s `TcpPinned` remote-daemon mode so
+/// the app still launches.
+#[cfg(target_os = "ios")]
+fn embedded_connection_mode() -> Option<ConnectionMode> {
+    // Standard path resolvers (db/accounts/catalog), same convention the CLI
+    // daemon uses: `dirs` resolves inside the iOS app sandbox (app-container
+    // HOME), so the embedded daemon's database lives entirely in the app's
+    // own storage — never the shared `~/.config/choreographr` the socket
+    // daemon uses (which the sandbox cannot see).
+    let db_path = match choreo_daemon::db::db_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "embedded daemon: cannot resolve db path; \
+                falling back to TcpPinned remote daemon");
+            return None;
+        }
+    };
+    let accounts_path = match choreo_daemon::accounts::accounts_config_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "embedded daemon: cannot resolve accounts path; \
+                falling back to TcpPinned remote daemon");
+            return None;
+        }
+    };
+    // max_turns 0 = unlimited: the GUI's embedded daemon has no env/config
+    // knob surface (the CLI's `resolve_max_turns` is CLI-private), and a
+    // GUI-driven agent loop is bounded by its own Stop/cancel affordances.
+    let state = match choreo_daemon::DaemonState::open(choreo_daemon::OpenOptions {
+        db_path,
+        accounts_path,
+        catalog_paths: choreo_daemon::catalog::CatalogPaths::from_dirs(),
+        tool_policy: choreo_daemon::ToolPolicy::Mobile,
+        max_turns: 0,
+    }) {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::error!(error = %e, "embedded daemon: DaemonState::open failed; \
+                falling back to TcpPinned remote daemon");
+            return None;
+        }
+    };
+    let daemon =
+        match choreo_daemon::spawn_embedded(state, choreo_daemon::EmbeddedOptions::default()) {
+            Ok(daemon) => daemon,
+            Err(e) => {
+                tracing::error!(error = %e, "embedded daemon: spawn_embedded failed; \
+                falling back to TcpPinned remote daemon");
+                return None;
+            }
+        };
+    // connect() spawns the connection thread BEFORE returning, so it cannot
+    // fail for readiness reasons — only the connection cap (impossible here:
+    // this is the first and only link).
+    let link = match daemon.connect() {
+        Ok(link) => link,
+        Err(e) => {
+            tracing::error!(error = %e, "embedded daemon: connect failed; \
+                falling back to TcpPinned remote daemon");
+            return None;
+        }
+    };
+    // Keep the daemon handle alive for the whole process (see EMBEDDED_DAEMON:
+    // no graceful-shutdown hook exists — teardown is process death).
+    if EMBEDDED_DAEMON.set(std::sync::Mutex::new(daemon)).is_err() {
+        // Unreachable in practice: embedded_connection_mode runs once from
+        // main() before the event loop. set() failing means a daemon already
+        // exists, which would mean double-startup — log and still wire the
+        // (already-returned) link so the session proceeds.
+        tracing::warn!("embedded daemon: EMBEDDED_DAEMON already set; using the new link anyway");
+    }
+    tracing::info!("embedded daemon: in-process connection established");
+    Some(ConnectionMode::InProcess {
+        daemon_tx: link.client_tx,
+        daemon_rx: link.daemon_rx,
+    })
+}
 
 /// Resolve the no-CLI-args connection mode.
 ///
-/// Split out of [`main`] so it is unit-testable on the host: `cfg!` is a
-/// compile-time constant, so the desktop branch is exercised here and the iOS
-/// branch (`TcpPinned`) is exercised on-device / by `scripts/check-ios.sh`'s
-/// target compile. Desktop keeps the Unix-socket default; iOS has no usable
-/// Unix-socket daemon path, so it always dials TCP with the pinned key.
+/// Split out of [`main`] so it is unit-testable on the host. The bodies are
+/// selected by `#[cfg]` (not `cfg!`), so each target compiles exactly one:
+/// desktop/Android keep the Unix-socket default (pinned by
+/// `default_mode_is_unix_socket_on_host`; `cfg!` is compile-time, so an
+/// on-host test can only pin the desktop branch — the iOS branch is exercised
+/// on-device and by `scripts/check-ios.sh`'s target compile). On iOS the
+/// embedded in-process daemon is attempted first, degrading to the `TcpPinned`
+/// remote-daemon mode on any construction failure (see
+/// [`embedded_connection_mode`]).
 fn default_connection_mode() -> ConnectionMode {
-    if cfg!(target_os = "ios") {
-        ConnectionMode::TcpPinned(IOS_DEFAULT_TCP_ADDR.to_string())
-    } else {
-        ConnectionMode::UnixSocket(socket_path())
-    }
+    // Desktop + Android: unchanged Unix-socket default. The Android build
+    // keeps it because Termux exposes one; desktop always has one.
+    #[cfg(not(target_os = "ios"))]
+    return ConnectionMode::UnixSocket(socket_path());
+
+    // iOS: no usable Unix-socket daemon path in the sandbox — run the daemon
+    // in-process instead; remote TCP/Noise-IK with a pinned key is the
+    // degraded fallback.
+    #[cfg(target_os = "ios")]
+    embedded_connection_mode()
+        .unwrap_or_else(|| ConnectionMode::TcpPinned(IOS_DEFAULT_TCP_ADDR.to_string()))
 }
 
 /// Shared clap [`Styles`] for this crate's CLI binary.
@@ -161,9 +292,10 @@ fn android_main(app: android_activity::AndroidApp) {
 // the desktop and Android builds use (the `native` renderer serves desktop,
 // Android and iOS with one code path — there is deliberately no
 // per-platform UI entry here). The connection story differs: the iOS
-// sandbox has no usable Unix-socket daemon path, so `main()` resolves to
-// the TcpPinned mode (see default_connection_mode) without any branching
-// beyond the cfg there.
+// sandbox has no usable Unix-socket daemon path, so `main()` resolves to the
+// embedded in-process daemon (see `embedded_connection_mode`), degrading to
+// TcpPinned on construction failure — without any branching beyond the cfg
+// in `default_connection_mode`.
 //
 // The event loop is constructed on the main thread (main.m calls us from
 // main(), satisfying winit's MainThreadMarker requirement), and blitz-shell
@@ -186,10 +318,12 @@ fn App() -> Element {
             // Pinned mode also dials an address — display it exactly like
             // the explicit-key Tcp variant (the pin itself is not secret).
             Some(ConnectionMode::TcpPinned(addr)) => addr.clone(),
-            // In-process (embedded daemon): no dial address; show the unix
-            // socket path, matching the LOCAL trust domain the keystore keys
-            // this daemon under (see client.rs's `connection_addr`).
-            Some(ConnectionMode::InProcess { .. }) => socket_path(),
+            // In-process (embedded daemon, iOS): no dial address; show the
+            // stable user-visible label for the local trust domain (see
+            // client.rs's `connection_addr`, which keys the keystore under
+            // the distinct "embedded" string so an embedded daemon can never
+            // collide with a real unix daemon's binding under socket_path()).
+            Some(ConnectionMode::InProcess { .. }) => "embedded daemon".to_string(),
             None => socket_path(),
         };
         AppState::new(display_path)
@@ -279,17 +413,15 @@ mod cli_tests {
     }
 
     /// On the host (desktop), the no-args connection mode must stay the
-    /// Unix-socket default — the iOS branch of `default_connection_mode` is
-    /// compile-time-selected (`cfg!`), so this pins the desktop behavior and
-    /// any accidental flip of that cfg shows up in the regular unit suite.
+    /// Unix-socket default — the iOS branch is `#[cfg]`-selected, so an
+    /// on-host test can only pin the desktop branch (the iOS branch compiles
+    /// on-device and via `scripts/check-ios.sh`'s target compile; `cfg!` is a
+    /// compile-time constant either way). Any accidental flip of the cfg
+    /// selection shows up here in the regular unit suite.
     #[test]
     fn default_mode_is_unix_socket_on_host() {
         let mode = default_connection_mode();
-        if cfg!(target_os = "ios") {
-            assert!(matches!(mode, ConnectionMode::TcpPinned(_)));
-        } else {
-            assert!(matches!(mode, ConnectionMode::UnixSocket(_)));
-        }
+        assert!(matches!(mode, ConnectionMode::UnixSocket(_)));
     }
 
     /// Parsing `--tcp-addr` alone must not fail (the value is resolved later,

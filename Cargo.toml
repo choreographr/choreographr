@@ -13,7 +13,7 @@ readme.workspace = true
 default-run = "choreographr"
 
 [dependencies]
-choreo-daemon = { path = "choreo-daemon", version = "0.1" }
+choreo-daemon.workspace = true
 choreo-tui = { path = "choreo-tui", version = "0.1" }
 # Bridges are feature-gated (off by default): a plain `cargo build` produces
 # only the daemon + TUI binaries. Opt in with `--features im,acp` (or either
@@ -273,6 +273,9 @@ panic = "unwind"
 rpath = false
 
 [workspace.dependencies]
+# Promoted now that choreo-gui consumes it too (iOS-only, target-gated there):
+# per AGENTS.md, a crate used by two members lives here.
+choreo-daemon = { path = "choreo-daemon", version = "0.1" }
 anyhow = "1"
 thiserror = "2"
 futures-channel = "0.3"

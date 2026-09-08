@@ -18,6 +18,12 @@ pub(crate) fn use_daemon_connection() -> DaemonConnection {
 
     // Connect to the daemon and spawn the client reader thread.
     // This runs once on mount.
+    //
+    // The two immediate sends are safe on EVERY transport, including the iOS
+    // embedded link: `EmbeddedDaemon::connect` spawns the daemon-side
+    // connection thread BEFORE returning (see choreo-daemon/src/embedded.rs),
+    // so these queue in the unbounded channel — there is no handshake window
+    // to race, same as the socket transports.
     use_hook(move || {
         let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
         let (ui_tx, ui_rx) = mpsc::unbounded::<UiEvent>();

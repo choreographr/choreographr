@@ -68,3 +68,19 @@ choreo-client-core = { workspace = true, features = ["test-support"] }
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
 blitz-shell = "0.2"
+
+# iOS-only: the embedded in-process daemon (choreo-daemon::embedded). Target-
+# gated so desktop and Android builds neither link nor compile-reach any of it
+# — a plain host build has no `choreo_daemon` symbols in this crate at all.
+# The GUI opens daemon state (Mobile tool policy: no shell/exec/RISC-V tools,
+# no MCP subprocess spawning — sandbox-safe) and talks to the daemon core over
+# plain channels (ConnectionMode::InProcess). See lib.rs's
+# `embedded_connection_mode`.
+[target.'cfg(target_os = "ios")'.dependencies]
+# default-features = false: drops choreo-daemon's `pdf` feature (see its
+# Cargo.toml) — pdf-inspector's build script links a C dylib for the Apple
+# target, which the Linux compile-validation shim path cannot do, and a
+# mobile daemon has no use for a desktop PDF parser anyway. Everything else
+# the embedded daemon needs (DB, accounts, catalog, tools, transport) is
+# unconditional.
+choreo-daemon = { workspace = true, default-features = false }

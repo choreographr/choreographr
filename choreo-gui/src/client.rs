@@ -55,9 +55,11 @@ pub(crate) fn connection_addr() -> String {
         Some(ConnectionMode::UnixSocket(path)) => path.clone(),
         Some(ConnectionMode::Tcp { addr, .. }) => addr.clone(),
         Some(ConnectionMode::TcpPinned(addr)) => addr.clone(),
-        // In-process (embedded daemon): LOCAL trust domain, keyed the same
-        // as the unix socket path (see the TUI's matching arm).
-        Some(ConnectionMode::InProcess { .. }) => socket_path(),
+        // In-process (embedded daemon, iOS): a DISTINCT stable key string, not
+        // the unix socket path — a real unix daemon's keystore binding lives
+        // under socket_path(), and the embedded daemon must never collide with
+        // it (different daemon, different database, different unlock keys).
+        Some(ConnectionMode::InProcess { .. }) => "embedded".to_string(),
         // Unset (e.g. unit tests, or a mis-wired launcher): default to the
         // unix socket path, which is what a local default-mode connection uses.
         None => socket_path(),

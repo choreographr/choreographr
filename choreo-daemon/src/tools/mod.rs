@@ -184,8 +184,12 @@ mod image;
 pub(crate) mod nu;
 #[cfg(feature = "blockchain")]
 pub(crate) mod subxt;
-// Native PDF tools (pdf_classify / pdf_to_markdown) — unconditional since
-// pdf-inspector 1.15.0 ships the RUSTSEC-2026-0187 fix (lopdf >= 0.42).
+// Native PDF tools (pdf_classify / pdf_to_markdown). Behind the `pdf`
+// feature (on by default): the pdf-inspector dependency builds a C dylib
+// its build script links for the Apple target, which the iOS GUI build's
+// Linux compile-validation shim cannot do — the iOS embedded daemon opts out
+// via `default-features = false`. See choreo-daemon/Cargo.toml.
+#[cfg(feature = "pdf")]
 pub(crate) mod pdf;
 pub(crate) mod random;
 pub(crate) mod read_file;
@@ -701,8 +705,13 @@ impl ToolRegistry {
         }
         reg.register(grep::Grep);
         reg.register(find::Find);
-        reg.register(pdf::PdfClassify);
-        reg.register(pdf::PdfToMarkdown);
+        // PDF tools — feature-gated (see the `mod pdf` comment above); the
+        // feature is on by default, so only the iOS build compiles these out.
+        #[cfg(feature = "pdf")]
+        {
+            reg.register(pdf::PdfClassify);
+            reg.register(pdf::PdfToMarkdown);
+        }
         reg.register(read_image::ReadImage::new());
         // Blockchain tools — registered only when the `blockchain` feature is
         // enabled; the tools themselves live in the `choreo-blockchain` crate.

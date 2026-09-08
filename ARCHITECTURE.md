@@ -69,7 +69,9 @@ Choreographr (workspace)
 ├── choreo-gui             Desktop/Android/iOS GUI client (Dioxus Native / Blitz
 │                       renderer — no webview; lib+cdylib for dx/gradle APK
 │                       packaging; iOS via scripts/build-ios.sh + the ios/
-│                       Xcode scaffold)
+│                       Xcode scaffold; on iOS it hosts an embedded in-process
+│                       daemon via choreo-daemon::embedded under the Mobile
+│                       tool policy — see the choreo-gui section)
 └── choreo-im              IM platform bridge (Telegram; feature-gated `im`
                         root-package feature, off by default)
 ```
@@ -288,7 +290,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 | `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine (the CI release workflow ships the tarballs but does not touch the tap) |
 | `check-supply-chain.sh` | The dependency supply-chain gate — runs `cargo deny check advisories bans sources` against `deny.toml` (falling back to `cargo-audit` + a literal lockfile scan when cargo-deny is absent), after scanning the local `~/.cargo/registry` cache for the `.crate` files deleted during the 2026-08-20 `arrayref` attack (RUSTSEC-2026-0260). Wired into `just pre-commit` / `just ci`; see the **Dependency supply chain** subsection under **Security model** |
 | `build-android.sh` | Cross-builds the shipped suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run) under `--profile dist` (the shipped-artifact profile — matches the desktop release pipeline), stages them in `target/android/<abi>/` (cargo's target/ tree — `dist/` is reserved for final publishable artifacts), and prints the `adb push` guidance for Termux `$PREFIX/bin`. Its output is the input for the Termux packaging step (`scripts/build-deb-termux.sh`, CI android job): packaging never rebuilds. Links the four binaries with a linker-script fragment that re-aligns the TLS output sections to 64 bytes — bionic's loader rejects arm64 executables whose `PT_TLS` has `p_align < 64` (rust/LLVM emit 8, and the emutls-for-Android rust PR was never merged), which aborted every Rust binary with thread-locals at startup on Android 10+; a post-build `readelf` gate fails the build rather than shipping a binary that dies on-device. Strips the per-profile `rustflags` from the manifest for the duration (persistent backups under `target/` + EXIT-trap restore, plus a next-run self-heal that recovers a tree left stripped by a hard-killed predecessor — the trap-reliant restore alone was not kill-safe; see `build-stable.sh`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
-| `build-ios.sh` | Compiles `choreo-gui` (the ONLY crate that ships to iOS) for `aarch64-apple-ios` (+ the `-sim` slice when run on a Mac) and stages the link inputs the `ios/` Xcode scaffold consumes (`target/ios/<triple>/<profile>/`: `libchoreo_gui.rlib` plus the ring/secp256k1 static archives). Runs on ANY host: with Xcode it is a full build; without one (the Linux check laptop) it installs shims under `target/ios-shims/` — a `RUSTC` wrapper stripping `-C target-cpu=native` (profile rustflags are not suppressible via `RUSTFLAGS` env, the same trap `build-android.sh` documents) and cc wrappers routing cc-rs through `zig cc` with a fake `SDKROOT` so cc-rs never needs `xcrun` (zig ships macOS darwin libc headers but not iOS ones, so cc-rs's iOS C target is rewritten to zig's macOS target — compile-only; the final Apple dylib/app link happens on the Mac, and the script builds the rlib via `cargo rustc --crate-type lib` so the cdylib's Apple link is never attempted). The `ios/` directory (main.m UIApplication bootstrap + xcodegen `project.yml` + Info.plist) is the Xcode-side counterpart; see the phase 0b caveat comments there about the winit/blitz-shell iOS event-loop wiring, the one piece no non-Mac host can verify |
+| `build-ios.sh` | Compiles `choreo-gui` (the ONLY crate that ships to iOS) for `aarch64-apple-ios` (+ the `-sim` slice when run on a Mac) and stages the link inputs the `ios/` Xcode scaffold consumes. Runs on ANY host: with Xcode it is a full build; without one (the Linux check laptop) it installs shims under `target/ios-shims/` — a `RUSTC` wrapper stripping `-C target-cpu=native` (profile rustflags are not suppressible via `RUSTFLAGS` env, the same trap `build-android.sh` documents) and cc wrappers translating clang/rust-style target triples to `zig cc` form (Apple-iOS compiles AND the pdf-inspector-style build-script dylib links are rewritten to zig's macOS target, because zig ships darwin libc headers and stub dylibs only for macOS — compile-validation fidelity, not on-device code; the shim is also put on `PATH` so build scripts that spawn a bare `cc` hit it instead of the HOST compiler), with a fake `SDKROOT` so cc-rs never needs `xcrun`. The final Apple dylib/app link happens on the Mac; the script builds the staticlib via `cargo rustc --crate-type staticlib` — a self-contained `.a` (std + every C dependency folded in by rustc's internal archiver, so NO per-dependency staging list exists to rot as deps change; the staged artifact now embeds the whole choreo-daemon tree for the iOS embedded daemon, minus the `pdf` feature which is iOS-opted-out because pdf-inspector's Apple dylib link is exactly what the shim cannot do). The `ios/` directory (main.m UIApplication bootstrap + xcodegen `project.yml` + Info.plist) is the Xcode-side counterpart; see the phase 0b caveat comments there about the winit/blitz-shell iOS event-loop wiring, the one piece no non-Mac host can verify |
 
 ### Distribution channels (0.1)
 
@@ -1428,26 +1430,53 @@ misleading `X / ?` fill when the context window isn't loaded), and `/lock`
 | `clipboard.rs` | OSC 52 clipboard writer: `copy_to_clipboard` encodes the text as base64 and writes `ESC ] 52 ; c ; <payload> ST` to stdout, mirroring `terminal_progress`'s OSC 9;4 usage. The terminal mediates the write, so it works over SSH/tmux (the *local* clipboard), is a silent no-op on terminals without OSC 52 support (e.g. macOS Terminal.app), and can be refused by the terminal without affecting the TUI. Selections larger than 1 MiB are refused up front (the caller shows a "too large to copy" status) rather than stalling the UI loop on a multi-megabyte escape sequence terminals may drop anyway. `build_osc52` is a pure function, so the byte layout is unit-tested without a terminal. A write is only ever triggered by a user-initiated mouse-up over their own selection — hostile LLM/tool output can never inject a clipboard write through this path. |
 
 
-### `choreo-gui` — Desktop/Android client
+### `choreo-gui` — Desktop/Android client (iOS: embedded-daemon host)
 
 Entry point: `src/bin/choreo-gui.rs` (thin wrapper calling `choreo_gui::main()`
 in `src/lib.rs`) — the crate owns its binary, unlike the daemon/TUI/IM/ACP
 which live in the root package.
 
-Unix socket or Noise IK encrypted TCP transport (selected via `--tcp-addr` / `--server-pk` CLI flags),
+Unix socket or Noise IK encrypted TCP transport (selected via `--tcp-addr` / `--server-pk` CLI flags)
 rendered via Dioxus components on the Dioxus Native (Blitz/wgpu) renderer —
-one renderer for both desktop and Android (no webview anywhere; the crate is
+one renderer for desktop, Android and iOS (no webview anywhere; the crate is
 built as a lib+cdylib so dx/gradle can package it as an APK). Uses hooks to spawn async reader/writer tasks inside
 the Dioxus runtime. Subscribes to the session summary at connect
 (`SubscribeSessionsSummary`, alongside the initial `ListSessions`) so its session
 list stays live via daemon push broadcasts — required since the daemon stopped
 auto-registering TCP clients as summary subscribers.
 
+**iOS: embedded in-process daemon.** On `target_os = "ios"` (and ONLY there —
+the whole construction is `#[cfg(target_os = "ios")]` and the choreo-daemon
+dependency is target-gated in Cargo.toml, so desktop and Android builds never
+compile or link any of it) the GUI runs the daemon in-process:
+`default_connection_mode()` calls `embedded_connection_mode()`, which opens
+`DaemonState` via `DaemonState::open` under `ToolPolicy::Mobile` (sandbox-safe:
+no shell/exec/RISC-V tools, no MCP subprocess spawning) at the standard
+`dirs`-based paths (which resolve inside the app sandbox), spawns it with
+`choreo_daemon::spawn_embedded`, and mints an `EmbeddedLink` whose channel ends
+become `ConnectionMode::InProcess`. Messages travel as values — no codec, no
+socket — and the same `ClientConn` state machine serves the connection. Any
+construction failure is logged (`error!`) and the mode degrades to the
+previous `TcpPinned` remote-daemon fallback (`IOS_DEFAULT_TCP_ADDR`), so the
+app always launches. The `EmbeddedDaemon` handle is kept in a static
+`OnceLock<Mutex<…>>` (`EMBEDDED_DAEMON`): there is no graceful-shutdown hook
+in the Dioxus Native lifecycle, so shutdown happens at process teardown — the
+`Drop` warn in `embedded.rs` is expected there. The embedded daemon's keystore
+binding is keyed under the distinct stable string `"embedded"`
+(`client.rs::connection_addr`), never under `socket_path()`, so it cannot
+collide with a real unix daemon's binding; the UI shows the label
+"embedded daemon" for this mode. Desktop behavior is byte-for-byte unchanged
+(UnixSocket default, pinned by `default_mode_is_unix_socket_on_host`; the iOS
+branch is `#[cfg]`-selected, so an on-host test can only pin the desktop
+branch — the iOS branch is exercised on-device and by `scripts/check-ios.sh`'s
+target compile).
+
 **Module breakdown:**
 
 | Module | Purpose |
 |---|---|
-| `client.rs` | `run_client()` — socket split, reader/writer, daemon message dispatch |
+| `client.rs` | `run_client()` — socket split, reader/writer, daemon message dispatch; `connection_addr()` — the per-daemon keystore keying address (dial address for TCP, socket path for Unix, the distinct stable string `"embedded"` for the iOS in-process daemon so it can never collide with a real unix daemon's binding) |
+| `hooks.rs` | `use_daemon_connection()` — the connect-once hook; sends `ListSessions` + `SubscribeSessionsSummary` immediately (safe on every transport including the embedded link: `EmbeddedDaemon::connect` spawns the connection thread before returning, so the early sends queue in the unbounded channel) |
 | `state.rs` | `AppState` with input, request tracking, `ClientHistory` |
 | `render.rs` | RSX rendering of history items: markdown → sanitized HTML, images via `data:` URLs, structured diffs via `format_diff_file` |
 | `lib.rs` | clap CLI, Dioxus `App` component, toolbar, history pane, textarea composer, CSS |

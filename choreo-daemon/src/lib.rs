@@ -49,6 +49,8 @@ pub use crate::tools::git::{
 };
 pub use crate::tools::grep::{GrepArgs, GrepOutputMode, execute_grep_tool};
 pub use crate::tools::nu::{NuArgs, execute_nu_tool};
+// PDF tools — feature-gated (see tools/mod.rs's `mod pdf` comment).
+#[cfg(feature = "pdf")]
 pub use crate::tools::pdf::{
     PdfClassifyArgs, PdfToMarkdownArgs, execute_pdf_classify, execute_pdf_to_markdown,
 };

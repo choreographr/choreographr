@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- iOS GUI runs an embedded in-process daemon (step 5 of the embedded-daemon
+  refactor, final step): on `target_os = "ios"` and with no `--tcp-addr`
+  override, `choreo-gui` now opens `DaemonState` via `DaemonState::open` under
+  `ToolPolicy::Mobile` (no shell/exec/RISC-V tools, no MCP subprocess
+  spawning — sandbox-safe), spawns it with `choreo_daemon::spawn_embedded`, and
+  connects to mint an `EmbeddedLink` whose channel ends become
+  `ConnectionMode::InProcess` — messages travel as values, no codec, no
+  socket. The whole construction is `#[cfg(target_os = "ios")]` and the
+  choreo-daemon dependency is target-gated in choreo-gui's Cargo.toml, so
+  desktop and Android builds never compile or link any of it and desktop
+  behavior is byte-for-byte unchanged (UnixSocket default). Every
+  construction failure is logged and degrades to the previous `TcpPinned`
+  remote-daemon fallback so the app still launches. The `EmbeddedDaemon`
+  handle is kept in a static `OnceLock<Mutex<…>>`; the Dioxus Native
+  lifecycle has no daemon-shutdown hook, so shutdown happens at process
+  teardown (the `Drop` warn in `embedded.rs` is expected there) — no polling,
+  no background threads.
+
 - `ConnectionMode::InProcess` (step 4 of the embedded-daemon refactor):
   `choreo-client-core` gains an in-process connection mode carrying the raw
   crossbeam channel ends of an embedded daemon's `EmbeddedLink` (as values —
@@ -116,6 +134,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `choreo-im`, `choreo-acp`, and `choreo-mcp` feature-gated off by default.
 
 ### Changed
+
+- Connection keying for the in-process mode: `choreo-gui`'s
+  `connection_addr()` keys an embedded daemon's keystore binding under the
+  distinct stable string `"embedded"` instead of the unix socket path — a
+  real unix daemon's binding lives under `socket_path()`, and the embedded
+  daemon must never collide with it. The UI's display path for
+  `ConnectionMode::InProcess` shows the label "embedded daemon".
+- `choreo-daemon`'s `pdf` tool group (pdf_classify / pdf_to_markdown) moved
+  behind a new `pdf` cargo feature that is in `default`, so desktop builds
+  are unchanged; the iOS GUI build opts out (`default-features = false`)
+  because pdf-inspector's build script links a C dylib for the Apple target,
+  which the Linux compile-validation shim path cannot perform, and a mobile
+  daemon has no use for a desktop PDF parser.
+- `choreo-daemon` promoted to `[workspace.dependencies]` (now consumed by the
+  root crate and — target-gated — choreo-gui).
+- `scripts/build-ios.sh` / `scripts/check-ios.sh`: the zig `cc` shims now
+  translate clang/rust-style target triples to zig's form (instead of
+  stripping them) and are also put on `PATH`, because the choreo-daemon
+  dependency tree brings build scripts that compile C for the HOST (ring via
+  headless_chrome's build deps) and link Apple dylibs (pdf-inspector) during
+  an iOS build — the host triple `--target=x86_64-unknown-linux-gnu` is
+  unparseable to zig and a bare `cc` from PATH bypassed the shim entirely.
+  Apple-iOS compiles AND build-script dylib links are rewritten to zig's
+  macOS target (compile-validation fidelity; the final Apple link happens on
+  the Mac). Staging remains the single self-contained staticlib — new C
+  dependencies are folded in by rustc automatically, so no per-library
+  staging list exists.
 
 - Refactor(daemon): split `run_server` (step 2 of the embedded-daemon
   refactor) into a transport-independent `start_daemon_core` in the new

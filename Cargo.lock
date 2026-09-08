@@ -2947,6 +2947,7 @@ dependencies = [
  "base64 0.23.1",
  "blitz-shell",
  "choreo-client-core",
+ "choreo-daemon",
  "choreo-keystore",
  "choreo-markdown",
  "choreo-proto",
