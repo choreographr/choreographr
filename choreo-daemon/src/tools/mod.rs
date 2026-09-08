@@ -637,8 +637,37 @@ impl Default for ToolRegistry {
     }
 }
 
+/// Where the daemon runs, deciding which tool groups are registered at all.
+/// The filter is applied at REGISTRATION time (in [`ToolRegistry::new_for_policy`]
+/// / [`ToolRegistry::build_for_policy`]), so a restricted policy never even
+/// holds the tools — no schema advertisement, no dispatch surface, no chance
+/// for a model to select one. This is deliberately stronger than a runtime
+/// allow-list: an unregistered tool cannot be re-activated by any prompt or
+/// persisted tool-group name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolPolicy {
+    /// The shipped CLI daemon: every tool group registered. The default, so
+    /// existing behavior is unchanged.
+    #[default]
+    Full,
+    /// Embedded/mobile profile: shell execution (`sh`, `nu`, `fish`, `exec`),
+    /// the RISC-V sandbox (`run_riscv`), and MCP dynamic tool groups are NOT
+    /// registered. An embedded daemon runs inside a GUI process on a device
+    /// the user carries — arbitrary subprocess spawning and sandbox escapes
+    /// are exactly the surfaces that profile must not expose.
+    Mobile,
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
+        Self::new_for_policy(ToolPolicy::Full)
+    }
+
+    /// Build the registry under a [`ToolPolicy`]. `Mobile` simply skips the
+    /// registrations for shell/exec and (in [`build_for_policy`]) the VM
+    /// sandbox — see the policy docs for why registration-time filtering is
+    /// the right granularity.
+    pub fn new_for_policy(policy: ToolPolicy) -> Self {
         let mut reg = Self {
             tools: HashMap::new(),
             dynamic_groups: Vec::new(),
@@ -659,14 +688,17 @@ impl ToolRegistry {
         reg.register(git::GitCommit);
         reg.register(git::GitPush);
         reg.register(git::GitShow);
-        reg.register(sh::Sh);
-        if shell_util::binary_exists("nu") {
-            reg.register(nu::NuShell);
+        // Shell/exec tools — the group the Mobile policy exists to omit.
+        if policy == ToolPolicy::Full {
+            reg.register(sh::Sh);
+            if shell_util::binary_exists("nu") {
+                reg.register(nu::NuShell);
+            }
+            if shell_util::binary_exists("fish") {
+                reg.register(fish::FishShell);
+            }
+            reg.register(exec::Exec);
         }
-        if shell_util::binary_exists("fish") {
-            reg.register(fish::FishShell);
-        }
-        reg.register(exec::Exec);
         reg.register(grep::Grep);
         reg.register(find::Find);
         reg.register(pdf::PdfClassify);
@@ -740,9 +772,19 @@ impl ToolRegistry {
     /// `load_tools`/`unload_tools` also receive a weak reference so their
     /// JSON Schema enums can list the live group catalog at definition time.
     pub fn build(self) -> Arc<Self> {
+        self.build_for_policy(ToolPolicy::Full)
+    }
+
+    /// Build a shared registry under a [`ToolPolicy`]. See [`build`] for the
+    /// `Arc::new_cyclic` rationale; `Mobile` skips the RISC-V sandbox
+    /// registration entirely (`run_series`/`load_tools`/`unload_tools` stay —
+    /// they are session-surface tools, not execution sandboxes).
+    pub fn build_for_policy(self, policy: ToolPolicy) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
             let mut reg = self;
-            reg.register(vm::RunRiscV::new(weak.clone()));
+            if policy == ToolPolicy::Full {
+                reg.register(vm::RunRiscV::new(weak.clone()));
+            }
             reg.register(series::RunSeries::new(weak.clone()));
             reg.register(load_tools::LoadTools::new(weak.clone()));
             reg.register(unload_tools::UnloadTools::new(weak.clone()));

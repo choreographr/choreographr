@@ -79,6 +79,52 @@ impl ConnectionWriter for choreo_transport::noise::NoiseStream {
     }
 }
 
+/// The embedded (in-process) transport's writer: forward the message as a
+/// Rust VALUE over a channel instead of serializing + encrypting it.
+///
+/// The embedded connection never becomes bytes: `ClientMessage`s travel
+/// GUI→daemon as values over one channel, `DaemonMessage`s daemon→GUI as
+/// values over the writer's target channel. `send_message` therefore just
+/// forwards `msg.clone()` — the clone is the price of the `&msg` signature,
+/// and it is strictly cheaper than the socket path's msgpack encode +
+/// AES-GCM encrypt + syscall per message.
+struct ChannelConnectionWriter {
+    /// Forward target = the GUI's read half. Wrapped in an Option so
+    /// [`shutdown`] can DROP it: a dropped sender closes the receiver
+    /// immediately — the channel analogue of `Shutdown::Both` — which is
+    /// what preserves notify-before-close (the writer thread forwards the
+    /// special-cased `ShuttingDown`/`Evicted` FIRST, then calls
+    /// `shutdown()`, then breaks; the GUI observes the value, then `Err`
+    /// on the next recv).
+    tx: Option<crossbeam_channel::Sender<DaemonMessage>>,
+}
+
+impl ChannelConnectionWriter {
+    fn new(tx: crossbeam_channel::Sender<DaemonMessage>) -> Self {
+        Self { tx: Some(tx) }
+    }
+}
+
+impl ConnectionWriter for ChannelConnectionWriter {
+    fn send_message(&mut self, msg: &DaemonMessage) -> Result<(), String> {
+        match &self.tx {
+            Some(tx) => tx.send(msg.clone()).map_err(|_| {
+                // The receiver (GUI read half) is gone — the embedded client
+                // dropped its link. Same "connection is broken" class as a
+                // broken pipe on the socket paths.
+                "embedded client receiver dropped".to_string()
+            }),
+            None => Err("embedded writer already shut down".to_string()),
+        }
+    }
+    fn shutdown(&mut self) {
+        // Dropping the sender closes the GUI's receiver immediately (see the
+        // field docs): the embedded analogue of closing the socket, ordered
+        // AFTER the ShuttingDown/Evicted flush by the shared writer_thread.
+        self.tx = None;
+    }
+}
+
 /// Drain a connection's writer channel — the connection's SOLE writer.
 ///
 /// Each connection has exactly one writer thread, so messages on `rx` are
@@ -606,11 +652,12 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
 /// Owns everything the read loop used to thread through per-message borrowed
 /// `ClientCtx` constructions: the daemon command channel, the delivery sink,
 /// the daemon-wide lag counter, the attachment state, and the writer thread's
-/// join handle (so `finish()` can run the bounded writer join). The two
-/// socket threads (Unix and TCP/Noise) differ only in HOW they read one
+/// join handle (so `finish()` can run the bounded writer join). The three
+/// connection threads (Unix socket, TCP/Noise, and the in-process embedded
+/// channel path in `crate::embedded`) differ only in HOW they read one
 /// message off the wire and classify transport errors; everything between
 /// message read and teardown lives here.
-struct ClientConn {
+pub(crate) struct ClientConn {
     daemon_tx: mpsc::Sender<DaemonCommand>,
     /// This connection's delivery sink (see `send_to_writer`).
     writer: crate::broadcast::SubscriberSink,
@@ -667,7 +714,7 @@ impl ClientConn {
     /// Returns an error only when the daemon has disconnected (caller should
     /// terminate the connection) — identical to the pre-refactor per-message
     /// `ClientCtx` construction + `dispatch_client_message` call.
-    fn dispatch(&mut self, msg: ClientMessage) -> io::Result<()> {
+    pub(crate) fn dispatch(&mut self, msg: ClientMessage) -> io::Result<()> {
         let mut ctx = ClientCtx {
             writer: &self.writer,
             global_lag: &self.global_lag,
@@ -682,7 +729,7 @@ impl ClientConn {
 
     /// Tear the connection down: detach from any attached session, notify the
     /// daemon, drop the sink, and join the writer thread with a bound.
-    fn finish(self) {
+    pub(crate) fn finish(self) {
         cleanup_client(
             self.attached_session_tx,
             self.client_id,
@@ -893,6 +940,76 @@ pub(crate) fn tcp_client_thread(
             }
         }
     }
+
+    conn.finish();
+    Ok(())
+}
+
+/// Per-connection inputs for the embedded (in-process) transport, bundled
+/// into one struct so the spawn call site stays a single argument (and no
+/// `too_many_arguments` lint ever applies). Mirrors the parameter lists the
+/// Unix/TCP connection threads take, minus the socket.
+pub(crate) struct EmbeddedConnArgs {
+    /// GUI→daemon message values. Channel close IS the EOF.
+    pub client_rx: crossbeam_channel::Receiver<ClientMessage>,
+    /// The writer's forward target = the GUI's read half.
+    pub out_tx: crossbeam_channel::Sender<DaemonMessage>,
+    pub daemon_tx: mpsc::Sender<DaemonCommand>,
+    pub client_id: u64,
+    pub writer: crate::broadcast::SubscriberSink,
+    pub writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
+    pub global_lag: Arc<AtomicUsize>,
+}
+
+/// The embedded (in-process) connection thread — the third transport, next
+/// to [`client_thread`] (Unix) and [`tcp_client_thread`] (TCP/Noise).
+///
+/// The connection never becomes bytes: client messages arrive as Rust values
+/// on `client_rx` and daemon messages leave as values on `out_tx` (via the
+/// [`ChannelConnectionWriter`] the shared writer thread drains). There is no
+/// error classification and no timeout machinery: the `for` loop over
+/// `client_rx` ends exactly when the GUI drops its `EmbeddedLink` (channel
+/// close IS the EOF), and `conn.finish()` runs the same teardown the socket
+/// paths use.
+///
+/// `is_unix: true` — an embedded connection is the LOCAL trust domain, like
+/// the Unix socket: both peers are the same process, so `/acl add` (and the
+/// local-only command semantics generally) apply.
+pub(crate) fn embedded_client_thread(args: EmbeddedConnArgs) -> io::Result<()> {
+    let EmbeddedConnArgs {
+        client_rx,
+        out_tx,
+        daemon_tx,
+        client_id,
+        writer,
+        writer_rx,
+        global_lag,
+    } = args;
+
+    let mut conn = ClientConn::new(
+        daemon_tx,
+        writer,
+        ChannelConnectionWriter::new(out_tx),
+        writer_rx,
+        global_lag,
+        client_id,
+        true,
+    );
+
+    // The writer channel was registered with the daemon by `connect()`
+    // (register_client_writer) BEFORE this thread was spawned, so the
+    // shutdown path can route `ShuttingDown` through this single writer
+    // thread — same ordering invariant as the socket paths.
+    info!("embedded client connected: id={}", client_id);
+    crate::metrics::record_client_connected();
+
+    for msg in client_rx {
+        if let Err(e) = conn.dispatch(msg) {
+            debug!("daemon disconnected: {e}");
+            break;
+        }
+    }
+    info!("embedded client disconnected: id={}", client_id);
 
     conn.finish();
     Ok(())
@@ -2386,5 +2503,76 @@ mod tests {
                 },
             } if error == "no session attached"
         ));
+    }
+
+    // ── ChannelConnectionWriter (embedded transport) ─────────────────────
+
+    /// A message sent while the writer is open arrives as a VALUE on the
+    /// receiver, and dropping the last sender (writer_thread's post-loop
+    /// path) closes the receiver — the channel analogue of socket EOF.
+    #[test]
+    fn channel_writer_forwards_values_and_receiver_sees_close() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let mut writer = ChannelConnectionWriter::new(tx);
+        writer.send_message(&DaemonMessage::Pong).unwrap();
+        // Dropping the writer drops the sender: the receiver sees the value,
+        // then a disconnect (Err) — without any shutdown call, mirroring the
+        // writer_thread exit path.
+        drop(writer);
+        assert!(matches!(rx.recv(), Ok(DaemonMessage::Pong)));
+        assert!(
+            rx.recv().is_err(),
+            "dropping the sender must close the receiver"
+        );
+    }
+
+    /// After `shutdown()` the sender is gone, so any subsequent send is an
+    /// error and the receiver is closed immediately — the same
+    /// notify-before-close contract the socket writer provides via
+    /// `Shutdown::Both`.
+    #[test]
+    fn channel_writer_send_after_shutdown_errors() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let mut writer = ChannelConnectionWriter::new(tx);
+        writer.shutdown();
+        assert!(
+            writer.send_message(&DaemonMessage::Pong).is_err(),
+            "sending after shutdown must error (the writer thread never does this on the \
+             graceful path, but the contract must hold)"
+        );
+        assert!(rx.recv().is_err(), "shutdown must close the receiver");
+    }
+
+    /// Through the shared (generic) writer_thread: `ShuttingDown` is
+    /// delivered to the embedded receiver as a value FIRST, then the writer
+    /// shuts the channel down, so the GUI observes the notification before
+    /// the channel close — notify-before-close, no bytes involved.
+    #[test]
+    fn writer_thread_delivers_shutting_down_before_channel_close() {
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let global = Arc::new(AtomicUsize::new(0));
+        let handle = std::thread::spawn({
+            let bytes = Arc::clone(&bytes);
+            let global = Arc::clone(&global);
+            move || writer_thread(ChannelConnectionWriter::new(out_tx), rx, bytes, global)
+        });
+
+        tx.send(DaemonMessage::Pong).unwrap();
+        tx.send(DaemonMessage::ShuttingDown).unwrap();
+        // Queued after the notification: must never reach the GUI.
+        tx.send(DaemonMessage::Pong).unwrap();
+
+        handle.join().expect("writer thread panicked");
+        assert!(matches!(out_rx.recv(), Ok(DaemonMessage::Pong)));
+        assert!(
+            matches!(out_rx.recv(), Ok(DaemonMessage::ShuttingDown)),
+            "ShuttingDown must be delivered BEFORE the channel closes"
+        );
+        assert!(
+            out_rx.recv().is_err(),
+            "after the notification the channel must be closed (recv errors)"
+        );
     }
 }

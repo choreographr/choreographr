@@ -366,7 +366,13 @@ pub(crate) fn migration_backup_version(db: &redb::Database) -> io::Result<Option
 /// once so the pre-migration backup targets the file that is actually being
 /// migrated (never injected from a test's tempdir).
 pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
-    run_migrations_to(db, SCHEMA_VERSION, MIGRATIONS, &db_path()?)
+    run_migrations_at(db, &db_path()?)
+}
+
+/// [`run_migrations`] parameterized by the database file path (the pre-migration
+/// backup targets this file), mirroring [`open_db_at`] for non-CLI embedders.
+pub fn run_migrations_at(db: &redb::Database, path: &std::path::Path) -> io::Result<()> {
+    run_migrations_to(db, SCHEMA_VERSION, MIGRATIONS, path)
 }
 
 /// The full migration runner, parameterized by the target version and the
@@ -495,7 +501,15 @@ fn initialize_schema_version(db: &redb::Database) -> io::Result<()> {
 /// cannot open rather than recreating a potentially recoverable file (the
 /// old "trying to recreate" catch-all could silently clobber it).
 pub fn open_db() -> io::Result<redb::Database> {
-    let path = db_path()?;
+    open_db_at(&db_path()?)
+}
+
+/// [`open_db`] parameterized by an explicit database file path, so non-CLI
+/// embedders (the GUI's embedded daemon, tests) can open state without the
+/// environment-variable override dance (`CHOREOGRAPHR_DB_PATH`). Same
+/// create/stamp/upgrade semantics as `open_db` — this is the function; the
+/// pathless version just resolves the standard location first.
+pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
     info!(path = %path.display(), "opening database");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -506,16 +520,16 @@ pub fn open_db() -> io::Result<redb::Database> {
     // potentially-valuable corrupt file. As with a brand-new file, the
     // initial schema version is stamped immediately so the database is
     // versioned from the moment it exists.
-    if let Ok(metadata) = fs::metadata(&path)
+    if let Ok(metadata) = fs::metadata(path)
         && metadata.len() == 0
     {
         warn!("database file exists but is empty (interrupted create?); recreating");
-        let db = redb::Database::create(&path)
+        let db = redb::Database::create(path)
             .map_err(|e| io::Error::other(format!("failed to create database: {e}")))?;
         initialize_schema_version(&db)?;
         return Ok(db);
     }
-    match redb::Database::open(&path) {
+    match redb::Database::open(path) {
         Ok(db) => Ok(db),
         // File does not exist: fresh install. Create the database file and
         // stamp the initial schema version so `run_migrations` (called by
@@ -528,7 +542,7 @@ pub fn open_db() -> io::Result<redb::Database> {
             if io_err.kind() == io::ErrorKind::NotFound =>
         {
             info!("database file not found, creating new database");
-            let db = redb::Database::create(&path)
+            let db = redb::Database::create(path)
                 .map_err(|e| io::Error::other(format!("failed to create database: {e}")))?;
             initialize_schema_version(&db)?;
             Ok(db)

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Embedded daemon transport (step 3 of the embedded-daemon refactor): the new
+  `choreo_daemon::embedded` module spawns the daemon core in-process
+  (`spawn_embedded`) and connects clients over plain channels — `ClientMessage`
+  and `DaemonMessage` values travel GUI→daemon and daemon→GUI with NO
+  serialization, no crypto, and no polling; channel close is the EOF. The same
+  `ClientConn` state machine, lag accounting, eviction, and the
+  notify-before-close shutdown broadcast are reused unchanged (`EmbeddedDaemon`
+  delivers `ShuttingDown` as a value, then closes the channel). Includes
+  `DaemonState::open(OpenOptions)` (explicit DB/accounts/catalog paths + tool
+  policy, replacing the CLI's inline construction) and a registration-time
+  `ToolPolicy` (`Full`/`Mobile`) where `Mobile` never registers shell/exec,
+  RISC-V, or MCP tool groups.
 - Vision input: `read_image` tool feeding per-provider image parts; image
   bytes persisted durably via a `session_attachments` table.
 - Image format surface: HEIC + SVG support, EXIF orientation baked in,

@@ -9,6 +9,7 @@ pub mod context;
 pub mod daemon;
 pub mod db;
 pub mod diff_util;
+pub mod embedded;
 pub mod image_prep;
 pub mod mcp;
 pub mod metrics;
@@ -19,7 +20,8 @@ pub mod server;
 mod sessions;
 pub mod tools;
 
-pub use crate::daemon::{DaemonCommand, DaemonState};
+pub use crate::daemon::{DaemonCommand, DaemonState, OpenOptions};
+pub use crate::embedded::{EmbeddedDaemon, EmbeddedLink, EmbeddedOptions, spawn_embedded};
 #[cfg(feature = "test-utils")]
 pub use crate::reasoning::build_chat_request_messages;
 pub use crate::requests::{
@@ -32,6 +34,7 @@ pub use crate::sessions::{
     ActiveSessionEntry, AssistantResponse, ChildResult, RequestContext, SessionCommand,
     SessionMetadata, SessionState, session_main,
 };
+pub use crate::tools::ToolPolicy;
 pub use crate::tools::exec::{ExecArgs, execute_exec_tool};
 pub use crate::tools::find::{FindArgs, execute_find_tool};
 pub use crate::tools::fish::{FishArgs, execute_fish_tool};

@@ -27,7 +27,13 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
+mod open;
 mod subscriber_handlers;
+
+// Re-export the state constructor's options type alongside DaemonState so
+// embedders (and the CLI) can name it without reaching into the private
+// `open` module.
+pub use open::OpenOptions;
 
 /// TTL for cached provider model lists. Shared by the freshness checks in
 /// `handle_list_models_inner` and the background-prefetch guard

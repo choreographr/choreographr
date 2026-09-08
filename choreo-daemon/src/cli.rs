@@ -1,14 +1,9 @@
-use crate::accounts::{AccountManager, accounts_config_path};
 use crate::config::load_daemon_config;
 use crate::daemon::DaemonState;
-use crate::db::read_all_sessions;
 use anyhow::Context;
 use choreo_proto::socket_path;
 use choreo_transport::key::ensure_transport_keypair;
 use clap::Parser;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -245,148 +240,24 @@ pub fn main() -> anyhow::Result<()> {
         }
     }
 
+    // The state construction (DB open/migrate/backup dance, tombstone purge,
+    // session index, accounts, tool registry, MCP) lives in
+    // `DaemonState::open` so the embedded daemon can share the exact same
+    // sequence. The CLI supplies the standard paths and the unrestricted tool
+    // policy, so its behavior is unchanged.
     let max_turns = resolve_max_turns().context("failed to resolve tool-loop iteration limit")?;
     info!(max_turns, "tool loop iteration limit");
     info!("choreographr starting (locked)");
 
-    // Windows-safe startup sequence: redb holds a whole-file exclusive lock
-    // on the database for as long as a `redb::Database` handle is open, and on
-    // Windows that lock blocks even same-process reads of the file (os error
-    // 33). The pre-migration backup therefore must be taken BEFORE the file is
-    // opened/locked. Sequence: open → read the schema version → drop the
-    // handle (releasing the lock) → if a real migration is pending
-    // (migration_backup_version returns Some exactly when run_migrations_to
-    // would back up), copy the backup from the unlocked file → reopen →
-    // migrate. The in-runner backup step is a no-op then (skip-if-exists);
-    // its fs::copy fallback only fires for direct callers that did not
-    // pre-copy (the unit tests).
-    let db_path = crate::db::db_path().context("failed to resolve database path")?;
-    let db = Arc::new({
-        let opened = crate::db::open_db().context("failed to open database")?;
-        match crate::db::migration_backup_version(&opened)
-            .context("failed to read database schema version")?
-        {
-            Some(version) => {
-                // Release redb's whole-file exclusive lock before the copy —
-                // reading the open file is exactly what fails on Windows.
-                drop(opened);
-                crate::db::backup_database(&db_path, version).with_context(|| {
-                    format!("failed to back up database (pre-migration snapshot of v{version})")
-                })?;
-                crate::db::open_db()
-                    .context("failed to reopen database after pre-migration backup")?
-            }
-            // No pending real migration (fresh DB, up-to-date, newer-version
-            // refusal, or unversioned): keep the original handle.
-            None => opened,
-        }
-    });
-
-    // Bring the database up to the current schema version before any table
-    // access: open_db already stamped a fresh database at creation (0 → 1
-    // initialization); run_migrations applies any pending migrations from
-    // there up to SCHEMA_VERSION (a no-op today), and refuses a
-    // newer-version database before any code can read or write it. The
-    // pre-migration backup, when one was needed, was already taken above
-    // before the file was locked.
-    crate::db::run_migrations(&db).context("failed to migrate database")?;
-
-    // Purge any sessions that were deleted while their still-shutting-down
-    // thread was alive and re-created the record before the daemon crashed:
-    // without this, a deleted session could reappear after a restart.  Runs
-    // before the session index is loaded so the record never surfaces.
-    match crate::db::purge_tombstoned_sessions(&db) {
-        Ok(n) if n > 0 => warn!(
-            purged = n,
-            "purged records left behind by interrupted session deletions"
-        ),
-        Ok(_) => {}
-        Err(e) => warn!(error = %e, "failed to purge tombstoned sessions; continuing"),
-    }
-
-    let (daemon_tx, _daemon_rx) = mpsc::channel::<crate::daemon::DaemonCommand>();
-
-    let mut session_metadata = std::collections::HashMap::new();
-    match read_all_sessions(&db) {
-        Ok(sessions) => {
-            for (id, record) in sessions {
-                session_metadata.insert(id, record.into());
-            }
-        }
-        Err(e) => {
-            warn!("failed to load sessions from database: {e}");
-        }
-    }
-
-    info!(
-        count = session_metadata.len(),
-        "loaded sessions from database"
-    );
-
-    // Load accounts (may be empty — unlock will reload them)
-    // If the config path or file is unavailable, start with an empty manager.
-    let accounts = match accounts_config_path() {
-        Ok(path) => AccountManager::load(&path).unwrap_or_else(|e| {
-            warn!("failed to load accounts: {e}");
-            AccountManager::empty()
-        }),
-        Err(e) => {
-            warn!("no accounts config path: {e}");
-            AccountManager::empty()
-        }
-    };
-
-    // Build the tool registry and initialize MCP servers before wrapping
-    // in Arc (McpManager needs &mut ToolRegistry to register dynamic tools).
-    let mut tool_registry = crate::tools::ToolRegistry::new();
-    let mcp_manager = crate::mcp::McpManager::from_config(&mut tool_registry);
-    let tool_registry = tool_registry.build();
-
-    let state = DaemonState {
-        daemon_tx,
-        // Derive the next session ID from the highest existing record so a
-        // fresh daemon never collides with a persisted session.
-        next_session_id: session_metadata
-            .keys()
-            .max()
-            .copied()
-            .map(|m| m + 1)
-            .unwrap_or(1),
-        max_turns,
-        active_sessions: std::collections::HashMap::new(),
-        session_metadata,
-        deleted_sessions: std::collections::HashSet::new(),
-        children: std::collections::HashMap::new(),
-        accounts,
-        providers: HashMap::new(),
-        credentials: std::collections::HashMap::new(),
-        x_credentials: None,
-        // The daemon starts locked: credentials are only decrypted into memory
-        // once a client presents the valid unlock key.
-        locked: true,
-        db,
-        tool_registry,
-        summary_subscribers: std::collections::HashMap::new(),
-        client_writers: HashMap::new(),
-        activity_subscribers: std::collections::HashMap::new(),
-        client_subscribed_sessions: std::collections::HashMap::new(),
-        // One daemon-wide lag counter shared by every connection's sink and
-        // every session thread (see `broadcast::SubscriberSink`). The accept
-        // path clones it so `register_client_writer` can hand it to the
-        // connection threads' writers.
-        global_lag: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        lag_limits: crate::broadcast::LagLimits::default(),
-        model_cache: HashMap::new(),
-        model_prefetch_in_flight: HashSet::new(),
-        mcp_manager,
-        // Populated by `run_server`, which spawns the maintenance thread
-        // (it needs the real command-loop channel, created there).
-        maintenance_tx: None,
-        // Installed by `run_server` from the `acl` parameter (the command
-        // loop needs the same Arc the accept paths read).
-        acl: None,
+    let state = DaemonState::open(crate::daemon::OpenOptions {
+        db_path: crate::db::db_path().context("failed to resolve database path")?,
+        accounts_path: crate::accounts::accounts_config_path()
+            .context("failed to resolve accounts config path")?,
         catalog_paths: crate::catalog::CatalogPaths::from_dirs(),
-    };
+        tool_policy: crate::tools::ToolPolicy::Full,
+        max_turns,
+    })
+    .context("failed to open daemon state")?;
 
     // Load or generate the transport keypair for Noise IK.
     let (transport_sk, _transport_pk) =

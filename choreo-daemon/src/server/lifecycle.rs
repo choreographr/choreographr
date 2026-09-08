@@ -30,7 +30,7 @@ use uds_windows::{UnixListener, UnixStream};
 /// on that, so the join is abandoned after the grace period (the daemon
 /// process exits and the OS closes the socket anyway). Mirrors
 /// `sessions::SESSION_SHUTDOWN_GRACE`.
-const CONNECTION_DRAIN_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const CONNECTION_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// Bound for the shutdown wake-probe's connect to the TCP accept thread. The
 /// probe only needs to land in the accept queue; a healthy listener accepts it
@@ -90,13 +90,17 @@ const CLIENT_THREAD_PRUNE_THRESHOLD: usize = 64;
 /// EOF rather than hanging in the accept backlog) and the event is logged.
 /// Generous for a personal daemon (TUI + GUI + IM bridge + a handful of
 /// mobile clients).
-const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+pub(crate) const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
 /// RAII live-connection slot: decrements the daemon-wide connection counter
 /// when a connection thread exits — including on panic — so a connection can
 /// never leak its slot and slowly eat into the cap. Owns an `Arc` clone so it
 /// can be moved into the spawned connection thread.
-struct ConnectionSlot(Arc<AtomicUsize>);
+///
+/// `pub(crate)`: the embedded daemon's `connect()` takes the same slot type
+/// so MAX_CONCURRENT_CONNECTIONS applies uniformly across all three
+/// transports.
+pub(crate) struct ConnectionSlot(Arc<AtomicUsize>);
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
@@ -108,7 +112,7 @@ impl Drop for ConnectionSlot {
 /// Atomic `fetch_add` makes the check-and-take race-free across the two
 /// accept paths (Unix main thread + TCP accept thread); on rejection the
 /// increment is undone and `None` is returned.
-fn try_take_connection_slot(count: &Arc<AtomicUsize>) -> Option<ConnectionSlot> {
+pub(crate) fn try_take_connection_slot(count: &Arc<AtomicUsize>) -> Option<ConnectionSlot> {
     if count.fetch_add(1, Ordering::Relaxed) >= MAX_CONCURRENT_CONNECTIONS {
         count.fetch_sub(1, Ordering::Relaxed);
         return None;
