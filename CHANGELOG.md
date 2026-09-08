@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Channel-selection convention in [AGENTS.md](./AGENTS.md) (Thread
+  Communication section): thread-to-thread messaging in the crates that
+  already depend on it (`choreo-daemon`, `choreo-tui`, `choreo-client-core`,
+  `choreo-ai-protocols`) must use `crossbeam_channel` rather than
+  `std::sync::mpsc` — cloneable receivers, `select!`/`select_biased!`
+  (including send arms and timer channels), and a consistent error taxonomy
+  keep future evolution a one-line change. Existing std `mpsc` converts
+  opportunistically (only when the change would strain single-consumer
+  semantics or needs select/cloned-receiver support); one-shot reply/flag
+  channels and test-site constructions are left alone; leaf crates
+  (`choreo-acp`, `choreo-gui`, `choreo-im`, `choreo-mcp`,
+  `choreo-transport`) stay on std `mpsc` for their trivial single-consumer
+  fan-in/out; async code keeps the runtime's own channels and never calls a
+  blocking `recv()` inside an async task. Also records the crossfire
+  evaluation outcome: crossbeam stays; crossfire is rejected codebase-wide
+  (its select layer has no send arms or timer channels, it targets saturated
+  throughput rather than our human-rate control-plane traffic, and its own
+  README flags memory-ordering bugs on weaker-ordering platforms such as the
+  aarch64 Termux/Android targets `choreo-tui` supports).
+
 - iOS GUI runs an embedded in-process daemon (step 5 of the embedded-daemon
   refactor, final step): on `target_os = "ios"` and with no `--tcp-addr`
   override, `choreo-gui` now opens `DaemonState` via `DaemonState::open` under
