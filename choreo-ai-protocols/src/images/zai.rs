@@ -22,7 +22,9 @@ use serde::Deserialize;
 use std::io;
 use std::io::Read as _;
 
-use crate::images::{IMAGE_DOWNLOAD_CAP_BYTES, IMAGE_MAX_ATTEMPTS, IMAGE_TOTAL_TIMEOUT_SECS};
+use crate::images::{
+    IMAGE_DOWNLOAD_ATTEMPTS, IMAGE_DOWNLOAD_CAP_BYTES, IMAGE_MAX_ATTEMPTS, IMAGE_TOTAL_TIMEOUT_SECS,
+};
 use crate::images::{ImageGenerationClient, ImageGenerationRequest, ImageGenerationResult};
 use crate::openai::endpoint_url;
 use crate::openai::{OpenAiError, ServiceConfig};
@@ -162,12 +164,82 @@ impl ZaiImageClient {
     ///
     /// No Authorization header (see the module docs: the URL is pre-signed
     /// and the API key must not travel to a third-party host), and the
-    /// shared agent's `timeout_global` bounds the fetch under the same
+    /// shared agent's `timeout_global` bounds each fetch under the same
     /// per-attempt budget as the generation POST — a slow CDN cannot escape
     /// the 180 s per-attempt deadline. The stream is read with a running cap
     /// ([`IMAGE_DOWNLOAD_CAP_BYTES`]) so a hostile/huge response fails at
     /// the cap instead of after a full multi-gigabyte read.
-    fn download_image(&self, url: &str) -> Result<Vec<u8>, OpenAiError> {
+    ///
+    /// The whole download gets its OWN small retry budget
+    /// ([`IMAGE_DOWNLOAD_ATTEMPTS`]) separate from the generation POST's:
+    /// z.ai's object storage advertises the URL in the generation response
+    /// *before* the object is fully published, so an immediate follow-up
+    /// GET can hit a propagation race and receive a non-image body (an
+    /// error page or metadata served with a success status) instead of the
+    /// bytes. Observed in production: the identical URL served an HTML-ish
+    /// body on the first GET and a clean `image/png` seconds later (the
+    /// CDN's `X-Ufile-Create-Time` confirms lazy materialization). A retry
+    /// with the account's short initial backoff (~1-2 s typically) rides
+    /// that race out well within the overall attempt deadline; a scheme
+    /// violation, a cap overflow, or an empty body stays terminal — those
+    /// cannot be fixed by waiting.
+    fn download_image(
+        &self,
+        url: &str,
+        cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    ) -> Result<Vec<u8>, OpenAiError> {
+        // Track the last not-yet-published error only for the theoretical
+        // exhausted-loop fallthrough below (the match arms make the final
+        // attempt terminal, so this arm is unreachable in practice — the
+        // unwrap_or_else fallback keeps the code panic-free regardless,
+        // per the repo's no-unwrap rule).
+        let mut last_not_ready: Option<OpenAiError> = None;
+        for attempt in 1..=IMAGE_DOWNLOAD_ATTEMPTS {
+            match self.fetch_once(url) {
+                Ok(bytes) => return Ok(bytes),
+                // Only "the CDN answered but not with an image yet"
+                // (EmptyResponse from fetch_once's content-type / empty-body
+                // guards) is retryable — that is the propagation race. Cap
+                // overflow, scheme violations, transport errors, and the
+                // final attempt all return the error verbatim: waiting
+                // cannot fix those.
+                Err(e)
+                    if matches!(e, OpenAiError::EmptyResponse)
+                        && attempt < IMAGE_DOWNLOAD_ATTEMPTS =>
+                {
+                    tracing::warn!(
+                        url = %url,
+                        attempt,
+                        "z.ai image URL not yet published — retrying after backoff"
+                    );
+                    last_not_ready = Some(e);
+                    let wait =
+                        std::time::Duration::from_millis(self.config.retry_initial_backoff_ms);
+                    // sleep_or_cancel wakes instantly on a cancel (biased
+                    // select) and errors on a dropped/disconnected channel —
+                    // either way the wait is over and the racy fetch is
+                    // nowhere near completing, so the saved error is the
+                    // honest outcome.
+                    if retry::sleep_or_cancel(wait, cancel_rx).is_err() {
+                        tracing::warn!("z.ai image download retry wait aborted (cancel/close)");
+                        // unwrap_or: last_not_ready is always Some here
+                        // (assigned two lines above) — the fallback is a
+                        // never-taken safety net, not a recovered panic path.
+                        return Err(last_not_ready.take().unwrap_or(OpenAiError::EmptyResponse));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_not_ready.take().unwrap_or(OpenAiError::EmptyResponse))
+    }
+
+    /// One download fetch (scheme guard → GET → content-type guard →
+    /// capped stream read). Split from [`Self::download_image`] so the
+    /// retry loop above can distinguish a *retryable* outcome —
+    /// [`OpenAiError::EmptyResponse`], repurposed here to mean "the CDN
+    /// answered but not with an image yet" — from terminal ones.
+    fn fetch_once(&self, url: &str) -> Result<Vec<u8>, OpenAiError> {
         // Scheme guard: only http(s) URLs are honored — the response's `url`
         // field is provider-controlled text, and a `file://` (or any
         // non-HTTP scheme) value must never be dereferenced as one.
@@ -186,21 +258,30 @@ impl ZaiImageClient {
 
         // Loose content-type guard: the daemon's prepare pipeline validates
         // the bytes properly, but an obviously-wrong content type (an HTML
-        // error page served with a 200 by the CDN) is cheap to reject here,
-        // before meaningful bytes are read. `image/*` covers the JPEG/PNG/
-        // WebP payloads z.ai serves; an octet-stream from a quirky proxy is
-        // let through deliberately (bytes are validated downstream anyway).
-        let mime_ok = response
+        // error page served with a 200 by the CDN — which happens transiently
+        // while the object is still propagating, see download_image) is
+        // cheap to reject here, before meaningful bytes are read.
+        // `image/*` covers the JPEG/PNG/WebP payloads z.ai serves; an
+        // octet-stream from a quirky proxy is let through deliberately
+        // (bytes are validated downstream anyway). Mapped to EmptyResponse
+        // rather than a plain Io error so the download retry loop can treat
+        // this specific outcome as retryable.
+        let content_type = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let mime_ok = content_type
+            .as_deref()
             .map(|ct| ct.starts_with("image/"))
             .unwrap_or(true); // absent header → defer to byte-level validation
         if !mime_ok {
-            tracing::warn!(url = %url, "z.ai image URL did not return an image content type");
-            return Err(OpenAiError::Io(io::Error::other(format!(
-                "generated image URL returned a non-image content type ({url})"
-            ))));
+            tracing::warn!(
+                url = %url,
+                content_type = content_type.as_deref().unwrap_or(""),
+                "z.ai image URL did not return an image content type"
+            );
+            return Err(OpenAiError::EmptyResponse);
         }
 
         // Stream with the cap enforced *during* the read: a +1 reserve byte
@@ -386,7 +467,7 @@ impl ImageGenerationClient for ZaiImageClient {
                 ));
             };
             BASE64.encode(
-                self.download_image(&url)
+                self.download_image(&url, cancel_rx)
                     .map_err(crate::shared::provider_error_to_inference)?,
             )
         };

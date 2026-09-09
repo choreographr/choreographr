@@ -376,6 +376,94 @@ fn zai_url_response_downloads_image_bytes() {
 
 #[test]
 #[ignore]
+fn zai_url_download_retries_the_not_yet_published_race() {
+    // Production race (observed 2026-09): z.ai's object storage advertises
+    // the generation's url BEFORE the object is published, so the first
+    // GET receives a non-image body while the CDN propagates, and the
+    // identical URL serves a clean image seconds later. Pinned here: GET #1
+    // returns an error-page-shaped 200 (non-image content type), GET #2
+    // returns the real bytes — the adapter must retry the download (its own
+    // 3-attempt budget, EMPTY-wait backoff in this test) and succeed on #3
+    // of the script, instead of failing the whole generation. zero backoff
+    // so the test sleeps nothing.
+    let mock = MockProvider::start_scripted(|base| {
+        vec![
+            (
+                200,
+                "application/json",
+                serde_json::json!({
+                    "data": [{ "url": format!("{base}/cdn/img/race.png") }]
+                })
+                .to_string(),
+            ),
+            // GET #1: "not published yet" — an error page served with a
+            // 200 by the object storage while it materializes the object.
+            (200, "text/html", "<html>not an image</html>".to_string()),
+            // GET #2: the same URL now serving the settled image.
+            (200, "image/png", IMAGE_BYTES.to_string()),
+        ]
+    });
+    let config = ServiceConfig {
+        base_url: mock.base_url("paas/v4"),
+        provider_slug: "zai".to_string(),
+        retry_initial_backoff_ms: 0, // no sleeping in tests
+        ..Default::default()
+    };
+    let result = ZaiImageClient::new(config, "zai-key".to_string())
+        .generate_image(&zai_sample_request(), None)
+        .expect("second CDN fetch resolves the propagation race");
+
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&result.image_b64)
+        .expect("result b64 decodes");
+    assert_eq!(bytes, IMAGE_BYTES.as_bytes());
+    // Three requests: POST, racy GET #1, retried GET #2.
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3, "POST + failed GET + retried GET");
+    assert_eq!(requests[1].path, "/cdn/img/race.png");
+    assert_eq!(requests[2].path, "/cdn/img/race.png");
+}
+
+#[test]
+#[ignore]
+fn zai_url_download_stays_terminal_after_the_retry_budget() {
+    // The retry budget is bounded: if EVERY GET serves the racy non-image
+    // body, the download fails for real instead of looping forever — the
+    // POST response, then the configured 3 download attempts (4 GET total
+    // including retries over that single POST).
+    let mock = MockProvider::start_scripted(|base| {
+        vec![
+            (
+                200,
+                "application/json",
+                serde_json::json!({ "data": [{ "url": format!("{base}/cdn/img/stuck.png") }] })
+                    .to_string(),
+            ),
+            // start()'s last response repeats for excess requests —
+            // every download fetch gets the racy page.
+            (200, "text/html", "<html>never publishes</html>".to_string()),
+        ]
+    });
+    let config = ServiceConfig {
+        base_url: mock.base_url("paas/v4"),
+        provider_slug: "zai".to_string(),
+        retry_initial_backoff_ms: 0, // no sleeping in tests
+        ..Default::default()
+    };
+    let err = ZaiImageClient::new(config, "zai-key".to_string())
+        .generate_image(&zai_sample_request(), None)
+        .expect_err("all-fetches-racy must be terminal after the download budget");
+    assert!(
+        matches!(err, InferenceError::EmptyResponse),
+        "expected the empty/not-ready error to surface, got {err:?}"
+    );
+    // 1 POST + the full 3-fetch download budget.
+    assert_eq!(mock.requests().len(), 4, "POST + 3 download attempts");
+}
+
+#[test]
+#[ignore]
 fn zai_b64_json_present_is_used_directly() {
     // b64_json is not part of glm-image's contract but is tolerated at the
     // parse level — when present (and non-empty) it must be preferred over

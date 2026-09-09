@@ -47,6 +47,18 @@ pub(crate) const IMAGE_MAX_ATTEMPTS: u32 = 2;
 /// the cap fires.
 pub(crate) const IMAGE_DOWNLOAD_CAP_BYTES: usize = 8 * 1024 * 1024;
 
+/// Download retry attempts for adapters whose provider returns a temporary
+/// URL (z.ai). z.ai's object storage advertises the URL in the generation
+/// response *before* the object is fully published, so an immediate follow-up
+/// GET can transiently receive a non-image body while the CDN propagates
+/// (observed in production: an HTML-ish body on GET #1, a clean image/png
+/// seconds later, with the CDN's `X-Ufile-Create-Time` confirming lazy
+/// materialization). Three fetches with the account's short initial backoff
+/// between them ride that race out well inside the 180 s per-attempt
+/// deadline; the whole download is bounded by deadline × attempts, still
+/// leaving the heavy cost share to the generation POST itself.
+pub(crate) const IMAGE_DOWNLOAD_ATTEMPTS: u32 = 3;
+
 pub use openai::OpenAiImageClient;
 pub use zai::ZaiImageClient;
 

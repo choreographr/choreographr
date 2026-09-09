@@ -190,6 +190,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- z.ai image download resilience: z.ai's object storage advertises the generated image URL *before* the object is published
+  (observed in production — the identical URL served a non-image error page on the first GET and a clean PNG seconds later, with
+  the CDN's `X-Ufile-Create-Time` confirming lazy materialization), which turned the single-shot URL fetch into a hard
+  `generate_image` failure right after a successful paid generation. The z.ai adapter's URL download now has its own bounded
+  3-attempt retry budget over the account's short initial backoff (scheme violations, cap overflows, transport errors, and the
+  exhausted budget stay terminal), with the cancel flag honored during the retry wait.
+
 - ConfigWatcher resends directory state after an inotify queue overflow, so
   subscribers no longer miss changes dropped by the kernel under load (fixes
   the flaky config_watch integration tests): `notify` surfaces `IN_Q_OVERFLOW`
