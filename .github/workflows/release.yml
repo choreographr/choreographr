@@ -481,6 +481,16 @@ jobs:
     name: ios aarch64 (build + link)
     runs-on: macos-latest
     timeout-minutes: 60
+    env:
+      # zlob's build.rs feeds the raw rust triple into bindgen/clang, and
+      # clang rejects the rust-only `-sim` suffix (the valid triple is
+      # `…-simulator`). bindgen appends per-target extra clang args AFTER the
+      # `--target` zlob passes, and clang honors the LAST `--target`, so
+      # pointing the simulator target's args at the plain iOS triple fixes
+      # the bindings generation. Device builds are unaffected (the plain
+      # triple is already valid). Job scope so both the compile check and
+      # build-ios.sh's simulator build inherit it.
+      BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_ios_sim: --target=aarch64-apple-ios
     steps:
       - uses: actions/checkout@v7
 
