@@ -77,6 +77,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- ConfigWatcher resends directory state after an inotify queue overflow, so
+  subscribers no longer miss changes dropped by the kernel under load (fixes
+  the flaky config_watch integration tests): `notify` surfaces `IN_Q_OVERFLOW`
+  as an event carrying `Flag::Rescan`, and on that signal (and on watch
+  read-errors, which can equally mean missed events) the transport thread now
+  rescans the watched directory and replays divergences from a per-basename
+  last-known-content view as synthesized Create/Modify/Remove through the
+  same subscriber routing as real events.
+
 - `binary_exists` (the registration-time PATH probe behind conditional tool
   registration) now resolves Windows executables through PATHEXT: a bare
   `nu`/`pwsh` is really `nu.exe`/`pwsh.exe`, so the old exact-name probe
