@@ -2769,6 +2769,7 @@ dependencies = [
  "anyhow",
  "choreo-proto",
  "clap",
+ "mimalloc",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2978,6 +2979,7 @@ dependencies = [
  "choreo-markdown",
  "choreo-proto",
  "clap",
+ "mimalloc",
  "serde",
  "serde_json",
  "tempfile",
@@ -3100,6 +3102,7 @@ dependencies = [
  "humfmt",
  "image",
  "lru 0.18.4",
+ "mimalloc",
  "mio",
  "nix 0.31.3",
  "postcard",
@@ -3123,10 +3126,7 @@ name = "choreographr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "choreo-acp",
  "choreo-daemon",
- "choreo-im",
- "choreo-tui",
  "mimalloc",
 ]
 

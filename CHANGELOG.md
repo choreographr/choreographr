@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Bin-to-crate relocation (part 1):** the thin binary wrappers moved out of
+  the root `choreographr` package into their own crates — `choreo-tui`,
+  `choreo-im`, and `choreo-acp` now each declare their `[[bin]]`
+  (`src/main.rs`, a thin wrapper calling the library's `main()`) plus their
+  own `mimalloc` feature/optional dependency (mimalloc cannot live in
+  `[workspace.dependencies]` because cargo rejects `optional` there — each
+  crate declares it inline). The root package declares ONLY the daemon
+  binary: the `im`/`acp` features, the optional bridge dependencies, and the
+  root `avif` → `choreo-tui/avif` forwarding were removed (the TUI's `avif`
+  feature stays on the `choreo-tui` package). Source builds of the bridges
+  are now `cargo build -p choreo-im` / `cargo build -p choreo-acp`, and the
+  full crates.io source install is `cargo install choreographr choreo-tui
+  choreo-im choreo-acp`. `just tui/im/acp` recipes updated accordingly
+  (`just im`/`just acp` also dropped `_require-zig` — those crates never
+  touch zlob).
+- Workspace `default-members = [".", "choreo-tui"]` added: a bare `cargo
+  build` at the root keeps producing the daemon + TUI exactly as before the
+  split, while choreo-gui (Blitz/wgpu-heavy) stays out of default builds.
+
 ### Added
 
 - iOS-native-tool C-ABI bridge skeleton (Subsession 1 of the iOS tools

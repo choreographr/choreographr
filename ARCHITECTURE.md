@@ -33,10 +33,12 @@ package plus fifteen members:
 
 ```
 Choreographr (workspace)
-├── choreographr          Workspace root — the suite installer: declares the
-│                       binaries (choreographr choreo-tui; the choreo-im/
-│                       choreo-acp bridges behind the im/acp features; the
-│                       desktop GUI is a separate crate, choreo-gui)
+├── choreographr          Workspace root — declares ONLY the daemon binary
+│                       (default-run = "choreographr"); workspace
+│                       default-members = [".", "choreo-tui"] keeps a bare
+│                       `cargo build` producing daemon + TUI exactly as before
+│                       the binary split (the GUI is a separate crate,
+│                       choreo-gui, deliberately excluded from default-members)
 ├── choreo-proto           Wire protocol (shared types + framing)
 ├── choreo-sanitize        Leaf crate — shared Unicode "spoofing" predicates
 │                       and the tool-output byte budget + truncation marker
@@ -53,27 +55,31 @@ Choreographr (workspace)
 ├── choreo-ai-protocols    Provider protocols — OpenAI-compatible, Anthropic Messages, and
 │                       Google Gemini clients, the ProviderClient trait, and the provider
 │                       catalog (models.dev base + bundled overlay, embedded postcard)
-├── choreo-daemon          Unix socket server — the core engine (library; the daemon
-│                       binary `choreographr` lives in the root package)
+├── choreo-daemon          Unix socket server — the core engine (library; the
+│                       daemon binary `choreographr` is declared by the root
+│                       package)
 ├── choreo-acp             ACP bridge — translates the Agent Communication Protocol
 │                       (JSON-RPC over stdin/stdout) into choreo-proto messages over the
 │                       daemon's Unix socket, enabling ACP-compatible editors (Claude
-│                       Code, Cline, etc.) to interact with Choreographr sessions
-│                       (feature-gated `acp` root-package feature, off by default)
+│                       Code, Cline, etc.) to interact with Choreographr sessions —
+│                       owns its binary (src/main.rs); not in default-members, build
+│                       with -p choreo-acp
 ├── choreo-content           Choreographr Coordination Platform client — Substrate
 │                       chain writes (subxt via a tokio sidecar), indexer reads,
 │                       IPFS add/cat, content protobuf encode/decode, and the
 │                       publish-time image mipmap pipeline behind the `content` tools
 │                       (feature-gated `content` cargo feature, off by default)
-├── choreo-tui             Terminal UI client (ratatui + crossterm)
+├── choreo-tui             Terminal UI client (ratatui + crossterm; owns its
+│                       binary — src/main.rs; in default-members)
 ├── choreo-gui             Desktop/Android/iOS GUI client (Dioxus Native / Blitz
 │                       renderer — no webview; lib+cdylib for dx/gradle APK
 │                       packaging; iOS via scripts/build-ios.sh + the ios/
 │                       Xcode scaffold; on iOS it hosts an embedded in-process
 │                       daemon via choreo-daemon::embedded under the Mobile
 │                       tool policy — see the choreo-gui section)
-└── choreo-im              IM platform bridge (Telegram; feature-gated `im`
-                        root-package feature, off by default)
+└── choreo-im              IM platform bridge (Telegram; owns its binary
+                        (src/main.rs); not in default-members, build with -p
+                        choreo-im)
 ```
 
 ### Dependency graph
@@ -153,10 +159,12 @@ Homebrew, AUR):
 - `choreographr` — the daemon
 - `choreo-tui` — terminal UI client
 
-The `choreo-im` and `choreo-acp` bridges are **feature-gated** (root-package
-`im` / `acp` features, off by default) and are NOT built for release —
+The `choreo-im` and `choreo-acp` bridges are NOT built for release —
 release.sh / the CI workflow build only the two shipped binaries; the
-bridges are source-build extras via `--features im,acp`.
+bridges are source-build extras (`cargo build -p choreo-im` /
+`cargo build -p choreo-acp`). Each bridge/TUI binary lives in its own
+workspace crate (choreo-im, choreo-acp, choreo-tui), which owns its
+`src/main.rs` wrapper and its own `mimalloc` feature.
 
 `choreo-mcp` is a **library-only crate** (the MCP client the daemon's
 feature-gated `mcp` module uses to spawn tool servers) — it has no `[[bin]]`
@@ -346,7 +354,7 @@ tarball's archive-root binaries (an empty `bin-dir` is rejected by binstall),
 and an `x86_64-unknown-linux-gnu` override maps glibc hosts to the static
 musl tarball (the only Linux asset shipped). The daemon crate is `choreo-daemon` (library
 `choreo_daemon`, no `[[bin]]` target) — the `choreographr` binary it backs
-lives in the root package's `src/bin/`.
+is declared by the root package's `src/bin/choreographr.rs`.
 
 ---
 
@@ -720,12 +728,11 @@ the daemon channel fail harmlessly once the command loop is gone.
 
 ### `choreo-acp` — ACP bridge (Agent Communication Protocol)
 
-Feature-gated: the root package builds this bridge only with `--features acp`
-(the binary is `required-features = ["acp"]`), so default and release builds
-exclude it entirely.
-
-Entry point: `src/main.rs` → initializes logging, connects to the daemon's Unix socket,
-spawns I/O threads, runs the main event loop.
+Its own crate: the `choreo-acp` package owns the binary (`src/main.rs`, a thin
+wrapper calling `choreo_acp::main()`), so default and release builds of the
+root package exclude it entirely; build it explicitly with `cargo build -p
+choreo-acp`. Entry point `src/main.rs`: initializes logging, connects to the
+daemon's Unix socket, spawns I/O threads, runs the main event loop.
 
 The ACP bridge translates the **Agent Communication Protocol** (JSON-RPC 2.0 over
 stdin/stdout) into `choreo-proto` messages sent to the daemon over its Unix socket.
@@ -1435,8 +1442,9 @@ misleading `X / ?` fill when the context window isn't loaded), and `/lock`
 ### `choreo-gui` — Desktop/Android client (iOS: embedded-daemon host)
 
 Entry point: `src/bin/choreo-gui.rs` (thin wrapper calling `choreo_gui::main()`
-in `src/lib.rs`) — the crate owns its binary, unlike the daemon/TUI/IM/ACP
-which live in the root package.
+in `src/lib.rs`) — the crate owns its binary, as do all the suite binaries
+since the binary split (choreo-tui / choreo-im / choreo-acp own their
+wrappers too).
 
 Unix socket or Noise IK encrypted TCP transport (selected via `--tcp-addr` / `--server-pk` CLI flags)
 rendered via Dioxus components on the Dioxus Native (Blitz/wgpu) renderer —
@@ -1515,11 +1523,12 @@ build's behavior is unchanged.
 
 ### `choreo-im` — IM platform bridge
 
-Feature-gated: the root package builds this bridge only with `--features im`
-(the binary is `required-features = ["im"]`), so default and release builds
-exclude it entirely.
+Its own crate: the `choreo-im` package owns the binary, so default and release
+builds of the root package exclude it entirely; build it explicitly with
+`cargo build -p choreo-im`.
 
-Entry point: `src/lib.rs` (the root package's `src/bin/choreo-im.rs` is a thin wrapper calling `choreo_im::main()`)
+Entry point: `src/main.rs` (thin wrapper calling `choreo_im::main()` in the
+library)
 
 Single binary (`choreo-im`) that bridges IM platforms to the daemon.
 The binary takes a single required positional platform argument via clap:
@@ -3556,8 +3565,9 @@ tears every thread down before propagating.
 
 > **Binary-spawning integration tests.** Integration tests live in their
 > crates and test the libs. Any future binary-spawning integration test (via
-> `env!("CARGO_BIN_EXE_...")`) must live in the ROOT package's `tests/`,
-> because the root package owns the binaries.
+> `env!("CARGO_BIN_EXE_...")`) must live in the crate that owns the binary
+> (choreo-tui / choreo-im / choreo-acp each own theirs; the root package owns
+> only the daemon binary).
 >
 > **Shared daemon-test harness.** `choreo-daemon/tests/common/mod.rs` provides
 > the scaffolding for end-to-end daemon tests that run the real
@@ -3723,14 +3733,14 @@ cargo build --release
 # Run daemon (default-run selects the choreographr bin)
 cargo run -p choreographr
 
-# Run terminal client
-cargo run -p choreographr --bin choreo-tui
+# Run terminal client (its own crate — owns its binary)
+cargo run -p choreo-tui
 
 # Run desktop client (its own crate — owns its binary)
 cargo run -p choreo-gui
 
 # Run IM bridge (Telegram)
-cargo run -p choreographr --bin choreo-im -- telegram
+cargo run -p choreo-im -- telegram
 ```
 
 

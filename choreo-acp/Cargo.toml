@@ -8,6 +8,12 @@ homepage.workspace = true
 readme.workspace = true
 edition = "2024"
 rust-version.workspace = true
+# The crate has one library and one binary, so `cargo run -p choreo-acp` is
+# unambiguous without `default-run`; the explicit `[[bin]]` pins the path to
+# the thin wrapper that calls [`choreo_acp::main`].
+[[bin]]
+name = "choreo-acp"
+path = "src/main.rs"
 
 [dependencies]
 choreo-proto.workspace = true
@@ -18,6 +24,17 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Process-wide allocator for the binary only — enabled by the `mimalloc`
+# feature (see [features] below); library consumers never see it.
+mimalloc = { version = "0.1", optional = true }
+
+# mimalloc — process-wide allocator for the `choreo-acp` BINARY, enabled ONLY
+# by the static musl tarball build in the release pipeline (musl's default
+# malloc is weaker; mimalloc's per-thread heaps replace it). Off by default so
+# crates.io / `cargo install` builds stay on the system allocator and need no
+# C compiler.
+[features]
+mimalloc = ["dep:mimalloc"]
 
 # Windows Unix domain sockets (std::os::windows::net::UnixStream is still
 # unstable); see the workspace-level comment. Unix-only builds never compile it.

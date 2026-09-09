@@ -8,6 +8,12 @@ homepage.workspace = true
 readme.workspace = true
 edition = "2024"
 rust-version.workspace = true
+# The crate has one library and one binary, so `cargo run -p choreo-tui`
+# is unambiguous without `default-run`; the explicit `[[bin]]` just pins the
+# path to the thin wrapper that calls [`choreo_tui::main`].
+[[bin]]
+name = "choreo-tui"
+path = "src/main.rs"
 
 [dependencies]
 ansi-to-tui = "8.0.1"
@@ -43,6 +49,9 @@ crossbeam = "0.8"
 mio = { version = "1.2", features = ["os-ext"] }
 tui-prompts = "0.6"
 humfmt.workspace = true
+# Process-wide allocator for the binary only — enabled by the `mimalloc`
+# feature (see [features] below); library consumers never see it.
+mimalloc = { version = "0.1", optional = true }
 
 # `nix` is a Unix-only crate: it does not compile on Windows at all (no
 # POSIX signals/fds there), so it is gated behind cfg(unix) rather than being
@@ -52,6 +61,12 @@ humfmt.workspace = true
 nix = { workspace = true, features = ["signal", "fs"] }
 
 [features]
+# mimalloc — process-wide allocator for the `choreo-tui` BINARY, enabled ONLY
+# by the static musl tarball build in the release pipeline (musl's default
+# malloc is weaker; mimalloc's per-thread heaps replace it). Off by default so
+# crates.io / `cargo install` builds stay on the system allocator and need no
+# C compiler.
+mimalloc = ["dep:mimalloc"]
 # Opt-in AVIF decode via `image/avif-native` (dav1d, a C library). Off by
 # default so the default/release build stays C-free (see the release.sh
 # static-musl rationale and the workspace `image` comment). Forwarded from the

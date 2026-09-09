@@ -335,23 +335,25 @@ ci: fmt-check clippy-strict test-all check-supply-chain
 daemon args="": _require-zig
     cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr -- {{ args }}
 
-# Run the terminal UI client (root package bin)
+# Run the terminal UI client (its own crate — owns its binary)
 tui args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --bin choreo-tui -- {{ args }}
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-tui -- {{ args }}
 
 # Run the desktop GUI client (its own crate — owns its binary)
 gui args="": _require-zig
     cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-gui -- {{ args }}
 
 # Run the instant-messaging bridge (e.g. `just im telegram`).
-# Feature-gated: pulls in the `im` feature (the binary is required-features-gated).
-im args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --features im --bin choreo-im -- {{ args }}
+# Its own crate (choreo-im) owns the binary — no root feature gating anymore.
+im args="":
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-im -- {{ args }}
 
 # Run the ACP bridge for ACP-compatible editors.
-# Feature-gated: pulls in the `acp` feature (the binary is required-features-gated).
-acp args="": _require-zig
-    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreographr --features acp --bin choreo-acp -- {{ args }}
+# Its own crate (choreo-acp) owns the binary. No _require-zig: these bridge
+# crates do not depend on choreo-daemon (the only zlob consumer), so the
+# zig requirement the old root-feature-gated recipes inherited is gone.
+acp args="":
+    cargo run {{ CARGO_FLAGS }} --profile "{{ profile }}" -p choreo-acp -- {{ args }}
 
 # Run any workspace crate's binary. e.g. `just run choreographr -v`
 run crate args="": _require-zig

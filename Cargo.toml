@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-# `cargo run -p choreographr` (and `cargo install choreographr`) default to the
-# daemon binary; the other suite binaries remain explicit targets.
+# `cargo run -p choreographr` (and `cargo install choreographr`) build the
+# daemon binary; the TUI and bridge binaries live in their own crates now.
 default-run = "choreographr"
 
 [dependencies]
@@ -19,14 +19,9 @@ default-run = "choreographr"
 # re-enables the default `pdf` feature here: desktop daemons parse PDFs. The
 # feature-forwarding entries below (metrics/blockchain/…) compose on top.
 choreo-daemon = { workspace = true, features = ["pdf"] }
-choreo-tui = { path = "choreo-tui", version = "0.1" }
-# Bridges are feature-gated (off by default): a plain `cargo build` produces
-# only the daemon + TUI binaries. Opt in with `--features im,acp` (or either
-# alone) to build the messaging/ACP bridge executables.
-choreo-im = { path = "choreo-im", version = "0.1", optional = true }
-choreo-acp = { path = "choreo-acp", version = "0.1", optional = true }
 anyhow.workspace = true
 mimalloc = { version = "0.1", optional = true }
+# (inline, not workspace: cargo rejects `optional` on workspace.dependencies)
 
 [features]
 # Prometheus/OpenMetrics instrumentation + `/metrics` HTTP server. Off by
@@ -44,14 +39,10 @@ content = ["choreo-daemon/content"]
 # Opt-in AVIF decode via `image/avif-native` (dav1d, a C library). Off by
 # default so the default/release build stays C-free (see the release.sh
 # static-musl rationale); a source build with `--features avif` enables it for
-# both the daemon (read_image / display_image) and the TUI (display decode).
-avif = ["choreo-daemon/avif", "choreo-tui/avif"]
-# Instant-messaging bridge (`choreo-im` binary). Off by default; opt in with
-# `--features im` to build the choreo-im executable.
-im = ["dep:choreo-im"]
-# Agent-Client-Protocol bridge (`choreo-acp` binary). Off by default; opt in
-# with `--features acp` to build the choreo-acp executable.
-acp = ["dep:choreo-acp"]
+# the daemon (read_image / display_image). The TUI's AVIF decode lives on the
+# `choreo-tui` package's own `avif` feature now that the TUI binary is its own
+# crate.
+avif = ["choreo-daemon/avif"]
 # MCP tool group in the daemon (dynamic tools from stdio MCP server
 # subprocesses). Off by default; forwards to choreo-daemon/mcp.
 mcp = ["choreo-daemon/mcp"]
@@ -65,22 +56,9 @@ mimalloc = ["dep:mimalloc"]
 name = "choreographr"
 path = "src/bin/choreographr.rs"
 
-[[bin]]
-name = "choreo-tui"
-path = "src/bin/choreo-tui.rs"
-
-# Bridge binaries are feature-gated via required-features: a default build
-# (and every release artifact) skips them entirely; `--features im` / `acp`
-# pulls in the bridge crate and enables the target.
-[[bin]]
-name = "choreo-im"
-path = "src/bin/choreo-im.rs"
-required-features = ["im"]
-
-[[bin]]
-name = "choreo-acp"
-path = "src/bin/choreo-acp.rs"
-required-features = ["acp"]
+# The TUI and the IM/ACP bridges are separate crates now (choreo-tui,
+# choreo-im, choreo-acp) — each owning its binary and its own mimalloc
+# feature. The root package declares ONLY the daemon binary.
 
 # cargo-binstall metadata: lets `cargo binstall choreographr` resolve our
 # GitHub release asset naming (`choreographr-<version>-<target>.<ext>`) from
@@ -125,6 +103,16 @@ members = [
     "choreo-transport",
 ]
 resolver = "3"
+
+# Default-members limits what a bare `cargo build` / `cargo test` at the root
+# touches. `.` keeps the daemon binary and `choreo-tui` keeps producing the
+# TUI — exactly the two binaries a plain build produced before the split —
+# while the bridges stay opt-in via `-p choreo-im` / `-p choreo-acp` (and
+# `--workspace` still covers everything). choreo-gui is deliberately
+# EXCLUDED: its Blitz/wgpu renderer stack is far too heavy to drag into every
+# casual root build (it was already skipped by the old required-features
+# gating shape and by release tooling).
+default-members = [".", "choreo-tui"]
 
 # Shared package metadata inherited by every member via `*.workspace = true`.
 # MSRV: the workspace builds and tests on Rust 1.94.1 and newer; keep code
@@ -294,6 +282,11 @@ anyhow = "1"
 # chained expression replaces a manual Vec + sort/join dance; see AGENTS.md.
 itertools = "0.15"
 thiserror = "2"
+# NOTE: mimalloc is deliberately NOT here — every consumer (root, choreo-tui,
+# choreo-im, choreo-acp) needs it `optional = true` behind its own `mimalloc`
+# feature, and cargo rejects `optional` on workspace.dependencies entries.
+# Each crate therefore declares `mimalloc = { version = "0.1", optional = true }`
+# inline.
 futures-channel = "0.3"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

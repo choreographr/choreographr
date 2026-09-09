@@ -39,8 +39,8 @@ Currently the primary client is **`choreo-tui`** - a fullscreen terminal UI.
 Other clients being developed: 
 
 - **`choreo-gui`** — Desktop/Android/iOS GUI built with [Dioxus](https://dioxuslabs.com/) on the Dioxus Native (Blitz) renderer — one renderer for desktop, Android and iOS, no webview. Built as a lib+cdylib so dx/gradle can package it as an APK; iOS builds via `scripts/build-ios.sh` + the `ios/` Xcode scaffold. On iOS the GUI runs an **embedded in-process daemon** (Mobile tool policy, sandbox-safe) and can register the **on-device tools** — `clipboard_write`, `clipboard_read`, `open_url`, and `notify` — over a C-ABI bridge to the Swift host (`ios/IosToolHost.swift`), all Direct-only (not callable by the LLM) and permission-free. A toolbar toggle, **On-device tools**, controls whether the bridge is handed to the embedded daemon; it persists to `gui-settings.toml` in the app's config and, because tool registration happens at daemon construction, a change **takes effect on the next app start**. Caveats: running the app still needs a Mac or a device (the Rust event loop boots at runtime, which a compile-check host cannot exercise); clipboard and open_url work in the iOS simulator, while local-notification behavior differs (the simulator suppresses some presentations and the notification permission prompt timing varies); desktop and Android builds are unchanged — the setting, the bridge, and the tool group do not exist there.
-- **`choreo-im`** — instant-messaging bridge (Telegram, more platforms coming) - chat with your agent on the go! Feature-gated (`--features im`); not part of the prebuilt release binaries.
-- **`choreo-acp`** — ACP bridge so ACP-compatible editors (Claude Code, Cline, …) can drive Choreographr sessions over JSON-RPC. Feature-gated (`--features acp`); not part of the prebuilt release binaries.
+- **`choreo-im`** — instant-messaging bridge (Telegram, more platforms coming) - chat with your agent on the go! Its own crate (build with `cargo build -p choreo-im`); not part of the prebuilt release binaries.
+- **`choreo-acp`** — ACP bridge so ACP-compatible editors (Claude Code, Cline, …) can drive Choreographr sessions over JSON-RPC. Its own crate (build with `cargo build -p choreo-acp`); not part of the prebuilt release binaries.
 - **`choreographr`** — Choreographr servers will be able to connect to other servers to deploy work elsewhere.
 
 ### RISC-V Virtual Machine
@@ -255,8 +255,8 @@ parallel and can be interacted with independently. How the other agents compare:
 
 Prebuilt releases ship exactly two binaries — `choreographr choreo-tui`
 (`choreo-mcp` is a library-only crate and ships no binary; the `choreo-im`
-and `choreo-acp` bridges are feature-gated and ship only in source builds
-via `--features im,acp`) — for **x86_64 Linux**, **macOS (Apple Silicon)**, **Windows (x86_64)**,
+and `choreo-acp` bridges ship only in source builds — `cargo build -p choreo-im`
+/ `cargo build -p choreo-acp`) — for **x86_64 Linux**, **macOS (Apple Silicon)**, **Windows (x86_64)**,
 and **Android/Termux (aarch64)**. All installs below use prebuilt binaries; no
 Rust or Zig toolchain is required. (The binaries are built by the GitHub
 Actions `release` workflow on every `vX.Y.Z` tag — see RELEASE.md's
@@ -289,10 +289,11 @@ Alternatives:
   `curl -fsSL https://choreographr.com/install.sh | sh`
 - **cargo binstall** — installs the prebuilt tarball, no toolchain:
   `cargo binstall choreographr`
-- **cargo install** — builds from source; needs Zig at build time. Installs the
-  whole suite (daemon + TUI + IM + ACP — the root package owns all four
-  `[[bin]]` targets; `default-run` only affects `cargo run`):
-  `cargo install choreographr`
+- **cargo install** — builds from source; needs Zig at build time. `choreo-tui`,
+  `choreo-im`, and `choreo-acp` are separate crates now, so the full suite is
+  four crates: `cargo install choreographr choreo-tui choreo-im choreo-acp`
+  (cargo supports multiple package specs on crates.io and with `--git`; from a
+  local clone run one `cargo install --path <crate-dir>` per crate).
 
 ### Linux
 
@@ -307,8 +308,9 @@ Alternatives:
   `cargo binstall choreographr` (prebuilt, no toolchain — fetches the static
   musl tarball from GitHub Releases; the binstall manifest maps glibc x86_64
   hosts to the musl asset, so no `--target` is needed) ·
-  `cargo install choreographr` (source build, needs Zig — installs the
-  daemon + TUI; add `--features im,acp` for the bridge binaries)
+  `cargo install choreographr choreo-tui choreo-im choreo-acp` (source build,
+  needs Zig — installs the daemon + TUI + bridges; from a local clone, one
+  `cargo install --path <crate-dir>` per crate)
 
 ### Windows & Android (Termux)
 
@@ -351,7 +353,8 @@ choreographr                                     # ...or just run it in a termin
 
 The non-Homebrew launchd plist expects `/opt/homebrew/bin/choreographr` —
 edit its `ProgramArguments` if your binaries live elsewhere. Once the daemon
-is up, attach a client (`choreo-tui`; the bridges via `--features im,acp`)
+is up, attach a client (`choreo-tui`; the bridges via `cargo run -p choreo-im`
+/ `-p choreo-acp`)
 and follow
 [First conversation](#first-conversation) below. The daemon listens on the
 Unix socket `/tmp/Choreographr.sock` and stores its data under
@@ -396,14 +399,13 @@ cargo run --release -p choreographr -- -q   # warnings only
 RUST_LOG=debug cargo run --release -p choreographr
 ```
 
-Then a client — the suite binaries live in the root package, selected with `--bin`;
-the GUI is a separate crate (`choreo-gui`):
+Then a client — each is its own crate now:
 
 ```bash
-cargo run --release -p choreographr --bin choreo-tui                 # terminal UI
-cargo run --release -p choreo-gui                                    # desktop app
-cargo run --release -p choreographr --features im --bin choreo-im    # IM bridge
-cargo run --release -p choreographr --features acp --bin choreo-acp  # ACP bridge for editors
+cargo run --release -p choreo-tui      # terminal UI
+cargo run --release -p choreo-gui      # desktop app
+cargo run --release -p choreo-im       # IM bridge
+cargo run --release -p choreo-acp      # ACP bridge for editors
 ```
 
 ### First conversation
@@ -438,7 +440,7 @@ data model.
 
 | Crate | Description |
 |---|---|
-| `choreographr` | Workspace root — the suite installer. Declares the binaries (`choreographr choreo-tui`, plus the feature-gated bridges `choreo-im`/`choreo-acp` behind `im`/`acp`); `cargo run -p choreographr` / `cargo install choreographr` default to the daemon binary via `default-run` |
+| `choreographr` | Workspace root — declares ONLY the daemon binary; `cargo run -p choreographr` / `cargo install choreographr` select it via `default-run`. Workspace `default-members = [".", "choreo-tui"]` keeps a bare `cargo build` at the root producing daemon + TUI exactly as before the binary split |
 | `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
 | `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (208 providers) |
 | `choreo-blockchain` | Blockchain tools — EVM (alloy) and Substrate/Polkadot (subxt) read-only queries plus the tokio sidecar runtime they run on; pulled in by the daemon's `blockchain` feature (off by default) |
