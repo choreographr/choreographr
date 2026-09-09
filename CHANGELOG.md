@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace `default-members = [".", "choreo-tui"]` added: a bare `cargo
   build` at the root keeps producing the daemon + TUI exactly as before the
   split, while choreo-gui (Blitz/wgpu-heavy) stays out of default builds.
+- **Release pipeline for the split binaries (part 2):** the release build
+  now selects BOTH owning packages (`-p choreographr -p choreo-tui`) with
+  package-scoped feature syntax (`--features
+  choreographr/metrics,choreographr/blockchain[,choreographr/mimalloc,choreo-tui/mimalloc]`),
+  in `scripts/release.sh`, the CI `windows-msvc` job, and
+  `scripts/build-android.sh` (whose `--features` list is prefixed per-item
+  with `choreographr/` for two-package unambiguity). Both bins still land in
+  the shared `target/<triple>/dist` profile dir, so tarball/.deb/.rpm/Termux
+  staging, smoke tests, and `install.sh` are unchanged. `choreo-tui` gained
+  an identical `[package.metadata.binstall]` block so `cargo binstall
+  choreo-tui` resolves the same single tarball asset and extracts just its
+  own binary.
 
 ### Added
 

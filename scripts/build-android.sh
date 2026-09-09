@@ -205,9 +205,20 @@ done
 TARGETS="arm64-v8a"
 [ "$EMULATOR" = 1 ] && TARGETS="$TARGETS x86_64"
 
-# The shipped suite binaries, as cargo -p/-bin names (all live in the root
-# package); the feature-gated bridge binaries are excluded.
+# The shipped suite binaries: the daemon (root package `choreographr`) and
+# the TUI (the `choreo-tui` crate) — SEPARATE packages since the binary-split
+# refactor, so both must be selected explicitly at build time. The
+# feature-gated bridge binaries (choreo-im / choreo-acp) are excluded.
 BINS="choreographr choreo-tui"
+
+# Package-scoped form of the caller's --features list: with TWO packages
+# selected, bare feature names rely on cargo's ambiguity resolution (a name
+# found in exactly one selected package) — the shipped features (metrics,
+# blockchain) belong to the daemon package, so each comma item is prefixed
+# with `choreographr/` to stay unambiguous even if choreo-tui ever grows a
+# same-named feature (same rationale as scripts/release.sh).
+SCOPED_FEATURES=""
+[ -n "$FEATURES" ] && SCOPED_FEATURES="$(echo "$FEATURES" | tr ',' '\n' | sed 's/^/choreographr\//' | paste -sd,)"
 
 if [ "$CHECK" = 1 ]; then
     # Dry run: report what WOULD happen and exit before touching the manifest.
@@ -218,10 +229,8 @@ if [ "$CHECK" = 1 ]; then
         # Matches the real invocation below (no -o: cargo-ndk only auto-copies
         # cdylibs anyway; the binaries are staged explicitly afterwards).
         log "  cargo ndk -t $abi -- build --locked --profile dist \\"
-        [ -n "$FEATURES" ] && log "      --features $FEATURES \\"
-        for bin in $BINS; do
-            log "      -p choreographr --bin $bin"
-        done
+        [ -n "$FEATURES" ] && log "      --features $SCOPED_FEATURES \\"
+        log "      -p choreographr -p choreo-tui"
     done
     log "staging layout: target/android/<abi>/{choreographr,choreo-tui}"
     exit 0
@@ -345,18 +354,21 @@ for abi in $TARGETS; do
     triple="$(abi_to_triple "$abi")"
     log "building suite binaries for $abi ($triple)"
     # cargo ndk syntax verified against `cargo ndk --help` (cargo-ndk 3.x):
-    # `-t` takes the Android ABI name, cargo args follow after `--`. Both
-    # shipped bins live in the root package, so one invocation per ABI builds them
-    # against shared artifacts.
-    PKG_ARGS=()
-    for bin in $BINS; do PKG_ARGS+=("-p" choreographr "--bin" "$bin"); done
+    # `-t` takes the Android ABI name, cargo args follow after `--`. The two
+    # shipped bins live in two SEPARATE packages (daemon = root `choreographr`,
+    # TUI = `choreo-tui` crate), so both packages are selected explicitly and
+    # no `--bin` filter is needed — each package owns exactly one binary.
+    # One invocation per ABI builds them against shared artifacts.
+    PKG_ARGS=("-p" choreographr "-p" choreo-tui)
     # --locked mirrors scripts/release.sh: the committed Cargo.lock is
     # authoritative for release artifacts (supply-chain control — a silent
     # lockfile regeneration must never repick semver-compatible versions).
     # FEATURE_ARGS stays empty without --features, so local zero-flag Termux
-    # deploys keep building the default feature set exactly as before.
+    # deploys keep building the default feature set exactly as before. The
+    # feature list is passed in package-scoped form (SCOPED_FEATURES above):
+    # with two packages selected, cargo requires unambiguous feature naming.
     FEATURE_ARGS=()
-    [ -n "$FEATURES" ] && FEATURE_ARGS+=("--features" "$FEATURES")
+    [ -n "$FEATURES" ] && FEATURE_ARGS+=("--features" "$SCOPED_FEATURES")
     # --profile dist matches the desktop release pipeline (release.sh): the
     # shipped Termux binaries come from the same [profile.dist] profile, and
     # land in target/<triple>/dist rather than target/<triple>/release.

@@ -74,6 +74,23 @@ mimalloc = ["dep:mimalloc"]
 # decode path too (image_worker.rs must be able to decode AVIF it receives).
 avif = ["image/avif-native"]
 
+# cargo-binstall metadata — IDENTICAL to the root package's block. The
+# release tarball is ONE archive containing both shipped binaries named after
+# the choreographr version; binstall installs only the binaries the package
+# declares, so `cargo binstall choreo-tui` resolves the same asset URL and
+# extracts just `choreo-tui`. The `{ version }` template renders THIS crate's
+# version — workspace versions are inherited (`version.workspace = true`), so
+# it always matches the release version. See ARCHITECTURE.md's binstall note.
+[package.metadata.binstall]
+pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+# Same glibc mapping as the root package: x86_64-unknown-linux-gnu hosts get
+# no native Linux asset, so binstall is pointed at the static musl tarball.
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-x86_64-unknown-linux-musl{ archive-suffix }"
+
 [dev-dependencies]
 tempfile.workspace = true
 # Unit tests construct `PreflightError::Rejected(TransportError)` to pin the

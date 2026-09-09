@@ -242,10 +242,14 @@ jobs:
           # --profile dist (the workspace's shipped-artifact profile — matches
           # what release.sh/build-android.sh pass; output lands in target/dist),
           # metrics + blockchain features, system allocator (mimalloc is a
-          # static-musl-only property of the tarball build). build-stable.sh
-          # strips the nightly-only profile-rustflags bits that hard-block
-          # stable Cargo — it is plain bash + sed, so it runs fine under Git
-          # Bash on the Windows runner.
+          # static-musl-only property of the tarball build). The daemon and the
+          # TUI live in two SEPARATE packages (binary-split refactor), so both
+          # are selected explicitly and features use package-scoped syntax
+          # (`pkg/feature` — see release.sh's rationale comment). Package-scoped
+          # syntax is identical to the musl build minus the mimalloc bits.
+          # build-stable.sh strips the nightly-only profile-rustflags bits that
+          # hard-block stable Cargo — it is plain bash + sed, so it runs fine
+          # under Git Bash on the Windows runner.
           #
           # CPU floor: x86-64-v2 — same reasoning as release.sh's musl build
           # (see the comment there): env rustflags, not profile rustflags
@@ -254,7 +258,7 @@ jobs:
           # a future per-CPU-level Windows artifact reuses this mechanism with
           # a different value.
           export RUSTFLAGS="-C target-cpu=x86-64-v2"
-          ./scripts/build-stable.sh build --locked --profile dist -p choreographr --features metrics,blockchain
+          ./scripts/build-stable.sh build --locked --profile dist -p choreographr -p choreo-tui --features choreographr/metrics,choreographr/blockchain
 
       - name: Stage, smoke-test, and zip
         run: |

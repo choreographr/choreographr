@@ -99,18 +99,28 @@ esac
 # release — release binaries ship only the daemon + TUI suite.
 BINARIES=(choreographr choreo-tui)
 
-echo "==> building release binaries (root package)"
-# Build only the shipped binaries: `-p choreographr` pulls in the daemon and
-# TUI transitively but NOT choreo-gui (its dioxus/webkit2gtk stack
-# is not shipped and must not be a build requirement of the release machine).
-# The bridge binaries (`choreo-im`, `choreo-acp`) are required-features-gated
-# and therefore skipped by this build. `--features metrics,blockchain` enables
-# the Prometheus `/metrics` endpoint and
-# the EVM/Substrate blockchain tools for the shipped binaries — both are off by
-# default so the published crates.io manifests stay lean (the metrics machinery
-# and the optional `choreo-blockchain` crate, which pulls tokio/alloy/subxt into
-# the binary). The native PDF tools (pdf_classify / pdf_to_markdown) need no
-# feature flag: `pdf-inspector` has been an unconditional dependency since 1.15.0
+echo "==> building release binaries (daemon + TUI packages)"
+# Build only the shipped binaries, from their two owning packages: the daemon
+# (root package `choreographr`) and the TUI (the `choreo-tui` crate) are now
+# SEPARATE packages (binary-split refactor), so a single `-p choreographr` no
+# longer produces the TUI binary — both packages must be selected explicitly.
+# Neither package is choreo-gui (its dioxus/webkit2gtk stack is not shipped
+# and must not be a build requirement of the release machine). The bridge
+# binaries (`choreo-im`, `choreo-acp`) are required-features-gated and
+# therefore skipped by this build. Features use PACKAGE-SCOPED syntax
+# (`pkg/feature`) because two packages are selected: with multiple packages,
+# bare feature names rely on cargo's ambiguity resolution (a name found in
+# exactly one selected package), which silently changes meaning the moment
+# the other package grows a same-named feature — explicit scoping is stable
+# regardless. `choreographr/metrics,choreographr/blockchain` enable the
+# Prometheus `/metrics` endpoint and the EVM/Substrate blockchain tools for
+# the daemon — both are off by default so the published crates.io manifests
+# stay lean (the metrics machinery and the optional `choreo-blockchain`
+# crate, which pulls tokio/alloy/subxt into the binary). Each package
+# carries its OWN `mimalloc` feature (cargo rejects `optional = true` in
+# [workspace.dependencies]), so the musl build enables it once per package.
+# The native PDF tools (pdf_classify / pdf_to_markdown) need no feature
+# flag: `pdf-inspector` has been an unconditional dependency since 1.15.0
 # replaced the RUSTSEC-2026-0187-vulnerable lopdf ^0.41 pin.
 
 # ── Tarball build ────────────────────────────────────────────────────────────
@@ -150,13 +160,13 @@ if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     # a developer's target-cpu=native), so local and CI artifacts are
     # comparable. Future per-CPU-level artifacts (e.g. a v3 tarball) reuse this
     # exact mechanism with a different value.
-    RUSTFLAGS="-C target-cpu=x86-64-v2" ./scripts/build-stable.sh zigbuild --locked --profile dist -p choreographr --target x86_64-unknown-linux-musl --features metrics,mimalloc,blockchain
+    RUSTFLAGS="-C target-cpu=x86-64-v2" ./scripts/build-stable.sh zigbuild --locked --profile dist -p choreographr -p choreo-tui --target x86_64-unknown-linux-musl --features choreographr/metrics,choreographr/blockchain,choreographr/mimalloc,choreo-tui/mimalloc
     TARBALL_BIN_DIR="target/x86_64-unknown-linux-musl/dist"
 else
     # macOS: NO target-cpu flag — the aarch64-apple-darwin target spec already
     # defaults to apple-a14 (Apple-Silicon-tuned), and the fleet is homogeneous
     # by definition, so the target default is the right answer here.
-    ./scripts/build-stable.sh build --locked --profile dist -p choreographr --features metrics,blockchain
+    ./scripts/build-stable.sh build --locked --profile dist -p choreographr -p choreo-tui --features choreographr/metrics,choreographr/blockchain
     TARBALL_BIN_DIR="target/dist"
 fi
 
@@ -194,7 +204,7 @@ if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     # Deliberately NO target-cpu: the .deb/.rpm serve the full glibc-distro
     # range, whose baselines are split (Debian/Arch/Fedora = v1, RHEL 10 =
     # v3), so baseline (2003 SSE2) is the only level that covers them all.
-    ./scripts/build-stable.sh build --locked --profile dist -p choreographr --features metrics,blockchain
+    ./scripts/build-stable.sh build --locked --profile dist -p choreographr -p choreo-tui --features choreographr/metrics,choreographr/blockchain
 
     # .deb/.rpm are best-effort: skip with a warning when the toolchain is
     # absent so a Linux-x86_64 release can still proceed without dpkg/rpmbuild

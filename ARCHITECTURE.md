@@ -138,8 +138,11 @@ is never the first test of the pipeline. The orchestrator,
 [`scripts/release.sh`](../scripts/release.sh), is a dry-run by default: it
 reads the version from the root `Cargo.toml` (the single source of truth that
 the Homebrew formula, AUR PKGBUILD, and installer mirror), runs
-`cargo build --profile dist -p choreographr` (the four shipped binaries only —
-choreo-gui's Dioxus Native (Blitz) renderer stack is excluded from
+`cargo build --profile dist -p choreographr -p choreo-tui` with
+package-scoped feature syntax (the daemon and the TUI are SEPARATE packages
+since the binary-split refactor; the musl build additionally enables both
+packages' `mimalloc` features) — the two shipped binaries only
+(choreo-gui's Dioxus Native (Blitz) renderer stack is excluded from
 the release build) under the workspace's dedicated `[profile.dist]` profile
 (root `Cargo.toml`),
 packs the release tarball, writes
@@ -297,7 +300,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 | `publish-stable.sh` | The crates.io publish wrapper (RELEASE.md Phase 2) — strips the nightly-only per-profile `rustflags` and the `[unstable]` config opt-in for the duration of `cargo release publish` (masking the two edited files from cargo-release's clean-tree gate via `git update-index --skip-worktree`, and always passing `--exclude choreo-gui`, which cargo-release 1.1.5 won't drop on its own via `publish = false`), so published manifests stay buildable by stable `cargo install`, then restores both files and clears the masks |
 | `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine (the CI release workflow ships the tarballs but does not touch the tap) |
 | `check-supply-chain.sh` | The dependency supply-chain gate — runs `cargo deny check advisories bans sources` against `deny.toml` (falling back to `cargo-audit` + a literal lockfile scan when cargo-deny is absent), after scanning the local `~/.cargo/registry` cache for the `.crate` files deleted during the 2026-08-20 `arrayref` attack (RUSTSEC-2026-0260). Wired into `just pre-commit` / `just ci`; see the **Dependency supply chain** subsection under **Security model** |
-| `build-android.sh` | Cross-builds the shipped suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run) under `--profile dist` (the shipped-artifact profile — matches the desktop release pipeline), stages them in `target/android/<abi>/` (cargo's target/ tree — `dist/` is reserved for final publishable artifacts), and prints the `adb push` guidance for Termux `$PREFIX/bin`. Its output is the input for the Termux packaging step (`scripts/build-deb-termux.sh`, CI android job): packaging never rebuilds. Links the four binaries with a linker-script fragment that re-aligns the TLS output sections to 64 bytes — bionic's loader rejects arm64 executables whose `PT_TLS` has `p_align < 64` (rust/LLVM emit 8, and the emutls-for-Android rust PR was never merged), which aborted every Rust binary with thread-locals at startup on Android 10+; a post-build `readelf` gate fails the build rather than shipping a binary that dies on-device. Strips the per-profile `rustflags` from the manifest for the duration (persistent backups under `target/` + EXIT-trap restore, plus a next-run self-heal that recovers a tree left stripped by a hard-killed predecessor — the trap-reliant restore alone was not kill-safe; see `build-stable.sh`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
+| `build-android.sh` | Cross-builds the shipped suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run) under `--profile dist` (the shipped-artifact profile — matches the desktop release pipeline), stages them in `target/android/<abi>/` (cargo's target/ tree — `dist/` is reserved for final publishable artifacts), and prints the `adb push` guidance for Termux `$PREFIX/bin`. Its output is the input for the Termux packaging step (`scripts/build-deb-termux.sh`, CI android job): packaging never rebuilds. Links both shipped binaries with a linker-script fragment that re-aligns the TLS output sections to 64 bytes — bionic's loader rejects arm64 executables whose `PT_TLS` has `p_align < 64` (rust/LLVM emit 8, and the emutls-for-Android rust PR was never merged), which aborted every Rust binary with thread-locals at startup on Android 10+; a post-build `readelf` gate fails the build rather than shipping a binary that dies on-device. Strips the per-profile `rustflags` from the manifest for the duration (persistent backups under `target/` + EXIT-trap restore, plus a next-run self-heal that recovers a tree left stripped by a hard-killed predecessor — the trap-reliant restore alone was not kill-safe; see `build-stable.sh`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
 | `build-ios.sh` | Compiles `choreo-gui` (the ONLY crate that ships to iOS) for `aarch64-apple-ios` (+ the `-sim` slice when run on a Mac) and stages the link inputs the `ios/` Xcode scaffold consumes. Runs on ANY host: with Xcode it is a full build; without one (the Linux check laptop) it installs shims under `target/ios-shims/` — a `RUSTC` wrapper stripping `-C target-cpu=native` (profile rustflags are not suppressible via `RUSTFLAGS` env, the same trap `build-android.sh` documents) and cc wrappers translating clang/rust-style target triples to `zig cc` form (Apple-iOS compiles AND the pdf-inspector-style build-script dylib links are rewritten to zig's macOS target, because zig ships darwin libc headers and stub dylibs only for macOS — compile-validation fidelity, not on-device code; the shim is also put on `PATH` so build scripts that spawn a bare `cc` hit it instead of the HOST compiler), with a fake `SDKROOT` so cc-rs never needs `xcrun` (the cc/cxx shim generator is SHARED with `check-ios.sh` in `scripts/lib/ios-cc-shims.sh` — one generator, so the two scripts cannot drift again; the generated shim files are stamped with the current generator's name so a stale shim shows where it came from). The final Apple dylib/app link happens on the Mac; the script builds the staticlib via `cargo rustc --crate-type staticlib` — a self-contained `.a` (std + every C dependency folded in by rustc's internal archiver, so NO per-dependency staging list exists to rot as deps change; the staged artifact now embeds the whole choreo-daemon tree for the iOS embedded daemon, minus the `pdf` feature which is iOS-opted-out because pdf-inspector's Apple dylib link is exactly what the shim cannot do). The `ios/` directory (main.m UIApplication bootstrap + xcodegen `project.yml` + Info.plist) is the Xcode-side counterpart; see the phase 0b caveat comments there about the winit/blitz-shell iOS event-loop wiring, the one piece no non-Mac host can verify |
 
 ### Distribution channels (0.1)
@@ -306,7 +309,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 - **GitHub Releases** — the tarball, `SHA256SUMS`, the desktop `.deb`/`.rpm`, and the Termux `.deb` at `https://github.com/choreographr/choreographr/releases`
 - **choreographr.com** — `https://choreographr.com/download/<version>/` mirrors the tarball and `SHA256SUMS` (this is what `install.sh` fetches); `https://choreographr.com/install.sh` serves the installer, and per-version download redirects are added at release time
 - **AUR** — `choreographr-bin`
-- **crates.io** — `cargo install choreographr` (source build, needs Zig) and `cargo binstall choreographr` (prebuilt; asset naming resolved via `[package.metadata.binstall]` below)
+- **crates.io** — `cargo install choreographr choreo-tui` (source build, needs Zig) and `cargo binstall choreographr choreo-tui` (prebuilt; asset naming resolved via `[package.metadata.binstall]` in each package, below)
 
 ### crates.io metadata
 
@@ -352,7 +355,16 @@ The root package declares `[package.metadata.binstall]`, so
 requiring a manual `--pkg-url`; `bin-dir = "{ bin }{ binary-ext }"` maps the
 tarball's archive-root binaries (an empty `bin-dir` is rejected by binstall),
 and an `x86_64-unknown-linux-gnu` override maps glibc hosts to the static
-musl tarball (the only Linux asset shipped). The daemon crate is `choreo-daemon` (library
+musl tarball (the only Linux asset shipped). The `choreo-tui` crate carries
+an IDENTICAL `[package.metadata.binstall]` block: the release tarball is one
+archive containing both binaries, and binstall installs only the binaries a
+package declares — so `cargo binstall choreo-tui` resolves the SAME asset
+URL (the version template renders the crate's version, which stays in
+lockstep with the release version via the workspace version inheritance) and
+extracts just `choreo-tui`. Fetching the same asset from two packages costs
+a duplicate download but keeps every package self-describing — the
+alternative (per-package asset split) would change the release artifact set
+for zero benefit. The daemon crate is `choreo-daemon` (library
 `choreo_daemon`, no `[[bin]]` target) — the `choreographr` binary it backs
 is declared by the root package's `src/bin/choreographr.rs`.
 
