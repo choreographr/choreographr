@@ -190,6 +190,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `generate_image` tool timeout raised from the generic 60 s default to a dedicated 600 s floor: the previous default fired
+  *while a paid generation was still rendering* (glm-image `hd` is documented at ~20 s but the adapters' bounded worst case —
+  2 POST attempts × the 180 s per-attempt deadline plus the z.ai URL download's 3-fetch retry budget — exceeds 60 s), causing
+  the outer wait-loop to kill a generation that was working correctly. 600 s floors every adapter's realistic completion path;
+  the adapters' internal deadlines keep the ceiling bounded.
+
 - z.ai image download resilience: z.ai's object storage advertises the generated image URL *before* the object is published
   (observed in production — the identical URL served a non-image error page on the first GET and a clean PNG seconds later, with
   the CDN's `X-Ufile-Create-Time` confirming lazy materialization), which turned the single-shot URL fetch into a hard

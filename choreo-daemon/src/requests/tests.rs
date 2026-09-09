@@ -2362,6 +2362,32 @@ fn determine_tool_timeout_ignored_for_non_shell_tools() {
     );
 }
 
+#[test]
+fn determine_tool_timeout_generate_image_covers_adapter_worst_case() {
+    // glm-image `hd` renders ~20 s per the z.ai docs, but the adapters own
+    // bounded worst cases (2 POST attempts × the 180 s agent deadline, plus
+    // the z.ai URL download's 3-fetch budget) that the generic 60 s default
+    // discards as a timeout AFTER a paid generation completes. Pinned here
+    // as a floor that covers every adapter's realistic path: 600 s — and it
+    // must be name-gated ONLY on generate_image, not reach other tools.
+    assert_eq!(
+        determine_tool_timeout("generate_image", "{}"),
+        Some(Duration::from_secs(600)),
+    );
+    // Non-shell tools still cannot raise their deadline via a stray
+    // `timeout` argument, generate_image included (no raise path). And
+    // other image-adjacent tool names do NOT inherit the 600 s floor —
+    // the branches are name-exact, not prefix-matched.
+    assert_eq!(
+        determine_tool_timeout("generate_image", r#"{"timeout": 999999999}"#),
+        Some(Duration::from_secs(600)),
+    );
+    assert_eq!(
+        determine_tool_timeout("display_image", "{}"),
+        Some(Duration::from_secs(60)),
+    );
+}
+
 // -- spawn_single_tool tests ---------------------------------------
 
 /// Build a throwaway `ToolContext` and command channel for

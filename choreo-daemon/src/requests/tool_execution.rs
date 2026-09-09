@@ -251,6 +251,22 @@ pub(crate) fn determine_tool_timeout(name: &str, arguments_json: &str) -> Option
         // Shell commands may involve compilation, tests, or long-running
         // processes that need more time than the default.
         Duration::from_secs(300)
+    } else if name == "generate_image" {
+        // Image generation is slow BY PROVIDER CONTRACT, not slow because
+        // the process is stuck: glm-image's `hd` quality renders in ~20 s
+        // per the z.ai docs, but the tool's adapters own a bounded worst
+        // case the generic 60 s default cannot cover without discarding a
+        // PAID-for generation — 2 frugal POST attempts × the 180 s
+        // per-attempt agent deadline (gpt-image high renders minutes-long)
+        // plus the z.ai URL download's own 3-fetch retry budget (bounded by
+        // the same per-attempt deadline via the shared agent). 600 s floors
+        // every adapter's realistic completion path with headroom for the
+        // inter-attempt backoffs; the adapters' internal deadlines guarantee
+        // this time is never unbounded, only "as slow as the provider is
+        // allowed to be". (Timeouts modelling the pathological ceiling
+        // 180×(2+3) = 900 s are not worth the extra spinner-cost for a case
+        // the deployer has already retried out of — see the frugal budget.)
+        Duration::from_secs(600)
     } else {
         Duration::from_secs(60)
     };

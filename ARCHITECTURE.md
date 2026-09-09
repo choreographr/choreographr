@@ -2351,8 +2351,11 @@ For concurrent tools, each call gets:
    SSE reader uses. It cannot deadlock: the forwarder drains continuously into the
    unbounded session command channel, and when it exits it drops the receiver, failing any
    blocked `send`.
-3. A **wait-loop thread** that enforces the per-tool timeout (300s for shell tools, 60s for
-   others, no limit for sub-sessions).
+3. A **wait-loop thread** that enforces the per-tool timeout (300s for shell tools, 600s for
+   `generate_image` — it must cover the image adapters' own bounded worst cases: 2 frugal POST
+   attempts × the 180 s per-attempt agent deadline plus the z.ai URL download's 3-fetch retry
+   budget, so a slow provider render is never discarded as an outer timeout after a PAID
+   generation — 60s for others, no limit for sub-sessions).
 4. A dedicated **image channel** — the tool emits any produced image through this channel,
    which the wait-loop drains after execution completes.
 
