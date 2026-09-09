@@ -51,6 +51,7 @@ Always use the latest stable version of crates where possible. When adding or up
 1. Use the latest stable semver-compatible release for each crate (check `cargo search <name> --limit 1` for the current version).
 2. If a dependency is locked to an older version upstream, accept the duplication rather than patching — upstream issues should resolve naturally over time.
 3. If a dependency is used by two or more workspace members, declare it in `[workspace.dependencies]` and reference it with `dep.workspace = true` in member crates. This is not optional — when adding a crate-level dependency that already exists (or is being introduced simultaneously) in another workspace member, promote it to the workspace and update both crates in the same change.
+4. Use [`itertools`](https://docs.rs/itertools) where it will genuinely improve code quality — e.g. `.format()` for joining display values, `.sorted()`, `.dedup()`, `.partition_map()`, or `process_results()` replacing awkward manual loops or `Result`-yielding iterator plumbing. Do not adopt it for its own sake; add it (declared in `[workspace.dependencies]`) alongside the concrete change that warrants it.
 
 ## Testing New Code
 

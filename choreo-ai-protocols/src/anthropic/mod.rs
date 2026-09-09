@@ -14,6 +14,7 @@ use crate::types::{
 };
 use crate::{ChatTurnRequest, ContextWindowConfig};
 use choreo_proto::{ReasoningArtifact, TokenUsage};
+use itertools::Itertools;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_API_VERSION: &str = "2023-06-01";
@@ -636,7 +637,11 @@ fn build_message_payloads<'a>(
     _tools: &'a [ChatToolDefinition],
     thinking_enabled: bool,
 ) -> Result<(Vec<MessagePayload<'a>>, Option<String>), AnthropicError> {
-    let mut system: Option<String> = None;
+    // System texts collected verbatim and joined once at the end — the
+    // previous `Option<String>` accumulator needed empty-check/leading-newline
+    // bookkeeping on every push; `.format("\n")` handles the separator
+    // placement so multiple system segments can never drift apart.
+    let mut system_texts: Vec<&str> = Vec::new();
     let mut payloads: Vec<MessagePayload> = Vec::new();
 
     for msg in messages {
@@ -645,11 +650,7 @@ fn build_message_payloads<'a>(
                 // Collect system messages — Anthropic uses a top-level "system"
                 // field instead of a system message in the messages array.
                 if let Some(ref content) = msg.content {
-                    let text = system.get_or_insert_with(String::new);
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(content);
+                    system_texts.push(content);
                 }
             }
             "tool" => {
@@ -674,9 +675,9 @@ fn build_message_payloads<'a>(
                 // altered block is a 400 on the next tool-loop request).
                 let mut blocks: Vec<ContentBlockPayload<'a>> = Vec::new();
                 if thinking_enabled {
-                    for block in artifact_thinking_blocks(msg.reasoning_artifact.as_ref())? {
-                        blocks.push(block);
-                    }
+                    // The artifact blocks arrive as an iterator; `extend`
+                    // replaces the push-for-loop without changing semantics.
+                    blocks.extend(artifact_thinking_blocks(msg.reasoning_artifact.as_ref())?);
                 }
                 // Add text content if present.
                 if let Some(text) = msg.content.as_deref().filter(|t| !t.is_empty()) {
@@ -736,6 +737,12 @@ fn build_message_payloads<'a>(
     {
         payloads.pop();
     }
+
+    let system = if system_texts.is_empty() {
+        None
+    } else {
+        Some(system_texts.iter().format("\n").to_string())
+    };
 
     Ok((payloads, system))
 }

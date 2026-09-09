@@ -10,6 +10,7 @@ use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
 };
+use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -942,27 +943,31 @@ fn path_label(path: &Path, resolved: &Path, single_file: bool) -> String {
 /// separators, context lines `-` (ripgrep's -C convention), groups of
 /// context are separated by `--`.
 fn render_content(sink: &GrepSink) -> String {
-    let mut lines: Vec<String> = Vec::new();
     // Buckets are never empty (push_item opens one only to fill it), so no
     // empty-skip is needed here. The label was precomputed at push time so
     // the byte budget could charge exact rendered bytes; reuse it verbatim.
-    for bucket in &sink.content_files {
-        lines.extend(bucket.items.iter().map(|item| item.render(&bucket.label)));
-    }
-    lines.join("\n")
+    // `flat_map` streams the rendered lines and `.format` joins them without
+    // materializing the intermediate `Vec<String>` the old loop buffered.
+    sink.content_files
+        .iter()
+        .flat_map(|bucket| bucket.items.iter().map(|item| item.render(&bucket.label)))
+        .format("\n")
+        .to_string()
 }
 
 /// FilesWithMatches mode: one deduplicated, sorted path per hit file.
 fn render_files(sink: &GrepSink) -> String {
-    let mut files: Vec<String> = sink
-        .matched_files
-        .iter()
-        .map(|p| sanitize_name(&path_label(p, &sink.resolved, sink.single_file)))
-        .collect();
+    // One deduplicated, sorted path per hit file. `sorted()` folds the sort
+    // into the same chain that maps the display labels, so the rendering
+    // stays a single expression like the other two modes.
     // Deterministic ordering — the walk order is stable, but sorting removes
     // any dependence on traversal internals.
-    files.sort();
-    files.join("\n")
+    sink.matched_files
+        .iter()
+        .map(|p| sanitize_name(&path_label(p, &sink.resolved, sink.single_file)))
+        .sorted()
+        .format("\n")
+        .to_string()
 }
 
 /// Count mode: `path: N` per file, sorted by path, zero-match files omitted.
@@ -981,8 +986,10 @@ fn render_count(sink: &GrepSink) -> String {
     entries
         .iter()
         .map(|(p, n)| format!("{p}: {n}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+        // `.format` joins the rendered lines without materializing the
+        // intermediate `Vec<String>` the old collect-then-join produced.
+        .format("\n")
+        .to_string()
 }
 
 /// Render the collected sink per its output mode, appending the regex-mode
@@ -1312,51 +1319,45 @@ impl Tool for Grep {
         // The description is line-oriented (logs, TUI), so a pattern containing
         // a control character (hostile or accidental) must render as an inert
         // escape rather than splitting the line or injecting terminal escapes.
-        let mut parts = vec![format!(
+        // Every flag clause is a conditional item chained onto the pattern
+        // lead; `.format("")` concatenates them with no intermediate `Vec`
+        // (and no separator — each clause carries its own leading space).
+        std::iter::once(format!(
             "Searching for `{}`.",
             sanitize_content(&args.pattern)
-        )];
-        // Regex is the default, so only an explicit literal search (regex:false)
-        // is flagged — the model needs to notice when it accidentally got
-        // literal matching, the exact failure a regex default prevents.
-        if !args.regex {
-            parts.push(" Using literal matching.".to_string());
-        }
-        if args.ignore_case {
-            parts.push(" Ignoring case.".to_string());
-        }
-        // Context is only ever applied in Content mode — the other modes ignore
-        // it entirely — so advertising it there would mislead the model.
-        if args.context > 0 && args.output_mode == GrepOutputMode::Content {
-            // Report the value the searcher will actually apply — out-of-range
-            // requests are clamped to MAX_CONTEXT_LINES, so advertising e.g.
-            // "1000 context line(s)" while 100 are shown would mislead the
-            // model.
-            let shown = args.context.min(MAX_CONTEXT_LINES);
-            parts.push(format!(" Showing {shown} context line(s)."));
-        }
-        if args.output_mode != GrepOutputMode::Content {
-            parts.push(format!(" Output mode: {}.", args.output_mode));
-        }
-        if let Some(ref incl) = args.include {
-            parts.push(format!(" Include pattern: `{}`.", sanitize_content(incl)));
-        }
-        match &args.path {
-            Some(p) => parts.push(format!(" In path: `{}`.", sanitize_content(p))),
-            None => parts.push(" In working directory.".to_string()),
-        }
-        // Always report the effective result cap the tool will apply — the
-        // default when the caller omits it, clamped when they over-request —
-        // so the model knows the result set is bounded even for default
-        // searches. Out-of-range requests are clamped to MAX_RESULTS_CAP at
-        // execution, so advertising e.g. "5000" while 200 are returned would
-        // mislead the model.
-        let shown = args
-            .max_results
-            .unwrap_or(DEFAULT_MAX_RESULTS)
-            .clamp(1, MAX_RESULTS_CAP);
-        parts.push(format!(" Max results: {shown}."));
-        parts.concat()
+        ))
+        .chain((!args.regex).then(|| " Using literal matching.".to_string()))
+        .chain(args.ignore_case.then(|| " Ignoring case.".to_string()))
+        .chain(
+            (args.context > 0 && args.output_mode == GrepOutputMode::Content).then(|| {
+                format!(
+                    " Showing {} context line(s).",
+                    args.context.min(MAX_CONTEXT_LINES)
+                )
+            }),
+        )
+        .chain(
+            (args.output_mode != GrepOutputMode::Content)
+                .then(|| format!(" Output mode: {}.", args.output_mode)),
+        )
+        .chain(
+            args.include
+                .as_ref()
+                .map(|incl| format!(" Include pattern: `{}`.", sanitize_content(incl))),
+        )
+        .chain(match &args.path {
+            Some(p) => Some(format!(" In path: `{}`.", sanitize_content(p))),
+            None => Some(" In working directory.".to_string()),
+        })
+        .chain({
+            let shown = args
+                .max_results
+                .unwrap_or(DEFAULT_MAX_RESULTS)
+                .clamp(1, MAX_RESULTS_CAP);
+            Some(format!(" Max results: {shown}."))
+        })
+        .format("")
+        .to_string()
     }
 
     fn execute(

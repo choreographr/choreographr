@@ -290,6 +290,9 @@ rpath = false
 # lacks the native PDF tools (pdf_classify / pdf_to_markdown).
 choreo-daemon = { path = "choreo-daemon", version = "0.1", default-features = false }
 anyhow = "1"
+# Extra iterator adaptors (`.format()`, `.sorted()`, etc.) — used where a
+# chained expression replaces a manual Vec + sort/join dance; see AGENTS.md.
+itertools = "0.15"
 thiserror = "2"
 futures-channel = "0.3"
 futures-util = "0.3"

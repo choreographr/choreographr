@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+itertools.workspace = true
 chrono.workspace = true
 clap.workspace = true
 base64.workspace = true

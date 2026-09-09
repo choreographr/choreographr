@@ -384,18 +384,16 @@ impl DaemonState {
     /// writer entry has no connection to tear down — `handle_evict_client`
     /// would no-op on it, silently failing to relieve the pressure.
     pub(super) fn handle_evict_largest_lagging(&mut self) {
-        let mut best: Option<(u64, usize)> = None;
-        let mut consider = |id: &u64, sink: &SubscriberSink| {
-            let bytes = sink.bytes_in_flight.load(Ordering::Relaxed);
-            if bytes > 0 && best.is_none_or(|(_, b)| bytes > b) {
-                best = Some((*id, bytes));
-            }
-        };
-        for (id, sink) in &self.client_writers {
-            consider(id, sink);
-        }
+        // Hand-rolled max over the per-client byte counters, expressed as a
+        // `max_by_key` scan: zero-lag writers are excluded (they have nothing
+        // to relieve) and the winner is the largest in-flight backlog.
+        let best = self
+            .client_writers
+            .iter()
+            .filter(|(_, sink)| sink.bytes_in_flight.load(Ordering::Relaxed) > 0)
+            .max_by_key(|(_, sink)| sink.bytes_in_flight.load(Ordering::Relaxed));
         if let Some((client_id, _)) = best {
-            self.handle_evict_client(client_id);
+            self.handle_evict_client(*client_id);
         }
     }
 

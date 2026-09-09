@@ -14,6 +14,7 @@ use crate::types::{
 };
 use crate::{ChatTurnRequest, ContextWindowConfig};
 use choreo_proto::{ReasoningArtifact, TokenUsage};
+use itertools::Itertools;
 
 /// Default base URL for the Gemini API.
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -617,14 +618,18 @@ fn google_inline_image<'a>(image: &'a ChatImagePart) -> Option<PartPayload<'a>> 
 fn build_message_payloads<'a>(
     messages: &'a [ChatRequestMessage],
 ) -> Result<(Vec<ContentPayload<'a>>, Option<String>), GoogleError> {
-    let mut system_texts: Vec<String> = Vec::new();
+    // System texts borrowed verbatim and joined once at the end — `.format`
+    // places the newline separators, so the old clone-into-Vec + `join` no
+    // longer needs owned strings (and multiple system segments can never
+    // drift apart).
+    let mut system_texts: Vec<&str> = Vec::new();
     let mut payloads: Vec<ContentPayload<'a>> = Vec::new();
 
     for msg in messages {
         match msg.role {
             "system" => {
                 if let Some(ref content) = msg.content {
-                    system_texts.push(content.clone());
+                    system_texts.push(content);
                 }
             }
             "tool" => {
@@ -696,7 +701,7 @@ fn build_message_payloads<'a>(
     let system_instruction = if system_texts.is_empty() {
         None
     } else {
-        Some(system_texts.join("\n"))
+        Some(system_texts.iter().format("\n").to_string())
     };
 
     Ok((payloads, system_instruction))
