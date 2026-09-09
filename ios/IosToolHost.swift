@@ -71,7 +71,12 @@ enum IosToolHost {
     /// authorization — requested lazily on first `notify`, never again.
     private static var notificationAuthRequested = false
 
-    // ── C ABI entry points ────────────────────────────────────────────────
+    // ── Entry points (called by the top-level @_cdecl wrappers below) ────
+    //
+    // `@_cdecl` can only be applied to TOP-LEVEL global functions — Swift
+    // rejects it on enum statics — so the exported C symbols are thin
+    // top-level wrappers (bottom of this file) over the statics here, which
+    // keep the in-flight state and the actual work.
 
     /// Enqueue a tool request onto the main queue. NEVER blocks and never
     /// touches UIKit directly — the caller is a Rust daemon worker thread.
@@ -79,28 +84,27 @@ enum IosToolHost {
     /// contract's four-argument signature — without it,
     /// `choreo_ios_tool_cancel(request_id)` has no way to identify the
     /// request, making the best-effort cancel path unimplementable.
-    @_cdecl("choreo_ios_tool_request")
-    public func choreo_ios_tool_request(request_id: UInt64,
-                                        name: UnsafePointer<CChar>?,
-                                        args_json: UnsafePointer<CChar>?,
-                                        reply_ctx: UnsafeMutableRawPointer?,
-                                        reply_cb: @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<CChar>?) -> Void) {
+    static func enqueue(requestId: UInt64,
+                        name: UnsafePointer<CChar>?,
+                        argsJson: UnsafePointer<CChar>?,
+                        replyCtx: UnsafeMutableRawPointer?,
+                        replyCb: @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<CChar>?) -> Void) {
         let nameStr = name.map { String(cString: $0) } ?? ""
-        let argsStr = args_json.map { String(cString: $0) } ?? ""
-        guard let ctx = reply_ctx else {
+        let argsStr = argsJson.map { String(cString: $0) } ?? ""
+        guard let ctx = replyCtx else {
             // Contract violation on the Rust side (never expected): nothing
             // to reply into. Log-and-drop (no reply is possible at all).
             NSLog("choreo_ios_tool_request: null reply_ctx (contract violation)")
             return
         }
         DispatchQueue.main.async {
-            let state = IosToolRequestState(replyCtx: ctx, replyCb: reply_cb)
-            IosToolHost.inflight[request_id] = state
+            let state = IosToolRequestState(replyCtx: ctx, replyCb: replyCb)
+            IosToolHost.inflight[requestId] = state
             IosToolHost.handle(name: nameStr, argsJson: argsStr, state: state)
             // Deregister after the synchronous part: any later completion
             // (open_url / notify) still replies through the captured state,
             // but cancel no longer applies once work is underway.
-            IosToolHost.inflight.removeValue(forKey: request_id)
+            IosToolHost.inflight.removeValue(forKey: requestId)
         }
     }
 
@@ -109,10 +113,9 @@ enum IosToolHost {
     /// and replies normally. Rust-side the caller's flag is authoritative
     /// either way — a reply into an abandoned (disconnected) channel is
     /// ignored and frees the slot, per the ownership contract above.
-    @_cdecl("choreo_ios_tool_cancel")
-    public func choreo_ios_tool_cancel(request_id: UInt64) {
+    static func cancel(requestId: UInt64) {
         DispatchQueue.main.async {
-            guard let state = IosToolHost.inflight.removeValue(forKey: request_id) else {
+            guard let state = IosToolHost.inflight.removeValue(forKey: requestId) else {
                 return // already running/completed — nothing to cancel here
             }
             state.reply(1, "request was canceled before it ran")
@@ -235,4 +238,26 @@ enum IosToolHost {
             }
         }
     }
+}
+
+// ── C ABI entry points (top level — `@_cdecl` rejects enum statics) ────────
+// Thin wrappers over IosToolHost.enqueue/cancel; the symbol names are the
+// contract the Rust side declares (choreo-gui/src/ios_bridge.rs).
+
+@_cdecl("choreo_ios_tool_request")
+public func choreo_ios_tool_request(request_id: UInt64,
+                                    name: UnsafePointer<CChar>?,
+                                    args_json: UnsafePointer<CChar>?,
+                                    reply_ctx: UnsafeMutableRawPointer?,
+                                    reply_cb: @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<CChar>?) -> Void) {
+    IosToolHost.enqueue(requestId: request_id,
+                        name: name,
+                        argsJson: args_json,
+                        replyCtx: reply_ctx,
+                        replyCb: reply_cb)
+}
+
+@_cdecl("choreo_ios_tool_cancel")
+public func choreo_ios_tool_cancel(request_id: UInt64) {
+    IosToolHost.cancel(requestId: request_id)
 }
