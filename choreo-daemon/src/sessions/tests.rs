@@ -659,7 +659,7 @@ fn unload_tools_protects_core() {
 
     assert!(state.config.active_tool_groups.contains("core"));
     match reply_rx.recv() {
-        Ok(Ok(msg)) => assert_eq!(msg, "The 'core' group cannot be unloaded."),
+        Ok(Ok(msg)) => assert_eq!(msg, "The core group cannot be unloaded."),
         Ok(Err(e)) => panic!("expected success reply, got error: {e}"),
         Err(e) => panic!("expected reply, got {e:?}"),
     }

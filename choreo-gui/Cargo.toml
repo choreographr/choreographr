@@ -50,6 +50,12 @@ choreo-client-core.workspace = true
 choreo-keystore.workspace = true
 choreo-markdown.workspace = true
 choreo-proto.workspace = true
+# GUI preference storage (src/settings.rs): serde for the settings struct,
+# toml for the gui-settings.toml file. Unconditional deps (the settings
+# module compiles on every target) — both are already workspace deps consumed
+# elsewhere, so no new supply-chain surface.
+serde.workspace = true
+toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
@@ -84,3 +90,11 @@ blitz-shell = "0.2"
 # the embedded daemon needs (DB, accounts, catalog, tools, transport) is
 # unconditional.
 choreo-daemon = { workspace = true }
+# The iOS bridge (src/ios_bridge.rs): crossbeam one-shot reply channels
+# across the C ABI (the boxed Sender travels to Swift and comes back through
+# choreo_ios_tool_reply), and serde_json for the reply payload decode.
+# Leaf-crate note (AGENTS.md): this is the documented exception where the
+# bridge contract itself mandates crossbeam — the channel type is fixed by
+# choreo-daemon's ToolBridgeReply shape.
+crossbeam-channel.workspace = true
+serde_json.workspace = true

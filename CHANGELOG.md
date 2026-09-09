@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- iOS-native-tool C-ABI bridge skeleton (Subsession 1 of the iOS tools
+  plan; Subsession 2 added tool registration): `choreo_daemon::tools::ios_bridge` defines
+  the unconditionally-compiled `IosToolBridge` trait, the
+  `IosToolRequest`/`ToolBridgeReply` envelope, the serializable
+  `ToolBridgeError` (BridgeUnavailable/Canceled/Timeout/Platform), the
+  `IosToolPending` handle (deadline-bounded `wait` with cancellation polling
+  + cancel-precedence, best-effort `cancel()`), named per-tool timeout
+  constants (clipboard 1500ms / open_url 3000ms / notify 5000ms), and a
+  scripted `MockBridge`; the concrete `SwiftIosToolBridge` lives in
+  `choreo-gui/src/ios_bridge.rs` behind `#[cfg(target_os = "ios")]` (extern
+  "C" declarations for the Swift host plus the exported
+  `choreo_ios_tool_reply` callback that reconstructs the boxed one-shot reply
+  sender — reply-slot ownership contract documented verbatim in the module
+  header: Rust never frees the box; Swift guarantees exactly-once reply on
+  the main queue; an abandoned request's late reply sends into a
+  disconnected channel and drops the slot), and `ios/IosToolHost.swift` is
+  the main-queue-serialized Swift host (UIPasteboard clipboard
+  write/read, https:/mailto:-restricted `open_url`, UNUserNotificationCenter
+  `notify` with lazily-requested provisional authorization; the Swift file
+  is not compiled in CI — its errors surface on a Mac; the zig path of
+  `scripts/build-ios.sh` validates the Rust cfg(ios) code).
+- iOS-native tools themselves (Subsession 2 of the iOS tools plan): the four
+  `Tool` wrappers — `clipboard_write`, `clipboard_read`, `open_url`, `notify`
+  — live in `choreo-daemon/src/tools/ios/` (compiled unconditionally; no cfg
+  anywhere; the bridge's presence is the only gate). All are Direct-only
+  (exfiltration-chain mitigation), entry-check `ToolContext.cancelled` before
+  dispatching (a cancelled call never touches the bridge), wait with the
+  cancel-precedence `IosToolPending::wait` and per-tool timeout constants,
+  and best-effort `pending.cancel()` on the late-cancel path. `open_url`
+  advertises an `https|mailto`-pattern schema and re-validates in `execute`
+  (scheme allow-list + control-character ban; schema is advisory, the
+  executor is the boundary); `notify` enforces 200/2000-character
+  title/body caps in `execute`. `ToolRegistry::register_platform_tools`
+  registers them under a new PROTECTED `"ios"` group; `OpenOptions`
+  gained `platform_tool_bridge: Option<Arc<dyn IosToolBridge>>` and the
+  iOS GUI passes its Swift bridge there (desktop passes `None` and the
+  group never exists). Protected groups: always unioned into
+  `available_definitions` (so pre-existing persisted sessions get the ios
+  tools too), excluded from `group_names()` (never offered to
+  load_tools/unload_tools schemas), and honored by `apply_unload_tools`,
+  which now takes the registry's protected set instead of hardcoding
+  "core". The default group lists (`daemon.rs` CreateSession,
+  `default_active_tool_groups`) push "ios" behind `cfg(target_os = "ios")`
+  as belt-and-suspenders for display honesty. The iOS GUI's bridge hand-off
+  is gated by a new user setting, **on-device tools** (default ON — all four
+  tools are permission-free): choreo-gui gains its first settings store
+  (`src/settings.rs`, `gui-settings.toml` in the shared config dir via
+  `choreo_keystore::paths::config_dir()` — not the daemon DB, since the
+  bridge decision happens at `DaemonState::open` before any daemon exists;
+  tolerant load — missing/corrupt file falls back to defaults — and
+  whole-file persist), an iOS-only toolbar toggle that persists the flag
+  and states that a change takes effect on the next app start (the
+  protected group cannot be re-registered live), and host unit tests for
+  the persistence round-trip. Desktop/Android behavior is unchanged — the
+  setting surface compiles but is consumed only under
+  `cfg(target_os = "ios")`, and the desktop GUI toolbar renders an empty
+  placeholder component.
 - `powershell` shell tool for Windows: executes commands via Windows
   PowerShell 5.1 (`powershell.exe`, always present) or PowerShell 7+ (`pwsh`)
   with the same timeout-watchdog/streaming plumbing as the other shell tools.

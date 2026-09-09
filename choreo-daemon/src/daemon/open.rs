@@ -13,6 +13,7 @@ use crate::catalog::CatalogPaths;
 use crate::daemon::DaemonState;
 use crate::db;
 use crate::mcp::McpManager;
+use crate::tools::ios_bridge::IosToolBridge;
 use crate::tools::{ToolPolicy, ToolRegistry};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -37,6 +38,13 @@ pub struct OpenOptions {
     /// Tool-loop iteration limit (0 = unlimited). The CLI resolves this from
     /// env/config; an embedder decides it directly.
     pub max_turns: u32,
+    /// Optional bridge to the host's platform-native tools (clipboard,
+    /// open_url, notify on iOS). When `Some`, the `ios` tool group is
+    /// registered and PROTECTED (always active, unloadable by no one); the
+    /// bridge's PRESENCE is the gate — a desktop embedder passes `None` and
+    /// the group simply never exists. No `cfg` here on purpose: that keeps
+    /// the registration testable on every platform.
+    pub platform_tool_bridge: Option<Arc<dyn IosToolBridge>>,
 }
 
 impl DaemonState {
@@ -122,6 +130,14 @@ impl DaemonState {
         // subprocesses at all, so the manager stays empty (registration-time
         // filtering; see ToolPolicy).
         let mut tool_registry = ToolRegistry::new_for_policy(opts.tool_policy);
+        // Register the platform tools (if a bridge was supplied) BEFORE
+        // `build_for_policy`: `register_platform_tools` needs `&mut self`,
+        // and `build_for_policy` consumes the registry into the shared `Arc`
+        // (its `Arc::new_cyclic` closure keeps the `protected_groups` field
+        // alive — it moves with the value).
+        if let Some(bridge) = opts.platform_tool_bridge {
+            tool_registry.register_platform_tools(bridge);
+        }
         let mcp_manager = if opts.tool_policy == ToolPolicy::Full {
             McpManager::from_config(&mut tool_registry)
         } else {
@@ -201,6 +217,7 @@ mod tests {
             },
             tool_policy: ToolPolicy::Full,
             max_turns: 0,
+            platform_tool_bridge: None,
         })
         .unwrap();
 
@@ -226,6 +243,7 @@ mod tests {
             catalog_paths: CatalogPaths::default(),
             tool_policy: ToolPolicy::Mobile,
             max_turns: 0,
+            platform_tool_bridge: None,
         })
         .unwrap();
 
@@ -241,6 +259,68 @@ mod tests {
             assert!(
                 !names.contains(&absent),
                 "Mobile policy must not register {absent}: {names:?}"
+            );
+        }
+    }
+
+    /// Supplying a `platform_tool_bridge` registers the four iOS tools as a
+    /// PROTECTED group even on a non-iOS build: the registration is
+    /// bridge-gated, not platform-gated. They are available WITHOUT "ios"
+    /// being in the caller-supplied active set (the protected-groups union
+    /// rule), excluded from `group_names()` (no load/unload schema slot),
+    /// and an unload_tools("ios") style request is impossible through the
+    /// schema — the group is simply always active.
+    #[test]
+    fn open_with_platform_bridge_registers_protected_ios_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = DaemonState::open(OpenOptions {
+            db_path: dir.path().join("state.redb"),
+            accounts_path: dir.path().join("accounts.toml"),
+            catalog_paths: CatalogPaths::default(),
+            tool_policy: ToolPolicy::Mobile,
+            max_turns: 0,
+            platform_tool_bridge: Some(std::sync::Arc::new(
+                crate::tools::ios_bridge::MockBridge::default(),
+            )),
+        })
+        .unwrap();
+
+        // Available WITHOUT "ios" in the caller-supplied active set.
+        let active: HashSet<String> = HashSet::new();
+        let defs = state.tool_registry.available_definitions(&active);
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        for tool in ["clipboard_write", "clipboard_read", "open_url", "notify"] {
+            assert!(names.contains(&tool), "missing {tool}: {names:?}");
+        }
+
+        // "ios" is protected: excluded from the load/unload schema enum and
+        // present in the protected set.
+        assert!(
+            !state.tool_registry.group_names().iter().any(|g| g == "ios"),
+            "protected groups must not appear in group_names()"
+        );
+        assert!(
+            state.tool_registry.protected_groups().contains("ios"),
+            "ios must be marked protected"
+        );
+        // Direct-only callers (exfiltration-chain mitigation) — checked on
+        // the four ios tools specifically (the union also surfaces core
+        // tools, which keep their own caller policy).
+        let ios_tools = ["clipboard_write", "clipboard_read", "open_url", "notify"];
+        // `available_definitions` (chat path) carries no callers field — the
+        // caller policy only rides the Responses-API definitions.
+        let resp_defs = state
+            .tool_registry
+            .available_definitions_for_responses(&active);
+        for def in resp_defs
+            .iter()
+            .filter(|d| ios_tools.contains(&d.function.name.as_str()))
+        {
+            assert_eq!(
+                def.function.allowed_callers.as_deref(),
+                Some(&[choreo_ai_protocols::openai::AllowedCaller::Direct][..]),
+                "{} must be Direct-only",
+                def.function.name
             );
         }
     }

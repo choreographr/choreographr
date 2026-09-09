@@ -311,14 +311,18 @@ fn pending_config_change(
 }
 
 /// Apply a captured session-config mutation to the worker's config copy.
-fn apply_pending_config_change(session: &mut SessionState, change: &PendingConfigChange) {
+fn apply_pending_config_change(
+    session: &mut SessionState,
+    change: &PendingConfigChange,
+    protected: &HashSet<String>,
+) {
     match change {
         PendingConfigChange::LoadTools(groups) => {
             apply_load_tools(&mut session.config.active_tool_groups, groups);
             debug!(groups = ?groups, "mirrored load_tools onto worker session config");
         }
         PendingConfigChange::UnloadTools(groups) => {
-            apply_unload_tools(&mut session.config.active_tool_groups, groups);
+            apply_unload_tools(&mut session.config.active_tool_groups, groups, protected);
             debug!(groups = ?groups, "mirrored unload_tools onto worker session config");
         }
         PendingConfigChange::SetWorkingDir(path) => {
@@ -1170,7 +1174,11 @@ pub(crate) fn run_agent_loop(
                 // copy is still discarded at request end, so the two copies
                 // cannot drift across requests.
                 for change in &pending_config_changes {
-                    apply_pending_config_change(session, change);
+                    apply_pending_config_change(
+                        session,
+                        change,
+                        ctx.tool_registry.protected_groups(),
+                    );
                 }
 
                 // A cancel observed during tool execution stops the request

@@ -13,6 +13,12 @@ use choreo_keystore::ServiceCredential;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 use std::sync::mpsc;
 
+/// Protected set for the mirror tests: just "core" (no platform tools
+/// registered in these unit tests).
+fn core_protected() -> std::collections::HashSet<String> {
+    std::collections::HashSet::from(["core".into()])
+}
+
 fn make_session_with_turns() -> SessionState {
     let mut session = SessionState::empty();
     let (tid0, _) = session.start_turn(Some("hello".into()));
@@ -1232,7 +1238,7 @@ fn pending_load_tools_captures_groups_and_applies() {
 
     let mut session = SessionState::empty();
     session.config.active_tool_groups = ["core".into(), "git".into()].into_iter().collect();
-    apply_pending_config_change(&mut session, &change);
+    apply_pending_config_change(&mut session, &change, &core_protected());
     assert!(session.config.active_tool_groups.contains("shell"));
     assert!(session.config.active_tool_groups.contains("x"));
     assert!(session.config.active_tool_groups.contains("core"));
@@ -1247,7 +1253,7 @@ fn pending_unload_tools_captures_groups_and_applies() {
 
     let mut session = SessionState::empty();
     session.config.active_tool_groups = ["core".into(), "shell".into()].into_iter().collect();
-    apply_pending_config_change(&mut session, &change);
+    apply_pending_config_change(&mut session, &change, &core_protected());
     assert!(!session.config.active_tool_groups.contains("shell"));
     assert!(session.config.active_tool_groups.contains("core"));
 }
@@ -1269,7 +1275,7 @@ fn pending_set_working_dir_mirrors_executed_result() {
 
     let mut session = SessionState::empty();
     session.discovered_skills = Some(Vec::new());
-    apply_pending_config_change(&mut session, &change);
+    apply_pending_config_change(&mut session, &change, &core_protected());
     assert_eq!(
         session.config.working_dir.as_deref(),
         Some(PathBuf::from("/real/canonical/sub").as_path())
@@ -1293,7 +1299,7 @@ fn pending_set_working_dir_falls_back_to_shared_resolution() {
         .expect("set_working_dir should produce a change");
 
     let mut session = SessionState::empty();
-    apply_pending_config_change(&mut session, &change);
+    apply_pending_config_change(&mut session, &change, &core_protected());
     assert_eq!(
         session.config.working_dir.as_deref(),
         Some(sub.canonicalize().unwrap().as_path())
@@ -1311,7 +1317,7 @@ fn pending_set_working_dir_nonexistent_path_still_invalidates_skills() {
 
     let mut session = SessionState::empty();
     session.discovered_skills = Some(Vec::new());
-    apply_pending_config_change(&mut session, &change);
+    apply_pending_config_change(&mut session, &change, &core_protected());
     assert_eq!(
         session.config.working_dir.as_deref(),
         Some(PathBuf::from("/gone/dir").as_path())
@@ -1338,7 +1344,7 @@ fn pending_set_working_dir_unresolvable_fallback_still_invalidates_skills() {
 
     let mut session = SessionState::empty();
     session.discovered_skills = Some(Vec::new());
-    apply_pending_config_change(&mut session, &change);
+    apply_pending_config_change(&mut session, &change, &core_protected());
     assert!(session.config.working_dir.is_none());
     assert!(
         session.discovered_skills.is_none(),

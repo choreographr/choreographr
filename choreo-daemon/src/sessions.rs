@@ -999,6 +999,12 @@ fn default_active_tool_groups() -> HashSet<String> {
     let mut groups = HashSet::from(["core".to_string(), "git".to_string(), "shell".to_string()]);
     #[cfg(feature = "content")]
     groups.insert("content".to_string());
+    // The iOS group is PROTECTED (register_platform_tools) and unioned into
+    // the active set at definition time regardless — listing it here is
+    // belt-and-suspenders for display honesty (same rationale as the
+    // CreateSession default list in daemon.rs).
+    #[cfg(target_os = "ios")]
+    groups.insert("ios".to_string());
     groups
 }
 
@@ -2050,9 +2056,13 @@ fn handle_unload_tools(
         return false;
     }
 
+    // The protected set lives in the live registry ("core" always; "ios"
+    // once register_platform_tools ran) — one source of truth shared with
+    // the unload_tools tool and the request worker's mirror.
     let result = crate::tools::unload_tools::apply_unload_tools(
         &mut state.config.active_tool_groups,
         &groups,
+        ctx.tool_registry.protected_groups(),
     );
 
     // Broadcast updated session state so the client picks up the new

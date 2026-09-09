@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+
+use crate::tools::ios_bridge::IosToolBridge;
 use std::sync::OnceLock;
 use std::sync::mpsc;
 
@@ -179,8 +181,17 @@ pub(crate) mod fs;
 pub(crate) mod git;
 pub(crate) mod glob_util;
 pub(crate) mod grep;
+// iOS-native-tool bridge (clipboard_write/clipboard_read/open_url/notify →
+// UIKit via a C-ABI bridge to the Swift host, ios/IosToolHost.swift).
+// Compiled UNCONDITIONALLY on every target — the `powershell` precedent:
+// modules compile everywhere, only tool REGISTRATION is platform-gated
+// (see `register_platform_tools`; the bridge's presence is the gate). The
+// concrete Swift-side impl lives in choreo-gui behind
+// #[cfg(target_os = "ios")].
 pub mod http;
 mod image;
+pub mod ios;
+pub mod ios_bridge;
 pub(crate) mod nu;
 #[cfg(feature = "blockchain")]
 pub(crate) mod subxt;
@@ -639,6 +650,13 @@ pub fn static_groups() -> &'static [ToolGroup] {
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn ToolDyn>>,
     dynamic_groups: Vec<(String, String)>,
+    /// Groups that cannot be unloaded and are ALWAYS active regardless of a
+    /// session's persisted active set. Always contains "core"; gains "ios"
+    /// when [`ToolRegistry::register_platform_tools`] runs. Protected groups
+    /// are excluded from `group_names()` (so load/unload schema enums never
+    /// offer them) and unioned into `available_definitions` (so their tools
+    /// are enabled even for pre-existing sessions that never listed them).
+    protected_groups: HashSet<String>,
 }
 
 impl Default for ToolRegistry {
@@ -681,6 +699,9 @@ impl ToolRegistry {
         let mut reg = Self {
             tools: HashMap::new(),
             dynamic_groups: Vec::new(),
+            // "core" is the original protected group: always active, never
+            // unloadable. register_platform_tools adds "ios" at runtime.
+            protected_groups: HashSet::from(["core".to_string()]),
         };
         reg.register(read_file::ReadFile);
         reg.register(read_file_range::ReadFileRange);
@@ -788,6 +809,40 @@ impl ToolRegistry {
         reg.register(set_working_dir::SetWorkingDir);
         reg.register(subsession::SpawnSubsession);
         reg
+    }
+
+    /// Register the four iOS-native tools (`clipboard_write`,
+    /// `clipboard_read`, `open_url`, `notify`) under the protected `"ios"`
+    /// group.
+    ///
+    /// Called from `DaemonState::open` (between `new_for_policy` and
+    /// `build_for_policy`) ONLY when the embedder supplies a
+    /// `platform_tool_bridge` — the bridge's presence is the gate, not a
+    /// `cfg`, so desktop daemons (which pass `None`) never register the
+    /// group, while tests can register it on any platform. Marks `"ios"` as
+    /// a PROTECTED group: always active (the definitions union rule makes
+    /// pre-existing sessions pick it up too) and unloadable by no one — the
+    /// tools touch the device's shared clipboard and system URL handler, and
+    /// their constant availability on the hosting device is a platform
+    /// property, not a per-session choice.
+    pub fn register_platform_tools(&mut self, bridge: Arc<dyn IosToolBridge>) {
+        self.register(ios::clipboard::ClipboardWrite::new(Arc::clone(&bridge)));
+        self.register(ios::clipboard::ClipboardRead::new(Arc::clone(&bridge)));
+        self.register(ios::open_url::OpenUrl::new(Arc::clone(&bridge)));
+        self.register(ios::notify::Notify::new(bridge));
+        self.protected_groups.insert(ios::IOS_GROUP.to_string());
+        tracing::info!(
+            group = ios::IOS_GROUP,
+            "registered iOS platform tools (protected group)"
+        );
+    }
+
+    /// The set of protected group names: always active and unloadable by no
+    /// one (see [`ToolRegistry::register_platform_tools`]). Read by the
+    /// unload path (`apply_unload_tools`) so the tool, the session handler,
+    /// and the request worker's mirror all share one source of truth.
+    pub fn protected_groups(&self) -> &HashSet<String> {
+        &self.protected_groups
     }
 
     /// Build a shared registry with the RunRiscV tool registered.
@@ -937,6 +992,18 @@ impl ToolRegistry {
 
     pub fn groups(&self) -> Vec<ToolGroup> {
         let mut groups: Vec<ToolGroup> = static_groups().to_vec();
+        // Protected non-core groups ("ios") don't live in static_groups (it
+        // is a OnceLock shared by registries that never registered them), so
+        // surface them here — clients listing the group catalog should see
+        // them even though they can never be loaded/unloaded.
+        if self.protected_groups.contains(ios::IOS_GROUP) {
+            groups.push(ToolGroup {
+                name: ios::IOS_GROUP.into(),
+                description:
+                    "Device-native tools (clipboard, open_url, notify) — always active on iOS"
+                        .into(),
+            });
+        }
         for (name, desc) in &self.dynamic_groups {
             groups.push(ToolGroup {
                 name: name.clone(),
@@ -946,12 +1013,14 @@ impl ToolRegistry {
         groups
     }
 
-    /// Return group names suitable for a JSON Schema enum (excluding "core", which
-    /// is always active and should not appear in load_tools/unload_tools schemas).
+    /// Return group names suitable for a JSON Schema enum (excluding every
+    /// PROTECTED group — "core" and, when registered, "ios" — which are
+    /// always active and can be neither loaded nor unloaded, so the
+    /// load_tools/unload_tools schemas must not offer them).
     pub fn group_names(&self) -> Vec<String> {
         self.groups()
             .into_iter()
-            .filter(|g| g.name != "core")
+            .filter(|g| !self.protected_groups.contains(&g.name))
             .map(|g| g.name)
             .collect()
     }
@@ -963,7 +1032,12 @@ impl ToolRegistry {
     /// group names before they can be persisted into a session's active set.
     pub(crate) fn known_group_names(&self) -> HashSet<String> {
         let mut s: HashSet<String> = self.group_names().into_iter().collect();
-        s.insert("core".into());
+        // Protected groups are known names too ("core" loads as a no-op and
+        // unload attempts produce the "cannot be unloaded" reply; "ios" —
+        // when registered — behaves the same). Without this, an
+        // unload_tools("ios") would be rejected as unknown instead of
+        // reaching the protected-group message.
+        s.extend(self.protected_groups.iter().cloned());
         s
     }
 
@@ -977,7 +1051,12 @@ impl ToolRegistry {
     pub fn available_definitions(&self, active: &HashSet<String>) -> Vec<ChatToolDefinition> {
         self.tools
             .values()
-            .filter(|t| active.contains(t.group()))
+            // Union the session's active set with the protected groups: the
+            // iOS tools are enabled by default even for pre-existing
+            // persisted sessions whose stored active set predates the group
+            // (the group is unloadable, so "not listed" can only mean
+            // "session is older than the group", never "user opted out").
+            .filter(|t| active.contains(t.group()) || self.protected_groups.contains(t.group()))
             .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
             .collect()
     }
@@ -991,7 +1070,8 @@ impl ToolRegistry {
     ) -> Vec<ChatToolDefinition> {
         self.tools
             .values()
-            .filter(|t| active.contains(t.group()))
+            // Same protected-group union as `available_definitions` (see it).
+            .filter(|t| active.contains(t.group()) || self.protected_groups.contains(t.group()))
             .map(|t| {
                 let callers = t.allowed_callers();
                 ChatToolDefinition::function_with_options(
@@ -1280,10 +1360,12 @@ mod tests {
         assert!(!known.contains("coord"));
         let active: HashSet<String> = ["content".into(), "coord".into()].into_iter().collect();
         let defs = registry.available_definitions(&active);
+        // The protected-groups union (core always) means core tools still
+        // appear; the binding claim is that NO content/coord-group tool does.
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(
-            defs.is_empty(),
-            "content/coord groups must contribute no tools: {:?}",
-            defs.iter().map(|d| &d.function.name).collect::<Vec<_>>()
+            !names.iter().any(|n| n.starts_with("coord_")),
+            "content/coord groups must contribute no tools: {names:?}"
         );
     }
 

@@ -962,6 +962,12 @@ impl DaemonState {
         let mut default_groups = vec!["core".to_string(), "git".to_string(), "shell".to_string()];
         #[cfg(feature = "content")]
         default_groups.push("content".to_string());
+        // The iOS tools' group is PROTECTED (register_platform_tools) and
+        // always unioned into the active set at definition time — listing it
+        // here is belt-and-suspenders so the session's persisted/displayed
+        // active set is honest about what the model can actually call.
+        #[cfg(target_os = "ios")]
+        default_groups.push("ios".to_string());
         let active_cats = if active_tool_groups.is_empty() {
             default_groups
         } else {

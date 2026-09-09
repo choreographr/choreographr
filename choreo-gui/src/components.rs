@@ -7,6 +7,8 @@
 #![allow(clippy::useless_format)]
 use crate::client::{send_client_message, submit_input};
 use crate::render::render_turn;
+#[cfg(target_os = "ios")]
+use crate::settings;
 use crate::state::AppState;
 use choreo_proto::ClientMessage;
 use dioxus::prelude::*;
@@ -77,8 +79,60 @@ pub(crate) fn Toolbar(
                 }
                 button { onclick: on_cancel, "Cancel" }
             }
+            // The on-device tools toggle exists ONLY on iOS (the setting
+            // gates the Swift bridge there); the desktop/Android build gets
+            // an empty component so the rsx call site compiles unchanged.
+            OnDeviceToolsToggle { state }
         }
     }
+}
+
+/// iOS toolbar toggle for the persisted "on-device tools" setting
+/// (`gui-settings.toml`). The bridge is handed to `DaemonState::open` during
+/// startup, so the label and the confirmation status BOTH state that a
+/// change applies on the next app start — toggling mid-session cannot
+/// re-register the protected tool group live.
+#[component]
+#[cfg(target_os = "ios")]
+fn OnDeviceToolsToggle(state: Signal<AppState>) -> Element {
+    let label = if settings::on_device_tools_cached() {
+        "ON"
+    } else {
+        "OFF"
+    };
+
+    let on_toggle = move |_| match settings::toggle_on_device_tools() {
+        Ok(enabled) => {
+            // The status push is also the rerender trigger: the label above
+            // reads the cache atomic, which is re-evaluated on rerender.
+            let verb = if enabled { "enabled" } else { "disabled" };
+            state.write().status_texts.push(format!(
+                "[settings] on-device tools {verb} — takes effect after restarting the app"
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "on-device tools toggle persist failed");
+            state.write().status_texts.push(format!(
+                "[settings] could not save on-device tools setting: {error}"
+            ));
+        }
+    };
+
+    rsx! {
+        div { class: "settings-row",
+            button { onclick: on_toggle, "On-device tools: {label} (next app start)" }
+        }
+    }
+}
+
+/// Desktop/Android fallback: the setting is iOS-only (the bridge exists only
+/// there), so the toolbar slot renders nothing — one call site, no cfg in
+/// the parent rsx.
+#[component]
+#[cfg(not(target_os = "ios"))]
+fn OnDeviceToolsToggle(state: Signal<AppState>) -> Element {
+    let _ = state;
+    rsx! {}
 }
 
 #[component]

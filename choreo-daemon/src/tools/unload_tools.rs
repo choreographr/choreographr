@@ -20,20 +20,22 @@ pub(crate) struct UnloadToolsArgs {
 // ── Execute ────────────────────────────────────────────────────────────────
 
 /// Apply an `unload_tools` request to the session's active group set,
-/// returning a human-readable summary of what changed.  The "core" group is
-/// protected and cannot be removed.
+/// returning a human-readable summary of what changed.  Protected groups
+/// ("core" and, when registered, "ios" — the set comes from the live
+/// [`crate::tools::ToolRegistry::protected_groups`]) cannot be removed.
 ///
 /// Pure function (no I/O, no channels) so it can be unit-tested directly and
 /// reused by the session main loop, which holds the authoritative group set.
 pub(crate) fn apply_unload_tools(
     active_tool_groups: &mut HashSet<String>,
     groups: &[String],
+    protected: &HashSet<String>,
 ) -> String {
     let mut unloaded = Vec::new();
-    let mut protected = Vec::new();
+    let mut protected_hits = Vec::new();
     for g in groups {
-        if g == "core" {
-            protected.push(g.clone());
+        if protected.contains(g) {
+            protected_hits.push(g.clone());
         } else if active_tool_groups.remove(g) {
             unloaded.push(g.clone());
         }
@@ -46,8 +48,12 @@ pub(crate) fn apply_unload_tools(
             humfmt::list(&unloaded)
         ));
     }
-    if !protected.is_empty() {
-        parts.push("The 'core' group cannot be unloaded.".to_string());
+    if !protected_hits.is_empty() {
+        parts.push(format!(
+            "The {} group{} cannot be unloaded.",
+            humfmt::list(&protected_hits),
+            if protected_hits.len() == 1 { "" } else { "s" }
+        ));
     }
     if parts.is_empty() {
         parts.push("None of the specified groups were active.".to_string());
@@ -137,7 +143,7 @@ impl Tool for UnloadTools {
     fn description(&self) -> &'static str {
         "Deactivate one or more tool groups. Tools in deactivated \
          groups will no longer be available to call in this session. \
-         The 'core' group cannot be unloaded."
+         Protected groups ('core', and 'ios' on iOS) cannot be unloaded."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
@@ -168,9 +174,10 @@ impl Tool for UnloadTools {
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
         // Reject unknown group names against the live catalog (the schema
-        // enum is advisory — the model may pass anything).  "core" is a known
-        // name here even though it is protected from unload; it reaches
-        // apply_unload_tools and produces the "cannot be unloaded" reply.
+        // enum is advisory — the model may pass anything).  Protected groups
+        // are known names here even though they cannot be unloaded; they
+        // reach apply_unload_tools and produce the "cannot be unloaded"
+        // reply.
         if let Some(known) = self.registry.upgrade().map(|r| r.known_group_names())
             && let Some(unknown) = unknown_group_names(&args.groups, &known)
         {
@@ -237,34 +244,60 @@ mod tests {
         let mut active: HashSet<String> = ["core".into(), "git".into(), "shell".into(), "x".into()]
             .into_iter()
             .collect();
-        let result = apply_unload_tools(&mut active, &["x".into()]);
+        let result = apply_unload_tools(&mut active, &["x".into()], &default_protected());
         assert_eq!(result, "Deactivated tool groups: x");
         assert!(!active.contains("x"));
         assert!(active.contains("core"));
         assert!(active.contains("git"));
     }
 
+    /// The default protected set ("core"; "ios" joins it only when the
+    /// platform tools are registered — mirrors `ToolRegistry::new`).
+    fn default_protected() -> HashSet<String> {
+        HashSet::from(["core".into()])
+    }
+
     #[test]
     fn apply_protects_core() {
         let mut active: HashSet<String> = ["core".into(), "git".into()].into_iter().collect();
-        let result = apply_unload_tools(&mut active, &["core".into()]);
-        assert_eq!(result, "The 'core' group cannot be unloaded.");
+        let result = apply_unload_tools(&mut active, &["core".into()], &default_protected());
+        assert_eq!(result, "The core group cannot be unloaded.");
         assert!(active.contains("core"));
+    }
+
+    #[test]
+    fn apply_protects_ios_when_registered() {
+        // With "ios" in the protected set (register_platform_tools ran), an
+        // unload attempt must produce the protected reply, not remove the
+        // group from the active set.
+        let mut active: HashSet<String> = ["core".into(), "ios".into()].into_iter().collect();
+        let protected: HashSet<String> = HashSet::from(["core".into(), "ios".into()]);
+        let result = apply_unload_tools(&mut active, &["ios".into()], &protected);
+        assert_eq!(result, "The ios group cannot be unloaded.");
+        assert!(active.contains("ios"));
     }
 
     #[test]
     fn apply_skips_inactive() {
         let mut active: HashSet<String> = ["core".into()].into_iter().collect();
-        let result = apply_unload_tools(&mut active, &["x".into(), "vm".into()]);
+        let result = apply_unload_tools(
+            &mut active,
+            &["x".into(), "vm".into()],
+            &default_protected(),
+        );
         assert_eq!(result, "None of the specified groups were active.");
     }
 
     #[test]
     fn apply_protected_and_unloaded() {
         let mut active: HashSet<String> = ["core".into(), "shell".into()].into_iter().collect();
-        let result = apply_unload_tools(&mut active, &["core".into(), "shell".into()]);
+        let result = apply_unload_tools(
+            &mut active,
+            &["core".into(), "shell".into()],
+            &default_protected(),
+        );
         assert!(result.contains("Deactivated tool groups: shell"));
-        assert!(result.contains("The 'core' group cannot be unloaded."));
+        assert!(result.contains("cannot be unloaded"));
         assert!(active.contains("core"));
         assert!(!active.contains("shell"));
     }

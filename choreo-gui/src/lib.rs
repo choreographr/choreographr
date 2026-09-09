@@ -2,7 +2,17 @@ mod client;
 mod components;
 mod hooks;
 mod render;
+mod settings;
 mod state;
+// iOS-only bridge to the Swift host (ios/IosToolHost.swift) implementing
+// choreo_daemon::tools::ios_bridge::IosToolBridge. Gated on target_os =
+// "ios" because that is also the cfg under which choreo-gui depends on
+// choreo-daemon (see Cargo.toml) — desktop/Android builds have no
+// choreo_daemon symbols to link against. Declared `pub` so the module is a
+// reachable public item (no dead_code warning until the tools that hold the
+// bridge arrive next subsession, and testable from anywhere in the crate).
+#[cfg(target_os = "ios")]
+pub mod ios_bridge;
 
 use crate::client::apply_daemon_message;
 use crate::components::{Composer, HistoryList, Toolbar};
@@ -112,6 +122,22 @@ fn embedded_connection_mode() -> Option<ConnectionMode> {
         catalog_paths: choreo_daemon::catalog::CatalogPaths::from_dirs(),
         tool_policy: choreo_daemon::ToolPolicy::Mobile,
         max_turns: 0,
+        // iOS: hand the embedded daemon the Swift-host bridge so the
+        // clipboard/open_url/notify tools are registered (protected group).
+        // The cfg mirrors the choreo-daemon dependency gate in Cargo.toml —
+        // desktop/Android builds pass None and the group never exists. The
+        // user's persisted "on-device tools" setting (settings.rs, default
+        // ON — all four tools are permission-free) gates the bridge; because
+        // registration happens HERE, at DaemonState::open, a toggle only
+        // takes effect on the next app start (the toolbar says so).
+        #[cfg(target_os = "ios")]
+        platform_tool_bridge: if settings::init_on_device_tools() {
+            Some(std::sync::Arc::new(ios_bridge::SwiftIosToolBridge::new()))
+        } else {
+            None
+        },
+        #[cfg(not(target_os = "ios"))]
+        platform_tool_bridge: None,
     }) {
         Ok(state) => state,
         Err(e) => {

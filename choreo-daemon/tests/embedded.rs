@@ -24,6 +24,8 @@ fn open_state(dir: &tempfile::TempDir) -> DaemonState {
         },
         tool_policy: ToolPolicy::Full,
         max_turns: 0,
+        // No platform bridge in these tests — the ios group stays unregistered.
+        platform_tool_bridge: None,
     })
     .unwrap()
 }

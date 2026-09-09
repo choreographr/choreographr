@@ -33,6 +33,11 @@ targets:
     platform: iOS
     sources:
       - path: main.m
+      # Swift host for the iOS-native-tool bridge (clipboard/open_url/notify
+      # → UIKit). Mixed ObjC main.m + Swift app target: SWIFT_VERSION 5.0 is
+      # set below, and the -framework UIKit/Foundation link entries the Swift
+      # sources need are already present.
+      - path: IosToolHost.swift
     info:
       path: Info.plist
     settings:

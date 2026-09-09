@@ -842,6 +842,8 @@ alloy/subxt clients, and the daemon calls their synchronous `execute_*` entry po
 | `tools/admin/` | Session-admin tools (`list_sessions`, `get_session`, `load_skill`), one file per tool. |
 | `tools/pdf/` | Native PDF ingestion tools (`pdf_classify`, `pdf_to_markdown`), one file per tool (`classify.rs`, `markdown.rs`) with shared input-gating / output-hygiene helpers in `pdf/mod.rs` and the shared PDF fixture builders in `pdf/test_fixtures.rs`. |
 | `tools/glob_util.rs` | `GlobFilter` — shared glob-matching utility used by `delete_files` and `grep` that follows gitignore conventions (patterns without `/` match basename, patterns with `/` match full path). |
+| `tools/ios/` | The four iOS-native `Tool` wrappers — `clipboard_write`, `clipboard_read`, `open_url`, `notify` — over `tools/ios_bridge.rs`. Compiled UNCONDITIONALLY (no cfg anywhere; it contains no Apple API, only bridge calls, following the `powershell` precedent) but registered only when the embedder supplies `OpenOptions.platform_tool_bridge` — the bridge's presence is the gate, keeping the group testable on every platform. Registered by `ToolRegistry::register_platform_tools` (called from `DaemonState::open` between `new_for_policy` and `build_for_policy`), which also marks `"ios"` as a PROTECTED group: `ToolRegistry.protected_groups` (always contains `"core"`) is unioned into `available_definitions`/`available_definitions_for_responses` (pre-existing persisted sessions get the tools too), excluded from `group_names()` (never offered to load/unload schema enums), and consumed by `apply_unload_tools` (now parameterized on the protected set instead of hardcoding `"core"`). All four tools override `allowed_callers()` to Direct-only — the recorded security decision for this batch: all four are Direct-only because `clipboard_read` combined with `http_request`/`open_url` forms an exfiltration chain (a model could read the clipboard and ship its contents out via a URL or HTTP call), and Direct-caller gating keeps every one of the four out of the LLM-driven tool loop; the residual risk (the model being handed the results by a Direct caller flow) is consciously accepted for this no-permission batch. `ToolPolicy` is otherwise unchanged: the group registers purely on the bridge's PRESENCE (the embedder's `platform_tool_bridge`), never on the platform — a `Mobile` embedded daemon without a bridge has no ios tools, and the registration-gate rationale is the `powershell` precedent (unconditional compile, conditional registration). All four tools entry-check `ToolContext.cancelled` before dispatching, wait with the cancel-precedence `IosToolPending::wait` (per-tool timeout constants injected as constructor params so tests use `Duration::ZERO`), and best-effort `pending.cancel()` on the late-cancel path. `open_url` re-validates in `execute` (https:/mailto: prefix allow-list + control-character ban — the schema pattern is advisory, the executor is the boundary); `notify` enforces 200/2000-char title/body caps in `execute`. The iOS GUI passes `SwiftIosToolBridge` via `OpenOptions` under `cfg(target_os = "ios")`, further gated by the user's persisted "on-device tools" setting (see the choreo-gui section — default ON, applies on next app start); desktop passes `None`. |
+| `tools/ios_bridge.rs` | iOS-native-tool C-ABI bridge — the Rust half of the choreo-daemon ↔ Swift host seam for the iOS tools (clipboard_write/clipboard_read/open_url/notify). Compiled UNCONDITIONALLY (the `powershell` precedent: modules compile everywhere, only registration is platform-gated). Owns the object-safe `IosToolBridge` trait, the `IosToolRequest`/`ToolBridgeReply` envelopes, serializable `ToolBridgeError` (BridgeUnavailable/Canceled/Timeout/Platform), the `IosToolPending` handle (deadline-bounded `wait` with cancellation polling and cancel-precedence over an already-arrived reply, plus best-effort `cancel()` via a `Box<dyn FnOnce()>` hook), named per-tool timeouts (1500/3000/5000 ms), and the scripted `MockBridge`. The concrete `SwiftIosToolBridge` lives in choreo-gui under `#[cfg(target_os = "ios")]` (that crate depends on choreo-daemon only for iOS); the Swift side is `ios/IosToolHost.swift` (main-queue-serialized handlers, exactly-once reply per request) — NOT compiled in CI; the zig path of `scripts/build-ios.sh` validates the Rust cfg(ios) code. BINDING reply-slot ownership contract (verbatim in the module header): each request boxes a one-shot crossbeam reply Sender as an opaque pointer passed through the C ABI; ownership transfers to Swift at dispatch; Rust NEVER frees the box; Swift guarantees exactly-once reply on its serial main queue; if Rust abandons (timeout/cancel) it drops the receiver and a late Swift reply sends into a disconnected channel (Err ignored) and then drops the slot — no UAF, no leak. THREADING: the bridge needs NO new sanctioned shared-state exception — every request carries its OWN boxed crossbeam one-shot reply Sender as the C-ABI context pointer (no state is shared between requests or threads; the only cross-thread path is the channel), so the AGENTS.md channel-only rule holds unmodified. |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`ChoreographrSyscall`) for tool dispatch. |
 | `tools/shell_util.rs` | Shared child-process spawning for the shell/exec tools (`spawn_with_watchdog` / `spawn_with_streaming`): env sanitization, output caps, the timeout watchdog, and process-tree isolation — process-group + pidfd kill on Unix, a Windows Job Object (`ChildJob`) with blocking reads bounded by job termination on Windows. All waits are channel-driven (`recv_timeout` on the watchdog and on every drain's completion channel — no polling), each bounded by a completion grace that detaches a wedged drain rather than hanging the tool; the `Arc<ChildJob>` shared by the watchdog and drain threads is the fifth sanctioned shared-state exception (AGENTS.md). `binary_exists` (the registration-time PATH probe for conditional tool registration) resolves Windows executables through PATHEXT extension candidates — a bare `nu` is really `nu.exe` — so Unix behavior is exact-name while Windows probes every PATHEXT entry. |
 | `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json`, spawns subprocesses via `McpClient`, wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) and registers them in the `ToolRegistry` under a `mcp/<slug>` group. Compiled only with the `mcp` cargo feature (off by default); without it the module degrades to a no-op `McpManager` stub so call sites compile unchanged. |
@@ -1471,6 +1473,33 @@ branch is `#[cfg]`-selected, so an on-host test can only pin the desktop
 branch — the iOS branch is exercised on-device and by `scripts/check-ios.sh`'s
 target compile).
 
+**On-device tools + the settings store (iOS only).** The embedded daemon gets
+`OpenOptions.platform_tool_bridge: Some(SwiftIosToolBridge)` — the C-ABI bridge
+to `ios/IosToolHost.swift` (see the choreo-daemon `tools/ios_bridge.rs` row) —
+which makes `DaemonState::open` register the four protected on-device tools
+(`clipboard_write`, `clipboard_read`, `open_url`, `notify`). The bridge hand-off
+is gated by the user's persisted **on-device tools** setting (default ON — all
+four tools are iOS permission-free). `settings.rs` is the GUI's own minimal
+preference store (the crate's FIRST settings mechanism): `gui-settings.toml` in
+the shared config dir (via `choreo_keystore::paths::config_dir()` — inside the
+iOS app sandbox, NOT the daemon DB, because the bridge decision happens BEFORE
+any daemon exists). Load is deliberately tolerant (missing/corrupt/unparseable
+file → defaults + warning; every field is `#[serde(default)]`, so older files
+stay parseable), and persistence is a whole-file rewrite (tiny file, single
+GUI writer — no advisory lock, unlike known_servers.toml). A toolbar toggle
+(`OnDeviceToolsToggle`, iOS-only; desktop/Android render an empty component so
+the call site compiles unchanged) flips the setting and persists it; BOTH the
+button label and the confirmation status state that the change **applies on
+next app start**, because the bridge is handed to `DaemonState::open` during
+startup and the protected group cannot be re-registered live. The in-session
+toggle reads/writes a startup-cached `AtomicBool` (a single startup-resolved
+bit, no protocol data); the persisted FILE is the source of truth the next
+launch reads, and it is written BEFORE the cache adopts the new value, so a
+failed write leaves the cache matching disk. All of the settings surface is
+compiled on every target (platform-neutral concept; host unit tests cover the
+load/persist round-trip), with the iOS consumers cfg-gated; a plain desktop
+build's behavior is unchanged.
+
 **Module breakdown:**
 
 | Module | Purpose |
@@ -1480,6 +1509,8 @@ target compile).
 | `state.rs` | `AppState` with input, request tracking, `ClientHistory` |
 | `render.rs` | RSX rendering of history items: markdown → sanitized HTML, images via `data:` URLs, structured diffs via `format_diff_file` |
 | `lib.rs` | clap CLI, Dioxus `App` component, toolbar, history pane, textarea composer, CSS |
+| `settings.rs` | The GUI's own preference store (`gui-settings.toml` in the shared config dir, resolved through `choreo_keystore::paths::config_dir()`): tolerant load (defaults on missing/corrupt file), whole-file persist, the persisted `on_device_tools` flag (default ON), and the iOS-only startup cache + toggle helpers — see the "On-device tools" note above |
+| `ios_bridge.rs` | The cfg(ios) concrete bridge implementing `choreo_daemon::tools::ios_bridge::IosToolBridge` against the Swift host over the C ABI: `SwiftIosToolBridge` (per-request monotonic ids, boxed one-shot crossbeam reply Sender as the opaque context, NUL-check before dispatch), the exported `choreo_ios_tool_reply` callback (reconstructs the box, decodes the payload, sends exactly once, drops the slot), and the reply-slot ownership contract — see the choreo-daemon `tools/ios_bridge.rs` row. Desktop/Android never compile this module (the choreo-daemon dependency itself is iOS-gated) |
 
 
 ### `choreo-im` — IM platform bridge

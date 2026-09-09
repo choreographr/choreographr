@@ -256,6 +256,8 @@ pub fn main() -> anyhow::Result<()> {
         catalog_paths: crate::catalog::CatalogPaths::from_dirs(),
         tool_policy: crate::tools::ToolPolicy::Full,
         max_turns,
+        // Desktop CLI: no platform-native tool host exists in this process.
+        platform_tool_bridge: None,
     })
     .context("failed to open daemon state")?;
 
