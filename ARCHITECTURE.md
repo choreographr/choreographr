@@ -843,7 +843,7 @@ alloy/subxt clients, and the daemon calls their synchronous `execute_*` entry po
 | `tools/pdf/` | Native PDF ingestion tools (`pdf_classify`, `pdf_to_markdown`), one file per tool (`classify.rs`, `markdown.rs`) with shared input-gating / output-hygiene helpers in `pdf/mod.rs` and the shared PDF fixture builders in `pdf/test_fixtures.rs`. |
 | `tools/glob_util.rs` | `GlobFilter` — shared glob-matching utility used by `delete_files` and `grep` that follows gitignore conventions (patterns without `/` match basename, patterns with `/` match full path). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`ChoreographrSyscall`) for tool dispatch. |
-| `tools/shell_util.rs` | Shared child-process spawning for the shell/exec tools (`spawn_with_watchdog` / `spawn_with_streaming`): env sanitization, output caps, the timeout watchdog, and process-tree isolation — process-group + pidfd kill on Unix, a Windows Job Object (`ChildJob`) with blocking reads bounded by job termination on Windows. All waits are channel-driven (`recv_timeout` on the watchdog and on every drain's completion channel — no polling), each bounded by a completion grace that detaches a wedged drain rather than hanging the tool; the `Arc<ChildJob>` shared by the watchdog and drain threads is the fifth sanctioned shared-state exception (AGENTS.md). |
+| `tools/shell_util.rs` | Shared child-process spawning for the shell/exec tools (`spawn_with_watchdog` / `spawn_with_streaming`): env sanitization, output caps, the timeout watchdog, and process-tree isolation — process-group + pidfd kill on Unix, a Windows Job Object (`ChildJob`) with blocking reads bounded by job termination on Windows. All waits are channel-driven (`recv_timeout` on the watchdog and on every drain's completion channel — no polling), each bounded by a completion grace that detaches a wedged drain rather than hanging the tool; the `Arc<ChildJob>` shared by the watchdog and drain threads is the fifth sanctioned shared-state exception (AGENTS.md). `binary_exists` (the registration-time PATH probe for conditional tool registration) resolves Windows executables through PATHEXT extension candidates — a bare `nu` is really `nu.exe` — so Unix behavior is exact-name while Windows probes every PATHEXT entry. |
 | `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json`, spawns subprocesses via `McpClient`, wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) and registers them in the `ToolRegistry` under a `mcp/<slug>` group. Compiled only with the `mcp` cargo feature (off by default); without it the module degrades to a no-op `McpManager` stub so call sites compile unchanged. |
 
 ### Provider Architecture
@@ -3440,7 +3440,17 @@ itself is the kernel's responsibility.
 
 `fish` runs commands in a child `fish -c` process with the same sandboxing as `sh`. Registered only when the `fish` binary is found in `PATH`.
 
-Shell tools (`sh`, `fish`, `nu`, `exec`, and the streaming variants) put the
+### `powershell` — PowerShell command execution (Windows)
+
+`powershell` runs commands in a child `powershell.exe` (Windows PowerShell 5.1, always present on Windows) or `pwsh.exe` (PowerShell 7+) process with the same watchdog/streaming plumbing as the other shell tools. Registered only on Windows, and only when at least one of the two binaries is found in `PATH` (probed with PATHEXT-aware resolution — see `binary_exists` in `tools/shell_util.rs`). Two Windows-specific hardenings are baked into every invocation:
+
+1. **`-EncodedCommand`** — the script (a UTF-8 output-encoding preamble plus the user's command) is Base64-encoded as UTF-16LE, sidestepping Windows' nested command-line quoting rules entirely: LLM-generated commands containing any mix of quotes, `%VAR%`, `!`, or carets arrive byte-exact at the shell.
+2. **UTF-8 output** — `[Console]::OutputEncoding` is forced to UTF-8 (and `$ProgressPreference` silenced) at the start of the script, so redirected stdout is UTF-8 like every other platform instead of the console code page.
+
+`-NoProfile` and `-NonInteractive` keep user profile scripts and interactive prompts out of the tool path. Exit codes follow PowerShell semantics: `exit N` sets a nonzero code.
+
+Shell tools (`sh`, `fish`, `nu`, `powershell`, `exec`, and the streaming
+variants) put the
 child in its own process group (`setup_child` in `tools/shell_util.rs`, applied
 inside the shared `spawn_with_watchdog` / `spawn_with_streaming` helpers); on
 timeout the watchdog kills the whole group via `killpg(2)`. On Linux the

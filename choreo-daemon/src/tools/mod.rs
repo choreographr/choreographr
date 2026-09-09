@@ -191,6 +191,12 @@ pub(crate) mod subxt;
 // via `default-features = false`. See choreo-daemon/Cargo.toml.
 #[cfg(feature = "pdf")]
 pub(crate) mod pdf;
+// The tool is only REGISTERED on Windows (see `new_for_policy`), so on other
+// platforms everything here is construction-dead; keep the module compiled
+// (its unit tests run on any dev box) but silence the dead-code analysis
+// there.
+#[cfg_attr(not(target_os = "windows"), expect(dead_code))]
+pub(crate) mod powershell;
 pub(crate) mod random;
 pub(crate) mod read_file;
 pub(crate) mod read_file_range;
@@ -589,7 +595,7 @@ pub fn static_groups() -> &'static [ToolGroup] {
             },
             ToolGroup {
                 name: "shell".into(),
-                description: "Shell command execution (bash, nushell, fish, exec)".into(),
+                description: "Shell command execution (bash, nushell, fish, powershell, exec)".into(),
             },
             ToolGroup {
                 name: "x".into(),
@@ -702,6 +708,16 @@ impl ToolRegistry {
                 reg.register(fish::FishShell);
             }
             reg.register(exec::Exec);
+            // PowerShell tool — Windows-only registration, gated on a
+            // PowerShell binary actually being on PATH (Windows PowerShell
+            // 5.1 is always present on Windows; pwsh is the optional 7+).
+            // The tool itself compiles everywhere so its unit tests run on
+            // any dev box, but registering it where no PowerShell exists
+            // would advertise a tool that can never spawn.
+            #[cfg(target_os = "windows")]
+            if shell_util::binary_exists("powershell") || shell_util::binary_exists("pwsh") {
+                reg.register(powershell::PowerShell);
+            }
         }
         reg.register(grep::Grep);
         reg.register(find::Find);

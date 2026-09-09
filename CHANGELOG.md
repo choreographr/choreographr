@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `powershell` shell tool for Windows: executes commands via Windows
+  PowerShell 5.1 (`powershell.exe`, always present) or PowerShell 7+ (`pwsh`)
+  with the same timeout-watchdog/streaming plumbing as the other shell tools.
+  Invocations run `-NoProfile -NonInteractive -EncodedCommand` (Base64
+  UTF-16LE, so LLM-generated quoting never needs escaping), with a preamble
+  forcing `[Console]::OutputEncoding` to UTF-8 so redirected output is UTF-8
+  instead of the console code page (and `$ProgressPreference` silenced).
+  Registered only on Windows, and only when a PowerShell binary is on PATH.
+
+### Fixed
+
+- `binary_exists` (the registration-time PATH probe behind conditional tool
+  registration) now resolves Windows executables through PATHEXT: a bare
+  `nu`/`pwsh` is really `nu.exe`/`pwsh.exe`, so the old exact-name probe
+  missed every installed binary on Windows. Unix behavior is unchanged.
+
+### Changed
+
+- `itertools` adopted (declared in `[workspace.dependencies]`, consumed by
+  `choreo-daemon` and `choreo-ai-protocols`) alongside a new AGENTS.md
+  dependency-management rule: use it where it genuinely improves code
+  quality (`.format()` joins, `.sorted()`, `process_results`), never for its
+  own sake. Applied at the concrete sites that warranted it: the grep tool's
+  `describe_invocation` (a chain of conditional clauses instead of a manual
+  `parts` vec), the three output renderers (`flat_map` + `.format("\n")`
+  replacing buffered collect-join, `sorted()` folding the sort into the
+  chain), `handle_evict_largest_lagging` (hand-rolled max accumulator →
+  `max_by_key`), the Anthropic/Google system-message joining (multi-message
+  newline joining via `.format("\n")` instead of push-with-separator
+  bookkeeping), and Google system texts kept borrowed instead of cloned.
+  Behavior-preserving; existing tests pin every output shape.
 - Channel-selection convention in [AGENTS.md](./AGENTS.md) (Thread
   Communication section): thread-to-thread messaging in the crates that
   already depend on it (`choreo-daemon`, `choreo-tui`, `choreo-client-core`,
@@ -155,19 +186,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `itertools` adopted (declared in `[workspace.dependencies]`, consumed by
-  `choreo-daemon` and `choreo-ai-protocols`) alongside a new AGENTS.md
-  dependency-management rule: use it where it genuinely improves code
-  quality (`.format()` joins, `.sorted()`, `process_results`), never for its
-  own sake. Applied at the concrete sites that warranted it: the grep tool's
-  `describe_invocation` (a chain of conditional clauses instead of a manual
-  `parts` vec), the three output renderers (`flat_map` + `.format("\n")`
-  replacing buffered collect-join, `sorted()` folding the sort into the
-  chain), `handle_evict_largest_lagging` (hand-rolled max accumulator →
-  `max_by_key`), the Anthropic/Google system-message joining (multi-message
-  newline joining via `.format("\n")` instead of push-with-separator
-  bookkeeping), and Google system texts kept borrowed instead of cloned.
-  Behavior-preserving; existing tests pin every output shape.
 - Connection keying for the in-process mode: `choreo-gui`'s
   `connection_addr()` keys an embedded daemon's keystore binding under the
   distinct stable string `"embedded"` instead of the unix socket path — a

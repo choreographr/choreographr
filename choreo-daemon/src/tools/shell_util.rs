@@ -60,10 +60,62 @@ const DRAIN_COMPLETION_GRACE: Duration = Duration::from_secs(1);
 /// dropped to detach the thread rather than hang the tool.
 const DRAIN_DETACH_GRACE: Duration = Duration::from_secs(5);
 
+/// Candidate file names PATH lookup would consider for `name`.
+///
+/// On Unix this is just the name itself (PATH entries are searched for an
+/// exact, executable file). On Windows the loader resolves executables
+/// through PATHEXT: a bare "nu" is really nu.exe / nu.cmd / nu.bat / ... —
+/// a plain `dir.join("nu").is_file()` probe misses every installed binary —
+/// so each PATHEXT extension is appended as a separate candidate. A name
+/// that already carries an extension (e.g. "pwsh.exe") also matches its own
+/// bare entry first, so callers may pass either form.
+///
+/// `pathext` is the raw PATHEXT value (`None` = unset); `windows` selects the
+/// resolution mode so the extension logic stays unit-testable on Unix.
+fn executable_candidate_names(name: &str, pathext: Option<&str>, windows: bool) -> Vec<String> {
+    let mut candidates = vec![name.to_string()];
+    if windows {
+        // Windows' documented fallback when PATHEXT is unset (CreateProcess
+        // itself only ever appends .exe, but PATHEXT governs cmd/PowerShell
+        // resolution — cover both).
+        let raw = pathext.unwrap_or(".COM;.EXE;.BAT;.CMD");
+        for ext in raw.split(';') {
+            let ext = ext.trim();
+            if ext.is_empty() {
+                continue;
+            }
+            // PATHEXT is case-insensitive but is_file() is not on all file
+            // systems; canonicalize to lowercase (the real-world form).
+            let ext = ext.to_ascii_lowercase();
+            // Skip the extension when the name already ends with it
+            // (case-insensitive) — appending would yield the pathological
+            // "name.exe.exe".
+            let candidate = format!("{name}{ext}");
+            if !name.to_ascii_lowercase().ends_with(&ext) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
 /// Check whether a binary with the given name exists somewhere in PATH.
+///
+/// Windows-aware: because PATHEXT resolution means an installed binary is
+/// almost never a file literally named `nu` (it is `nu.exe`), every PATHEXT
+/// extension is probed on Windows. Unix behavior is unchanged (exact name).
 pub(crate) fn binary_exists(name: &str) -> bool {
+    let windows = cfg!(windows);
+    let pathext = std::env::var("PATHEXT").ok();
+    let candidates = executable_candidate_names(name, pathext.as_deref(), windows);
     std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+        .map(|path| {
+            std::env::split_paths(&path).any(|dir| {
+                candidates
+                    .iter()
+                    .any(|candidate| dir.join(candidate).is_file())
+            })
+        })
         .unwrap_or(false)
 }
 
@@ -1997,6 +2049,43 @@ mod tests {
             String::from_utf8_lossy(&stream),
             format!("{}€", "x".repeat(MAX_PENDING_LINE_BYTES - 2)),
             "chunks must join back into the original valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn executable_candidate_names_unix_is_exact() {
+        // Unix PATH lookup is exact-name; no extension probing.
+        assert_eq!(executable_candidate_names("nu", None, false), vec!["nu"]);
+        // PATHEXT must be ignored in Unix mode.
+        assert_eq!(
+            executable_candidate_names("nu", Some(".EXE;.CMD"), false),
+            vec!["nu"]
+        );
+    }
+
+    #[test]
+    fn executable_candidate_names_windows_probes_pathext() {
+        // Bare name (a file may exist without extension) plus every PATHEXT
+        // entry, lowercased; the default when PATHEXT is unset.
+        assert_eq!(
+            executable_candidate_names("pwsh", None, true),
+            vec!["pwsh", "pwsh.com", "pwsh.exe", "pwsh.bat", "pwsh.cmd"]
+        );
+        // Custom PATHEXT honored; empty entries skipped.
+        assert_eq!(
+            executable_candidate_names("nu", Some(".exe;.MSI;"), true),
+            vec!["nu", "nu.exe", "nu.msi"]
+        );
+        // A name already carrying .exe dedupes (name+.exe == the bare entry);
+        // the other extensions still append, matching real PATHEXT lookup.
+        assert_eq!(
+            executable_candidate_names("powershell.exe", None, true),
+            vec![
+                "powershell.exe",
+                "powershell.exe.com",
+                "powershell.exe.bat",
+                "powershell.exe.cmd"
+            ]
         );
     }
 
