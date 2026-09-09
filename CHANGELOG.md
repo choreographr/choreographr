@@ -61,9 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `generate_image` invocation line shows what the API receives (`1024x1024`, `high`, …) instead of Rust variant names.
 - The OpenAI image adapter's wire tests moved from `src/images/tests.rs` (unit) to `tests/images_wire.rs` (integration,
   `#[ignore]`) per the Test Discipline rule — socket-based tests no longer run under `cargo test-fast`.
-- `generate_image` model resolution degrades gracefully: when the provider's catalog lists no image-output models, the tool
-  falls back (warn-logged) to the adapter's `default_image_model()` instead of erroring, and `args.prompt` is moved into the
-  request instead of cloned.
+- `default_image_model` removed from `ImageGenerationClient` (and the hardcoded `gpt-image-1` default from `OpenAiImageClient`):
+  with no catalog image-output candidates the tool now fails with guidance (pass `model` explicitly, or add a
+  `supports_image_output` overlay entry + /refresh-models) instead of silently sending a guessed model the provider likely
+  does not route (e.g. `gpt-image-1` against an opencode gateway); `args.prompt` is moved into the request instead of cloned.
 - `prepare_image_from_bytes` (normalization + alt-text return shape) was
   extracted from `tools/image.rs`'s `display_image` so the new
   `generate_image` tool can share the same pipeline; behavior-neutral

@@ -284,7 +284,6 @@ fn defaults_and_trait_accessors() {
     let mock = MockProvider::start(vec![]);
     let c = client(&mock);
     assert_eq!(c.provider_slug(), "openai");
-    assert_eq!(c.default_image_model(), "gpt-image-1");
     // Defaults land on the "auto"/default variants.
     let req = ImageGenerationRequest::new("p", "gpt-image-1");
     assert_eq!(req.size, ImageSize::Auto);

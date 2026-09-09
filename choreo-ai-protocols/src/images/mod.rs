@@ -210,9 +210,6 @@ pub trait ImageGenerationClient: std::fmt::Debug + Send + Sync {
     /// [`crate::ProviderClient::provider_slug`].
     fn provider_slug(&self) -> &str;
 
-    /// The model used when the caller does not pin one (e.g. `gpt-image-1`).
-    fn default_image_model(&self) -> &str;
-
     fn generate_image(
         &self,
         req: &ImageGenerationRequest,

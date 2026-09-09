@@ -78,11 +78,10 @@ fn pick_image_model(
     }
     if candidates.is_empty() {
         return Err(format!(
-            "provider `{slug}` has no image-output models in the catalog — pass `model` explicitly if your endpoint proxies one"
+            "provider `{slug}` has no image-output models in the catalog — pass `model` \
+             explicitly if your endpoint routes one, or add a `supports_image_output` \
+             overlay entry for it and /refresh-models"
         ));
-        // NOTE: `execute` does not surface this error verbatim — it degrades
-        // to the client's `default_image_model()` (see the resolution chain
-        // there) so a lagging catalog snapshot cannot hard-fail the tool.
     }
 
     // Priority tiers by case-insensitive substring match, first match wins.
@@ -221,27 +220,17 @@ impl super::Tool for GenerateImage {
         })?;
         let handle = handle.map_err(ToolExecError)?;
 
-        // Model resolution: explicit arg > catalog-priority pick > the
-        // client's own default model. The catalog is the source of truth for
-        // what this provider can route at all; when it lists no image models
-        // (a lagging snapshot, or a proxy account with no overlay entry) the
-        // adapter's default (e.g. `gpt-image-1`) is the authoritative choice
-        // for the wire family it speaks, so we degrade to that instead of
-        // hard-failing the whole tool.
+        // Model resolution: explicit arg > catalog-priority pick. The
+        // catalog is the source of truth for what this provider can route at
+        // all, and there is NO guessed fallback model: with no catalog
+        // image-output candidates, the tool fails with guidance (overlay
+        // entry or explicit `model` arg) rather than silently sending a
+        // model the provider probably does not route (e.g. an opener-style
+        // gateway would never serve `gpt-image-1`). Fail-safe over
+        // fail-hopeful.
         let candidates = choreo_ai_protocols::image_models_for_provider(&handle.slug);
-        let model = match pick_image_model(&handle.slug, &candidates, args.model.as_deref()) {
-            Ok(model) => model,
-            Err(miss) => {
-                let fallback = handle.client.default_image_model().to_string();
-                warn!(
-                    slug = %handle.slug,
-                    miss = %miss,
-                    fallback = %fallback,
-                    "generate_image: no catalog image models for provider — using the client's default image model"
-                );
-                fallback
-            }
-        };
+        let model = pick_image_model(&handle.slug, &candidates, args.model.as_deref())
+            .map_err(ToolExecError)?;
 
         let size = args.size.unwrap_or_default();
         let quality = args.quality.unwrap_or_default();
@@ -456,9 +445,6 @@ mod tests {
     impl ImageGenerationClient for StubImageClient {
         fn provider_slug(&self) -> &str {
             "openai"
-        }
-        fn default_image_model(&self) -> &str {
-            "gpt-image-1"
         }
         fn generate_image(
             &self,

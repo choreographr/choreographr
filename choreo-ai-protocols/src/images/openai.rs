@@ -71,7 +71,6 @@ pub struct OpenAiImageClient {
     config: ServiceConfig,
     api_key: zeroize::Zeroizing<String>,
     http: ureq::Agent,
-    default_image_model: String,
 }
 
 // Manual Debug impl: derived Debug would print the raw API key if a client
@@ -82,27 +81,17 @@ impl std::fmt::Debug for OpenAiImageClient {
             .field("config", &self.config)
             .field("api_key", &"***")
             .field("http", &self.http)
-            .field("default_image_model", &self.default_image_model)
             .finish()
     }
 }
 
 impl OpenAiImageClient {
-    pub fn new(config: ServiceConfig, api_key: String) -> Self {
-        Self::with_default_model(config, api_key, "gpt-image-1")
-    }
-
-    /// Like [`OpenAiImageClient::new`], with an explicit fallback model for
-    /// callers that do not pin one. The agent is built with the image
-    /// attempt deadline (see [`IMAGE_TOTAL_TIMEOUT_SECS`]) rather than the
-    /// chat config's total timeout — the deadline lives on the agent, so
+    /// The agent is built with the image attempt deadline (see
+    /// [`IMAGE_TOTAL_TIMEOUT_SECS`]) rather than the chat config's total
+    /// timeout — the deadline lives on the agent, so
     /// `config.total_timeout_secs` is deliberately overridden here and the
     /// caller's value for that one field is not honored.
-    pub fn with_default_model(
-        mut config: ServiceConfig,
-        api_key: String,
-        default_image_model: impl Into<String>,
-    ) -> Self {
+    pub fn new(mut config: ServiceConfig, api_key: String) -> Self {
         let http = crate::shared::build_agent(
             config.connect_timeout_secs,
             // Idle-read timeout: a generation can be silent for a long time,
@@ -119,7 +108,6 @@ impl OpenAiImageClient {
             config,
             api_key: zeroize::Zeroizing::new(api_key),
             http,
-            default_image_model: default_image_model.into(),
         }
     }
 
@@ -149,10 +137,6 @@ struct WireBody<'a> {
 impl ImageGenerationClient for OpenAiImageClient {
     fn provider_slug(&self) -> &str {
         &self.config.provider_slug
-    }
-
-    fn default_image_model(&self) -> &str {
-        &self.default_image_model
     }
 
     fn generate_image(
