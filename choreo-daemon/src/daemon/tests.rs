@@ -3400,6 +3400,25 @@ fn get_image_provider_named_account_without_image_backend_names_slug() {
 }
 
 #[test]
+fn get_image_provider_unknown_named_account_names_the_account() {
+    let (mut state, _rx) = make_daemon_state();
+    // A resolved map that does NOT contain the requested name: the error must
+    // name the account, not the generic "no account is configured" (which
+    // would misdiagnose a typo / wrong session account).
+    let cfg = AccountConfig::simple("openai", "openai");
+    state.providers.insert(
+        "openai".into(),
+        InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap(),
+    );
+
+    let err = send_get_image_provider(&mut state, Some("oepnai".into())).unwrap_err();
+    assert!(
+        err.contains("account 'oepnai' is not configured"),
+        "error must name the missing account, got: {err}"
+    );
+}
+
+#[test]
 fn get_image_provider_happy_path_returns_handle_with_working_client() {
     let (mut state, _rx) = make_daemon_state();
     // A real OpenAI-protocol account with a fake api key — resolves through

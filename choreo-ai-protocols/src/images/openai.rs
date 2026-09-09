@@ -126,30 +126,24 @@ impl OpenAiImageClient {
     pub fn config(&self) -> &ServiceConfig {
         &self.config
     }
+}
 
-    /// Build the outgoing JSON body.
-    ///
-    /// `response_format` is deliberately NOT sent: gpt-image-1 rejects the
-    /// parameter outright and *always* returns `b64_json`, while the legacy
-    /// dall-e models would need it. v1 speaks gpt-image conventions; if a
-    /// dall-e path is added later it belongs behind a model check here, not
-    /// as a blanket field that breaks the primary model family.
-    ///
-    /// `n: 1` is pinned (see [`ImageGenerationRequest`] — the struct has no
-    /// `n` field by design, so it is injected at the single serialization
-    /// point here).
-    fn request_body(req: &ImageGenerationRequest) -> Result<serde_json::Value, OpenAiError> {
-        let mut body =
-            serde_json::to_value(req).map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
-        let map = body
-            .as_object_mut()
-            // `ImageGenerationRequest` serializes to a struct, so this arm is
-            // unreachable — but a corrupted custom Serialize impl must not
-            // panic; it degrades to an error instead.
-            .ok_or_else(|| OpenAiError::Io(io::Error::other("request body is not an object")))?;
-        map.insert("n".to_string(), serde_json::Value::from(1));
-        Ok(body)
-    }
+/// The outgoing JSON body: the request `flatten`ed with the pinned
+/// `n: 1` (see [`ImageGenerationRequest`] — the struct has no `n` field by
+/// design, so it is injected at the single serialization point here).
+/// `flatten` keeps `skip_serializing_if` on the default knobs working: an
+/// all-defaults request serializes to just `{model, prompt, n}`.
+///
+/// `response_format` is deliberately NOT sent anywhere: gpt-image-1 rejects
+/// the parameter outright and *always* returns `b64_json`, while the legacy
+/// dall-e models would need it. v1 speaks gpt-image conventions; if a
+/// dall-e path is added later it belongs behind a model check, not as a
+/// blanket field that breaks the primary model family.
+#[derive(serde::Serialize)]
+struct WireBody<'a> {
+    #[serde(flatten)]
+    req: &'a ImageGenerationRequest,
+    n: u32,
 }
 
 impl ImageGenerationClient for OpenAiImageClient {
@@ -169,7 +163,6 @@ impl ImageGenerationClient for OpenAiImageClient {
         let url = endpoint_url(&self.config.base_url, IMAGE_GENERATIONS_PATH)
             .map_err(OpenAiError::Io)
             .map_err(crate::shared::provider_error_to_inference)?;
-        let body = Self::request_body(req).map_err(crate::shared::provider_error_to_inference)?;
         // Frugal budget: max 2 attempts (see IMAGE_MAX_ATTEMPTS), with the
         // account's backoff knobs so the Retry-After budget gate behaves
         // exactly like the chat path's.
@@ -199,9 +192,13 @@ impl ImageGenerationClient for OpenAiImageClient {
 
         let response = retry::retry_loop(
             || {
+                // The body is rebuilt per attempt rather than cloned: the
+                // flattened wrapper is a cheap borrowed view of `req`, so
+                // reconstructing it costs nothing and avoids a
+                // `serde_json::Value` deep clone per retry.
                 http.post(&url)
                     .header("Authorization", auth_header.as_str())
-                    .send_json(body.clone())
+                    .send_json(WireBody { req, n: 1 })
             },
             &retry_cfg,
             &mut ctx,

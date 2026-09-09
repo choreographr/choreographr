@@ -8,8 +8,6 @@
 //! mapping — no new error taxonomy is invented for the image path.
 
 mod openai;
-#[cfg(test)]
-mod tests;
 
 pub use openai::OpenAiImageClient;
 
@@ -84,14 +82,93 @@ pub enum Background {
 /// requests multiply latency and cost with no consumer for the extras. A
 /// field can be added when a real use case appears — leaving it out keeps
 /// the wire body minimal and every provider response handling single-item.
+///
+/// Serialization is deliberately *minimal*: a knob left at its default
+/// (`auto`/`png`) is omitted from the wire body entirely rather than sent as
+/// an explicit default value. The gpt-image family accepts explicit defaults,
+/// but image models reached through OpenAI-compatible proxies (imagen, flux,
+/// gemini-image — see the tool's priority pick) often reject parameters they
+/// do not implement, so a bare `{model, prompt, n}` body is the maximally
+/// compatible request and the knobs opt in only when the caller sets them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageGenerationRequest {
     pub prompt: String,
     pub model: String,
+    #[serde(skip_serializing_if = "ImageSize::is_default")]
     pub size: ImageSize,
+    #[serde(skip_serializing_if = "ImageQuality::is_default")]
     pub quality: ImageQuality,
+    #[serde(skip_serializing_if = "OutputFormat::is_default")]
     pub output_format: OutputFormat,
+    #[serde(skip_serializing_if = "Background::is_default")]
     pub background: Background,
+}
+
+// `skip_serializing_if` needs path-callable predicates; `PartialEq` derives
+// give the comparison, these name it per field type. `is_default` stays
+// private — it is a serialization detail, not public API.
+impl ImageSize {
+    fn is_default(v: &Self) -> bool {
+        *v == Self::default()
+    }
+}
+impl ImageQuality {
+    fn is_default(v: &Self) -> bool {
+        *v == Self::default()
+    }
+}
+impl OutputFormat {
+    fn is_default(v: &Self) -> bool {
+        *v == Self::default()
+    }
+}
+impl Background {
+    fn is_default(v: &Self) -> bool {
+        *v == Self::default()
+    }
+}
+
+// `Display` mirrors the serde wire strings exactly (the single source of
+// truth for what goes on the wire), so user-facing renderings — e.g. the
+// tool's `describe_invocation` line — show the same values the API receives
+// instead of Rust variant names.
+impl std::fmt::Display for ImageSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Square1024 => "1024x1024",
+            Self::Portrait1024x1536 => "1024x1536",
+            Self::Landscape1536x1024 => "1536x1024",
+        })
+    }
+}
+impl std::fmt::Display for ImageQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        })
+    }
+}
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+            Self::Webp => "webp",
+        })
+    }
+}
+impl std::fmt::Display for Background {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Opaque => "opaque",
+            Self::Transparent => "transparent",
+        })
+    }
 }
 
 impl ImageGenerationRequest {

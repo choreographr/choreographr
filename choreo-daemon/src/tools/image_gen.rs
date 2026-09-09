@@ -80,6 +80,9 @@ fn pick_image_model(
         return Err(format!(
             "provider `{slug}` has no image-output models in the catalog — pass `model` explicitly if your endpoint proxies one"
         ));
+        // NOTE: `execute` does not surface this error verbatim — it degrades
+        // to the client's `default_image_model()` (see the resolution chain
+        // there) so a lagging catalog snapshot cannot hard-fail the tool.
     }
 
     // Priority tiers by case-insensitive substring match, first match wins.
@@ -90,10 +93,15 @@ fn pick_image_model(
         ("flux", None),
         ("dall-e", None),
     ];
+    // Candidate names are lowercased ONCE up front instead of per tier per
+    // candidate — the tier loop is ×5, and the catalog list can be long.
+    let lowered: Vec<(String, String)> = candidates
+        .iter()
+        .map(|c| (c.to_ascii_lowercase(), c.clone()))
+        .collect();
     for (primary, secondary) in tiers {
         let needle_p = primary.to_ascii_lowercase();
-        for candidate in candidates {
-            let hay = candidate.to_ascii_lowercase();
+        for (hay, original) in &lowered {
             if !hay.contains(&needle_p) {
                 continue;
             }
@@ -102,7 +110,7 @@ fn pick_image_model(
             if secondary.is_some_and(|sec| !hay.contains(sec)) {
                 continue;
             }
-            return Ok(candidate.clone());
+            return Ok(original.clone());
         }
     }
     // No tier matched: the catalog's first listed image-capable model is the
@@ -144,16 +152,18 @@ impl super::Tool for GenerateImage {
             parts.push(format!(" Model: `{model}`."));
         }
         if let Some(size) = args.size {
-            parts.push(format!(" Size: {size:?}."));
+            // Display mirrors the wire strings ("1024x1024", "high", …), so
+            // the invocation line matches what the API actually receives.
+            parts.push(format!(" Size: {size}."));
         }
         if let Some(quality) = args.quality {
-            parts.push(format!(" Quality: {quality:?}."));
+            parts.push(format!(" Quality: {quality}."));
         }
         if let Some(format) = args.output_format {
-            parts.push(format!(" Format: {format:?}."));
+            parts.push(format!(" Format: {format}."));
         }
         if let Some(background) = args.background {
-            parts.push(format!(" Background: {background:?}."));
+            parts.push(format!(" Background: {background}."));
         }
         if let Some(ref alt) = args.alt {
             parts.push(format!(" Alt text: {alt}."));
@@ -173,10 +183,12 @@ impl super::Tool for GenerateImage {
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
         // Cancellation is checked BEFORE anything (including the provider
-        // round-trip). Once the HTTP request is in flight it cannot be
-        // interrupted (the blocking client accepts no mid-flight cancel);
-        // v1 accepts that post-send abort is delivered as a discarded
-        // result — same accepted trade-off as the chat turn path.
+        // round-trip), and again right after the round-trip returns (see the
+        // post-generation check below). Once the HTTP request is in flight
+        // it cannot be interrupted (the blocking client accepts no
+        // mid-flight cancel) — v1 accepts that the in-flight generation
+        // completes and its cost is sunk, but the result is discarded
+        // instead of being decoded, persisted, and displayed.
         if let Some(ctx) = ctx
             && ctx.cancelled.load(Ordering::Relaxed)
         {
@@ -209,21 +221,36 @@ impl super::Tool for GenerateImage {
         })?;
         let handle = handle.map_err(ToolExecError)?;
 
-        // Model resolution: explicit arg > catalog-priority pick. The catalog
-        // is the source of truth for what this provider can route at all.
-        let model = pick_image_model(
-            &handle.slug,
-            &choreo_ai_protocols::image_models_for_provider(&handle.slug),
-            args.model.as_deref(),
-        )
-        .map_err(ToolExecError)?;
+        // Model resolution: explicit arg > catalog-priority pick > the
+        // client's own default model. The catalog is the source of truth for
+        // what this provider can route at all; when it lists no image models
+        // (a lagging snapshot, or a proxy account with no overlay entry) the
+        // adapter's default (e.g. `gpt-image-1`) is the authoritative choice
+        // for the wire family it speaks, so we degrade to that instead of
+        // hard-failing the whole tool.
+        let candidates = choreo_ai_protocols::image_models_for_provider(&handle.slug);
+        let model = match pick_image_model(&handle.slug, &candidates, args.model.as_deref()) {
+            Ok(model) => model,
+            Err(miss) => {
+                let fallback = handle.client.default_image_model().to_string();
+                warn!(
+                    slug = %handle.slug,
+                    miss = %miss,
+                    fallback = %fallback,
+                    "generate_image: no catalog image models for provider — using the client's default image model"
+                );
+                fallback
+            }
+        };
 
         let size = args.size.unwrap_or_default();
         let quality = args.quality.unwrap_or_default();
         let output_format = args.output_format.unwrap_or_default();
         let background = args.background.unwrap_or_default();
         let request = ImageGenerationRequest {
-            prompt: args.prompt.clone(),
+            // `prompt` moves (args is owned and `alt` is a disjoint field,
+            // so the partial move is fine) — no needless String clone.
+            prompt: args.prompt,
             model: model.clone(),
             size,
             quality,
@@ -231,14 +258,27 @@ impl super::Tool for GenerateImage {
             background,
         };
 
-        // `None` cancel_rx: v1 cancels only before send (the flag was checked
-        // above); passing a receiver would only stop the retry loop between
-        // attempts, which the single pre-send check already covers in
-        // practice. Post-send abort is accepted (comment per Task 4 spec).
+        // `None` cancel_rx: the blocking client accepts no mid-flight
+        // cancel, and the pre-send flag check below is the authoritative
+        // gate. Post-send abort IS still detected — the flag is re-checked
+        // as soon as the round-trip returns, before any decode/display work
+        // happens on the (possibly money-costing) result.
         let result = handle
             .client
             .generate_image(&request, None)
             .map_err(|e| ToolExecError(format!("image generation failed: {e}")))?;
+
+        // Post-generation cancel check: the flag is re-tested before the
+        // result is processed. A cancel issued while the (up to 180 s)
+        // generation was in flight must not trigger a decode, validation,
+        // persistence, or client display of the image — the generation cost
+        // is sunk either way, but the downstream pipeline stays silent.
+        if ctx.cancelled.load(Ordering::Relaxed) {
+            warn!(
+                "generate_image: session cancelled while generation was in flight — discarding result"
+            );
+            return Err(ToolExecError("image generation cancelled".to_string()));
+        }
 
         let bytes = BASE64.decode(result.image_b64.trim()).map_err(|e| {
             ToolExecError(format!(

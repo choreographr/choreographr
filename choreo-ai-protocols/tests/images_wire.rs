@@ -1,17 +1,19 @@
 //! Wire tests for the OpenAI image adapter, served by the shared
-//! scripted HTTP provider ([`crate::test_utils::MockProvider`]).
+//! scripted HTTP provider ([`MockProvider`]).
 //!
 //! These tests bind a local `TcpListener`, so they exercise the full
 //! request→response path against real sockets; the AGENTS.md test-discipline
-//! rule keeps socket tests in `tests/` directories — this module is the
-//! deliberate exception the image plan specifies (`#[cfg(test)]` unit tests
-//! over `MockProvider`), kept here so the adapter's wire behavior is
-//! verified next to the code it pins.
+//! rule keeps socket tests in `tests/` directories and marks them
+//! `#[ignore]` (run via `cargo test-integration` / `nextest --run-ignored`),
+//! so a plain `cargo test-fast` never opens a socket.
 
-use super::*;
-use crate::images::{ImageGenerationRequest, OutputFormat};
-use crate::openai::ServiceConfig;
-use crate::test_utils::MockProvider;
+use choreo_ai_protocols::images::{
+    Background, ImageGenerationRequest, ImageQuality, ImageSize, OutputFormat,
+};
+use choreo_ai_protocols::openai::ServiceConfig;
+use choreo_ai_protocols::test_utils::MockProvider;
+use choreo_ai_protocols::{ImageGenerationClient, OpenAiImageClient};
+use choreo_proto::InferenceError;
 
 /// Build a client pointed at the mock provider.
 fn client(mock: &MockProvider) -> OpenAiImageClient {
@@ -37,6 +39,7 @@ fn success_body() -> String {
 }
 
 #[test]
+#[ignore]
 fn success_maps_b64_and_revised_prompt() {
     let mock = MockProvider::start(vec![(200, "application/json", success_body())]);
     let result = client(&mock)
@@ -59,6 +62,7 @@ fn success_maps_b64_and_revised_prompt() {
 }
 
 #[test]
+#[ignore]
 fn wire_body_has_model_prompt_n1_and_no_response_format() {
     // gpt-image-1 rejects `response_format` (it always returns b64_json), so
     // the wire body must never carry it — pinned here so a future refactor
@@ -73,14 +77,18 @@ fn wire_body_has_model_prompt_n1_and_no_response_format() {
     assert_eq!(body["prompt"], "a lighthouse at dusk");
     assert_eq!(body["n"], 1);
     assert!(body.get("response_format").is_none());
-    // Typed enums serialize as the exact wire strings.
-    assert_eq!(body["size"], "auto");
-    assert_eq!(body["quality"], "auto");
-    assert_eq!(body["output_format"], "png");
-    assert_eq!(body["background"], "auto");
+    // Default knobs are OMITTED from the wire body entirely (minimal-body
+    // policy: proxies that don't implement a knob reject its presence even
+    // as an explicit default), so an all-defaults request is just
+    // `{model, prompt, n}`.
+    assert!(body.get("size").is_none());
+    assert!(body.get("quality").is_none());
+    assert!(body.get("output_format").is_none());
+    assert!(body.get("background").is_none());
 }
 
 #[test]
+#[ignore]
 fn non_2xx_error_body_message_surfaces() {
     // The standard OpenAI error envelope's `error.message` must reach the
     // caller instead of the raw body dump.
@@ -103,6 +111,7 @@ fn non_2xx_error_body_message_surfaces() {
 }
 
 #[test]
+#[ignore]
 fn rate_limited_with_small_retry_after_is_retried_then_succeeds() {
     // Retry-After: 0 fits the backoff budget (wait = zero → no sleeping in
     // the test) and the frugal 2-attempt budget allows exactly one retry.
@@ -169,6 +178,7 @@ fn single_response_with_header(
 }
 
 #[test]
+#[ignore]
 fn rate_limited_with_oversized_retry_after_is_terminal() {
     // A 1-hour cooldown outlives the 30 s backoff ceiling → the request must
     // fail immediately instead of waiting (and the frugal budget would not
@@ -198,6 +208,7 @@ fn rate_limited_with_oversized_retry_after_is_terminal() {
 }
 
 #[test]
+#[ignore]
 fn empty_data_array_is_empty_response_error() {
     let mock = MockProvider::start(vec![(
         200,
@@ -214,6 +225,7 @@ fn empty_data_array_is_empty_response_error() {
 }
 
 #[test]
+#[ignore]
 fn malformed_json_response_errors() {
     let mock = MockProvider::start(vec![(
         200,
@@ -230,6 +242,7 @@ fn malformed_json_response_errors() {
 }
 
 #[test]
+#[ignore]
 fn data_item_without_b64_is_empty_response_error() {
     // A 200 envelope whose item lacks b64_json is "no image data", not a
     // deserialization crash.
@@ -245,13 +258,14 @@ fn data_item_without_b64_is_empty_response_error() {
 }
 
 #[test]
+#[ignore]
 fn non_auto_enums_serialize_as_wire_strings() {
     let mock = MockProvider::start(vec![(200, "application/json", success_body())]);
     let req = ImageGenerationRequest {
-        size: crate::images::ImageSize::Landscape1536x1024,
-        quality: crate::images::ImageQuality::High,
+        size: ImageSize::Landscape1536x1024,
+        quality: ImageQuality::High,
         output_format: OutputFormat::Webp,
-        background: crate::images::Background::Transparent,
+        background: Background::Transparent,
         ..sample_request()
     };
     client(&mock)
@@ -265,6 +279,7 @@ fn non_auto_enums_serialize_as_wire_strings() {
 }
 
 #[test]
+#[ignore]
 fn defaults_and_trait_accessors() {
     let mock = MockProvider::start(vec![]);
     let c = client(&mock);
@@ -272,8 +287,13 @@ fn defaults_and_trait_accessors() {
     assert_eq!(c.default_image_model(), "gpt-image-1");
     // Defaults land on the "auto"/default variants.
     let req = ImageGenerationRequest::new("p", "gpt-image-1");
-    assert_eq!(req.size, crate::images::ImageSize::Auto);
-    assert_eq!(req.quality, crate::images::ImageQuality::Auto);
+    assert_eq!(req.size, ImageSize::Auto);
+    assert_eq!(req.quality, ImageQuality::Auto);
     assert_eq!(req.output_format, OutputFormat::Png);
-    assert_eq!(req.background, crate::images::Background::Auto);
+    assert_eq!(req.background, Background::Auto);
+    // Display mirrors the serde wire strings for every variant.
+    assert_eq!(ImageSize::Portrait1024x1536.to_string(), "1024x1536");
+    assert_eq!(ImageQuality::Medium.to_string(), "medium");
+    assert_eq!(OutputFormat::Jpeg.to_string(), "jpeg");
+    assert_eq!(Background::Opaque.to_string(), "opaque");
 }

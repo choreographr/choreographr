@@ -54,6 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Image-generation wire-body minimization: `ImageGenerationRequest` now `skip_serializing_if`-omits knobs left at their defaults
+  (`auto` size/quality/background, `png` format), so an all-defaults request serializes to just `{model, prompt, n}` —
+  image models reached through OpenAI-compatible proxies (imagen, flux, gemini-image) often reject parameters they do not
+  implement even as explicit defaults. `Display` impls on the knob enums mirror the serde wire strings exactly, so the
+  `generate_image` invocation line shows what the API receives (`1024x1024`, `high`, …) instead of Rust variant names.
+- The OpenAI image adapter's wire tests moved from `src/images/tests.rs` (unit) to `tests/images_wire.rs` (integration,
+  `#[ignore]`) per the Test Discipline rule — socket-based tests no longer run under `cargo test-fast`.
+- `generate_image` model resolution degrades gracefully: when the provider's catalog lists no image-output models, the tool
+  falls back (warn-logged) to the adapter's `default_image_model()` instead of erroring, and `args.prompt` is moved into the
+  request instead of cloned.
 - `prepare_image_from_bytes` (normalization + alt-text return shape) was
   extracted from `tools/image.rs`'s `display_image` so the new
   `generate_image` tool can share the same pipeline; behavior-neutral
@@ -514,6 +524,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capped; writer-loop joins bounded.
 - Trust: client fingerprint comparison tightened with pinned-mode failure
   UX; enrollment & transport trust model documented in ARCHITECTURE.md.
+
+### Fixed
+
+- `generate_image` post-generation cancellation: `ToolContext.cancelled` is now re-checked the moment the provider
+  round-trip returns, so a cancel issued while a (up to 180 s) generation was in flight discards the result before any
+  decode/validation/persistence/display work instead of surfacing an image the user already cancelled.
+- `GetImageGenerationProvider` error accuracy: a named-but-unknown account now reports
+  "account '<name>' is not configured or has no resolved provider" instead of the misleading generic
+  "no OpenAI-compatible account is configured", and the no-image-backend error picks its provider slug deterministically
+  (sorted-key order) instead of HashMap iteration order.
 
 ## [0.1.0]
 

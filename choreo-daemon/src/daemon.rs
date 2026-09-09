@@ -2600,9 +2600,14 @@ impl DaemonState {
         match account_name {
             Some(name) => {
                 let provider = self.providers.get(name).ok_or_else(|| {
-                    "no OpenAI-compatible account is configured — add one and \
-                     set it on the session"
-                        .to_string()
+                    // Name the missing account explicitly — a generic "no
+                    // account is configured" here would misdiagnose the
+                    // (common) typo/wrong-session-account case, since the
+                    // map is demonstrably non-empty at this point.
+                    format!(
+                        "account '{name}' is not configured or has no resolved provider — \
+                         add it and set it on the session"
+                    )
                 })?;
                 let client = provider.image_client().ok_or_else(|| {
                     format!(
@@ -2641,14 +2646,16 @@ impl DaemonState {
                         })
                     }
                     // Unlocked but every resolved provider is a protocol with
-                    // no image backend (Anthropic/Gemini) — surface the first
-                    // provider's slug so the message names the actual blocker.
+                    // no image backend (Anthropic/Gemini) — surface a slug so
+                    // the message names an actual blocker. `min_by` over the
+                    // sorted keys keeps the picked slug deterministic, unlike
+                    // HashMap `values().next()` iteration order.
                     None => {
                         let slug = self
                             .providers
-                            .values()
-                            .next()
-                            .map(|p| p.provider_slug().to_string())
+                            .iter()
+                            .min_by(|(a, _), (b, _)| a.cmp(b))
+                            .map(|(_, p)| p.provider_slug().to_string())
                             .unwrap_or_default();
                         Err(format!(
                             "provider '{slug}' does not support image generation"
