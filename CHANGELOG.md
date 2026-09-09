@@ -7,7 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Image-generation capability on the provider facade + `GetImageGenerationProvider` command:**
+  `InferenceProvider` now carries an optional `image_client`
+  (`Option<Arc<dyn ImageGenerationClient>>`, populated with an
+  `OpenAiImageClient` built from the same `AccountConfig`/key as the chat
+  client for OpenAI-protocol accounts; `None` for Anthropic/Gemini, whose
+  image backends are deferred in v1), exposed via an `image_client()`
+  accessor. The daemon gains a new `GetImageGenerationProvider` command that
+  hands a tool thread an opaque `ImageProviderHandle { slug, client }` over a
+  crossbeam reply channel — explicit account name, else the deterministic
+  first image-capable provider in sorted-key order — with precise errors for
+  a locked keystore, a named account that does not support image generation,
+  and no matching account. `/lock` revocation falls out of the existing
+  `providers.clear()`: no new handle can be resolved once locked.
+- **`ImageGenerationClient` trait + OpenAI Images adapter (`choreo-ai-protocols
+  src/images/`):** a provider-agnostic image-generation trait with typed
+  wire enums (`ImageSize`/`ImageQuality`/`OutputFormat`/`Background`,
+  `JsonSchema`+`Deserialize` so the daemon's tool args reuse them directly)
+  and the sole `OpenAiImageClient` adapter — 180 s per-attempt wall-clock
+  deadline, a deliberately frugal 2-attempt retry budget (a generation costs
+  the provider money, so only clearly-transient 429/5xx get a second shot),
+  and no `response_format` field (modern gpt-image models ignore it and
+  older proxies 400 on it; the requested `output_format` carries the intent
+  and the returned bytes are decoded with that MIME). Errors reuse
+  `InferenceError`, so chat and image share one error taxonomy and metrics
+  label mapping.
+- **Image-output modality in the provider catalog:** `ModelEntry` gained
+  `supports_image_output`, ingested from models.dev's `modalities.output`
+  array and overridable via the same per-model overlay key used for the
+  other model facts; new lookup helpers `model_supports_image_output` and
+  `image_models_for_provider` (the provider's image-capable model ids) back
+  the tool's model selection; `catalog/catalog.bin` regenerated.
+- **`GenerateImage` tool (new `image` tool group):** the model generates an
+  image from a text prompt; provider resolution runs through
+  `GetImageGenerationProvider` in the daemon command loop (the credential
+  never reaches a tool thread), model selection is catalog-driven (explicit
+  `model` arg wins; otherwise a priority pick gpt-image > imagen >
+  gemini-image > flux > dall-e over ONLY catalog-verified candidates, never
+  a guess), and the returned bytes re-enter the exact `prepare_image_from_bytes`
+  + `DisplayImageReturn` pipeline `display_image` uses — zero proto/client
+  changes — so display, durable persistence, and the vision-feedback loop
+  (the model sees its own generation and can refine it) are free. Covered by
+  the `#[ignore]` integration test `choreo-daemon/tests/image_gen_integration.rs`.
+
 ### Changed
+
+- `prepare_image_from_bytes` (normalization + alt-text return shape) was
+  extracted from `tools/image.rs`'s `display_image` so the new
+  `generate_image` tool can share the same pipeline; behavior-neutral
+  refactor, `display_image` output unchanged.
 
 - **Bin-to-crate relocation (part 1):** the thin binary wrappers moved out of
   the root `choreographr` package into their own crates — `choreo-tui`,

@@ -189,7 +189,8 @@ pub(crate) mod grep;
 // concrete Swift-side impl lives in choreo-gui behind
 // #[cfg(target_os = "ios")].
 pub mod http;
-mod image;
+pub mod image;
+pub mod image_gen;
 pub mod ios;
 pub mod ios_bridge;
 pub(crate) mod nu;
@@ -253,6 +254,26 @@ pub struct PreparedImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) alt: Option<String>,
+}
+
+impl PreparedImage {
+    /// Public read accessors: integration tests (tests/ are a separate
+    /// crate) and clients inspecting a [`ToolOutput`]'s image cannot see the
+    /// `pub(crate)` fields, but must be able to assert on the prepared bytes.
+    /// Read-only on purpose — construction stays crate-internal so the
+    /// prepare pipeline (`prepare_image_from_bytes`) remains the only entry.
+    pub fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+    pub fn alt_text(&self) -> Option<&str> {
+        self.alt.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -613,6 +634,10 @@ pub fn static_groups() -> &'static [ToolGroup] {
                 description: "X/Twitter API (post, search, user lookup)".into(),
             },
             ToolGroup {
+                name: "image".into(),
+                description: "Image generation (generate_image)".into(),
+            },
+            ToolGroup {
                 name: "vm".into(),
                 description: "RISC-V sandboxed code execution".into(),
             },
@@ -712,6 +737,7 @@ impl ToolRegistry {
         reg.register(fs::WriteFile);
         reg.register(fs::EditFile);
         reg.register(image::DisplayImage::new());
+        reg.register(image_gen::GenerateImage::new());
         reg.register(git::GitStatus);
         reg.register(git::GitDiff);
         reg.register(git::GitLog);
@@ -1240,6 +1266,25 @@ pub(crate) fn symlink_target_label(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_group_registers_generate_image() {
+        // The new "image" group must appear in the registry's group catalog
+        // (so `load_tools image` works) and generate_image must be listed
+        // under it; display_image stays in "core".
+        let registry = ToolRegistry::new().build();
+        let groups: Vec<String> = registry.groups().into_iter().map(|g| g.name).collect();
+        assert!(groups.iter().any(|g| g == "image"), "groups: {groups:?}");
+        assert!(registry.group_names().iter().any(|g| g == "image"));
+        let active: HashSet<String> = ["image".into()].into_iter().collect();
+        let defs = registry.available_definitions(&active);
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(names.contains(&"generate_image"), "names: {names:?}");
+        // display_image stays in "core" (protected, always unioned into the
+        // definitions), so absence can't be asserted from the active-set
+        // listing; pin it via its group membership instead.
+        assert_ne!("image", Tool::group(&image::DisplayImage::new()));
+    }
 
     #[test]
     fn available_definitions_includes_session_config_tools() {

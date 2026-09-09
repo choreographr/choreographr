@@ -26,7 +26,7 @@ pub struct DisplayImageArgs {
     alt: Option<String>,
 }
 
-const MAX_DISPLAY_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_DISPLAY_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
 
 /// The image MIME types `display_image` accepts. Covers every raster format the
@@ -104,6 +104,9 @@ impl JsonSchema for DisplayImageReturn {
 }
 
 fn prepare_image(args: &DisplayImageArgs) -> io::Result<PreparedImage> {
+    // Normalized up front too (the shared helper re-normalizes idempotently)
+    // so an unsupported MIME is rejected before any network/file I/O — the
+    // original error precedence of `display_image`, preserved by the refactor.
     let mime_type = normalize_image_mime_type(&args.mime_type)?;
     let selected_sources = [
         args.path.as_ref().map(|_| "path"),
@@ -138,6 +141,33 @@ fn prepare_image(args: &DisplayImageArgs) -> io::Result<PreparedImage> {
         unreachable!("source count validated")
     };
 
+    // Shared with `generate_image` (tools/image_gen.rs): every image that
+    // reaches a client display goes through the same normalize → cap →
+    // dimension-probe pipeline, so a new image-producing tool cannot drift
+    // from `display_image`'s safety posture (decompression-bomb guard, AVIF
+    // feature gate, size ceiling).
+    let (mime_type, width, height) = prepare_image_from_bytes(mime_type, &data)?;
+    Ok(PreparedImage {
+        mime_type,
+        data,
+        width,
+        height,
+        alt: args.alt.clone().filter(|alt| !alt.trim().is_empty()),
+    })
+}
+
+/// Normalize a MIME type, enforce the display-size cap, and probe the pixel
+/// dimensions of in-memory image bytes — the common tail of both image tools.
+/// Returns the normalized mime plus `(width, height)`; `data` is returned to
+/// the caller untouched so it can build its own [`PreparedImage`]. Kept
+/// separate from source acquisition (path/url/base64/svg) because the
+/// `generate_image` tool starts from provider bytes, not from user sources.
+pub(crate) fn prepare_image_from_bytes(
+    mime_type: &str,
+    data: &[u8],
+) -> io::Result<(String, u32, u32)> {
+    let mime_type = normalize_image_mime_type(mime_type)?;
+
     if data.len() > MAX_DISPLAY_IMAGE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -148,14 +178,8 @@ fn prepare_image(args: &DisplayImageArgs) -> io::Result<PreparedImage> {
         ));
     }
 
-    let (width, height) = inspect_image_dimensions(mime_type, &data)?;
-    Ok(PreparedImage {
-        mime_type: mime_type.to_string(),
-        data,
-        width,
-        height,
-        alt: args.alt.clone().filter(|alt| !alt.trim().is_empty()),
-    })
+    let (width, height) = inspect_image_dimensions(mime_type, data)?;
+    Ok((mime_type.to_string(), width, height))
 }
 
 fn normalize_image_mime_type(mime_type: &str) -> io::Result<&str> {

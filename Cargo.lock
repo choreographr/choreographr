@@ -2793,6 +2793,7 @@ dependencies = [
  "itertools 0.15.0",
  "postcard",
  "rand 0.10.2",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serial_test",

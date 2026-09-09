@@ -4,7 +4,8 @@ use std::sync::Arc;
 use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
 use choreo_ai_protocols::{
     AnthropicClient, AnthropicConfig, ChatTurnRequest, ChatTurnResult, GoogleClient, GoogleConfig,
-    ProviderClient, ProviderProtocol, StreamEvent, lookup_provider,
+    ImageGenerationClient, OpenAiImageClient, ProviderClient, ProviderProtocol, StreamEvent,
+    lookup_provider,
 };
 use choreo_proto::InferenceError;
 
@@ -27,6 +28,36 @@ pub struct InferenceProvider {
     /// because the catalog lookup that supplies it returns a clone, not a
     /// `'static` reference.
     slug: String,
+    /// Optional image-generation backend. `Some` only for OpenAI-protocol
+    /// providers today; Anthropic and Gemini have no image-generation backend
+    /// in v1 (the Gemini/Responses-image paths are deferred), so their
+    /// constructors leave this `None` and image requests against those
+    /// accounts surface a precise "does not support" error instead of a
+    /// half-working client.
+    image_client: Option<Arc<dyn ImageGenerationClient>>,
+}
+
+/// Opaque handle returned to a tool thread by
+/// `DaemonCommand::GetImageGenerationProvider`.
+///
+/// It deliberately carries ONLY the trait object and the catalog slug: the
+/// daemon command loop stays the sole owner of the providers map, and the
+/// tool never learns which wire protocol is behind the client (same
+/// protocol-erasure rule as [`InferenceProvider`]). The slug travels
+/// alongside the client because the tool does catalog-based model selection
+/// (`model_supports_image_output` / `image_models_for_provider`), and the
+/// client's own `provider_slug()` may be generic — same reasoning as the
+/// `slug` field below.
+#[derive(Clone, Debug)]
+pub struct ImageProviderHandle {
+    /// Catalog slug of the resolved account's provider (e.g. "openai",
+    /// "opencode") — the key for image-capability catalog lookups.
+    pub slug: String,
+    /// The image-generation client. Arc-cloned out of the providers map: the
+    /// command loop keeps its entry (so later requests resolve again) while
+    /// the tool thread owns a share — no shared mutable state, the client is
+    /// immutable.
+    pub client: Arc<dyn ImageGenerationClient>,
 }
 
 /// User-Agent product string for every inference request: names the daemon
@@ -42,6 +73,7 @@ impl InferenceProvider {
         Self {
             client: Arc::new(client),
             slug: "openai".to_string(),
+            image_client: None,
         }
     }
 
@@ -49,6 +81,7 @@ impl InferenceProvider {
         Self {
             client: Arc::new(client),
             slug: "anthropic".to_string(),
+            image_client: None,
         }
     }
 
@@ -56,6 +89,7 @@ impl InferenceProvider {
         Self {
             client: Arc::new(client),
             slug: "google".to_string(),
+            image_client: None,
         }
     }
 
@@ -85,11 +119,23 @@ impl InferenceProvider {
                 config.apply_overrides(&mut svc_config);
                 let key = api_key
                     .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
-                let client = OpenAiClient::new(svc_config, key)
+                let client = OpenAiClient::new(svc_config.clone(), key.clone())
                     .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
+                // Same account, same key, same base_url/user_agent/slug as the
+                // chat client — the image client is built from a clone of the
+                // identical `ServiceConfig` (its constructor overrides only the
+                // attempt deadline + retry budget the image path needs).
+                // `config.apply_overrides` ran on `svc_config` BEFORE the chat
+                // client was built, so the clone here sees every account-level
+                // override (base_url, user agent, backoff knobs) already
+                // applied. An image client is constructed even when the
+                // account's models later fail a catalog image-capability
+                // check — the tool gates model choice at request time.
+                let image_client = Arc::new(OpenAiImageClient::new(svc_config, key));
                 Ok(Self {
                     client: Arc::new(client),
                     slug: entry.slug,
+                    image_client: Some(image_client),
                 })
             }
             ProviderProtocol::AnthropicMessages => {
@@ -111,6 +157,9 @@ impl InferenceProvider {
                 Ok(Self {
                     client: Arc::new(client),
                     slug: entry.slug,
+                    // No image backend for Anthropic in v1 — the Messages API
+                    // has no image-generation endpoint; deferred.
+                    image_client: None,
                 })
             }
             ProviderProtocol::GoogleGenerativeAi => {
@@ -129,6 +178,10 @@ impl InferenceProvider {
                 Ok(Self {
                     client: Arc::new(client),
                     slug: entry.slug,
+                    // No image backend for Gemini in v1 — the Gemini image
+                    // backend is deferred; `None` keeps image requests against
+                    // these accounts failing with a precise error.
+                    image_client: None,
                 })
             }
             // `ProviderProtocol` is #[non_exhaustive] — a new protocol added
@@ -188,6 +241,17 @@ impl InferenceProvider {
             // from the variant list; reuse it rather than duplicating here.
             crate::metrics::record_api_error(model, e.metric_label());
         }
+    }
+
+    /// The optional image-generation backend for this provider.
+    ///
+    /// Returns a clone of the `Arc`: the providers map entry stays intact
+    /// (subsequent requests resolve again) while the caller — typically a
+    /// tool thread via `DaemonCommand::GetImageGenerationProvider` — owns a
+    /// share. The client is immutable, so sharing it is safe with no
+    /// additional synchronization.
+    pub fn image_client(&self) -> Option<Arc<dyn ImageGenerationClient>> {
+        self.image_client.clone()
     }
 
     /// Return the provider slug (e.g. "openai", "anthropic").
@@ -383,6 +447,7 @@ pub(crate) mod test_util {
         InferenceProvider {
             client: Arc::new(StubProviderClient),
             slug: "test-stub".to_string(),
+            image_client: None,
         }
     }
 
@@ -430,6 +495,7 @@ pub(crate) mod test_util {
         InferenceProvider {
             client: Arc::new(FailingProviderClient),
             slug: "test-failing".to_string(),
+            image_client: None,
         }
     }
 }

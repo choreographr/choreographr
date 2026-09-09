@@ -97,6 +97,33 @@ pub fn model_supports_vision(provider_slug: &str, model: &str) -> bool {
     with_model_fact(provider_slug, model, |m| m.supports_vision).unwrap_or(false)
 }
 
+/// Whether the given model on the given provider can *produce* images
+/// (image output), mirroring [`model_supports_vision`] on the output side of
+/// the modalities pair. Unknown models and providers default to `false` —
+/// the safe conservative choice: an image-capable capability gate must never
+/// enable itself for an untracked model.
+pub fn model_supports_image_output(provider_slug: &str, model: &str) -> bool {
+    with_model_fact(provider_slug, model, |m| m.supports_image_output).unwrap_or(false)
+}
+
+/// Return the model IDs on the given provider that can produce images
+/// (`supports_image_output == true`), in the catalog's natural order (the
+/// snapshot/overlay insertion order). Unknown providers yield an empty list.
+pub fn image_models_for_provider(provider_slug: &str) -> Vec<String> {
+    let catalog = PROVIDER_CATALOG.load();
+    catalog
+        .iter()
+        .find(|e| e.slug == provider_slug)
+        .map(|e| {
+            e.models
+                .iter()
+                .filter(|m| m.supports_image_output)
+                .map(|m| m.model.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether the model requires `reasoning_content` to be present on every
 /// assistant message (e.g. DeepSeek/GLM 5.x chat completions). Purely
 /// data-driven now: the ingested models.dev fact (`interleaved.field ==
@@ -788,5 +815,89 @@ mod tests {
         ));
         assert!(!model_supports_vision("deepseek", "deepseek-v4-pro"));
         assert!(!model_supports_vision("no-such-provider", "any-model"));
+    }
+
+    #[test]
+    fn model_supports_image_output_resolves_from_catalog() {
+        let _restore = RestoreBundledOnDrop;
+        // Synthetic two-flag catalog: the two modalities sides are
+        // independent facts, and unknown provider/model default false.
+        let bundled = catalog_snapshot();
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            c[0].models[0].supports_vision = true;
+            c[0].models[0].supports_image_output = true;
+            c
+        });
+        assert!(model_supports_image_output("tiny-test", "tiny-model"));
+        // Dropping only the output flag leaves vision on: they do not imply
+        // each other.
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            c[0].models[0].supports_vision = true;
+            c
+        });
+        assert!(!model_supports_image_output("tiny-test", "tiny-model"));
+        assert!(model_supports_vision("tiny-test", "tiny-model"));
+        // Unknown provider/model → false, the safe default.
+        crate::catalog::replace_catalog(bundled.to_vec());
+        assert!(!model_supports_image_output(
+            "no-such-provider",
+            "any-model"
+        ));
+        assert!(!model_supports_image_output("openai", "not-a-real-model"));
+    }
+
+    #[test]
+    fn image_models_for_provider_lists_flagged_models_in_catalog_order() {
+        let _restore = RestoreBundledOnDrop;
+        // A synthetic multi-model provider: only the flagged entries are
+        // listed, in the catalog's insertion order.
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            let flagged = |id: &str| crate::catalog::ModelEntry {
+                model: id.to_string(),
+                supports_image_output: true,
+                ..Default::default()
+            };
+            c[0].models = vec![
+                flagged("image-a"),
+                crate::catalog::ModelEntry::default(), // unflagged
+                flagged("image-b"),
+            ];
+            c
+        });
+        assert_eq!(
+            image_models_for_provider("tiny-test"),
+            vec!["image-a".to_string(), "image-b".to_string()]
+        );
+        // Unknown provider → empty, never an error.
+        assert!(image_models_for_provider("no-such-provider").is_empty());
+    }
+
+    #[test]
+    fn bundled_overlay_flips_image_output_flag() {
+        // The bundled overlay can override the flag like vision's. Swap in a
+        // catalog with the flag ON and overlay it back OFF (and vice versa)
+        // via merge_overlay to pin the override plumbing end to end.
+        let _restore = RestoreBundledOnDrop;
+        let merged = crate::catalog::merge_overlay(
+            &tiny_catalog(),
+            "[provider.tiny-test.models.\"tiny-model\"]\nsupports_image_output = true\n",
+        );
+        crate::catalog::replace_catalog(merged);
+        assert!(model_supports_image_output("tiny-test", "tiny-model"));
+        assert_eq!(
+            image_models_for_provider("tiny-test"),
+            vec!["tiny-model".to_string()]
+        );
+        // And back off again.
+        let off = crate::catalog::merge_overlay(
+            &tiny_catalog(),
+            "[provider.tiny-test.models.\"tiny-model\"]\nsupports_image_output = false\n",
+        );
+        crate::catalog::replace_catalog(off);
+        assert!(!model_supports_image_output("tiny-test", "tiny-model"));
+        assert!(image_models_for_provider("tiny-test").is_empty());
     }
 }

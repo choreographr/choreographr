@@ -90,7 +90,8 @@ struct RawModel {
     /// Input/output modalities (`{"input": ["text", "image"], "output": ["text"]}`).
     /// A model is vision-capable when `"image"` appears in `modalities.input`;
     /// absent → treated as text-only. This is the source of truth for
-    /// [`ModelEntry::supports_vision`].
+    /// [`ModelEntry::supports_vision`], and the `output` side feeds
+    /// [`ModelEntry::supports_image_output`] the same way.
     #[serde(default)]
     modalities: Option<RawModalities>,
 }
@@ -99,6 +100,11 @@ struct RawModel {
 struct RawModalities {
     #[serde(default)]
     input: Vec<String>,
+    /// Output modalities the model can *produce*. Absent in older snapshot
+    /// entries → empty → no image-output fact, the same safe-default pattern
+    /// as `input`.
+    #[serde(default)]
+    output: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,6 +231,15 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
                 .as_ref()
                 .map(|mods| mods.input.iter().any(|m| m == "image"))
                 .unwrap_or(false),
+            // Image OUTPUT: same safe-default pattern, on the `output` side
+            // of the modalities pair. `"image"` there means the model can
+            // *produce* images (gpt-image-1, Gemini image models, …);
+            // absent modalities → false (text-generation only).
+            supports_image_output: m
+                .modalities
+                .as_ref()
+                .map(|mods| mods.output.iter().any(|m| m == "image"))
+                .unwrap_or(false),
         })
         .collect();
 
@@ -312,6 +327,10 @@ mod tests {
                     "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}],
                     "limit": {"context": 400000, "output": 131072},
                     "modalities": {"input": ["text", "image"], "output": ["text"]}
+                },
+                "gpt-image-1": {
+                    "limit": {"context": 128000, "output": 4096},
+                    "modalities": {"input": ["text"], "output": ["image"]}
                 }
             }
         },
@@ -458,6 +477,21 @@ mod tests {
         // glm-5 (text only) and chatty-1 (no modalities field) → not vision.
         assert!(!catalog[0].models[0].supports_vision);
         assert!(!catalog[4].models[0].supports_vision);
+    }
+
+    #[test]
+    fn derives_image_output_from_modalities_output() {
+        let catalog = normalize_modelsdev(SNAPSHOT);
+        // gpt-image-1 declares image in OUTPUT modalities → image generation.
+        assert!(catalog[1].models[1].supports_image_output);
+        assert!(!catalog[1].models[1].supports_vision);
+        // gpt-5.4 declares image INPUT only — that must not leak into the
+        // output flag (input side and output side are independent facts).
+        assert!(!catalog[1].models[0].supports_image_output);
+        // glm-5 (no output modality recorded) and chatty-1 (no modalities
+        // field at all) → false, the safe default.
+        assert!(!catalog[0].models[0].supports_image_output);
+        assert!(!catalog[4].models[0].supports_image_output);
     }
 
     #[test]

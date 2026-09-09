@@ -30,6 +30,7 @@
 pub mod anthropic;
 pub mod catalog;
 pub mod google;
+pub mod images;
 pub mod openai;
 pub mod retry;
 
@@ -49,13 +50,18 @@ pub use anthropic::{AnthropicClient, AnthropicConfig};
 pub use catalog::{
     ModelEntry, PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, ReasoningPassback, RefreshError,
     RefreshOutcome, all_display_names, all_slugs, bundled_overlay_src, catalog_snapshot,
-    fetch_modelsdev, load_bundled_base, lookup_context_window, lookup_max_output_tokens,
-    lookup_provider, merge_overlay, model_reasoning_capability, model_reasoning_passback,
-    model_request_format, model_supports_temperature, model_supports_vision, normalize_modelsdev,
+    fetch_modelsdev, image_models_for_provider, load_bundled_base, lookup_context_window,
+    lookup_max_output_tokens, lookup_provider, merge_overlay, model_reasoning_capability,
+    model_reasoning_passback, model_request_format, model_supports_image_output,
+    model_supports_temperature, model_supports_vision, normalize_modelsdev,
     provider_slug_for_model, replace_catalog, requires_reasoning_content, write_file_atomic,
 };
 pub use context_window::ContextWindowConfig;
 pub use google::{GoogleClient, GoogleConfig};
+pub use images::{
+    Background, ImageGenerationClient, ImageGenerationRequest, ImageGenerationResult, ImageQuality,
+    ImageSize, OpenAiImageClient, OutputFormat,
+};
 pub use openai::{AllowedCaller, OpenAiClient, RequestFormat, ServiceConfig};
 pub use overrides::ProviderOverrides;
 pub use retry::RetryCallback;

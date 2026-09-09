@@ -45,9 +45,10 @@ pub mod refresh;
 
 pub use loader::{bundled_overlay_src, load_bundled_base};
 pub use lookup::{
-    lookup_context_window, lookup_max_output_tokens, model_reasoning_capability,
-    model_reasoning_passback, model_request_format, model_supports_temperature,
-    model_supports_vision, requires_reasoning_content,
+    image_models_for_provider, lookup_context_window, lookup_max_output_tokens,
+    model_reasoning_capability, model_reasoning_passback, model_request_format,
+    model_supports_image_output, model_supports_temperature, model_supports_vision,
+    requires_reasoning_content,
 };
 pub use modelsdev::normalize_modelsdev;
 pub use overlay::merge_overlay;
@@ -149,6 +150,12 @@ pub struct ModelEntry {
     /// `false` is the safe default for unknown models.
     #[serde(default)]
     pub supports_vision: bool,
+    /// Whether the model can *produce* images (image output). Derived from
+    /// the models.dev `modalities.output` array (`"image"` present) at
+    /// ingestion; the overlay can override it the same way vision can.
+    /// `false` is the safe default for unknown models (text generation only).
+    #[serde(default)]
+    pub supports_image_output: bool,
 }
 
 // Manual `impl` rather than `#[derive(Default)]` + `#[default]` because
@@ -172,6 +179,7 @@ impl Default for ModelEntry {
             supports_temperature: true,
             deprecated: false,
             supports_vision: false,
+            supports_image_output: false,
         }
     }
 }

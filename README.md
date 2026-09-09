@@ -509,8 +509,18 @@ in the same table and still stream to the TUI.
 Vision support is per-model: pick a vision-capable model (e.g.
 `deepseek-v4-flash-vision-exp`) and call `read_image` with a path.
 
+**Image generation.** The `generate_image` tool (in the `image` tool group,
+activated with `load_tools image`) produces an image from a text prompt via
+the session's image-capable provider account (OpenAI Images API in v1 —
+Anthropic/Gemini backends are deferred). When no explicit model is passed,
+the daemon picks among the provider's catalog-verified image models by
+priority (gpt-image > imagen > gemini-image > flux > dall-e). The generated
+bytes are displayed, persisted, and fed back to the model exactly like
+`display_image` images — so the model sees what it generated and can refine
+it on the next turn.
+
 **Tool group.** Tools are organized into groups (`core`, `git`, `shell`,
-`content`, `x`, `vm`, `db`, `mcp`, `blockchain`). Only `core`, `git`, and
+`content`, `image`, `x`, `vm`, `db`, `mcp`, `blockchain`). Only `core`, `git`, and
 `shell` are active by default; the `content` group additionally becomes
 available when the daemon is built with the `content` cargo feature (off by
 default; opt in with `--features content`). The model can activate additional groups with

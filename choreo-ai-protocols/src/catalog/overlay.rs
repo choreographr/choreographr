@@ -236,6 +236,16 @@ fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
                     "overlay: supports_vision is not a bool; skipping",
                 ),
             },
+            // Image-output override: same shape as supports_vision, for
+            // pinning image generation where the snapshot's output
+            // modalities are wrong or a new image model is not yet listed.
+            "supports_image_output" => match value.as_bool() {
+                Some(support) => model.supports_image_output = support,
+                None => warn!(
+                    model = %model.model,
+                    "overlay: supports_image_output is not a bool; skipping",
+                ),
+            },
             // Output-token ceiling: overrides the ingested `limit.output`
             // (0 = unknown, same convention as `context_window`).
             "max_output_tokens" => match value.as_integer() {
@@ -601,6 +611,50 @@ deprecated = true
     fn empty_overlay_returns_base_unchanged() {
         let merged = merge_overlay(&base(), "");
         assert_eq!(merged.len(), base().len());
+    }
+
+    #[test]
+    fn supports_image_output_overlay_override_flips_the_flag() {
+        // Mirror of the supports_vision override: an overlay bool flips the
+        // ingested fact in either direction (and can define it wholesale for
+        // a model the snapshot does not cover).
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme.models."acme-base"]
+supports_image_output = true
+
+[provider.acme.models."brand-new-image"]
+supports_image_output = true
+
+[provider.acme.models."acme-lite"]
+supports_image_output = true
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        // The default entry for acme-base carries image output false — the
+        // overlay flips it.
+        assert!(
+            acme.models
+                .iter()
+                .find(|m| m.model == "acme-base")
+                .unwrap()
+                .supports_image_output
+        );
+        // A brand-new model is added wholesale with the flag set.
+        assert!(
+            acme.models
+                .iter()
+                .find(|m| m.model == "brand-new-image")
+                .unwrap()
+                .supports_image_output
+        );
+        // A different provider's model is untouched.
+        let zoo = merged
+            .iter()
+            .find(|e| e.slug == "zoocorp")
+            .expect("zoocorp");
+        assert!(!zoo.models[0].supports_image_output);
     }
 
     #[test]
