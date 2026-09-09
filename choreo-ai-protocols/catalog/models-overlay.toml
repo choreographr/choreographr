@@ -253,6 +253,28 @@
   base_url = "https://api.z.ai/api/coding/paas/v4"
   default_model = "glm-5.1"
 
+# glm-image (z.ai + mainland zhipuai): the GLM text-to-image model on the
+# same PaaS-v4 Gateway the chat models use. NOT in the models.dev snapshot
+# (image-generation models live outside its chat completions contract), so
+# the image-output flag is pinned here — this makes the model show up in
+# image_models_for_provider("zai") / ("zhipuai") for the generate_image
+# tool's priority pick (picked as the only image-output candidate for the
+# provider). The image model used to also carry `cogview-*` alternates;
+# glm-image is the current documented generation.
+#
+# Probe notes (docs.z.ai/api-reference/image/generate-image, 2026-09):
+# quality is hd|standard ONLY, size is a WxH string (1280x1280 default), the
+# response is data[0].url (30-day-expiring CDN link), and neither `n` nor
+# `output_format` nor `background` are documented — the adapter never sends
+# them.
+[provider.zai.models."glm-image"]
+  supports_image_output = true
+
+# Same image model on the mainland zhipuai (bigmodel.cn) entry: same GLM
+# image family, same endpoint shape (/api/paas/v4/images/generations).
+[provider.zhipuai.models."glm-image"]
+  supports_image_output = true
+
 # Anthropic last-turn-only models: echo reasoning only on tool-call turns
 [provider.anthropic.models."claude-sonnet-4-5"]
   reasoning_passback = "tool_loop"

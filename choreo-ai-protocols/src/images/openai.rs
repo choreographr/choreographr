@@ -15,29 +15,16 @@ use choreo_proto::InferenceError;
 use serde::Deserialize;
 use std::io;
 
-/// Wall-clock deadline for a single image-generation attempt, in seconds.
-///
-/// Image generation is *slow by design* — tens of seconds is normal for a
-/// high-quality gpt-image request — so the chat client's 120 s idle-read
-/// default is too tight and the 3600 s total default is absurdly loose for a
-/// single bounded POST. 180 s covers the slowest legitimate generation while
-/// still guaranteeing a hung attempt cannot wedge a worker for minutes on
-/// end. Applied via `build_agent`'s `timeout_global` (the only timeout that
-/// fires even when the connection trickles keep-alive bytes).
-const IMAGE_TOTAL_TIMEOUT_SECS: u64 = 180;
+// The wall-clock deadline and retry budget live in [`super`] as shared
+// adapter policy constants (see super::IMAGE_TOTAL_TIMEOUT_SECS and
+// super::IMAGE_MAX_ATTEMPTS) — identical across every image adapter and
+// reused for the URL-download path too.
 
 /// Images API path under the configured base URL (OpenAI: `/v1`).
 const IMAGE_GENERATIONS_PATH: &str = "/images/generations";
 
-/// Frugal retry budget for image generations: at most 2 attempts.
-///
-/// Unlike a chat turn, a failed generation has a user staring at a spinner
-/// and the attempt itself can cost tens of seconds — one opportunistic retry
-/// (transport error, or 429/503 whose Retry-After fits the budget, decided
-/// by the shared `retry_decision`) is enough to ride out a blip; anything
-/// beyond that should surface as an error so the caller can decide, rather
-/// than silently doubling an already-long wait.
-const IMAGE_MAX_ATTEMPTS: u32 = 2;
+const IMAGE_MAX_ATTEMPTS: u32 = super::IMAGE_MAX_ATTEMPTS;
+const IMAGE_TOTAL_TIMEOUT_SECS: u64 = super::IMAGE_TOTAL_TIMEOUT_SECS;
 
 /// One `data[]` item of the Images API response.
 ///

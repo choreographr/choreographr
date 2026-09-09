@@ -5,7 +5,7 @@ use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
 use choreo_ai_protocols::{
     AnthropicClient, AnthropicConfig, ChatTurnRequest, ChatTurnResult, GoogleClient, GoogleConfig,
     ImageGenerationClient, OpenAiImageClient, ProviderClient, ProviderProtocol, StreamEvent,
-    lookup_provider,
+    ZaiImageClient, lookup_provider,
 };
 use choreo_proto::InferenceError;
 
@@ -28,12 +28,17 @@ pub struct InferenceProvider {
     /// because the catalog lookup that supplies it returns a clone, not a
     /// `'static` reference.
     slug: String,
-    /// Optional image-generation backend. `Some` only for OpenAI-protocol
-    /// providers today; Anthropic and Gemini have no image-generation backend
-    /// in v1 (the Gemini/Responses-image paths are deferred), so their
-    /// constructors leave this `None` and image requests against those
-    /// accounts surface a precise "does not support" error instead of a
-    /// half-working client.
+    /// Optional image-generation backend. `Some` for OpenAI-protocol
+    /// providers — the plain OpenAI-protocol proxy families use the
+    /// [`OpenAiImageClient`] default, while the two Zhipu slugs (`zai`, the
+    /// z.ai coding gateway, and `zhipuai`, the mainland bigmodel endpoint)
+    /// get the dedicated [`ZaiImageClient`] since their Images API is a
+    /// different endpoint contract (URL-returning glm-image, hd/standard
+    /// quality, no-n body). Anthropic and Gemini have no image-generation
+    /// backend in v1 (the Gemini/Responses-image paths are deferred), so
+    /// their constructors leave this `None` and image requests against
+    /// those accounts surface a precise "does not support" error instead of
+    /// a half-working client.
     image_client: Option<Arc<dyn ImageGenerationClient>>,
 }
 
@@ -131,7 +136,22 @@ impl InferenceProvider {
                 // applied. An image client is constructed even when the
                 // account's models later fail a catalog image-capability
                 // check — the tool gates model choice at request time.
-                let image_client = Arc::new(OpenAiImageClient::new(svc_config, key));
+                //
+                // Zhipu (z.ai coding + mainland zhipuai/bigmodel) accounts
+                // route their Images API at a different endpoint than the
+                // generic OpenAI one (and z.ai's chat base — the `/coding`
+                // plan path — is not where images are served), so those two
+                // slugs get the dedicated [`ZaiImageClient`]; every other
+                // OpenAI-protocol provider keeps the default
+                // [`OpenAiImageClient`]. `ZaiImageClient` itself rewrites the
+                // coding base to the plain PaaS-v4 base, so both slugs share
+                // one adapter with one documented endpoint convention.
+                let image_client: Arc<dyn ImageGenerationClient> =
+                    if matches!(entry.slug.as_str(), "zai" | "zhipuai") {
+                        Arc::new(ZaiImageClient::new(svc_config, key))
+                    } else {
+                        Arc::new(OpenAiImageClient::new(svc_config, key))
+                    };
                 Ok(Self {
                     client: Arc::new(client),
                     slug: entry.slug,
@@ -362,6 +382,46 @@ mod tests {
         let cfg = AccountConfig::simple("gemini", "google");
         let err = InferenceProvider::from_account_config(&cfg, None).unwrap_err();
         assert!(err.contains("no API key"), "{err}");
+    }
+
+    #[test]
+    fn from_account_config_zai_routes_to_dedicated_image_client() {
+        // The z.ai chat path is OpenAI-compatible, but its Images API is a
+        // different endpoint shape (URL-returning glm-image, no-n body) —
+        // the image backend must be the dedicated adapter, not the generic
+        // OpenAI one. Asserted via the redacted Debug (which names the
+        // concrete struct), because the trait object carries no type shape.
+        let cfg = AccountConfig::simple("zai", "zai");
+        let provider = InferenceProvider::from_account_config(&cfg, Some("key".into()))
+            .expect("zai account constructs");
+        let image_client = provider
+            .image_client()
+            .expect("OpenAI protocol gets an image client");
+        let debug = format!("{:?}", image_client);
+        assert!(debug.starts_with("ZaiImageClient"), "{debug}");
+        // Mainland zhipuai resolves to the same Zhipu image adapter.
+        let cfg = AccountConfig::simple("zhipu", "zhipuai");
+        let provider = InferenceProvider::from_account_config(&cfg, Some("key".into()))
+            .expect("zhipuai account constructs");
+        let debug = format!(
+            "{:?}",
+            provider.image_client().expect("image client present")
+        );
+        assert!(debug.starts_with("ZaiImageClient"), "{debug}");
+    }
+
+    #[test]
+    fn from_account_config_openai_keeps_default_image_client() {
+        // Other OpenAI-protocol providers (and the plain openai slug) must
+        // NOT have been switched to the z.ai adapter.
+        let cfg = AccountConfig::simple("openai", "openai");
+        let provider = InferenceProvider::from_account_config(&cfg, Some("key".into()))
+            .expect("openai account constructs");
+        let debug = format!(
+            "{:?}",
+            provider.image_client().expect("image client present")
+        );
+        assert!(debug.starts_with("OpenAiImageClient"), "{debug}");
     }
 
     #[test]

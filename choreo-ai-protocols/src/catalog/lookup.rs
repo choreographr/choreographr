@@ -900,4 +900,27 @@ mod tests {
         assert!(!model_supports_image_output("tiny-test", "tiny-model"));
         assert!(image_models_for_provider("tiny-test").is_empty());
     }
+
+    #[test]
+    fn bundled_overlay_lists_glm_image_under_the_zai_and_zhipuai_slugs() {
+        // The REAL bundled catalog: glm-image is not in the models.dev
+        // snapshot, so its image-output flag comes solely from the bundled
+        // overlay's `[provider.<slug>.models."glm-image"]` entries — this
+        // pins the overlay plumbing end to end for the Zhipu image model.
+        // Read-only (no catalog swap), so no restore guard is needed.
+        assert!(model_supports_image_output("zai", "glm-image"));
+        assert!(model_supports_image_output("zhipuai", "glm-image"));
+        // The tool's candidate list picks it up under both slugs, and it is
+        // the single (hence priority-fallback) image candidate for each.
+        assert_eq!(
+            image_models_for_provider("zai"),
+            vec!["glm-image".to_string()]
+        );
+        assert_eq!(
+            image_models_for_provider("zhipuai"),
+            vec!["glm-image".to_string()]
+        );
+        // Sanity: chat models under the same slug stay non-image.
+        assert!(!model_supports_image_output("zai", "glm-5.1"));
+    }
 }

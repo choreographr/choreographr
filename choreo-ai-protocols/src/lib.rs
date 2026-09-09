@@ -60,7 +60,7 @@ pub use context_window::ContextWindowConfig;
 pub use google::{GoogleClient, GoogleConfig};
 pub use images::{
     Background, ImageGenerationClient, ImageGenerationRequest, ImageGenerationResult, ImageQuality,
-    ImageSize, OpenAiImageClient, OutputFormat,
+    ImageSize, OpenAiImageClient, OutputFormat, ZaiImageClient,
 };
 pub use openai::{AllowedCaller, OpenAiClient, RequestFormat, ServiceConfig};
 pub use overrides::ProviderOverrides;

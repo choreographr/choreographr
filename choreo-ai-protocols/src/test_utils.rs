@@ -78,15 +78,34 @@ impl MockProvider {
     /// `responses`: `(status, content_type, body)` served in order; the last
     /// entry repeats for any excess requests.
     pub fn start(responses: Vec<(u16, &'static str, String)>) -> Self {
+        // `start_scripted` with no address to embed — the common shape.
+        Self::start_scripted(move |_| responses)
+    }
+
+    /// Like [`MockProvider::start`], but the script is built AFTER the bind
+    /// and receives the bound base root (`http://<addr>`) so a response body
+    /// can embed a URL pointing back at this very server (the z.ai adapter
+    /// tests' `data[0].url` CDN download — the port does not exist before
+    /// the bind, so the body cannot carry it).
+    pub fn start_scripted<F>(make: F) -> Self
+    where
+        F: FnOnce(&str) -> Vec<(u16, &'static str, String)>,
+    {
+        // Bind first so the scripted responses can embed the real address,
+        // THEN build them — the serve thread is spawned below, so the script
+        // is complete before any traffic arrives.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
         // Non-blocking so the serve loop can poll `accept` and observe the
         // shutdown flag instead of blocking forever on a connection that never
         // arrives.
         listener.set_nonblocking(true).expect("nonblocking");
         let addr = listener.local_addr().expect("mock provider local addr");
+        let responses = Arc::new(Mutex::new(VecDeque::from(make(&format!(
+            "http://{}",
+            addr
+        )))));
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_thread = Arc::clone(&captured);
-        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_thread = Arc::clone(&shutdown);
 

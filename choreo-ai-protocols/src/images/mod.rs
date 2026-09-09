@@ -2,14 +2,53 @@
 //! request/result types it is expressed in.
 //!
 //! This mirrors the [`crate::ProviderClient`] split: a provider-agnostic
-//! trait plus per-provider adapters (currently only the OpenAI Images API,
-//! [`OpenAiImageClient`]). Errors reuse [`InferenceError`] so callers of the
+//! trait plus per-provider adapters (the OpenAI Images API,
+//! [`OpenAiImageClient`], and the z.ai / Zhipu GLM Images API,
+//! [`ZaiImageClient`]). Errors reuse [`InferenceError`] so callers of the
 //! chat trait and of this trait share one error type and one metrics-label
 //! mapping — no new error taxonomy is invented for the image path.
 
 mod openai;
+mod zai;
+
+// ── Shared adapter policy constants ───────────────────────────────────────
+
+/// Wall-clock deadline for a single image-generation attempt, in seconds.
+///
+/// Image generation is *slow by design* — tens of seconds is normal for a
+/// high-quality gpt-image request (and glm-image's `hd` quality renders in
+/// ~20 s) — so the chat client's 120 s idle-read default is too tight and
+/// the 3600 s total default is absurdly loose for a single bounded POST.
+/// 180 s covers the slowest legitimate generation while still guaranteeing a
+/// hung attempt cannot wedge a worker for minutes on end. Applied via
+/// `build_agent`'s `timeout_global` (the only timeout that fires even when
+/// the connection trickles keep-alive bytes), and — because the agent is
+/// shared with the URL-download path of URL-returning adapters — it also
+/// bounds that post-response fetch.
+pub(crate) const IMAGE_TOTAL_TIMEOUT_SECS: u64 = 180;
+
+/// Frugal retry budget for image generations: at most 2 attempts.
+///
+/// Unlike a chat turn, a failed generation has a user staring at a spinner
+/// and the attempt itself can cost tens of seconds — one opportunistic retry
+/// (transport error, or 429/503 whose Retry-After fits the budget, decided
+/// by the shared `retry_decision`) is enough to ride out a blip; anything
+/// beyond that should surface as an error so the caller can decide, rather
+/// than silently doubling an already-long wait.
+pub(crate) const IMAGE_MAX_ATTEMPTS: u32 = 2;
+
+/// Cap on downloaded image bytes for adapters whose provider returns a
+/// temporary URL instead of inline bytes (z.ai: the URL is a CDN link that
+/// expires after 30 days). 8 MiB mirrors the daemon's
+/// `MAX_DISPLAY_IMAGE_BYTES` — anything larger would be rejected by the
+/// prepare pipeline right after decoding, so downloading past the cap only
+/// allocates bytes that will be thrown away. Enforced during the streaming
+/// read so a hostile multi-gigabyte response cannot balloon memory before
+/// the cap fires.
+pub(crate) const IMAGE_DOWNLOAD_CAP_BYTES: usize = 8 * 1024 * 1024;
 
 pub use openai::OpenAiImageClient;
+pub use zai::ZaiImageClient;
 
 use choreo_proto::InferenceError;
 use serde::{Deserialize, Serialize};

@@ -296,3 +296,296 @@ fn defaults_and_trait_accessors() {
     assert_eq!(OutputFormat::Jpeg.to_string(), "jpeg");
     assert_eq!(Background::Opaque.to_string(), "opaque");
 }
+
+// ── ZaiImageClient (z.ai / Zhipu GLM Images API) ─────────────────────────
+//
+// The mock is reused verbatim: it scripts "one canned response per
+// request", so a z.ai URL-returning success is scripted as TWO responses —
+// [JSON envelope, image bytes] — served to the generation POST and the
+// follow-up CDN download in that order. The self-referential URL (the body
+// must embed the server's own address) is why these use
+// `MockProvider::start_scripted` instead of `start`.
+
+use choreo_ai_protocols::ZaiImageClient;
+
+/// Plain payload bytes the mock "CDN" serves. A real PNG is not needed:
+/// the adapter intentionally guards only the content type (bytes are
+/// validated by the daemon's prepare pipeline); this test pins byte
+/// fidelity through the adapter, not image decodability.
+const IMAGE_BYTES: &str = "\u{89}PNG-fixture-bytes-7a5f0e\u{82}";
+
+fn zai_client(mock: &MockProvider) -> ZaiImageClient {
+    // "paas/v4" mirrors the real z.ai PaaS base's trailing segments so the
+    // composed request path mirrors what production would compose.
+    let config = ServiceConfig {
+        base_url: mock.base_url("paas/v4"),
+        provider_slug: "zai".to_string(),
+        ..Default::default()
+    };
+    ZaiImageClient::new(config, "zai-key".to_string())
+}
+
+fn zai_sample_request() -> ImageGenerationRequest {
+    ImageGenerationRequest::new("a lighthouse at dusk", "glm-image")
+}
+
+#[test]
+#[ignore]
+fn zai_url_response_downloads_image_bytes() {
+    let mock = MockProvider::start_scripted(|base| {
+        vec![
+            (
+                200,
+                "application/json",
+                serde_json::json!({
+                    // `created` is parsed-but-unexposed by the adapter.
+                    "created": 1_700_000_000_u64,
+                    "data": [{ "url": format!("{base}/cdn/img/generated.png") }]
+                })
+                .to_string(),
+            ),
+            // The "CDN": same mock listener, image content type, raw bytes.
+            (200, "image/png", IMAGE_BYTES.to_string()),
+        ]
+    });
+    let result = zai_client(&mock)
+        .generate_image(&zai_sample_request(), None)
+        .expect("generation succeeds");
+
+    // Byte fidelity: the downloaded bytes are re-encoded b64 and decode
+    // back to the exact payload the mock served.
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&result.image_b64)
+        .expect("result b64 decodes");
+    assert_eq!(bytes, IMAGE_BYTES.as_bytes());
+    // URL-variant responses carry no revised prompt; the model is echoed.
+    assert_eq!(result.revised_prompt, None);
+    assert_eq!(result.model, "glm-image");
+
+    // Two requests: the generation POST and the CDN download — which must
+    // NOT carry the Authorization header (the URL is pre-signed and the
+    // API key must not travel to the CDN).
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/paas/v4/images/generations");
+    assert_eq!(requests[0].header("authorization"), Some("Bearer zai-key"));
+    assert_eq!(requests[1].path, "/cdn/img/generated.png");
+    assert_eq!(requests[1].header("authorization"), None);
+}
+
+#[test]
+#[ignore]
+fn zai_b64_json_present_is_used_directly() {
+    // b64_json is not part of glm-image's contract but is tolerated at the
+    // parse level — when present (and non-empty) it must be preferred over
+    // a URL fetch.
+    let mock = MockProvider::start(vec![(
+        200,
+        "application/json",
+        r#"{"created":1,"data":[{"b64_json":"aVNTaGVQclBuZ0J5dGVz"}]}"#.to_string(),
+    )]);
+    let result = zai_client(&mock)
+        .generate_image(&zai_sample_request(), None)
+        .expect("generation succeeds");
+    // The payload passes through verbatim; no download happened.
+    assert_eq!(result.image_b64, "aVNTaGVQclBuZ0J5dGVz");
+    assert_eq!(mock.requests().len(), 1, "no CDN fetch expected");
+}
+
+#[test]
+#[ignore]
+fn zai_wire_body_has_model_prompt_only_plus_mapped_knobs() {
+    // glm-image's schema is {model, prompt} + optional {size, quality}.
+    // n / response_format / background / output_format are NOT documented
+    // by z.ai and must never be sent, even when our request sets them
+    // (explicit background is silently ignored — documented decision).
+    let mock = MockProvider::start(vec![(
+        200,
+        "application/json",
+        r#"{"created":1,"data":[{"url":"http://127.0.0.1:1/img.png"}]}"#.to_string(),
+    )]);
+    let req = ImageGenerationRequest {
+        size: ImageSize::Portrait1024x1536,
+        quality: ImageQuality::High,
+        output_format: OutputFormat::Webp,
+        background: Background::Transparent,
+        ..zai_sample_request()
+    };
+    zai_client(&mock)
+        .generate_image(&req, None)
+        .expect_err("127.0.0.1:1 download must fail; the POST body assertions below still run");
+    // The generation POST body is what matters here.
+    let body = mock.requests()[0].body_json();
+    assert_eq!(body["model"], "glm-image");
+    assert_eq!(body["prompt"], "a lighthouse at dusk");
+    assert_eq!(body["size"], "1024x1536"); // verbatim wire string
+    assert_eq!(body["quality"], "hd"); // High → hd (glm-image's sharp tier)
+    // The never-send fields, pinned explicitly.
+    assert!(body.get("n").is_none());
+    assert!(body.get("response_format").is_none());
+    assert!(body.get("output_format").is_none());
+    assert!(body.get("background").is_none());
+}
+
+#[test]
+#[ignore]
+fn zai_quality_map_low_medium_are_standard_high_is_hd_auto_omitted() {
+    let mock = MockProvider::start(vec![
+        (
+            200,
+            "application/json",
+            r#"{"data":[{"b64_json":"aGk"}]}"#.to_string(),
+        ), // High
+        (
+            200,
+            "application/json",
+            r#"{"data":[{"b64_json":"aGk"}]}"#.to_string(),
+        ), // Medium
+        (
+            200,
+            "application/json",
+            r#"{"data":[{"b64_json":"aGk"}]}"#.to_string(),
+        ), // Low
+        (
+            200,
+            "application/json",
+            r#"{"data":[{"b64_json":"aGk"}]}"#.to_string(),
+        ), // Auto
+    ]);
+    for (quality, expected) in [
+        (ImageQuality::High, Some("hd")),
+        (ImageQuality::Medium, Some("standard")),
+        (ImageQuality::Low, Some("standard")),
+        (ImageQuality::Auto, None), // omitted entirely
+    ] {
+        let req = ImageGenerationRequest {
+            quality,
+            ..zai_sample_request()
+        };
+        zai_client(&mock).generate_image(&req, None).expect("ok");
+        let body = mock.requests().last().expect("a request").body_json();
+        match expected {
+            Some(w) => assert_eq!(body["quality"], w, "quality {quality:?}"),
+            None => assert!(body.get("quality").is_none(), "Auto must be omitted"),
+        }
+    }
+    // And the POST path is the base the docs pin: "/paas/v4/…" composes
+    // even against the coding-gateway base used for chat.
+    assert_eq!(mock.requests()[0].path, "/paas/v4/images/generations");
+}
+
+#[test]
+#[ignore]
+fn zai_flat_error_body_message_surfaces() {
+    // z.ai errors are the FLAT {code, message} shape (not OpenAI's nested
+    // error envelope) — the retry layer's `message` fallback must surface it.
+    let mock = MockProvider::start(vec![(
+        400,
+        "application/json",
+        r#"{"code":1212,"message":"invalid size"}"#.to_string(),
+    )]);
+    let err = zai_client(&mock)
+        .generate_image(&zai_sample_request(), None)
+        .expect_err("400 is terminal");
+    match err {
+        InferenceError::ClientError { status, detail } => {
+            assert_eq!(status, 400);
+            assert!(detail.contains("invalid size"), "{detail}");
+            assert!(!detail.contains("1212"), "raw code must not leak");
+        }
+        other => panic!("expected ClientError, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore]
+fn zai_content_filter_blocks_with_clear_message_not_empty_response() {
+    // Documented semantics: level 0 (most severe) ..= 3; any entry at level
+    // 0..=2 marks the generation BLOCKED — a ClientError, NOT EmptyResponse
+    // (and never a retry: policy blocks cannot clear on resend).
+    let mock = MockProvider::start(vec![(
+        200,
+        "application/json",
+        r#"{"created":1,"data":[{"url":"http://127.0.0.1:1/x.png"}],"content_filter":[{"role":"user","level":1}]}"#
+            .to_string(),
+    )]);
+    let err = zai_client(&mock)
+        .generate_image(&zai_sample_request(), None)
+        .expect_err("level-1 filter entry must block");
+    match err {
+        InferenceError::ClientError { status, detail } => {
+            assert_eq!(status, 200);
+            assert!(
+                detail.contains("content filter blocked the generation"),
+                "{detail}"
+            );
+            assert!(detail.contains("level 1"), "{detail}");
+            assert!(detail.contains("user"), "{detail}");
+        }
+        other => panic!("expected ClientError, got {other:?}"),
+    }
+    assert_eq!(mock.requests().len(), 1, "blocked is terminal — no retry");
+}
+
+#[test]
+#[ignore]
+fn zai_content_filter_level_3_is_advisory_not_blocking() {
+    // Level 3 is the least severe (docs: 0 most severe, 3 least) — a level-3
+    // entry must NOT turn the generation into an error.
+    let mock = MockProvider::start(vec![(
+        200,
+        "application/json",
+        r#"{"created":1,"data":[{"b64_json":"b2th"}],"content_filter":[{"role":"assistant","level":3}]}"#
+            .to_string(),
+    )]);
+    let result = zai_client(&mock)
+        .generate_image(&zai_sample_request(), None)
+        .expect("level-3 is advisory");
+    assert_eq!(result.image_b64, "b2th");
+}
+
+#[test]
+#[ignore]
+fn zai_empty_data_is_empty_response_and_neither_field_is_nor() {
+    // Empty data array → EmptyResponse (same convention as the OpenAI
+    // adapter), not a deserialization failure.
+    let mock = MockProvider::start(vec![(
+        200,
+        "application/json",
+        r#"{"created":1,"data":[]}"#.to_string(),
+    )]);
+    let err = zai_client(&mock)
+        .generate_image(&zai_sample_request(), None)
+        .expect_err("empty data must error");
+    assert!(matches!(err, InferenceError::EmptyResponse), "{err:?}");
+
+    // An item with NEITHER url NOR b64_json → also EmptyResponse.
+    let mock = MockProvider::start(vec![(
+        200,
+        "application/json",
+        r#"{"created":1}"#.to_string(),
+    )]);
+    let err = zai_client(&mock)
+        .generate_image(&zai_sample_request(), None)
+        .expect_err("no data at all must error");
+    assert!(matches!(err, InferenceError::EmptyResponse), "{err:?}");
+}
+
+#[test]
+#[ignore]
+fn zai_defaults_and_trait_accessors() {
+    let mock = MockProvider::start(vec![]);
+    let c = zai_client(&mock);
+    assert_eq!(c.provider_slug(), "zai");
+    // The 180 s attempt deadline + 2-attempt budget come from the shared
+    // adapter policy constants even when the chat config said otherwise.
+    let mut config = ServiceConfig {
+        base_url: mock.base_url("paas/v4"),
+        provider_slug: "zai".to_string(),
+        ..Default::default()
+    };
+    config.total_timeout_secs = 3600;
+    let c = ZaiImageClient::new(config, "k".to_string());
+    assert_eq!(c.config().total_timeout_secs, 180);
+}

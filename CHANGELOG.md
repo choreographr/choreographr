@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ZaiImageClient` — the z.ai (Zhipu GLM) Images adapter (`choreo-ai-protocols` src/images/zai.rs):**
+  a second adapter behind `ImageGenerationClient` for the `/paas/v4/images/generations` endpoint
+  (glm-image): request body is `{model, prompt}` + optional `size` (OpenAI wire strings verbatim;
+  Auto omitted — z.ai documents no auto sentinel) and `quality` (`Low`/`Medium` → `standard`,
+  `High` → `hd`, `Auto` omitted); `n`/`response_format`/`background`/`output_format` are never
+  sent (z.ai documents none of them; an explicitly-set background is silently ignored — a
+  documented best-effort-knobs decision, not an error). Responses are URL-returning (a temporary
+  CDN link that expires after 30 days), so the adapter downloads the URL with the shared agent
+  (no Authorization header — the pre-signed URL must not leak the API key to the CDN), an 8 MiB
+  streaming cap, a loose `image/*` content-type guard, and the same 180 s per-attempt deadline;
+  a `b64_json` field is tolerated (parse-level) and preferred when present. `content_filter`
+  entries at level 0..=2 (0 = most severe, 3 = least) surface a clear "provider content filter
+  blocked the generation (level N)" ClientError instead of EmptyResponse — blocked means no
+  retry. Flat `{code, message}` error bodies surface their message via the existing retry-layer
+  envelope extraction. Dispatch: the daemon's `from_account_config` routes the `zai` and
+  `zhipuai` provider slugs to this adapter (all other OpenAI-protocol providers keep the default
+  `OpenAiImageClient`); the catalog overlay pins `glm-image` as `supports_image_output` under
+  both slugs (picked as the sole priority-fallback image candidate — no `pick_image_model`
+  change needed).
 - **Image-generation capability on the provider facade + `GetImageGenerationProvider` command:**
   `InferenceProvider` now carries an optional `image_client`
   (`Option<Arc<dyn ImageGenerationClient>>`, populated with an
