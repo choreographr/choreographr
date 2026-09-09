@@ -124,7 +124,17 @@ jobs:
           # when absent), so installing rpm here is what turns the .rpm from
           # a manual-SOP artifact into a CI one. build-rpm.sh consumes the
           # same host target/dist/ build the .deb uses.
-          sudo apt-get update -qq
+          # SCOPE the update to Ubuntu's own sources: the runner image also
+          # carries a Google Chrome apt repo, and dl.google.com's index can
+          # hash-sum-flake when Google republishes mid-day (observed for real:
+          # `apt-get update` died with exit 100 on that repo BEFORE `rpm` was
+          # ever installed, failing the whole job on a source we never install
+          # from). `Dir::Etc::sourceparts=-` drops every third-party source;
+          # List-Cleanup keeps the main-list entries so the install finds rpm.
+          sudo apt-get update -qq \
+            -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0"
           sudo apt-get install -y -qq rpm
 
       - name: Build (static musl tarball + .deb/.rpm)
