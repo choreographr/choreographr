@@ -81,8 +81,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registration) now resolves Windows executables through PATHEXT: a bare
   `nu`/`pwsh` is really `nu.exe`/`pwsh.exe`, so the old exact-name probe
   missed every installed binary on Windows. Unix behavior is unchanged.
+- `IosToolPending::wait`'s `Duration`-overflow fallback no longer converts an
+  intended-indefinite deadline into an instant `Timeout` (the old
+  `unwrap_or_else(Instant::now)` produced an already-elapsed deadline); the
+  overflowed case now means "wait until the reply or a cancel", which matches
+  the intent of an unbounded wait.
+- The `cancel_wins_over_arrived_reply` bridge test genuinely exercises the
+  POST-reply cancel re-check now: the old version flipped the flag BEFORE
+  `wait` with a `Duration::ZERO` deadline, so it only pinned the pre-wait
+  check and never reached the reply arm it claimed to cover. The predicate
+  now flips the flag on its second invocation (the post-reply re-check), and
+  the per-tool cancel-race tests share one deterministic
+  `cancel_race_fixture`.
+- `toggle_on_device_tools` (choreo-gui) now LOAD-modifies-persists the
+  settings file instead of rewriting it from a fresh struct — a whole-file
+  rewrite from scratch would have silently reset every OTHER preference to
+  its default the moment a second field exists.
 
 ### Changed
+
+- iOS platform tools hardening/streamlining: `open_url`'s executor-side
+  validation now parses the URL with the `url` crate (scheme allow-list over
+  a real parse — a bare prefix check accepted degenerate strings like
+  `https:not-a-url`) before the control-character ban; `notify`'s schema
+  advertises `maxLength` (200/2000) mirroring the executor caps; `open_url`
+  and `notify` surface the host's verdict (`{"opened": Bool}` /
+  `{"scheduled": Bool}`) instead of always reporting success; and
+  `run_bridge_tool` is the single serialization point (`&impl Serialize`),
+  removing the per-tool pre-encode + re-encode dance. iOS behavior for the
+  success paths is unchanged; declined opens/schedules now report as such.
 
 - `itertools` adopted (declared in `[workspace.dependencies]`, consumed by
   `choreo-daemon` and `choreo-ai-protocols`) alongside a new AGENTS.md

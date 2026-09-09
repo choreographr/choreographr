@@ -81,10 +81,7 @@ impl Tool for ClipboardWrite {
         _working_dir: Option<&Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
-        let value = serde_json::to_value(&args).map_err(|e| {
-            ToolExecError(format!("failed to encode clipboard_write arguments: {e}"))
-        })?;
-        run(&self.bridge, self.name(), value, self.timeout, ctx)?;
+        run(&self.bridge, self.name(), &args, self.timeout, ctx)?;
         Ok("Clipboard updated.".to_string())
     }
 
@@ -152,7 +149,7 @@ impl Tool for ClipboardRead {
         let value = run(
             &self.bridge,
             self.name(),
-            serde_json::json!({}),
+            &serde_json::json!({}),
             self.timeout,
             ctx,
         )?;
@@ -171,29 +168,9 @@ impl Tool for ClipboardRead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ios::test_util::CancelDuringDispatchBridge;
+    use crate::tools::ios::test_util::test_ctx;
     use crate::tools::ios_bridge::{MockBridge, MockResponse, ToolBridgeError};
     use std::sync::atomic::Ordering;
-
-    /// A context whose cancelled flag is the GIVEN atomic (shared with a
-    /// test bridge that flips it mid-dispatch; see `test_util`).
-    fn ctx_with_flag(flag: Arc<std::sync::atomic::AtomicBool>) -> ToolContext {
-        let mut c = ctx();
-        c.cancelled = flag;
-        c
-    }
-
-    fn ctx() -> ToolContext {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        // Unique per-call DB path: nextest runs tests in parallel threads and
-        // redb holds a whole-file exclusive lock while a handle is open. The
-        // guard is leaked on purpose — the context outlives this scope and
-        // redb cleans the file's contents on drop anyway.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.redb");
-        std::mem::forget(dir);
-        ToolContext::new(7, Arc::new(redb::Database::create(path).unwrap()), tx)
-    }
 
     #[test]
     fn clipboard_write_success() {
@@ -278,7 +255,7 @@ mod tests {
     #[test]
     fn cancel_at_entry_never_dispatches() {
         let m = Arc::new(MockBridge::default());
-        let context = ctx();
+        let context = test_ctx();
         context.cancelled.store(true, Ordering::Relaxed);
         let tool = ClipboardWrite::with_timeout(
             Arc::clone(&m) as Arc<dyn IosToolBridge>,
@@ -303,14 +280,9 @@ mod tests {
         // passes, the reply is already queued when wait runs, and wait's
         // cancel-precedence must surface Canceled (the recorded best-effort
         // cancel proves the late-cancel path ran). Deterministic — no threads.
-        let inner = Arc::new(MockBridge::default());
-        inner.script(MockResponse::Reply(Ok(serde_json::json!({"text": "late"}))));
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let bridge = Arc::new(CancelDuringDispatchBridge {
-            inner: Arc::clone(&inner),
-            flag: Arc::clone(&flag),
-        });
-        let context = ctx_with_flag(flag);
+        let (bridge, _inner, context) = crate::tools::ios::test_util::cancel_race_fixture(Ok(
+            serde_json::json!({"text": "late"}),
+        ));
         let tool = ClipboardRead::with_timeout(
             Arc::clone(&bridge) as Arc<dyn IosToolBridge>,
             CLIPBOARD_TIMEOUT,

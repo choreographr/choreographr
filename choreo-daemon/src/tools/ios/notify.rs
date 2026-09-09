@@ -19,8 +19,13 @@ pub(crate) const NOTIFY_BODY_MAX: usize = 2000;
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct NotifyArgs {
     /// Notification title (max 200 characters, enforced in execute).
+    // The schema advertises maxLength mirroring the executor caps (schemars
+    // counts JS string units — UTF-16 — while the executor counts chars; the
+    // schema is advisory, so the executor remains the real boundary).
+    #[schemars(length(max = 200))]
     pub(crate) title: String,
     /// Notification body (max 2000 characters, enforced in execute).
+    #[schemars(length(max = 2000))]
     pub(crate) body: String,
 }
 
@@ -92,10 +97,21 @@ impl Tool for Notify {
                 "notify: body exceeds {NOTIFY_BODY_MAX} characters"
             )));
         }
-        let value = serde_json::to_value(&args)
-            .map_err(|e| ToolExecError(format!("failed to encode notify arguments: {e}")))?;
-        run(&self.bridge, self.name(), value, self.timeout, ctx)?;
-        Ok("Notification posted.".to_string())
+        let value = run(&self.bridge, self.name(), &args, self.timeout, ctx)?;
+        // Surface the host's scheduling verdict (IosToolHost replies
+        // `{"scheduled": Bool}`) instead of discarding it — a host that
+        // declined (e.g. notifications disabled system-wide) must not be
+        // reported to the model as success. Absent field (null reply from
+        // tests/older hosts) degrades to success.
+        let scheduled = value
+            .get("scheduled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        Ok(if scheduled {
+            "Notification posted.".to_string()
+        } else {
+            "The notification could not be scheduled (the system declined).".to_string()
+        })
     }
 
     fn return_string(ret: &Self::Return) -> String {
@@ -106,20 +122,12 @@ impl Tool for Notify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ios::test_util::CancelDuringDispatchBridge;
+    use crate::tools::ios::test_util::test_ctx;
     use crate::tools::ios_bridge::{MockBridge, MockResponse, ToolBridgeError};
     use std::sync::atomic::Ordering;
 
     fn tool(m: &Arc<MockBridge>, timeout: Duration) -> Notify {
         Notify::with_timeout(Arc::clone(m) as Arc<dyn IosToolBridge>, timeout)
-    }
-
-    fn ctx() -> ToolContext {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.redb");
-        std::mem::forget(dir); // context outlives this scope; see clipboard.rs
-        ToolContext::new(7, Arc::new(redb::Database::create(path).unwrap()), tx)
     }
 
     #[test]
@@ -247,7 +255,7 @@ mod tests {
     #[test]
     fn cancel_at_entry_never_dispatches_and_cancel_wins_on_reply() {
         let m = Arc::new(MockBridge::default());
-        let context = ctx();
+        let context = test_ctx();
         context.cancelled.store(true, Ordering::Relaxed);
         let err = tool(&m, NOTIFY_TIMEOUT)
             .execute(
@@ -266,17 +274,49 @@ mod tests {
         // Cancel-wins-on-reply: the wrapper flips the flag DURING dispatch
         // (entry check passed, reply already queued when wait runs).
         // Deterministic — no threads, no sleeps.
-        let inner = Arc::new(MockBridge::default());
-        inner.script(MockResponse::Reply(Ok(serde_json::Value::Null)));
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let bridge = CancelDuringDispatchBridge {
-            inner: Arc::clone(&inner),
-            flag: Arc::clone(&flag),
-        };
-        let mut context = ctx();
-        context.cancelled = flag.clone();
-        let wrapped: Arc<dyn IosToolBridge> = Arc::new(bridge);
-        let err = Notify::with_timeout(wrapped, NOTIFY_TIMEOUT)
+        let (bridge, _inner, context) =
+            crate::tools::ios::test_util::cancel_race_fixture(Ok(serde_json::Value::Null));
+        let err = Notify::with_timeout(
+            Arc::clone(&bridge) as Arc<dyn IosToolBridge>,
+            NOTIFY_TIMEOUT,
+        )
+        .execute(
+            NotifyArgs {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            None,
+            None,
+            Some(&context),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "request was canceled");
+        assert_eq!(
+            bridge.cancels().len(),
+            1,
+            "late-cancel path must call pending.cancel()"
+        );
+    }
+
+    #[test]
+    fn schema_advertises_max_length() {
+        // The advisory schema mirrors the executor caps (schemars counts
+        // UTF-16 units; the executor counts chars — the executor remains the
+        // boundary).
+        let schema = Tool::schema(&Notify::new(Arc::new(MockBridge::default())));
+        assert_eq!(schema["properties"]["title"]["maxLength"], 200);
+        assert_eq!(schema["properties"]["body"]["maxLength"], 2000);
+    }
+
+    #[test]
+    fn declined_schedule_is_surfaced() {
+        // The host's `{"scheduled": false}` verdict must NOT be reported to
+        // the model as success.
+        let m = Arc::new(MockBridge::default());
+        m.script(MockResponse::Reply(Ok(
+            serde_json::json!({"scheduled": false}),
+        )));
+        let ret = tool(&m, NOTIFY_TIMEOUT)
             .execute(
                 NotifyArgs {
                     title: "t".into(),
@@ -284,19 +324,10 @@ mod tests {
                 },
                 None,
                 None,
-                Some(&context),
+                None,
             )
-            .unwrap_err();
-        assert_eq!(err.to_string(), "request was canceled");
-        let b = CancelDuringDispatchBridge {
-            inner,
-            flag: Arc::clone(&flag),
-        };
-        assert_eq!(
-            b.cancels().len(),
-            1,
-            "late-cancel path must call pending.cancel()"
-        );
+            .unwrap();
+        assert!(ret.contains("could not be scheduled"), "got: {ret}");
     }
 
     #[test]

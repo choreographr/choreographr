@@ -49,10 +49,10 @@ pub(crate) const IOS_GROUP: &str = "ios";
 /// stringly-typed [`ToolExecError`] these simple tools use:
 /// `Canceled` → cancellation message, `Timeout` → its own message,
 /// `BridgeUnavailable` / `Platform` → error string.
-pub(crate) fn run_bridge_tool(
+pub(crate) fn run_bridge_tool<T: serde::Serialize>(
     bridge: &Arc<dyn IosToolBridge>,
     tool_name: &'static str,
-    args: serde_json::Value,
+    args: &T,
     timeout: Duration,
     ctx: Option<&ToolContext>,
 ) -> Result<serde_json::Value, ToolExecError> {
@@ -70,9 +70,12 @@ pub(crate) fn run_bridge_tool(
         return Err(ToolExecError("request was canceled".into()));
     }
 
-    let args_json = serde_json::to_string(&args).map_err(|e| {
-        // Args are plain serde JSON values; failure here is a bug, but it
-        // must not panic (house rule) — surface it as a tool error.
+    // The SINGLE serialization point: the tools hand us their typed args
+    // (or a `serde_json::Value` for the no-arg tools) and we serialize once
+    // here — no per-tool pre-encode + re-encode dance.
+    let args_json = serde_json::to_string(args).map_err(|e| {
+        // Args are plain serde data; failure here is a bug, but it must not
+        // panic (house rule) — surface it as a tool error.
         ToolExecError(format!("failed to encode ios tool arguments: {e}"))
     })?;
 
@@ -145,7 +148,7 @@ pub(crate) mod test_util {
     //! Deterministic test scaffolding shared by the per-tool test modules.
 
     use super::*;
-    use crate::tools::ios_bridge::MockBridge;
+    use crate::tools::ios_bridge::{MockBridge, MockResponse};
 
     /// A bridge wrapper that flips the context's cancellation flag DURING
     /// dispatch — i.e. after the tool's entry check but before `wait` runs.
@@ -166,6 +169,53 @@ pub(crate) mod test_util {
         pub(crate) fn cancels(&self) -> Vec<u64> {
             self.inner.cancels()
         }
+    }
+
+    /// A test `ToolContext` whose DB backing file is DELETED immediately
+    /// after the redb handle is created: the open handle stays valid (Unix
+    /// unlink semantics; on Windows the remove may fail and is ignored —
+    /// the TempDir still cleans up on drop), and the TempDir is dropped
+    /// normally, so tests leave no accumulating files behind.
+    pub(crate) fn test_ctx() -> ToolContext {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        let db = Arc::new(redb::Database::create(&path).unwrap());
+        // Unlink while the handle is open — no mem::forget leak of the
+        // TempDir (the previous approach leaked one tempdir per test run).
+        let _ = std::fs::remove_file(&path);
+        ToolContext::new(7, db, tx)
+    }
+
+    /// A `ToolContext` whose cancelled flag is the GIVEN atomic (shared
+    /// with a [`CancelDuringDispatchBridge`] that flips it mid-dispatch).
+    pub(crate) fn ctx_with_flag(flag: Arc<std::sync::atomic::AtomicBool>) -> ToolContext {
+        let mut c = test_ctx();
+        c.cancelled = flag;
+        c
+    }
+
+    /// Build the cancel-wins-on-reply fixture shared by the per-tool tests:
+    /// a bridge that flips the context's flag DURING dispatch (the entry
+    /// check already passed) over an inner mock with one scripted reply, so
+    /// the reply is already buffered when `wait` runs. Coerce the returned
+    /// bridge with `Arc::clone(&bridge) as Arc<dyn IosToolBridge>` when
+    /// handing it to a tool constructor.
+    pub(crate) fn cancel_race_fixture(
+        reply: crate::tools::ios_bridge::ToolBridgeReply,
+    ) -> (
+        Arc<CancelDuringDispatchBridge>,
+        Arc<MockBridge>,
+        ToolContext,
+    ) {
+        let inner = Arc::new(MockBridge::default());
+        inner.script(MockResponse::Reply(reply));
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bridge = Arc::new(CancelDuringDispatchBridge {
+            inner: Arc::clone(&inner),
+            flag: Arc::clone(&flag),
+        });
+        (bridge, inner, ctx_with_flag(flag))
     }
 
     impl IosToolBridge for CancelDuringDispatchBridge {

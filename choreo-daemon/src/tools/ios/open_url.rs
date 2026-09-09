@@ -48,29 +48,41 @@ impl JsonSchema for OpenUrlArgs {
 
 impl OpenUrlArgs {
     /// The executor-side boundary. The JSON Schema is advisory (the model may
-    /// send anything), so execute() re-validates: scheme allow-list plus a
+    /// send anything), so execute() re-validates: a REAL URL parse (the `url`
+    /// crate — a bare `starts_with("https:")` would accept degenerate strings
+    /// like `https:not-a-url`), the scheme allow-list, and a
     /// control-character ban anywhere in the string (control chars could
     /// otherwise smuggle newlines/C0 bytes through URL handling on the host
     /// side).
     fn validate(&self) -> Result<(), ToolExecError> {
-        if !self.url.starts_with("https:") && !self.url.starts_with("mailto:") {
-            return Err(ToolExecError(format!(
-                "open_url only supports https and mailto URLs (got scheme: {:?})",
-                self.url.split(':').next().unwrap_or("")
-            )));
-        }
+        // Control-char ban FIRST: url::Url::parse would reject (or strip)
+        // them with its own error, masking this more precise message.
         if self.url.chars().any(char::is_control) {
             return Err(ToolExecError(
                 "open_url: the URL must not contain control characters".into(),
             ));
+        }
+        let parsed = url::Url::parse(&self.url).map_err(|e| {
+            ToolExecError(format!(
+                "open_url only supports https and mailto URLs (not a valid URL: {e})"
+            ))
+        })?;
+        match parsed.scheme() {
+            "https" | "mailto" => {}
+            other => {
+                return Err(ToolExecError(format!(
+                    "open_url only supports https and mailto URLs (got scheme: {other:?})"
+                )));
+            }
         }
         Ok(())
     }
 }
 
 /// `open_url`: hands the URL to the host (SpringBoard on iOS) and waits for
-/// the completion handler. The raw string passes through to the bridge —
-/// the Swift host owns actual URL parsing; this side only gates schemes.
+/// the completion handler. The Rust side parses/validates with the `url`
+/// crate (see [`OpenUrlArgs::validate`]); the Swift host runs the SAME
+/// scheme check independently over its own `URL` parse — both sides gate.
 pub(crate) struct OpenUrl {
     bridge: Arc<dyn IosToolBridge>,
     timeout: Duration,
@@ -126,10 +138,20 @@ impl Tool for OpenUrl {
         // Re-validate here: the schema is advisory, the executor is the
         // boundary. Validation failures happen BEFORE the bridge dispatch.
         args.validate()?;
-        let value = serde_json::to_value(&args)
-            .map_err(|e| ToolExecError(format!("failed to encode open_url arguments: {e}")))?;
-        run(&self.bridge, self.name(), value, self.timeout, ctx)?;
-        Ok("URL opened.".to_string())
+        let value = run(&self.bridge, self.name(), &args, self.timeout, ctx)?;
+        // Surface the host's verdict (IosToolHost replies `{"opened": Bool}`
+        // from the completion handler) instead of discarding it — the model
+        // wants to know whether the URL actually opened. Absent field (null
+        // reply from tests/older hosts) degrades to success.
+        let opened = value
+            .get("opened")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        Ok(if opened {
+            "URL opened.".to_string()
+        } else {
+            "The system declined to open the URL.".to_string()
+        })
     }
 
     fn return_string(ret: &Self::Return) -> String {
@@ -140,7 +162,7 @@ impl Tool for OpenUrl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ios::test_util::CancelDuringDispatchBridge;
+    use crate::tools::ios::test_util::test_ctx;
     use crate::tools::ios_bridge::{MockBridge, MockResponse, ToolBridgeError};
     use std::sync::atomic::Ordering;
 
@@ -148,18 +170,8 @@ mod tests {
         OpenUrl::with_timeout(Arc::clone(m) as Arc<dyn IosToolBridge>, timeout)
     }
 
-    fn ctx() -> (
-        ToolContext,
-        std::sync::mpsc::Receiver<crate::daemon::DaemonCommand>,
-    ) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.redb");
-        std::mem::forget(dir); // context outlives this scope; see clipboard.rs
-        (
-            ToolContext::new(7, Arc::new(redb::Database::create(path).unwrap()), tx),
-            rx,
-        )
+    fn ctx() -> ToolContext {
+        test_ctx()
     }
 
     #[test]
@@ -274,7 +286,7 @@ mod tests {
     #[test]
     fn cancel_at_entry_never_dispatches_and_cancel_wins_on_reply() {
         let m = Arc::new(MockBridge::default());
-        let (context, _rx) = ctx();
+        let context = ctx();
         // Cancel at entry.
         context.cancelled.store(true, Ordering::Relaxed);
         let err = tool(&m, OPEN_URL_TIMEOUT)
@@ -293,37 +305,49 @@ mod tests {
         // Cancel wins on reply: the wrapper flips the flag DURING dispatch
         // (entry check already passed; reply already queued when wait runs).
         // Deterministic — no threads, no sleeps.
-        let inner = Arc::new(MockBridge::default());
-        inner.script(MockResponse::Reply(Ok(serde_json::Value::Null)));
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let bridge = CancelDuringDispatchBridge {
-            inner: Arc::clone(&inner),
-            flag: Arc::clone(&flag),
-        };
-        let (mut context, _rx) = ctx();
-        context.cancelled = flag.clone();
-        let wrapped: Arc<dyn IosToolBridge> = Arc::new(bridge);
-        let err = OpenUrl::with_timeout(wrapped, OPEN_URL_TIMEOUT)
-            .execute(
-                OpenUrlArgs {
-                    url: "https://y".into(),
-                },
-                None,
-                None,
-                Some(&context),
-            )
-            .unwrap_err();
+        let (bridge, _inner, context) =
+            crate::tools::ios::test_util::cancel_race_fixture(Ok(serde_json::Value::Null));
+        let err = OpenUrl::with_timeout(
+            Arc::clone(&bridge) as Arc<dyn IosToolBridge>,
+            OPEN_URL_TIMEOUT,
+        )
+        .execute(
+            OpenUrlArgs {
+                url: "https://y".into(),
+            },
+            None,
+            None,
+            Some(&context),
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "request was canceled");
-        let b = CancelDuringDispatchBridge {
-            inner,
-            flag: Arc::clone(&flag),
-        };
-        assert_eq!(b.dispatched().len(), 1, "dispatch must have happened");
+        assert_eq!(bridge.dispatched().len(), 1, "dispatch must have happened");
         assert_eq!(
-            b.cancels().len(),
+            bridge.cancels().len(),
             1,
             "late-cancel path must call pending.cancel()"
         );
+    }
+
+    #[test]
+    fn declined_open_is_surfaced() {
+        // The host's `{"opened": false}` verdict must NOT be reported to the
+        // model as a successful open.
+        let m = Arc::new(MockBridge::default());
+        m.script(MockResponse::Reply(Ok(
+            serde_json::json!({"opened": false}),
+        )));
+        let ret = tool(&m, OPEN_URL_TIMEOUT)
+            .execute(
+                OpenUrlArgs {
+                    url: "https://x".into(),
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(ret.contains("declined"), "got: {ret}");
     }
 
     #[test]

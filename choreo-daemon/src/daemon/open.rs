@@ -202,6 +202,10 @@ impl DaemonState {
 mod tests {
     use super::*;
 
+    /// The four platform tools (shared by the registration test's two
+    /// assertion loops).
+    const IOS_TOOLS: [&str; 4] = ["clipboard_write", "clipboard_read", "open_url", "notify"];
+
     /// A full-policy state opens on explicit temp paths: DB migrated, session
     /// index empty but valid, and the shell tools present (the policy default
     /// must not restrict the CLI-like case).
@@ -289,7 +293,7 @@ mod tests {
         let active: HashSet<String> = HashSet::new();
         let defs = state.tool_registry.available_definitions(&active);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        for tool in ["clipboard_write", "clipboard_read", "open_url", "notify"] {
+        for tool in IOS_TOOLS {
             assert!(names.contains(&tool), "missing {tool}: {names:?}");
         }
 
@@ -306,15 +310,12 @@ mod tests {
         // Direct-only callers (exfiltration-chain mitigation) — checked on
         // the four ios tools specifically (the union also surfaces core
         // tools, which keep their own caller policy).
-        let ios_tools = ["clipboard_write", "clipboard_read", "open_url", "notify"];
-        // `available_definitions` (chat path) carries no callers field — the
-        // caller policy only rides the Responses-API definitions.
         let resp_defs = state
             .tool_registry
             .available_definitions_for_responses(&active);
         for def in resp_defs
             .iter()
-            .filter(|d| ios_tools.contains(&d.function.name.as_str()))
+            .filter(|d| IOS_TOOLS.contains(&d.function.name.as_str()))
         {
             assert_eq!(
                 def.function.allowed_callers.as_deref(),

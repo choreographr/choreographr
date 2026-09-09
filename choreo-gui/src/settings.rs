@@ -161,10 +161,13 @@ pub(crate) fn on_device_tools_cached() -> bool {
 #[cfg(target_os = "ios")]
 pub(crate) fn toggle_on_device_tools() -> Result<bool, String> {
     let new_value = !on_device_tools_cached();
-    GuiSettings {
-        on_device_tools: new_value,
-    }
-    .persist()?;
+    // LOAD-modify-persist (not construct-from-scratch): the whole-file
+    // rewrite must preserve any OTHER fields the file already carries —
+    // building a fresh struct would silently reset them to defaults the
+    // moment a second preference exists.
+    let mut settings = load();
+    settings.on_device_tools = new_value;
+    settings.persist()?;
     ON_DEVICE_TOOLS.store(new_value, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(enabled = new_value, "on-device tools setting toggled");
     Ok(new_value)

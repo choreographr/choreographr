@@ -186,10 +186,11 @@ impl IosToolPending {
     pub fn wait(&self, deadline: Duration, is_canceled: &dyn Fn() -> bool) -> ToolBridgeReply {
         // Absolute deadline so per-iteration select slices can never stretch
         // the total (the same absolute-budget discipline the Noise handshake
-        // uses): a poll slice bounds only cancel responsiveness.
-        let deadline_at = Instant::now()
-            .checked_add(deadline)
-            .unwrap_or_else(Instant::now);
+        // uses): a poll slice bounds only cancel responsiveness. `None` means
+        // the deadline overflowed (impossible for our named constants) — the
+        // CORRECT fallback is "wait indefinitely", not "already expired" (a
+        // past instant would turn an unbounded wait into an instant Timeout).
+        let deadline_at = Instant::now().checked_add(deadline);
         loop {
             // Check cancellation FIRST: a pre-canceled request must not even
             // consume its (possibly already-arrived) reply.
@@ -197,13 +198,15 @@ impl IosToolPending {
                 return Err(ToolBridgeError::Canceled);
             }
             let now = Instant::now();
-            if now >= deadline_at {
+            if deadline_at.is_some_and(|d| now >= d) {
                 return Err(ToolBridgeError::Timeout);
             }
             // Slice the remaining budget so the flag is re-checked at least
             // every CANCEL_POLL_SLICE; the reply arm fires the moment a reply
             // lands regardless of the slice.
-            let slice = CANCEL_POLL_SLICE.min(deadline_at - now);
+            let slice = deadline_at
+                .map(|d| CANCEL_POLL_SLICE.min(d.saturating_duration_since(now)))
+                .unwrap_or(CANCEL_POLL_SLICE);
             select! {
                 recv(self.reply_rx) -> res => {
                     match res {
@@ -465,22 +468,35 @@ mod tests {
 
     #[test]
     fn cancel_wins_over_arrived_reply() {
-        // The pinned race: reply arrives Ok but the flag is set by the time
-        // the reply arm fires → Canceled, not the value.
+        // The pinned race: the PRE-wait check passes (the flag is still
+        // false), the reply arm fires with the Ok reply already buffered, and
+        // the POST-reply re-check inside the reply arm must observe the flag
+        // and surface Canceled — the reply value must never escape.
+        //
+        // Deterministic, no threads/sleeps: the predicate flips the flag on
+        // its SECOND call (call 1 = the pre-wait check, call 2 = the
+        // post-reply re-check). A non-ZERO deadline is required so the loop
+        // reaches the select instead of returning Timeout immediately; the
+        // reply is already buffered, so the reply arm fires at once.
         let m = mock();
         m.script(MockResponse::Reply(Ok(serde_json::json!({"ok": true}))));
         let pending = m.dispatch(request()).unwrap();
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag_wait = flag.clone();
-        let is_canceled = move || flag_wait.load(Ordering::Relaxed);
-        // Deterministic flag flip with no thread/sleep: the predicate consults
-        // a cell we flip right before wait, exercising the post-reply
-        // re-check inside the reply arm.
-        flag.store(true, Ordering::Relaxed);
-        assert!(matches!(
-            pending.wait(Duration::ZERO, &is_canceled),
-            Err(ToolBridgeError::Canceled)
-        ));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (flag_wait, calls_wait) = (Arc::clone(&flag), Arc::clone(&calls));
+        let is_canceled = move || {
+            let n = calls_wait.fetch_add(1, Ordering::Relaxed);
+            if n > 0 {
+                // Second+ invocation: the post-reply re-check — set the flag
+                // so THIS call observes it (cancel-precedence on the reply).
+                flag_wait.store(true, Ordering::Relaxed);
+            }
+            flag_wait.load(Ordering::Relaxed)
+        };
+        match pending.wait(CLIPBOARD_TIMEOUT, &is_canceled) {
+            Err(ToolBridgeError::Canceled) => {}
+            other => panic!("expected Canceled over the arrived reply, got {other:?}"),
+        }
     }
 
     #[test]
