@@ -755,6 +755,9 @@ fn responses_response_to_turn(
         if !full_text.is_empty() {
             return Ok(ChatTurnResult::FinalText(FinalTextResult {
                 content: full_text,
+                // Responses API has no finish_reason-equivalent length flag
+                // parsed today; only the chat-completions adapter sets it.
+                truncated: false,
                 reasoning: if full_reasoning.is_empty() {
                     None
                 } else {
@@ -774,6 +777,7 @@ fn responses_response_to_turn(
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content: full_text,
+        truncated: false,
         reasoning: if full_reasoning.is_empty() {
             None
         } else {
@@ -1083,6 +1087,7 @@ where
         if !discarded.is_empty() && !full_content.is_empty() {
             return Ok(ChatTurnResult::FinalText(FinalTextResult {
                 content: full_content,
+                truncated: false,
                 reasoning: if full_reasoning.is_empty() {
                     None
                 } else {
@@ -1107,6 +1112,7 @@ where
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content: full_content,
+        truncated: false,
         reasoning: if full_reasoning.is_empty() {
             None
         } else {

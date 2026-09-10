@@ -175,6 +175,13 @@ pub enum InferenceError {
     /// the same prompt can never clear it.
     #[error("provider content filter blocked the generation: {detail}")]
     ContentFiltered { detail: String },
+    /// The prompt exceeded the model's declared context window (e.g. z.ai's
+    /// `finish_reason: "model_context_window_exceeded"`). Terminal and never
+    /// retryable: resending the same prompt cannot shrink it, and surfacing a
+    /// distinct variant (instead of a generic 4xx) makes it a compaction-bug
+    /// signal rather than an opaque provider failure.
+    #[error("prompt exceeded the model's context window: {detail}")]
+    ContextWindowExceeded { detail: String },
     #[error("request cancelled during retry backoff")]
     Cancelled,
     #[error("total request deadline exceeded while reading streaming response")]
@@ -201,6 +208,7 @@ impl InferenceError {
             InferenceError::EmptyResponse => "empty_response",
             InferenceError::NotReady { .. } => "not_ready",
             InferenceError::ContentFiltered { .. } => "content_filtered",
+            InferenceError::ContextWindowExceeded { .. } => "context_window_exceeded",
             InferenceError::Cancelled => "cancelled",
             InferenceError::DeadlineExceeded => "deadline_exceeded",
             InferenceError::TruncatedToolCall { .. } => "truncated_tool_call",

@@ -30,6 +30,14 @@ pub struct ChatAssistantToolUse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalTextResult {
     pub content: String,
+    /// The provider reported `finish_reason: "length"` (or equivalent) on a
+    /// final-text turn: the answer was cut off by the output token limit, not
+    /// finished. Purely informational for consumers — the daemon appends the
+    /// user-visible truncation notice when it consumes the result; only the
+    /// chat-completions adapter sets this today (other providers leave it
+    /// `false`). `length` + tool calls is normal tool-loop flow, so a
+    /// `ToolUse` turn never carries it.
+    pub truncated: bool,
     pub reasoning: Option<String>,
     pub usage: Option<TokenUsage>,
     pub response_id: Option<String>,

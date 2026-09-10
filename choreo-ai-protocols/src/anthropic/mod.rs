@@ -575,6 +575,7 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
+        truncated: false,
         reasoning,
         usage,
         response_id: None,

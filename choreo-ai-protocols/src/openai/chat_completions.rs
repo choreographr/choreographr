@@ -51,6 +51,9 @@ pub(crate) struct ChatCompletionsResponse {
 #[derive(Debug, Deserialize)]
 pub(crate) struct Choice {
     pub(crate) message: AssistantMessage,
+    /// z.ai/OpenAI finish reason on the choice. `None` when the provider
+    /// omits it (never treated as an error — see `FinishReason`).
+    pub(crate) finish_reason: Option<FinishReason>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +131,9 @@ pub(crate) struct ChatCompletionsStreamResponse {
 #[derive(Debug, Deserialize)]
 pub(crate) struct StreamChoice {
     pub(crate) delta: Option<StreamDelta>,
+    /// The finish reason arrives on the final SSE chunk (before `[DONE]`);
+    /// every earlier chunk has it absent.
+    pub(crate) finish_reason: Option<FinishReason>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +161,74 @@ pub(crate) struct StreamToolCallDelta {
 pub(crate) struct StreamToolCallFunctionDelta {
     pub(crate) name: Option<String>,
     pub(crate) arguments: Option<String>,
+}
+
+/// Lenient, provider-portable chat-completions `finish_reason`.
+///
+/// Covers z.ai's documented set (`stop`, `tool_calls`, `length`, `sensitive`,
+/// `model_context_window_exceeded`, `network_error`) plus OpenAI's aliases
+/// (`content_filter` → [`FinishReason::Sensitive`], `function_call` →
+/// [`FinishReason::ToolCalls`]). Unknown values map to
+/// [`FinishReason::Other`] and NEVER fail the response parse — a provider
+/// adding a new finish reason must degrade to a logged diagnostic, not a
+/// hard error on every response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    Sensitive,
+    ContextWindowExceeded,
+    NetworkError,
+    /// Any unrecognized raw value, preserved verbatim for diagnostics.
+    Other(String),
+}
+
+impl FinishReason {
+    /// Map a raw wire string to the lenient enum. Never fails.
+    fn parse(raw: &str) -> Self {
+        match raw {
+            "stop" => FinishReason::Stop,
+            // `function_call` is OpenAI's legacy single-function alias for
+            // the modern `tool_calls` — treat identically.
+            "tool_calls" | "function_call" => FinishReason::ToolCalls,
+            "length" => FinishReason::Length,
+            // z.ai's `sensitive` (content-filter refusal) and OpenAI's
+            // `content_filter` are the same policy denial — both terminal.
+            "sensitive" | "content_filter" => FinishReason::Sensitive,
+            "model_context_window_exceeded" => FinishReason::ContextWindowExceeded,
+            "network_error" => FinishReason::NetworkError,
+            other => {
+                // Preserve the raw string so new provider values are
+                // diagnosable in logs instead of silently vanishing.
+                debug!(raw = %other, "unknown chat-completions finish_reason");
+                FinishReason::Other(other.to_string())
+            }
+        }
+    }
+
+    /// Whether this reason is a *content-filter* denial (z.ai `sensitive`,
+    /// OpenAI `content_filter`): terminal and never retryable — resending
+    /// the same prompt can never clear the policy filter.
+    fn is_content_filtered(&self) -> bool {
+        matches!(self, FinishReason::Sensitive)
+    }
+
+    /// Whether this reason signals a prompt over the model's context window:
+    /// terminal (a compaction-bug signal), never retried.
+    fn is_context_window_exceeded(&self) -> bool {
+        matches!(self, FinishReason::ContextWindowExceeded)
+    }
+}
+
+// Custom impl: serde's derive would hard-error on an unrecognized string,
+// which would fail the WHOLE response parse. Going through `String` +
+// `FinishReason::parse` keeps unknown values lenient (`Other(raw)`).
+impl<'de> Deserialize<'de> for FinishReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(FinishReason::parse(&raw))
+    }
 }
 
 // ── Simple (no-tool) chat completions request ────────────────────────────
@@ -263,12 +337,50 @@ pub(crate) fn chat_completions_request_with_tools(
 /// Convert a parsed non-streaming chat completions response into a turn
 /// result. The raw reasoning value is captured into the round-trip artifact
 /// inside `AssistantMessage::take_reasoning`, before the field is consumed.
+/// Terminal finish reasons must surface as distinct errors, not turn
+/// results: a content-filter refusal (z.ai `sensitive` / OpenAI
+/// `content_filter`) is never retryable, and a context-window overflow is a
+/// compaction-bug signal. `Length` deliberately maps to NO error here — it is
+/// a truncation notice carried on the FinalText result instead (and is normal
+/// flow when tool calls are present).
+fn finish_reason_terminal_error(reason: Option<&FinishReason>) -> Option<super::OpenAiError> {
+    let reason = reason?;
+    if reason.is_content_filtered() {
+        // Follows the images adapter's ContentFiltered precedent: the HTTP
+        // response itself succeeded, so no status rides along, and the
+        // retry layer must never treat this as retryable.
+        return Some(super::OpenAiError::ContentFiltered {
+            detail: "provider content filter refused the response \
+                     (finish_reason: sensitive/content_filter)"
+                .into(),
+        });
+    }
+    if reason.is_context_window_exceeded() {
+        return Some(super::OpenAiError::ContextWindowExceeded {
+            detail: "the prompt exceeded the model's context window \
+                     (finish_reason: model_context_window_exceeded)"
+                .into(),
+        });
+    }
+    None
+}
+
 fn chat_completions_response_to_turn(
     payload: ChatCompletionsResponse,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
     let Some(mut choice) = payload.choices.into_iter().next() else {
         return Err(super::OpenAiError::EmptyResponse);
     };
+
+    // A declared terminal finish reason wins over whatever (possibly empty)
+    // body the provider sent — z.ai's `sensitive` often arrives with an empty
+    // content, which would otherwise look like a (retryable) empty response.
+    if let Some(err) = finish_reason_terminal_error(choice.finish_reason.as_ref()) {
+        return Err(err);
+    }
+    // `length` on a FINAL-TEXT turn means the answer was cut off; only the
+    // FinalText paths below set the flag (ToolUse is normal tool-loop flow).
+    let truncated = matches!(choice.finish_reason, Some(FinishReason::Length));
 
     // Extract reasoning early (before partial moves into tool_calls / content)
     let (reasoning, reasoning_artifact) = choice.message.take_reasoning();
@@ -328,6 +440,7 @@ fn chat_completions_response_to_turn(
             .to_string();
         return Ok(ChatTurnResult::FinalText(FinalTextResult {
             content,
+            truncated,
             reasoning,
             usage: turn_usage,
             response_id: None,
@@ -347,6 +460,7 @@ fn chat_completions_response_to_turn(
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
+        truncated,
         reasoning,
         usage: turn_usage,
         response_id: None,
@@ -512,6 +626,9 @@ struct ChatCompletionsStreamAccumulator {
     /// Usage from the final SSE chunk (OpenAI sends a usage chunk with
     /// choices: [] when stream_options.include_usage is true).
     last_usage: Option<TokenUsage>,
+    /// Finish reason from the final SSE chunk (last non-None wins — the
+    /// provider sends it exactly once, but tolerate repeats defensively).
+    finish_reason: Option<FinishReason>,
 }
 
 impl Default for ChatCompletionsStreamAccumulator {
@@ -528,6 +645,7 @@ impl Default for ChatCompletionsStreamAccumulator {
             seen_tool_call_indices: [false; MAX_TOOL_CALLS],
             distinct_tool_call_count: 0,
             last_usage: None,
+            finish_reason: None,
         }
     }
 }
@@ -564,6 +682,10 @@ impl ChatCompletionsStreamAccumulator {
         }
 
         for choice in &payload.choices {
+            // Capture the finish reason (arrives on the final chunk).
+            if choice.finish_reason.is_some() {
+                self.finish_reason = choice.finish_reason.clone();
+            }
             let Some(delta) = &choice.delta else {
                 continue;
             };
@@ -641,9 +763,18 @@ impl ChatCompletionsStreamAccumulator {
     /// provider's raw reasoning value, echoed verbatim — to the same field —
     /// on tool-loop turns).
     fn into_turn_result(self) -> Result<ChatTurnResult, super::OpenAiError> {
+        // A declared terminal finish reason wins over the accumulated body:
+        // z.ai's `sensitive` streams no content, which would otherwise fall
+        // through to the (retryable-looking) EmptyResponse error.
+        if let Some(err) = finish_reason_terminal_error(self.finish_reason.as_ref()) {
+            return Err(err);
+        }
         if !self.has_any_output {
             return Err(super::OpenAiError::EmptyResponse);
         }
+        // `length` on a FINAL-TEXT turn is a truncation notice, not an error;
+        // only the FinalText paths below carry the flag.
+        let truncated = matches!(self.finish_reason, Some(FinishReason::Length));
 
         // The field was locked in on the first non-empty delta; the artifact
         // carries that field so re-emission targets the same wire field.
@@ -677,6 +808,7 @@ impl ChatCompletionsStreamAccumulator {
                 // the session can continue gracefully.
                 return Ok(ChatTurnResult::FinalText(FinalTextResult {
                     content: self.full_content,
+                    truncated,
                     reasoning: if self.full_reasoning.is_empty() {
                         None
                     } else {
@@ -691,6 +823,7 @@ impl ChatCompletionsStreamAccumulator {
 
         Ok(ChatTurnResult::FinalText(FinalTextResult {
             content: self.full_content,
+            truncated,
             reasoning: if self.full_reasoning.is_empty() {
                 None
             } else {
@@ -774,6 +907,243 @@ where
 mod tests {
     use super::*;
     use crate::openai::{is_zhipu_provider_slug, zhipu_reasoning_effort_api_value};
+
+    // -- finish_reason lenient deserialization -----------------------------
+
+    #[test]
+    fn finish_reason_parses_known_values() {
+        for (raw, expected) in [
+            ("stop", FinishReason::Stop),
+            ("tool_calls", FinishReason::ToolCalls),
+            ("length", FinishReason::Length),
+            ("sensitive", FinishReason::Sensitive),
+            (
+                "model_context_window_exceeded",
+                FinishReason::ContextWindowExceeded,
+            ),
+            ("network_error", FinishReason::NetworkError),
+        ] {
+            let parsed: FinishReason = serde_json::from_value(serde_json::json!(raw))
+                .unwrap_or_else(|e| panic!("parse {raw}: {e}"));
+            assert_eq!(parsed, expected, "raw {raw}");
+        }
+    }
+
+    #[test]
+    fn finish_reason_maps_openai_aliases() {
+        // OpenAI's legacy `function_call` and its `content_filter` must map
+        // to the shared variants so behavior is provider-portable.
+        let function_call: FinishReason =
+            serde_json::from_value(serde_json::json!("function_call")).unwrap();
+        assert_eq!(function_call, FinishReason::ToolCalls);
+        let content_filter: FinishReason =
+            serde_json::from_value(serde_json::json!("content_filter")).unwrap();
+        assert_eq!(content_filter, FinishReason::Sensitive);
+        assert!(content_filter.is_content_filtered());
+    }
+
+    #[test]
+    fn finish_reason_unknown_value_maps_to_other_not_parse_failure() {
+        // A provider adding a new finish reason must degrade to Other(raw),
+        // never fail the whole response parse.
+        let parsed: FinishReason =
+            serde_json::from_value(serde_json::json!("some_future_reason")).unwrap();
+        assert_eq!(
+            parsed,
+            FinishReason::Other("some_future_reason".to_string())
+        );
+        // Not terminal in any way.
+        assert!(!parsed.is_content_filtered());
+        assert!(!parsed.is_context_window_exceeded());
+    }
+
+    #[test]
+    fn choice_without_finish_reason_parses_to_none() {
+        let payload: ChatCompletionsResponse =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":"hi"}}],"usage":null}"#)
+                .unwrap();
+        let choice = payload.choices.into_iter().next().unwrap();
+        assert!(choice.finish_reason.is_none());
+    }
+
+    #[test]
+    fn stream_choice_parses_finish_reason_on_final_chunk() {
+        let payload: ChatCompletionsStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#).unwrap();
+        let choice = payload.choices.into_iter().next().unwrap();
+        assert_eq!(choice.finish_reason, Some(FinishReason::Length));
+    }
+
+    // -- finish_reason behavior mapping (non-streaming) ---------------------
+
+    #[test]
+    fn length_on_final_text_sets_truncation_flag() {
+        let json = r#"{"choices":[{"message":{"content":"partial answer"},"finish_reason":"length"}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let turn = chat_completions_response_to_turn(payload).unwrap();
+        let ChatTurnResult::FinalText(result) = turn else {
+            panic!("expected FinalText");
+        };
+        assert!(result.truncated, "length on final text must set truncated");
+        assert_eq!(result.content, "partial answer");
+    }
+
+    #[test]
+    fn length_on_tool_use_does_not_set_truncation_flag() {
+        // Tool calls + length is normal tool-loop flow, not a user-visible
+        // truncation: the ToolUse result carries no truncation semantics.
+        let json = r#"{"choices":[{"message":{
+            "content":null,
+            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"London\"}"}}],
+            "reasoning_content":null,"reasoning":null,"reasoning_text":null
+        },"finish_reason":"length"}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let turn = chat_completions_response_to_turn(payload).unwrap();
+        assert!(matches!(turn, ChatTurnResult::ToolUse(_)));
+    }
+
+    #[test]
+    fn stop_keeps_behavior_unchanged() {
+        let json =
+            r#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let turn = chat_completions_response_to_turn(payload).unwrap();
+        let ChatTurnResult::FinalText(result) = turn else {
+            panic!("expected FinalText");
+        };
+        assert!(!result.truncated);
+        assert_eq!(result.content, "done");
+    }
+
+    #[test]
+    fn sensitive_is_terminal_content_filtered_error() {
+        // z.ai's `sensitive` refusal often arrives with EMPTY content — it
+        // must surface as the terminal ContentFiltered error, not as an
+        // (empty-response) error that could be retried.
+        let json = r#"{"choices":[{"message":{"content":null,"tool_calls":[],"reasoning_content":null,"reasoning":null,"reasoning_text":null},"finish_reason":"sensitive"}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let err = chat_completions_response_to_turn(payload).unwrap_err();
+        assert!(
+            matches!(err, crate::openai::OpenAiError::ContentFiltered { .. }),
+            "expected ContentFiltered, got {err:?}"
+        );
+        // And the OpenAI alias behaves identically.
+        let json = r#"{"choices":[{"message":{"content":null},"finish_reason":"content_filter"}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let err = chat_completions_response_to_turn(payload).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::openai::OpenAiError::ContentFiltered { .. }
+        ));
+    }
+
+    #[test]
+    fn sensitive_maps_to_non_retryable_inference_error() {
+        // The retryability contract: the mapped InferenceError must be the
+        // ContentFiltered variant, which the daemon never retries (it only
+        // special-cases Cancelled and TruncatedToolCall; the HTTP retry layer
+        // only retries 429/5xx status codes, and this error is produced after
+        // a successful 200 parse).
+        let err = crate::openai::OpenAiError::ContentFiltered {
+            detail: "blocked".into(),
+        };
+        let inference = crate::shared::provider_error_to_inference(err);
+        assert!(matches!(
+            inference,
+            choreo_proto::InferenceError::ContentFiltered { .. }
+        ));
+        assert_eq!(inference.metric_label(), "content_filtered");
+    }
+
+    #[test]
+    fn context_window_exceeded_is_terminal_error() {
+        let json = r#"{"choices":[{"message":{"content":null},"finish_reason":"model_context_window_exceeded"}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let err = chat_completions_response_to_turn(payload).unwrap_err();
+        match err {
+            crate::openai::OpenAiError::ContextWindowExceeded { detail } => {
+                assert!(detail.contains("context window"), "{detail}");
+            }
+            other => panic!("expected ContextWindowExceeded, got {other:?}"),
+        }
+        // The mapped InferenceError carries the stable metrics label.
+        let err = crate::openai::OpenAiError::ContextWindowExceeded {
+            detail: "too long".into(),
+        };
+        assert_eq!(
+            crate::shared::provider_error_to_inference(err).metric_label(),
+            "context_window_exceeded"
+        );
+    }
+
+    // -- finish_reason behavior mapping (streaming) -------------------------
+
+    #[test]
+    fn streaming_length_sets_truncation_flag_on_final_text() {
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk1: ChatCompletionsStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"partial"}}]}"#).unwrap();
+        let chunk2: ChatCompletionsStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#).unwrap();
+        acc.apply(&chunk1, &mut |_| Ok(())).unwrap();
+        acc.apply(&chunk2, &mut |_| Ok(())).unwrap();
+        let result = acc.into_turn_result().unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => assert!(f.truncated),
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_sensitive_is_terminal_even_with_empty_body() {
+        // The silent-failure fix: a content-filtered stream sends no deltas,
+        // so without the finish-reason check it would fall through to the
+        // generic EmptyResponse error.
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk: ChatCompletionsStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{},"finish_reason":"sensitive"}]}"#)
+                .unwrap();
+        acc.apply(&chunk, &mut |_| Ok(())).unwrap();
+        let err = acc.into_turn_result().unwrap_err();
+        assert!(matches!(
+            err,
+            crate::openai::OpenAiError::ContentFiltered { .. }
+        ));
+    }
+
+    #[test]
+    fn streaming_context_window_exceeded_is_terminal() {
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{},"finish_reason":"model_context_window_exceeded"}]}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk, &mut |_| Ok(())).unwrap();
+        let err = acc.into_turn_result().unwrap_err();
+        assert!(matches!(
+            err,
+            crate::openai::OpenAiError::ContextWindowExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn streaming_stop_leaves_truncation_flag_false() {
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk1: ChatCompletionsStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"all done"}}]}"#).unwrap();
+        let chunk2: ChatCompletionsStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#).unwrap();
+        acc.apply(&chunk1, &mut |_| Ok(())).unwrap();
+        acc.apply(&chunk2, &mut |_| Ok(())).unwrap();
+        let result = acc.into_turn_result().unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert!(!f.truncated);
+                assert_eq!(f.content, "all done");
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
 
     // -- validate_tool_call_arguments tests --------------------------------
 

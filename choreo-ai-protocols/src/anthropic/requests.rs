@@ -454,6 +454,7 @@ where
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content: full_text,
+        truncated: false,
         reasoning: if full_reasoning.is_empty() {
             None
         } else {

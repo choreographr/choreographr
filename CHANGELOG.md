@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Chat-completions `finish_reason` parsing and truncation notice (`choreo-ai-protocols`, `choreo-proto`, `choreo-daemon`):**
+  the OpenAI-compatible chat-completions adapter now deserializes the per-choice `finish_reason`
+  (non-streaming `Choice` and the streaming `StreamChoice`, threaded through the SSE accumulator)
+  into a lenient, provider-portable `FinishReason` enum: z.ai's set (`stop`, `tool_calls`,
+  `length`, `sensitive`, `model_context_window_exceeded`, `network_error`) plus OpenAI's aliases
+  (`content_filter` → `Sensitive`, `function_call` → `ToolCalls`). Unknown values map to
+  `Other(raw)` (logged, raw string preserved) and never fail the response parse. A `length`
+  finish on a FINAL-TEXT turn sets a new `truncated: bool` on `FinalTextResult` (`false` for
+  other providers and for tool-call turns, where `length` is normal tool-loop flow); the daemon
+  appends a visible "⚠ response truncated (length limit)" line to such answers and logs a
+  warning, so an output-limited cut-off no longer looks like a complete reply.
+
+### Fixed
+
+- **Silent failure modes for content-filter refusals and context-window overflow:** z.ai's
+  `sensitive` finish reason (and OpenAI's `content_filter`) previously surfaced as an empty or
+  blank response indistinguishable from a glitch — and potentially retryable. It now maps to the
+  terminal, non-retryable `ContentFiltered` error (following the images-adapter precedent: no
+  fabricated HTTP status, the retry layer never retries it). A
+  `model_context_window_exceeded` finish now maps to a new distinct terminal
+  `ContextWindowExceeded` error variant on both `ProviderError` and `InferenceError` (metrics
+  label `context_window_exceeded`) with a clear "prompt exceeded the model's context window"
+  message, turning a previously invisible compaction-bug signal into a diagnosable failure.
+  `stop` / `tool_calls` / `network_error` / unknown values leave behavior unchanged.
+
 - **Cached prompt-token reporting (`choreo-proto`, `choreo-ai-protocols`, `choreo-tui`):**
   `TokenUsage` gains a `cached_tokens: u32` field (`#[serde(default)]`, 0 when unreported, so
   old wire payloads and providers that omit the details object keep deserializing) and

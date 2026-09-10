@@ -576,6 +576,23 @@ pub(crate) fn run_agent_loop(
                 let token_usage = final_text.usage;
                 accumulate_token_usage(session, &token_usage, turn_iter, ctx);
                 broadcast_token_usage(ctx, session);
+                // Cheap display hook for the finish-reason truncation flag:
+                // `length` on a final-text turn means the answer was cut off
+                // by the output limit. Append a visible notice so the user is
+                // not left reading a half-answer that looks complete. It goes
+                // into the persisted assistant text, so the next request also
+                // "sees" the truncation marker — acceptable, since resuming
+                // mid-answer would otherwise be indistinguishable from a
+                // finished reply.
+                let mut assistant_text = final_text.content;
+                if final_text.truncated {
+                    warn!(
+                        session_id = ctx.session_id,
+                        turn = turn_iter,
+                        "provider cut the final answer at the output length limit"
+                    );
+                    assistant_text.push_str("\n\n⚠ response truncated (length limit)");
+                }
                 // Write the reasoning artifact + producing model through to the
                 // turn (phase 4c): the builder re-emits it on the next request
                 // when the same model is still active and the passback policy
@@ -589,7 +606,7 @@ pub(crate) fn run_agent_loop(
                 session.set_assistant_response(
                     current_turn_id,
                     AssistantResponse {
-                        text: Some(final_text.content),
+                        text: Some(assistant_text),
                         reasoning: final_text.reasoning,
                         token_usage,
                         reasoning_artifact: final_text.reasoning_artifact.clone(),

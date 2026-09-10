@@ -51,6 +51,13 @@ pub enum ProviderError {
     /// policy denial is not a 4xx and must not be reported as one.
     #[error("provider content filter blocked the generation: {detail}")]
     ContentFiltered { detail: String },
+    /// The prompt exceeded the model's context window (e.g. z.ai's
+    /// `finish_reason: "model_context_window_exceeded"`). Terminal: retrying
+    /// the same prompt cannot succeed, and the distinct variant signals a
+    /// compaction bug rather than an ordinary provider failure. Mirrors the
+    /// `InferenceError` variant of the same name in `choreo-proto`.
+    #[error("prompt exceeded the model's context window: {detail}")]
+    ContextWindowExceeded { detail: String },
     #[error("request cancelled during retry backoff")]
     Cancelled,
     #[error("total request deadline exceeded while reading streaming response")]
@@ -133,6 +140,9 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
         ProviderError::EmptyResponse => InferenceError::EmptyResponse,
         ProviderError::NotReady { detail } => InferenceError::NotReady { detail },
         ProviderError::ContentFiltered { detail } => InferenceError::ContentFiltered { detail },
+        ProviderError::ContextWindowExceeded { detail } => {
+            InferenceError::ContextWindowExceeded { detail }
+        }
         ProviderError::Cancelled => InferenceError::Cancelled,
         ProviderError::DeadlineExceeded => InferenceError::DeadlineExceeded,
         ProviderError::TruncatedToolCall { discarded } => {
@@ -313,6 +323,7 @@ mod tests {
     fn final_text_with_content_emits_answer() {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "hello".into(),
+            truncated: false,
             reasoning: None,
             usage: None,
             response_id: None,
@@ -328,6 +339,7 @@ mod tests {
     fn final_text_with_content_and_reasoning_emits_both() {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "hello".into(),
+            truncated: false,
             reasoning: Some("thinking...".into()),
             usage: None,
             response_id: None,
@@ -346,6 +358,7 @@ mod tests {
     fn final_text_empty_content_emits_nothing() {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: String::new(),
+            truncated: false,
             reasoning: None,
             usage: None,
             response_id: None,
@@ -358,6 +371,7 @@ mod tests {
     fn final_text_empty_reasoning_is_skipped() {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "hi".into(),
+            truncated: false,
             reasoning: Some(String::new()),
             usage: None,
             response_id: None,
@@ -433,6 +447,7 @@ mod tests {
     fn callback_error_propagates_final_text() {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "boom".into(),
+            truncated: false,
             reasoning: None,
             usage: None,
             response_id: None,
