@@ -757,6 +757,8 @@ fn response_to_turn_result(
         input_tokens: u.prompt_token_count,
         output_tokens: u.candidates_token_count,
         total_tokens: u.total_token_count,
+        // Provider response shape exposes no cached-prompt count here.
+        cached_tokens: 0,
     });
     let candidate = response
         .candidates

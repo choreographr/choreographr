@@ -120,6 +120,7 @@ fn apply_daemon_turn_appended_with_image() {
             input_tokens: 10,
             output_tokens: 5,
             total_tokens: 15,
+            cached_tokens: 0,
         }),
         tool_results: vec![],
         displayed_images: vec![DisplayedImageRecord {

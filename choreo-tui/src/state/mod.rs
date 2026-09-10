@@ -1869,6 +1869,9 @@ impl App {
             total_tokens: usage.total_tokens
                 + display.live_input_estimate
                 + display.live_output_tokens,
+            // Cached tokens are only reported in settled usage, not in the live
+            // per-chunk estimates, so carry the settled value through untouched.
+            cached_tokens: usage.cached_tokens,
         })
     }
 }

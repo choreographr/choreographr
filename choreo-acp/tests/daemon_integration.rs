@@ -79,6 +79,7 @@ fn daemon_io_send_and_receive() {
                         input_tokens: 5,
                         output_tokens: 3,
                         total_tokens: 8,
+                        cached_tokens: 0,
                     }),
                     last_prompt_tokens: None,
                 },

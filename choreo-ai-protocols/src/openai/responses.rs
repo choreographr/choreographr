@@ -639,6 +639,10 @@ fn responses_response_to_turn(
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
         total_tokens: u.total_tokens,
+        // The Responses API has no `prompt_tokens_details` object; its
+        // cached-token analogue (`input_tokens_details.cached_tokens`) is a
+        // possible follow-up, so chat-completions z.ai parsing only for now.
+        cached_tokens: 0,
     });
 
     // Parse output items: extract text, reasoning, tool calls, and the
@@ -970,6 +974,9 @@ where
                         input_tokens: u.prompt_tokens,
                         output_tokens: u.completion_tokens,
                         total_tokens: u.total_tokens,
+                        // See responses_response_to_turn: Responses API
+                        // cached-token plumbing is a possible follow-up.
+                        cached_tokens: 0,
                     };
                     last_usage = Some(usage);
                 }

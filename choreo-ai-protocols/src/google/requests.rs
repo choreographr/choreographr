@@ -241,6 +241,7 @@ where
                 input_tokens: u.prompt_token_count,
                 output_tokens: u.candidates_token_count,
                 total_tokens: u.total_token_count,
+                cached_tokens: 0,
             });
         }
 

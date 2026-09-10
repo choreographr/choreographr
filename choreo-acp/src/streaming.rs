@@ -296,6 +296,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 20,
                     total_tokens: 30,
+                    cached_tokens: 0,
                 }),
                 last_prompt_tokens: None,
             },

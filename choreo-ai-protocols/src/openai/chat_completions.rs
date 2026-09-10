@@ -274,10 +274,23 @@ fn chat_completions_response_to_turn(
     let (reasoning, reasoning_artifact) = choice.message.take_reasoning();
 
     // Extract token usage from the API response for cost tracking / display.
-    let turn_usage: Option<TokenUsage> = payload.usage.map(|u| TokenUsage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        total_tokens: u.total_tokens,
+    // z.ai reports cached prompt tokens via `prompt_tokens_details`; providers
+    // without the details object yield 0.
+    let turn_usage: Option<TokenUsage> = payload.usage.map(|u| {
+        let cached_tokens = u.prompt_tokens_details.map_or(0, |d| d.cached_tokens);
+        if cached_tokens > 0 {
+            debug!(
+                cached_tokens,
+                prompt_tokens = u.prompt_tokens,
+                "chat-completions cached prompt tokens"
+            );
+        }
+        TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            cached_tokens,
+        }
     });
 
     let mut tool_calls: Vec<ChatToolCall> = choice
@@ -530,16 +543,22 @@ impl ChatCompletionsStreamAccumulator {
     ) -> Result<(), super::OpenAiError> {
         // Capture usage from the final chunk (choices: []).
         if let Some(ref u) = payload.usage {
+            let cached_tokens = u
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cached_tokens);
             debug!(
                 prompt_tokens = u.prompt_tokens,
                 completion_tokens = u.completion_tokens,
                 total_tokens = u.total_tokens,
+                cached_tokens,
                 "OpenAI streaming turn usage"
             );
             let usage = TokenUsage {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
+                cached_tokens,
             };
             self.last_usage = Some(usage);
         }
@@ -1240,6 +1259,70 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn usage_parses_zai_cached_prompt_tokens() {
+        // z.ai-shaped usage: prompt_tokens_details.cached_tokens present.
+        let json = r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":64}}}"#;
+        let resp: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.expect("usage should be present");
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .expect("details present")
+                .cached_tokens,
+            64
+        );
+    }
+
+    #[test]
+    fn usage_without_prompt_tokens_details_defaults_to_none() {
+        // OpenAI/DeepSeek-style usage with no details object must still parse.
+        let json = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        let resp: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.expect("usage should be present");
+        assert!(usage.prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn response_to_turn_maps_zai_cached_tokens_into_token_usage() {
+        // z.ai reports cached prompt tokens in prompt_tokens_details; the
+        // parsed TokenUsage must carry that count for cost/usage reporting.
+        let json = r#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":64}}}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let turn = chat_completions_response_to_turn(payload).expect("turn");
+        let ChatTurnResult::FinalText(result) = turn else {
+            panic!("expected FinalText");
+        };
+        assert_eq!(
+            result.usage,
+            Some(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                total_tokens: 120,
+                cached_tokens: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn response_to_turn_defaults_cached_tokens_to_zero_when_absent() {
+        let json = r#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let turn = chat_completions_response_to_turn(payload).expect("turn");
+        let ChatTurnResult::FinalText(result) = turn else {
+            panic!("expected FinalText");
+        };
+        assert_eq!(
+            result.usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                cached_tokens: 0,
+            })
+        );
     }
 
     // -- chat completions stream delta keeps reasoning separate -----------

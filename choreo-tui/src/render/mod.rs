@@ -884,12 +884,21 @@ pub(crate) fn status_token_readout(usage: &TokenUsage) -> String {
 /// surfaces agree; the `Tokens:        ` label keeps the column aligned with
 /// its neighbours (`Working Dir:`, `Turn Count:`, …).
 pub(crate) fn session_detail_tokens_line(usage: &TokenUsage) -> String {
-    format!(
+    let mut line = format!(
         "Tokens:        {} in / {} out ({} total)",
         humfmt::number(usage.input_tokens),
         humfmt::number(usage.output_tokens),
         humfmt::number(usage.total_tokens),
-    )
+    );
+    // Cached prompt tokens are a subset of the input count; annotate only
+    // when the provider actually reported them so the common case is unchanged.
+    if usage.cached_tokens > 0 {
+        line.push_str(&format!(
+            " ({} cached)",
+            humfmt::number(usage.cached_tokens)
+        ));
+    }
+    line
 }
 
 #[cfg(test)]

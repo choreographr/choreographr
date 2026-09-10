@@ -547,6 +547,8 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             total_tokens: total,
+            // Provider response shape exposes no cached-prompt count here.
+            cached_tokens: 0,
         }
     });
 

@@ -74,6 +74,13 @@ pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
+    /// Prompt tokens served from the provider's prompt cache (z.ai's
+    /// `usage.prompt_tokens_details.cached_tokens`). Cached input is priced
+    /// differently, so cost/usage reporting tracks it separately. 0 when the
+    /// provider does not report it; `#[serde(default)]` keeps old payloads and
+    /// providers that omit the details object deserializing cleanly.
+    #[serde(default)]
+    pub cached_tokens: u32,
 }
 
 impl TokenUsage {
@@ -87,6 +94,7 @@ impl TokenUsage {
         self.input_tokens = self.input_tokens.max(other.input_tokens);
         self.output_tokens = self.output_tokens.max(other.output_tokens);
         self.total_tokens = self.total_tokens.max(other.total_tokens);
+        self.cached_tokens = self.cached_tokens.max(other.cached_tokens);
     }
 }
 
@@ -1035,6 +1043,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 20,
                 total_tokens: 30,
+                cached_tokens: 0,
             }),
             tool_results: vec![ToolResultRecord {
                 call_id: "call_1".to_string(),
@@ -1138,21 +1147,25 @@ mod tests {
             input_tokens: 30,
             output_tokens: 5,
             total_tokens: 35,
+            cached_tokens: 12,
         };
         usage.merge_max(TokenUsage {
             input_tokens: 10,
             output_tokens: 15,
             total_tokens: 25,
+            cached_tokens: 20,
         });
         assert_eq!(usage.input_tokens, 30);
         assert_eq!(usage.output_tokens, 15);
         assert_eq!(usage.total_tokens, 35);
+        assert_eq!(usage.cached_tokens, 20);
 
         // An identical or trailing value is a no-op.
         usage.merge_max(TokenUsage {
             input_tokens: 30,
             output_tokens: 15,
             total_tokens: 35,
+            cached_tokens: 18,
         });
         assert_eq!(
             usage,
@@ -1160,6 +1173,7 @@ mod tests {
                 input_tokens: 30,
                 output_tokens: 15,
                 total_tokens: 35,
+                cached_tokens: 20,
             }
         );
     }
@@ -1195,6 +1209,7 @@ mod tests {
                     input_tokens: 1,
                     output_tokens: 2,
                     total_tokens: 3,
+                    cached_tokens: 0,
                 }),
                 tool_results: (0..n_results)
                     .map(|i| ToolResultRecord {
@@ -1253,6 +1268,7 @@ mod tests {
                     input_tokens: 100,
                     output_tokens: 50,
                     total_tokens: 150,
+                    cached_tokens: 0,
                 }),
                 context_window: Some(128_000),
                 last_prompt_tokens: Some(100),
@@ -1313,6 +1329,7 @@ mod tests {
                             input_tokens: 100,
                             output_tokens: 50,
                             total_tokens: 150,
+                            cached_tokens: 0,
                         }),
                         context_window: Some(128_000),
                         last_prompt_tokens: Some(100),
@@ -1436,6 +1453,7 @@ mod tests {
                             input_tokens: 100,
                             output_tokens: 50,
                             total_tokens: 150,
+                            cached_tokens: 0,
                         },
                         last_prompt_tokens: Some(100),
                     },
@@ -1472,6 +1490,7 @@ mod tests {
                             input_tokens: 100,
                             output_tokens: 50,
                             total_tokens: 150,
+                            cached_tokens: 0,
                         }),
                         last_prompt_tokens: Some(100),
                     },

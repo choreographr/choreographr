@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cached prompt-token reporting (`choreo-proto`, `choreo-ai-protocols`, `choreo-tui`):**
+  `TokenUsage` gains a `cached_tokens: u32` field (`#[serde(default)]`, 0 when unreported, so
+  old wire payloads and providers that omit the details object keep deserializing) and
+  `merge_max` now folds it per-field. The OpenAI-compatible client parses z.ai's
+  `usage.prompt_tokens_details.cached_tokens` (an optional nested `prompt_tokens_details`
+  struct on `Usage`) in both the non-streaming and streaming chat-completions paths, maps it
+  into `TokenUsage` with a `debug!` trace on nonzero counts, and the TUI session-detail
+  "Tokens:" line annotates `(<N> cached)` when the provider reported a cached count. DeepSeek's
+  differently-shaped flat `prompt_cache_hit_tokens` and the Responses API's
+  `input_tokens_details.cached_tokens` are noted in-code as possible follow-ups.
+
 - **`max_tokens` field pinned for the Zhipu slugs (`choreo-ai-protocols` catalog/models-overlay.toml):**
   z.ai's chat-completions API documents only `max_tokens` (no `max_completion_tokens`), but the
   models.dev derivation defaults every OpenAI-protocol provider to `max_completion_tokens` —

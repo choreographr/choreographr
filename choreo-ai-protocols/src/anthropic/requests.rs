@@ -404,6 +404,7 @@ where
                 input_tokens: in_tok,
                 output_tokens: out_tok,
                 total_tokens: total,
+                cached_tokens: 0,
             })
         }
         _ => None,

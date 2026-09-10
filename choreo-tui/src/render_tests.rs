@@ -43,6 +43,7 @@ fn status_token_readout_small_counts_pass_through() {
         input_tokens: 847,
         output_tokens: 23,
         total_tokens: 870,
+        cached_tokens: 0,
     };
     assert_eq!(status_token_readout(&usage), "↑847 ↓23");
 }
@@ -57,6 +58,7 @@ fn status_token_readout_compacts_large_counts() {
         input_tokens: 15_320,
         output_tokens: 1_280,
         total_tokens: 16_600,
+        cached_tokens: 0,
     };
     assert_eq!(status_token_readout(&usage), "↑15.3K ↓1.3K");
 }
@@ -72,10 +74,27 @@ fn session_detail_tokens_line_compacts_and_keeps_label_alignment() {
         input_tokens: 15_320,
         output_tokens: 1_280,
         total_tokens: 16_600,
+        cached_tokens: 0,
     };
     assert_eq!(
         session_detail_tokens_line(&usage),
         "Tokens:        15.3K in / 1.3K out (16.6K total)"
+    );
+}
+
+#[test]
+fn session_detail_tokens_line_annotates_cached_tokens_when_reported() {
+    // z.ai reports cached prompt tokens; the detail line annotates them as a
+    // subset of the input count. Zero cached stays silent (see the test above).
+    let usage = TokenUsage {
+        input_tokens: 15_320,
+        output_tokens: 1_280,
+        total_tokens: 16_600,
+        cached_tokens: 10_000,
+    };
+    assert_eq!(
+        session_detail_tokens_line(&usage),
+        "Tokens:        15.3K in / 1.3K out (16.6K total) (10K cached)"
     );
 }
 
@@ -85,6 +104,7 @@ fn session_detail_tokens_line_small_counts_pass_through() {
         input_tokens: 42,
         output_tokens: 7,
         total_tokens: 49,
+        cached_tokens: 0,
     };
     assert_eq!(
         session_detail_tokens_line(&usage),

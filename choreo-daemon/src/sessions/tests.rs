@@ -364,6 +364,7 @@ fn apply_worker_snapshot_preserves_main_loop_config_mutations() {
         input_tokens: 10,
         output_tokens: 5,
         total_tokens: 15,
+        cached_tokens: 0,
     };
     snapshot.context_window = Some(8192);
     snapshot.last_prompt_tokens = Some(10);
@@ -831,6 +832,7 @@ fn accumulated_usage_reconstructed_from_turns() {
                 input_tokens: 10,
                 output_tokens: 20,
                 total_tokens: 30,
+                cached_tokens: 0,
             }),
             tool_results: Vec::new(),
             displayed_images: Vec::new(),
@@ -854,6 +856,7 @@ fn accumulated_usage_reconstructed_from_turns() {
                 input_tokens: 100,
                 output_tokens: 50,
                 total_tokens: 150,
+                cached_tokens: 0,
             }),
             tool_results: Vec::new(),
             displayed_images: Vec::new(),
@@ -941,6 +944,7 @@ fn last_prompt_tokens_from_latest_usage_turn() {
                 input_tokens: 5,
                 output_tokens: 10,
                 total_tokens: 15,
+                cached_tokens: 0,
             }),
             tool_results: Vec::new(),
             displayed_images: Vec::new(),
@@ -964,6 +968,7 @@ fn last_prompt_tokens_from_latest_usage_turn() {
                 input_tokens: 42,
                 output_tokens: 7,
                 total_tokens: 49,
+                cached_tokens: 0,
             }),
             tool_results: Vec::new(),
             displayed_images: Vec::new(),
@@ -1039,6 +1044,7 @@ fn accumulated_usage_in_snapshot() {
         input_tokens: 50,
         output_tokens: 25,
         total_tokens: 75,
+        cached_tokens: 0,
     };
     let snap = state.snapshot();
     assert_eq!(snap.config.accumulated_usage.input_tokens, 50);
@@ -1053,6 +1059,7 @@ fn accumulated_usage_in_session_summary() {
         input_tokens: 80,
         output_tokens: 40,
         total_tokens: 120,
+        cached_tokens: 0,
     };
 
     let (reply, rx) = mpsc::channel();
@@ -1080,6 +1087,7 @@ fn accumulated_usage_in_attach_snapshot() {
         input_tokens: 30,
         output_tokens: 15,
         total_tokens: 45,
+        cached_tokens: 0,
     };
 
     let (sub_tx, sub_rx) = test_sink();
@@ -1140,6 +1148,7 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
         input_tokens: 30,
         output_tokens: 15,
         total_tokens: 45,
+        cached_tokens: 0,
     };
     let mut shutdown = false;
     process_command(
@@ -1207,6 +1216,7 @@ fn attach_snapshot_carries_mid_turn_accumulated_usage() {
         input_tokens: 30,
         output_tokens: 15,
         total_tokens: 45,
+        cached_tokens: 0,
     };
     let mut shutdown = false;
     process_command(
@@ -1275,6 +1285,7 @@ fn sync_accumulated_usage_never_regresses_config() {
                 input_tokens: 30,
                 output_tokens: 15,
                 total_tokens: 45,
+                cached_tokens: 0,
             },
             last_prompt_tokens: Some(30),
         },
@@ -1289,6 +1300,7 @@ fn sync_accumulated_usage_never_regresses_config() {
                 input_tokens: 5,
                 output_tokens: 3,
                 total_tokens: 8,
+                cached_tokens: 0,
             },
             last_prompt_tokens: None,
         },

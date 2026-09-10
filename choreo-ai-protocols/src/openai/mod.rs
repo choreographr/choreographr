@@ -63,6 +63,19 @@ pub(crate) struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    /// OpenAI-style per-prompt breakdown. z.ai (and OpenAI itself) report
+    /// `prompt_tokens_details.cached_tokens` here; providers that omit the
+    /// object entirely (e.g. plain DeepSeek) still parse via `#[serde(default)]`.
+    /// NOTE: DeepSeek also exposes a differently-shaped flat
+    /// `prompt_cache_hit_tokens` field — parsing that is a possible follow-up.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
