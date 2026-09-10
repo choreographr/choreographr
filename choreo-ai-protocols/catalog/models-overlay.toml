@@ -252,6 +252,18 @@
 [provider.zai]
   base_url = "https://api.z.ai/api/coding/paas/v4"
   default_model = "glm-5.1"
+  # z.ai's chat-completions API documents ONLY `max_tokens` (128K max output
+  # for the GLM-5.x series — docs.z.ai/api-reference/llm/chat-completion,
+  # 2026-09); it has no `max_completion_tokens`. The models.dev derivation
+  # defaults every OpenAI-protocol provider to `max_completion_tokens`, which
+  # z.ai would ignore or reject, so the Zhipu slugs are pinned to the
+  # documented field here (same pin pattern as opencode-go above).
+  max_tokens_field = "max_tokens"
+
+# Mainland zhipuai (bigmodel.cn) serves the same GLM family through the same
+# PaaS-v4 contract shape, so the same max_tokens field pin applies.
+[provider.zhipuai]
+  max_tokens_field = "max_tokens"
 
 # glm-image (z.ai + mainland zhipuai): the GLM text-to-image model on the
 # same PaaS-v4 Gateway the chat models use. NOT in the models.dev snapshot

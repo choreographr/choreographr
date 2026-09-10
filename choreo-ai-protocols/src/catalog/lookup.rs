@@ -902,6 +902,29 @@ mod tests {
     }
 
     #[test]
+    fn bundled_overlay_pins_max_tokens_field_for_the_zhipu_slugs() {
+        // z.ai's chat-completions API documents only `max_tokens` (no
+        // `max_completion_tokens`), but the models.dev derivation defaults
+        // every OpenAI-protocol provider to `max_completion_tokens`. The
+        // bundled overlay must win for both Zhipu slugs — this pins the
+        // field-wise provider-scalar merge end to end for the real catalog.
+        // Read-only (no catalog swap), so no restore guard is needed.
+        for slug in ["zai", "zhipuai"] {
+            let entry =
+                lookup_provider(slug).unwrap_or_else(|| panic!("{slug} in bundled catalog"));
+            assert!(
+                matches!(
+                    entry.protocol,
+                    ProviderProtocol::OpenAi {
+                        max_tokens_field: MaxTokensField::MaxTokens
+                    }
+                ),
+                "{slug} must resolve max_tokens, not max_completion_tokens"
+            );
+        }
+    }
+
+    #[test]
     fn bundled_overlay_lists_glm_image_under_the_zai_and_zhipuai_slugs() {
         // The REAL bundled catalog: glm-image is not in the models.dev
         // snapshot, so its image-output flag comes solely from the bundled

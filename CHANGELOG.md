@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`max_tokens` field pinned for the Zhipu slugs (`choreo-ai-protocols` catalog/models-overlay.toml):**
+  z.ai's chat-completions API documents only `max_tokens` (no `max_completion_tokens`), but the
+  models.dev derivation defaults every OpenAI-protocol provider to `max_completion_tokens` —
+  z.ai would ignore or reject the output cap sent under that name. The bundled overlay now pins
+  `max_tokens_field = "max_tokens"` on both `zai` and `zhipuai` (same GLM PaaS-v4 contract shape);
+  pinned end-to-end by the new bundled-catalog regression test
+  `bundled_overlay_pins_max_tokens_field_for_the_zhipu_slugs`.
+
 - **`ZaiImageClient` — the z.ai (Zhipu GLM) Images adapter (`choreo-ai-protocols` src/images/zai.rs):**
   a second adapter behind `ImageGenerationClient` for the `/paas/v4/images/generations` endpoint
   (glm-image): request body is `{model, prompt}` + optional `size` (OpenAI wire strings verbatim;
