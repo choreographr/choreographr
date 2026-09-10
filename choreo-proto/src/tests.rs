@@ -741,6 +741,14 @@ fn inference_error_metric_labels_are_stable() {
         InferenceError::EmptyResponse.metric_label(),
         "empty_response"
     );
+    assert_eq!(
+        InferenceError::NotReady { detail: "x".into() }.metric_label(),
+        "not_ready"
+    );
+    assert_eq!(
+        InferenceError::ContentFiltered { detail: "x".into() }.metric_label(),
+        "content_filtered"
+    );
     assert_eq!(InferenceError::Cancelled.metric_label(), "cancelled");
     assert_eq!(
         InferenceError::DeadlineExceeded.metric_label(),
@@ -790,6 +798,8 @@ fn inference_error_metric_labels_are_distinct() {
         }
         .metric_label(),
         InferenceError::EmptyResponse.metric_label(),
+        InferenceError::NotReady { detail: "x".into() }.metric_label(),
+        InferenceError::ContentFiltered { detail: "x".into() }.metric_label(),
         InferenceError::Cancelled.metric_label(),
         InferenceError::DeadlineExceeded.metric_label(),
         InferenceError::TruncatedToolCall { discarded: vec![] }.metric_label(),
@@ -799,7 +809,7 @@ fn inference_error_metric_labels_are_distinct() {
     .collect();
     assert_eq!(
         labels.len(),
-        9,
+        11,
         "each InferenceError variant must have a distinct metric label"
     );
 }

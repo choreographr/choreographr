@@ -454,10 +454,15 @@ fn zai_url_download_stays_terminal_after_the_retry_budget() {
     let err = ZaiImageClient::new(config, "zai-key".to_string())
         .generate_image(&zai_sample_request(), None)
         .expect_err("all-fetches-racy must be terminal after the download budget");
-    assert!(
-        matches!(err, InferenceError::EmptyResponse),
-        "expected the empty/not-ready error to surface, got {err:?}"
-    );
+    match err {
+        // NotReady is the dedicated "CDN answered but not with an image yet"
+        // variant — the exhausted download budget surfaces it honestly
+        // instead of conflating with EmptyResponse.
+        InferenceError::NotReady { detail } => {
+            assert!(detail.contains("non-image content type"), "{detail}");
+        }
+        other => panic!("expected NotReady, got {other:?}"),
+    }
     // 1 POST + the full 3-fetch download budget.
     assert_eq!(mock.requests().len(), 4, "POST + 3 download attempts");
 }
@@ -500,9 +505,9 @@ fn zai_wire_body_has_model_prompt_only_plus_mapped_knobs() {
         background: Background::Transparent,
         ..zai_sample_request()
     };
-    zai_client(&mock)
-        .generate_image(&req, None)
-        .expect_err("127.0.0.1:1 download must fail; the POST body assertions below still run");
+    zai_client(&mock).generate_image(&req, None).expect_err(
+        "127.0.0.1:1 download must fail (SSRF guard); the POST body assertions below still run",
+    );
     // The generation POST body is what matters here.
     let body = mock.requests()[0].body_json();
     assert_eq!(body["model"], "glm-image");
@@ -590,28 +595,33 @@ fn zai_flat_error_body_message_surfaces() {
 #[ignore]
 fn zai_content_filter_blocks_with_clear_message_not_empty_response() {
     // Documented semantics: level 0 (most severe) ..= 3; any entry at level
-    // 0..=2 marks the generation BLOCKED — a ClientError, NOT EmptyResponse
-    // (and never a retry: policy blocks cannot clear on resend).
-    let mock = MockProvider::start(vec![(
-        200,
-        "application/json",
-        r#"{"created":1,"data":[{"url":"http://127.0.0.1:1/x.png"}],"content_filter":[{"role":"user","level":1}]}"#
-            .to_string(),
-    )]);
+    // 0..=2 marks the generation BLOCKED — a ContentFiltered error, NOT
+    // EmptyResponse (and never a retry: policy blocks cannot clear on
+    // resend). No HTTP status is fabricated: the response itself succeeded.
+    let mock = MockProvider::start(vec![
+        (
+            200,
+            "application/json",
+            r#"{"created":1,"data":[{"url":"http://127.0.0.1:1/x.png"}],"content_filter":[{"role":"user","level":1}]}"#
+                .to_string(),
+        ),
+    ]);
     let err = zai_client(&mock)
         .generate_image(&zai_sample_request(), None)
         .expect_err("level-1 filter entry must block");
+    let rendered = err.to_string();
     match err {
-        InferenceError::ClientError { status, detail } => {
-            assert_eq!(status, 200);
+        InferenceError::ContentFiltered { detail } => {
+            // The variant's Display carries the human-readable policy message
+            // (the detail holds the flag facts); no HTTP status is fabricated.
             assert!(
-                detail.contains("content filter blocked the generation"),
-                "{detail}"
+                rendered.contains("content filter blocked the generation"),
+                "{rendered}"
             );
             assert!(detail.contains("level 1"), "{detail}");
             assert!(detail.contains("user"), "{detail}");
         }
-        other => panic!("expected ClientError, got {other:?}"),
+        other => panic!("expected ContentFiltered, got {other:?}"),
     }
     assert_eq!(mock.requests().len(), 1, "blocked is terminal — no retry");
 }

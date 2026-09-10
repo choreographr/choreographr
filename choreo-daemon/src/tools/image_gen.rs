@@ -85,6 +85,9 @@ fn pick_image_model(
     }
 
     // Priority tiers by case-insensitive substring match, first match wins.
+    // Each candidate is lowercased once per tier comparison — simple and
+    // obviously correct; the catalog list is human-catalog-sized, so there
+    // is nothing to optimize here.
     let tiers: [(&str, Option<&str>); 5] = [
         ("gpt-image", None),
         ("imagen", None),
@@ -92,16 +95,10 @@ fn pick_image_model(
         ("flux", None),
         ("dall-e", None),
     ];
-    // Candidate names are lowercased ONCE up front instead of per tier per
-    // candidate — the tier loop is ×5, and the catalog list can be long.
-    let lowered: Vec<(String, String)> = candidates
-        .iter()
-        .map(|c| (c.to_ascii_lowercase(), c.clone()))
-        .collect();
     for (primary, secondary) in tiers {
-        let needle_p = primary.to_ascii_lowercase();
-        for (hay, original) in &lowered {
-            if !hay.contains(&needle_p) {
+        for candidate in candidates {
+            let hay = candidate.to_ascii_lowercase();
+            if !hay.contains(primary) {
                 continue;
             }
             // "gemini-" + "image": both substrings must be present (a bare
@@ -109,7 +106,7 @@ fn pick_image_model(
             if secondary.is_some_and(|sec| !hay.contains(sec)) {
                 continue;
             }
-            return Ok(original.clone());
+            return Ok(candidate.clone());
         }
     }
     // No tier matched: the catalog's first listed image-capable model is the
@@ -218,7 +215,9 @@ impl super::Tool for GenerateImage {
                 "daemon dropped the image provider reply channel: {e}"
             ))
         })?;
-        let handle = handle.map_err(ToolExecError)?;
+        // Map the structured daemon error into its Display text so the model
+        // still sees the precise guidance (unlock / account / slug wording).
+        let handle = handle.map_err(|e| ToolExecError(e.to_string()))?;
 
         // Model resolution: explicit arg > catalog-priority pick. The
         // catalog is the source of truth for what this provider can route at

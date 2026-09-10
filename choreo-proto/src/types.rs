@@ -154,6 +154,19 @@ pub enum InferenceError {
     ClientError { status: u16, detail: String },
     #[error("provider returned an empty response")]
     EmptyResponse,
+    /// The provider accepted the request but the referenced artifact (e.g. a
+    /// generated image on its CDN) is not available yet — a propagation race,
+    /// not an HTTP error and not an empty response. Retryable by callers that
+    /// know how to wait; distinct from [`InferenceError::EmptyResponse`] so a
+    /// genuinely empty body is never mistaken for "not published yet".
+    #[error("provider artifact not ready yet: {detail}")]
+    NotReady { detail: String },
+    /// The provider's content filter blocked the generation. No HTTP status
+    /// accompanied the response (it came back with a success code), so this
+    /// variant carries none — policy denial is honest as-is, and resending
+    /// the same prompt can never clear it.
+    #[error("provider content filter blocked the generation: {detail}")]
+    ContentFiltered { detail: String },
     #[error("request cancelled during retry backoff")]
     Cancelled,
     #[error("total request deadline exceeded while reading streaming response")]
@@ -178,6 +191,8 @@ impl InferenceError {
             InferenceError::ServerError { .. } => "server_error",
             InferenceError::ClientError { .. } => "client_error",
             InferenceError::EmptyResponse => "empty_response",
+            InferenceError::NotReady { .. } => "not_ready",
+            InferenceError::ContentFiltered { .. } => "content_filtered",
             InferenceError::Cancelled => "cancelled",
             InferenceError::DeadlineExceeded => "deadline_exceeded",
             InferenceError::TruncatedToolCall { .. } => "truncated_tool_call",

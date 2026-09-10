@@ -1,0 +1,309 @@
+//! Image-generation provider resolution: the `DaemonCommand::
+//! GetImageGenerationProvider` handler and its pure resolution logic.
+//!
+//! These are the `impl DaemonState` methods that turn an (optional) account
+//! name into an opaque [`ImageProviderHandle`] for a tool thread. They live
+//! in a child module (same pattern as `daemon/subscriber_handlers.rs`) so
+//! `daemon.rs` stays focused on core command handling; the methods are
+//! `pub(super)` because `handle_command` in the parent dispatches the
+//! corresponding `DaemonCommand` variant here.
+//!
+//! As a CHILD of `crate::daemon`, this module reaches the parent's private
+//! items (`DaemonState` fields, ...) via `use super::*`.
+//!
+//! [`ImageProviderHandle`] itself stays in `crate::providers`: it is the
+//! protocol-erased companion of [`InferenceProvider`](crate::providers::
+//! InferenceProvider) (constructed by `InferenceProvider::image_client()`,
+//! consumed by `tools/image_gen.rs` next to the other provider facade
+//! types), so it belongs with the provider facade, not with the command
+//! plumbing that hands it out.
+
+use super::*;
+use thiserror::Error;
+
+/// Why image-generation provider resolution failed.
+///
+/// A structured replacement for the `Result<_, String>` this path used to
+/// return: the tool call site (`tools/image_gen.rs`) maps these into its
+/// `ToolExecError` message so the model still sees the precise guidance
+/// text, but the daemon side gets real variants to match on.
+#[derive(Debug, Clone, Error)]
+pub enum ImageProviderError {
+    /// `providers` is empty — the keystore is locked (or no credential has
+    /// ever been stored), so no provider can be resolved at all.
+    #[error("keystore is locked — unlock first")]
+    Locked,
+    /// The explicitly named account is absent from the resolved map (typo,
+    /// wrong session account, or the account never resolved a provider).
+    #[error(
+        "account '{name}' is not configured or has no resolved provider — \
+         add it and set it on the session"
+    )]
+    AccountNotConfigured { name: String },
+    /// The account resolved, but its provider has no image backend.
+    #[error("provider '{slug}' does not support image generation")]
+    NoImageBackend { slug: String },
+    /// Unlocked, but EVERY resolved provider lacks an image backend — the
+    /// slug names the deterministic (sorted-first) provider that was
+    /// inspected, so the message names an actual blocker.
+    #[error("provider '{slug}' does not support image generation")]
+    NoImageCapableAccount { slug: String },
+}
+
+impl DaemonState {
+    /// Resolve an image-generation handle for a tool thread.
+    ///
+    /// Every path replies over the caller's crossbeam channel — never the
+    /// broadcast machinery — and logs the outcome so a misconfigured tool
+    /// call leaves a trace in the daemon log.
+    pub(super) fn handle_get_image_generation_provider(
+        &self,
+        account_name: Option<String>,
+        reply: crossbeam_channel::Sender<
+            Result<crate::providers::ImageProviderHandle, ImageProviderError>,
+        >,
+    ) {
+        let result = self.resolve_image_generation_provider(account_name.as_deref());
+        match &result {
+            Ok(handle) => {
+                info!(
+                    account = ?account_name,
+                    slug = %handle.slug,
+                    "resolved image-generation provider"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    account = ?account_name,
+                    error = %err,
+                    "image-generation provider resolution failed"
+                );
+            }
+        }
+        // Best-effort send: a dropped receiver (tool cancelled mid-call) must
+        // not panic the command loop.
+        let _ = reply.send(result);
+    }
+
+    /// Pure resolution logic for [`Self::handle_get_image_generation_provider`],
+    /// split out so the error precedence (lock → no match → no backend) is
+    /// unit-testable without threading a channel through the test.
+    ///
+    /// Resolution order mirrors `handle_list_models_inner`: an explicit
+    /// account name wins; `None` falls through to the only/default account —
+    /// there is no persistent "default account" concept in `DaemonState`, so
+    /// the deterministic pick is the FIRST image-capable provider in
+    /// sorted-key order (sorted, not map order, so the answer does not depend
+    /// on HashMap iteration noise).
+    pub(super) fn resolve_image_generation_provider(
+        &self,
+        account_name: Option<&str>,
+    ) -> Result<crate::providers::ImageProviderHandle, ImageProviderError> {
+        // `providers` is wiped by /lock (`providers.clear()`), so an empty map
+        // here means the keystore is locked (or no credential has ever been
+        // stored) — lock revocation of a previously returned handle falls out
+        // of the SAME clear: the client Arc already handed out stays valid
+        // until the tool drops it, but no NEW handle can be resolved, which
+        // is the contract the tool checks per call.
+        if self.providers.is_empty() {
+            return Err(ImageProviderError::Locked);
+        }
+
+        match account_name {
+            Some(name) => {
+                let provider = self.providers.get(name).ok_or_else(|| {
+                    // Name the missing account explicitly — a generic "no
+                    // account is configured" here would misdiagnose the
+                    // (common) typo/wrong-session-account case, since the
+                    // map is demonstrably non-empty at this point.
+                    ImageProviderError::AccountNotConfigured {
+                        name: name.to_string(),
+                    }
+                })?;
+                let client =
+                    provider
+                        .image_client()
+                        .ok_or_else(|| ImageProviderError::NoImageBackend {
+                            slug: provider.provider_slug().to_string(),
+                        })?;
+                Ok(crate::providers::ImageProviderHandle {
+                    slug: provider.provider_slug().to_string(),
+                    client,
+                })
+            }
+            None => {
+                // Deterministic default: lowest account name that has an
+                // image backend. HashMap order is not stable between runs, so
+                // sorting keeps "only one image-capable account" unambiguous
+                // and repeatable.
+                let best = self
+                    .providers
+                    .iter()
+                    .filter(|(_, p)| p.image_client().is_some())
+                    .min_by(|(a, _), (b, _)| a.cmp(b));
+                match best {
+                    Some((_, provider)) => {
+                        let client = provider
+                            .image_client()
+                            // Just filtered for Some — a None here would mean
+                            // a broken `image_client()`; degrade to an error,
+                            // never panic.
+                            .ok_or_else(|| ImageProviderError::NoImageBackend {
+                                slug: provider.provider_slug().to_string(),
+                            })?;
+                        Ok(crate::providers::ImageProviderHandle {
+                            slug: provider.provider_slug().to_string(),
+                            client,
+                        })
+                    }
+                    // Unlocked but every resolved provider is a protocol with
+                    // no image backend (Anthropic/Gemini) — surface a slug so
+                    // the message names an actual blocker. `min_by` over the
+                    // sorted keys keeps the picked slug deterministic, unlike
+                    // HashMap `values().next()` iteration order.
+                    None => {
+                        let slug = self
+                            .providers
+                            .iter()
+                            .min_by(|(a, _), (b, _)| a.cmp(b))
+                            .map(|(_, p)| p.provider_slug().to_string())
+                            .unwrap_or_default();
+                        Err(ImageProviderError::NoImageCapableAccount { slug })
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::tests::make_daemon_state;
+
+    /// Send a `GetImageGenerationProvider` command and wait for the crossbeam
+    /// reply (the same channel shape the tool thread will use in production).
+    fn send_get_image_provider(
+        state: &mut DaemonState,
+        account_name: Option<String>,
+    ) -> Result<crate::providers::ImageProviderHandle, ImageProviderError> {
+        let (reply, rx) = crossbeam_channel::unbounded();
+        state.handle_command(DaemonCommand::GetImageGenerationProvider {
+            account_name,
+            reply,
+        });
+        rx.recv().unwrap()
+    }
+
+    #[test]
+    fn get_image_provider_locked_keystore_errors_with_unlock_guidance() {
+        let (mut state, _rx) = make_daemon_state();
+        // A fresh test state starts locked with an empty providers map — the
+        // exact shape /lock leaves behind.
+        let err = send_get_image_provider(&mut state, None).unwrap_err();
+        assert!(
+            matches!(err, ImageProviderError::Locked)
+                && err.to_string().contains("keystore is locked"),
+            "unlock guidance expected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_image_provider_named_account_without_image_backend_names_slug() {
+        let (mut state, _rx) = make_daemon_state();
+        // An Anthropic-protocol provider has no image backend in v1.
+        let cfg = AccountConfig::simple("claude", "anthropic");
+        let provider =
+            InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap();
+        state.providers.insert("claude".into(), provider);
+
+        let err = send_get_image_provider(&mut state, Some("claude".into())).unwrap_err();
+        assert!(
+            matches!(&err, ImageProviderError::NoImageBackend { slug } if slug == "anthropic"),
+            "error must name the provider slug, got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_image_provider_unknown_named_account_names_the_account() {
+        let (mut state, _rx) = make_daemon_state();
+        // A resolved map that does NOT contain the requested name: the error
+        // must name the account, not the generic "no account is configured"
+        // (which would misdiagnose a typo / wrong session account).
+        let cfg = AccountConfig::simple("openai", "openai");
+        state.providers.insert(
+            "openai".into(),
+            InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap(),
+        );
+
+        let err = send_get_image_provider(&mut state, Some("oepnai".into())).unwrap_err();
+        assert!(
+            matches!(&err, ImageProviderError::AccountNotConfigured { name } if name == "oepnai")
+                && err
+                    .to_string()
+                    .contains("account 'oepnai' is not configured"),
+            "error must name the missing account, got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_image_provider_happy_path_returns_handle_with_working_client() {
+        let (mut state, _rx) = make_daemon_state();
+        // A real OpenAI-protocol account with a fake api key — resolves
+        // through the same `from_account_config` path production uses.
+        let cfg = AccountConfig::simple("openai", "openai");
+        let provider =
+            InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap();
+        state.providers.insert("openai".into(), provider);
+
+        let handle = send_get_image_provider(&mut state, Some("openai".into())).unwrap();
+        // The slug is the catalog slug, and the client is a working
+        // `ImageGenerationClient` — its own provider_slug answers.
+        assert_eq!(handle.slug, "openai");
+        assert_eq!(handle.client.provider_slug(), "openai");
+    }
+
+    #[test]
+    fn get_image_provider_default_selection_picks_image_capable_account() {
+        let (mut state, _rx) = make_daemon_state();
+        // One Anthropic provider (no backend) and one OpenAI provider
+        // (backend): `account_name: None` must deterministically pick the
+        // image-capable one.
+        let claude = AccountConfig::simple("claude", "anthropic");
+        let openai = AccountConfig::simple("openai", "openai");
+        state.providers.insert(
+            "claude".into(),
+            InferenceProvider::from_account_config(&claude, Some("test-key".into())).unwrap(),
+        );
+        state.providers.insert(
+            "openai".into(),
+            InferenceProvider::from_account_config(&openai, Some("test-key".into())).unwrap(),
+        );
+
+        let handle = send_get_image_provider(&mut state, None).unwrap();
+        assert_eq!(handle.slug, "openai");
+        assert_eq!(handle.client.provider_slug(), "openai");
+    }
+
+    #[test]
+    fn get_image_provider_revoked_after_lock() {
+        let (mut state, _rx) = make_daemon_state();
+        let cfg = AccountConfig::simple("openai", "openai");
+        let provider =
+            InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap();
+        state.providers.insert("openai".into(), provider);
+        assert!(send_get_image_provider(&mut state, Some("openai".into())).is_ok());
+
+        // Simulate /lock: the handler clears the providers map. A handle
+        // resolved BEFORE the clear stays alive in the tool's hands (the Arc
+        // is valid), but no NEW handle can be resolved — the revocation
+        // contract.
+        state.providers.clear();
+
+        let err = send_get_image_provider(&mut state, Some("openai".into())).unwrap_err();
+        assert!(
+            matches!(err, ImageProviderError::Locked),
+            "post-lock resolution must fail with unlock guidance, got: {err}"
+        );
+    }
+}

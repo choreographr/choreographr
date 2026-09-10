@@ -38,6 +38,19 @@ pub enum ProviderError {
     ClientError { status: u16, detail: String },
     #[error("provider returned an empty response")]
     EmptyResponse,
+    /// The provider accepted the request but the referenced artifact is not
+    /// available yet (e.g. z.ai's CDN has not published a generated image
+    /// when the generation response already names its URL). This is a
+    /// propagation race the adapter's own retry loop can ride out — it must
+    /// never be conflated with [`ProviderError::EmptyResponse`], which means
+    /// a genuinely empty body and is terminal on the download path.
+    #[error("provider artifact not ready yet: {detail}")]
+    NotReady { detail: String },
+    /// The provider's content filter blocked the generation. The HTTP
+    /// response itself was a success code, so this variant carries NO status:
+    /// policy denial is not a 4xx and must not be reported as one.
+    #[error("provider content filter blocked the generation: {detail}")]
+    ContentFiltered { detail: String },
     #[error("request cancelled during retry backoff")]
     Cancelled,
     #[error("total request deadline exceeded while reading streaming response")]
@@ -118,6 +131,8 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
             InferenceError::ClientError { status, detail }
         }
         ProviderError::EmptyResponse => InferenceError::EmptyResponse,
+        ProviderError::NotReady { detail } => InferenceError::NotReady { detail },
+        ProviderError::ContentFiltered { detail } => InferenceError::ContentFiltered { detail },
         ProviderError::Cancelled => InferenceError::Cancelled,
         ProviderError::DeadlineExceeded => InferenceError::DeadlineExceeded,
         ProviderError::TruncatedToolCall { discarded } => {

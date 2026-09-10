@@ -64,6 +64,9 @@ tracing.workspace = true
 # dev-dependencies, so this lives in [dependencies].
 tracing-subscriber.workspace = true
 ureq.workspace = true
+# SSRF guard on the provider-returned image download URL: parse the URL and
+# reject private/loopback/link-local IP-literal hosts (see images/zai.rs).
+url.workspace = true
 zeroize.workspace = true
 
 # Generator binary: regenerates `catalog/catalog.bin` from the local

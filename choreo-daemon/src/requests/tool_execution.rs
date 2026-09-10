@@ -15,6 +15,27 @@ use choreo_proto::{DaemonMessage, DisplayedImageRecord, ImageMetadata, SessionEv
 /// process tree, draining buffered output, and serializing the result.
 pub(crate) const TOOL_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
 
+/// Headroom added on top of the image adapters' computed worst case when
+/// deriving the `generate_image` tool timeout: covers the inter-attempt
+/// retry backoffs (the shared agent's short initial backoff) and the small
+/// per-attempt setup/teardown costs that sit outside the bounded attempt
+/// deadlines themselves.
+const IMAGE_TIMEOUT_HEADROOM_SECS: u64 = 60;
+
+/// Derived floor for the `generate_image` outer deadline: (POST attempts +
+/// URL-download attempts) × the adapters' per-attempt deadline, plus headroom
+/// for the inter-attempt backoffs. Derived from the shared adapter constants
+/// (choreo-ai-protocols) so the daemon's budget can never fall behind the
+/// adapters' retry policy — raising an adapter's attempts or deadline raises
+/// this floor automatically instead of silently discarding a PAID generation
+/// as an outer timeout.
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(
+    (choreo_ai_protocols::images::IMAGE_MAX_ATTEMPTS as u64
+        + choreo_ai_protocols::images::IMAGE_DOWNLOAD_ATTEMPTS as u64)
+        * choreo_ai_protocols::images::IMAGE_TOTAL_TIMEOUT_SECS
+        + IMAGE_TIMEOUT_HEADROOM_SECS,
+);
+
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -253,20 +274,17 @@ pub(crate) fn determine_tool_timeout(name: &str, arguments_json: &str) -> Option
         Duration::from_secs(300)
     } else if name == "generate_image" {
         // Image generation is slow BY PROVIDER CONTRACT, not slow because
-        // the process is stuck: glm-image's `hd` quality renders in ~20 s
-        // per the z.ai docs, but the tool's adapters own a bounded worst
-        // case the generic 60 s default cannot cover without discarding a
-        // PAID-for generation — 2 frugal POST attempts × the 180 s
-        // per-attempt agent deadline (gpt-image high renders minutes-long)
-        // plus the z.ai URL download's own 3-fetch retry budget (bounded by
-        // the same per-attempt deadline via the shared agent). 600 s floors
-        // every adapter's realistic completion path with headroom for the
-        // inter-attempt backoffs; the adapters' internal deadlines guarantee
-        // this time is never unbounded, only "as slow as the provider is
-        // allowed to be". (Timeouts modelling the pathological ceiling
-        // 180×(2+3) = 900 s are not worth the extra spinner-cost for a case
-        // the deployer has already retried out of — see the frugal budget.)
-        Duration::from_secs(600)
+        // the process is stuck: the tool's adapters own a bounded worst case
+        // the generic 60 s default cannot cover without discarding a
+        // PAID-for generation. The floor is derived from the shared adapter
+        // constants — 2 frugal POST attempts × the 180 s per-attempt agent
+        // deadline (gpt-image high renders minutes-long) plus the z.ai URL
+        // download's own 3-fetch retry budget (bounded by the same
+        // per-attempt deadline via the shared agent), with a small headroom
+        // margin for the inter-attempt backoffs. See [`IMAGE_TIMEOUT`]:
+        // because it is computed from the adapters' own budget, an adapter
+        // policy change automatically keeps the outer deadline in sync.
+        IMAGE_TIMEOUT
     } else {
         Duration::from_secs(60)
     };

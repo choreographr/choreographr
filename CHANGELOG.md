@@ -73,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Image-generation provider resolution extracted into `daemon/image_provider.rs` (`choreo-daemon`)**: the `GetImageGenerationProvider` handler and its pure `resolve_image_generation_provider` logic moved out of `daemon.rs` into a dedicated `pub(super)` child module (same pattern as `daemon/subscriber_handlers.rs`); its tests moved from `daemon/tests.rs` into the module's `#[cfg(test)]` block. The reply channel no longer carries `Result<_, String>`: a structured `ImageProviderError` (thiserror; `Locked` / `AccountNotConfigured` / `NoImageBackend` / `NoImageCapableAccount`, re-exported next to `DaemonCommand`) replaces it, preserving the precise guidance wording — the `generate_image` tool maps the error's `Display` text into its `ToolExecError` so the model still sees "keystore is locked — unlock first", the named-account guidance, and the "does not support image generation" slug. `ImageProviderHandle` stays in `providers/mod.rs`, next to the `InferenceProvider` facade it is protocol-erased alongside. No behavior change.
+
 - Image-generation wire-body minimization: `ImageGenerationRequest` now `skip_serializing_if`-omits knobs left at their defaults
   (`auto` size/quality/background, `png` format), so an all-defaults request serializes to just `{model, prompt, n}` —
   image models reached through OpenAI-compatible proxies (imagen, flux, gemini-image) often reject parameters they do not
@@ -190,11 +192,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `generate_image` tool timeout raised from the generic 60 s default to a dedicated 600 s floor: the previous default fired
+- `generate_image` tool timeout raised from the generic 60 s default to a dedicated floor derived from the image adapters' shared
+  retry/deadline constants (`IMAGE_MAX_ATTEMPTS`/`IMAGE_DOWNLOAD_ATTEMPTS`/`IMAGE_TOTAL_TIMEOUT_SECS`, now `pub` in
+  choreo-ai-protocols) plus a 60 s inter-attempt backoff headroom — currently 960 s: the previous default fired
   *while a paid generation was still rendering* (glm-image `hd` is documented at ~20 s but the adapters' bounded worst case —
   2 POST attempts × the 180 s per-attempt deadline plus the z.ai URL download's 3-fetch retry budget — exceeds 60 s), causing
-  the outer wait-loop to kill a generation that was working correctly. 600 s floors every adapter's realistic completion path;
-  the adapters' internal deadlines keep the ceiling bounded.
+  the outer wait-loop to kill a generation that was working correctly. Because the floor is computed from the adapter constants,
+  an adapter retry-policy change automatically keeps the outer deadline in sync; the adapters' internal deadlines keep the
+  ceiling bounded.
 
 - z.ai image download resilience: z.ai's object storage advertises the generated image URL *before* the object is published
   (observed in production — the identical URL served a non-image error page on the first GET and a clean PNG seconds later, with
@@ -567,6 +572,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "account '<name>' is not configured or has no resolved provider" instead of the misleading generic
   "no OpenAI-compatible account is configured", and the no-image-backend error picks its provider slug deterministically
   (sorted-key order) instead of HashMap iteration order.
+
+- **z.ai image error honesty + SSRF hardening (`choreo-ai-protocols` images/, `choreo-proto`):**
+  (1) the CDN download retry loop no longer overloads `EmptyResponse` as "object storage hasn't
+  published the file yet" — a dedicated `NotReady { detail }` variant was added to `ProviderError`
+  and `InferenceError` (metrics label `not_ready`) for the propagation race, and `EmptyResponse`
+  once again means strictly "empty body" (terminal); the retry loop was reshaped to an
+  attempt-counter `loop` so the exhausted-budget fallthrough (and its `unwrap_or` workaround) is
+  gone entirely. (2) A blocked generation no longer fabricates `ClientError { status: 200 }` — a
+  new honest `ContentFiltered { detail }` variant (metrics label `content_filtered`) carries the
+  policy denial with no invented HTTP status. (3) SSRF guard on the CDN download:
+  `is_downloadable_url` (`url`-crate parse, new `choreo-ai-protocols` dependency) rejects
+  IP-literal hosts in loopback/private/link-local/unique-local ranges (incl. IPv4-mapped v6);
+  non-IP provider CDN hostnames are allowed — residual risk documented in code (provider-
+  controlled hostname over an authenticated TLS channel, bytes fully validated downstream).
+  Also hoisted the Zhipu slug allowlist out of the daemon into
+  `images::is_zhipu_image_provider_slug` (the client crate owns provider-family knowledge), and
+  added pure unit tests for the SSRF guard and the `/coding/paas` → `/paas` base rewrite.
 
 ## [0.1.0]
 

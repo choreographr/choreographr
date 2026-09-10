@@ -25,7 +25,11 @@ mod zai;
 /// the connection trickles keep-alive bytes), and — because the agent is
 /// shared with the URL-download path of URL-returning adapters — it also
 /// bounds that post-response fetch.
-pub(crate) const IMAGE_TOTAL_TIMEOUT_SECS: u64 = 180;
+///
+/// `pub` (not `pub(crate)`) because the daemon derives the `generate_image`
+/// tool's outer wait-loop floor from the adapters' bounded worst case — the
+/// adapter budget is the authoritative number and must not be duplicated.
+pub const IMAGE_TOTAL_TIMEOUT_SECS: u64 = 180;
 
 /// Frugal retry budget for image generations: at most 2 attempts.
 ///
@@ -35,7 +39,10 @@ pub(crate) const IMAGE_TOTAL_TIMEOUT_SECS: u64 = 180;
 /// by the shared `retry_decision`) is enough to ride out a blip; anything
 /// beyond that should surface as an error so the caller can decide, rather
 /// than silently doubling an already-long wait.
-pub(crate) const IMAGE_MAX_ATTEMPTS: u32 = 2;
+///
+/// `pub` so the daemon can derive the `generate_image` tool deadline from
+/// the adapters' worst case (see [`IMAGE_TOTAL_TIMEOUT_SECS`]).
+pub const IMAGE_MAX_ATTEMPTS: u32 = 2;
 
 /// Cap on downloaded image bytes for adapters whose provider returns a
 /// temporary URL instead of inline bytes (z.ai: the URL is a CDN link that
@@ -57,10 +64,30 @@ pub(crate) const IMAGE_DOWNLOAD_CAP_BYTES: usize = 8 * 1024 * 1024;
 /// between them ride that race out well inside the 180 s per-attempt
 /// deadline; the whole download is bounded by deadline × attempts, still
 /// leaving the heavy cost share to the generation POST itself.
-pub(crate) const IMAGE_DOWNLOAD_ATTEMPTS: u32 = 3;
+///
+/// `pub` so the daemon can derive the `generate_image` tool deadline from
+/// the adapters' worst case (see [`IMAGE_TOTAL_TIMEOUT_SECS`]).
+pub const IMAGE_DOWNLOAD_ATTEMPTS: u32 = 3;
 
 pub use openai::OpenAiImageClient;
 pub use zai::ZaiImageClient;
+
+/// Whether a catalog provider slug is one of the two Zhipu image-provider
+/// slugs the daemon must route to the dedicated [`ZaiImageClient`]:
+///
+/// - `"zai"` — the z.ai coding gateway (`https://api.z.ai/api/coding/paas/v4`),
+///   whose chat base carries the `/coding` plan segment the image adapter
+///   rewrites to the plain PaaS base;
+/// - `"zhipuai"` — the mainland bigmodel endpoint
+///   (`https://open.bigmodel.cn/api/paas/v4`), already at the plain PaaS base.
+///
+/// Both serve the same URL-returning glm-image Images contract (see the
+/// module docs on [`ZaiImageClient`]); every other slug uses the generic
+/// [`OpenAiImageClient`]. The client crate owns this knowledge so the
+/// daemon's dispatch does not hardcode provider-family facts.
+pub fn is_zhipu_image_provider_slug(slug: &str) -> bool {
+    matches!(slug, "zai" | "zhipuai")
+}
 
 use choreo_proto::InferenceError;
 use serde::{Deserialize, Serialize};
@@ -266,4 +293,35 @@ pub trait ImageGenerationClient: std::fmt::Debug + Send + Sync {
         req: &ImageGenerationRequest,
         cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     ) -> Result<ImageGenerationResult, InferenceError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_zhipu_image_provider_slug;
+
+    #[test]
+    fn zhipu_slug_allowlist_is_exact() {
+        // Exactly the two documented Zhipu slugs route to the dedicated
+        // ZaiImageClient; near-misses and other families must not.
+        for slug in ["zai", "zhipuai"] {
+            assert!(
+                is_zhipu_image_provider_slug(slug),
+                "{slug} must be a Zhipu image-provider slug"
+            );
+        }
+        for slug in [
+            "zai-future",
+            "za",
+            "openai",
+            "anthropic",
+            "zhipu",
+            "",
+            "ZAI",
+        ] {
+            assert!(
+                !is_zhipu_image_provider_slug(slug),
+                "{slug:?} must NOT be a Zhipu image-provider slug"
+            );
+        }
+    }
 }

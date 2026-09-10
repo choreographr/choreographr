@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
+/// `pub(super)` so the sibling `daemon::image_provider` test module can
+/// build a fresh locked state without duplicating the constructor.
+pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
     let (daemon_tx, daemon_rx) = mpsc::channel();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
@@ -3352,125 +3354,4 @@ fn add_credential_on_bound_keystore_rejects_wrong_key_blob() {
     );
     assert!(db::get_all_credential_blobs(&state.db).unwrap().is_empty());
     assert!(state.locked);
-}
-
-// ---------------------------------------------------------------------------
-// GetImageGenerationProvider — image handle resolution
-// ---------------------------------------------------------------------------
-
-/// Send a `GetImageGenerationProvider` command and wait for the crossbeam
-/// reply (the same channel shape the tool thread will use in production).
-fn send_get_image_provider(
-    state: &mut DaemonState,
-    account_name: Option<String>,
-) -> Result<crate::providers::ImageProviderHandle, String> {
-    let (reply, rx) = crossbeam_channel::unbounded();
-    state.handle_command(DaemonCommand::GetImageGenerationProvider {
-        account_name,
-        reply,
-    });
-    rx.recv().unwrap()
-}
-
-#[test]
-fn get_image_provider_locked_keystore_errors_with_unlock_guidance() {
-    let (mut state, _rx) = make_daemon_state();
-    // A fresh test state starts locked with an empty providers map — the
-    // exact shape /lock leaves behind.
-    let err = send_get_image_provider(&mut state, None).unwrap_err();
-    assert!(
-        err.contains("keystore is locked"),
-        "unlock guidance expected, got: {err}"
-    );
-}
-
-#[test]
-fn get_image_provider_named_account_without_image_backend_names_slug() {
-    let (mut state, _rx) = make_daemon_state();
-    // An Anthropic-protocol provider has no image backend in v1.
-    let cfg = AccountConfig::simple("claude", "anthropic");
-    let provider = InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap();
-    state.providers.insert("claude".into(), provider);
-
-    let err = send_get_image_provider(&mut state, Some("claude".into())).unwrap_err();
-    assert!(
-        err.contains("anthropic") && err.contains("does not support image generation"),
-        "error must name the provider slug, got: {err}"
-    );
-}
-
-#[test]
-fn get_image_provider_unknown_named_account_names_the_account() {
-    let (mut state, _rx) = make_daemon_state();
-    // A resolved map that does NOT contain the requested name: the error must
-    // name the account, not the generic "no account is configured" (which
-    // would misdiagnose a typo / wrong session account).
-    let cfg = AccountConfig::simple("openai", "openai");
-    state.providers.insert(
-        "openai".into(),
-        InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap(),
-    );
-
-    let err = send_get_image_provider(&mut state, Some("oepnai".into())).unwrap_err();
-    assert!(
-        err.contains("account 'oepnai' is not configured"),
-        "error must name the missing account, got: {err}"
-    );
-}
-
-#[test]
-fn get_image_provider_happy_path_returns_handle_with_working_client() {
-    let (mut state, _rx) = make_daemon_state();
-    // A real OpenAI-protocol account with a fake api key — resolves through
-    // the same `from_account_config` path production uses.
-    let cfg = AccountConfig::simple("openai", "openai");
-    let provider = InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap();
-    state.providers.insert("openai".into(), provider);
-
-    let handle = send_get_image_provider(&mut state, Some("openai".into())).unwrap();
-    // The slug is the catalog slug, and the client is a working
-    // `ImageGenerationClient` — its own provider_slug answers.
-    assert_eq!(handle.slug, "openai");
-    assert_eq!(handle.client.provider_slug(), "openai");
-}
-
-#[test]
-fn get_image_provider_default_selection_picks_image_capable_account() {
-    let (mut state, _rx) = make_daemon_state();
-    // One Anthropic provider (no backend) and one OpenAI provider (backend):
-    // `account_name: None` must deterministically pick the image-capable one.
-    let claude = AccountConfig::simple("claude", "anthropic");
-    let openai = AccountConfig::simple("openai", "openai");
-    state.providers.insert(
-        "claude".into(),
-        InferenceProvider::from_account_config(&claude, Some("test-key".into())).unwrap(),
-    );
-    state.providers.insert(
-        "openai".into(),
-        InferenceProvider::from_account_config(&openai, Some("test-key".into())).unwrap(),
-    );
-
-    let handle = send_get_image_provider(&mut state, None).unwrap();
-    assert_eq!(handle.slug, "openai");
-    assert_eq!(handle.client.provider_slug(), "openai");
-}
-
-#[test]
-fn get_image_provider_revoked_after_lock() {
-    let (mut state, _rx) = make_daemon_state();
-    let cfg = AccountConfig::simple("openai", "openai");
-    let provider = InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap();
-    state.providers.insert("openai".into(), provider);
-    assert!(send_get_image_provider(&mut state, Some("openai".into())).is_ok());
-
-    // Simulate /lock: the handler clears the providers map. A handle resolved
-    // BEFORE the clear stays alive in the tool's hands (the Arc is valid),
-    // but no NEW handle can be resolved — the revocation contract.
-    state.providers.clear();
-
-    let err = send_get_image_provider(&mut state, Some("openai".into())).unwrap_err();
-    assert!(
-        err.contains("keystore is locked"),
-        "post-lock resolution must fail with unlock guidance, got: {err}"
-    );
 }

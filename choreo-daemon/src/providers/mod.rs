@@ -147,7 +147,10 @@ impl InferenceProvider {
                 // coding base to the plain PaaS-v4 base, so both slugs share
                 // one adapter with one documented endpoint convention.
                 let image_client: Arc<dyn ImageGenerationClient> =
-                    if matches!(entry.slug.as_str(), "zai" | "zhipuai") {
+                    // The client crate owns the provider-family knowledge
+                    // (which slugs speak the Zhipu Images contract) — see
+                    // images::is_zhipu_image_provider_slug's doc comment.
+                    if choreo_ai_protocols::images::is_zhipu_image_provider_slug(&entry.slug) {
                         Arc::new(ZaiImageClient::new(svc_config, key))
                     } else {
                         Arc::new(OpenAiImageClient::new(svc_config, key))

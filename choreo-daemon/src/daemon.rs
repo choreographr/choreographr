@@ -4,6 +4,11 @@ use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshReque
 use crate::db::{self, SessionRecord};
 use crate::mcp::McpManager;
 use crate::providers::{ImageProviderHandle, InferenceProvider};
+
+// Re-export the image-resolution error type next to the DaemonCommand that
+// carries it, so senders of `GetImageGenerationProvider` can name the reply
+// error without reaching into the private child module.
+pub use self::image_provider::ImageProviderError;
 use crate::sessions::{
     ActiveSessionEntry, CANCEL_ALL, RequestContext, SessionCommand, SessionMetadata, session_main,
 };
@@ -27,6 +32,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
+mod image_provider;
 mod open;
 mod subscriber_handlers;
 
@@ -414,7 +420,7 @@ pub enum DaemonCommand {
         /// Explicit account to use; `None` selects deterministically among
         /// the image-capable resolved providers (sorted by account name).
         account_name: Option<String>,
-        reply: crossbeam_channel::Sender<Result<ImageProviderHandle, String>>,
+        reply: crossbeam_channel::Sender<Result<ImageProviderHandle, ImageProviderError>>,
     },
     AccountExists {
         name: String,
@@ -2539,131 +2545,6 @@ impl DaemonState {
         reply: std::sync::mpsc::Sender<Option<InferenceProvider>>,
     ) {
         let _ = reply.send(self.providers.get(&account).cloned());
-    }
-
-    /// Resolve an image-generation handle for a tool thread.
-    ///
-    /// Resolution order mirrors `handle_list_models_inner`: an explicit
-    /// account name wins; `None` falls through to the only/default account —
-    /// there is no persistent "default account" concept in `DaemonState`, so
-    /// the deterministic pick is the FIRST image-capable provider in
-    /// sorted-key order (sorted, not map order, so the answer does not depend
-    /// on HashMap iteration noise).
-    ///
-    /// Every path replies over the caller's crossbeam channel — never the
-    /// broadcast machinery — and logs the outcome so a misconfigured tool
-    /// call leaves a trace in the daemon log.
-    fn handle_get_image_generation_provider(
-        &self,
-        account_name: Option<String>,
-        reply: crossbeam_channel::Sender<Result<ImageProviderHandle, String>>,
-    ) {
-        let result = self.resolve_image_generation_provider(account_name.as_deref());
-        match &result {
-            Ok(handle) => {
-                info!(
-                    account = ?account_name,
-                    slug = %handle.slug,
-                    "resolved image-generation provider"
-                );
-            }
-            Err(msg) => {
-                warn!(
-                    account = ?account_name,
-                    error = %msg,
-                    "image-generation provider resolution failed"
-                );
-            }
-        }
-        // Best-effort send: a dropped receiver (tool cancelled mid-call) must
-        // not panic the command loop.
-        let _ = reply.send(result);
-    }
-
-    /// Pure resolution logic for [`Self::handle_get_image_generation_provider`],
-    /// split out so the error precedence (lock → no match → no backend) is
-    /// unit-testable without threading a channel through the test.
-    fn resolve_image_generation_provider(
-        &self,
-        account_name: Option<&str>,
-    ) -> Result<ImageProviderHandle, String> {
-        // `providers` is wiped by /lock (`providers.clear()`), so an empty map
-        // here means the keystore is locked (or no credential has ever been
-        // stored) — lock revocation of a previously returned handle falls out
-        // of the SAME clear: the client Arc already handed out stays valid
-        // until the tool drops it, but no NEW handle can be resolved, which
-        // is the contract the tool checks per call.
-        if self.providers.is_empty() {
-            return Err("keystore is locked — unlock first".to_string());
-        }
-
-        match account_name {
-            Some(name) => {
-                let provider = self.providers.get(name).ok_or_else(|| {
-                    // Name the missing account explicitly — a generic "no
-                    // account is configured" here would misdiagnose the
-                    // (common) typo/wrong-session-account case, since the
-                    // map is demonstrably non-empty at this point.
-                    format!(
-                        "account '{name}' is not configured or has no resolved provider — \
-                         add it and set it on the session"
-                    )
-                })?;
-                let client = provider.image_client().ok_or_else(|| {
-                    format!(
-                        "provider '{}' does not support image generation",
-                        provider.provider_slug()
-                    )
-                })?;
-                Ok(ImageProviderHandle {
-                    slug: provider.provider_slug().to_string(),
-                    client,
-                })
-            }
-            None => {
-                // Deterministic default: lowest account name that has an
-                // image backend. HashMap order is not stable between runs, so
-                // sorting keeps "only one image-capable account" unambiguous
-                // and repeatable.
-                let best = self
-                    .providers
-                    .iter()
-                    .filter(|(_, p)| p.image_client().is_some())
-                    .min_by(|(a, _), (b, _)| a.cmp(b));
-                match best {
-                    Some((_, provider)) => {
-                        let client = provider
-                            .image_client()
-                            // Just filtered for Some — a None here would mean
-                            // a broken `image_client()`; degrade to an error,
-                            // never panic.
-                            .ok_or_else(|| {
-                                "provider lost its image backend during resolution".to_string()
-                            })?;
-                        Ok(ImageProviderHandle {
-                            slug: provider.provider_slug().to_string(),
-                            client,
-                        })
-                    }
-                    // Unlocked but every resolved provider is a protocol with
-                    // no image backend (Anthropic/Gemini) — surface a slug so
-                    // the message names an actual blocker. `min_by` over the
-                    // sorted keys keeps the picked slug deterministic, unlike
-                    // HashMap `values().next()` iteration order.
-                    None => {
-                        let slug = self
-                            .providers
-                            .iter()
-                            .min_by(|(a, _), (b, _)| a.cmp(b))
-                            .map(|(_, p)| p.provider_slug().to_string())
-                            .unwrap_or_default();
-                        Err(format!(
-                            "provider '{slug}' does not support image generation"
-                        ))
-                    }
-                }
-            }
-        }
     }
 
     /// Check whether an account with the given name exists.
