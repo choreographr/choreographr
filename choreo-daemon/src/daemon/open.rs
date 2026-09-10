@@ -169,6 +169,10 @@ impl DaemonState {
             children: HashMap::new(),
             accounts,
             providers: HashMap::new(),
+            // ONE registry for the whole daemon lifetime: every provider
+            // client and the cancel/suspend handlers share this Arc, so
+            // `shutdown_all` covers all provider sockets process-wide.
+            socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
             credentials: HashMap::new(),
             x_credentials: None,
             // The daemon starts locked: credentials are only decrypted into

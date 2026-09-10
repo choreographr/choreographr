@@ -419,7 +419,12 @@ fn config_context_window_for_model_resolves_per_model() {
     ]
     .into();
     cfg.context_window_config.context_window = Some(100_000);
-    let client = AnthropicClient::new(cfg, "test-key".into()).unwrap();
+    let client = AnthropicClient::new(
+        cfg,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .unwrap();
     // Exact model match takes precedence
     assert_eq!(
         client.context_window_for_model("claude-sonnet-4-20250514"),

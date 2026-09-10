@@ -7,8 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New `choreo-power-events` leaf crate: platform suspend/resume notifications
+  as crossbeam channel events for the daemon's command loop. `PowerMonitor`
+  spawns a dedicated, daemon-like monitor thread and exposes
+  `SuspendEvent::{Sleep, Wake}` on `events()` (Sleep sent BEFORE the machine
+  sleeps, Wake after resume). Linux subscribes to systemd-logind's
+  `PrepareForSleep` via zbus 5.19's blocking façade (`blocking-api` +
+  `async-io` features — no tokio; the async→sync bridge lives entirely on
+  the monitor thread); macOS uses `IORegisterForSystemPower` + CFRunLoop and
+  always acknowledges sleep with `IOAllowPowerChange` (declining would block
+  system sleep); Windows/other platforms and best-effort fallbacks get an
+  inert monitor (`is_active() == false`, never-firing receiver). Events are
+  explicitly best-effort — kernel-level dead-link detection (sockreg TCP
+  keepalives) remains the correctness fallback. `PowerMonitor::new` is the
+  strict constructor, `best_effort()` logs once and falls back, `inert()`
+  builds the no-op monitor directly.
+- New `choreo-sockreg` leaf crate: a cloneable `SocketRegistry` that tracks
+  live sockets (by duplicate fd) so a control thread can `shutdown_all()` them
+  out from under blocked readers, `prune_dead()` liveness probing (the same
+  non-blocking peek technique ureq's socket transport uses), `SocketTuning`
+  TCP keepalive options (idle 45s / interval 10s / 5 probes / Linux
+  `TCP_USER_TIMEOUT` 30s) applied after connect, and — behind the optional
+  `ureq` feature — a `RegisteringTcpConnector` for `Agent::with_parts` that
+  dials TCP, tunes keepalives, and registers every connection it opens. Real
+  functionality is Unix-only via `nix` (socket/net/fs features); Windows
+  compiles with logged no-ops (Winsock shutdown is a planned follow-up).
+- Daemon power-event handling: `DaemonState` handles a new
+  `DaemonCommand::PowerEvent(SuspendEvent)` — `start_daemon_core` builds a
+  `PowerMonitor::best_effort()` and a forwarder thread translates each
+  suspend/wake event into that command; on `Sleep` the command loop
+  force-closes the daemon-wide socket registry ("machine sleeping:
+  force-closing N provider sockets"), on `Wake` it logs only (kernel
+  keepalive tuning catches stragglers).
+- Forced socket close on cancel: user cancellation (`handle_cancel_request`
+  in the daemon command loop, and the `select_biased!` cancel arm of the
+  request worker's concurrent tool-batch loop) calls
+  `SocketRegistry::shutdown_all()` after the cooperative flag is set, with an
+  info log ("request cancelled: force-closing provider sockets to unblock any
+  wedged reader") — organic provider IO errors deliberately do NOT trigger a
+  shutdown. Pinned by new unit tests (sleep force-closes, wake untouched) and
+  the `#[ignore]` integration test `tests/cancel_force_close.rs` (a stalling
+  SSE provider + real daemon: mid-stream cancel finishes promptly via the
+  registry force-close).
+
 ### Changed
 
+- Provider HTTP clients (`choreo-ai-protocols`) now build their ureq agents
+  through a registry-registered connector chain: `build_agent` replaces
+  ureq's plain TCP stage with choreo-sockreg's `RegisteringTcpConnector`
+  (chain: `ConnectProxyConnector` → `RegisteringTcpConnector` →
+  `RustlsConnector`, mirroring ureq 3.4's `DefaultConnector` for our feature
+  set), so every provider HTTP connection is keepalive-tuned and tracked in a
+  `SocketRegistry` for force-closing hung connections. All client
+  constructors (`OpenAiClient`, `AnthropicClient`, `GoogleClient`,
+  `OpenAiImageClient`, `ZaiImageClient`) now take the registry explicitly.
+- **One daemon-wide socket registry**: `InferenceProvider::from_account_config`
+  now takes the registry handle, and `DaemonState` holds a single
+  `Arc<SocketRegistry>` created at startup (`DaemonState::open`) that every
+  account's provider clients share (replacing the per-account registries),
+  threaded to the request workers via the new `RequestContext::socket_registry`.
 - Repinned the `zai` provider to z.ai's documented standard PaaS gateway
   (`https://api.z.ai/api/paas/v4`, per docs.z.ai) instead of the Coding-Plan
   gateway (`/api/coding/paas/v4`); z.ai's single API key type works on both,

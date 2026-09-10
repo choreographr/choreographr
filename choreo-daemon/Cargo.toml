@@ -79,6 +79,7 @@ choreo-sanitize.workspace = true
 choreo-image.workspace = true
 choreo-transport.workspace = true
 choreo-ai-protocols.workspace = true
+choreo-power-events.workspace = true
 signal-hook.workspace = true
 notify.workspace = true
 toml.workspace = true

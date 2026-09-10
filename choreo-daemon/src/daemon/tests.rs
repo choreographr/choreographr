@@ -25,6 +25,9 @@ pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>
         children: HashMap::new(),
         accounts: AccountManager::load(&accounts_path).unwrap(),
         providers: HashMap::new(),
+        // Fresh empty registry per test state — no provider sockets exist in
+        // unit tests, so the shared-handle semantics are inert here.
+        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
         credentials: HashMap::new(),
         x_credentials: None,
         // Test states start locked, matching the production daemon.
@@ -46,6 +49,58 @@ pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>
         catalog_paths: CatalogPaths::default(),
     };
     (state, daemon_rx)
+}
+
+/// `handle_suspend_event` is the power-event policy: SuspendEvent::Sleep
+/// must force-close every registered provider socket (observable as EOF on
+/// the peer end of a registered duplicate fd), Wake must leave the registry
+/// untouched.
+mod suspend_tests {
+    use super::*;
+    use choreo_ai_protocols::SocketRegistry;
+    use std::os::unix::net::UnixStream;
+
+    /// Register a duplicate of `a` (the registry TAKES ownership) and return
+    /// the peer end `b` so the test can observe the shutdown from the other
+    /// side of the socket — the same technique as sockreg's own tests.
+    fn registered_pair(registry: &SocketRegistry) -> UnixStream {
+        let (a, b) = UnixStream::pair().unwrap();
+        let dup = a.try_clone().unwrap();
+        registry.register(dup);
+        // Drop our handle to `a`: the registry's duplicate is now the only
+        // owner besides the kernel peer, so a clean EOF is unambiguous.
+        drop(a);
+        b
+    }
+
+    #[test]
+    fn sleep_force_closes_registered_sockets() {
+        let registry = SocketRegistry::new();
+        let mut peer = registered_pair(&registry);
+        assert_eq!(registry.registered_count(), 1);
+
+        handle_suspend_event(&SuspendEvent::Sleep, &registry);
+
+        // The registry cleared its list (shutdown_all closes each fd).
+        assert_eq!(registry.registered_count(), 0);
+        // The peer observes the closure as EOF — a blocked provider reader
+        // would return instead of waiting for the request timeout.
+        let mut buf = [0u8; 1];
+        let n = std::io::Read::read(&mut peer, &mut buf).unwrap();
+        assert_eq!(n, 0, "peer must see EOF after sleep force-close");
+    }
+
+    #[test]
+    fn wake_leaves_registry_untouched() {
+        let registry = SocketRegistry::new();
+        let _peer = registered_pair(&registry);
+
+        handle_suspend_event(&SuspendEvent::Wake, &registry);
+
+        // Wake is log-only: nothing registered may be disturbed, because
+        // (unlike at sleep) fresh connections can legitimately exist.
+        assert_eq!(registry.registered_count(), 1);
+    }
 }
 
 #[test]

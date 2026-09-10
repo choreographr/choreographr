@@ -65,6 +65,8 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         children: HashMap::new(),
         accounts: AccountManager::load(&accounts_path).unwrap(),
         providers: HashMap::new(),
+        // Fresh empty registry per test daemon (see DaemonState docs).
+        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
         credentials: HashMap::new(),
         x_credentials: None,
         // Test daemons start locked, matching the production daemon.

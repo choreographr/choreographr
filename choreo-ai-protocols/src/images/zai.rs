@@ -15,6 +15,7 @@
 //! key to a third-party CDN host would leak the credential to a provider the
 //! account never agreed to authenticate against.
 
+use crate::SocketRegistry;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use choreo_proto::InferenceError;
@@ -182,8 +183,9 @@ impl ZaiImageClient {
     /// The agent is built with the image attempt deadline (see
     /// [`IMAGE_TOTAL_TIMEOUT_SECS`]) rather than the chat config's total
     /// timeout — same override pattern as [`super::OpenAiImageClient::new`].
-    pub fn new(mut config: ServiceConfig, api_key: String) -> Self {
+    pub fn new(mut config: ServiceConfig, api_key: String, registry: &SocketRegistry) -> Self {
         let http = crate::shared::build_agent(
+            registry,
             config.connect_timeout_secs,
             // Idle-read timeout: a generation can be silent for a long time,
             // so the idle bound must not be tighter than the wall-clock
@@ -722,7 +724,8 @@ mod tests {
                         base_url: base.to_string(),
                         ..Default::default()
                     },
-                    "k".to_string()
+                    "k".to_string(),
+                    &choreo_ai_protocols::SocketRegistry::new()
                 )
                 .host_guard_relaxed(),
                 "{base} must relax the host guard"
@@ -739,7 +742,8 @@ mod tests {
                         base_url: base.to_string(),
                         ..Default::default()
                     },
-                    "k".to_string()
+                    "k".to_string(),
+                    &choreo_ai_protocols::SocketRegistry::new()
                 )
                 .host_guard_relaxed(),
                 "{base} must NOT relax the host guard"

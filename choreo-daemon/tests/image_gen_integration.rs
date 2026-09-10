@@ -78,6 +78,7 @@ fn generate_image_end_to_end_against_mock_server() {
             ..Default::default()
         },
         "sk-test".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
     );
     let handle = ImageProviderHandle {
         slug: "openai".to_string(),

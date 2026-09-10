@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 use serde::{Deserialize, Serialize};
 
+use crate::SocketRegistry;
 use crate::openai::{ChatImagePart, ChatRequestMessage, ChatToolDefinition};
 use crate::overrides::ProviderOverrides;
 use crate::types::{
@@ -122,8 +123,13 @@ impl std::fmt::Debug for GoogleClient {
 }
 
 impl GoogleClient {
-    pub fn new(config: GoogleConfig, api_key: String) -> io::Result<Self> {
+    pub fn new(
+        config: GoogleConfig,
+        api_key: String,
+        registry: &SocketRegistry,
+    ) -> io::Result<Self> {
         let http = crate::shared::build_agent(
+            registry,
             config.connect_timeout_secs,
             config.request_timeout_secs,
             config.total_timeout_secs,

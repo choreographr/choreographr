@@ -213,8 +213,12 @@ mod tests {
         let (mut state, _rx) = make_daemon_state();
         // An Anthropic-protocol provider has no image backend in v1.
         let cfg = AccountConfig::simple("claude", "anthropic");
-        let provider =
-            InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap();
+        let provider = InferenceProvider::from_account_config(
+            &cfg,
+            Some("test-key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap();
         state.providers.insert("claude".into(), provider);
 
         let err = send_get_image_provider(&mut state, Some("claude".into())).unwrap_err();
@@ -233,7 +237,12 @@ mod tests {
         let cfg = AccountConfig::simple("openai", "openai");
         state.providers.insert(
             "openai".into(),
-            InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap(),
+            InferenceProvider::from_account_config(
+                &cfg,
+                Some("test-key".into()),
+                &choreo_ai_protocols::SocketRegistry::new(),
+            )
+            .unwrap(),
         );
 
         let err = send_get_image_provider(&mut state, Some("oepnai".into())).unwrap_err();
@@ -252,8 +261,12 @@ mod tests {
         // A real OpenAI-protocol account with a fake api key — resolves
         // through the same `from_account_config` path production uses.
         let cfg = AccountConfig::simple("openai", "openai");
-        let provider =
-            InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap();
+        let provider = InferenceProvider::from_account_config(
+            &cfg,
+            Some("test-key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap();
         state.providers.insert("openai".into(), provider);
 
         let handle = send_get_image_provider(&mut state, Some("openai".into())).unwrap();
@@ -273,11 +286,21 @@ mod tests {
         let openai = AccountConfig::simple("openai", "openai");
         state.providers.insert(
             "claude".into(),
-            InferenceProvider::from_account_config(&claude, Some("test-key".into())).unwrap(),
+            InferenceProvider::from_account_config(
+                &claude,
+                Some("test-key".into()),
+                &choreo_ai_protocols::SocketRegistry::new(),
+            )
+            .unwrap(),
         );
         state.providers.insert(
             "openai".into(),
-            InferenceProvider::from_account_config(&openai, Some("test-key".into())).unwrap(),
+            InferenceProvider::from_account_config(
+                &openai,
+                Some("test-key".into()),
+                &choreo_ai_protocols::SocketRegistry::new(),
+            )
+            .unwrap(),
         );
 
         let handle = send_get_image_provider(&mut state, None).unwrap();
@@ -289,8 +312,12 @@ mod tests {
     fn get_image_provider_revoked_after_lock() {
         let (mut state, _rx) = make_daemon_state();
         let cfg = AccountConfig::simple("openai", "openai");
-        let provider =
-            InferenceProvider::from_account_config(&cfg, Some("test-key".into())).unwrap();
+        let provider = InferenceProvider::from_account_config(
+            &cfg,
+            Some("test-key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap();
         state.providers.insert("openai".into(), provider);
         assert!(send_get_image_provider(&mut state, Some("openai".into())).is_ok());
 

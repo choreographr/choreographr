@@ -10,6 +10,7 @@ pub use crate::shared::MaxTokensField;
 use crate::types::{ChatTurnResult, StreamEvent};
 use tracing::{debug, warn};
 
+use crate::SocketRegistry;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 
 pub(crate) use config::endpoint_url;
@@ -394,8 +395,13 @@ impl std::fmt::Debug for OpenAiClient {
 }
 
 impl OpenAiClient {
-    pub fn new(config: ServiceConfig, api_key: String) -> io::Result<Self> {
+    pub fn new(
+        config: ServiceConfig,
+        api_key: String,
+        registry: &SocketRegistry,
+    ) -> io::Result<Self> {
         let http = crate::shared::build_agent(
+            registry,
             config.connect_timeout_secs,
             config.request_timeout_secs,
             config.total_timeout_secs,

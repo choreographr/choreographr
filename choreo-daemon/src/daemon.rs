@@ -13,9 +13,11 @@ use crate::sessions::{
     ActiveSessionEntry, CANCEL_ALL, RequestContext, SessionCommand, SessionMetadata, session_main,
 };
 use choreo_ai_protocols::{
-    bundled_overlay_src, catalog_snapshot, lookup_context_window, merge_overlay, replace_catalog,
+    SocketRegistry, bundled_overlay_src, catalog_snapshot, lookup_context_window, merge_overlay,
+    replace_catalog,
 };
 use choreo_keystore::ServiceCredential;
+use choreo_power_events::SuspendEvent;
 use choreo_proto::{
     AccountInfo, CatalogProvider, ContextConfig, DaemonMessage, RefreshStatus, SessionEvent,
     SessionStatus, SessionSummary, TimestampMs, TokenUsage,
@@ -70,6 +72,14 @@ pub struct DaemonState {
     pub children: HashMap<u64, Vec<u64>>,
     pub accounts: AccountManager,
     pub providers: HashMap<String, InferenceProvider>,
+    /// The ONE daemon-wide provider-socket registry, created at startup and
+    /// shared by every `InferenceProvider` client (via
+    /// `InferenceProvider::from_account_config`) and by the request/cancel
+    /// machinery (via `RequestContext::socket_registry`). Cancel and suspend
+    /// handlers call `shutdown_all` on it to un-block worker threads wedged
+    /// in a provider `read()`. Arc-cloned, never mutated after creation —
+    /// the handle is plumbing, not shared mutable state.
+    pub socket_registry: Arc<SocketRegistry>,
     pub credentials: HashMap<String, ServiceCredential>,
     pub x_credentials: Option<ServiceCredential>,
     /// Whether the credential keystore is currently locked (no decrypted
@@ -454,6 +464,15 @@ pub enum DaemonCommand {
         path: PathBuf,
         reply: mpsc::Sender<Result<String, String>>,
     },
+    /// A platform power transition (suspend/wake) detected by the
+    /// `choreo-power-events` monitor. Delivered to the command loop by the
+    /// dedicated forwarder thread (spawned in `start_daemon_core`) rather
+    /// than a `select!` arm: the command channel is a std mpsc receiver, and
+    /// the codebase's established pattern for external event sources
+    /// (config watchers, ACL watcher) is exactly this forwarder-into-
+    /// `DaemonCommand` shape. Same delivery semantics, zero channel-type
+    /// churn across the ~40 existing `DaemonCommand` senders.
+    PowerEvent(SuspendEvent),
     /// Activate tool groups.  Forwarded to the session's main loop, which
     /// applies the change to the authoritative active-group set and replies
     /// with a summary of what changed.
@@ -694,6 +713,7 @@ impl DaemonState {
                 groups,
                 reply,
             } => self.handle_unload_tools(session_id, groups, reply),
+            DaemonCommand::PowerEvent(event) => handle_suspend_event(&event, &self.socket_registry),
             DaemonCommand::Shutdown => {
                 warn!("unexpected Shutdown command in handle_command; handled at loop level");
             }
@@ -728,6 +748,11 @@ impl DaemonState {
         #[cfg(not(feature = "content"))]
         let substrate_credential = None;
 
+        // The daemon-wide provider-socket registry, cloned OUT of `self`
+        // before the `move` closure so the session thread gets its own Arc
+        // handle (the closure must not borrow `self`).
+        let socket_registry = Arc::clone(&self.socket_registry);
+
         // Resolve provider from the session's account name
         let account_name = metadata.account_name.clone();
         let provider = account_name
@@ -754,6 +779,10 @@ impl DaemonState {
                     lag_limits,
                     global_lag,
                     substrate_credential,
+                    // The one daemon-wide provider-socket registry: cancels
+                    // inside the request worker force-close every provider
+                    // socket through it (see requests.rs cancel sites).
+                    socket_registry,
                 },
             );
         });
@@ -809,7 +838,8 @@ impl DaemonState {
     /// Returns `true` if a provider was successfully created and cached.
     fn resolve_account_provider(&mut self, name: &str, api_key: Option<String>) -> bool {
         if let Some(config) = self.accounts.get(name)
-            && let Ok(provider) = InferenceProvider::from_account_config(config, api_key)
+            && let Ok(provider) =
+                InferenceProvider::from_account_config(config, api_key, &self.socket_registry)
         {
             self.providers.insert(name.to_string(), provider);
             true
@@ -1957,6 +1987,23 @@ impl DaemonState {
         // Propagate to children — this runs here in the daemon so that
         // leaf sessions never generate an unnecessary message.
         self.cancel_children_of(session_id);
+
+        // The cancel is DECIDED here (the session worker only observes it),
+        // so this is where the force-close belongs: a streaming inference
+        // read wedged on a half-dead provider connection would otherwise
+        // keep the worker blocked until the request timeout even after the
+        // cooperative cancel flag fired. Shutting the registry's sockets
+        // down makes any blocked read return immediately. Only provider
+        // sockets are affected — client connections and tools are untouched.
+        // The count is logged by `shutdown_all` itself; this line records
+        // the WHY (a user cancel, distinct from suspend or organic IO
+        // errors) so the daemon log stays greppable.
+        info!(
+            session_id,
+            request_id,
+            "request cancelled: force-closing provider sockets to unblock any wedged reader"
+        );
+        self.socket_registry.shutdown_all();
     }
 
     /// Send `Cancel` to every active child session of `parent_id`.
@@ -2855,6 +2902,41 @@ fn send_catalog_reply(reply: Vec<RefreshRequester>, providers: usize, models: us
             models,
             status,
         }));
+    }
+}
+
+/// Handle a platform suspend/wake event on the daemon command loop.
+/// Factored out of `handle_command` so the policy is unit-testable without a
+/// full `DaemonState`.
+///
+/// * `Sleep`: force-close every registered provider socket BEFORE the machine
+///   suspends — the logind event arrives before suspension, so this is the
+///   one window where the closure is proactive rather than reactive. Any
+///   worker blocked in a provider `read()` wakes immediately with an error;
+///   after resume the sockets would be dead anyway (the OS's TCP state is
+///   gone), so nothing is lost.
+/// * `Wake`: log only. Sockets that survived the sleep are dead on resume;
+///   the kernel keepalive tuning from `choreo-sockreg` notices them on the
+///   next use, and clients re-establish connections lazily. No shutdown here:
+///   `shutdown_all` on wake would add nothing (the sleep path already
+///   cleared the registry) and could only disturb fresh connections.
+fn handle_suspend_event(event: &SuspendEvent, registry: &SocketRegistry) {
+    match event {
+        SuspendEvent::Sleep => {
+            // Read the count BEFORE the shutdown consumes the list, so the
+            // log reports what was actually closed.
+            let sockets = registry.registered_count();
+            info!(
+                sockets,
+                "machine sleeping: force-closing {} provider sockets", sockets
+            );
+            registry.shutdown_all();
+        }
+        SuspendEvent::Wake => {
+            // Sockets already dead (closed pre-sleep, or kernel-dead on
+            // resume); keepalive tuning catches any stragglers on next use.
+            info!("machine woke from suspend; provider sockets will be re-established lazily");
+        }
     }
 }
 

@@ -1,7 +1,10 @@
 use std::io;
 
 use choreo_proto::InferenceError;
+use choreo_sockreg::{RegisteringTcpConnector, SocketRegistry};
 use serde::{Deserialize, Serialize};
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::{ConnectProxyConnector, Connector, RustlsConnector};
 
 use crate::types::{ChatTurnResult, StreamEvent};
 
@@ -169,6 +172,7 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
 ///   covers one attempt: each retry restarts the deadline, so retries plus
 ///   their backoff can exceed this value in aggregate.
 pub(crate) fn build_agent(
+    registry: &SocketRegistry,
     connect_timeout_secs: u64,
     read_timeout_secs: u64,
     total_timeout_secs: u64,
@@ -194,7 +198,34 @@ pub(crate) fn build_agent(
     if let Some(ua) = user_agent {
         cfg = cfg.user_agent(ua);
     }
-    ureq::Agent::new_with_config(cfg.build())
+
+    // Connector chain mirroring ureq 3.4's `DefaultConnector` for OUR feature
+    // set (rustls enabled via ureq's default features; `socks-proxy` NOT
+    // enabled anywhere in the workspace, so `SocksConnector` was never part
+    // of the pre-change default chain either — no proxy regression). The only
+    // difference from the default chain is that the plain `TcpConnector`
+    // stage is replaced by `RegisteringTcpConnector`, which dials identically
+    // but additionally applies keepalive tuning and hands a duplicate fd to
+    // the registry so a control thread can force-close hung connections.
+    //
+    // Stage order matches `DefaultConnector::default()`:
+    //   1. `ConnectProxyConnector` — runs FIRST (before TCP, exactly like the
+    //      default): when chained is empty and an HTTP CONNECT proxy is
+    //      configured it dials the proxy itself via ureq's `run_connector`
+    //      and tunnels; otherwise it declines (returns `None`) and the next
+    //      stage dials directly. Passing it through unchanged keeps CONNECT
+    //      proxy support identical to the default agent.
+    //   2. `RegisteringTcpConnector` — the replaced TCP stage. When an
+    //      earlier stage produced a transport (the CONNECT tunnel), it passes
+    //      it through untouched and does NOT register the socket (documented
+    //      in choreo-sockreg: ureq does not expose the proxy connector's fd).
+    //   3. `RustlsConnector` — wraps in TLS for `https`, passes `http`
+    //      through, using the same rustls config ureq's default chain uses.
+    let connector =
+        ().chain(ConnectProxyConnector::default())
+            .chain(RegisteringTcpConnector::new(registry.clone()))
+            .chain(RustlsConnector::default());
+    ureq::Agent::with_parts(cfg.build(), connector, DefaultResolver::default())
 }
 
 /// `x-opencode-client` value sent to the opencode.ai zen/go gateway: names

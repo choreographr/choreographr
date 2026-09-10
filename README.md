@@ -443,6 +443,8 @@ data model.
 | `choreographr` | Workspace root — declares ONLY the daemon binary; `cargo run -p choreographr` / `cargo install choreographr` select it via `default-run`. Workspace `default-members = [".", "choreo-tui"]` keeps a bare `cargo build` at the root producing daemon + TUI exactly as before the binary split |
 | `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
 | `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (208 providers) |
+| `choreo-sockreg` | Leaf crate — live provider-socket registry (force-close + liveness prune) and TCP keepalive tuning; every provider HTTP connection registers here so cancels/suspends can un-block wedged readers |
+| `choreo-power-events` | Leaf crate — platform suspend/wake notifications as crossbeam events (logind on Linux, IOKit on macOS, inert fallback elsewhere); best-effort over sockreg's kernel keepalives |
 | `choreo-blockchain` | Blockchain tools — EVM (alloy) and Substrate/Polkadot (subxt) read-only queries plus the tokio sidecar runtime they run on; pulled in by the daemon's `blockchain` feature (off by default) |
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
 | `choreo-sanitize` | Internal leaf crate — the single source of truth for the Unicode "spoofing" predicates (bidi/ZWSP escaping) and the shared tool-output byte budget + `...[truncated]` marker, used by the daemon, TUI, blockchain tools, and client |

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc;
 use std::thread;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
@@ -65,6 +66,31 @@ pub(crate) struct DaemonCore {
     /// JoinHandle of the command-loop thread; the shutdown drain joins it
     /// after sending `Shutdown` and dropping `daemon_tx`.
     pub cmd_handle: thread::JoinHandle<()>,
+}
+
+/// Dedicated forwarder thread for platform suspend/wake events: blocks on
+/// the power monitor's crossbeam receiver (a dedicated thread blocking in
+/// `recv()` is fine — the house rule only forbids blocking the command loop)
+/// and translates each [`SuspendEvent`] into a [`DaemonCommand::PowerEvent`].
+/// The command loop's policy (force-close on sleep, log on wake) lives in
+/// `handle_suspend_event`; this thread is transport only. Exits when the
+/// command channel closes (daemon shutting down); the power monitor's own
+/// thread is daemon-like and reaps itself when its sender fails.
+fn spawn_power_event_forwarder(
+    daemon_tx: mpsc::Sender<DaemonCommand>,
+    power_rx: crossbeam_channel::Receiver<choreo_power_events::SuspendEvent>,
+) {
+    let _ = thread::Builder::new()
+        .name("power-events".into())
+        .spawn(move || {
+            for event in power_rx.iter() {
+                debug!(?event, "power event received; forwarding to command loop");
+                if daemon_tx.send(DaemonCommand::PowerEvent(event)).is_err() {
+                    info!("daemon command loop gone; stopping power-event forwarder");
+                    break;
+                }
+            }
+        });
 }
 
 /// Assemble the transport-independent daemon core: command channel, ACL
@@ -167,6 +193,19 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> io::Re
         overlay_rx,
     );
     state.maintenance_tx = Some(maintenance_tx);
+
+    // Best-effort platform power monitoring: on Linux this subscribes to
+    // logind's PrepareForSleep (a monitor thread inside choreo-power-events
+    // owns the subscription); on any platform where the notification
+    // mechanism is unavailable it degrades to an inert monitor that logs
+    // once and never fires. Suspend/wake events reach the command loop via
+    // `DaemonCommand::PowerEvent` — the same forwarder-into-command-channel
+    // pattern the config/ACL watchers use — instead of a select! arm on the
+    // command channel (a std mpsc receiver, which crossbeam's select! cannot
+    // accept without converting every DaemonCommand sender).
+    let power_monitor = choreo_power_events::PowerMonitor::best_effort();
+    let power_rx = power_monitor.events().clone();
+    spawn_power_event_forwarder(daemon_tx.clone(), power_rx);
 
     let shutdown = Arc::new(AtomicBool::new(false));
 

@@ -262,6 +262,11 @@ pub struct RequestContext {
     /// Daemon-wide backlog counter, shared with every session thread and the
     /// daemon command loop (the 6th sanctioned shared-state exception).
     pub global_lag: Arc<AtomicUsize>,
+    /// The daemon's ONE provider-socket registry. The request worker calls
+    /// `shutdown_all` on it at the explicit-cancel sites so a streaming
+    /// inference read wedged on a half-dead provider connection un-blocks
+    /// immediately instead of waiting for the request timeout.
+    pub socket_registry: Arc<choreo_ai_protocols::SocketRegistry>,
     /// The daemon's Substrate credential, plumbed to the request worker so the
     /// `content` write tools can build a signing [`ChainAccount`].
     ///

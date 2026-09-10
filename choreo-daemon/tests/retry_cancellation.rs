@@ -98,7 +98,12 @@ fn retry_succeeds_with_callback() {
         streaming: false,
         ..ServiceConfig::default()
     };
-    let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+    let client = OpenAiClient::new(
+        config,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("OpenAiClient");
 
     let call_count = Arc::new(AtomicU32::new(0));
     let count = call_count.clone();
@@ -163,7 +168,12 @@ fn retry_cancelled_during_backoff() {
         streaming: false,
         ..ServiceConfig::default()
     };
-    let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+    let client = OpenAiClient::new(
+        config,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("OpenAiClient");
 
     let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     let messages = [ChatRequestMessage::simple("user", "hello".into())];
@@ -223,7 +233,12 @@ fn hard_rate_limit_fails_without_retrying() {
         streaming: false,
         ..ServiceConfig::default()
     };
-    let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+    let client = OpenAiClient::new(
+        config,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("OpenAiClient");
 
     let call_count = Arc::new(AtomicU32::new(0));
     let count = call_count.clone();
@@ -288,7 +303,12 @@ fn server_503_with_long_retry_after_fails_without_retrying() {
         streaming: false,
         ..ServiceConfig::default()
     };
-    let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+    let client = OpenAiClient::new(
+        config,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("OpenAiClient");
 
     let call_count = Arc::new(AtomicU32::new(0));
     let count = call_count.clone();
@@ -351,7 +371,12 @@ fn retry_after_in_budget_is_honored_on_503() {
         streaming: false,
         ..ServiceConfig::default()
     };
-    let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+    let client = OpenAiClient::new(
+        config,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("OpenAiClient");
 
     let call_count = Arc::new(AtomicU32::new(0));
     let count = call_count.clone();
@@ -459,7 +484,12 @@ fn sse_test_config(port: u16) -> ServiceConfig {
 #[ignore]
 fn streaming_cancelled_during_sse_events() {
     let (port, event_tx, _server) = spawn_sse_server();
-    let client = OpenAiClient::new(sse_test_config(port), "test-key".into()).expect("OpenAiClient");
+    let client = OpenAiClient::new(
+        sse_test_config(port),
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("OpenAiClient");
 
     let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
 
@@ -501,7 +531,12 @@ fn streaming_cancelled_during_sse_events() {
 #[ignore]
 fn streaming_cancelled_before_first_event() {
     let (port, _event_tx, _server) = spawn_sse_server();
-    let client = OpenAiClient::new(sse_test_config(port), "test-key".into()).expect("OpenAiClient");
+    let client = OpenAiClient::new(
+        sse_test_config(port),
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("OpenAiClient");
 
     let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
 

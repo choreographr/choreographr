@@ -176,6 +176,7 @@ fn model_switch_sends_no_reasoning_on_the_wire() {
             ..Default::default()
         },
         "test-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("openai client");
 

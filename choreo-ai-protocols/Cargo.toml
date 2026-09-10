@@ -30,6 +30,11 @@ itertools.workspace = true
 # `inline_data.data` on Google).
 base64.workspace = true
 choreo-proto.workspace = true
+# Keepalive-tuned, registry-registered sockets for every provider HTTP
+# connection: `build_agent` swaps ureq's plain TCP stage for this crate's
+# `RegisteringTcpConnector`, so hung connections can be force-closed. The
+# `ureq` feature is required — `RegisteringTcpConnector` lives behind it.
+choreo-sockreg = { workspace = true, features = ["ureq"] }
 # RFC 7231 Retry-After headers arrive in two forms: delta-seconds (the
 # common one) or an HTTP-date (`Wed, 21 Oct 2015 07:28:00 GMT`).  chrono is
 # already a workspace dependency (daemon + TUI) and parses the strict

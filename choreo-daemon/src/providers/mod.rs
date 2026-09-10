@@ -104,6 +104,12 @@ impl InferenceProvider {
     pub fn from_account_config(
         config: &crate::accounts::AccountConfig,
         api_key: Option<String>,
+        // The daemon-wide registry (one per process, created in
+        // `DaemonState::open`). Every client this account produces registers
+        // its sockets here, so cancel/suspend force-closes reach all of them
+        // — a per-account registry would leave other accounts' wedged
+        // readers blocked, defeating the whole point of `shutdown_all`.
+        registry: &choreo_ai_protocols::SocketRegistry,
     ) -> Result<Self, String> {
         let entry = lookup_provider(&config.provider)
             .ok_or_else(|| format!("unknown provider: {}", config.provider))?;
@@ -124,7 +130,7 @@ impl InferenceProvider {
                 config.apply_overrides(&mut svc_config);
                 let key = api_key
                     .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
-                let client = OpenAiClient::new(svc_config.clone(), key.clone())
+                let client = OpenAiClient::new(svc_config.clone(), key.clone(), registry)
                     .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
                 // Same account, same key, same base_url/user_agent/slug as the
                 // chat client — the image client is built from a clone of the
@@ -151,9 +157,9 @@ impl InferenceProvider {
                     // (which slugs speak the Zhipu Images contract) — see
                     // images::is_zhipu_image_provider_slug's doc comment.
                     if choreo_ai_protocols::images::is_zhipu_image_provider_slug(&entry.slug) {
-                        Arc::new(ZaiImageClient::new(svc_config, key))
+                        Arc::new(ZaiImageClient::new(svc_config, key, registry))
                     } else {
-                        Arc::new(OpenAiImageClient::new(svc_config, key))
+                        Arc::new(OpenAiImageClient::new(svc_config, key, registry))
                     };
                 Ok(Self {
                     client: Arc::new(client),
@@ -175,7 +181,7 @@ impl InferenceProvider {
                 anthro_cfg.user_agent = Some(daemon_user_agent());
                 let overrides = config.provider_overrides();
                 anthro_cfg.apply_overrides(&overrides);
-                let client = AnthropicClient::new(anthro_cfg, key)
+                let client = AnthropicClient::new(anthro_cfg, key, registry)
                     .map_err(|e| format!("failed to create Anthropic client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
@@ -196,7 +202,7 @@ impl InferenceProvider {
                 google_cfg.user_agent = Some(daemon_user_agent());
                 let overrides = config.provider_overrides();
                 google_cfg.apply_overrides(&overrides);
-                let client = GoogleClient::new(google_cfg, key)
+                let client = GoogleClient::new(google_cfg, key, registry)
                     .map_err(|e| format!("failed to create Google client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
@@ -317,7 +323,12 @@ mod tests {
     #[test]
     fn from_openai_constructs_provider() {
         let config = ServiceConfig::default();
-        let client = OpenAiClient::new(config, "test-key".into()).unwrap();
+        let client = OpenAiClient::new(
+            config,
+            "test-key".into(),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap();
         let _provider = InferenceProvider::from_openai(client);
         // Construction succeeds — no panic.
     }
@@ -325,7 +336,12 @@ mod tests {
     #[test]
     fn from_anthropic_constructs_provider() {
         let config = AnthropicConfig::default();
-        let client = AnthropicClient::new(config, "test-key".into()).unwrap();
+        let client = AnthropicClient::new(
+            config,
+            "test-key".into(),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap();
         let _provider = InferenceProvider::from_anthropic(client);
         // Construction succeeds — no panic.
     }
@@ -333,7 +349,12 @@ mod tests {
     #[test]
     fn from_google_constructs_provider() {
         let config = GoogleConfig::default();
-        let client = GoogleClient::new(config, "test-key".into()).unwrap();
+        let client = GoogleClient::new(
+            config,
+            "test-key".into(),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap();
         let _provider = InferenceProvider::from_google(client);
         // Construction succeeds — no panic.
     }
@@ -341,49 +362,81 @@ mod tests {
     #[test]
     fn from_account_config_unknown_provider_errors() {
         let cfg = AccountConfig::simple("unknown", "nonexistent");
-        let err = InferenceProvider::from_account_config(&cfg, Some("key".into())).unwrap_err();
+        let err = InferenceProvider::from_account_config(
+            &cfg,
+            Some("key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap_err();
         assert!(err.contains("unknown provider"), "{err}");
     }
 
     #[test]
     fn from_account_config_anthropic_requires_key() {
         let cfg = AccountConfig::simple("claude", "anthropic");
-        let err = InferenceProvider::from_account_config(&cfg, None).unwrap_err();
+        let err = InferenceProvider::from_account_config(
+            &cfg,
+            None,
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap_err();
         assert!(err.contains("no API key"), "{err}");
     }
 
     #[test]
     fn from_account_config_openai_missing_key_errors() {
         let cfg = AccountConfig::simple("openai", "openai");
-        let err = InferenceProvider::from_account_config(&cfg, None).unwrap_err();
+        let err = InferenceProvider::from_account_config(
+            &cfg,
+            None,
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap_err();
         assert!(err.contains("no API key"), "{err}");
     }
 
     #[test]
     fn from_account_config_openai_succeeds() {
         let cfg = AccountConfig::simple("openai", "openai");
-        let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
+        let result = InferenceProvider::from_account_config(
+            &cfg,
+            Some("key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        );
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
     fn from_account_config_anthropic_succeeds() {
         let cfg = AccountConfig::simple("claude", "anthropic");
-        let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
+        let result = InferenceProvider::from_account_config(
+            &cfg,
+            Some("key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        );
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
     fn from_account_config_google_succeeds() {
         let cfg = AccountConfig::simple("gemini", "google");
-        let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
+        let result = InferenceProvider::from_account_config(
+            &cfg,
+            Some("key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        );
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
     fn from_account_config_google_missing_key_errors() {
         let cfg = AccountConfig::simple("gemini", "google");
-        let err = InferenceProvider::from_account_config(&cfg, None).unwrap_err();
+        let err = InferenceProvider::from_account_config(
+            &cfg,
+            None,
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap_err();
         assert!(err.contains("no API key"), "{err}");
     }
 
@@ -395,8 +448,12 @@ mod tests {
         // OpenAI one. Asserted via the redacted Debug (which names the
         // concrete struct), because the trait object carries no type shape.
         let cfg = AccountConfig::simple("zai", "zai");
-        let provider = InferenceProvider::from_account_config(&cfg, Some("key".into()))
-            .expect("zai account constructs");
+        let provider = InferenceProvider::from_account_config(
+            &cfg,
+            Some("key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .expect("zai account constructs");
         let image_client = provider
             .image_client()
             .expect("OpenAI protocol gets an image client");
@@ -404,8 +461,12 @@ mod tests {
         assert!(debug.starts_with("ZaiImageClient"), "{debug}");
         // Mainland zhipuai resolves to the same Zhipu image adapter.
         let cfg = AccountConfig::simple("zhipu", "zhipuai");
-        let provider = InferenceProvider::from_account_config(&cfg, Some("key".into()))
-            .expect("zhipuai account constructs");
+        let provider = InferenceProvider::from_account_config(
+            &cfg,
+            Some("key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .expect("zhipuai account constructs");
         let debug = format!(
             "{:?}",
             provider.image_client().expect("image client present")
@@ -418,8 +479,12 @@ mod tests {
         // Other OpenAI-protocol providers (and the plain openai slug) must
         // NOT have been switched to the z.ai adapter.
         let cfg = AccountConfig::simple("openai", "openai");
-        let provider = InferenceProvider::from_account_config(&cfg, Some("key".into()))
-            .expect("openai account constructs");
+        let provider = InferenceProvider::from_account_config(
+            &cfg,
+            Some("key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .expect("openai account constructs");
         let debug = format!(
             "{:?}",
             provider.image_client().expect("image client present")
@@ -430,7 +495,12 @@ mod tests {
     #[test]
     fn anthropic_provider_list_models_returns_known() {
         let config = AnthropicConfig::default();
-        let client = AnthropicClient::new(config, "test-key".into()).unwrap();
+        let client = AnthropicClient::new(
+            config,
+            "test-key".into(),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap();
         let provider = InferenceProvider::from_anthropic(client);
         let models = provider.list_models().unwrap();
         assert!(!models.is_empty());
@@ -442,7 +512,12 @@ mod tests {
         let mut cfg = ServiceConfig::default();
         cfg.context_window_config.per_model = [("gpt-4.1-nano".into(), 1_048_576)].into();
         cfg.context_window_config.context_window = Some(128_000);
-        let client = OpenAiClient::new(cfg, "test-key".into()).unwrap();
+        let client = OpenAiClient::new(
+            cfg,
+            "test-key".into(),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap();
         let provider = InferenceProvider::from_openai(client);
         // Per-model from client config
         assert_eq!(
@@ -461,7 +536,12 @@ mod tests {
         // Anthropic provider with default config has no per-model map entries
         // and no global fallback, so it falls back to the catalog.
         let config = AnthropicConfig::default();
-        let client = AnthropicClient::new(config, "test-key".into()).unwrap();
+        let client = AnthropicClient::new(
+            config,
+            "test-key".into(),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .unwrap();
         let provider = InferenceProvider::from_anthropic(client);
         assert_eq!(
             provider.resolve_context_window("claude-sonnet-4-6"),

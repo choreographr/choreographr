@@ -21,7 +21,11 @@ fn client(mock: &MockProvider) -> OpenAiImageClient {
         base_url: mock.base_url("v1"),
         ..Default::default()
     };
-    OpenAiImageClient::new(config, "sk-test".to_string())
+    OpenAiImageClient::new(
+        config,
+        "sk-test".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
 }
 
 fn sample_request() -> ImageGenerationRequest {
@@ -193,9 +197,13 @@ fn rate_limited_with_oversized_retry_after_is_terminal() {
         base_url: format!("http://{addr}/v1"),
         ..Default::default()
     };
-    let err = OpenAiImageClient::new(config, "sk-test".to_string())
-        .generate_image(&sample_request(), None)
-        .expect_err("oversized Retry-After is terminal");
+    let err = OpenAiImageClient::new(
+        config,
+        "sk-test".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .generate_image(&sample_request(), None)
+    .expect_err("oversized Retry-After is terminal");
     assert!(matches!(err, InferenceError::RateLimited { .. }), "{err:?}");
     // Retry-After must survive into the typed error (the Display omits it).
     match err {
@@ -322,7 +330,11 @@ fn zai_client(mock: &MockProvider) -> ZaiImageClient {
         provider_slug: "zai".to_string(),
         ..Default::default()
     };
-    ZaiImageClient::new(config, "zai-key".to_string())
+    ZaiImageClient::new(
+        config,
+        "zai-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
 }
 
 fn zai_sample_request() -> ImageGenerationRequest {
@@ -409,9 +421,13 @@ fn zai_url_download_retries_the_not_yet_published_race() {
         retry_initial_backoff_ms: 0, // no sleeping in tests
         ..Default::default()
     };
-    let result = ZaiImageClient::new(config, "zai-key".to_string())
-        .generate_image(&zai_sample_request(), None)
-        .expect("second CDN fetch resolves the propagation race");
+    let result = ZaiImageClient::new(
+        config,
+        "zai-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .generate_image(&zai_sample_request(), None)
+    .expect("second CDN fetch resolves the propagation race");
 
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -451,9 +467,13 @@ fn zai_url_download_stays_terminal_after_the_retry_budget() {
         retry_initial_backoff_ms: 0, // no sleeping in tests
         ..Default::default()
     };
-    let err = ZaiImageClient::new(config, "zai-key".to_string())
-        .generate_image(&zai_sample_request(), None)
-        .expect_err("all-fetches-racy must be terminal after the download budget");
+    let err = ZaiImageClient::new(
+        config,
+        "zai-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .generate_image(&zai_sample_request(), None)
+    .expect_err("all-fetches-racy must be terminal after the download budget");
     match err {
         // NotReady is the dedicated "CDN answered but not with an image yet"
         // variant — the exhausted download budget surfaces it honestly
@@ -684,6 +704,10 @@ fn zai_defaults_and_trait_accessors() {
         ..Default::default()
     };
     config.total_timeout_secs = 3600;
-    let c = ZaiImageClient::new(config, "k".to_string());
+    let c = ZaiImageClient::new(
+        config,
+        "k".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    );
     assert_eq!(c.config().total_timeout_secs, 180);
 }

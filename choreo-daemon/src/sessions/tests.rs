@@ -321,6 +321,7 @@ fn broadcast_setup() -> (SessionState, RequestContext) {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
+        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     (test_state(), ctx)
 }
@@ -1136,6 +1137,7 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
+        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     let mut state = test_state();
 
@@ -1274,6 +1276,7 @@ fn sync_accumulated_usage_never_regresses_config() {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
+        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     let mut state = test_state();
     let mut shutdown = false;

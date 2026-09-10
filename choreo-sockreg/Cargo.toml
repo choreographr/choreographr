@@ -1,0 +1,35 @@
+[package]
+name = "choreo-sockreg"
+version.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# Pulls in ureq and provides `RegisteringTcpConnector`, a drop-in Connector
+# that dials TCP like ureq's own TcpConnector but also tunes keepalives and
+# registers a duplicate of every live socket in a SocketRegistry.
+ureq = ["dep:ureq"]
+
+[dependencies]
+tracing.workspace = true
+# nix does not build on non-Unix targets at all, so it is target-gated; the
+# non-Unix fallback in this crate is a documented no-op (see lib.rs).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["socket", "net", "fs"] }
+
+[dependencies.ureq]
+workspace = true
+optional = true
+
+# Gated so a plain `cargo test` (no features) never tries to build the ureq
+# integration test against an absent dependency.
+[[test]]
+name = "ureq_connector"
+required-features = ["ureq"]

@@ -121,6 +121,7 @@ fn mock_openai_provider(base_url: String) -> InferenceProvider {
             ..Default::default()
         },
         "test-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("openai client");
     InferenceProvider::from_openai(client)
@@ -157,6 +158,7 @@ fn spawn_session_with_provider(
                 lag_limits: LagLimits::default(),
                 global_lag: Arc::new(AtomicUsize::new(0)),
                 substrate_credential: None,
+                socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
             },
         );
     });

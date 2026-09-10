@@ -371,7 +371,12 @@ fn google_config_context_window_for_model_resolves_per_model() {
     ]
     .into();
     cfg.context_window_config.context_window = Some(128_000);
-    let client = GoogleClient::new(cfg, "test-key".into()).unwrap();
+    let client = GoogleClient::new(
+        cfg,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .unwrap();
     assert_eq!(
         client.context_window_for_model("gemini-2.5-pro-exp-03-25"),
         Some(1_048_576)
@@ -391,7 +396,12 @@ fn google_config_context_window_for_model_resolves_per_model() {
 #[test]
 fn google_client_new() {
     let cfg = GoogleConfig::default();
-    let client = GoogleClient::new(cfg, "test-key".into()).unwrap();
+    let client = GoogleClient::new(
+        cfg,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .unwrap();
     assert_eq!(client.api_key(), "test-key");
     assert_eq!(
         client.config().base_url,
@@ -402,7 +412,12 @@ fn google_client_new() {
 #[test]
 fn google_client_list_models() {
     let cfg = GoogleConfig::default();
-    let client = GoogleClient::new(cfg, "test-key".into()).unwrap();
+    let client = GoogleClient::new(
+        cfg,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .unwrap();
     let models = client.validate_and_list_models().unwrap();
     assert!(!models.is_empty());
     assert!(models.contains(&"gemini-2.5-pro".to_string()));
@@ -669,7 +684,12 @@ fn provider_client_trait_impl() {
     // Verify that GoogleClient implements ProviderClient at compile time.
     fn takes_provider_client(_: &dyn ProviderClient) {}
     let cfg = GoogleConfig::default();
-    let client = GoogleClient::new(cfg, "test-key".into()).unwrap();
+    let client = GoogleClient::new(
+        cfg,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .unwrap();
     takes_provider_client(&client);
     // If we get here, the trait is implemented.
 }

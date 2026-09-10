@@ -157,6 +157,7 @@ fn deepseek_tool_loop_echoes_reasoning_content_verbatim() {
             ..Default::default()
         },
         "test-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("openai client");
 
@@ -303,6 +304,7 @@ fn anthropic_thinking_blocks_echoed_byte_identical() {
             ..Default::default()
         },
         "test-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("anthropic client");
 
@@ -449,6 +451,7 @@ fn gemini_thought_signatures_reemitted() {
             ..Default::default()
         },
         "test-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("google client");
 
@@ -604,6 +607,7 @@ fn responses_chains_reasoning_continuity_via_response_id() {
             ..Default::default()
         },
         "test-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("openai client");
 
@@ -732,6 +736,7 @@ fn chat_turn_request(config: ServiceConfig) -> CapturedRequest {
             ..config
         },
         "test-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("openai client");
 

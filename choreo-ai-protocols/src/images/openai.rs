@@ -7,6 +7,7 @@
 //! legacy `response_format` parameter, so that field is never sent (see the
 //! body builder below for the why).
 
+use crate::SocketRegistry;
 use crate::images::{ImageGenerationClient, ImageGenerationRequest, ImageGenerationResult};
 use crate::openai::endpoint_url;
 use crate::openai::{OpenAiError, ServiceConfig};
@@ -78,8 +79,9 @@ impl OpenAiImageClient {
     /// timeout — the deadline lives on the agent, so
     /// `config.total_timeout_secs` is deliberately overridden here and the
     /// caller's value for that one field is not honored.
-    pub fn new(mut config: ServiceConfig, api_key: String) -> Self {
+    pub fn new(mut config: ServiceConfig, api_key: String, registry: &SocketRegistry) -> Self {
         let http = crate::shared::build_agent(
+            registry,
             config.connect_timeout_secs,
             // Idle-read timeout: a generation can be silent for a long time,
             // so the idle bound must not be tighter than the wall-clock

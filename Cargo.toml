@@ -94,8 +94,10 @@ members = [
     "choreo-keystore",
     "choreo-markdown",
     "choreo-mcp",
+    "choreo-power-events",
     "choreo-proto",
     "choreo-sanitize",
+    "choreo-sockreg",
     "choreo-tui",
     "choreo-gui",
     "choreo-image",
@@ -296,7 +298,9 @@ choreo-client-core = { path = "choreo-client-core", version = "0.1" }
 choreo-content = { path = "choreo-content", version = "0.1" }
 choreo-keystore = { path = "choreo-keystore", version = "0.1" }
 choreo-proto = { path = "choreo-proto", version = "0.1" }
+choreo-power-events = { path = "choreo-power-events", version = "0.1" }
 choreo-sanitize = { path = "choreo-sanitize", version = "0.1" }
+choreo-sockreg = { path = "choreo-sockreg", version = "0.1" }
 choreo-image = { path = "choreo-image", version = "0.1" }
 # Not in [workspace.dependencies]: the root crate is the only consumer, and
 # workspace dependencies cannot be `optional = true` — the feature-gated root

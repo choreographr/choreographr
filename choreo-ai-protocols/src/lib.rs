@@ -63,6 +63,10 @@ pub use images::{
     ImageSize, OpenAiImageClient, OutputFormat, ZaiImageClient,
 };
 pub use openai::{AllowedCaller, OpenAiClient, RequestFormat, ServiceConfig};
+// Re-export so downstream crates (choreo-daemon) can construct/handle the
+// socket registry without taking a direct choreo-sockreg dependency: the
+// registry type is part of this crate's client-construction surface.
+pub use choreo_sockreg::SocketRegistry;
 pub use overrides::ProviderOverrides;
 pub use retry::RetryCallback;
 pub use shared::{MaxTokensField, ProviderError};

@@ -34,6 +34,7 @@ fn spawn_session(
                 lag_limits: LagLimits::default(),
                 global_lag: Arc::new(AtomicUsize::new(0)),
                 substrate_credential: None,
+                socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
             },
         );
     });

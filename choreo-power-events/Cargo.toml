@@ -1,0 +1,40 @@
+[package]
+name = "choreo-power-events"
+version.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true
+# The monitor thread is the single producer; the daemon command loop is the
+# consumer (recv'd inside its `select!`), so crossbeam per AGENTS.md.
+crossbeam-channel.workspace = true
+
+# Linux: systemd-logind's PrepareForSleep signal over D-Bus. default-features =
+# false keeps tokio OUT entirely; "async-io" pulls zbus's own async runtime
+# (async-io/async-executor/async-task/async-lock — all pure-Rust), and
+# "blocking-api" enables the `zbus::blocking` module whose `SignalIterator`
+# internally bridges to async via `block_on` on the calling (monitor) thread —
+# so the crate contains zero tokio code.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+
+# macOS: IOKit power-management notifications. io-kit-sys 0.5 links the IOKit
+# framework (its build.rs emits `cargo:rustc-link-lib=framework=IOKit`) but
+# does NOT export the IOPMLib symbols we need (IORegisterForSystemPower /
+# IOAllowPowerChange), so those two are extern-declared in platform/macos.rs —
+# this dependency is still what brings the framework linkage and the
+# io_object_t / IOServiceInterestCallback types. core-foundation provides the
+# CFRunLoop wrapper; core-foundation-sys is needed directly for
+# CFRunLoopSourceRef and kCFRunLoopCommonModes.
+[target.'cfg(target_os = "macos")'.dependencies]
+io-kit-sys = "0.5"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"

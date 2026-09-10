@@ -1476,6 +1476,7 @@ fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
+        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     let mut session = SessionState::empty();
     let (turn_id, _) = session.start_turn(Some("hello".into()));
@@ -1540,6 +1541,7 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
+        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     let provider = make_failing_provider();
     let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
@@ -1614,7 +1616,12 @@ fn resolve_reasoning_effort_unknown_provider_disables() {
 #[test]
 fn resolve_reasoning_effort_openai_supported_model_preserves() {
     let config = choreo_ai_protocols::openai::ServiceConfig::default();
-    let client = choreo_ai_protocols::openai::OpenAiClient::new(config, "test-key".into()).unwrap();
+    let client = choreo_ai_protocols::openai::OpenAiClient::new(
+        config,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .unwrap();
     let provider = InferenceProvider::from_openai(client);
 
     let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, "high");
@@ -1624,7 +1631,12 @@ fn resolve_reasoning_effort_openai_supported_model_preserves() {
 #[test]
 fn resolve_reasoning_effort_openai_unsupported_model_disables() {
     let config = choreo_ai_protocols::openai::ServiceConfig::default();
-    let client = choreo_ai_protocols::openai::OpenAiClient::new(config, "test-key".into()).unwrap();
+    let client = choreo_ai_protocols::openai::OpenAiClient::new(
+        config,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .unwrap();
     let provider = InferenceProvider::from_openai(client);
 
     let result = resolve_reasoning_effort(&provider, "gpt-4.1", 1, 0, "medium");
@@ -1897,6 +1909,7 @@ fn run_exec_tool(
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
+        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     let (result, cancelled, _image) = execute_tool_with_timeout(
         &tool_call,
