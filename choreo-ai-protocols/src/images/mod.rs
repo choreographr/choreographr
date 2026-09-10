@@ -75,9 +75,11 @@ pub use zai::ZaiImageClient;
 /// Whether a catalog provider slug is one of the two Zhipu image-provider
 /// slugs the daemon must route to the dedicated [`ZaiImageClient`]:
 ///
-/// - `"zai"` — the z.ai coding gateway (`https://api.z.ai/api/coding/paas/v4`),
-///   whose chat base carries the `/coding` plan segment the image adapter
-///   rewrites to the plain PaaS base;
+/// - `"zai"` — the z.ai PaaS gateway
+///   (`https://api.z.ai/api/paas/v4`), the documented default chat base;
+///   the adapter's coding-gateway rewrite is a no-op passthrough at this
+///   base (it still applies if an account's base_url override points at
+///   `https://api.z.ai/api/coding/paas/v4`);
 /// - `"zhipuai"` — the mainland bigmodel endpoint
 ///   (`https://open.bigmodel.cn/api/paas/v4`), already at the plain PaaS base.
 ///

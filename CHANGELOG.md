@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Repinned the `zai` provider to z.ai's documented standard PaaS gateway
+  (`https://api.z.ai/api/paas/v4`, per docs.z.ai) instead of the Coding-Plan
+  gateway (`/api/coding/paas/v4`); z.ai's single API key type works on both,
+  and Coding-Plan subscribers can still reach the coding gateway via the
+  per-account `base_url` override. The image adapter's coding-gateway
+  rewrite is unchanged but is now a no-op passthrough for the default base;
+  doc comments/doc rows updated to say so.
+
 ### Added
 
 - **Chat-completions `finish_reason` parsing and truncation notice (`choreo-ai-protocols`, `choreo-proto`, `choreo-daemon`):**

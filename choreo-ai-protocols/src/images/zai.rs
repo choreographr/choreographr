@@ -106,15 +106,19 @@ fn is_blocked_ip_literal(ip: IpAddr) -> bool {
 /// ends at `/api/paas/v4`, so the composed URL is `/paas/v4/images/generations`).
 const IMAGE_GENERATIONS_PATH: &str = "/images/generations";
 
-/// z.ai chat accounts resolve to the coding gateway base
-/// (`https://api.z.ai/api/coding/paas/v4` — see the overlay's
-/// `[provider.zai]` base_url), but the Images API is NOT served under the
-/// `/coding` plan path: the docs pin it at `https://api.z.ai/api/paas/v4`.
-/// Strip the `/coding` segment so the image request lands on the plain
-/// PaaS base. The rewrite is a no-op for any other base — the mainland
-/// zhipuai base already ends at `/api/paas/v4`, proxies and test mocks
-/// don't carry the segment at all — so it can never corrupt an unrelated
-/// endpoint shape.
+/// z.ai chat accounts resolve to the documented standard PaaS base
+/// (`https://api.z.ai/api/paas/v4` — see the overlay's `[provider.zai]`
+/// base_url), so this rewrite is a NO-OP PASSTHROUGH for the default
+/// configuration. It stays as a safety net for Coding-Plan subscribers
+/// who override their account's base_url to the coding gateway
+/// (`https://api.z.ai/api/coding/paas/v4`): the Images API is NOT served
+/// under the `/coding` plan path — the docs pin it at
+/// `https://api.z.ai/api/paas/v4`. Strip the `/coding` segment so the
+/// image request lands on the plain PaaS base. The rewrite is a no-op
+/// for any other base — the default z.ai base already ends at
+/// `/api/paas/v4`, the mainland zhipuai base does too, proxies and test
+/// mocks don't carry the segment at all — so it can never corrupt an
+/// unrelated endpoint shape.
 fn image_base_url(chat_base: &str) -> String {
     chat_base.replace("/coding/paas", "/paas")
 }

@@ -254,10 +254,19 @@
   default_model = "mimo-v2.5-pro"
 
 # zai.toml / zai-cn.toml / zai-coding-cn.toml -> zai (the three old Z.AI
-# entry points merged into the models.dev `zai` key; policy taken from
-# zai.toml, the international Z.AI coding endpoint).
+# entry points merged into the models.dev `zai` key).
+#
+# The base is the DOCUMENTED standard PaaS gateway (`/api/paas/v4`, per
+# docs.z.ai's chat-completion reference) — z.ai issues a SINGLE API key
+# type that authenticates on every gateway, so this base works for any
+# z.ai account. Coding-Plan subscribers who specifically want the coding
+# gateway's plan-quota billing can set their account's base_url override
+# (AccountConfig.base_url in choreo-daemon) to
+# `https://api.z.ai/api/coding/paas/v4`; the image adapter still strips
+# the `/coding` segment there, since images are only served on the plain
+# PaaS base.
 [provider.zai]
-  base_url = "https://api.z.ai/api/coding/paas/v4"
+  base_url = "https://api.z.ai/api/paas/v4"
   default_model = "glm-5.1"
   # z.ai's chat-completions API documents ONLY `max_tokens` (128K max output
   # for the GLM-5.x series — docs.z.ai/api-reference/llm/chat-completion,
