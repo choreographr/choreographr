@@ -183,6 +183,13 @@
   context_window = 1000000
   reasoning_supported = true
   reasoning_content_required = true
+  # z.ai's chat-completions docs: GLM-5.3(-flash) accepts ONLY the wire
+  # values low / high / max (the models.dev-style full OpenAI set is not
+  # valid for this generation). `off` is still offered UI-side as the
+  # "omit the field / minimum" choice even though 5.3's thinking can never
+  # be fully disabled — the chat adapter omits reasoning_effort for it and
+  # the model thinks at its documented `max` default.
+  reasoning_levels = ["off", "low", "high", "max"]
 
 # opencode -> opencode (policy from the pre-models.dev TOML)
 [provider.opencode]

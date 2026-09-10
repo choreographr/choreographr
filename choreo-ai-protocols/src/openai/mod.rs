@@ -501,7 +501,15 @@ impl OpenAiClient {
         &self,
         params: crate::ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, OpenAiError> {
-        let reasoning_effort = reasoning_effort_api_value(&params.thinking_effort);
+        // z.ai models only accept a subset of the OpenAI effort slugs, and
+        // the accepted set differs by GLM generation — dispatch to the
+        // Zhipu-specific mapper for those providers, plain pass-through for
+        // everything else.
+        let reasoning_effort = if is_zhipu_provider_slug(&self.config.provider_slug) {
+            zhipu_reasoning_effort_api_value(&params.thinking_effort, params.model)
+        } else {
+            reasoning_effort_api_value(&params.thinking_effort)
+        };
         tracing::debug!(effort = %params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
         // The turn's real session/request ids drive the opencode gateway's
         // per-session sticky routing (see `shared::opencode_gateway_headers`).
@@ -547,7 +555,14 @@ impl OpenAiClient {
     where
         F: FnMut(StreamEvent) -> io::Result<()>,
     {
-        let reasoning_effort = reasoning_effort_api_value(&params.thinking_effort);
+        // Same Zhipu dispatch as `chat_completion_turn` — both turn paths
+        // must apply the identical mapping so streaming and non-streaming
+        // requests carry the same wire value.
+        let reasoning_effort = if is_zhipu_provider_slug(&self.config.provider_slug) {
+            zhipu_reasoning_effort_api_value(&params.thinking_effort, params.model)
+        } else {
+            reasoning_effort_api_value(&params.thinking_effort)
+        };
         tracing::debug!(
             effort = %params.thinking_effort,
             ?reasoning_effort,
@@ -602,6 +617,127 @@ impl OpenAiClient {
 /// "off" → None (omit the field). Others → Some(slug).
 pub(crate) fn reasoning_effort_api_value(slug: &str) -> Option<&str> {
     if slug == "off" { None } else { Some(slug) }
+}
+
+/// Whether a catalog provider slug is one of the two Zhipu chat slugs the
+/// chat adapter must apply z.ai's model-specific `reasoning_effort` mapping
+/// to (see [`zhipu_reasoning_effort_api_value`]):
+///
+/// - `"zai"` — the z.ai coding gateway,
+/// - `"zhipuai"` — the mainland bigmodel endpoint.
+///
+/// This mirrors `images::is_zhipu_image_provider_slug`, which exists for the
+/// image dispatch; the two are kept textually in sync rather than shared so
+/// the chat path never depends on the images module. If a third Zhipu slug
+/// appears, both allowlists must gain it together.
+pub(crate) fn is_zhipu_provider_slug(slug: &str) -> bool {
+    matches!(slug, "zai" | "zhipuai")
+}
+
+/// Map our OpenAI-style reasoning-effort slug to z.ai's documented
+/// `reasoning_effort` wire value for the given model (chat-completions
+/// API, docs.z.ai — POST /paas/v4/chat/completions).
+///
+/// z.ai's API does not accept the full OpenAI effort set, and the accepted
+/// values differ by model generation:
+///
+/// - **GLM-5.3 / GLM-5.3-flash** accept ONLY `low` / `high` / `max`, and
+///   thinking can never be disabled (`thinking.type` is fixed to
+///   `enabled`). Unsupported slugs are therefore coerced to the nearest
+///   supported level, consistent with the documented 5.2 family mappings.
+/// - **GLM-5.2 and below** follow the documented family mappings: `none` /
+///   `minimal` skip thinking, `low` and `medium` are mapped to `high`, and
+///   `xhigh` is mapped to `max` (the documented default).
+///
+/// `off` always maps to `None` (field omitted) — for 5.2-and-below that is
+/// the provider-documented way to skip thinking; for 5.3 thinking stays on
+/// at its `max` default regardless, which the caller warns about.
+pub(crate) fn zhipu_reasoning_effort_api_value<'a>(slug: &'a str, model: &str) -> Option<&'a str> {
+    // Deliberately narrow name check: only the 5.3 generation tightened its
+    // accepted effort set, and 5.3-specific mappings must not leak onto
+    // other GLM models (e.g. a future "glm-5.3x" variant would still want
+    // this, but "glm-5.2" must not).
+    let is_glm_5_3 = model.to_ascii_lowercase().starts_with("glm-5.3");
+
+    let mapped = match slug {
+        // Omitted entirely: GLM-5.3 cannot disable thinking (defaults to
+        // `max`), GLM-5.2-and-below skip thinking — both are the
+        // documented behaviors for an absent field.
+        "off" => {
+            if is_glm_5_3 {
+                warn!(
+                    model = %model,
+                    "GLM-5.3 cannot disable thinking; request sent without \
+                     reasoning_effort and the model will think at its `max` default"
+                );
+            }
+            None
+        }
+        // GLM-5.3 folds everything below `high` into `low`; the 5.2 family
+        // documents `minimal` as skip-thinking and everything up to
+        // `medium` as `high`.
+        "minimal" | "low" => {
+            let value = if is_glm_5_3 {
+                "low"
+            } else if slug == "minimal" {
+                "minimal"
+            } else {
+                "high"
+            };
+            if value != slug {
+                warn!(
+                    model = %model,
+                    requested = %slug,
+                    mapped = %value,
+                    "coercing unsupported reasoning_effort to z.ai-documented value"
+                );
+            }
+            Some(value)
+        }
+        "medium" => {
+            // `medium` is only ever a coercion target-level mismatch: 5.3
+            // and the 5.2 family both document it as `high`.
+            warn!(
+                model = %model,
+                requested = %slug,
+                mapped = "high",
+                "coercing unsupported reasoning_effort to z.ai-documented value"
+            );
+            Some("high")
+        }
+        "high" => Some("high"),
+        // `xhigh` is documented as mapping to `max` on the 5.2 family; 5.3
+        // only accepts `max` at the top end anyway.
+        "xhigh" => {
+            warn!(
+                model = %model,
+                requested = %slug,
+                mapped = "max",
+                "coercing unsupported reasoning_effort to z.ai-documented value"
+            );
+            Some("max")
+        }
+        "max" => Some("max"),
+        // Unknown slug: pass through untouched so new upstream effort
+        // levels are not silently dropped; the API will reject an invalid
+        // value loudly rather than us guessing a coercion.
+        other => {
+            debug!(
+                model = %model,
+                slug = %other,
+                "unrecognized reasoning effort slug; passing through to z.ai unchanged"
+            );
+            Some(other)
+        }
+    };
+
+    debug!(
+        model = %model,
+        slug = %slug,
+        ?mapped,
+        "zhipu reasoning_effort mapping"
+    );
+    mapped
 }
 
 /// Serialize a Responses input item to its wire JSON value. Kept as a tiny

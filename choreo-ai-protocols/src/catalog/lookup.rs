@@ -925,6 +925,22 @@ mod tests {
     }
 
     #[test]
+    fn bundled_overlay_pins_glm_5_3_flash_reasoning_levels() {
+        // The REAL bundled catalog: glm-5.3-flash exists only as the
+        // wholesale opencode-go overlay entry, and z.ai's chat docs accept
+        // ONLY low/high/max as reasoning_effort wire values for the 5.3
+        // generation. The overlay must pin that documented set (with `off`
+        // offered UI-side as omit/minimum) so the UI never advertises
+        // slugs the API would reject. Read-only (no catalog swap), so no
+        // restore guard is needed.
+        let cap = model_reasoning_capability("opencode-go", "glm-5.3-flash");
+        assert_eq!(
+            cap.available_effort_levels,
+            vec!["off", "low", "high", "max"]
+        );
+    }
+
+    #[test]
     fn bundled_overlay_lists_glm_image_under_the_zai_and_zhipuai_slugs() {
         // The REAL bundled catalog: glm-image is not in the models.dev
         // snapshot, so its image-output flag comes solely from the bundled

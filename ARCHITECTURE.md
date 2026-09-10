@@ -905,7 +905,7 @@ Uses `&mut dyn FnMut` for the streaming callback to keep the trait object-safe.
 `context_window_for_model()` returns the model's context window size, using a
 resolution chain: per-model config → global fallback → catalog fallback.
 Each client implementation maps the `&str` effort slug to its wire format:
-- **OpenAI**: `reasoning_effort` field (`None` for `"off"`, `"low"`/`"medium"`/`"high"` slug → API string)
+- **OpenAI**: `reasoning_effort` field (`None` for `"off"`, otherwise slug → API string). For the Zhipu slugs (`zai`/`zhipuai`) the chat adapter instead applies the documented z.ai model-specific mapping (`zhipu_reasoning_effort_api_value` in `choreo-ai-protocols/src/openai/mod.rs`): GLM-5.3/-flash accept only `low`/`high`/`max` (unsupported slugs are coerced, `off` omits the field — 5.3 cannot disable thinking and thinks at its `max` default), and GLM-5.2-and-below follow the documented 5.2 family mappings (`minimal` skips thinking, `low`/`medium`→`high`, `xhigh`→`max`).
 - **Anthropic**: `thinking` block with `budget_tokens` (slug ≠ `"off"` enables thinking, clamping to `max_tokens - 1024`)
 - **Google**: `thinkingConfig` with `includeThoughts: true` (slug ≠ `"off"` enables thinking)
 - **Mistral**: `reasoning_effort` field (`"off"` omits the field, otherwise slug → `"low"`/`"medium"`/`"high"`)

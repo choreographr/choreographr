@@ -754,6 +754,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openai::{is_zhipu_provider_slug, zhipu_reasoning_effort_api_value};
 
     // -- validate_tool_call_arguments tests --------------------------------
 
@@ -1092,6 +1093,103 @@ mod tests {
             crate::openai::reasoning_effort_api_value("high"),
             Some("high")
         );
+    }
+
+    #[test]
+    fn zhipu_reasoning_effort_mapper_table() {
+        // GLM-5.3: only low/high/max are accepted on the wire; off is
+        // omitted (thinking stays on at max — unavoidable for 5.3).
+        for model in ["glm-5.3", "glm-5.3-flash", "GLM-5.3-FLASH"] {
+            assert_eq!(zhipu_reasoning_effort_api_value("off", model), None);
+            assert_eq!(
+                zhipu_reasoning_effort_api_value("minimal", model),
+                Some("low")
+            );
+            assert_eq!(zhipu_reasoning_effort_api_value("low", model), Some("low"));
+            assert_eq!(
+                zhipu_reasoning_effort_api_value("medium", model),
+                Some("high")
+            );
+            assert_eq!(
+                zhipu_reasoning_effort_api_value("high", model),
+                Some("high")
+            );
+            assert_eq!(
+                zhipu_reasoning_effort_api_value("xhigh", model),
+                Some("max")
+            );
+            assert_eq!(zhipu_reasoning_effort_api_value("max", model), Some("max"));
+        }
+
+        // GLM-5.2 and below: documented family mappings (minimal skips
+        // thinking, low/medium → high, xhigh → max, max passes through).
+        for model in ["glm-5.2", "glm-5.1", "glm-5", "glm-4.7"] {
+            assert_eq!(zhipu_reasoning_effort_api_value("off", model), None);
+            assert_eq!(
+                zhipu_reasoning_effort_api_value("minimal", model),
+                Some("minimal")
+            );
+            assert_eq!(zhipu_reasoning_effort_api_value("low", model), Some("high"));
+            assert_eq!(
+                zhipu_reasoning_effort_api_value("medium", model),
+                Some("high")
+            );
+            assert_eq!(
+                zhipu_reasoning_effort_api_value("high", model),
+                Some("high")
+            );
+            assert_eq!(
+                zhipu_reasoning_effort_api_value("xhigh", model),
+                Some("max")
+            );
+            assert_eq!(zhipu_reasoning_effort_api_value("max", model), Some("max"));
+        }
+
+        // Unknown slug passes through unchanged (no silent coercion) for
+        // both GLM generations.
+        assert_eq!(
+            zhipu_reasoning_effort_api_value("turbo", "glm-5.3"),
+            Some("turbo")
+        );
+        assert_eq!(
+            zhipu_reasoning_effort_api_value("turbo", "glm-5.2"),
+            Some("turbo")
+        );
+    }
+
+    #[test]
+    fn zhipu_slug_allowlist_matches_images_helper() {
+        // The chat-path allowlist must stay in sync with the images
+        // module's dispatch helper — both cover exactly zai + zhipuai.
+        for slug in ["zai", "zhipuai"] {
+            assert!(is_zhipu_provider_slug(slug));
+            assert!(crate::images::is_zhipu_image_provider_slug(slug));
+        }
+        for slug in ["openai", "zhipu", "", "zai-coding-plan"] {
+            assert!(!is_zhipu_provider_slug(slug));
+            assert!(!crate::images::is_zhipu_image_provider_slug(slug));
+        }
+    }
+
+    #[test]
+    fn chat_body_carries_mapped_reasoning_effort_for_glm_5_3() {
+        // End-to-end wire shape: a glm-5.3 request under the zai slug with
+        // our `medium` slug must serialize `reasoning_effort: "high"` in
+        // the chat-completions body (z.ai only accepts low/high/max there).
+        assert!(is_zhipu_provider_slug("zai"));
+        let effort = zhipu_reasoning_effort_api_value("medium", "glm-5.3");
+        let body = serde_json::to_value(&ChatCompletionsRequest {
+            model: "glm-5.3",
+            messages: &[ChatRequestMessage::simple("user", "hello".into())],
+            tools: None,
+            stream: false,
+            stream_options: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: effort,
+        })
+        .unwrap();
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[test]
