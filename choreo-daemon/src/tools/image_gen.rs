@@ -202,6 +202,10 @@ impl super::Tool for GenerateImage {
         let (tx, rx) = crossbeam_channel::unbounded();
         ctx.daemon_tx
             .send(crate::daemon::DaemonCommand::GetImageGenerationProvider {
+                // The requesting session scopes the image sockets: the daemon
+                // builds the client against THAT session's registry, so a
+                // cancel closes an in-flight image request too.
+                session_id: ctx.session_id,
                 account_name: ctx.account_name.clone(),
                 reply: tx,
             })

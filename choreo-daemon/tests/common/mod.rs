@@ -17,10 +17,11 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use choreo_daemon::accounts::AccountManager;
+use choreo_daemon::accounts::{AccountConfig, AccountManager};
 use choreo_daemon::broadcast::LagLimits;
 use choreo_daemon::server::acl::SharedAcl;
 use choreo_daemon::{DaemonState, run_server};
+use choreo_keystore::ServiceCredential;
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -55,6 +56,10 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
     let tool_registry = choreo_daemon::tools::ToolRegistry::new().build();
     let config_dir = tempfile::tempdir().expect("tempdir for config");
     let accounts_path = config_dir.path().join("accounts.toml");
+    // The stays-alive detail: account seeding (add/save) later rewrites the
+    // accounts file, so its directory must outlive the state — forgetting
+    // the TempDir leaks its cleanup, an acceptable cost in a test process.
+    std::mem::forget(config_dir);
 
     DaemonState {
         next_session_id: 1,
@@ -64,9 +69,10 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         deleted_sessions: std::collections::HashSet::new(),
         children: HashMap::new(),
         accounts: AccountManager::load(&accounts_path).unwrap(),
-        providers: HashMap::new(),
-        // Fresh empty registry per test daemon (see DaemonState docs).
-        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
+        // Daemon-owned registry for NON-session clients (prefetch/maintenance);
+        // sessions create their own registries at spawn time in unit tests.
+        daemon_registry: choreo_ai_protocols::SocketRegistry::default(),
+        session_registries: HashMap::new(),
         credentials: HashMap::new(),
         x_credentials: None,
         // Test daemons start locked, matching the production daemon.
@@ -90,6 +96,41 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         // Installed by run_server from the `acl` parameter.
         acl: None,
         catalog_paths: choreo_daemon::catalog::CatalogPaths::default(),
+    }
+}
+
+/// Seed `state` with a credentialed OpenAI-protocol account whose base URL
+/// is a local mock server, plus (optionally) a fresh model-cache entry.
+/// This replaces the old `state.providers` injection: provider clients are
+/// now built lazily by the SESSION (via the daemon's ResolveAccountCmd),
+/// against the session's own socket registry — so the injected ingredients
+/// are the account config + decrypted key, exactly what production holds.
+/// The warm model cache also suppresses the create-session background
+/// prefetch (no stray mock hits) and lets SetModel validate locally.
+pub fn seed_mock_account(state: &mut DaemonState, name: &str, base_url: String, models: &[&str]) {
+    let mut config = AccountConfig::simple(name, "openai");
+    config.base_url = Some(base_url);
+    config.streaming = Some(true);
+    // Fail fast instead of the provider-default timeouts.
+    config.retry_max_attempts = Some(1);
+    config.connect_timeout_secs = Some(5);
+    config.request_timeout_secs = Some(30);
+    config.total_timeout_secs = Some(60);
+    state.accounts.add(config).expect("seed mock account");
+    state.credentials.insert(
+        name.to_string(),
+        ServiceCredential::ApiKey {
+            key: "test-key".to_string(),
+        },
+    );
+    if !models.is_empty() {
+        state.model_cache.insert(
+            name.to_string(),
+            (
+                models.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+                std::time::Instant::now(),
+            ),
+        );
     }
 }
 

@@ -38,22 +38,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DaemonCommand::PowerEvent(SuspendEvent)` — `start_daemon_core` builds a
   `PowerMonitor::best_effort()` and a forwarder thread translates each
   suspend/wake event into that command; on `Sleep` the command loop
-  force-closes the daemon-wide socket registry ("machine sleeping:
-  force-closing N provider sockets"), on `Wake` it logs only (kernel
-  keepalive tuning catches stragglers).
-- Forced socket close on cancel: user cancellation (`handle_cancel_request`
-  in the daemon command loop, and the `select_biased!` cancel arm of the
-  request worker's concurrent tool-batch loop) calls
-  `SocketRegistry::shutdown_all()` after the cooperative flag is set, with an
-  info log ("request cancelled: force-closing provider sockets to unblock any
-  wedged reader") — organic provider IO errors deliberately do NOT trigger a
-  shutdown. Pinned by new unit tests (sleep force-closes, wake untouched) and
-  the `#[ignore]` integration test `tests/cancel_force_close.rs` (a stalling
+  force-closes every session's socket registry plus the daemon's own
+  ("machine sleeping: force-closing N provider sockets"), on `Wake` it
+  prunes dead entries via `SocketRegistry::prune_dead` (defense-in-depth
+  for a missed `Sleep` — normally a no-op since a well-delivered Sleep
+  already emptied every registry; live connections are never disturbed in
+  either arm).
+- Forced socket close on cancel: user cancellation
+  (`handle_cancel_request` in the daemon command loop) force-closes the
+  TARGET SESSION's socket registry — and, via `cancel_children_of`, every
+  child's — with an info log ("request cancelled: force-closing provider
+  sockets to unblock any wedged reader"); other sessions' connections are
+  untouched. Organic provider IO errors deliberately do NOT trigger a
+  shutdown. Pinned by new unit tests (cancel isolation between sessions,
+  parent-cancel cascade, sleep force-closes, wake untouched) and the
+  `#[ignore]` integration test `tests/cancel_force_close.rs` (a stalling
   SSE provider + real daemon: mid-stream cancel finishes promptly via the
   registry force-close).
 
+### Fixed
+
+- Request cancellation no longer force-closes provider sockets belonging to
+  unrelated concurrent sessions: each session owns a private
+  `SocketRegistry` (plus one daemon-level registry for prefetch/catalog
+  fetches), so `shutdown_all` from a cancel is scoped to exactly the
+  cancelled session and its children.
+
 ### Changed
 
+- `SocketRegistry::register` now returns a `SocketId` and
+  `RegisteredTcpTransport` unregisters + closes its registry fd on `Drop`,
+  so the registry tracks only live connections (no more growth bounded
+  only by the 256-entry prune). Unregistering an entry that `shutdown_all`/`prune`
+  already removed is a documented no-op: entry removal is the single
+  close-ownership-transfer signal, so the RAII guard cannot double-close an
+  fd the registry closed first.
 - Provider HTTP clients (`choreo-ai-protocols`) now build their ureq agents
   through a registry-registered connector chain: `build_agent` replaces
   ureq's plain TCP stage with choreo-sockreg's `RegisteringTcpConnector`
@@ -63,11 +82,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SocketRegistry` for force-closing hung connections. All client
   constructors (`OpenAiClient`, `AnthropicClient`, `GoogleClient`,
   `OpenAiImageClient`, `ZaiImageClient`) now take the registry explicitly.
-- **One daemon-wide socket registry**: `InferenceProvider::from_account_config`
-  now takes the registry handle, and `DaemonState` holds a single
-  `Arc<SocketRegistry>` created at startup (`DaemonState::open`) that every
-  account's provider clients share (replacing the per-account registries),
-  threaded to the request workers via the new `RequestContext::socket_registry`.
+- **Per-session socket registries and lazy clients**: neither the daemon nor
+  a session shares a provider client. Each session owns a private
+  `SocketRegistry` plus a lazily-built provider client (sessions can be
+  created while the keystore is locked, so no client can exist at creation
+  time — it is built on the session thread at the first request, against
+  that session's registry). The daemon command loop holds a clone of each
+  session's registry so `handle_cancel_request` can force-close a wedged
+  session's sockets from the one thread that DECIDED the cancel; a
+  registry-clone map lives in `DaemonState`, entered at session spawn and
+  dropped at session exit. Cancellation granularity is exactly the session
+  (sub-sessions own their own registries; a parent cancel closes the whole
+  subtree). Future async tool calls will reuse the session's
+  agent+pool+registry triple. The old per-account provider cache
+  (`DaemonState.providers`) is gone: `/lock`, `RemoveCredential`, and
+  `AccountsReload` invalidate affected sessions' clients via a new
+  `SessionCommand::DropProvider`, and each session rebuilds lazily on its
+  next request. Only non-session-scoped work (model prefetch, catalog
+  maintenance fetch — never individually cancelled) uses a
+  command-loop-owned `daemon_registry`.
 - Repinned the `zai` provider to z.ai's documented standard PaaS gateway
   (`https://api.z.ai/api/paas/v4`, per docs.z.ai) instead of the Coding-Plan
   gateway (`/api/coding/paas/v4`); z.ai's single API key type works on both,

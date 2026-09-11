@@ -17,8 +17,22 @@
 //! [`SocketRegistry::register`] takes ownership of the fd it is given — it
 //! does NOT duplicate it. Callers that want to keep using the socket must
 //! pass a duplicate (e.g. `TcpStream::try_clone(&stream)` followed by
-//! `OwnedFd::from(dup)`). The registry closes every fd it holds (via
-//! `prune_dead` for dead sockets, via `shutdown_all` at teardown).
+//! `OwnedFd::from(dup)`).
+//!
+//! # RAII lifecycle (register → track → unregister on drop)
+//!
+//! [`SocketRegistry::register`] returns a [`SocketId`]; the caller passes it
+//! back to [`SocketRegistry::unregister`] when the connection is done
+//! (normally from a `Drop` impl), which removes the entry and closes the
+//! registry's fd exactly once. With the `ureq` feature,
+//! `RegisteredTcpTransport` does this automatically, so in steady state the
+//! registry's size equals the number of LIVE connections — ureq can close
+//! pooled connections at any time without leaking entries. Entry removal is
+//! the single close-ownership-transfer signal: if `shutdown_all` or
+//! `prune_dead` already removed an entry, `unregister` is a documented
+//! no-op, so a guard can never double-close an fd the registry closed
+//! first. `prune_dead` and the 256-entry cap in the registry remain purely
+//! as backstops.
 //!
 //! # Portability
 //!
@@ -37,7 +51,7 @@ pub mod tuning;
 #[cfg(feature = "ureq")]
 pub mod connector;
 
-pub use socket_registry::SocketRegistry;
+pub use socket_registry::{SocketId, SocketRegistry};
 pub use tuning::SocketTuning;
 
 #[cfg(feature = "ureq")]

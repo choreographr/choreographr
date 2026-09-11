@@ -168,11 +168,11 @@ impl DaemonState {
             deleted_sessions: HashSet::new(),
             children: HashMap::new(),
             accounts,
-            providers: HashMap::new(),
-            // ONE registry for the whole daemon lifetime: every provider
-            // client and the cancel/suspend handlers share this Arc, so
-            // `shutdown_all` covers all provider sockets process-wide.
-            socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
+            // Daemon-owned registry for NON-session provider clients (model
+            // prefetch, catalog maintenance) — never individually cancelled.
+            // Sessions create their OWN registries at spawn time.
+            daemon_registry: choreo_ai_protocols::SocketRegistry::default(),
+            session_registries: HashMap::new(),
             credentials: HashMap::new(),
             x_credentials: None,
             // The daemon starts locked: credentials are only decrypted into

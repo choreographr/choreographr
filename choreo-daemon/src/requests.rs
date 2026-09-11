@@ -19,7 +19,6 @@ use choreo_proto::{
     AssistantToolCallRecord, DaemonMessage, OutputStream, ReasoningProducer, SessionEvent,
     SessionStatus,
 };
-use tracing::info;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -1068,21 +1067,14 @@ pub(crate) fn run_agent_loop(
                         if cancelled_now {
                             cancel_flag.store(true, Ordering::Relaxed);
                             cancelled = true;
-                            // Force-close the provider sockets too. The
-                            // cancel was DECIDED (this arm fired), so unlike
-                            // the inference-failure path — an organic IO
-                            // error must NOT trigger a shutdown — this is
-                            // the moment to un-block a worker wedged in a
-                            // provider read that no cooperative flag can
-                            // reach. Client sockets and tool sockets are
-                            // not in this registry, so nothing else is
-                            // disturbed.
-                            info!(
-                                session_id = ctx.session_id,
-                                request_id,
-                                "request cancelled: force-closing provider sockets to unblock any wedged reader"
-                            );
-                            ctx.socket_registry.shutdown_all();
+                            // NOTE: no provider-socket force-close here. The
+                            // cancel is DECIDED on the daemon command loop
+                            // (`handle_cancel_request`), which closes THIS
+                            // session's socket registry directly — a wedged
+                            // reader cannot observe a channel message, so the
+                            // close must happen outside the worker. This arm
+                            // only handles the cooperative part: stopping the
+                            // tool wait and unwinding the turn.
                             // Bias for cancel: stop waiting for the slowest
                             // tool right now.  First, kill every still-running
                             // wait-loop so its forwarder stops streaming

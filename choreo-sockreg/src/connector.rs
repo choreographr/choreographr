@@ -18,7 +18,7 @@ use ureq::unversioned::transport::{
 use ureq::{Error, Timeout};
 
 use crate::socket_registry::OwnedSock;
-use crate::{SocketRegistry, SocketTuning};
+use crate::{SocketId, SocketRegistry, SocketTuning};
 
 /// A [`Connector`] that registers every socket it opens.
 ///
@@ -77,18 +77,26 @@ impl<In: Transport> Connector<In> for RegisteringTcpConnector {
         }
 
         // Register a DUPLICATE of the stream: the registry owns the dup (and
-        // will close it on shutdown_all/prune), while the returned transport
-        // keeps the original. `try_clone` dups the fd; the registry's owned type (OwnedFd/OwnedSocket) takes
-        // ownership of that dup. If the dup fails the connection still works
-        // — we just lose force-close coverage for it, hence warn not error.
-        match stream.try_clone() {
-            Ok(dup) => self.registry.register(OwnedSock::from(dup)),
-            Err(e) => tracing::warn!(error = %e, "could not duplicate stream for socket registry"),
-        }
+        // will close it on unregister/shutdown_all/prune), while the returned
+        // transport keeps the original. `try_clone` dups the fd; the
+        // registry's owned type (OwnedFd/OwnedSocket) takes ownership of that
+        // dup. If the dup fails the connection still works — we just lose
+        // force-close coverage for it (and RAII deregistration, since there
+        // is nothing registered), hence warn not error.
+        let registration = match stream.try_clone() {
+            Ok(dup) => Some(self.registry.register(OwnedSock::from(dup))),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not duplicate stream for socket registry");
+                None
+            }
+        };
 
         let buffers = LazyBuffers::new(config.input_buffer_size(), config.output_buffer_size());
         Ok(Some(Either::B(RegisteredTcpTransport::new(
-            stream, buffers,
+            stream,
+            buffers,
+            registration,
+            self.registry.clone(),
         ))))
     }
 }
@@ -148,6 +156,10 @@ fn dial_one(addr: SocketAddr, timeout: NextTimeout) -> Result<TcpStream, Error> 
 pub struct RegisteredTcpTransport {
     stream: TcpStream,
     buffers: LazyBuffers,
+    // RAII registration: the SocketId `register` handed us plus a clone of
+    // the registry, both held so `Drop` can deregister. `None` when the dup
+    // failed at connect time (nothing was registered, nothing to remove).
+    registration: Option<(SocketId, SocketRegistry)>,
     // Memoized last-set timeouts: setting a socket timeout is a syscall per
     // call site otherwise; ureq's transport caches the same way.
     timeout_write: Option<time::Duration>,
@@ -155,10 +167,16 @@ pub struct RegisteredTcpTransport {
 }
 
 impl RegisteredTcpTransport {
-    fn new(stream: TcpStream, buffers: LazyBuffers) -> Self {
+    fn new(
+        stream: TcpStream,
+        buffers: LazyBuffers,
+        registration: Option<SocketId>,
+        registry: SocketRegistry,
+    ) -> Self {
         Self {
             stream,
             buffers,
+            registration: registration.map(|id| (id, registry)),
             timeout_read: None,
             timeout_write: None,
         }
@@ -252,6 +270,23 @@ impl Transport for RegisteredTcpTransport {
 
     fn is_open(&mut self) -> bool {
         Self::probe_open(&mut self.stream)
+    }
+}
+
+// RAII deregistration: when ureq drops the transport (it closes pooled
+// connections when the agent dies or the pool evicts), `Drop` removes the
+// registry entry and closes the registry's DUPLICATE fd via
+// `SocketRegistry::unregister`. Two fds refer to the same socket here: the
+// transport's own `stream` fd is closed by normal `Drop` semantics on
+// `TcpStream`, and `unregister` closes the registry's dup exactly once.
+// Double-closing is impossible by construction: if `shutdown_all` or
+// `prune_dead` already removed the entry, `unregister` is a documented no-op
+// (entry removal is the single close-ownership-transfer signal).
+impl Drop for RegisteredTcpTransport {
+    fn drop(&mut self) {
+        if let Some((id, registry)) = self.registration.take() {
+            registry.unregister(id);
+        }
     }
 }
 

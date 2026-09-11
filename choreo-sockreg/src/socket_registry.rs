@@ -7,6 +7,7 @@
 //! makes the blocked `read` return immediately. So a control thread needs the
 //! fd numbers of all live sockets — which is exactly what this registry keeps.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // The platform's owned-descriptor type: fd on Unix, Winsock SOCKET handle on
@@ -24,11 +25,44 @@ pub(crate) type OwnedSock = std::os::windows::io::OwnedSocket;
 /// with churny short-lived connections.
 const MAX_REGISTERED_SOCKETS: usize = 256;
 
+/// A handle identifying one registration inside a [`SocketRegistry`].
+///
+/// Returned by [`SocketRegistry::register`] and handed back to
+/// [`SocketRegistry::unregister`] by the RAII guard in the connector, so a
+/// dropped transport removes exactly its own entry. Ids are monotonic,
+/// non-zero, and unique *per registry instance* (each registry carries its
+/// own `AtomicU64` counter, cloned with the registry's `Arc` — clones share
+/// the counter and the list, so a registration through any clone yields ids
+/// from the same sequence). Uniqueness per registry is all that is needed:
+/// unregister only ever searches the registry the registration came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SocketId(u64);
+
+impl SocketId {
+    /// Allocates the next id from a registry's shared counter. Non-zero by
+    /// construction (the counter starts at 1), so 0 can serve as a sentinel
+    /// elsewhere if it ever needs to.
+    fn next(counter: &AtomicU64) -> Self {
+        Self(counter.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// One registry entry: the socket the registry owns plus the id that refers
+/// to it.
+#[derive(Debug)]
+struct Entry {
+    id: SocketId,
+    sock: OwnedSock,
+}
+
 /// Cheaply cloneable registry of live socket fds.
 ///
-/// Clones share the same fd list (internal `Arc<Mutex<Vec<OwnedSock>>>`). The
-/// registry OWNS every fd registered into it; see the crate docs for the
-/// ownership contract.
+/// Clones share the same fd list (internal `Arc<Mutex<Vec<Entry>>>`) and id
+/// counter. The registry OWNS every fd registered into it; see the crate
+/// docs for the ownership contract. Entries are normally removed by the RAII
+/// guard on the transport that created them (`unregister` on `Drop`), so in
+/// steady state the registry tracks only LIVE connections; `prune_dead` and
+/// the [`MAX_REGISTERED_SOCKETS`] cap stay purely as backstops.
 #[derive(Debug, Clone)]
 pub struct SocketRegistry {
     // A std Mutex is fine here despite the channel-first house rule: this is
@@ -36,14 +70,19 @@ pub struct SocketRegistry {
     // shapes — the lock is held for a handful of fd syscalls and carries no
     // message traffic. Channels cannot express "reach into another thread's
     // blocked syscall", which is the whole point of the registry.
-    sockets: Arc<Mutex<Vec<OwnedSock>>>,
+    sockets: Arc<Mutex<Vec<Entry>>>,
+    // Per-REGISTRY (not per-process) id counter: shared via the Arc so all
+    // clones of one registry hand out ids from the same monotonic sequence.
+    next_id: Arc<AtomicU64>,
 }
 
 impl SocketRegistry {
     /// Creates an empty registry.
     pub fn new() -> Self {
+        // Start at 1 so no valid SocketId is ever 0 (see SocketId's docs).
         Self {
             sockets: Arc::new(Mutex::new(Vec::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -62,7 +101,13 @@ impl SocketRegistry {
     /// gone" rather than an error. When the list exceeds
     /// [`MAX_REGISTERED_SOCKETS`], an opportunistic [`Self::prune_dead`] runs
     /// first to bound memory growth.
-    pub fn register(&self, socket: impl Into<OwnedSock>) {
+    ///
+    /// Returns the [`SocketId`] for this registration: the caller (normally
+    /// the connector's RAII guard) passes it back to [`Self::unregister`] to
+    /// remove the entry — and close the registry's fd — when the transport
+    /// is dropped.
+    pub fn register(&self, socket: impl Into<OwnedSock>) -> SocketId {
+        let id = SocketId::next(&self.next_id);
         let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
         // Prune BEFORE pushing so the cap applies to the steady-state size;
         // the new socket is by definition alive, so pruning first never
@@ -70,8 +115,53 @@ impl SocketRegistry {
         if sockets.len() >= MAX_REGISTERED_SOCKETS {
             prune_locked(&mut sockets);
         }
-        sockets.push(socket.into());
+        sockets.push(Entry {
+            id,
+            sock: socket.into(),
+        });
         tracing::debug!(count = sockets.len(), "socket registered");
+        id
+    }
+
+    /// Removes the entry for `id` and closes the registry's fd for it.
+    ///
+    /// This is the RAII deregistration half of the lifecycle: the connector's
+    /// transport guard calls it on `Drop` when ureq discards a connection, so
+    /// the registry's duplicate fd dies exactly when the connection does.
+    ///
+    /// ## The single-ownership-transfer invariant (why no-op is correct)
+    ///
+    /// An entry is REMOVED as the first step of every path that closes its
+    /// fd: `unregister` itself, `shutdown_all`, and `prune_locked`. Removal
+    /// is therefore the one and only "this fd's close has been handed off to
+    /// whichever code found the entry" signal. If `id` is not present —
+    /// because `shutdown_all`/`prune_dead` already removed and closed it —
+    /// `unregister` does NOTHING rather than guessing at an fd number: the
+    /// guard can never double-close an fd the registry already closed (and
+    /// can never close a recycled fd number belonging to something else).
+    /// The two fd owners are independent (the transport holds its own fd,
+    /// the registry holds its dup), so a no-op here leaves no leak: the
+    /// transport's own fd is closed by normal `Drop` regardless.
+    pub fn unregister(&self, id: SocketId) {
+        let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        match sockets.iter().position(|e| e.id == id) {
+            Some(pos) => {
+                let entry = sockets.remove(pos);
+                tracing::debug!(remaining = sockets.len(), "socket unregistered (RAII drop)");
+                // Removing the entry above is what transfers close ownership
+                // to this function; close our dup exactly once, logging any
+                // EBADF (the socket may legitimately have died first).
+                close_logged(entry.sock);
+            }
+            // Already gone: shutdown_all or prune_locked removed (and closed)
+            // it. Deliberately a NO-OP — see the invariant in the doc above.
+            None => {
+                tracing::trace!(
+                    ?id,
+                    "unregister of unknown id; entry already removed, no-op"
+                );
+            }
+        }
     }
 
     /// Number of currently registered fds (mainly for tests and metrics).
@@ -90,21 +180,20 @@ impl SocketRegistry {
     /// error (or EOF), which is the entire reason this method exists.
     #[cfg(unix)]
     pub fn shutdown_all(&self) {
-        use std::os::fd::IntoRawFd;
+        use std::os::fd::AsRawFd;
 
         use nix::sys::socket::{Shutdown, shutdown};
-        use nix::unistd::close;
 
         let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
         let count = sockets.len();
-        // Close via into_raw_fd + explicit close instead of relying on Drop:
-        // for an fd that was ALREADY closed elsewhere, Drop would close it a
-        // second time (a real double-close bug if the number was recycled in
-        // between). The explicit path logs the EBADF and moves on, and for
-        // healthy fds `shutdown` + `close` is exactly what Drop would have
-        // done anyway, just with observability at both steps.
-        for socket in sockets.drain(..) {
-            let raw = socket.into_raw_fd();
+        // Drain removes each entry FIRST, transferring close ownership to
+        // this loop (the invariant `unregister` relies on: a concurrent or
+        // later unregister of one of these ids finds nothing and no-ops).
+        // Close via the shared `close_logged` helper (explicit into_raw_fd +
+        // close, never Drop) so an fd already closed elsewhere surfaces as a
+        // logged EBADF instead of a double-close.
+        for entry in sockets.drain(..) {
+            let raw = entry.sock.as_raw_fd();
             match shutdown(raw, Shutdown::Both) {
                 Ok(()) => tracing::debug!(fd = raw, "socket shut down"),
                 // The fd was already closed by someone else — nothing to do.
@@ -116,11 +205,9 @@ impl SocketRegistry {
                 Err(e) => tracing::warn!(fd = raw, error = %e, "socket shutdown failed"),
             }
             // shutdown() does not close the fd; the registry owns it, so we
-            // do. An EBADF here mirrors the shutdown EBADF above and is
-            // equally harmless in this path.
-            if let Err(e) = close(raw) {
-                tracing::debug!(fd = raw, error = %e, "fd close after shutdown failed");
-            }
+            // do — through the same helper `prune_locked` and `unregister`
+            // use, so all three close paths behave identically.
+            close_logged(entry.sock);
         }
         tracing::info!(count, "force-closed all registered sockets");
     }
@@ -138,7 +225,11 @@ impl SocketRegistry {
         );
         let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
         let count = sockets.len();
-        sockets.clear();
+        // Draining (instead of `clear()`) keeps the remove-then-close order
+        // the ownership invariant expects; dropping OwnedSocket closes it.
+        for entry in sockets.drain(..) {
+            let _ = entry.sock;
+        }
         tracing::info!(count, "cleared registered sockets (no shutdown performed)");
     }
 
@@ -153,19 +244,22 @@ impl SocketRegistry {
     ///   unprompted data; ureq treats both as "connection is done for us",
     ///   and so do we: remove and close.
     /// * any other error (`ECONNRESET`, `EBADF`, …) — dead: remove and close.
+    ///
+    /// Returns the number of dead entries removed and closed.
     #[cfg(unix)]
-    pub fn prune_dead(&self) {
+    pub fn prune_dead(&self) -> usize {
         let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
-        prune_locked(&mut sockets);
+        prune_locked(&mut sockets)
     }
 
     /// Windows no-op for now (probing needs `ioctlsocket`-based non-blocking
     /// recv; planned with the Winsock follow-up).
     #[cfg(not(unix))]
-    pub fn prune_dead(&self) {
+    pub fn prune_dead(&self) -> usize {
         tracing::warn!(
             "prune_dead is not implemented on this platform yet (planned Winsock follow-up)"
         );
+        0
     }
 }
 
@@ -178,31 +272,35 @@ impl Default for SocketRegistry {
 /// Lock-held prune worker, shared by [`SocketRegistry::prune_dead`] and the
 /// opportunistic prune in [`SocketRegistry::register`] (which must not
 /// re-acquire the already-held mutex — hence taking the locked Vec directly).
+/// Returns the number of entries removed and closed.
 #[cfg(unix)]
-fn prune_locked(sockets: &mut Vec<OwnedSock>) {
+fn prune_locked(sockets: &mut Vec<Entry>) -> usize {
     use std::os::fd::AsFd;
 
     let before = sockets.len();
     let mut i = 0;
     while i < sockets.len() {
-        let alive = probe_alive(sockets[i].as_fd());
+        let alive = probe_alive(sockets[i].sock.as_fd());
         if alive {
             i += 1;
             continue;
         }
         // Remove and close EXPLICITLY (into_raw_fd + close, like
-        // shutdown_all) rather than dropping the OwnedFd: for a socket that
-        // was already closed elsewhere (EBADF is one of the "dead"
-        // verdicts), Drop would close it a second time — a real double-close
-        // bug — and std's IO-safety runtime aborts the process on it. The
-        // explicit path turns that into a logged EBADF.
-        let socket = sockets.remove(i);
-        close_logged(socket);
+        // shutdown_all and unregister) rather than dropping the OwnedFd: for
+        // a socket that was already closed elsewhere (EBADF is one of the
+        // "dead" verdicts), Drop would close it a second time — a real
+        // double-close bug — and std's IO-safety runtime aborts the process
+        // on it. The explicit path turns that into a logged EBADF. Removing
+        // the entry first is also what makes a later unregister of this id a
+        // no-op (the ownership-transfer invariant).
+        let entry = sockets.remove(i);
+        close_logged(entry.sock);
     }
     let pruned = before - sockets.len();
     if pruned > 0 {
         tracing::debug!(pruned, remaining = sockets.len(), "pruned dead sockets");
     }
+    pruned
 }
 
 /// Windows cap-enforcement stand-in for the Unix probe-based prune: without
@@ -210,10 +308,10 @@ fn prune_locked(sockets: &mut Vec<OwnedSock>) {
 /// when the cap is hit we close-and-drop the OLDEST entries to stay bounded.
 /// Same growth guarantee as the Unix path, weaker eviction policy.
 #[cfg(windows)]
-fn prune_locked(sockets: &mut Vec<OwnedSock>) {
+fn prune_locked(sockets: &mut Vec<Entry>) {
     while sockets.len() >= MAX_REGISTERED_SOCKETS {
         let oldest = sockets.remove(0);
-        let _ = oldest; // dropping OwnedSocket closes the handle
+        let _ = oldest.sock; // dropping OwnedSocket closes the handle
     }
     tracing::debug!(
         remaining = sockets.len(),
@@ -277,6 +375,11 @@ fn close_logged(socket: OwnedSock) {
 
     use nix::unistd::close;
 
+    // Shared close path for ALL entry-removal sites (shutdown_all,
+    // prune_locked, unregister): one place for the explicit-close-with-
+    // logging semantics, so the EBADF-tolerant behavior can never drift
+    // between them.
+
     let raw = socket.into_raw_fd();
     if let Err(e) = close(raw) {
         tracing::debug!(fd = raw, error = %e, "close of registered socket failed");
@@ -319,12 +422,97 @@ mod tests {
         let registry = SocketRegistry::new();
         assert_eq!(registry.registered_count(), 0);
         let (a, b) = pair();
-        registry.register(a);
+        let id_a = registry.register(a);
         let clone = registry.clone();
         assert_eq!(registry.registered_count(), 1);
         registry.register(b);
         // Clone sees the same underlying list.
         assert_eq!(clone.registered_count(), 2);
+
+        // Ids are distinct and increasing across the whole registry (clones
+        // share the counter, so both entry points draw from one sequence).
+        assert!(id_a < clone.register(pair().0));
+    }
+
+    #[test]
+    fn unregister_removes_entry_and_closes_fd() {
+        let registry = SocketRegistry::new();
+        let (a, b) = pair();
+        let id = registry.register(a);
+        assert_eq!(registry.registered_count(), 1);
+
+        // Unregister must close the registry's fd: the peer sees EOF (or a
+        // reset) on its end of the pair.
+        registry.unregister(id);
+        assert_eq!(registry.registered_count(), 0);
+        let mut buf = [0u8; 1];
+        match read(b.as_fd(), &mut buf) {
+            Ok(0) => {}                       // clean EOF: expected
+            Err(nix::Error::ECONNRESET) => {} // also acceptable
+            other => panic!("expected EOF/ECONNRESET after unregister, got {other:?}"),
+        }
+        // `b` is still open on our side (the close above hit the registry's
+        // dup and `a`'s socketpair end); drop it to silence nothing.
+    }
+
+    #[test]
+    fn unregister_unknown_id_is_noop() {
+        let registry = SocketRegistry::new();
+        let (a, _b) = pair();
+        let id = registry.register(a);
+        assert_eq!(registry.registered_count(), 1);
+
+        // Ids are unique PER REGISTRY (documented on `SocketId`), so the
+        // meaningful unknown-id cases here are: an id that was never handed
+        // out by this registry (counter starts at 1, so 999 never was), and
+        // an id for an entry that unregister has ALREADY removed (the exact
+        // double-drop shape the RAII guard can produce). Both must be no-ops
+        // that leave remaining entries intact and never touch an fd.
+        registry.unregister(SocketId(999));
+        registry.unregister(id); // first removal: real work
+        registry.unregister(id); // second removal: must be a no-op
+        assert_eq!(registry.registered_count(), 0);
+    }
+
+    #[test]
+    fn unregister_after_shutdown_all_is_noop() {
+        let registry = SocketRegistry::new();
+        let (a, b) = pair();
+        let id = registry.register(a);
+        registry.shutdown_all();
+        assert_eq!(registry.registered_count(), 0);
+
+        // The fd the entry pointed at was already closed by shutdown_all.
+        // If unregister were NOT a no-op here, it would close a stale fd
+        // number (or, if we'd stored it, the raw number — a double-close
+        // bug); the no-op is the whole invariant.
+        registry.unregister(id);
+        assert_eq!(registry.registered_count(), 0);
+        // Sanity: the peer end still reads its own state fine (no crash from
+        // a corrupted fd table is the real assertion).
+        let _ = read(b.as_fd(), &mut [0u8; 1]);
+    }
+
+    #[test]
+    fn unregister_after_prune_is_noop() {
+        let registry = SocketRegistry::new();
+        // Register a socket whose peer we then drop: the probe sees EOF, so
+        // `prune_dead` legitimately removes it (robust against fd-number
+        // reuse, unlike a manually closed raw fd — a recycled number could
+        // accidentally probe as alive).
+        let (doomed, peer) = pair();
+        let dead_id = registry.register(doomed);
+        drop(peer);
+        // The live entry keeps BOTH ends alive so the probe keeps it.
+        let (live, _peer) = pair();
+        let id = registry.register(live);
+        registry.prune_dead();
+        assert_eq!(registry.registered_count(), 1);
+        // The pruned entry's id must no-op (ownership was transferred to
+        // prune_locked); the surviving entry's id must still unregister it.
+        registry.unregister(dead_id); // no-op
+        registry.unregister(id);
+        assert_eq!(registry.registered_count(), 0);
     }
 
     #[test]

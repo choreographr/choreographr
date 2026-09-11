@@ -3,9 +3,9 @@
 //! Builds a real [`OpenAiClient`] whose HTTP agent dials through
 //! choreo-sockreg's `RegisteringTcpConnector` (the connector chain wired in
 //! `shared::build_agent`), points it at the scripted loopback HTTP provider,
-//! and asserts that the connection actually shows up in the registry — i.e.
-//! the registry-registered connector chain is live end-to-end, not just
-//! type-correct.
+//! and asserts the RAII lifecycle end-to-end: the connection never dangles in
+//! the registry — once the response is consumed and the transport dropped,
+//! the registry is empty again.
 //!
 //! These tests bind a real local TCP socket, so per AGENTS.md they live in
 //! `tests/` and are marked `#[ignore]` (run via `cargo test-integration`).
@@ -61,20 +61,22 @@ fn provider_connection_is_registered_and_shutdown_all_does_not_panic() {
         .expect("turn succeeds over the registered connection");
     assert!(matches!(result, ChatTurnResult::FinalText(_)));
 
-    // The connector registered a duplicate of the dialed socket. (Count is
-    // >= 1 rather than == 1 because ureq may pool the connection for reuse;
-    // pooled sockets keep their registry fd alive.)
-    assert!(
-        registry.registered_count() >= 1,
-        "the dialed connection must appear in the socket registry"
+    // RAII deregistration: the mock closes its connection after scripting a
+    // single response, so ureq drops the transport once the body is read —
+    // and `RegisteredTcpTransport`'s `Drop` unregisters the entry. The
+    // registry must therefore be back to EMPTY (the pre-dial level): its
+    // steady state now tracks only LIVE connections. (Previously this test
+    // asserted `>= 1` here, because nothing ever deregistered.)
+    assert_eq!(
+        registry.registered_count(),
+        0,
+        "dropped transport must deregister via RAII"
     );
 
-    // Expected semantics: shutdown_all force-closes every registered socket,
-    // INCLUDING ones back in ureq's pool — that is the intended behavior
-    // (pooled idle connections are exactly what a control thread wants to be
-    // able to kill). The client still holds its twin fd; closing the registry
-    // copy does not double-close anything (each fd is closed exactly once,
-    // see choreo-sockreg's ownership contract). Must not panic.
+    // shutdown_all still force-closes any sockets present (e.g. one back in
+    // ureq's pool for a keep-alive connection) and clears even an empty
+    // list. Each fd is closed exactly once (see choreo-sockreg's ownership
+    // contract). Must not panic.
     registry.shutdown_all();
     assert_eq!(
         registry.registered_count(),

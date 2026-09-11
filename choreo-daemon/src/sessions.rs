@@ -228,6 +228,13 @@ pub enum SessionCommand {
     SetAccount {
         name: String,
     },
+    /// Drop the session's cached provider client so it is rebuilt lazily on
+    /// the next request. Sent by the daemon command loop when the keystore
+    /// locks, or a credential/account is removed or reconfigured — the
+    /// cached client would otherwise keep dialing with a stale (possibly
+    /// revoked) key. The session registry itself stays alive: the session
+    /// keeps its own cancellable scope; only the client is discarded.
+    DropProvider,
     SetReasoningEffort {
         effort: String,
     },
@@ -262,11 +269,6 @@ pub struct RequestContext {
     /// Daemon-wide backlog counter, shared with every session thread and the
     /// daemon command loop (the 6th sanctioned shared-state exception).
     pub global_lag: Arc<AtomicUsize>,
-    /// The daemon's ONE provider-socket registry. The request worker calls
-    /// `shutdown_all` on it at the explicit-cancel sites so a streaming
-    /// inference read wedged on a half-dead provider connection un-blocks
-    /// immediately instead of waiting for the request timeout.
-    pub socket_registry: Arc<choreo_ai_protocols::SocketRegistry>,
     /// The daemon's Substrate credential, plumbed to the request worker so the
     /// `content` write tools can build a signing [`ChainAccount`].
     ///
@@ -546,6 +548,17 @@ pub struct SessionState {
     subscribers: HashMap<u64, SubscriberSink>,
     pub(crate) active_requests: BTreeMap<u32, ActiveRequest>,
     pub provider: Option<InferenceProvider>,
+    /// This session's provider-socket registry. The provider client built for
+    /// this session registers every dialed socket here, so closing the
+    /// registry (cancel / suspend / keystore-lock) force-closes THIS
+    /// session's connections and nothing else's — cancellation granularity
+    /// is exactly the session.
+    ///
+    /// Design note: the registry deliberately travels together with
+    /// `provider` (and, in future, the connection pool) as one per-session
+    /// triple — agent + pool + registry. Future async tool calls will reuse
+    /// this same triple so their sockets land in the same cancellable scope.
+    pub registry: choreo_ai_protocols::SocketRegistry,
     pub loaded_skill_bodies: Vec<LoadedSkill>,
     pub context_cache: Option<(u64, Arc<String>)>,
     pub discovered_skills: Option<Vec<SkillMeta>>,
@@ -616,6 +629,9 @@ impl SessionState {
             subscribers,
             active_requests: BTreeMap::new(),
             provider: None,
+            // Restored snapshots never carry a live provider client; the next
+            // request rebuilds one lazily against this fresh registry.
+            registry: choreo_ai_protocols::SocketRegistry::default(),
             loaded_skill_bodies: snapshot.loaded_skill_bodies,
             context_cache: snapshot.context_cache,
             discovered_skills: snapshot.discovered_skills,
@@ -858,10 +874,75 @@ impl SessionState {
             subscribers: HashMap::new(),
             active_requests: BTreeMap::new(),
             provider: None,
+            // A fresh empty registry: any provider client built for this
+            // state registers its sockets here, so cancelling this session
+            // (or dropping it) never touches another session's connections.
+            registry: choreo_ai_protocols::SocketRegistry::default(),
             loaded_skill_bodies: Vec::new(),
             context_cache: None,
             discovered_skills: None,
         }
+    }
+
+    /// Lazily resolve (and cache) this session's inference provider against
+    /// THIS session's socket registry.
+    ///
+    /// Sessions can be created while the keystore is locked, so no provider
+    /// exists at creation time; instead the first request asks the daemon
+    /// command loop for the account's config + API key (the daemon is the
+    /// sole owner of the credential map — the cleartext key never leaves it)
+    /// and builds the client HERE, on the session thread, so every socket it
+    /// dials lands in `self.registry`.
+    ///
+    /// Error strings are the SAME user-facing messages the old daemon-side
+    /// cache produced, so clients see identical guidance.
+    pub(crate) fn resolve_provider(
+        &mut self,
+        ctx: &RequestContext,
+    ) -> Result<InferenceProvider, String> {
+        if let Some(p) = &self.provider {
+            return Ok(p.clone());
+        }
+        let Some(name) = self.config.account_name.clone() else {
+            return Err(
+                "no account configured on this session — use /account <name> to set one"
+                    .to_string(),
+            );
+        };
+        let (reply, rx) = mpsc::channel();
+        let _ = ctx.daemon_tx.send(DaemonCommand::ResolveAccountCmd {
+            account: name.clone(),
+            reply,
+        });
+        // `None` from the daemon covers every failure the old provider cache
+        // hid behind the same reply shape: unknown account, keystore locked,
+        // or no credential stored. Keep the exact wording those paths used.
+        let Some((config, api_key)) = rx.recv().ok().flatten() else {
+            return Err(format!(
+                "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
+            ));
+        };
+        let Some(api_key) = api_key else {
+            return Err(format!(
+                "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
+            ));
+        };
+        let provider = InferenceProvider::from_account_config(&config, Some(api_key), &self.registry)
+            .map_err(|e| {
+                tracing::warn!(
+                    session = ctx.session_id,
+                    account = %name,
+                    error = %e,
+                    "failed to build provider client for session"
+                );
+                // Same user-facing message as the old unresolvable-cache path.
+                format!(
+                    "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
+                )
+            })?;
+        debug!(session = ctx.session_id, account = %name, "resolved session provider lazily");
+        self.provider = Some(provider.clone());
+        Ok(provider)
     }
 }
 
@@ -1015,7 +1096,8 @@ fn default_active_tool_groups() -> HashSet<String> {
 
 pub fn session_main(
     rx: std::sync::mpsc::Receiver<SessionCommand>,
-    provider: Option<InferenceProvider>,
+    initial_provider: Option<InferenceProvider>,
+    registry: choreo_ai_protocols::SocketRegistry,
     account_name: Option<String>,
     init_record: Option<SessionRecord>,
     ctx: RequestContext,
@@ -1061,7 +1143,11 @@ pub fn session_main(
     };
     let mut state = SessionState {
         config,
-        provider,
+        // `initial_provider` is `None` in production (the daemon always
+        // resolves lazily on the session thread); tests may seed a provider
+        // directly to avoid driving the daemon resolution round-trip.
+        provider: initial_provider,
+        registry,
         ..SessionState::empty()
     };
 
@@ -1166,6 +1252,19 @@ fn process_command(
             handle_unload_tools(groups, reply, state, ctx)
         }
         SessionCommand::SetAccount { name } => handle_set_account(name, state, ctx),
+        SessionCommand::DropProvider => {
+            // The daemon decided the cached client is stale (keystore locked,
+            // credential removed/changed, account reconfigured). Drop it so
+            // the next request rebuilds against fresh credentials; the
+            // session's registry survives so its cancellable scope is stable.
+            if state.provider.take().is_some() {
+                info!(
+                    session = ctx.session_id,
+                    "dropped cached provider client; it will be rebuilt on the next request"
+                );
+            }
+            false
+        }
         SessionCommand::SetReasoningEffort { effort } => {
             handle_set_reasoning_effort(effort, state, ctx)
         }
@@ -1205,53 +1304,19 @@ fn handle_run_input(
             "empty input",
         );
     }
-    let provider = if let Some(p) = state.provider.as_ref() {
-        p.clone()
-    } else if let Some(ref name) = state.config.account_name {
-        // No cached provider yet — try lazy resolution via the daemon.
-        let (reply, rx) = mpsc::channel();
-        let _ = ctx.daemon_tx.send(DaemonCommand::ResolveProviderCmd {
-            account: name.clone(),
-            reply,
-        });
-        match rx.recv() {
-            Ok(Some(provider)) => {
-                state.provider = Some(provider);
-                // Re-resolve context window now that the provider is
-                // available (e.g. after unlocking the daemon).
-                state.resolve_context_window_if_missing(ctx);
-                let Some(p) = state.provider.as_ref() else {
-                    return fail_request(
-                        &mut state.subscribers,
-                        ctx,
-                        ctx.session_id,
-                        request_id,
-                        "internal error: provider not set after resolution".to_string(),
-                    );
-                };
-                p.clone()
-            }
-            _ => {
-                return fail_request(
-                    &mut state.subscribers,
-                    ctx,
-                    ctx.session_id,
-                    request_id,
-                    format!(
-                        "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
-                    ),
-                );
-            }
+    // Lazy provider resolution: the client is built HERE, on the session
+    // thread, against THIS session's socket registry — so a session created
+    // while the keystore is locked still works once credentials appear, and
+    // every socket it dials is cancellable with the session.
+    let provider = match state.resolve_provider(ctx) {
+        Ok(p) => p,
+        Err(msg) => {
+            return fail_request(&mut state.subscribers, ctx, ctx.session_id, request_id, msg);
         }
-    } else {
-        return fail_request(
-            &mut state.subscribers,
-            ctx,
-            ctx.session_id,
-            request_id,
-            "no account configured on this session — use /account <name> to set one",
-        );
     };
+    // Re-resolve context window now that a provider is available (e.g. the
+    // first request after unlocking the daemon).
+    state.resolve_context_window_if_missing(ctx);
     let model = match &state.config.selected_model {
         Some(m) => m.clone(),
         None => {
@@ -1338,9 +1403,15 @@ fn handle_run_child_input(
     shutdown_requested: &mut bool,
     ctx: &RequestContext,
 ) -> bool {
-    let Some(provider) = state.provider.as_ref() else {
-        let _ = reply.send(Err(io::Error::other("daemon locked")));
-        return false;
+    // Lazy resolution (same path as RunInput): a session thread that has
+    // never run a request may still be provider-less (keystore was locked at
+    // attach). The old wording ("daemon locked") is preserved for failures.
+    let provider = match state.resolve_provider(ctx) {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = reply.send(Err(io::Error::other("daemon locked")));
+            return false;
+        }
     };
     let model = state.config.selected_model.clone().unwrap_or_default();
     if *shutdown_requested {
@@ -2083,13 +2154,20 @@ fn handle_unload_tools(
 /// Set the account for this session and try to resolve its provider.
 fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
     info!("session {}: SetAccount account={}", ctx.session_id, name);
-    // Try to resolve the provider from the daemon by name.
+    // Try to resolve the account config + API key from the daemon; the client
+    // itself is built HERE against this session's registry so its sockets are
+    // session-cancellable. If resolution fails (locked, no credential yet)
+    // the provider stays None — the account name is still recorded and the
+    // next request retries lazily (see `SessionState::resolve_provider`).
     let (reply, rx) = mpsc::channel();
-    let _ = ctx.daemon_tx.send(DaemonCommand::ResolveProviderCmd {
+    let _ = ctx.daemon_tx.send(DaemonCommand::ResolveAccountCmd {
         account: name.clone(),
         reply,
     });
-    if let Ok(Some(provider)) = rx.recv() {
+    if let Ok(Some((config, Some(api_key)))) = rx.recv()
+        && let Ok(provider) =
+            InferenceProvider::from_account_config(&config, Some(api_key), &state.registry)
+    {
         // Re-resolve context window if a model is already selected.
         if let Some(ref model) = state.config.selected_model {
             let cw = provider.resolve_context_window(model);

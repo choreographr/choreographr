@@ -28,7 +28,7 @@ fn shutdown_all_unblocks_blocking_reader() {
     // client stream. shutdown_all closes the dup — the ORIGINAL stream is
     // the one whose blocked read must un-block (same underlying socket).
     let dup = client.try_clone().expect("try_clone");
-    registry.register(OwnedFd::from(dup));
+    let _id = registry.register(OwnedFd::from(dup));
 
     // Reader thread blocks in read() until shutdown_all forces it out.
     let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<usize>>();

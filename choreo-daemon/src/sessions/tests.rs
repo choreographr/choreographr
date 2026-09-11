@@ -52,7 +52,67 @@ fn test_state() -> SessionState {
         subscribers: HashMap::new(),
         active_requests: BTreeMap::new(),
         provider: None,
+        // A fresh empty registry: any provider client this test state builds
+        // registers here, mirroring the production per-session scope.
+        registry: choreo_ai_protocols::SocketRegistry::default(),
     }
+}
+
+/// Drive `resolve_provider` to completion without the keystore: a fake
+/// daemon serves the `ResolveAccountCmd` reply from a thread, exactly the
+/// round-trip the real command loop performs.
+#[test]
+fn resolve_provider_rebuilds_lazily_after_client_drop() {
+    use std::sync::mpsc;
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
+    let tool_registry = ToolRegistry::new().build();
+    let (daemon_tx, daemon_rx) = mpsc::channel();
+    let (cmd_tx, _) = mpsc::channel();
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 1,
+        db,
+        tool_registry,
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: LagLimits::default(),
+        global_lag: Arc::new(AtomicUsize::new(0)),
+        substrate_credential: None,
+    };
+
+    // The fake daemon: answer exactly ONE ResolveAccountCmd, then exit when
+    // the channel closes. Deterministic — the session's `recv` unblocks only
+    // after this thread's reply is sent.
+    let server = std::thread::spawn(move || {
+        while let Ok(DaemonCommand::ResolveAccountCmd { account, reply }) = daemon_rx.recv() {
+            assert_eq!(account, "mock-account");
+            let mut config = crate::accounts::AccountConfig::simple("mock-account", "openai");
+            config.base_url = Some("https://mock.invalid/v1".to_string());
+            let _ = reply.send(Some((config, Some("test-key".into()))));
+        }
+    });
+
+    let mut state = SessionState::empty();
+    state.config.account_name = Some("mock-account".into());
+    assert!(state.provider.is_none(), "clientless after the drop");
+
+    let provider = state.resolve_provider(&ctx).expect("resolution succeeds");
+    // The client was built from the served config (OpenAI protocol slug)
+    // and cached on the session for reuse.
+    assert_eq!(provider.provider_slug(), "openai");
+    assert_eq!(
+        state.provider.as_ref().map(|p| p.provider_slug()),
+        Some("openai")
+    );
+
+    // Drop the handles; the channel disconnects and the server thread exits
+    // promptly (nothing else holds the sender after this).
+    drop(ctx.daemon_tx);
+    drop(ctx.cmd_tx);
+    server.join().unwrap();
+    drop(provider);
 }
 
 #[test]
@@ -321,7 +381,6 @@ fn broadcast_setup() -> (SessionState, RequestContext) {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
-        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     (test_state(), ctx)
 }
@@ -1137,7 +1196,6 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
-        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     let mut state = test_state();
 
@@ -1276,7 +1334,6 @@ fn sync_accumulated_usage_never_regresses_config() {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
-        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     let mut state = test_state();
     let mut shutdown = false;

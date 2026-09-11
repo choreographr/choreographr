@@ -146,6 +146,7 @@ fn spawn_session_with_provider(
         session_main(
             session_rx,
             Some(provider),
+            choreo_ai_protocols::SocketRegistry::default(),
             None,
             None,
             RequestContext {
@@ -158,7 +159,6 @@ fn spawn_session_with_provider(
                 lag_limits: LagLimits::default(),
                 global_lag: Arc::new(AtomicUsize::new(0)),
                 substrate_credential: None,
-                socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
             },
         );
     });
@@ -430,13 +430,16 @@ fn evicts_client_that_stops_reading() {
     let mut daemon = common::SpawnedDaemon::start_with_state(
         move || {
             let mock = MockProvider::start(vec![(200, "text/event-stream", sse.clone())]);
-            let provider = mock_openai_provider(mock.base_url("v1"));
             let mut state = common::test_daemon_state_with_limits(limits);
-            // Pre-register the provider under a fake account so a session
-            // created with that account can resolve it at spawn (the real
-            // daemon's normal resolution path is account-config + credential
-            // based, which a test cannot drive without hitting a real API).
-            state.providers.insert("mock-account".to_string(), provider);
+            // Seed the mock account so a session created with it resolves
+            // its provider lazily (via ResolveAccountCmd) against its OWN
+            // socket registry — the per-session-registry wiring under test.
+            common::seed_mock_account(
+                &mut state,
+                "mock-account",
+                mock.base_url("v1"),
+                &["mock-4o"],
+            );
             // Keep the mock's serve thread alive for the daemon's lifetime.
             (state, vec![Box::new(mock)])
         },

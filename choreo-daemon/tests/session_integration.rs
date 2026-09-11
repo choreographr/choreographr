@@ -22,6 +22,7 @@ fn spawn_session(
         session_main(
             session_rx,
             None,
+            choreo_ai_protocols::SocketRegistry::default(),
             None,
             None,
             RequestContext {
@@ -34,7 +35,6 @@ fn spawn_session(
                 lag_limits: LagLimits::default(),
                 global_lag: Arc::new(AtomicUsize::new(0)),
                 substrate_credential: None,
-                socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
             },
         );
     });

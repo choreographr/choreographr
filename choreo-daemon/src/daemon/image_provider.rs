@@ -29,12 +29,13 @@ use thiserror::Error;
 /// text, but the daemon side gets real variants to match on.
 #[derive(Debug, Clone, Error)]
 pub enum ImageProviderError {
-    /// `providers` is empty — the keystore is locked (or no credential has
-    /// ever been stored), so no provider can be resolved at all.
+    /// The keystore is locked (or no credential has ever been stored),
+    /// so no provider can be resolved at all.
     #[error("keystore is locked — unlock first")]
     Locked,
-    /// The explicitly named account is absent from the resolved map (typo,
-    /// wrong session account, or the account never resolved a provider).
+    /// The explicitly named account is absent from the configured map or
+    /// holds no decrypted credential (typo, wrong session account, or
+    /// the keystore is locked).
     #[error(
         "account '{name}' is not configured or has no resolved provider — \
          add it and set it on the session"
@@ -43,7 +44,7 @@ pub enum ImageProviderError {
     /// The account resolved, but its provider has no image backend.
     #[error("provider '{slug}' does not support image generation")]
     NoImageBackend { slug: String },
-    /// Unlocked, but EVERY resolved provider lacks an image backend — the
+    /// Unlocked, but NO credentialed account has an image backend — the
     /// slug names the deterministic (sorted-first) provider that was
     /// inspected, so the message names an actual blocker.
     #[error("provider '{slug}' does not support image generation")]
@@ -58,12 +59,13 @@ impl DaemonState {
     /// call leaves a trace in the daemon log.
     pub(super) fn handle_get_image_generation_provider(
         &self,
+        session_id: u64,
         account_name: Option<String>,
         reply: crossbeam_channel::Sender<
             Result<crate::providers::ImageProviderHandle, ImageProviderError>,
         >,
     ) {
-        let result = self.resolve_image_generation_provider(account_name.as_deref());
+        let result = self.resolve_image_generation_provider(session_id, account_name.as_deref());
         match &result {
             Ok(handle) => {
                 info!(
@@ -92,34 +94,57 @@ impl DaemonState {
     /// Resolution order mirrors `handle_list_models_inner`: an explicit
     /// account name wins; `None` falls through to the only/default account —
     /// there is no persistent "default account" concept in `DaemonState`, so
-    /// the deterministic pick is the FIRST image-capable provider in
-    /// sorted-key order (sorted, not map order, so the answer does not depend
+    /// the deterministic pick is the FIRST image-capable credentialed account
+    /// in sorted order (sorted, not map order, so the answer does not depend
     /// on HashMap iteration noise).
+    ///
+    /// The client is built against the REQUESTING SESSION's socket registry
+    /// (its clone lives in `session_registries`), so image sockets land in
+    /// the session's cancellable scope — cancelling the session force-closes
+    /// its in-flight image request too. When the session is already gone the
+    /// daemon-owned registry is used as a fallback (the sockets then only
+    /// close on suspend).
     pub(super) fn resolve_image_generation_provider(
         &self,
+        session_id: u64,
         account_name: Option<&str>,
     ) -> Result<crate::providers::ImageProviderHandle, ImageProviderError> {
-        // `providers` is wiped by /lock (`providers.clear()`), so an empty map
-        // here means the keystore is locked (or no credential has ever been
-        // stored) — lock revocation of a previously returned handle falls out
-        // of the SAME clear: the client Arc already handed out stays valid
-        // until the tool drops it, but no NEW handle can be resolved, which
-        // is the contract the tool checks per call.
-        if self.providers.is_empty() {
+        // Lock check FIRST: after /lock there are no decrypted credentials,
+        // so no client can be built — the same contract the old providers-map
+        // emptiness check enforced. (A handle already handed out stays valid
+        // until the tool drops it; only NEW resolution is blocked.)
+        if self.locked {
             return Err(ImageProviderError::Locked);
         }
 
+        // Registry scope: the session's clone when it is still alive, else
+        // the daemon-owned registry.
+        let fallback;
+        let registry = match self.session_registries.get(&session_id) {
+            Some(r) => r,
+            None => {
+                fallback = &self.daemon_registry;
+                fallback
+            }
+        };
+        let build = |name: &str| {
+            self.accounts
+                .get(name)
+                .and_then(|config| {
+                    InferenceProvider::from_account_config(config, self.api_key_for(name), registry)
+                        .ok()
+                })
+                .ok_or_else(|| ImageProviderError::AccountNotConfigured {
+                    name: name.to_string(),
+                })
+        };
+
         match account_name {
             Some(name) => {
-                let provider = self.providers.get(name).ok_or_else(|| {
-                    // Name the missing account explicitly — a generic "no
-                    // account is configured" here would misdiagnose the
-                    // (common) typo/wrong-session-account case, since the
-                    // map is demonstrably non-empty at this point.
-                    ImageProviderError::AccountNotConfigured {
-                        name: name.to_string(),
-                    }
-                })?;
+                // Name the missing account explicitly — a generic "no
+                // account is configured" here would misdiagnose the
+                // (common) typo/wrong-session-account case.
+                let provider = build(name)?;
                 let client =
                     provider
                         .image_client()
@@ -132,45 +157,35 @@ impl DaemonState {
                 })
             }
             None => {
-                // Deterministic default: lowest account name that has an
-                // image backend. HashMap order is not stable between runs, so
-                // sorting keeps "only one image-capable account" unambiguous
-                // and repeatable.
-                let best = self
-                    .providers
+                // Deterministic default: lowest credentialed account name
+                // that has an image backend. HashMap order is not stable
+                // between runs, so sorting keeps "only one image-capable
+                // account" unambiguous and repeatable.
+                let mut names: Vec<String> = self
+                    .accounts
+                    .all_configs()
                     .iter()
-                    .filter(|(_, p)| p.image_client().is_some())
-                    .min_by(|(a, _), (b, _)| a.cmp(b));
-                match best {
-                    Some((_, provider)) => {
-                        let client = provider
-                            .image_client()
-                            // Just filtered for Some — a None here would mean
-                            // a broken `image_client()`; degrade to an error,
-                            // never panic.
-                            .ok_or_else(|| ImageProviderError::NoImageBackend {
-                                slug: provider.provider_slug().to_string(),
-                            })?;
-                        Ok(crate::providers::ImageProviderHandle {
+                    .map(|c| c.name.clone())
+                    .collect();
+                names.sort();
+                let mut inspected_slug = String::new();
+                for name in names {
+                    let Ok(provider) = build(name.as_str()) else {
+                        continue;
+                    };
+                    if inspected_slug.is_empty() {
+                        inspected_slug = provider.provider_slug().to_string();
+                    }
+                    if let Some(client) = provider.image_client() {
+                        return Ok(crate::providers::ImageProviderHandle {
                             slug: provider.provider_slug().to_string(),
                             client,
-                        })
-                    }
-                    // Unlocked but every resolved provider is a protocol with
-                    // no image backend (Anthropic/Gemini) — surface a slug so
-                    // the message names an actual blocker. `min_by` over the
-                    // sorted keys keeps the picked slug deterministic, unlike
-                    // HashMap `values().next()` iteration order.
-                    None => {
-                        let slug = self
-                            .providers
-                            .iter()
-                            .min_by(|(a, _), (b, _)| a.cmp(b))
-                            .map(|(_, p)| p.provider_slug().to_string())
-                            .unwrap_or_default();
-                        Err(ImageProviderError::NoImageCapableAccount { slug })
+                        });
                     }
                 }
+                Err(ImageProviderError::NoImageCapableAccount {
+                    slug: inspected_slug,
+                })
             }
         }
     }
@@ -185,22 +200,41 @@ mod tests {
     /// reply (the same channel shape the tool thread will use in production).
     fn send_get_image_provider(
         state: &mut DaemonState,
+        session_id: u64,
         account_name: Option<String>,
     ) -> Result<crate::providers::ImageProviderHandle, ImageProviderError> {
         let (reply, rx) = crossbeam_channel::unbounded();
         state.handle_command(DaemonCommand::GetImageGenerationProvider {
+            session_id,
             account_name,
             reply,
         });
         rx.recv().unwrap()
     }
 
+    /// Seed `state` as an UNLOCKED daemon holding one credentialed account:
+    /// the resolution path reads the account config from `state.accounts`
+    /// and the decrypted key from `state.credentials` (the provider is built
+    /// fresh per resolution — there is no daemon-side cache anymore).
+    fn seed_account(state: &mut DaemonState, name: &str, provider_slug: &str) {
+        state.locked = false;
+        state
+            .accounts
+            .add(AccountConfig::simple(name, provider_slug))
+            .unwrap();
+        state.credentials.insert(
+            name.to_string(),
+            ServiceCredential::ApiKey {
+                key: "test-key".to_string(),
+            },
+        );
+    }
+
     #[test]
     fn get_image_provider_locked_keystore_errors_with_unlock_guidance() {
         let (mut state, _rx) = make_daemon_state();
-        // A fresh test state starts locked with an empty providers map — the
-        // exact shape /lock leaves behind.
-        let err = send_get_image_provider(&mut state, None).unwrap_err();
+        // A fresh test state starts locked — the exact shape /lock leaves.
+        let err = send_get_image_provider(&mut state, 7, None).unwrap_err();
         assert!(
             matches!(err, ImageProviderError::Locked)
                 && err.to_string().contains("keystore is locked"),
@@ -212,16 +246,9 @@ mod tests {
     fn get_image_provider_named_account_without_image_backend_names_slug() {
         let (mut state, _rx) = make_daemon_state();
         // An Anthropic-protocol provider has no image backend in v1.
-        let cfg = AccountConfig::simple("claude", "anthropic");
-        let provider = InferenceProvider::from_account_config(
-            &cfg,
-            Some("test-key".into()),
-            &choreo_ai_protocols::SocketRegistry::new(),
-        )
-        .unwrap();
-        state.providers.insert("claude".into(), provider);
+        seed_account(&mut state, "claude", "anthropic");
 
-        let err = send_get_image_provider(&mut state, Some("claude".into())).unwrap_err();
+        let err = send_get_image_provider(&mut state, 7, Some("claude".into())).unwrap_err();
         assert!(
             matches!(&err, ImageProviderError::NoImageBackend { slug } if slug == "anthropic"),
             "error must name the provider slug, got: {err}"
@@ -231,21 +258,13 @@ mod tests {
     #[test]
     fn get_image_provider_unknown_named_account_names_the_account() {
         let (mut state, _rx) = make_daemon_state();
-        // A resolved map that does NOT contain the requested name: the error
-        // must name the account, not the generic "no account is configured"
-        // (which would misdiagnose a typo / wrong session account).
-        let cfg = AccountConfig::simple("openai", "openai");
-        state.providers.insert(
-            "openai".into(),
-            InferenceProvider::from_account_config(
-                &cfg,
-                Some("test-key".into()),
-                &choreo_ai_protocols::SocketRegistry::new(),
-            )
-            .unwrap(),
-        );
+        // A configured account that does NOT match the requested name: the
+        // error must name the account, not the generic "no account is
+        // configured" (which would misdiagnose a typo / wrong session
+        // account).
+        seed_account(&mut state, "openai", "openai");
 
-        let err = send_get_image_provider(&mut state, Some("oepnai".into())).unwrap_err();
+        let err = send_get_image_provider(&mut state, 7, Some("oepnai".into())).unwrap_err();
         assert!(
             matches!(&err, ImageProviderError::AccountNotConfigured { name } if name == "oepnai")
                 && err
@@ -259,17 +278,10 @@ mod tests {
     fn get_image_provider_happy_path_returns_handle_with_working_client() {
         let (mut state, _rx) = make_daemon_state();
         // A real OpenAI-protocol account with a fake api key — resolves
-        // through the same `from_account_config` path production uses.
-        let cfg = AccountConfig::simple("openai", "openai");
-        let provider = InferenceProvider::from_account_config(
-            &cfg,
-            Some("test-key".into()),
-            &choreo_ai_protocols::SocketRegistry::new(),
-        )
-        .unwrap();
-        state.providers.insert("openai".into(), provider);
+        // through the same accounts+credentials path production uses.
+        seed_account(&mut state, "openai", "openai");
 
-        let handle = send_get_image_provider(&mut state, Some("openai".into())).unwrap();
+        let handle = send_get_image_provider(&mut state, 7, Some("openai".into())).unwrap();
         // The slug is the catalog slug, and the client is a working
         // `ImageGenerationClient` — its own provider_slug answers.
         assert_eq!(handle.slug, "openai");
@@ -282,28 +294,10 @@ mod tests {
         // One Anthropic provider (no backend) and one OpenAI provider
         // (backend): `account_name: None` must deterministically pick the
         // image-capable one.
-        let claude = AccountConfig::simple("claude", "anthropic");
-        let openai = AccountConfig::simple("openai", "openai");
-        state.providers.insert(
-            "claude".into(),
-            InferenceProvider::from_account_config(
-                &claude,
-                Some("test-key".into()),
-                &choreo_ai_protocols::SocketRegistry::new(),
-            )
-            .unwrap(),
-        );
-        state.providers.insert(
-            "openai".into(),
-            InferenceProvider::from_account_config(
-                &openai,
-                Some("test-key".into()),
-                &choreo_ai_protocols::SocketRegistry::new(),
-            )
-            .unwrap(),
-        );
+        seed_account(&mut state, "claude", "anthropic");
+        seed_account(&mut state, "openai", "openai");
 
-        let handle = send_get_image_provider(&mut state, None).unwrap();
+        let handle = send_get_image_provider(&mut state, 7, None).unwrap();
         assert_eq!(handle.slug, "openai");
         assert_eq!(handle.client.provider_slug(), "openai");
     }
@@ -311,23 +305,17 @@ mod tests {
     #[test]
     fn get_image_provider_revoked_after_lock() {
         let (mut state, _rx) = make_daemon_state();
-        let cfg = AccountConfig::simple("openai", "openai");
-        let provider = InferenceProvider::from_account_config(
-            &cfg,
-            Some("test-key".into()),
-            &choreo_ai_protocols::SocketRegistry::new(),
-        )
-        .unwrap();
-        state.providers.insert("openai".into(), provider);
-        assert!(send_get_image_provider(&mut state, Some("openai".into())).is_ok());
+        seed_account(&mut state, "openai", "openai");
+        assert!(send_get_image_provider(&mut state, 7, Some("openai".into())).is_ok());
 
-        // Simulate /lock: the handler clears the providers map. A handle
-        // resolved BEFORE the clear stays alive in the tool's hands (the Arc
-        // is valid), but no NEW handle can be resolved — the revocation
-        // contract.
-        state.providers.clear();
+        // Simulate /lock: the handler clears the credentials map (there is
+        // no provider cache to clear anymore). A handle resolved BEFORE the
+        // clear stays alive in the tool's hands (the Arc is valid), but no
+        // NEW handle can be resolved — the revocation contract.
+        state.credentials.clear();
+        state.locked = true;
 
-        let err = send_get_image_provider(&mut state, Some("openai".into())).unwrap_err();
+        let err = send_get_image_provider(&mut state, 7, Some("openai".into())).unwrap_err();
         assert!(
             matches!(err, ImageProviderError::Locked),
             "post-lock resolution must fail with unlock guidance, got: {err}"

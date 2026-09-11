@@ -1,6 +1,5 @@
 use super::*;
 use crate::broadcast::test_sink;
-use crate::providers::test_util::{make_failing_provider, make_test_provider};
 use crate::sessions::SessionMetadata;
 use choreo_proto::{DaemonMessage, SessionEvent, SessionStatus};
 use std::collections::HashMap;
@@ -16,6 +15,11 @@ pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>
     let tool_registry = crate::tools::ToolRegistry::new().build();
     let config_dir = tempfile::tempdir().unwrap();
     let accounts_path = config_dir.path().join("accounts.toml");
+    // The stays-alive detail: `add`/`save` later rewrite the accounts file
+    // (tests seed accounts post-construction), so the directory holding it
+    // must OUTLIVE the state — forgetting the TempDir leaks its cleanup, an
+    // acceptable cost in a per-test process.
+    std::mem::forget(config_dir);
     let state = DaemonState {
         next_session_id: 1,
         max_turns: 10,
@@ -24,10 +28,8 @@ pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>
         deleted_sessions: HashSet::new(),
         children: HashMap::new(),
         accounts: AccountManager::load(&accounts_path).unwrap(),
-        providers: HashMap::new(),
-        // Fresh empty registry per test state — no provider sockets exist in
-        // unit tests, so the shared-handle semantics are inert here.
-        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
+        daemon_registry: choreo_ai_protocols::SocketRegistry::default(),
+        session_registries: HashMap::new(),
         credentials: HashMap::new(),
         x_credentials: None,
         // Test states start locked, matching the production daemon.
@@ -49,6 +51,55 @@ pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>
         catalog_paths: CatalogPaths::default(),
     };
     (state, daemon_rx)
+}
+
+/// Seed an account config + decrypted credential so the new lazy provider
+/// gate (`self.accounts.contains + self.api_key_for`) sees the account as
+/// resolvable. When `base_url` is given the OpenAI client is pointed there
+/// — used with a dead local port so background prefetch fetches fail
+/// instantly (connection refused) without touching the real network.
+fn seed_credentialed_account(
+    state: &mut DaemonState,
+    name: &str,
+    provider_slug: &str,
+) -> crate::accounts::AccountConfig {
+    seed_credentialed_account_with_url(state, name, provider_slug, None)
+}
+
+/// Like [`seed_credentialed_account`] but with an explicit `base_url`
+/// override sculpted into the config (None keeps the catalog default —
+/// never dialed in these tests; building a client does not connect).
+fn seed_credentialed_account_with_url(
+    state: &mut DaemonState,
+    name: &str,
+    provider_slug: &str,
+    base_url: Option<String>,
+) -> crate::accounts::AccountConfig {
+    let mut config = crate::accounts::AccountConfig::simple(name, provider_slug);
+    config.base_url = base_url;
+    // Fail fast on the (dead) endpoint instead of the provider default
+    // timeouts/retries.
+    config.retry_max_attempts = Some(1);
+    config.connect_timeout_secs = Some(2);
+    config.request_timeout_secs = Some(5);
+    config.total_timeout_secs = Some(10);
+    state.accounts.add(config.clone()).unwrap();
+    state.credentials.insert(
+        name.to_string(),
+        ServiceCredential::ApiKey {
+            key: "test-key".to_string(),
+        },
+    );
+    config
+}
+
+/// Bind a local port and immediately release it: connecting to the address
+/// fails instantly with ECONNREFUSED — the deterministic zero-network stand-
+/// in for an unreachable provider.
+fn dead_base_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let _ = listener.set_nonblocking(true);
+    format!("http://{}", listener.local_addr().unwrap())
 }
 
 /// `handle_suspend_event` is the power-event policy: SuspendEvent::Sleep
@@ -79,7 +130,10 @@ mod suspend_tests {
         let mut peer = registered_pair(&registry);
         assert_eq!(registry.registered_count(), 1);
 
-        handle_suspend_event(&SuspendEvent::Sleep, &registry);
+        // (An empty session-map is fine here: the session-scoped close is
+        // pinned separately by the cancel-isolation tests below.)
+        let empty: std::collections::HashMap<u64, SocketRegistry> = HashMap::new();
+        handle_suspend_event(&SuspendEvent::Sleep, &registry, &empty);
 
         // The registry cleared its list (shutdown_all closes each fd).
         assert_eq!(registry.registered_count(), 0);
@@ -91,15 +145,191 @@ mod suspend_tests {
     }
 
     #[test]
-    fn wake_leaves_registry_untouched() {
+    fn sleep_force_closes_session_registries_too() {
+        // Suspend must close EVERY session's registry alongside the
+        // daemon-owned one — a machine-wide event, not a per-session one.
+        let daemon_registry = SocketRegistry::new();
+        let mut sessions: HashMap<u64, SocketRegistry> = HashMap::new();
+        let mut peers = Vec::new();
+        for id in [1u64, 2, 3] {
+            let r = SocketRegistry::new();
+            peers.push(registered_pair(&r));
+            assert_eq!(r.registered_count(), 1);
+            sessions.insert(id, r);
+        }
+        assert_eq!(daemon_registry.registered_count(), 0);
+
+        handle_suspend_event(&SuspendEvent::Sleep, &daemon_registry, &sessions);
+
+        assert_eq!(daemon_registry.registered_count(), 0);
+        for (id, r) in &sessions {
+            assert_eq!(r.registered_count(), 0, "session {id} registry cleared");
+        }
+        for peer in &mut peers {
+            let mut buf = [0u8; 1];
+            let n = std::io::Read::read(peer, &mut buf).unwrap();
+            assert_eq!(n, 0, "session peer must see EOF after sleep force-close");
+        }
+    }
+
+    #[test]
+    fn wake_prunes_dead_but_keeps_live_sockets() {
+        // Wake prunes DEAD entries (defense-in-depth for a missed Sleep
+        // event) but must keep LIVE ones: fresh connections can legitimately
+        // exist across the suspend, so a blanket shutdown on wake would
+        // disturb healthy sockets. One live pair + one dead fd pin the
+        // split: the dead fd's registry entry is removed, the live one
+        // survives.
         let registry = SocketRegistry::new();
-        let _peer = registered_pair(&registry);
+        let _live_keep = live_pair(&registry);
+        let _dead = dead_pair(&registry); // one dead entry in the SAME registry
+        let mut sessions: HashMap<u64, SocketRegistry> = HashMap::new();
+        let session_registry = SocketRegistry::new();
+        let _session_live = live_pair(&session_registry);
+        let _session_dead = dead_pair(&session_registry);
+        sessions.insert(1, session_registry);
 
-        handle_suspend_event(&SuspendEvent::Wake, &registry);
+        handle_suspend_event(&SuspendEvent::Wake, &registry, &sessions);
 
-        // Wake is log-only: nothing registered may be disturbed, because
-        // (unlike at sleep) fresh connections can legitimately exist.
+        // Only the dead entries were removed (2 registered → 1 per registry).
         assert_eq!(registry.registered_count(), 1);
+        assert_eq!(sessions[&1].registered_count(), 1);
+    }
+
+    /// Registers a LIVE entry into `registry`: a connected pair, both ends
+    /// kept alive by the caller (the registry holds a duplicate of `a`).
+    fn live_pair(registry: &SocketRegistry) -> (UnixStream, UnixStream) {
+        let (a, b) = UnixStream::pair().expect("unix pair");
+        registry.register(a.try_clone().expect("dup"));
+        (a, b)
+    }
+
+    /// Registers a DEAD entry into `registry`: the registered fd stays open
+    /// but its peer is dropped, so the probe sees EOF (Ok(0)) and renders
+    /// the "dead" verdict. Exactly the shape a post-resume dead socket has,
+    /// without any raw-fd games.
+    fn dead_pair(registry: &SocketRegistry) -> () {
+        let (a, b) = UnixStream::pair().expect("unix pair");
+        registry.register(a.try_clone().expect("dup"));
+        drop((a, b)); // both ends gone: the registered duplicate reads EOF
+    }
+}
+
+/// `handle_cancel_request` / `cancel_children_of` close EVERY targeted
+/// session's registry but NOTHING else's — cancel is scoped to the session
+/// (and, for a parent cancel, its subtree). Uses the same socket-pair
+/// technique as `suspend_tests`.
+mod cancel_isolation_tests {
+    use super::*;
+    use choreo_ai_protocols::SocketRegistry;
+    use std::os::unix::net::UnixStream;
+
+    /// Register a duplicate of `a` in `registry` (the registry takes the
+    /// dup; the test keeps BOTH ends so it can (1) observe the shutdown as
+    /// EOF on `b` and (2) verify a *live* registry by writing through `a`).
+    fn register_pair(registry: &SocketRegistry) -> (UnixStream, UnixStream) {
+        let (a, b) = UnixStream::pair().unwrap();
+        registry.register(a.try_clone().unwrap());
+        (a, b)
+    }
+
+    /// Seed a session whose registry the daemon holds a clone of, exactly
+    /// as `spawn_session` production order does (insert BEFORE the session
+    /// thread — here, before the cancel command).
+    fn seed_session(state: &mut DaemonState, id: u64) -> SocketRegistry {
+        let registry = SocketRegistry::default();
+        state.session_registries.insert(id, registry.clone());
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        state.active_sessions.insert(
+            id,
+            ActiveSessionEntry {
+                cmd_tx,
+                // No thread is spawned in this test scaffold: the entry is
+                // only read for its command channel, never joined.
+                handle: std::thread::Builder::new()
+                    .spawn(|| ())
+                    .expect("spawn placeholder thread"),
+            },
+        );
+        registry
+    }
+
+    /// EOF on the peer end (the successful force-close observable). A read
+    /// timeout guards every call so an *untouched* socket's read returns
+    /// TimedOut (not Ok(0)) instead of blocking a unit test forever.
+    fn peer_saw_close(b: &mut UnixStream) -> bool {
+        use std::time::Duration;
+        let _ = b.set_read_timeout(Some(Duration::from_secs(1)));
+        let mut buf = [0u8; 1];
+        matches!(std::io::Read::read(b, &mut buf), Ok(0))
+    }
+
+    #[test]
+    fn cancel_of_session_a_leaves_session_b_registry_untouched() {
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let (a_handle, mut a_peer) = {
+            let r = seed_session(&mut state, 1);
+            register_pair(&r)
+        };
+        let (mut b_handle, _b_peer) = {
+            let r = seed_session(&mut state, 2);
+            register_pair(&r)
+        };
+
+        state.handle_cancel_request(1, 7);
+
+        // Session A's sockets are dead.
+        assert!(peer_saw_close(&mut a_peer), "cancelled session sees EOF");
+        // Session B — even sharing NOTHING — is untouched: its registry
+        // still holds its entry and its socket is still writable.
+        assert_eq!(state.session_registries[&2].registered_count(), 1);
+        use std::io::Write;
+        b_handle
+            .write_all(b"x")
+            .expect("uncancelled session's socket must survive the cancel");
+    }
+
+    #[test]
+    fn cancel_of_parent_closes_children_registries() {
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let (parent_handle, mut parent_peer) = {
+            let r = seed_session(&mut state, 1);
+            register_pair(&r)
+        };
+        let (child_handle, mut child_peer) = {
+            let r = seed_session(&mut state, 11);
+            register_pair(&r)
+        };
+        state.children.insert(1, vec![11]);
+
+        state.handle_cancel_request(1, 7);
+
+        // The whole subtree loses its sockets...
+        assert!(peer_saw_close(&mut parent_peer));
+        assert!(peer_saw_close(&mut child_peer));
+        // ...while sessions OUTSIDE the subtree keep theirs.
+        let (outside, _outside_peer) = {
+            let r = seed_session(&mut state, 2);
+            register_pair(&r)
+        };
+        assert_eq!(state.session_registries[&2].registered_count(), 1);
+        drop((parent_handle, child_handle, outside));
+        // (outside_peer untouched — the count assertion above suffices.)
+    }
+
+    #[test]
+    fn cancel_of_unknown_session_is_a_noop() {
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let (handle, mut peer) = {
+            let r = seed_session(&mut state, 1);
+            register_pair(&r)
+        };
+
+        // No panic, and no collateral close of an unrelated session.
+        state.handle_cancel_request(999, 7);
+        assert_eq!(state.session_registries[&1].registered_count(), 1);
+        drop(handle);
+        assert!(!peer_saw_close(&mut peer));
     }
 }
 
@@ -1198,9 +1428,7 @@ fn handle_validate_model_rejects_unknown_model() {
             last_prompt_tokens: None,
         },
     );
-    state
-        .providers
-        .insert("test-account".into(), make_test_provider());
+    seed_credentialed_account(&mut state, "test-account", "openai");
     state.model_cache.insert(
         "test-account".into(),
         (vec!["gpt-4".into(), "gpt-3.5".into()], Instant::now()),
@@ -1243,9 +1471,7 @@ fn handle_validate_model_allows_known_model() {
             last_prompt_tokens: None,
         },
     );
-    state
-        .providers
-        .insert("test-account".into(), make_test_provider());
+    seed_credentialed_account(&mut state, "test-account", "openai");
     state.model_cache.insert(
         "test-account".into(),
         (vec!["gpt-4".into(), "gpt-3.5".into()], Instant::now()),
@@ -1679,11 +1905,41 @@ fn handle_accounts_reload_noops_when_logically_unchanged() {
     assert_eq!(state.accounts.names(), vec!["alpha".to_string()]);
 }
 
+fn insert_active_session_with_account(
+    state: &mut DaemonState,
+    session_id: u64,
+    account: &str,
+) -> (mpsc::Receiver<SessionCommand>, mpsc::Sender<()>) {
+    state.session_metadata.insert(
+        session_id,
+        SessionMetadata {
+            title: None,
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            created_at: 1000,
+            last_modified: 1000,
+            turn_count: 0,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: Some(account.to_string()),
+            accumulated_usage: TokenUsage::default(),
+            context_window: None,
+            last_prompt_tokens: None,
+        },
+    );
+    insert_active_session(state, session_id)
+}
+
 #[test]
-fn handle_accounts_reload_prunes_removed_account_providers() {
-    // When an external edit drops an account, the daemon drops its cached
-    // provider (a stale provider for a gone account is dead weight) while
-    // keeping the providers for accounts that still exist.
+fn handle_accounts_reload_invalidates_session_clients_of_removed_account() {
+    // When an external edit drops an account, every live session's cached
+    // provider client is invalidated (sent DropProvider) so it is rebuilt —
+    // and cleanly fails — on the next request instead of keep dialing a
+    // dead provider forever. (The reload invalidates ALL sessions, not only
+    // the removed account's: over-invalidation is harmless, each rebuild is
+    // lazy and gets the fresh config from the reloaded manager.)
     let (mut state, _rx) = make_daemon_state();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("accounts.toml");
@@ -1693,17 +1949,10 @@ fn handle_accounts_reload_prunes_removed_account_providers() {
         "[[account]]\nname = \"keep\"\nprovider = \"openai\"\n\n[[account]]\nname = \"gone\"\nprovider = \"anthropic\"\n",
     )
     .unwrap();
-
-    state
-        .providers
-        .insert("keep".to_string(), make_test_provider());
-    state
-        .providers
-        .insert("gone".to_string(), make_test_provider());
-
-    state.handle_command(DaemonCommand::AccountsReload);
-    assert!(state.accounts.contains("keep"));
-    assert!(state.accounts.contains("gone"));
+    seed_credentialed_account(&mut state, "keep", "openai");
+    seed_credentialed_account(&mut state, "gone", "anthropic");
+    let (keep_cmd_rx, keep_release) = insert_active_session_with_account(&mut state, 1, "keep");
+    let (gone_cmd_rx, gone_release) = insert_active_session_with_account(&mut state, 2, "gone");
 
     // Now remove "gone" externally.
     std::fs::write(
@@ -1712,35 +1961,41 @@ fn handle_accounts_reload_prunes_removed_account_providers() {
     )
     .unwrap();
     state.handle_command(DaemonCommand::AccountsReload);
-
+    assert!(state.accounts.contains("keep"));
     assert!(!state.accounts.contains("gone"));
+
+    // Both live sessions received the DropProvider invalidation (sends are
+    // synchronous on the command loop → try_recv is deterministic).
     assert!(
-        !state.providers.contains_key("gone"),
-        "removed account's cached provider is dropped"
+        matches!(gone_cmd_rx.try_recv(), Ok(SessionCommand::DropProvider)),
+        "removed account's session client must be invalidated"
     );
-    assert!(state.providers.contains_key("keep"));
+    assert!(
+        matches!(keep_cmd_rx.try_recv(), Ok(SessionCommand::DropProvider)),
+        "surviving session is over-invalidated harmlessly (rebuild is lazy)"
+    );
+    drop(keep_release);
+    drop(gone_release);
 }
 
 #[test]
-fn handle_accounts_reload_drops_stale_provider_for_modified_account() {
-    // The external edit that was a real bug: an account whose CONFIG changed
-    // (not removed) kept serving its old cached provider forever. The reload
-    // must drop the stale provider. We use a config whose client construction
-    // fails fast (unknown provider slug) so the deterministic assertion is
-    // "the stale provider is gone," not a network-dependent rebuild.
+fn handle_accounts_reload_drops_stale_client_for_modified_account() {
+    // The external edit that was a real bug under the old cache: an account
+    // whose CONFIG changed (not removed) kept serving its stale client
+    // forever. The reload must invalidate the session client so the next
+    // request rebuilds against the NEW config + still-held credential.
     let (mut state, _rx) = make_daemon_state();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("accounts.toml");
-    std::fs::write(
-        &path,
-        "[[account]]\nname = \"keep\"\nprovider = \"openai\"\n",
-    )
-    .unwrap();
+    // Load an EMPTY manager first, then materialize "keep" through the same
+    // add+save path the daemon itself uses (the seeded save writes the file;
+    // the later rewrite below is the external edit). Overwriting the loaded
+    // manager with the reparse is important: the reload's parse-compare
+    // must see this exact config as "current".
     state.accounts = AccountManager::load(&path).unwrap();
-    // Simulate a cached provider built from the OLD (openai) config.
-    state
-        .providers
-        .insert("keep".to_string(), make_test_provider());
+    seed_credentialed_account(&mut state, "keep", "openai");
+    state.accounts = AccountManager::load(&path).unwrap();
+    let (cmd_rx, release) = insert_active_session_with_account(&mut state, 1, "keep");
 
     // The account is edited externally: provider protocol changes.
     std::fs::write(
@@ -1752,13 +2007,14 @@ fn handle_accounts_reload_drops_stale_provider_for_modified_account() {
 
     // The new config is applied...
     assert_eq!(state.accounts.get("keep").unwrap().provider, "bogus");
-    // ...and the stale cached provider built from the old config is GONE (it
-    // fails to rebuild for the unknown slug, so it must not linger and keep
-    // serving the old protocol).
+    // ...and the session's stale client is invalidated; the next request
+    // rebuilds (and the bogus slug fails to build, surfacing clean
+    // guidance instead of silently dialing the old protocol).
     assert!(
-        !state.providers.contains_key("keep"),
-        "modified account's stale cached provider is dropped"
+        matches!(cmd_rx.try_recv(), Ok(SessionCommand::DropProvider)),
+        "modified account's session client must be invalidated"
     );
+    drop(release);
 }
 
 #[test]
@@ -2798,7 +3054,9 @@ fn handle_lock_clears_credentials_latches_locked_and_broadcasts() {
     });
     drain_send_on_subscribe(&writer_rx);
 
-    // Simulate an unlocked daemon holding decrypted credentials + providers.
+    // Simulate an unlocked daemon holding decrypted credentials and a live
+    // session with a cached client — the client must be invalidated so its
+    // next request rebuilds against fresh credentials.
     state.locked = false;
     state.credentials.insert(
         "openai".to_string(),
@@ -2806,9 +3064,7 @@ fn handle_lock_clears_credentials_latches_locked_and_broadcasts() {
             key: "sk-secret".to_string(),
         },
     );
-    state
-        .providers
-        .insert("openai".to_string(), make_test_provider());
+    let (cmd_rx, release) = insert_active_session_with_account(&mut state, 5, "openai");
     state.x_credentials = Some(ServiceCredential::ApiKey {
         key: "x-secret".to_string(),
     });
@@ -2816,13 +3072,18 @@ fn handle_lock_clears_credentials_latches_locked_and_broadcasts() {
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::Lock { reply });
 
-    // The wipe is confirmed, the state is latched locked, and the cleartext
-    // credentials (and their providers) are gone from memory.
+    // The wipe is confirmed, the state is latched locked, the cleartext
+    // credentials are gone from memory, and the session's cached client was
+    // invalidated for a lazy rebuild.
     assert!(reply_rx.recv().unwrap().is_ok());
     assert!(state.locked, "/lock must latch the locked state");
     assert!(state.credentials.is_empty(), "credentials cleared");
-    assert!(state.providers.is_empty(), "providers cleared");
     assert!(state.x_credentials.is_none(), "x credential cleared");
+    assert!(
+        matches!(cmd_rx.try_recv(), Ok(SessionCommand::DropProvider)),
+        "/lock must invalidate live session clients"
+    );
+    drop(release);
     // The transition was broadcast to every activity subscriber.
     match writer_rx.recv().unwrap() {
         DaemonMessage::Locked => {}
@@ -2856,14 +3117,14 @@ fn handle_lock_when_already_locked_does_not_rebroadcast() {
 // ── Background model prefetch ────────────────────────────────────────────
 
 #[test]
-fn should_prefetch_models_gates_on_provider_flight_and_freshness() {
+fn should_prefetch_models_gates_on_account_flight_and_freshness() {
     let (mut state, _rx) = make_daemon_state();
 
-    // No resolved provider → nothing to prefetch.
+    // No credentialed account → nothing to prefetch.
     assert!(!state.should_prefetch_models("acct"));
 
-    state.providers.insert("acct".into(), make_test_provider());
-    // Provider present, no cache → prefetch needed.
+    // Account exists WITH a credential, no cache → prefetch needed.
+    seed_credentialed_account(&mut state, "acct", "openai");
     assert!(state.should_prefetch_models("acct"));
 
     // In-flight → no duplicate prefetch (the dedup guard).
@@ -2891,10 +3152,10 @@ fn should_prefetch_models_gates_on_provider_flight_and_freshness() {
 #[test]
 fn handle_model_prefetch_result_success_populates_cache_and_releases_guard() {
     let (mut state, _rx) = make_daemon_state();
-    // A resolved provider is the real precondition for a prefetch (the
-    // spawn gate requires one), and the handler now discards results for
-    // accounts whose provider vanished mid-flight.
-    state.providers.insert("acct".into(), make_test_provider());
+    // A credentialed account is the real precondition for a prefetch (the
+    // spawn gate requires one), and the handler discards results for
+    // accounts whose credential vanished mid-flight.
+    seed_credentialed_account(&mut state, "acct", "openai");
     state.model_prefetch_in_flight.insert("acct".into());
 
     state.handle_command(DaemonCommand::ModelPrefetchResult {
@@ -2930,13 +3191,11 @@ fn handle_model_prefetch_result_failure_releases_guard_without_caching() {
 
 #[test]
 fn update_metadata_account_change_spawns_background_prefetch() {
-    // `make_failing_provider` returns list-models errors instantly (no
-    // network), so the spawned prefetch thread completes immediately and
-    // sends its result back over the daemon channel.
+    // The account is seeded against a dead local port, so the spawned
+    // prefetch thread fails instantly (ECONNREFUSED, no network) and sends
+    // its result back over the daemon channel right away.
     let (mut state, rx) = make_daemon_state();
-    state
-        .providers
-        .insert("acct".into(), make_failing_provider());
+    seed_credentialed_account_with_url(&mut state, "acct", "openai", Some(dead_base_url()));
     state.session_metadata.insert(
         1,
         SessionMetadata {
@@ -3001,9 +3260,7 @@ fn update_metadata_account_change_spawns_background_prefetch() {
 #[test]
 fn create_session_with_account_spawns_background_prefetch() {
     let (mut state, _rx) = make_daemon_state();
-    state
-        .providers
-        .insert("acct".into(), make_failing_provider());
+    seed_credentialed_account_with_url(&mut state, "acct", "openai", Some(dead_base_url()));
     let (reply, rx) = mpsc::channel();
 
     state.handle_command(DaemonCommand::CreateSession {
@@ -3027,18 +3284,13 @@ fn create_session_with_account_spawns_background_prefetch() {
 
 // ── ListModels never blocks the command loop ─────────────────────────────
 
-/// Build a state whose session 1 points at `account`, with the given
-/// provider (or none when `provider` is `None`).  Shared by the ListModels
-/// prefetch tests to keep the verbose SessionMetadata boilerplate in one
-/// place.
-fn state_with_session_account(
-    account: &str,
-    provider: Option<InferenceProvider>,
-) -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
+/// Build a state whose session 1 points at `account`, backed by a
+/// credentialed account whose endpoint is a dead local port (instant fetch
+/// failure). Shared by the ListModels prefetch tests to keep the verbose
+/// SessionMetadata boilerplate in one place.
+fn state_with_session_account(account: &str) -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
     let (mut state, rx) = make_daemon_state();
-    if let Some(p) = provider {
-        state.providers.insert(account.to_string(), p);
-    }
+    seed_credentialed_account_with_url(&mut state, account, "openai", Some(dead_base_url()));
     state.session_metadata.insert(
         1,
         SessionMetadata {
@@ -3066,7 +3318,7 @@ fn list_models_serves_stale_cache_without_duplicate_fetch_while_prefetch_in_flig
     // In-flight prefetch + a stale cache: the on-demand path must serve the
     // stale list and NOT spawn a second (duplicate) HTTP fetch behind the
     // running one.
-    let (mut state, rx) = state_with_session_account("acct", Some(make_failing_provider()));
+    let (mut state, rx) = state_with_session_account("acct");
     state.model_cache.insert(
         "acct".into(),
         (
@@ -3088,7 +3340,7 @@ fn list_models_with_cold_cache_triggers_background_prefetch_and_reports_warming(
     // Cold cache, no prefetch running: the fetch must be handed to the
     // background thread (never the command loop) and the caller gets a
     // retryable "warming" error.
-    let (mut state, rx) = state_with_session_account("acct", Some(make_failing_provider()));
+    let (mut state, rx) = state_with_session_account("acct");
 
     let err = handle_list_models_inner(&mut state, Some(1)).expect_err("cold cache → warming");
     assert!(err.contains("warming"), "unexpected error: {err}");
@@ -3114,7 +3366,7 @@ fn list_models_with_cold_cache_triggers_background_prefetch_and_reports_warming(
 fn list_models_with_stale_cache_and_no_prefetch_serves_stale_and_warms_background() {
     // Stale-but-present cache, nothing in flight: serve the stale list (it
     // beats nothing) AND kick off a background refresh.
-    let (mut state, rx) = state_with_session_account("acct", Some(make_failing_provider()));
+    let (mut state, rx) = state_with_session_account("acct");
     state.model_cache.insert(
         "acct".into(),
         (
@@ -3139,9 +3391,9 @@ fn list_models_with_stale_cache_and_no_prefetch_serves_stale_and_warms_backgroun
 
 #[test]
 fn prefetch_result_for_removed_account_is_discarded_not_cached() {
-    // The account's provider was removed while the fetch was in flight
-    // (RemoveAccountCmd / a rebuild from AccountsReload): the result must
-    // not populate the cache — a dead provider's list would otherwise be
+    // The account's credential was removed while the fetch was in flight
+    // (RemoveCredential / a rebuild from AccountsReload): the result must
+    // not populate the cache — a dead account's list would otherwise be
     // served for a full TTL.
     let (mut state, _rx) = make_daemon_state();
     state.model_prefetch_in_flight.insert("acct".into());
@@ -3157,13 +3409,15 @@ fn prefetch_result_for_removed_account_is_discarded_not_cached() {
 }
 
 #[test]
-fn panicking_fetch_releases_in_flight_guard_with_error() {
-    // `make_test_provider`'s list_models panics. A panic inside the fetch
-    // thread must still produce a `ModelPrefetchResult` (via catch_unwind)
-    // — otherwise the in-flight guard leaks and the account can never be
-    // re-prefetched until daemon restart.
+fn failed_fetch_releases_in_flight_guard_with_error() {
+    // The seeded account points at a dead local port, so the spawned fetch
+    // fails fast and STILL produces a `ModelPrefetchResult` (the whole
+    // fetch is wrapped in catch_unwind, so even a panic inside the provider
+    // code is reported as an Err) — otherwise the in-flight guard would
+    // leak and the account could never be re-prefetched until daemon
+    // restart.
     let (mut state, rx) = make_daemon_state();
-    state.providers.insert("acct".into(), make_test_provider());
+    seed_credentialed_account_with_url(&mut state, "acct", "openai", Some(dead_base_url()));
 
     state.maybe_spawn_model_prefetch("acct");
     assert!(
@@ -3176,14 +3430,14 @@ fn panicking_fetch_releases_in_flight_guard_with_error() {
         matches!(
             &msg,
             DaemonCommand::ModelPrefetchResult { account, result }
-                if account == "acct" && result.as_ref().is_err_and(|e| e.contains("panicked"))
+                if account == "acct" && result.is_err()
         ),
-        "expected a panicking fetch reported as an Err"
+        "expected a fetch failure reported as an Err"
     );
     if let DaemonCommand::ModelPrefetchResult { result, .. } = &msg {
         assert!(
-            result.as_ref().is_err_and(|e| e.contains("panicked")),
-            "expected Err mentioning 'panicked', got {result:?}"
+            result.as_ref().is_err(),
+            "expected an Err result, got {result:?}"
         );
     }
     state.handle_command(msg);

@@ -1476,7 +1476,6 @@ fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
-        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     let mut session = SessionState::empty();
     let (turn_id, _) = session.start_turn(Some("hello".into()));
@@ -1541,7 +1540,6 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
-        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     let provider = make_failing_provider();
     let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
@@ -1909,7 +1907,6 @@ fn run_exec_tool(
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
-        socket_registry: Arc::new(choreo_ai_protocols::SocketRegistry::new()),
     };
     let (result, cancelled, _image) = execute_tool_with_timeout(
         &tool_call,

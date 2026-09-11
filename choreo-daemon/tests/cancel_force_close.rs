@@ -18,8 +18,6 @@
 //! This binds real sockets and spawns the real daemon, so per AGENTS.md it
 //! lives in `tests/`, is `#[ignore]`, and runs under `cargo test-integration`.
 
-use choreo_ai_protocols::openai::{MaxTokensField, OpenAiClient, ServiceConfig};
-use choreo_daemon::providers::InferenceProvider;
 use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, SessionStatus};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -127,39 +125,12 @@ impl StallingSseServer {
 
     /// Block (bounded) until the fake provider has actually delivered the
     /// SSE prefix, which is the earliest point the daemon's worker socket is
-    /// guaranteed to be registered in the daemon-wide registry.
+    /// guaranteed to be registered in the TARGET SESSION's registry.
     fn wait_until_wedged(&self, timeout: std::time::Duration) {
         self.prefix_flushed_rx
             .recv_timeout(timeout)
             .expect("stalling server never delivered its SSE prefix");
     }
-}
-
-/// Build an OpenAI-protocol provider pointed at `base_url`, registering its
-/// sockets in `registry` — THE daemon-wide registry, not a fresh one. That
-/// wiring is the code under test: only sockets registered in the daemon's
-/// registry are reachable by the cancel force-close.
-fn provider_with_registry(
-    base_url: String,
-    registry: &choreo_ai_protocols::SocketRegistry,
-) -> InferenceProvider {
-    let client = OpenAiClient::new(
-        ServiceConfig {
-            base_url,
-            provider_slug: "openai".to_string(),
-            streaming: true,
-            retry_max_attempts: 1,
-            connect_timeout_secs: 5,
-            request_timeout_secs: 30,
-            total_timeout_secs: 60,
-            chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
-            ..Default::default()
-        },
-        "test-key".to_string(),
-        registry,
-    )
-    .expect("openai client");
-    InferenceProvider::from_openai(client)
 }
 
 fn write_message<W: Write, T: serde::Serialize>(writer: &mut W, msg: &T) {
@@ -185,16 +156,20 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
     let mut daemon = common::SpawnedDaemon::start_with_state(
         move || {
             let mut state = common::test_daemon_state();
-            // Build the provider against the DAEMON's own registry (Arc
-            // clone out of the state) — this is the consolidation under
-            // test. A per-provider registry here would make the cancel
-            // force-close a no-op and the request would hang until Done's
-            // 15 s bound expires instead.
-            let registry = state.socket_registry.clone();
-            let provider = provider_with_registry(format!("{staller_url}/v1"), &registry);
-            // Pre-register under a fake account so the session can resolve
-            // it without credentials (same trick as stream_integrity.rs).
-            state.providers.insert("mock-account".to_string(), provider);
+            // Seed the mock account pointed at the stalling server so the
+            // session resolves its provider LAZILY against its own socket
+            // registry: the session's client is what dials the staller, so
+            // the wedged socket lands in the session registry that the
+            // cancel force-closes. The warm model cache suppresses the
+            // create-session background prefetch (which would otherwise
+            // race the single-connection stalling server) and lets the
+            // session's model selection validate locally.
+            common::seed_mock_account(
+                &mut state,
+                "mock-account",
+                format!("{staller_url}/v1"),
+                &["mock-4o"],
+            );
             // Detached keepalive token, built per call (same content as
             // `StallingSseServer::keepalive_token` — a URL the box holds
             // alive so test-process exit reaps the serve thread).

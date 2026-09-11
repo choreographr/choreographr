@@ -31,7 +31,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use zeroize::{Zeroize, Zeroizing};
 
 mod image_provider;
@@ -71,15 +71,23 @@ pub struct DaemonState {
     /// deleting a parent session also stops its child sub-sessions.
     pub children: HashMap<u64, Vec<u64>>,
     pub accounts: AccountManager,
-    pub providers: HashMap<String, InferenceProvider>,
-    /// The ONE daemon-wide provider-socket registry, created at startup and
-    /// shared by every `InferenceProvider` client (via
-    /// `InferenceProvider::from_account_config`) and by the request/cancel
-    /// machinery (via `RequestContext::socket_registry`). Cancel and suspend
-    /// handlers call `shutdown_all` on it to un-block worker threads wedged
-    /// in a provider `read()`. Arc-cloned, never mutated after creation —
-    /// the handle is plumbing, not shared mutable state.
-    pub socket_registry: Arc<SocketRegistry>,
+    /// The daemon-owned provider-socket registry, used only for provider
+    /// clients that are NOT session-scoped: model prefetch and catalog
+    /// maintenance fetches. Those are never individually cancelled, so they
+    /// don't need a session's cancellable scope; this registry lives on the
+    /// command-loop thread (the sole writer/closer) and is force-closed on
+    /// suspend.
+    pub daemon_registry: choreo_ai_protocols::SocketRegistry,
+    /// Per-session provider-socket registries, one clone per live session
+    /// (the session thread owns the sibling clone inside its
+    /// `SessionState`). The daemon's clone exists so `handle_cancel_request`
+    /// can force-close a wedged session's sockets from the command loop: a
+    /// reader blocked in a provider `read()` cannot observe a channel
+    /// message, so the close must happen here, on the thread that DECIDED
+    /// the cancel. Cancellation granularity is exactly the session — other
+    /// sessions' connections are untouched. Entries are created in
+    /// `spawn_session` and dropped in `handle_session_exited`.
+    pub session_registries: HashMap<u64, choreo_ai_protocols::SocketRegistry>,
     pub credentials: HashMap<String, ServiceCredential>,
     pub x_credentials: Option<ServiceCredential>,
     /// Whether the credential keystore is currently locked (no decrypted
@@ -415,20 +423,28 @@ pub enum DaemonCommand {
     /// accept path only ever READS lock-free snapshots. No reply:
     /// fire-and-forget, like `AccountsReload`.
     AclReload,
-    ResolveProviderCmd {
+    /// Hand the session the raw resolution ingredients (account config +
+    /// decrypted API key) so the SESSION thread can build its own client
+    /// against its own socket registry. The cleartext key crosses only this
+    /// per-request reply channel and never enters a cache. `None` covers
+    /// unknown account, keystore locked, and no credential stored.
+    ResolveAccountCmd {
         account: String,
-        reply: std::sync::mpsc::Sender<Option<InferenceProvider>>,
+        reply: std::sync::mpsc::Sender<Option<(crate::accounts::AccountConfig, Option<String>)>>,
     },
     /// Fetch an opaque image-generation client (plus the provider slug) for
     /// an account. The reply goes back to the TOOL thread directly over the
     /// crossbeam channel — not through the broadcast machinery — because the
     /// handle is a per-request credential-shaped value, not a client-visible
-    /// event. Arc-cloning the client out of the providers map keeps the
-    /// command loop the sole owner of the map: no new shared state, no
-    /// routing through the single `x_credentials` slot.
+    /// event. The client is built against the REQUESTING SESSION's socket
+    /// registry (looked up by `session_id`), so image sockets are
+    /// cancellable with the session; when the session is already gone the
+    /// daemon-owned registry is used as a fallback.
     GetImageGenerationProvider {
+        /// The session requesting the image generation (socket-registry scope).
+        session_id: u64,
         /// Explicit account to use; `None` selects deterministically among
-        /// the image-capable resolved providers (sorted by account name).
+        /// the image-capable credentialed accounts (sorted by account name).
         account_name: Option<String>,
         reply: crossbeam_channel::Sender<Result<ImageProviderHandle, ImageProviderError>>,
     },
@@ -678,13 +694,14 @@ impl DaemonState {
             DaemonCommand::ListAccountsCmd { reply } => self.handle_list_accounts(reply),
             DaemonCommand::AccountsReload => self.handle_accounts_reload(),
             DaemonCommand::AclReload => self.handle_acl_reload(),
-            DaemonCommand::ResolveProviderCmd { account, reply } => {
-                self.handle_resolve_provider(account, reply)
+            DaemonCommand::ResolveAccountCmd { account, reply } => {
+                self.handle_resolve_account(account, reply)
             }
             DaemonCommand::GetImageGenerationProvider {
+                session_id,
                 account_name,
                 reply,
-            } => self.handle_get_image_generation_provider(account_name, reply),
+            } => self.handle_get_image_generation_provider(session_id, account_name, reply),
             DaemonCommand::AccountExists { name, reply } => self.handle_account_exists(name, reply),
             DaemonCommand::ValidateModel {
                 session_id,
@@ -713,7 +730,9 @@ impl DaemonState {
                 groups,
                 reply,
             } => self.handle_unload_tools(session_id, groups, reply),
-            DaemonCommand::PowerEvent(event) => handle_suspend_event(&event, &self.socket_registry),
+            DaemonCommand::PowerEvent(event) => {
+                handle_suspend_event(&event, &self.daemon_registry, &self.session_registries)
+            }
             DaemonCommand::Shutdown => {
                 warn!("unexpected Shutdown command in handle_command; handled at loop level");
             }
@@ -748,17 +767,22 @@ impl DaemonState {
         #[cfg(not(feature = "content"))]
         let substrate_credential = None;
 
-        // The daemon-wide provider-socket registry, cloned OUT of `self`
-        // before the `move` closure so the session thread gets its own Arc
-        // handle (the closure must not borrow `self`).
-        let socket_registry = Arc::clone(&self.socket_registry);
+        // Each session gets its OWN socket registry: the owned instance goes
+        // into the session's `SessionState` (its provider client registers
+        // every dialed socket there), and a clone stays in
+        // `session_registries` so the command loop can force-close exactly
+        // this session's connections on cancel/suspend. Closing a session's
+        // registry never disturbs another session's connections.
+        let session_registry = choreo_ai_protocols::SocketRegistry::default();
+        self.session_registries
+            .insert(session_id, session_registry.clone());
 
         // Resolve provider from the session's account name
         let account_name = metadata.account_name.clone();
-        let provider = account_name
-            .as_ref()
-            .and_then(|name| self.providers.get(name))
-            .cloned();
+        // The provider is NEVER built here: sessions can be created while the
+        // keystore is locked, so the session thread builds its client lazily
+        // on the first request (see `SessionState::resolve_provider`).
+        let provider = None;
 
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let cmd_tx = session_tx.clone();
@@ -767,6 +791,7 @@ impl DaemonState {
             session_main(
                 session_rx,
                 provider,
+                session_registry,
                 account_name,
                 Some(record),
                 RequestContext {
@@ -779,10 +804,10 @@ impl DaemonState {
                     lag_limits,
                     global_lag,
                     substrate_credential,
-                    // The one daemon-wide provider-socket registry: cancels
-                    // inside the request worker force-close every provider
-                    // socket through it (see requests.rs cancel sites).
-                    socket_registry,
+                    // No socket registry here: the session owns its own (see
+                    // `SessionState::registry`); cancel/suspend closes it via
+                    // the daemon's `session_registries` clone, not via the
+                    // request context.
                 },
             );
         });
@@ -829,32 +854,78 @@ impl DaemonState {
         first_substrate.cloned()
     }
 
-    /// Try to resolve an `InferenceProvider` for the given account name using
-    /// the stored credential.  Silently ignores missing credentials or config.
-    /// This is a pure in-memory operation (client construction from config —
-    /// no I/O); the model list is warmed separately, in the background, by
-    /// [`Self::maybe_spawn_model_prefetch`], so unlocking and credential/
-    /// account mutations never block the command loop on HTTP round-trips.
-    /// Returns `true` if a provider was successfully created and cached.
-    fn resolve_account_provider(&mut self, name: &str, api_key: Option<String>) -> bool {
-        if let Some(config) = self.accounts.get(name)
-            && let Ok(provider) =
-                InferenceProvider::from_account_config(config, api_key, &self.socket_registry)
-        {
-            self.providers.insert(name.to_string(), provider);
-            true
-        } else {
-            false
+    /// Extract the decrypted API key for an account, if one is held in
+    /// memory. `None` covers both "keystore locked" and "no credential
+    /// stored" — callers that must distinguish them check `self.locked`.
+    fn api_key_for(&self, name: &str) -> Option<String> {
+        self.credentials.get(name).and_then(|c| match c {
+            ServiceCredential::ApiKey { key } => Some(key.clone()),
+            _ => None,
+        })
+    }
+
+    /// Build a provider client for an account against the DAEMON-owned
+    /// registry. Used only for non-session-scoped clients (model prefetch,
+    /// image-gen fallback when the session is already gone) — those are never
+    /// individually cancelled. Session request clients are built by the
+    /// session thread against the session's own registry instead
+    /// (see `SessionState::resolve_provider`).
+    fn build_daemon_provider(&self, name: &str) -> Option<InferenceProvider> {
+        let config = self.accounts.get(name)?;
+        InferenceProvider::from_account_config(
+            config,
+            self.api_key_for(name),
+            &self.daemon_registry,
+        )
+        .ok()
+    }
+
+    /// Drop the cached provider client of every active session bound to
+    /// `account` (or ALL sessions when `account` is `None`, e.g. `/lock`) by
+    /// sending `SessionCommand::DropProvider`. The session thread then
+    /// rebuilds its client lazily on the next request — against fresh
+    /// credentials and its own registry. This replaces the old per-account
+    /// provider cache: there is no daemon-side cache to clear, only live
+    /// session clients to invalidate.
+    fn drop_session_clients(&mut self, account: Option<&str>) {
+        let targets: Vec<u64> = self
+            .session_metadata
+            .iter()
+            .filter(|(_, meta)| match account {
+                // Some(account): only sessions bound to that account.
+                Some(a) => meta.account_name.as_deref() == Some(a),
+                // None (e.g. /lock): every session.
+                None => true,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut dropped = 0;
+        for id in targets {
+            if let Some(entry) = self.active_sessions.get(&id)
+                && entry.cmd_tx.send(SessionCommand::DropProvider).is_ok()
+            {
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            info!(
+                account = ?account,
+                dropped,
+                "invalidated cached session provider clients; they rebuild on next use"
+            );
         }
     }
 
     /// Decide whether the model list for `account` needs a background
-    /// prefetch: only when a resolved provider exists, no fetch is already
-    /// running for the account, and the cached list is missing or past
-    /// [`MODEL_CACHE_TTL`].  Pure — no side effects — so tests can assert the
-    /// gate independently of thread spawning.
+    /// prefetch: only when the account is configured AND holds a decrypted
+    /// credential (otherwise the client build would fail anyway), no fetch is
+    /// already running for the account, and the cached list is missing or
+    /// past [`MODEL_CACHE_TTL`].  Pure — no side effects — so tests can
+    /// assert the gate independently of thread spawning.
     fn should_prefetch_models(&self, account: &str) -> bool {
-        if !self.providers.contains_key(account) || self.model_prefetch_in_flight.contains(account)
+        if !self.accounts.contains(account)
+            || self.api_key_for(account).is_none()
+            || self.model_prefetch_in_flight.contains(account)
         {
             return false;
         }
@@ -877,10 +948,12 @@ impl DaemonState {
             return;
         }
         self.model_prefetch_in_flight.insert(account.to_string());
-        // `should_prefetch_models` guarantees the provider exists; the None
-        // arm is belt-and-braces so the in-flight guard can never leak.
-        let provider = match self.providers.get(account) {
-            Some(p) => p.clone(),
+        // Build the client fresh against the daemon registry: there is no
+        // provider cache anymore. `should_prefetch_models` guarantees config
+        // + credential exist; the None arm is belt-and-braces so the
+        // in-flight guard can never leak.
+        let provider = match self.build_daemon_provider(account) {
+            Some(p) => p,
             None => {
                 self.model_prefetch_in_flight.remove(account);
                 return;
@@ -949,12 +1022,12 @@ impl DaemonState {
         self.model_prefetch_in_flight.remove(&account);
         match result {
             Ok(models) => {
-                // Only cache while the account still has a resolved provider:
+                // Only cache while the account still exists with a credential:
                 // the account may have been removed or reconfigured
-                // (`AccountsReload` rebuilds the provider) while the fetch
-                // was in flight, and inserting then would serve a dead
+                // (AccountsReload invalidates sessions) while the fetch was
+                // in flight, and inserting then would serve a dead
                 // provider's model list for a full TTL.
-                if !self.providers.contains_key(&account) {
+                if !self.accounts.contains(&account) || self.api_key_for(&account).is_none() {
                     debug!(
                         account = %account,
                         "discarding background model prefetch result; \
@@ -1300,6 +1373,10 @@ impl DaemonState {
         info!("SessionExited: id={}", session_id);
         crate::metrics::record_session_exited();
 
+        // Drop the session's registry clone: the thread is gone, nothing can
+        // register or be cancelled through it anymore.
+        self.session_registries.remove(&session_id);
+
         // Remove the session entry so it is no longer treated as active.
         self.active_sessions.remove(&session_id);
 
@@ -1482,7 +1559,11 @@ impl DaemonState {
         // was actually wiped, not a hardcoded zero.
         let credentials_cleared = self.credentials.len();
         self.credentials.clear();
-        self.providers.clear();
+        // No daemon-side provider cache to wipe anymore — instead invalidate
+        // every live session's cached client so it rebuilds (against fresh
+        // credentials) on its next request. Sessions stay browsable; only
+        // inference re-resolves.
+        self.drop_session_clients(None);
         self.x_credentials = None;
         self.locked = true;
         info!(
@@ -1643,10 +1724,11 @@ impl DaemonState {
         if matches!(&cred, ServiceCredential::X { .. }) && service == "twitter" {
             self.x_credentials = Some(cred.clone());
         }
-        if let ServiceCredential::ApiKey { key: api_key } = &cred {
-            // Resolve immediately too (in-memory only): so an AddCredential
-            // for a known account works before the tail re-resolves.
-            self.resolve_account_provider(&service, Some(api_key.clone()));
+        if matches!(&cred, ServiceCredential::ApiKey { .. }) {
+            // Invalidate sessions bound to this account so they drop any
+            // client built with the OLD key (or none) and rebuild lazily —
+            // the tail no longer bulk-resolves providers.
+            self.drop_session_clients(Some(&service));
         }
         let result = unlock_tail(self, &key);
         if let Err(e) = result {
@@ -1705,9 +1787,11 @@ impl DaemonState {
             let _ = reply.send(Err(format!("failed to remove credential: {e}")));
             return;
         }
-        // Remove from in-memory state
+        // Remove from in-memory state. No provider cache to drop — instead
+        // invalidate the cached client of every session bound to this
+        // account so it rebuilds (and fails with clean guidance) on next use.
         self.credentials.remove(&service);
-        self.providers.remove(&service);
+        self.drop_session_clients(Some(&service));
         if service == "twitter" {
             self.x_credentials = None;
         }
@@ -1910,11 +1994,11 @@ impl DaemonState {
             return;
         };
 
-        // No provider for this account → daemon is locked or the credential
-        // hasn't been saved.  Reject so the user knows they must unlock first
-        // (or configure a credential) rather than silently accepting an
+        // No resolvable client for this account (locked, credential missing,
+        // or account unknown) → reject so the user knows they must unlock
+        // first (or configure a credential) rather than silently accepting an
         // unvalidated model.
-        if !self.providers.contains_key(&account_name) {
+        if !self.accounts.contains(&account_name) || self.api_key_for(&account_name).is_none() {
             debug!(
                 "ValidateModel: no provider for account '{account_name}', \
                  rejecting model '{model}'"
@@ -1992,18 +2076,28 @@ impl DaemonState {
         // so this is where the force-close belongs: a streaming inference
         // read wedged on a half-dead provider connection would otherwise
         // keep the worker blocked until the request timeout even after the
-        // cooperative cancel flag fired. Shutting the registry's sockets
-        // down makes any blocked read return immediately. Only provider
-        // sockets are affected — client connections and tools are untouched.
-        // The count is logged by `shutdown_all` itself; this line records
-        // the WHY (a user cancel, distinct from suspend or organic IO
-        // errors) so the daemon log stays greppable.
-        info!(
-            session_id,
-            request_id,
-            "request cancelled: force-closing provider sockets to unblock any wedged reader"
-        );
-        self.socket_registry.shutdown_all();
+        // cooperative cancel flag fired. Closing the TARGET SESSION's
+        // registry makes its blocked reads return immediately — and touches
+        // NOTHING belonging to other concurrent sessions (each session owns
+        // its own registry). Only provider sockets are affected — client
+        // connections and tools are untouched. The count is logged by
+        // `shutdown_all` itself; this line records the WHY (a user cancel,
+        // distinct from suspend or organic IO errors) so the daemon log
+        // stays greppable.
+        self.force_close_session_sockets(session_id, "request cancelled");
+    }
+
+    /// Force-close one session's provider sockets by shutting down its
+    /// registry clone (the session thread holds the sibling that its client
+    /// registers sockets into). No-op when the session is already gone.
+    fn force_close_session_sockets(&self, session_id: u64, why: &str) {
+        if let Some(registry) = self.session_registries.get(&session_id) {
+            info!(
+                session_id,
+                why, "force-closing provider sockets to unblock any wedged reader"
+            );
+            registry.shutdown_all();
+        }
     }
 
     /// Send `Cancel` to every active child session of `parent_id`.
@@ -2035,6 +2129,11 @@ impl DaemonState {
                 {
                     warn!("cancel_children_of: failed to send Cancel to child {child_id}");
                 }
+                // A parent cancel kills the whole subtree's connections:
+                // each child's registry is closed too, while every OTHER
+                // session (siblings elsewhere, unrelated sessions) keeps its
+                // sockets.
+                self.force_close_session_sockets(*child_id, "parent request cancelled");
             }
         }
     }
@@ -2333,13 +2432,13 @@ impl DaemonState {
                 "failed to add inference account"
             ),
         }
-        // If account was added and there's a matching credential,
-        // resolve the provider immediately (in-memory only — the model
-        // list warms in the background on session join).
-        if result.is_ok()
-            && let Some(ServiceCredential::ApiKey { key }) = self.credentials.get(&name)
-        {
-            self.resolve_account_provider(&name, Some(key.clone()));
+        // If account was added and there's a matching credential, sessions
+        // bound to it drop their cached client so the next request rebuilds
+        // against the NEW config (the account may have existed before with a
+        // different provider/base_url). The model list warms in the
+        // background on session join.
+        if result.is_ok() {
+            self.drop_session_clients(Some(&name));
         }
         let _ = reply.send(result);
     }
@@ -2358,7 +2457,10 @@ impl DaemonState {
             }
         }
         if result.is_ok() {
-            self.providers.remove(&name);
+            // Invalidate sessions bound to the removed account so their next
+            // request surfaces the clean "account not configured" guidance
+            // instead of silently dialing the deleted provider.
+            self.drop_session_clients(Some(&name));
         }
         let _ = reply.send(result);
     }
@@ -2532,15 +2634,16 @@ impl DaemonState {
             }
         }
 
-        // Accounts that vanished: drop the cached provider (dead weight) and
-        // leave credentials intact (a credential with no account is inert).
+        // Accounts that vanished: invalidate sessions bound to them (their
+        // cached client would keep dialing a dead provider) and leave
+        // credentials intact (a credential with no account is inert).
+        // (At this point `self.accounts` still holds the OLD configs, so each
+        // `removed` name is genuinely present in it.)
         for name in &removed {
-            if self.providers.remove(name).is_some() {
-                warn!(
-                    account = name,
-                    "account removed from accounts.toml externally; dropped its cached provider",
-                );
-            }
+            warn!(
+                account = name,
+                "account removed from accounts.toml externally; invalidating its session clients",
+            );
         }
         // A non-empty → empty transition (the file was deleted or emptied
         // externally) drops every account; warn loudly, since this is
@@ -2554,30 +2657,21 @@ impl DaemonState {
         self.accounts = fresh;
         info!(path = %path.display(), "accounts reloaded from disk");
         // Accounts present in BOTH files but with a different config (e.g. the
-        // provider protocol or an override changed): drop the stale cached
-        // provider and rebuild it against the NEW config + still-held
-        // credential. This mirrors the unlock-time bulk resolve and the
-        // /add-key path; without it the next session would capture a provider
-        // built from the old file forever. A failed resolve just leaves the
-        // account uncached; the next explicit resolve retries it.
+        // provider protocol or an override changed): invalidate the cached
+        // client of every session bound to them so the next request rebuilds
+        // against the NEW config + still-held credential. This mirrors the
+        // /lock invalidation; without it the session would keep dialing the
+        // old file's endpoint forever.
         for name in &changed {
-            if self.providers.remove(name).is_some() {
-                warn!(
-                    account = name,
-                    "account config changed externally; rebuilding its provider",
-                );
-            }
-            let api_key = self.credentials.get(name).and_then(|c| match c {
-                ServiceCredential::ApiKey { key } => Some(key.clone()),
-                _ => None,
-            });
-            if self.resolve_account_provider(name, api_key) {
-                info!(
-                    account = name,
-                    "provider rebuilt for externally-modified account",
-                );
-            }
+            warn!(
+                account = name,
+                "account config changed externally; invalidating its session clients",
+            );
         }
+        // Invalidate in one pass. Over-invalidation (sessions bound to
+        // untouched accounts) is harmless: their clients simply rebuild
+        // lazily on the next request.
+        self.drop_session_clients(None);
         // Push the fresh list to activity subscribers (global/control
         // provenance — a flat, non-session message — so no origin-contract
         // dedup runs). Clients can refresh their account pickers live.
@@ -2585,13 +2679,19 @@ impl DaemonState {
         self.handle_broadcast_activity(None, DaemonMessage::Accounts { accounts });
     }
 
-    /// Resolve a cached provider for the given account name.
-    fn handle_resolve_provider(
+    /// Reply to a session's lazy provider-resolution request with the raw
+    /// ingredients (config + API key). The session thread builds the client
+    /// itself, against its own socket registry.
+    fn handle_resolve_account(
         &mut self,
         account: String,
-        reply: std::sync::mpsc::Sender<Option<InferenceProvider>>,
+        reply: std::sync::mpsc::Sender<Option<(crate::accounts::AccountConfig, Option<String>)>>,
     ) {
-        let _ = reply.send(self.providers.get(&account).cloned());
+        let resolved = self
+            .accounts
+            .get(&account)
+            .map(|config| (config.clone(), self.api_key_for(&account)));
+        let _ = reply.send(resolved);
     }
 
     /// Check whether an account with the given name exists.
@@ -2820,35 +2920,20 @@ pub(crate) fn unlock_tail(state: &mut DaemonState, key: &[u8; 32]) -> io::Result
         .collect();
     info!("Unlock: accounts loaded: {:?}", account_names);
 
-    // Resolve providers for all accounts
-    state.providers.clear();
+    // No bulk provider resolution anymore: there is no daemon-side provider
+    // cache. Each session builds its client lazily on its next request
+    // against its own registry (see `SessionState::resolve_provider`).
     for config in state.accounts.all_configs() {
-        let api_key = state.credentials.get(&config.name).and_then(|c| match c {
-            ServiceCredential::ApiKey { key } => Some(key.clone()),
-            _ => None,
-        });
         info!(
-            "Unlock: account '{}': api_key_found={}, has_credential={}",
+            "Unlock: account '{}': has_credential={}",
             config.name,
-            api_key.is_some(),
             state.credentials.contains_key(&config.name)
         );
-        if state.resolve_account_provider(&config.name, api_key) {
-            info!("Unlock: provider resolved for account '{}'", config.name);
-        } else {
-            info!(
-                "Unlock: failed to resolve provider for account '{}'",
-                config.name
-            );
-        }
     }
-    info!(
-        "Unlock: providers resolved: {:?}",
-        state.providers.keys().collect::<Vec<_>>()
-    );
+    info!("Unlock: keystore decrypted; sessions will rebuild providers lazily on next use");
 
-    // The keystore is now fully decrypted into memory (credentials, accounts,
-    // providers): this is the single authoritative unlocked point shared by
+    // The keystore is now fully decrypted into memory (credentials,
+    // accounts): this is the single authoritative unlocked point shared by
     // the `Unlock` path and the `AddCredential` implicit-unlock path. The
     // caller methods broadcast `Unlocked` on the locked→unlocked transition.
     state.locked = false;
@@ -2911,7 +2996,10 @@ fn send_catalog_reply(reply: Vec<RefreshRequester>, providers: usize, models: us
 ///
 /// * `Sleep`: force-close every registered provider socket BEFORE the machine
 ///   suspends — the logind event arrives before suspension, so this is the
-///   one window where the closure is proactive rather than reactive. Any
+///   one window where the closure is proactive rather than reactive. Both
+///   the daemon-owned registry (prefetch/maintenance clients) and EVERY
+///   session's registry are closed — this runs on the command loop, which
+///   owns [`DaemonState`], so the per-session clones are right here. Any
 ///   worker blocked in a provider `read()` wakes immediately with an error;
 ///   after resume the sockets would be dead anyway (the OS's TCP state is
 ///   gone), so nothing is lost.
@@ -2920,22 +3008,67 @@ fn send_catalog_reply(reply: Vec<RefreshRequester>, providers: usize, models: us
 ///   next use, and clients re-establish connections lazily. No shutdown here:
 ///   `shutdown_all` on wake would add nothing (the sleep path already
 ///   cleared the registry) and could only disturb fresh connections.
-fn handle_suspend_event(event: &SuspendEvent, registry: &SocketRegistry) {
+fn handle_suspend_event(
+    event: &SuspendEvent,
+    daemon_registry: &SocketRegistry,
+    session_registries: &HashMap<u64, SocketRegistry>,
+) {
     match event {
         SuspendEvent::Sleep => {
-            // Read the count BEFORE the shutdown consumes the list, so the
+            // Read the count BEFORE the shutdown consumes the lists, so the
             // log reports what was actually closed.
-            let sockets = registry.registered_count();
+            let daemon_sockets = daemon_registry.registered_count();
+            let session_sockets: usize = session_registries
+                .values()
+                .map(|r| r.registered_count())
+                .sum();
             info!(
-                sockets,
-                "machine sleeping: force-closing {} provider sockets", sockets
+                daemon_sockets,
+                session_sockets,
+                sessions = session_registries.len(),
+                "machine sleeping: force-closing provider sockets \
+                 ({} daemon-owned, {} across {} session registries)",
+                daemon_sockets,
+                session_sockets,
+                session_registries.len()
             );
-            registry.shutdown_all();
+            daemon_registry.shutdown_all();
+            for (session_id, registry) in session_registries {
+                registry.shutdown_all();
+                trace!(
+                    session_id,
+                    "session provider sockets force-closed for sleep"
+                );
+            }
         }
         SuspendEvent::Wake => {
-            // Sockets already dead (closed pre-sleep, or kernel-dead on
-            // resume); keepalive tuning catches any stragglers on next use.
-            info!("machine woke from suspend; provider sockets will be re-established lazily");
+            // Sockets that survived an UNANNOUNCED suspend (a missed Sleep
+            // event — the power monitor is explicitly best-effort) are dead
+            // but still registered: prune them now instead of waiting for
+            // the opportunistic 256-entry prune. This is defense-in-depth,
+            // not a correctness dependency: with a well-delivered Sleep the
+            // registries are already empty, so this is normally a no-op.
+            // The probe is non-blocking (MSG_PEEK with a flag flip) and
+            // bounded by registry size, so it is safe on the command loop.
+            // With a well-delivered Sleep the registries are already
+            // empty, so this is normally a no-op. The probe is non-blocking
+            // (MSG_PEEK with a flag flip) and bounded by registry size, so
+            // it is safe on the command loop.
+            let daemon_pruned = daemon_registry.prune_dead();
+            let mut session_pruned = 0;
+            for registry in session_registries.values() {
+                session_pruned += registry.prune_dead();
+            }
+            if daemon_pruned > 0 || session_pruned > 0 {
+                info!(
+                    daemon_pruned,
+                    session_pruned, "pruned dead provider sockets after wake"
+                );
+            }
+            info!(
+                "machine woke from suspend; stale provider sockets pruned, \
+                 any survivors re-established lazily"
+            );
         }
     }
 }
@@ -2950,15 +3083,21 @@ fn handle_list_models_inner(
         .unwrap_or_default();
 
     debug!(
-        "ListModels: session_id={:?}, account_name='{}', providers_keys={:?}",
+        "ListModels: session_id={:?}, account_name='{}', accounts={:?}",
         session_id,
         account_name,
-        state.providers.keys().collect::<Vec<_>>()
+        state
+            .accounts
+            .all_configs()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>()
     );
 
-    // Existence check only — no provider instance is needed below, because
-    // the actual fetch (if any) runs on the detached background thread.
-    if !state.providers.contains_key(&account_name) {
+    // Existence + credential check only — no provider instance is needed
+    // below, because the actual fetch (if any) runs on the detached
+    // background thread.
+    if !state.accounts.contains(&account_name) || state.api_key_for(&account_name).is_none() {
         return Err(if state.accounts.is_empty() {
             "no accounts configured".to_string()
         } else {
