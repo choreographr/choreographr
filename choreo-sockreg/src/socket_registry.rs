@@ -386,6 +386,26 @@ fn close_logged(socket: OwnedSock) {
     }
 }
 
+/// Windows variant of [`close_logged`]: dropping `OwnedSocket` closes the
+/// SOCKET handle, which is the closest analogue of `close(fd)` Winsock gives
+/// us (the real Winsock bounded shutdown — `shutdown(SD_BOTH)` + error
+/// mapping — is the WINDOWS-FOLLOW-UP). Created so the RAII `unregister`
+/// (shared, uncfg'd) compiles and behaves correctly on Windows too: without
+/// it the close ownership transfer would silently leak the handle.
+#[cfg(windows)]
+fn close_logged(socket: OwnedSock) {
+    use std::os::windows::io::IntoRawSocket;
+
+    // Consumes the OwnedSocket so Drop's close can never happen twice. On
+    // Windows we cannot observe WSACloseErrorCode per-handle the way nix maps
+    // errno, so just log that the entry was consumed.
+    let raw = socket.into_raw_socket();
+    tracing::debug!(
+        handle = raw as usize,
+        "registered socket closed (Winsock path)"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

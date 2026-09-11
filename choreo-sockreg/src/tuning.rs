@@ -80,6 +80,13 @@ impl SocketTuning {
                 "TCP_KEEPCNT",
                 setsockopt(&fd, sockopt::TcpKeepCount, &Self::PROBE_COUNT),
             );
+            // TCP_USER_TIMEOUT specifically: nix 0.31 gates this sockopt to
+            // `fuchsia | linux` (NOT android), and the same split as the
+            // const below — so the set is linux-only. TCP_USER_TIMEOUT is
+            // present in the android kernel (it is Linux), but nix does not
+            // expose the option there; basic SO_KEEPALIVE plus the three
+            // timing sockopts above still give good dead-link detection.
+            #[cfg(target_os = "linux")]
             best_effort(
                 "TCP_USER_TIMEOUT",
                 setsockopt(&fd, sockopt::TcpUserTimeout, &Self::USER_TIMEOUT_MS),

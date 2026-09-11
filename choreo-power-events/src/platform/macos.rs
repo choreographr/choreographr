@@ -48,6 +48,11 @@ use super::spawn_thread;
 use crate::{PowerMonitor, PowerMonitorError, SuspendEvent};
 
 use core_foundation::runloop::{CFRunLoop, CFRunLoopSource};
+// `wrap_under_get_rule` is a TCFType trait method (core-foundation declares
+// CFRunLoopSource via `declare_TCFType!`, which only derives the struct —
+// the method lives on the trait). The trait is NOT re-exported at the crate
+// root in core-foundation 0.10; it lives in the public `base` module.
+use core_foundation::base::TCFType;
 use core_foundation_sys::runloop::kCFRunLoopCommonModes;
 use io_kit_sys::types::{io_connect_t, io_object_t};
 use io_kit_sys::{
@@ -194,15 +199,30 @@ pub fn spawn_monitor() -> Result<PowerMonitor, PowerMonitorError> {
     // Record the root port before the run loop can deliver any callback.
     unsafe { (*context).root_port.set(root_port) };
 
+    // The raw port pointer is not `Send` (it is a plain `*mut`), and closure
+    // precise-field capture would defeat a local `unsafe impl Send` wrapper.
+    // IOKit's own contract makes the port thread-portable (IORegisterFor-
+    // SystemPower on one thread + its run-loop source added to another
+    // thread's CFRunLoop is the Apple-documented pattern), so transfer it as
+    // a plain usize and re-materialize it on the monitor thread with a
+    // SAFETY note — the unsafe assertion lives at the one reconstruct site.
+    let port_addr = notification_port as usize;
+
     spawn_thread("power-monitor-iokit", move || {
-        // SAFETY: `notification_port` is the valid port from registration.
+        // SAFETY: re-establishing the same non-null IONotificationPortRef
+        // that IORegisterForSystemPower returned on the registering thread;
+        // IOKit ports are thread-portable by IOPMLib contract (above).
+        let notification_port = port_addr as IONotificationPortRef;
         let raw_source = unsafe { IONotificationPortGetRunLoopSource(notification_port) };
         // Wrap the (get-rule, not owned) source so the CFRunLoop API can
         // add it; `wrap_under_get_rule` does NOT take ownership, matching
         // IOPMLib's semantics (the source lives as long as the port).
         let source = unsafe { CFRunLoopSource::wrap_under_get_rule(raw_source) };
         let run_loop = CFRunLoop::get_current();
-        run_loop.add_source(&source, kCFRunLoopCommonModes);
+        // SAFETY: `kCFRunLoopCommonModes` is the well-known constant Default
+        // run-loop mode CFString pointer from core-foundation-sys; passing it
+        // to `add_source` is its intended use.
+        run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
         tracing::info!("subscribed to IOKit system power notifications on the monitor run loop");
         // Runs "forever" (until the process exits or the run loop's sources
         // invalidate). There is no synchronous stop IOKit exposes for this
