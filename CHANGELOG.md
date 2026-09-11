@@ -64,8 +64,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetches), so `shutdown_all` from a cancel is scoped to exactly the
   cancelled session and its children.
 
+- **Windows `SocketRegistry` handle leak**: the Windows `close_logged`
+  variant called `into_raw_socket()`, transferring the `SOCKET` OUT of the
+  `OwnedSocket` without ever calling `closesocket` — every RAII unregister /
+  `shutdown_all` / prune on Windows leaked a socket handle. It now logs the
+  handle from a borrow (`as_raw_socket`) and lets `OwnedSocket`'s `Drop`
+  close it exactly once (verified with a `cargo check
+  --target x86_64-pc-windows-msvc`).
+- **`AccountsReload` over-invalidation**: the external-edit handler sent
+  `SessionCommand::DropProvider` to EVERY live session, forcing sessions
+  bound to untouched accounts to tear down their cached clients and HTTP
+  connection pools and rebuild on the next request. It now invalidates only
+  sessions bound to REMOVED or CHANGED accounts (the diff it already
+  computes), leaving untouched accounts' sessions warm — pinned by a
+  test asserting the untouched session's command channel stays empty.
+- The lazy provider-resolution reply (`ResolveAccountCmd`) crosses threads
+  via a `crossbeam_channel::Sender` (per the AGENTS.md channel rule for all
+  new code) and carries the decrypted API key wrapped in `Zeroizing<String>`,
+  so an unconsumed reply (session dropped mid-request) is wiped from the
+  channel queue on drop instead of lingering as an ordinary `String`.
+- Comment-only/test-only polish: de-duplicated the Wake-arm comment in
+  `handle_suspend_event`; the `make_daemon_state` test helper leaks its
+  config dir via the explicit `Box::leak` idiom instead of `mem::forget`.
+
 ### Changed
 
+- **AGENTS.md channel rule is now workspace-wide**: thread-to-thread
+  messaging must use `crossbeam_channel` in ALL crates, not only those that
+  already depend on it — a crate gains the dependency in the same change
+  that introduces its first cross-thread channel (leaf-crate std-`mpsc`
+  tolerance removed).
 - `SocketRegistry::register` now returns a `SocketId` and
   `RegisteredTcpTransport` unregisters + closes its registry fd on `Drop`,
   so the registry tracks only live connections (no more growth bounded

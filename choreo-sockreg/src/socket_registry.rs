@@ -386,24 +386,34 @@ fn close_logged(socket: OwnedSock) {
     }
 }
 
-/// Windows variant of [`close_logged`]: dropping `OwnedSocket` closes the
-/// SOCKET handle, which is the closest analogue of `close(fd)` Winsock gives
-/// us (the real Winsock bounded shutdown — `shutdown(SD_BOTH)` + error
-/// mapping — is the WINDOWS-FOLLOW-UP). Created so the RAII `unregister`
-/// (shared, uncfg'd) compiles and behaves correctly on Windows too: without
-/// it the close ownership transfer would silently leak the handle.
+/// Windows variant of [`close_logged`]: `OwnedSocket`'s `Drop` closes the
+/// SOCKET handle via `closesocket`, which is the closest analogue of
+/// `close(fd)` Winsock gives us (the real Winsock bounded shutdown —
+/// `shutdown(SD_BOTH)` + error mapping — is the WINDOWS-FOLLOW-UP). Created
+/// so the RAII `unregister` (shared, uncfg'd) compiles and behaves correctly
+/// on Windows too. CRITICAL: ownership must NOT be stolen from `OwnedSocket`
+/// — `into_raw_socket()` TRANSFERS ownership out, and a raw SOCKET nobody
+/// closes leaks the handle for the process's lifetime (exactly the bug the
+/// Unix path's explicit `close(raw)` avoids). So we only LOG the handle via
+/// a borrow (`as_raw_socket`), then drop the `OwnedSocket` and let `Drop` close
+/// it — Drop's close errors are unobservable, which is acceptable: the Unix
+/// path logs EBADF only because nix maps errno; the close-once-ownership
+/// invariant this helper serves is identical on both platforms.
 #[cfg(windows)]
 fn close_logged(socket: OwnedSock) {
-    use std::os::windows::io::IntoRawSocket;
+    use std::os::windows::io::AsRawSocket;
 
-    // Consumes the OwnedSocket so Drop's close can never happen twice. On
-    // Windows we cannot observe WSACloseErrorCode per-handle the way nix maps
-    // errno, so just log that the entry was consumed.
-    let raw = socket.into_raw_socket();
+    // Borrow for logging first — the value is still owned and will be closed
+    // exactly once by Drop below. `as_raw_socket` gives the numeric SOCKET
+    // value without taking ownership (the equivalent of `as_raw_fd`).
+    let raw = socket.as_raw_socket();
     tracing::debug!(
         handle = raw as usize,
         "registered socket closed (Winsock path)"
     );
+    // Drop of `OwnedSocket` = closesocket, guaranteed once (the value was
+    // never `into_raw_socket`'d, so no double-close and no leak).
+    drop(socket);
 }
 
 #[cfg(test)]

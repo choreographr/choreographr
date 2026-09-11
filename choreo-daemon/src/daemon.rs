@@ -426,11 +426,16 @@ pub enum DaemonCommand {
     /// Hand the session the raw resolution ingredients (account config +
     /// decrypted API key) so the SESSION thread can build its own client
     /// against its own socket registry. The cleartext key crosses only this
-    /// per-request reply channel and never enters a cache. `None` covers
-    /// unknown account, keystore locked, and no credential stored.
+    /// per-request reply channel and never enters a cache; it is carried in a
+    /// `Zeroizing<String>` so a reply that is never consumed (session dies
+    /// mid-request) is wiped from the channel queue on drop instead of
+    /// lingering as an ordinary `String`. `None` covers unknown account,
+    /// keystore locked, and no credential stored.
     ResolveAccountCmd {
         account: String,
-        reply: std::sync::mpsc::Sender<Option<(crate::accounts::AccountConfig, Option<String>)>>,
+        reply: crossbeam_channel::Sender<
+            Option<(crate::accounts::AccountConfig, Option<Zeroizing<String>>)>,
+        >,
     },
     /// Fetch an opaque image-generation client (plus the provider slug) for
     /// an account. The reply goes back to the TOOL thread directly over the
@@ -2668,10 +2673,22 @@ impl DaemonState {
                 "account config changed externally; invalidating its session clients",
             );
         }
-        // Invalidate in one pass. Over-invalidation (sessions bound to
-        // untouched accounts) is harmless: their clients simply rebuild
-        // lazily on the next request.
-        self.drop_session_clients(None);
+        // Invalidate ONLY the sessions bound to a removed or changed
+        // account — per-account targeting, matching how /lock (all) and
+        // RemoveCredential (one account) already scope their invalidation.
+        // The previous blanket `drop_session_clients(None)` over-invalidated
+        // sessions bound to UNTOUCHED accounts: they tore down cached
+        // clients and their HTTP connection pools and rebuilt on the next
+        // request for no reason. The diff computed above says exactly which
+        // accounts changed — use it. Broad targets are sent in one pass
+        // (order is irrelevant; each send is just a command on the session's
+        // control channel, and DropProvider is idempotent for a clientless
+        // session). Added names cannot have existing sessions bound to them
+        // (the session was bound BEFORE the reload), so additions need no
+        // invalidation.
+        for name in removed.iter().chain(changed.iter()) {
+            self.drop_session_clients(Some(name));
+        }
         // Push the fresh list to activity subscribers (global/control
         // provenance — a flat, non-session message — so no origin-contract
         // dedup runs). Clients can refresh their account pickers live.
@@ -2681,16 +2698,25 @@ impl DaemonState {
 
     /// Reply to a session's lazy provider-resolution request with the raw
     /// ingredients (config + API key). The session thread builds the client
-    /// itself, against its own socket registry.
+    /// itself, against its own socket registry. The key is wrapped in
+    /// `Zeroizing` here — the single hop where the daemon hands cleartext
+    /// across a thread boundary — so unconsumed replies are wiped on drop.
     fn handle_resolve_account(
         &mut self,
         account: String,
-        reply: std::sync::mpsc::Sender<Option<(crate::accounts::AccountConfig, Option<String>)>>,
+        reply: crossbeam_channel::Sender<
+            Option<(crate::accounts::AccountConfig, Option<Zeroizing<String>>)>,
+        >,
     ) {
-        let resolved = self
-            .accounts
-            .get(&account)
-            .map(|config| (config.clone(), self.api_key_for(&account)));
+        let resolved = self.accounts.get(&account).map(|config| {
+            (
+                config.clone(),
+                // api_key_for returns an inert String for internal gates
+                // (prefetch/validate checks); this reply is the credential
+                // EXIT point, so the wipe-on-drop wrapper goes on here.
+                self.api_key_for(&account).map(Zeroizing::new),
+            )
+        });
         let _ = reply.send(resolved);
     }
 
@@ -3047,13 +3073,11 @@ fn handle_suspend_event(
             // but still registered: prune them now instead of waiting for
             // the opportunistic 256-entry prune. This is defense-in-depth,
             // not a correctness dependency: with a well-delivered Sleep the
-            // registries are already empty, so this is normally a no-op.
-            // The probe is non-blocking (MSG_PEEK with a flag flip) and
-            // bounded by registry size, so it is safe on the command loop.
-            // With a well-delivered Sleep the registries are already
-            // empty, so this is normally a no-op. The probe is non-blocking
-            // (MSG_PEEK with a flag flip) and bounded by registry size, so
-            // it is safe on the command loop.
+            // registries are already empty, so this is normally a no-op —
+            // and when there ARE entries to probe, the probe is non-blocking
+            // (MSG_PEEK with an O_NONBLOCK flag flip, EOF/EAGAIN verdicts)
+            // and bounded by registry size, so it is safe on the command
+            // loop. Live connections are never disturbed on Wake.
             let daemon_pruned = daemon_registry.prune_dead();
             let mut session_pruned = 0;
             for registry in session_registries.values() {

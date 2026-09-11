@@ -13,13 +13,16 @@ pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
     let tool_registry = crate::tools::ToolRegistry::new().build();
-    let config_dir = tempfile::tempdir().unwrap();
-    let accounts_path = config_dir.path().join("accounts.toml");
     // The stays-alive detail: `add`/`save` later rewrite the accounts file
     // (tests seed accounts post-construction), so the directory holding it
-    // must OUTLIVE the state — forgetting the TempDir leaks its cleanup, an
-    // acceptable cost in a per-test process.
-    std::mem::forget(config_dir);
+    // must OUTLIVE the state. The state owns only the PATH (a `String`),
+    // not the TempDir, and threading a guard through every helper return
+    // value would touch ~98 call sites — so the TempDir is deliberately
+    // leaked via `Box::leak` (the explicit sanctioned idiom instead of
+    // `mem::forget`: same per-process leak cost, but leak-by-construction
+    // of one owned value, never arbitrary memory).
+    let config_dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let accounts_path = config_dir.path().join("accounts.toml");
     let state = DaemonState {
         next_session_id: 1,
         max_turns: 10,
@@ -182,11 +185,11 @@ mod suspend_tests {
         // survives.
         let registry = SocketRegistry::new();
         let _live_keep = live_pair(&registry);
-        let _dead = dead_pair(&registry); // one dead entry in the SAME registry
+        dead_pair(&registry); // one dead entry in the SAME registry
         let mut sessions: HashMap<u64, SocketRegistry> = HashMap::new();
         let session_registry = SocketRegistry::new();
         let _session_live = live_pair(&session_registry);
-        let _session_dead = dead_pair(&session_registry);
+        dead_pair(&session_registry);
         sessions.insert(1, session_registry);
 
         handle_suspend_event(&SuspendEvent::Wake, &registry, &sessions);
@@ -207,8 +210,9 @@ mod suspend_tests {
     /// Registers a DEAD entry into `registry`: the registered fd stays open
     /// but its peer is dropped, so the probe sees EOF (Ok(0)) and renders
     /// the "dead" verdict. Exactly the shape a post-resume dead socket has,
-    /// without any raw-fd games.
-    fn dead_pair(registry: &SocketRegistry) -> () {
+    /// without any raw-fd games. (Both ends are held only until the drop;
+    /// the registry's duplicate is what survives as the dead entry.)
+    fn dead_pair(registry: &SocketRegistry) {
         let (a, b) = UnixStream::pair().expect("unix pair");
         registry.register(a.try_clone().expect("dup"));
         drop((a, b)); // both ends gone: the registered duplicate reads EOF
@@ -267,7 +271,7 @@ mod cancel_isolation_tests {
     #[test]
     fn cancel_of_session_a_leaves_session_b_registry_untouched() {
         let (mut state, _daemon_rx) = make_daemon_state();
-        let (a_handle, mut a_peer) = {
+        let (_a_handle, mut a_peer) = {
             let r = seed_session(&mut state, 1);
             register_pair(&r)
         };
@@ -1937,9 +1941,10 @@ fn handle_accounts_reload_invalidates_session_clients_of_removed_account() {
     // When an external edit drops an account, every live session's cached
     // provider client is invalidated (sent DropProvider) so it is rebuilt —
     // and cleanly fails — on the next request instead of keep dialing a
-    // dead provider forever. (The reload invalidates ALL sessions, not only
-    // the removed account's: over-invalidation is harmless, each rebuild is
-    // lazy and gets the fresh config from the reloaded manager.)
+    // dead provider forever. Sessions bound to UNTOUCHED accounts are
+    // deliberately left alone: their clients and connection pools stay warm
+    // (per-account targeting — a blanket invalidation made healthy sessions
+    // churn for nothing).
     let (mut state, _rx) = make_daemon_state();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("accounts.toml");
@@ -1954,25 +1959,40 @@ fn handle_accounts_reload_invalidates_session_clients_of_removed_account() {
     let (keep_cmd_rx, keep_release) = insert_active_session_with_account(&mut state, 1, "keep");
     let (gone_cmd_rx, gone_release) = insert_active_session_with_account(&mut state, 2, "gone");
 
-    // Now remove "gone" externally.
-    std::fs::write(
-        &path,
-        "[[account]]\nname = \"keep\"\nprovider = \"openai\"\n",
-    )
-    .unwrap();
+    // Now remove "gone" externally. CRITICAL for the no-touch assertion
+    // below: the edit must leave "keep" LOGICALLY IDENTICAL, so derive the
+    // new file content from the daemon's own canonical save — drop the
+    // [[account]] section whose name is "gone" — rather than hand-writing a
+    // bare block (a bare `name = "keep"` line would silently drop the
+    // seed's retry/timeout overrides and count "keep" as CHANGED, which
+    // would legitimately invalidate it).
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let edited: String = format!(
+        "[[account]]{}",
+        saved
+            .split("[[account]]")
+            .skip(1)
+            .filter(|section| !section.contains("name = \"gone\""))
+            .collect::<Vec<_>>()
+            .join("[[account]]")
+    );
+    std::fs::write(&path, edited).unwrap();
     state.handle_command(DaemonCommand::AccountsReload);
     assert!(state.accounts.contains("keep"));
     assert!(!state.accounts.contains("gone"));
 
-    // Both live sessions received the DropProvider invalidation (sends are
-    // synchronous on the command loop → try_recv is deterministic).
+    // Only the session bound to the REMOVED account is invalidated; the
+    // untouched account's session must keep its warm client (its command
+    // channel stays empty — sends are synchronous on the command loop →
+    // try_recv is deterministic).
     assert!(
         matches!(gone_cmd_rx.try_recv(), Ok(SessionCommand::DropProvider)),
         "removed account's session client must be invalidated"
     );
     assert!(
-        matches!(keep_cmd_rx.try_recv(), Ok(SessionCommand::DropProvider)),
-        "surviving session is over-invalidated harmlessly (rebuild is lazy)"
+        keep_cmd_rx.try_recv().is_err(),
+        "session bound to an untouched account must NOT be invalidated — \
+         its cached client and connection pool stay warm"
     );
     drop(keep_release);
     drop(gone_release);

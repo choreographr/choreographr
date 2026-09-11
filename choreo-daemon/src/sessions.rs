@@ -909,7 +909,7 @@ impl SessionState {
                     .to_string(),
             );
         };
-        let (reply, rx) = mpsc::channel();
+        let (reply, rx) = crossbeam_channel::unbounded();
         let _ = ctx.daemon_tx.send(DaemonCommand::ResolveAccountCmd {
             account: name.clone(),
             reply,
@@ -917,6 +917,9 @@ impl SessionState {
         // `None` from the daemon covers every failure the old provider cache
         // hid behind the same reply shape: unknown account, keystore locked,
         // or no credential stored. Keep the exact wording those paths used.
+        // (Crossbeam per AGENTS.md: this reply may outlive the quick path —
+        // e.g. a dropped channel when the session dies mid-request — and
+        // Zeroizing wipes any unconsumed key from the queue on drop.)
         let Some((config, api_key)) = rx.recv().ok().flatten() else {
             return Err(format!(
                 "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
@@ -927,7 +930,15 @@ impl SessionState {
                 "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
             ));
         };
-        let provider = InferenceProvider::from_account_config(&config, Some(api_key), &self.registry)
+        // The client constructor retains the key inside its HTTP config
+        // anyway, so unwrapping the Zeroizing here is the ownership
+        // transfer into the client's own zeroize-free storage — the wipe
+        // protected the in-transit copy.
+        let provider = InferenceProvider::from_account_config(
+            &config,
+            Some((*api_key).clone()),
+            &self.registry,
+        )
             .map_err(|e| {
                 tracing::warn!(
                     session = ctx.session_id,
@@ -2159,14 +2170,20 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
     // session-cancellable. If resolution fails (locked, no credential yet)
     // the provider stays None — the account name is still recorded and the
     // next request retries lazily (see `SessionState::resolve_provider`).
-    let (reply, rx) = mpsc::channel();
+    let (reply, rx) = crossbeam_channel::unbounded();
     let _ = ctx.daemon_tx.send(DaemonCommand::ResolveAccountCmd {
         account: name.clone(),
         reply,
     });
     if let Ok(Some((config, Some(api_key)))) = rx.recv()
-        && let Ok(provider) =
-            InferenceProvider::from_account_config(&config, Some(api_key), &state.registry)
+        && let Ok(provider) = InferenceProvider::from_account_config(
+            &config,
+            // See resolve_provider: the Zeroizing wrapper protects the
+            // in-transit key; the client constructor takes ownership from
+            // here and stores the credential in its own config.
+            Some((*api_key).clone()),
+            &state.registry,
+        )
     {
         // Re-resolve context window if a model is already selected.
         if let Some(ref model) = state.config.selected_model {

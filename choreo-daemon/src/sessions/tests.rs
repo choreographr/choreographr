@@ -65,6 +65,8 @@ fn test_state() -> SessionState {
 fn resolve_provider_rebuilds_lazily_after_client_drop() {
     use std::sync::mpsc;
 
+    use zeroize::Zeroizing;
+
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
     let tool_registry = ToolRegistry::new().build();
@@ -90,7 +92,9 @@ fn resolve_provider_rebuilds_lazily_after_client_drop() {
             assert_eq!(account, "mock-account");
             let mut config = crate::accounts::AccountConfig::simple("mock-account", "openai");
             config.base_url = Some("https://mock.invalid/v1".to_string());
-            let _ = reply.send(Some((config, Some("test-key".into()))));
+            // Same Zeroizing shape the real command loop sends: the reply
+            // payload is the credential exit-point.
+            let _ = reply.send(Some((config, Some(Zeroizing::new("test-key".to_string())))));
         }
     });
 
