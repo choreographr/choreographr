@@ -224,7 +224,10 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     // copy on release) tracks the pointer even when no mouse event arrived —
     // the anchor stays pinned to its text.  See `selection::follow_cursor`.
     selection::follow_cursor(app);
-    render_history(frame, history_chunks[0], app);
+    // Layout::horizontal([Min(1), Length(1)]) always yields exactly 2 chunks;
+    // a zero-area fallback rect is harmless to render into.
+    let history_area = history_chunks.first().copied().unwrap_or_default();
+    render_history(frame, history_area, app);
 
     // ── Scrollbar ────────────────────────────────────────────
     let viewport_height = app.history_viewport.height as usize;
@@ -239,7 +242,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             .unwrap_or_default();
         frame.render_stateful_widget(
             vertical_scrollbar().with_markers(&marker_slots),
-            history_chunks[1],
+            history_chunks.get(1).copied().unwrap_or_default(), // always present (2-chunk split); safe fallback
             &mut SmoothScrollbarState::new(total_height)
                 .position(position)
                 .viewport_content_length(viewport_height),
@@ -501,7 +504,11 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // the viewport are skipped before any content is rendered.
     for raw_i in 0..len {
         let i = len - 1 - raw_i;
-        let turn_id = visible_turn_ids[i];
+        // `i < len == visible_turn_ids.len()`, so the lookup is always in
+        // bounds; `.get()` keeps it total.
+        let Some(turn_id) = visible_turn_ids.get(i).copied() else {
+            continue;
+        };
 
         if rows_remaining == 0 {
             break;
@@ -612,7 +619,12 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let row_end = top_line + visible_height;
             let line_start = text_offsets.partition_point(|&o| o <= row_start);
             let line_end = text_offsets.partition_point(|&o| o <= row_end);
-            let mut visible_lines = text_lines_arc[line_start..line_end].to_vec();
+            // `partition_point` returns offsets within `0..=text_lines.len()`,
+            // so the range is always a valid slice of `text_lines_arc`.
+            let mut visible_lines = text_lines_arc
+                .get(line_start..line_end)
+                .unwrap_or(&[])
+                .to_vec();
             // Apply the in-progress text-selection highlight to the visible
             // slice at draw time — the render cache stays pure, and the same
             // cached lines drive both the highlight and the copy, so what is

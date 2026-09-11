@@ -187,8 +187,12 @@ fn parse_credential(
                     "missing api_key field".to_string(),
                 ));
             }
+            // The len check above guarantees field 0 exists; first() keeps
+            // the access total instead of panicking on a logic bug.
             Ok(ServiceCredential::ApiKey {
-                key: fields[0].clone(),
+                key: fields.first().cloned().ok_or_else(|| {
+                    ClientError::CredentialParse("missing api_key field".to_string())
+                })?,
             })
         }
         "x" => {
@@ -197,16 +201,23 @@ fn parse_credential(
                     "missing X credential fields".to_string(),
                 ));
             }
-            let bearer = if fields[4] == "-" {
-                None
-            } else {
-                Some(fields[4].clone())
+            let bearer = match fields.get(4) {
+                Some(v) if v == "-" => None,
+                Some(v) => Some(v.clone()),
+                None => None,
+            };
+            // The len() >= 5 guard above bounds-guarantees every field;
+            // the closure keeps each access total instead of indexing.
+            let field = |i: usize| -> Result<String, ClientError> {
+                fields.get(i).cloned().ok_or_else(|| {
+                    ClientError::CredentialParse("missing X credential fields".to_string())
+                })
             };
             Ok(ServiceCredential::X {
-                api_key: fields[0].clone(),
-                api_key_secret: fields[1].clone(),
-                access_token: fields[2].clone(),
-                access_token_secret: fields[3].clone(),
+                api_key: field(0)?,
+                api_key_secret: field(1)?,
+                access_token: field(2)?,
+                access_token_secret: field(3)?,
                 bearer_token: bearer,
             })
         }

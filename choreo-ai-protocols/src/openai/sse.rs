@@ -44,7 +44,10 @@ impl SseReader {
                     return self.finish_event();
                 }
                 n => {
-                    self.pending.extend_from_slice(&buf[..n]);
+                    // `read` returns n <= buf.len() by contract, so the slice
+                    // always succeeds; the empty fallback is unreachable.
+                    let bytes = buf.get(..n).unwrap_or(&[]);
+                    self.pending.extend_from_slice(bytes);
                 }
             }
         }

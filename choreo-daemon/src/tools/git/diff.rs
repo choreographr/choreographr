@@ -116,8 +116,10 @@ pub(crate) fn git_diff_impl(
             if parts.len() < 2 {
                 continue;
             }
-            let status = parts[0];
-            let path = parts[1];
+            // Both elements exist per the len() check; fallbacks preserve the skip.
+            let (Some(status), Some(path)) = (parts.first().copied(), parts.get(1).copied()) else {
+                continue;
+            };
 
             match status {
                 // Added or copied files have no old content — diff against empty string.

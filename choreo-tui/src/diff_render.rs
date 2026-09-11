@@ -231,7 +231,11 @@ fn highlight_bucket(
     if !lines.is_empty() {
         let highlighted = highlight_lines_cached(syntax, &lines);
         for (&idx, hl) in indices.iter().zip(highlighted.iter()) {
-            *spans(&mut rows[idx]) = hl.clone();
+            // `idx` was collected from this same `rows` slice above, so it is
+            // always in bounds; the .get() keeps the indexing lint quiet.
+            if let Some(row) = rows.get_mut(idx) {
+                *spans(row) = hl.clone();
+            }
         }
     }
 }
@@ -320,7 +324,9 @@ fn spans_fixed_width(spans: &mut Vec<Span<'static>>, width: usize) {
         let mut remaining = width;
         let mut keep = 0usize;
         for i in 0..spans.len() {
-            let w = spans[i].width();
+            // Indexing is safe: the loop range mirrors `spans.len()`.
+            let Some(span) = spans.get(i) else { break };
+            let w = span.width();
             if w <= remaining {
                 remaining -= w;
                 keep = i + 1;
@@ -338,10 +344,11 @@ fn spans_fixed_width(spans: &mut Vec<Span<'static>>, width: usize) {
                 // content to fit rather than dropping it entirely (which would
                 // lose the text the user needs to see).
                 spans.truncate(keep + 1);
-                spans[keep] = Span::styled(
-                    truncate_str(&spans[keep].content, remaining),
-                    spans[keep].style,
-                );
+                // `keep + 1 == spans.len()` after the truncate, so `keep` is a
+                // valid index into the just-truncated vector.
+                if let Some(span) = spans.get_mut(keep) {
+                    *span = Span::styled(truncate_str(&span.content, remaining), span.style);
+                }
                 break;
             }
         }
@@ -370,7 +377,11 @@ fn render_side_by_side(diffs: &[FileDiff], total_width: usize) -> Vec<Line<'stat
     let mut offset = 0;
     for file in diffs {
         let row_count = file.hunks.iter().map(|h| 1 + h.lines.len()).sum::<usize>() + 1;
-        highlight_diff_panes(&mut rows[offset..offset + row_count], file);
+        // `rows` was built with exactly one row per header plus one per hunk
+        // line per file, so `offset..offset + row_count` is always in bounds.
+        if let Some(bucket) = rows.get_mut(offset..offset + row_count) {
+            highlight_diff_panes(bucket, file);
+        }
         offset += row_count;
     }
 
@@ -568,7 +579,9 @@ pub(crate) fn truncate_str(s: &str, max_width: usize) -> String {
         }
         current += w;
     }
-    let mut result = s[..cutoff].to_string();
+    // `cutoff` is a `char_indices()` offset, so it is always a valid
+    // char-boundary byte index into `s`.
+    let mut result = s.get(..cutoff).unwrap_or(s).to_string();
     result.push('…');
     result
 }

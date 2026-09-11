@@ -190,12 +190,12 @@ mod tests {
         assert!(
             result.starts_with("````diff\n"),
             "start: {}...",
-            &result[..result.len().min(40)]
+            result.get(..result.len().min(40)).unwrap_or("")
         );
         assert!(
             result.ends_with("\n````"),
             "end: {}...",
-            &result[..result.len().min(40)]
+            result.get(..result.len().min(40)).unwrap_or("")
         );
         // The diff's own context line (space + 3 backticks) must survive as
         // interior content, not be mistaken for the closing fence.

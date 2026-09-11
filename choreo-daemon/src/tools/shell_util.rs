@@ -741,7 +741,8 @@ fn accumulate_chunk(budget: &mut Option<ByteBudget>, full: &mut Vec<u8>, chunk: 
     match budget.as_mut() {
         Some(budget) => {
             let take = budget.fit(chunk.len());
-            full.extend_from_slice(&chunk[..take]);
+            // `fit` returns at most chunk.len(), so the range is in bounds.
+            full.extend_from_slice(chunk.get(..take).unwrap_or(chunk));
         }
         None => full.extend_from_slice(chunk),
     }
@@ -801,7 +802,9 @@ fn drain_fd<R: Read + AsFd>(
             match reader.read(&mut buf) {
                 Ok(0) => return full, // EOF: all pipe write ends are closed
                 Ok(n) => {
-                    on_data(&buf[..n]);
+                    // `n <= buf.len()` by the read() contract; fallback is unreachable.
+                    let filled = buf.get(..n).unwrap_or(&buf);
+                    on_data(filled);
                     // The accumulation cap only bounds the *returned* copy:
                     // on_data still receives every chunk and the read loop
                     // keeps consuming, so a child that out-produces the cap
@@ -809,7 +812,7 @@ fn drain_fd<R: Read + AsFd>(
                     // `cat /dev/zero`-class command would buffer its entire
                     // output in daemon memory even though the final tool
                     // result is truncated at MAX_TOOL_OUTPUT_BYTES anyway.
-                    accumulate_chunk(&mut budget, &mut full, &buf[..n]);
+                    accumulate_chunk(&mut budget, &mut full, filled);
                     if !nonblocking {
                         break; // blocking fallback: one read per poll
                     }
@@ -909,16 +912,19 @@ fn partial_tail_len(pending: &[u8]) -> usize {
     let mut i = pending.len();
     // A trailing CR is held back so a `\n` arriving in a later chunk can
     // still fold the CRLF (matching `BufRead::lines()`).
-    let cr = usize::from(i > 0 && pending[i - 1] == b'\r');
+    // `i` starts at pending.len(), so `pending[i-1]` is the last byte.
+    let cr = usize::from(i > 0 && pending.last() == Some(&b'\r'));
     i -= cr;
     // Walk back over continuation bytes (0b10xxxxxx) to the sequence lead.
     let mut continuations = 0usize;
-    while i > 0 && (0x80..=0xBF).contains(&pending[i - 1]) {
+    // `i > 0` guards the index; the get() fallback is unreachable.
+    while i > 0 && (0x80..=0xBF).contains(pending.get(i - 1).unwrap_or(&0)) {
         i -= 1;
         continuations += 1;
     }
     if i > 0 {
-        let lead = pending[i - 1];
+        // `i > 0` guards the index; fallback is unreachable.
+        let lead = pending.get(i - 1).copied().unwrap_or(0);
         // Continuation bytes the lead declares; 0 for ASCII and for the
         // invalid leads 0xF8..=0xFF, which cannot start a valid sequence.
         let expected = match lead {
@@ -1212,13 +1218,15 @@ impl StreamByteCap {
     /// still matches send order (prefix then marker).
     fn push(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> bool {
         let n = self.budget.fit(chunk.len());
+        // `fit` returns at most chunk.len(), so the range is in bounds.
+        let fitted = chunk.get(..n).unwrap_or(chunk);
         // Forward before accumulating: a chunk whose send is aborted must not
         // land in the recorded body (the live view never showed it).
-        if n > 0 && !self.forward(&chunk[..n]) {
+        if n > 0 && !self.forward(fitted) {
             return false;
         }
         if n > 0 {
-            out.extend_from_slice(&chunk[..n]);
+            out.extend_from_slice(fitted);
         }
         if let Some(marker) = self.budget.take_marker() {
             // Same byte-cap marker `truncate_tool_output` appends, so the

@@ -90,7 +90,9 @@ fn truncate_tool_output_at(content: &str, cap: usize) -> String {
     }
     // Cut on a char boundary so we never split a multi-byte UTF-8 char.
     let split = content.floor_char_boundary(cap);
-    let mut truncated = content[..split].to_string();
+    // floor_char_boundary guarantees `split` is a valid char boundary <= cap,
+    // so .get only fails if the content was shorter — fall back to the whole.
+    let mut truncated = content.get(..split).unwrap_or(content).to_string();
     truncated.push_str(TRUNCATION_SUFFIX);
     truncated
 }
@@ -294,7 +296,9 @@ mod tests {
         assert!(
             out.ends_with("...[truncated at 5 results]"),
             "marker must survive the cap: …{}",
-            &out[out.len().saturating_sub(60)..]
+            // char-safe tail: .get(..) is None only for a non-boundary start,
+            // impossible here (the output is ASCII plus the truncation marker)
+            out.get(out.len().saturating_sub(60)..).unwrap_or("")
         );
         assert!(
             out.len() <= MAX_TOOL_OUTPUT_BYTES,

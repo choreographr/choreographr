@@ -480,8 +480,9 @@ pub fn decode_image_mixin(msg: ImageMixinMessage) -> ImageSpec {
 /// Normalize a mixin hash field to the bare 32-byte digest: strip the sha2-256
 /// multihash header when present, pass raw 32-byte digests through unchanged.
 fn digest_from_bytes(bytes: &[u8]) -> Vec<u8> {
-    if bytes.len() == 34 && bytes[0] == 0x12 && bytes[1] == 0x20 {
-        bytes[2..].to_vec()
+    // The len check above guarantees indices 0..2 are in bounds.
+    if bytes.len() == 34 && bytes.first() == Some(&0x12) && bytes.get(1) == Some(&0x20) {
+        bytes.get(2..).unwrap_or(bytes).to_vec()
     } else {
         bytes.to_vec()
     }
@@ -548,12 +549,17 @@ pub fn cid_to_digest_hex(cid: &str) -> Result<String, crate::ContentError> {
     let multihash = bs58::decode(cid)
         .into_vec()
         .map_err(|_| crate::ContentError::Cid(format!("failed to decode CID {cid}")))?;
-    if multihash.len() != 34 || multihash[0] != 0x12 || multihash[1] != 0x20 {
+    // The != 34 check above guarantees the header indices are in bounds.
+    if multihash.len() != 34 || multihash.first() != Some(&0x12) || multihash.get(1) != Some(&0x20)
+    {
         return Err(crate::ContentError::Cid(format!(
             "CID {cid} is not a sha2-256 CIDv0 multihash"
         )));
     }
-    Ok(format!("0x{}", hex::encode(&multihash[2..])))
+    Ok(format!(
+        "0x{}",
+        hex::encode(multihash.get(2..).unwrap_or(&multihash))
+    ))
 }
 
 /// `0x`-prefixed digest hex -> raw digest bytes, for the protobuf mixin.
@@ -600,7 +606,11 @@ pub fn short_hex(value: &str) -> String {
     if value.len() <= 18 {
         value.to_string()
     } else {
-        format!("{}...{}", &value[..10], &value[value.len() - 8..])
+        // Hex strings are ASCII, so these are always char boundaries; .get
+        // keeps the truncation total against any future non-hex input.
+        let head = value.get(..10).unwrap_or("");
+        let tail = value.get(value.len().saturating_sub(8)..).unwrap_or("");
+        format!("{head}...{tail}")
     }
 }
 
@@ -637,7 +647,9 @@ mod tests {
         let encoded = bytes_to_hex(&bytes);
         assert_eq!(encoded, format!("0x{}", "ab".repeat(32)));
         assert_eq!(hex_to_bytes(&encoded).unwrap(), bytes);
-        assert_eq!(hex_to_bytes(&encoded[2..]).unwrap(), bytes);
+        // string_slice has no test-allowance config; the 0x prefix is ASCII
+        // so the .get fallback is unreachable.
+        assert_eq!(hex_to_bytes(encoded.get(2..).unwrap_or("")).unwrap(), bytes);
 
         assert!(hex_to_bytes("0xzz").is_err());
         assert!(hex_to_bytes("0x1234").is_err());

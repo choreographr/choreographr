@@ -7,6 +7,15 @@
 //! `#[ignore]` (run via `cargo test-integration` / `nextest --run-ignored`),
 //! so a plain `cargo test-fast` never opens a socket.
 
+// AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
+// allow-*-in-tests config only recognizes #[test]-annotated functions —
+// helper fns in this file need this file-level allowance.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 use choreo_ai_protocols::images::{
     Background, ImageGenerationRequest, ImageQuality, ImageSize, OutputFormat,
 };

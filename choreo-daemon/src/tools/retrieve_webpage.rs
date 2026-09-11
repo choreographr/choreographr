@@ -356,9 +356,13 @@ fn capture_screenshot(
 fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     // Signature (8) + chunk length (4) + "IHDR" (4) + width (4) + height (4).
     const SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-    if bytes.len() >= 24 && bytes[..8] == SIGNATURE && &bytes[12..16] == b"IHDR" {
-        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    // Compose the length guard with the accesses (clippy::indexing_slicing):
+    // `get` returns None for short/malformed input, which maps to the same
+    // `None` result the len() check produced.
+    if bytes.len() >= 24 && bytes.get(..8) == Some(&SIGNATURE) && bytes.get(12..16) == Some(b"IHDR")
+    {
+        let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+        let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
         Some((width, height))
     } else {
         None

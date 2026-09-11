@@ -691,7 +691,12 @@ fn format_rust_source(source: &str) -> String {
             // blank line when embedded in a markdown code block.
             let formatted = String::from_utf8_lossy(&output.stdout).to_string();
             if formatted.ends_with('\n') {
-                formatted[..formatted.len() - 1].to_string()
+                // Strip exactly the trailing newline; len() >= 1 per the
+                // ends_with check, fallback preserves behavior.
+                formatted
+                    .get(..formatted.len() - 1)
+                    .unwrap_or(&formatted)
+                    .to_string()
             } else {
                 formatted
             }
@@ -744,13 +749,36 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
         &mut self,
         machine: &mut DefaultCoreMachine<u64, FlatMemory<u64>>,
     ) -> Result<bool, VmError> {
-        let code = machine.registers()[registers::A7];
+        // Register indices (A7, A0..) are fixed constants within the
+        // machine's fixed-size register file; the copied() fallback is
+        // unreachable.
+        let code = machine
+            .registers()
+            .get(registers::A7)
+            .copied()
+            .unwrap_or_default();
         match code {
             0 => {
-                let req_ptr = machine.registers()[registers::A0];
-                let req_len = machine.registers()[registers::A1];
-                let out_ptr = machine.registers()[registers::A2];
-                let out_size = machine.registers()[registers::A3];
+                let req_ptr = machine
+                    .registers()
+                    .get(registers::A0)
+                    .copied()
+                    .unwrap_or_default();
+                let req_len = machine
+                    .registers()
+                    .get(registers::A1)
+                    .copied()
+                    .unwrap_or_default();
+                let out_ptr = machine
+                    .registers()
+                    .get(registers::A2)
+                    .copied()
+                    .unwrap_or_default();
+                let out_size = machine
+                    .registers()
+                    .get(registers::A3)
+                    .copied()
+                    .unwrap_or_default();
 
                 let request_bytes = machine.memory_mut().load_bytes(req_ptr, req_len)?;
 
@@ -771,17 +799,27 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
 
                 let to_write = result_bytes.len().min(out_size as usize);
                 if to_write > 0 {
-                    machine
-                        .memory_mut()
-                        .store_bytes(out_ptr, &result_bytes[..to_write])?;
+                    // `to_write <= result_bytes.len()` per the min() above.
+                    machine.memory_mut().store_bytes(
+                        out_ptr,
+                        result_bytes.get(..to_write).unwrap_or(&result_bytes),
+                    )?;
                 }
                 machine.set_register(registers::A0, to_write as u64);
 
                 Ok(true)
             }
             1 => {
-                let ptr = machine.registers()[registers::A0];
-                let len = machine.registers()[registers::A1];
+                let ptr = machine
+                    .registers()
+                    .get(registers::A0)
+                    .copied()
+                    .unwrap_or_default();
+                let len = machine
+                    .registers()
+                    .get(registers::A1)
+                    .copied()
+                    .unwrap_or_default();
                 if len > 0 {
                     trace!(len, "guest WRITE syscall");
                     let data = machine.memory_mut().load_bytes(ptr, len)?;
@@ -797,9 +835,11 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
                     // output beyond the cap is dropped.
                     let n = self.budget.fit(data.len());
                     if n > 0 {
-                        let _ = self.output_tx.send(data[..n].to_vec());
+                        // `fit` returns at most data.len(); fallback unreachable.
+                        let fitted = data.get(..n).unwrap_or(&data);
+                        let _ = self.output_tx.send(fitted.to_vec());
                         if let Some(tx) = &self.write_tx {
-                            let _ = tx.send(data[..n].into());
+                            let _ = tx.send(fitted.into());
                         }
                     }
                     // `take_marker` (not `is_truncated`): it latches, so a
@@ -817,10 +857,26 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
                 Ok(true)
             }
             3 => {
-                let req_ptr = machine.registers()[registers::A0];
-                let req_len = machine.registers()[registers::A1];
-                let out_ptr = machine.registers()[registers::A2];
-                let out_size = machine.registers()[registers::A3];
+                let req_ptr = machine
+                    .registers()
+                    .get(registers::A0)
+                    .copied()
+                    .unwrap_or_default();
+                let req_len = machine
+                    .registers()
+                    .get(registers::A1)
+                    .copied()
+                    .unwrap_or_default();
+                let out_ptr = machine
+                    .registers()
+                    .get(registers::A2)
+                    .copied()
+                    .unwrap_or_default();
+                let out_size = machine
+                    .registers()
+                    .get(registers::A3)
+                    .copied()
+                    .unwrap_or_default();
 
                 let request_bytes = machine.memory_mut().load_bytes(req_ptr, req_len)?;
 
@@ -885,9 +941,10 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
 
                 let to_write = response.len().min(out_size as usize);
                 if to_write > 0 {
+                    // `to_write <= response.len()` per the min() above.
                     machine
                         .memory_mut()
-                        .store_bytes(out_ptr, &response[..to_write])?;
+                        .store_bytes(out_ptr, response.get(..to_write).unwrap_or(&response))?;
                 }
                 machine.set_register(registers::A0, to_write as u64);
                 Ok(true)
@@ -1199,7 +1256,12 @@ fn run_riscv_impl(
     // argv from a1 (the stack has already been laid out by initialize_stack
     // with [argc, argv[0], ..., NULL] starting at SP).
     let arg_count = args_list.len() as u64;
-    let sp = trace.registers()[registers::SP];
+    // SP is a fixed constant within the fixed-size register file; fallback unreachable.
+    let sp = trace
+        .registers()
+        .get(registers::SP)
+        .copied()
+        .unwrap_or_default();
     trace.set_register(registers::A0, arg_count);
     trace.set_register(registers::A1, sp + 8);
 

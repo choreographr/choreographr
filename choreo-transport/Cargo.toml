@@ -30,3 +30,7 @@ serial_test.workspace = true
 # SO_RCVBUF) in noise_integration.rs — TcpStream has no stable API for these.
 # nix's default features are empty, so opt into the socket feature explicitly.
 nix = { workspace = true, features = ["socket"] }
+
+# Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
+[lints]
+workspace = true

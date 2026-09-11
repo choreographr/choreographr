@@ -292,10 +292,9 @@ fn grid_payload<'a>(
     } else {
         start.checked_add(loc.extent_length as usize)?
     };
-    if start > end || end > source.len() {
-        return None;
-    }
-    Some(&source[start..end])
+    // start/end are already validated above (start <= end <= source.len()),
+    // so this slice is in-bounds; use `get` for the lint rather than indexing.
+    source.get(start..end)
 }
 
 /// Parse a `grid` item payload: version(1) flags(1) rows(1) cols(1) then the
@@ -304,12 +303,14 @@ fn grid_payload<'a>(
 /// any other version is rejected rather than misparsed. Rejects a zero output
 /// size, which heif-oxide also does.
 fn parse_grid_payload(p: &[u8]) -> Option<GridGeometry> {
-    if p.len() < 8 || p[0] != 0 {
+    // Pull the fixed header via `get`+`try_into` so malformed input yields
+    // None instead of panicking on out-of-bounds indexing.
+    let [version, flags, rows_byte, cols_byte] = p.get(0..4).and_then(|s| s.try_into().ok())?;
+    if p.len() < 8 || version != 0 {
         return None;
     }
-    let flags = p[1];
-    let rows = p[2] as u32 + 1;
-    let cols = p[3] as u32 + 1;
+    let rows = rows_byte as u32 + 1;
+    let cols = cols_byte as u32 + 1;
     let (out_w, out_h) = if flags & 1 != 0 {
         (u32_at(p, 4)?, u32_at(p, 8)?)
     } else {
@@ -380,7 +381,10 @@ fn for_each_box<'a>(bytes: &'a [u8], mut f: impl FnMut([u8; 4], &'a [u8]) -> boo
         if content_end < content_start {
             return;
         }
-        if !f(btype, &bytes[content_start..content_end]) {
+        let Some(content) = bytes.get(content_start..content_end) else {
+            return;
+        };
+        if !f(btype, content) {
             return;
         }
         if next <= off {
@@ -437,17 +441,15 @@ impl<'a> ByteCursor<'a> {
 
 fn u16_at(b: &[u8], i: usize) -> Option<u16> {
     let s = b.get(i..i + 2)?;
-    Some(u16::from_be_bytes([s[0], s[1]]))
+    Some(u16::from_be_bytes(s.try_into().ok()?))
 }
 fn u32_at(b: &[u8], i: usize) -> Option<u32> {
     let s = b.get(i..i + 4)?;
-    Some(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    Some(u32::from_be_bytes(s.try_into().ok()?))
 }
 fn u64_at(b: &[u8], i: usize) -> Option<u64> {
     let s = b.get(i..i + 8)?;
-    Some(u64::from_be_bytes([
-        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-    ]))
+    Some(u64::from_be_bytes(s.try_into().ok()?))
 }
 
 #[cfg(test)]

@@ -41,3 +41,7 @@ tracing.workspace = true
 # (the same Cf-set logic the daemon and TUI use), so all consumers stay in
 # sync on a Unicode table bump.
 choreo-sanitize.workspace = true
+
+# Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
+[lints]
+workspace = true

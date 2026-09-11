@@ -20,6 +20,18 @@
 //! request and recording every request head/body so tests can assert on the
 //! actual wire.
 
+// Test-only mock-provider infrastructure, compiled solely under the
+// `test-utils` feature (see the module docs above). Clippy's test allowances
+// (clippy.toml) only recognize `#[cfg(test)]`/`#[test]` contexts, not feature
+// gates, so the sanctioned unwrap/expect/panic/indexing exception is granted
+// here at module level — mirroring the AGENTS.md test-only exception.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;

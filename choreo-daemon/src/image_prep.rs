@@ -261,13 +261,25 @@ fn rasterize_svg(bytes: &[u8]) -> std::io::Result<DynamicImage> {
 /// — AVIF and HEIC are both HEIF container brands, so the generic `mif1`/`msf1`
 /// brands alone are ambiguous and cannot be trusted to pick the HEIC path.
 fn is_heic(bytes: &[u8]) -> bool {
-    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+    // Compose the length guard with the accesses so every index is proven in
+    // bounds (clippy::indexing_slicing); `bytes.get(..8)` over the guarded
+    // prefix keeps the same `b"ftyp"` comparison.
+    let head = match bytes.get(..12) {
+        Some(h) => h,
+        None => return false,
+    };
+    if bytes.get(4..8) != Some(b"ftyp") {
         return false;
     }
     // The first four bytes are the box size (big-endian). 0 = to EOF; 1 =
     // extended size (size in a following 8-byte field) — both mean "scan to
     // the end of what we have" for brand detection.
-    let size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    // `head` is at least 12 bytes, so the range is in bounds.
+    let size = u32::from_be_bytes(
+        head.get(..4)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0u8; 4]),
+    );
     let box_end = match size {
         0 | 1 => bytes.len(),
         n => (n as usize).min(bytes.len()),
@@ -275,7 +287,8 @@ fn is_heic(bytes: &[u8]) -> bool {
     let mut has_heif_brand = false;
     let mut off = 8;
     while off + 4 <= box_end {
-        let brand = &bytes[off..off + 4];
+        // `off + 4 <= box_end <= bytes.len()`, so the range is always in bounds.
+        let brand = bytes.get(off..off + 4).unwrap_or_default();
         if matches!(brand, b"avif" | b"avis") {
             return false;
         }
@@ -300,12 +313,14 @@ fn is_svg(bytes: &[u8]) -> bool {
     let trimmed = bytes
         .iter()
         .position(|b| !b.is_ascii_whitespace())
-        .map(|i| &bytes[i..])
+        // `position` returns a valid index; fallback keeps the original slice.
+        .and_then(|i| bytes.get(i..))
         .unwrap_or(bytes);
     if trimmed.first() != Some(&b'<') {
         return false;
     }
-    let window = &trimmed[..trimmed.len().min(512)];
+    // Bounded window slice; the min() keeps the range in bounds.
+    let window = trimmed.get(..trimmed.len().min(512)).unwrap_or(trimmed);
     let lower = window.to_ascii_lowercase();
     lower.windows(4).any(|w| w == b"<svg")
 }

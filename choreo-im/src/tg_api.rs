@@ -92,7 +92,11 @@ impl Bot {
             "text": text,
         });
         if let Some(mode) = parse_mode {
-            body["parse_mode"] = serde_json::json!(mode);
+            // Map::insert (instead of Value's IndexMut, which would panic on
+            // a non-object body) is the correct API for setting top-level keys.
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("parse_mode".into(), serde_json::json!(mode));
+            }
         }
         let response = self.agent.post(&base).send_json(body)?;
         let api_resp: ApiResponse<serde_json::Value> = response.into_body().read_json()?;

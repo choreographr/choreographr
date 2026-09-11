@@ -9,6 +9,16 @@
 //! `tools/fs/mod.rs`) with `edit_file`; these tests pin down the permission
 //! behavior of that shared path from write_file's side.
 
+// AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
+// allow-*-in-tests config only recognizes #[test]-annotated functions —
+// helper fns in this file need this file-level allowance.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::panic_in_result_fn,
+    clippy::indexing_slicing
+)]
 use choreo_daemon::{WriteFileArgs, execute_write_file_tool};
 use std::path::Path;
 

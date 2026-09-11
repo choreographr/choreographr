@@ -45,14 +45,18 @@ impl InputBuffer {
     }
 
     pub(crate) fn cursor_left(&mut self) {
-        let prefix = &self.text[..self.cursor];
+        // The cursor is always maintained on a char boundary (moves are by
+        // grapheme/char, inserts advance by `len_utf8`), so `.get(..)`
+        // reproduces the slice exactly; the fallback is a no-op move.
+        let prefix = self.text.get(..self.cursor).unwrap_or("");
         if let Some((start, _)) = prefix.grapheme_indices(true).next_back() {
             self.cursor = start;
         }
     }
 
     pub(crate) fn cursor_right(&mut self) {
-        let suffix = &self.text[self.cursor..];
+        // Char-boundary invariant as in `cursor_left`.
+        let suffix = self.text.get(self.cursor..).unwrap_or("");
         if suffix.is_empty() {
             return;
         }
@@ -70,7 +74,8 @@ impl InputBuffer {
     }
 
     fn word_left_boundary(&self) -> usize {
-        let s = &self.text[..self.cursor];
+        // Char-boundary invariant as in `cursor_left`.
+        let s = self.text.get(..self.cursor).unwrap_or("");
         let trimmed = s.trim_end();
         if trimmed.is_empty() {
             return 0;
@@ -82,7 +87,8 @@ impl InputBuffer {
     }
 
     fn word_right_boundary(&self) -> usize {
-        let s = &self.text[self.cursor..];
+        // Char-boundary invariant as in `cursor_left`.
+        let s = self.text.get(self.cursor..).unwrap_or("");
         if s.is_empty() {
             return self.cursor;
         }
@@ -132,7 +138,8 @@ impl InputBuffer {
         if self.cursor == 0 {
             return;
         }
-        let prefix = &self.text[..self.cursor];
+        // Char-boundary invariant as in `cursor_left`.
+        let prefix = self.text.get(..self.cursor).unwrap_or("");
         if let Some((start, _)) = prefix.grapheme_indices(true).next_back() {
             self.text.drain(start..self.cursor);
             self.cursor = start;
@@ -144,7 +151,8 @@ impl InputBuffer {
         if self.cursor >= self.text.len() {
             return;
         }
-        let suffix = &self.text[self.cursor..];
+        // Char-boundary invariant as in `cursor_left`.
+        let suffix = self.text.get(self.cursor..).unwrap_or("");
         if let Some((offset, grapheme)) = suffix.grapheme_indices(true).next() {
             self.text
                 .drain(self.cursor + offset..self.cursor + offset + grapheme.len());
@@ -267,13 +275,15 @@ impl InputBuffer {
 
     /// Move cursor to the start of the current logical line (after `\n` or at offset 0).
     pub(crate) fn cursor_home_line(&mut self) {
-        let prefix = &self.text[..self.cursor];
+        // Char-boundary invariant as in `cursor_left`.
+        let prefix = self.text.get(..self.cursor).unwrap_or("");
         self.cursor = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
     }
 
     /// Move cursor to the end of the current logical line (at the `\n` or at text end).
     pub(crate) fn cursor_end_line(&mut self) {
-        let suffix = &self.text[self.cursor..];
+        // Char-boundary invariant as in `cursor_left`.
+        let suffix = self.text.get(self.cursor..).unwrap_or("");
         self.cursor += suffix.find('\n').unwrap_or(suffix.len());
     }
 
@@ -292,8 +302,17 @@ impl InputBuffer {
         if current_line == 0 {
             return;
         }
-        let target = &lines[current_line as usize - 1];
-        let target_text = &self.text[target.start_byte..target.end_byte];
+        // `current_line > 0` and `< lines.len()` (checked via `find_cursor_pos`
+        // returning an in-range row), so the previous line exists.
+        let Some(target) = lines.get(current_line as usize - 1) else {
+            return;
+        };
+        // Visual-line byte offsets come from `compute_visual_lines`, which
+        // only produces char-boundary offsets into `self.text`.
+        let target_text = self
+            .text
+            .get(target.start_byte..target.end_byte)
+            .unwrap_or("");
         let target_col = (col as usize).min(target.display_width);
         let byte_off = byte_offset_at_column(target_text, target_col);
         self.cursor = target.start_byte + byte_off;
@@ -314,8 +333,15 @@ impl InputBuffer {
         if current_line + 1 >= lines.len() as u16 {
             return;
         }
-        let target = &lines[current_line as usize + 1];
-        let target_text = &self.text[target.start_byte..target.end_byte];
+        // `current_line + 1 < lines.len()`, so the next line exists.
+        let Some(target) = lines.get(current_line as usize + 1) else {
+            return;
+        };
+        // Char-boundary invariant as above.
+        let target_text = self
+            .text
+            .get(target.start_byte..target.end_byte)
+            .unwrap_or("");
         let target_col = (col as usize).min(target.display_width);
         let byte_off = byte_offset_at_column(target_text, target_col);
         self.cursor = target.start_byte + byte_off;
@@ -433,7 +459,9 @@ impl InputBuffer {
         let visual_idx = offset.saturating_add(row);
         match lines.get(visual_idx) {
             Some(vl) => {
-                let line_text = &self.text[vl.start_byte..vl.end_byte];
+                // Visual-line byte offsets are char boundaries (see
+                // `compute_visual_lines`).
+                let line_text = self.text.get(vl.start_byte..vl.end_byte).unwrap_or("");
                 let target_col = col.min(vl.display_width);
                 vl.start_byte + grapheme_offset_at_column(line_text, target_col)
             }
@@ -486,7 +514,11 @@ pub(crate) struct VisualLineInfo {
 pub(crate) fn find_cursor_pos(text: &str, cursor: usize, lines: &[VisualLineInfo]) -> (u16, u16) {
     for (i, vl) in lines.iter().enumerate() {
         if cursor >= vl.start_byte && cursor <= vl.end_byte {
-            let line_text = &text[vl.start_byte..cursor.min(vl.end_byte)];
+            // `cursor` is a char boundary and is clamped to the line's end
+            // byte (also a boundary), so `.get()` reproduces the slice.
+            let line_text = text
+                .get(vl.start_byte..cursor.min(vl.end_byte))
+                .unwrap_or("");
             let col = UnicodeWidthStr::width(line_text);
             return (i as u16, col as u16);
         }
@@ -496,7 +528,7 @@ pub(crate) fn find_cursor_pos(text: &str, cursor: usize, lines: &[VisualLineInfo
         Some(vl) => vl,
         None => return (0, 0),
     };
-    let col = UnicodeWidthStr::width(&text[last.start_byte..last.end_byte]);
+    let col = UnicodeWidthStr::width(text.get(last.start_byte..last.end_byte).unwrap_or(""));
     (lines.len().saturating_sub(1) as u16, col as u16)
 }
 
@@ -532,14 +564,26 @@ pub(crate) fn compute_visual_lines(text: &str, max_width: usize) -> Vec<VisualLi
         let mut words: Vec<(usize, usize)> = Vec::new(); // (start, end) byte offsets within `logical`
         let mut pos = 0;
         while pos < logical.len() {
-            while pos < logical.len() && logical.as_bytes()[pos].is_ascii_whitespace() {
+            // Byte-indexing ASCII whitespace tests are safe on any byte, but
+            // `logical` may hold multi-byte chars — `.get()` keeps it total.
+            while pos < logical.len()
+                && logical
+                    .as_bytes()
+                    .get(pos)
+                    .is_some_and(u8::is_ascii_whitespace)
+            {
                 pos += 1;
             }
             if pos >= logical.len() {
                 break;
             }
             let w_start = pos;
-            while pos < logical.len() && !logical.as_bytes()[pos].is_ascii_whitespace() {
+            while pos < logical.len()
+                && !logical
+                    .as_bytes()
+                    .get(pos)
+                    .is_some_and(u8::is_ascii_whitespace)
+            {
                 pos += 1;
             }
             words.push((w_start, pos));
@@ -561,14 +605,21 @@ pub(crate) fn compute_visual_lines(text: &str, max_width: usize) -> Vec<VisualLi
         let mut last_word_end_byte = logical_offset; // end of last word placed
 
         for (i, &(w_start, w_end)) in words.iter().enumerate() {
-            let word = &logical[w_start..w_end];
+            // Word and whitespace offsets come from scanning `logical` above,
+            // so they are char boundaries within it; `.get()` stays total.
+            let word = logical.get(w_start..w_end).unwrap_or("");
             let word_width = UnicodeWidthStr::width(word);
 
             // Whitespace between the previous word (or start of logical line) and this word.
             let preceding_ws = if i == 0 {
-                &logical[0..w_start]
+                logical.get(..w_start).unwrap_or("")
             } else {
-                &logical[words[i - 1].1..w_start]
+                // `i > 0` here, so the previous word entry exists; fall back to
+                // an empty slice (zero-width gap) if it ever went missing.
+                words
+                    .get(i - 1)
+                    .and_then(|&(_, prev_end)| logical.get(prev_end..w_start))
+                    .unwrap_or("")
             };
             let ws_width = UnicodeWidthStr::width(preceding_ws);
 
@@ -595,7 +646,7 @@ pub(crate) fn compute_visual_lines(text: &str, max_width: usize) -> Vec<VisualLi
         // including any trailing whitespace after the last word.
         let trailing_ws = words
             .last()
-            .map(|&(_, w_end)| &logical[w_end..])
+            .and_then(|&(_, w_end)| logical.get(w_end..))
             .unwrap_or(logical);
         let trailing_ws_width = UnicodeWidthStr::width(trailing_ws);
         lines.push(VisualLineInfo {
@@ -622,7 +673,9 @@ pub(crate) fn compute_visual_lines(text: &str, max_width: usize) -> Vec<VisualLi
 pub(crate) fn byte_offset_at_column(s: &str, target_col: usize) -> usize {
     let mut col = 0;
     for (byte_i, ch) in s.char_indices() {
-        let ch_w = UnicodeWidthStr::width(&s[byte_i..byte_i + ch.len_utf8()]);
+        // `char_indices` guarantees `byte_i + ch.len_utf8()` is the next char
+        // boundary, so `.get()` reproduces the single-char slice.
+        let ch_w = UnicodeWidthStr::width(s.get(byte_i..byte_i + ch.len_utf8()).unwrap_or(""));
         if col + ch_w > target_col {
             return byte_i;
         }

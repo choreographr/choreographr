@@ -141,7 +141,12 @@ fn best_effort<T>(option: &str, result: nix::Result<T>) {
     }
 }
 
-#[cfg(all(test, unix))]
+// Two separate cfg attrs (not `cfg(all(test, unix))`): clippy's
+// `allow-expect-in-tests` only recognizes a bare `cfg(test)` when scanning
+// enclosing scopes, so the combined form would leave the test helpers below
+// subject to the workspace's expect/unwrap denies.
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::os::fd::AsFd;

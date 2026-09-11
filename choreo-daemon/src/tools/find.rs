@@ -605,7 +605,7 @@ mod tests {
         assert!(
             result.contains("truncated"),
             "byte-budget stop must report truncation:\n{}",
-            &result[..result.len().min(200)]
+            result.get(..result.len().min(200)).unwrap_or("")
         );
         // The generic `...[truncated]` suffix must not appear as its own
         // line: the walk stopped inside the reserved budget, so
@@ -613,7 +613,7 @@ mod tests {
         assert!(
             !result.lines().any(|l| l == "...[truncated]"),
             "no standalone generic marker: the walk must stop inside the reserved budget:\n{}",
-            &result[..result.len().min(400)]
+            result.get(..result.len().min(400)).unwrap_or("")
         );
         // The budget — not an empty search — stopped the walk: many results
         // were collected before the stop.

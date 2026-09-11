@@ -18,6 +18,16 @@
 //! This binds real sockets and spawns the real daemon, so per AGENTS.md it
 //! lives in `tests/`, is `#[ignore]`, and runs under `cargo test-integration`.
 
+// AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
+// allow-*-in-tests config only recognizes #[test]-annotated functions —
+// helper fns in this file need this file-level allowance.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::panic_in_result_fn,
+    clippy::indexing_slicing
+)]
 use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, SessionStatus};
 use std::io::{Read, Write};
 use std::net::TcpListener;

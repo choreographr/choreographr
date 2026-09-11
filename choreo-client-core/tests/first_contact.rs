@@ -1,5 +1,9 @@
 //! Integration tests for the TCP first-contact trust flow (phase 3).
 //!
+// AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
+// allow-*-in-tests config only recognizes #[test]-annotated functions —
+// helper fns like TestRoots::install need this file-level allowance.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! These drive the real client connection library
 //! (`choreo_client_core::probe_server_key`, `run_daemon_connection_with_mode`
 //! with `ConnectionMode::TcpPinned`) against hand-rolled responder threads

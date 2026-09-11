@@ -171,8 +171,11 @@ fn wrap_plain_line(line: &str, width: usize) -> Vec<String> {
                 out.push(std::mem::take(&mut buf));
                 buf_width = 0;
             } else {
-                out.push(buf[..cut.0].to_string());
-                buf = buf[cut.0..].to_string();
+                // `cut.0` is either a recorded whitespace boundary or the byte
+                // offset of the grapheme that overflowed — both are char
+                // boundaries within `buf` by construction.
+                out.push(buf.get(..cut.0).unwrap_or("").to_string());
+                buf = buf.get(cut.0..).unwrap_or("").to_string();
                 buf_width -= cut.1;
             }
             last_space = None;
@@ -298,10 +301,11 @@ fn sanitize_for_terminal(text: &str) -> String {
             } else {
                 // Non-SGR ESC use: render the ESC inert and the consumed
                 // `[` + intermediate bytes as plain text (`seq` is
-                // ESC + '[' + … , so `seq[1..]` keeps everything after the
-                // ESC byte).
+                // ESC + '[' + … , so everything after the leading ESC byte
+                // is kept; `.get(1..)` is total because `seq` always starts
+                // with the one-byte ESC).
                 out.push_str("\\u{1b}");
-                out.push_str(&seq[1..]);
+                out.push_str(seq.get(1..).unwrap_or(""));
             }
             continue;
         }
@@ -648,7 +652,11 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
         return 0;
     }
 
-    if lines.len() == 1 && lines[0].width() == 0 {
+    // A single zero-width line still occupies one row in the terminal.
+    if lines
+        .first()
+        .is_some_and(|line| lines.len() == 1 && line.width() == 0)
+    {
         return 1;
     }
 
@@ -1522,7 +1530,10 @@ fn render_markdown_block(
                         // The wrapper accounts for the actual row break type
                         // (Space at word boundaries, Join for hard splits);
                         // the first row of each source line is a fresh line.
-                        joins.push(wrapped_joins[wi]);
+                        // `wrapped_joins` is produced in lockstep with
+                        // `wrapped`, so `wi` is in bounds; fall back to a
+                        // hard break if the wrapper ever desynchronizes.
+                        joins.push(wrapped_joins.get(wi).copied().unwrap_or(LineJoin::Break));
                     }
                 } else if indent > 0 {
                     let mut spans = vec![Span::styled(" ".repeat(indent), Style::default())];
@@ -1746,7 +1757,12 @@ fn render_table_lines(
     for row in &table_rows {
         for (index, cell) in row.iter().enumerate() {
             for line in cell.lines() {
-                widths[index] = widths[index].max(display_width(line));
+                // `widths` has one entry per normalized column, and `row` was
+                // normalized to exactly that column count, so `index` is in
+                // bounds.
+                if let Some(w) = widths.get_mut(index) {
+                    *w = (*w).max(display_width(line));
+                }
             }
         }
     }
@@ -1761,8 +1777,10 @@ fn render_table_lines(
     let mut joins = Vec::new();
     lines.push(table_border_line('┌', '┬', '┐', &widths, indent));
     joins.push(LineJoin::Break);
-    let (header_lines, header_joins) =
-        render_table_row_wrapped(&table_rows[0], &widths, &header_alignment, indent);
+    let (header_lines, header_joins) = table_rows
+        .first()
+        .map(|row| render_table_row_wrapped(row, &widths, &header_alignment, indent))
+        .unwrap_or_default();
     lines.extend(header_lines);
     joins.extend(header_joins);
     lines.push(table_separator_line(&widths, &header_alignment, indent));
@@ -1815,7 +1833,12 @@ fn shrink_column_widths(widths: &mut [usize], budget: usize) {
             .filter(|(_, width)| **width > min_width)
             .max_by_key(|(_, width)| **width)
         {
-            widths[index] -= 1;
+            // The index comes from enumerating `widths` itself, so it is
+            // always in bounds; `saturating_sub` cannot saturate because the
+            // filter above guarantees `width > min_width`.
+            if let Some(width) = widths.get_mut(index) {
+                *width = width.saturating_sub(1);
+            }
         } else {
             break;
         }
@@ -1850,7 +1873,14 @@ fn table_separator_line(
     let mut text = String::new();
     text.push('├');
     for (index, width) in widths.iter().enumerate() {
-        text.push_str(&alignment_rule_segment(*width, alignments[index]));
+        // `alignments` is normalized to the same column count as `widths`.
+        text.push_str(&alignment_rule_segment(
+            *width,
+            alignments
+                .get(index)
+                .copied()
+                .unwrap_or(MarkdownAlignment::None),
+        ));
         text.push(if index + 1 == widths.len() {
             '┤'
         } else {
@@ -1893,15 +1923,25 @@ fn render_table_row_wrapped(
         let mut text = String::new();
         text.push('│');
         for column_index in 0..widths.len() {
-            let cell_line = wrapped_cells[column_index]
-                .get(line_index)
+            // `wrapped_cells`/`alignments` carry one entry per column of
+            // `widths` (rows are normalized to the column count), so these
+            // lookups are in bounds; `.get()` keeps them total.
+            let cell_line = wrapped_cells
+                .get(column_index)
+                .and_then(|cell| cell.get(line_index))
                 .map(String::as_str)
                 .unwrap_or("");
+            let Some(cell_width) = widths.get(column_index) else {
+                continue;
+            };
             text.push(' ');
             text.push_str(&pad_aligned(
                 cell_line,
-                widths[column_index],
-                alignments[column_index],
+                *cell_width,
+                alignments
+                    .get(column_index)
+                    .copied()
+                    .unwrap_or(MarkdownAlignment::None),
             ));
             text.push(' ');
             text.push('│');

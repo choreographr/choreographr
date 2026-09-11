@@ -46,26 +46,28 @@ fn shrink_socket_buffers(_stream: &TcpStream) {}
 
 /// Fresh X25519 keypairs for both handshake sides plus an ephemeral
 /// listener, shared by every test (cuts the per-test keygen boilerplate).
-fn noise_test_pair() -> (TcpListener, [u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
+fn noise_test_pair()
+-> std::result::Result<(TcpListener, [u8; 32], [u8; 32], [u8; 32], [u8; 32]), String> {
     let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
     let server_pk = PublicKey::from(&server_sk);
     let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
     let client_pk = PublicKey::from(&client_sk);
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    (
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    Ok((
         listener,
         server_sk.to_bytes(),
         server_pk.to_bytes(),
         client_sk.to_bytes(),
         client_pk.to_bytes(),
-    )
+    ))
 }
 
 /// Test full Noise IK handshake between client and server.
 #[test]
 #[ignore]
 fn noise_ik_handshake_round_trip() {
-    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
@@ -96,7 +98,8 @@ fn noise_ik_handshake_round_trip() {
 #[test]
 #[ignore]
 fn noise_ik_handshake_rejects_unknown_client() {
-    let (listener, server_sk, server_pk, client_sk, _client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, _client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
     let wrong_pk = PublicKey::from(&StaticSecret::random_from_rng(&mut rand::rng()));
 
@@ -130,7 +133,8 @@ fn noise_ik_handshake_rejects_unknown_client() {
 #[test]
 #[ignore]
 fn noise_encrypted_message_round_trip() {
-    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
@@ -214,7 +218,8 @@ fn noise_encrypted_message_round_trip() {
 #[test]
 #[ignore]
 fn noise_large_message_round_trip() {
-    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
@@ -275,7 +280,8 @@ fn noise_large_message_round_trip() {
 #[test]
 #[ignore]
 fn noise_fragmented_message_round_trip() {
-    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
@@ -375,7 +381,8 @@ fn noise_fragmented_message_round_trip() {
 #[test]
 #[ignore]
 fn noise_empty_message_round_trip() {
-    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
@@ -440,7 +447,8 @@ fn noise_empty_message_round_trip() {
 #[test]
 #[ignore]
 fn noise_peer_close_surfaces_as_connection_closed() {
-    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
@@ -535,7 +543,8 @@ fn noise_garbage_handshake_message_rejected() {
 #[test]
 #[ignore]
 fn noise_concurrent_bidirectional_large_messages() {
-    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     // Both sides send 1 MiB before either's receive completes; distinct byte
@@ -687,7 +696,8 @@ fn noise_concurrent_bidirectional_large_messages() {
 #[test]
 #[ignore]
 fn noise_rejects_oversized_fragment_prefix() {
-    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
@@ -772,7 +782,7 @@ fn raw_handshake_responder(
         .write_all(&(n as u16).to_be_bytes())
         .map_err(|e| format!("write msg2 len failed: {e}"))?;
     stream
-        .write_all(&out_buf[..n])
+        .write_all(out_buf.get(..n).ok_or("out_buf slice out of bounds")?)
         .map_err(|e| format!("write msg2 failed: {e}"))?;
 
     let ts = handshake
@@ -809,7 +819,7 @@ fn raw_handshake_initiator(
         .write_all(&(n as u16).to_be_bytes())
         .map_err(|e| format!("write msg1 len failed: {e}"))?;
     stream
-        .write_all(&buf[..n])
+        .write_all(buf.get(..n).ok_or("buf slice out of bounds")?)
         .map_err(|e| format!("write msg1 failed: {e}"))?;
 
     let mut len_buf = [0u8; 2];
@@ -847,7 +857,8 @@ fn raw_handshake_initiator(
 #[test]
 #[ignore]
 fn noise_rejects_tampered_length_prefix() {
-    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
@@ -1045,7 +1056,8 @@ fn noise_handshake_times_out_against_dribbling_peer() {
 #[test]
 #[ignore]
 fn noise_xx_handshake_round_trip() {
-    let (listener, server_sk, server_pk, client_sk, client_pk) = noise_test_pair();
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();
@@ -1107,7 +1119,8 @@ fn noise_xx_handshake_round_trip() {
 #[test]
 #[ignore]
 fn noise_xx_handshake_rejects_unknown_client() {
-    let (listener, server_sk, _server_pk, client_sk, _client_pk) = noise_test_pair();
+    let (listener, server_sk, _server_pk, client_sk, _client_pk) =
+        noise_test_pair().expect("noise test listener bind");
     let addr = listener.local_addr().expect("local addr");
 
     let (tx, rx) = mpsc::channel();

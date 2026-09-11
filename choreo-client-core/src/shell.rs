@@ -156,9 +156,11 @@ fn parse_account_subcommand(rest: &str) -> Option<ShellCommand> {
             ));
         }
         let parts: Vec<&str> = args.split_whitespace().collect();
-        return Some(match parts[0] {
-            "list" => ShellCommand::Send(ClientMessage::ListAccounts),
-            "remove" => {
+        // args was checked non-empty above, so first() is always Some; the
+        // catch-all arm treats the None case identically anyway.
+        return Some(match parts.first().copied() {
+            Some("list") => ShellCommand::Send(ClientMessage::ListAccounts),
+            Some("remove") => {
                 let name = args
                     .trim_start()
                     .strip_prefix("remove")
@@ -289,11 +291,13 @@ fn parse_command(
         if parts.len() < 2 {
             return ShellCommand::UnknownCommand("usage: /add-key <service> <api_key>".to_string());
         }
-        let service = parts[0].to_string();
+        // The len check above bounds-guarantees both fields; get() keeps the
+        // accesses total.
+        let service = parts.first().copied().unwrap_or_default().to_string();
         if !is_valid_account_name(&service) {
             return ShellCommand::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
         }
-        let key = parts[1].to_string();
+        let key = parts.get(1).copied().unwrap_or_default().to_string();
         // The unlock key is always resolved per-addr by
         // `build_add_credential_message` (stored → legacy → fresh), so the
         // shell takes no `unlock` argument anymore.
@@ -311,15 +315,32 @@ fn parse_command(
                 "usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_".to_string(),
             );
         }
-        let service = parts[0].to_string();
+        // The len check above bounds-guarantees all six fields; get() keeps
+        // the accesses total.
+        let [
+            service,
+            api_key,
+            api_key_secret,
+            access_token,
+            access_token_secret,
+            bearer_token,
+        ] = [
+            parts.first(),
+            parts.get(1),
+            parts.get(2),
+            parts.get(3),
+            parts.get(4),
+            parts.get(5),
+        ];
+        let service = service.copied().unwrap_or_default().to_string();
         if !is_valid_account_name(&service) {
             return ShellCommand::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
         }
-        let api_key = parts[1].to_string();
-        let api_key_secret = parts[2].to_string();
-        let access_token = parts[3].to_string();
-        let access_token_secret = parts[4].to_string();
-        let bearer_token = parts[5].to_string();
+        let api_key = api_key.copied().unwrap_or_default().to_string();
+        let api_key_secret = api_key_secret.copied().unwrap_or_default().to_string();
+        let access_token = access_token.copied().unwrap_or_default().to_string();
+        let access_token_secret = access_token_secret.copied().unwrap_or_default().to_string();
+        let bearer_token = bearer_token.copied().unwrap_or_default().to_string();
         // The unlock key is always resolved per-addr by
         // `build_add_credential_message` (stored → legacy → fresh), so the
         // shell takes no `unlock` argument anymore.
@@ -365,13 +386,22 @@ fn parse_command(
                     );
                 }
                 // Syntactic validation only (base64 shape + 32-byte length);
-                // the daemon re-validates authoritatively.
-                if let Err(e) = validate_pubkey_b64(parts[1]) {
-                    return ShellCommand::UnknownCommand(e);
-                }
-                return ShellCommand::AclAdd {
-                    pubkey: parts[1].to_string(),
+                // the daemon re-validates authoritatively. parts.len() == 2
+                // is checked above, so get(1) is always Some.
+                let pubkey = match parts.get(1) {
+                    Some(pubkey) => {
+                        if let Err(e) = validate_pubkey_b64(pubkey) {
+                            return ShellCommand::UnknownCommand(e);
+                        }
+                        pubkey.to_string()
+                    }
+                    None => {
+                        return ShellCommand::UnknownCommand(
+                            "usage: /acl add <base64-pubkey>".to_string(),
+                        );
+                    }
                 };
+                return ShellCommand::AclAdd { pubkey };
             }
             _ => {
                 return ShellCommand::UnknownCommand("usage: /acl add <base64-pubkey>".to_string());

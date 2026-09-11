@@ -616,12 +616,17 @@ fn merge_reasoning_item(items: &mut Vec<serde_json::Value>, item: serde_json::Va
         return;
     };
     // Same-id item already collected? Replace it with the later, complete
-    // value; otherwise append.
+    // value; otherwise append. `pos` came from `position()` over `items`,
+    // so the `get_mut` lookup always succeeds; the None arm is unreachable.
     match items
         .iter()
         .position(|it| it.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
     {
-        Some(pos) => items[pos] = item,
+        Some(pos) => {
+            if let Some(slot) = items.get_mut(pos) {
+                *slot = item;
+            }
+        }
         None => items.push(item),
     }
 }

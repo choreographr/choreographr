@@ -235,7 +235,9 @@ fn cursor_end_moves_to_end() {
 // ── Multi-line input tests ─────────────────────────────────
 
 fn vl_text<'a>(vl: &VisualLineInfo, source: &'a str) -> &'a str {
-    &source[vl.start_byte..vl.end_byte]
+    // Visual-line byte offsets are char boundaries within `source` (produced
+    // by `compute_visual_lines`); `.get()` keeps the slice total.
+    source.get(vl.start_byte..vl.end_byte).unwrap_or("")
 }
 
 #[test]
@@ -303,7 +305,8 @@ fn cursor_up_simple() {
     buf.text = "hello\nworld".to_string();
     buf.cursor = 9; // byte 9 = 'l', visual col 3 within "world"
     buf.cursor_up(80);
-    assert!(!buf.text[..buf.cursor].contains('\n'));
+    // The cursor is always a char boundary; total slice via `.get()`.
+    assert!(!buf.text.get(..buf.cursor).unwrap_or("").contains('\n'));
     // same col 3 lands at byte 3 ('l' in "hello")
     assert_eq!(buf.cursor, 3);
 }
@@ -314,7 +317,8 @@ fn cursor_down_simple() {
     buf.text = "hello\nworld".to_string();
     buf.cursor = 2; // byte 2 = 'l', visual col 2 within "hello"
     buf.cursor_down(80);
-    assert!(buf.text[..buf.cursor].contains('\n'));
+    // The cursor is always a char boundary; total slice via `.get()`.
+    assert!(buf.text.get(..buf.cursor).unwrap_or("").contains('\n'));
     // same col 2 lands at byte 8 ('r' in "world")
     assert_eq!(buf.cursor, 8);
 }

@@ -194,28 +194,37 @@ pub fn import_from_json(
         return Err(KeystoreError::InvalidKeystoreData);
     }
 
-    let salt: [u8; SALT_LEN] = decoded[..SALT_LEN]
-        .try_into()
-        .map_err(|_| KeystoreError::InvalidKeystoreData)?;
+    // Length-checked above; .get() + ok_or keeps the same InvalidKeystoreData
+    // behavior without clippy::indexing_slicing.
+    let salt: [u8; SALT_LEN] = decoded
+        .get(..SALT_LEN)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(KeystoreError::InvalidKeystoreData)?;
     let n = u32::from_le_bytes(
-        decoded[SALT_LEN..SALT_LEN + 4]
-            .try_into()
-            .map_err(|_| KeystoreError::InvalidKeystoreData)?,
+        decoded
+            .get(SALT_LEN..SALT_LEN + 4)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(KeystoreError::InvalidKeystoreData)?,
     );
     let p = u32::from_le_bytes(
-        decoded[SALT_LEN + 4..SALT_LEN + 8]
-            .try_into()
-            .map_err(|_| KeystoreError::InvalidKeystoreData)?,
+        decoded
+            .get(SALT_LEN + 4..SALT_LEN + 8)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(KeystoreError::InvalidKeystoreData)?,
     );
     let r = u32::from_le_bytes(
-        decoded[SALT_LEN + 8..SALT_LEN + 12]
-            .try_into()
-            .map_err(|_| KeystoreError::InvalidKeystoreData)?,
+        decoded
+            .get(SALT_LEN + 8..SALT_LEN + 12)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(KeystoreError::InvalidKeystoreData)?,
     );
-    let nonce: [u8; NONCE_LEN] = decoded[PARAMS_LEN..PREFIX_LEN]
-        .try_into()
-        .map_err(|_| KeystoreError::InvalidKeystoreData)?;
-    let ciphertext = &decoded[PREFIX_LEN..];
+    let nonce: [u8; NONCE_LEN] = decoded
+        .get(PARAMS_LEN..PREFIX_LEN)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(KeystoreError::InvalidKeystoreData)?;
+    let ciphertext = decoded
+        .get(PREFIX_LEN..)
+        .ok_or(KeystoreError::InvalidKeystoreData)?;
 
     let key = derive_scrypt_key(password, &salt, n, p, r)?;
     let plaintext = decrypt_secretbox(&key, &nonce, ciphertext)?;
@@ -228,18 +237,20 @@ pub fn import_from_json(
         return Err(KeystoreError::InvalidKeystoreData);
     }
 
-    if plaintext[..HEADER.len()] != HEADER {
+    if plaintext.get(..HEADER.len()) != Some(&HEADER[..]) {
         return Err(KeystoreError::InvalidKeystoreData);
     }
-    let secret_key: [u8; 64] = plaintext[16..80]
-        .try_into()
-        .map_err(|_| KeystoreError::InvalidKeystoreData)?;
-    if plaintext[80..85] != DIV {
+    let secret_key: [u8; 64] = plaintext
+        .get(16..80)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(KeystoreError::InvalidKeystoreData)?;
+    if plaintext.get(80..85) != Some(&DIV[..]) {
         return Err(KeystoreError::InvalidKeystoreData);
     }
-    let public_key: [u8; 32] = plaintext[85..117]
-        .try_into()
-        .map_err(|_| KeystoreError::InvalidKeystoreData)?;
+    let public_key: [u8; 32] = plaintext
+        .get(85..117)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(KeystoreError::InvalidKeystoreData)?;
 
     // Cross-check that the expanded ed25519 secret genuinely derives the
     // claimed public key — an integrity failure here would silently produce a

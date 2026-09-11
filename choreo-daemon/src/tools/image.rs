@@ -138,7 +138,15 @@ fn prepare_image(args: &DisplayImageArgs) -> io::Result<PreparedImage> {
     } else if let Some(svg_text) = &args.svg_text {
         svg_text.as_bytes().to_vec()
     } else {
-        unreachable!("source count validated")
+        // Provably unreachable: `selected_sources != 1` above already rejects
+        // every case other than exactly one Some source, so one of the four
+        // branches took it. The daemon must never panic even on a logical
+        // bug, so this defensive fallback returns a structured error instead
+        // of unreachable! — a mismatch would otherwise crash the process.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no image source set",
+        ));
     };
 
     // Shared with `generate_image` (tools/image_gen.rs): every image that

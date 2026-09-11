@@ -67,7 +67,8 @@ fn locate(app: &App, needle: &str) -> ((u16, u16), (u16, u16)) {
         for (line_idx, line) in cached.rendered.lines.iter().enumerate() {
             let text = line_text(line);
             if let Some(char_off) = text.find(needle) {
-                let col_start = UnicodeWidthStr::width(&text[..char_off]);
+                // `char_off` is a `find` byte offset, hence a char boundary.
+                let col_start = UnicodeWidthStr::width(text.get(..char_off).unwrap_or(""));
                 let col_end = col_start + UnicodeWidthStr::width(needle);
                 let row_lo = cached
                     .rendered

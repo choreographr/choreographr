@@ -34,7 +34,8 @@ impl ReasoningCapability {
             }
         };
         let next = (pos + 1) % self.available_effort_levels.len();
-        Some(self.available_effort_levels[next].clone())
+        // The modulo guarantees `next` is in bounds; .get keeps the lint total.
+        self.available_effort_levels.get(next).cloned()
     }
 }
 

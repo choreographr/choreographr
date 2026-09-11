@@ -111,14 +111,21 @@ pub fn decrypt_with_private_key(
         return Err(KeystoreError::TooShort);
     }
 
-    let eph_pub_bytes: [u8; 32] = data[..32].try_into().map_err(|_| KeystoreError::TooShort)?;
-    let salt: [u8; SALT_LEN] = data[32..64]
-        .try_into()
-        .map_err(|_| KeystoreError::TooShort)?;
-    let nonce_bytes: [u8; NONCE_LEN] = data[64..76]
-        .try_into()
-        .map_err(|_| KeystoreError::TooShort)?;
-    let ciphertext = &data[76..];
+    // The length check above guarantees these ranges are in bounds; .get()
+    // keeps clippy::indexing_slicing happy without a second error path.
+    let eph_pub_bytes: [u8; 32] = data
+        .get(..32)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(KeystoreError::TooShort)?;
+    let salt: [u8; SALT_LEN] = data
+        .get(32..64)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(KeystoreError::TooShort)?;
+    let nonce_bytes: [u8; NONCE_LEN] = data
+        .get(64..76)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(KeystoreError::TooShort)?;
+    let ciphertext = data.get(76..).ok_or(KeystoreError::TooShort)?;
 
     let eph_public = PublicKey::from(eph_pub_bytes);
     let secret = StaticSecret::from(*priv_key);

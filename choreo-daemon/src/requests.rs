@@ -228,7 +228,8 @@ fn is_session_config_tool(name: &str) -> bool {
 /// "(parallel)" for genuine multi-tool batches.
 fn concurrent_tool_status_label(tools: &[ChatToolCall]) -> String {
     if tools.len() == 1 {
-        tools[0].name.clone()
+        // Single-element slice per the len() check above; fallback is unreachable.
+        tools.first().map(|t| t.name.clone()).unwrap_or_default()
     } else {
         "(parallel)".into()
     }
@@ -799,7 +800,12 @@ pub(crate) fn run_agent_loop(
                         turn = turn_iter,
                         tool_name = %tool_call.name,
                         tool_call_id = %tool_call.id,
-                        args_preview = %(&tool_call.arguments_json[..tool_call.arguments_json.len().min(200)]),
+                        args_preview = %tool_call
+                            .arguments_json
+                            .get(..tool_call.arguments_json.len().min(200))
+                            // Char boundary by construction (len-capped ASCII-safe
+                            // prefix); fall back to the full string if not.
+                            .unwrap_or(&tool_call.arguments_json),
                         "executing tool (serial)",
                     );
 

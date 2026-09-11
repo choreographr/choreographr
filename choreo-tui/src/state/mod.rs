@@ -725,7 +725,16 @@ impl App {
                 width: term_width,
                 height: term_height,
             });
-        [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
+        // Layout::vertical([Min(1), Length(_), Length(_), Length(_),
+        // Length(_)]) always yields exactly 5 chunks; a zero-area fallback
+        // makes mouse hit-tests no-ops (nothing to click on).
+        [
+            chunks.first().copied().unwrap_or_default(),
+            chunks.get(1).copied().unwrap_or_default(),
+            chunks.get(2).copied().unwrap_or_default(),
+            chunks.get(3).copied().unwrap_or_default(),
+            chunks.get(4).copied().unwrap_or_default(),
+        ]
     }
 
     /// Rectangle (terminal coordinates) occupied by the command input box on
@@ -1175,7 +1184,9 @@ impl App {
     /// the user has edited the entry on top of it.
     fn load_history_entry(&mut self, idx: usize, texts: &[String]) {
         self.history_index = Some(idx);
-        let entry = texts[idx].clone();
+        // Callers always pass a valid history index, but a stale one must not
+        // panic the render path — fall back to an empty entry (no text).
+        let entry = texts.get(idx).cloned().unwrap_or_default();
         self.history_entry_text = Some(entry.clone());
         self.input.text = entry;
         self.input.generation += 1;
@@ -2007,8 +2018,15 @@ impl SessionDisplayState {
             // visual-row range — O(1) in the click handler, same approach
             // as image ranges.
             let reasoning_header_range = reasoning_header_idx.map(|idx| {
-                let start = if idx == 0 { 0 } else { text_offsets[idx - 1] };
-                let end = text_offsets[idx];
+                // `idx` indexes a semantic line of the same render that
+                // produced `text_offsets`, so `idx < offsets.len()` and the
+                // lookups are in bounds; fall back to a zero-width range.
+                let start = if idx == 0 {
+                    0
+                } else {
+                    text_offsets.get(idx - 1).copied().unwrap_or(0)
+                };
+                let end = text_offsets.get(idx).copied().unwrap_or(0);
                 (start, end)
             });
 
@@ -2018,8 +2036,13 @@ impl SessionDisplayState {
             let tool_result_header_ranges = tool_result_header_idxs
                 .iter()
                 .map(|&idx| {
-                    let start = if idx == 0 { 0 } else { text_offsets[idx - 1] };
-                    let end = text_offsets[idx];
+                    // In-bounds by construction, as above.
+                    let start = if idx == 0 {
+                        0
+                    } else {
+                        text_offsets.get(idx - 1).copied().unwrap_or(0)
+                    };
+                    let end = text_offsets.get(idx).copied().unwrap_or(0);
                     (start, end)
                 })
                 .collect();
@@ -2216,7 +2239,12 @@ impl SessionDisplayState {
             return self.rebuild_height_prefix_preserving_scroll(viewport);
         }
 
-        let turn_id = self.visible_turn_ids[turn_idx];
+        // `turn_idx < self.visible_turn_ids.len()` was checked above.
+        let turn_id = self
+            .visible_turn_ids
+            .get(turn_idx)
+            .copied()
+            .unwrap_or_default();
         let Some(turn) = self.view.turns.get(&turn_id) else {
             return self.rebuild_height_prefix_preserving_scroll(viewport);
         };
@@ -2289,8 +2317,13 @@ impl SessionDisplayState {
             // Rebuilds (via `rebuild_height_prefix`) recompute from scratch.
             if let Some(layout) = self.turn_layouts.get_mut(turn_idx) {
                 layout.reasoning_header_range = rendered.reasoning_header_idx.map(|idx| {
-                    let start = if idx == 0 { 0 } else { visual_offsets[idx - 1] };
-                    let end = visual_offsets[idx];
+                    // In-bounds by construction (see the rebuild path).
+                    let start = if idx == 0 {
+                        0
+                    } else {
+                        visual_offsets.get(idx - 1).copied().unwrap_or(0)
+                    };
+                    let end = visual_offsets.get(idx).copied().unwrap_or(0);
                     (start, end)
                 });
                 layout.reasoning_default_expanded = reasoning_default_expanded;
@@ -2301,8 +2334,13 @@ impl SessionDisplayState {
                     .tool_result_header_idxs
                     .iter()
                     .map(|&idx| {
-                        let start = if idx == 0 { 0 } else { visual_offsets[idx - 1] };
-                        let end = visual_offsets[idx];
+                        // In-bounds by construction (see the rebuild path).
+                        let start = if idx == 0 {
+                            0
+                        } else {
+                            visual_offsets.get(idx - 1).copied().unwrap_or(0)
+                        };
+                        let end = visual_offsets.get(idx).copied().unwrap_or(0);
                         (start, end)
                     })
                     .collect();
@@ -2338,13 +2376,23 @@ impl SessionDisplayState {
             let img_count = turn.displayed_images.len();
             let turn_height = text_height + img_count * full_img_height;
 
-            let old_height = self.turn_heights[turn_idx];
+            // `turn_idx` was bounds-checked against `visible_turn_ids` above,
+            // and `turn_heights` is kept in lockstep with it (one entry per
+            // visible turn); the fallback height of 0 routes a drift into the
+            // rebuild branch below (`old_height > turn_height` is false, then
+            // `turn_height > old_height` triggers a full rebuild).
+            let old_height = self.turn_heights.get(turn_idx).copied().unwrap_or(0);
 
             if turn_height > old_height {
                 let delta = turn_height - old_height;
-                self.turn_heights[turn_idx] = turn_height;
+                if let Some(h) = self.turn_heights.get_mut(turn_idx) {
+                    *h = turn_height;
+                }
                 for i in turn_idx..self.height_prefix.len() {
-                    self.height_prefix[i] = self.height_prefix[i].saturating_add(delta);
+                    // `i < self.height_prefix.len()` by the loop range.
+                    if let Some(prefix) = self.height_prefix.get_mut(i) {
+                        *prefix = prefix.saturating_add(delta);
+                    }
                 }
                 let at_bottom = self.effective_scroll(viewport) == 0;
                 if !at_bottom {
@@ -2409,7 +2457,10 @@ impl SessionDisplayState {
         let virtual_track = self.virtual_track_slots(viewport);
         let mut accum = 0usize;
         for (i, &turn_id) in self.visible_turn_ids.iter().enumerate() {
-            let turn_height = self.turn_heights[i];
+            // `turn_heights` is kept in lockstep with `visible_turn_ids` (one
+            // entry per visible turn); a height of 0 skips the marker for a
+            // drift-affected turn instead of panicking.
+            let turn_height = self.turn_heights.get(i).copied().unwrap_or(0);
             if let Some(turn) = self.view.turns.get(&turn_id)
                 && turn.user_text.is_some()
             {

@@ -73,13 +73,16 @@ pub(crate) fn read_line_capped<R: BufRead>(
                 return Ok(false);
             }
             let take = available.len().min(remaining);
-            match available[..take].iter().position(|&b| b == b'\n') {
+            // `take <= available.len()`, so all ranges below are in bounds;
+            // the get() fallbacks are unreachable.
+            let window = available.get(..take).unwrap_or(available);
+            match window.iter().position(|&b| b == b'\n') {
                 Some(idx) => {
-                    buf.extend_from_slice(&available[..=idx]);
+                    buf.extend_from_slice(available.get(..=idx).unwrap_or(available));
                     (idx + 1, true)
                 }
                 None => {
-                    buf.extend_from_slice(&available[..take]);
+                    buf.extend_from_slice(window);
                     (take, false)
                 }
             }
@@ -298,7 +301,9 @@ pub(crate) fn render_streamed_line(
         Err(e) if !line.complete && e.error_len().is_none() => {
             // The display cap split a multi-byte char mid-sequence; the
             // prefix before the split is valid and that is all we show.
-            std::str::from_utf8(&line.content[..e.valid_up_to()]).unwrap_or_default()
+            // `valid_up_to()` is a valid boundary index; fallback preserves behavior.
+            std::str::from_utf8(line.content.get(..e.valid_up_to()).unwrap_or(&line.content))
+                .unwrap_or_default()
         }
         Err(e) => {
             return Err(ToolExecError(format!(

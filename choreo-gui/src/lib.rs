@@ -289,7 +289,15 @@ pub fn main() {
                 Ok(pk) => pk,
                 Err(e) => {
                     eprintln!("failed to read server public key: {e}");
-                    std::process::exit(1);
+                    // Deliberate CLI startup exit: this is pre-launch argument
+                    // validation in a binary entry point (before any UI runs),
+                    // not daemon or library code — there is nothing to fail
+                    // gracefully in yet, so the clippy::exit deny is waived
+                    // here only. Wrapped in a closure so the `allow` stays
+                    // scoped to this single exit path.
+                    #[allow(clippy::exit)]
+                    let startup_exit = |code: i32| std::process::exit(code);
+                    startup_exit(1)
                 }
             };
             ConnectionMode::Tcp { addr, server_pk }

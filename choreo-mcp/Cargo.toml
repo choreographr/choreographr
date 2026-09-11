@@ -18,3 +18,7 @@ tracing.workspace = true
 [target.'cfg(unix)'.dependencies]
 # Used only for killpg-style process-group cleanup of MCP server subprocesses.
 libc = "0.2"
+
+# Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
+[lints]
+workspace = true

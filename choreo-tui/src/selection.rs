@@ -382,8 +382,13 @@ fn extract_selection_text(app: &App) -> Option<String> {
             out.push_str(&slot.text);
             continue;
         }
-        let prev_turn = slots[i - 1].turn_idx;
-        let prev_line = slots[i - 1].line_idx;
+        // `i > 0` inside this loop, so the previous slot always exists; the
+        // fallback duplicates the current slot's indices only if the iterator
+        // were ever handed an inconsistent slice.
+        let (prev_turn, prev_line) = slots
+            .get(i - 1)
+            .map(|p| (p.turn_idx, p.line_idx))
+            .unwrap_or((slot.turn_idx, slot.line_idx));
         let join = if prev_turn == slot.turn_idx && prev_line == slot.line_idx {
             // Same semantic line across two viewport rows — contiguous text.
             LineJoin::Join
@@ -477,12 +482,11 @@ fn text_and_join_for_content_line(
         .get(line_idx)
         .copied()
         .unwrap_or(LineJoin::Break);
-    Some((
-        slice_line_columns(&rendered.lines[line_idx], lo, hi),
-        join,
-        turn_idx,
-        line_idx,
-    ))
+    // `line_idx < rendered.lines.len()` by the parallel-array invariant
+    // asserted above (debug builds) and `content_range_for_row`'s mapping;
+    // bail to an empty selection if a cache drift ever breaks it.
+    let line = rendered.lines.get(line_idx)?;
+    Some((slice_line_columns(line, lo, hi), join, turn_idx, line_idx))
 }
 
 /// Resolve a turn-local visual row and viewport column range to the
@@ -705,9 +709,12 @@ pub(crate) fn style_line_selection(
         if sel_lo > sel_hi {
             std::mem::swap(&mut sel_lo, &mut sel_hi);
         }
-        let before = &span_text[..sel_lo];
-        let selected = &span_text[sel_lo..sel_hi];
-        let after = &span_text[sel_hi..];
+        // The snap offsets come from `grapheme_offset_at_column` over the same
+        // string, so both are char boundaries within `span_text` by
+        // construction; `.get()` keeps the slices total.
+        let before = span_text.get(..sel_lo).unwrap_or("");
+        let selected = span_text.get(sel_lo..sel_hi).unwrap_or("");
+        let after = span_text.get(sel_hi..).unwrap_or("");
         if !before.is_empty() {
             out.push(Span::styled(before.to_owned(), span.style));
         }
@@ -738,7 +745,10 @@ fn slice_line_columns(line: &Line<'_>, col_lo: usize, col_hi: usize) -> String {
     let width = UnicodeWidthStr::width(text.as_str());
     let lo = grapheme_offset_at_column(&text, col_lo.min(width));
     let hi = grapheme_offset_at_column(&text, col_hi.min(width));
-    text[lo.min(hi)..lo.max(hi)].to_string()
+    // Both offsets are grapheme (⇒ char) boundaries snapped by
+    // `grapheme_offset_at_column`, and ordered after the swap below.
+    let (start, end) = (lo.min(hi), lo.max(hi));
+    text.get(start..end).unwrap_or("").to_string()
 }
 
 #[cfg(test)]

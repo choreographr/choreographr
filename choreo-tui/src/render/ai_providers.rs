@@ -48,24 +48,36 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
+    // Layout::vertical([Min(1), Length(1)]) always yields exactly 2 chunks;
+    // a zero-area fallback rect is harmless to render into.
+    let (list_area, status_area) = (
+        chunks.first().copied().unwrap_or_default(),
+        chunks.get(1).copied().unwrap_or_default(),
+    );
+
     let block = Block::default()
         .title(" AI Provider Accounts ")
         .borders(Borders::ALL);
-    let inner = block.inner(chunks[0]);
-    frame.render_widget(block, chunks[0]);
+    let inner = block.inner(list_area);
+    frame.render_widget(block, list_area);
 
     let list_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
+    // Layout::horizontal([Min(1), Length(1)]) always yields exactly 2 chunks.
+    let (list_inner, scrollbar_area) = (
+        list_chunks.first().copied().unwrap_or_default(),
+        list_chunks.get(1).copied().unwrap_or_default(),
+    );
 
     let scroll = app.ai_providers.scroll;
-    let max_rows = list_chunks[0].height as usize;
+    let max_rows = list_inner.height as usize;
     let total_items = app.ai_providers.accounts.len();
 
     if total_items == 0 {
         let msg = Paragraph::new("No AI provider accounts configured. Press 'n' to add one.");
-        frame.render_widget(msg, list_chunks[0]);
+        frame.render_widget(msg, list_inner);
     } else {
         let mut lines: Vec<Line> = Vec::new();
 
@@ -73,7 +85,11 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
             if lines.len() + 3 > max_rows && i != scroll {
                 break;
             }
-            let account = &app.ai_providers.accounts[i];
+            // `i < total_items == accounts.len()`, so the lookup is always in
+            // bounds; `.get()` keeps it total.
+            let Some(account) = app.ai_providers.accounts.get(i) else {
+                continue;
+            };
             let is_selected = Some(i) == app.ai_providers.selection;
 
             let sel = if is_selected { ">" } else { " " };
@@ -121,14 +137,14 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         }
 
         let paragraph = Paragraph::new(lines);
-        frame.render_widget(paragraph, list_chunks[0]);
+        frame.render_widget(paragraph, list_inner);
     }
 
     let items_per_page = (max_rows / AI_PROVIDER_ITEM_LINES).max(1);
     if total_items > items_per_page {
         frame.render_stateful_widget(
             vertical_scrollbar(),
-            list_chunks[1],
+            scrollbar_area,
             &mut SmoothScrollbarState::new(total_items)
                 .position(scroll)
                 .viewport_content_length(items_per_page),
@@ -143,7 +159,7 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
             total_items
         )))
     };
-    frame.render_widget(status, chunks[1]);
+    frame.render_widget(status, status_area);
 }
 
 /// Centered popup for entering an API key: `c` on an existing account, or
@@ -193,6 +209,15 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(inner);
 
+    // Layout::vertical([Length(1), Length(3), Length(1), Min(1)]) always
+    // yields exactly 4 chunks; a zero-area fallback is harmless to render into.
+    let (prompt_row, input_row, error_row, footer_row) = (
+        rows.first().copied().unwrap_or_default(),
+        rows.get(1).copied().unwrap_or_default(),
+        rows.get(2).copied().unwrap_or_default(),
+        rows.get(3).copied().unwrap_or_default(),
+    );
+
     let dim = Style::default().fg(Color::DarkGray);
     let input_style = Style::default().fg(Color::Cyan);
 
@@ -201,7 +226,7 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
             "  Paste the API key for this account:",
             dim,
         ))),
-        rows[0],
+        prompt_row,
     );
 
     let text = &app.ai_providers.credential.input.text;
@@ -220,7 +245,7 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(display, input_style))),
-        rows[1],
+        input_row,
     );
 
     // Park the terminal cursor by CHARACTER count, not byte offset.  The
@@ -238,7 +263,7 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
             .min(masked.chars().count());
         masked.chars().take(n).collect::<String>()
     };
-    set_input_cursor(frame, rows[1], 0, 2, &masked_before);
+    set_input_cursor(frame, input_row, 0, 2, &masked_before);
 
     if let Some(ref err) = app.ai_providers.credential.error {
         frame.render_widget(
@@ -246,7 +271,7 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
                 format!("  Error: {err}"),
                 Style::default().fg(Color::Red),
             ))),
-            rows[2],
+            error_row,
         );
     }
 
@@ -254,7 +279,7 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
         " enter save · esc cancel ",
         Style::default().fg(Color::DarkGray),
     )));
-    frame.render_widget(status, rows[3]);
+    frame.render_widget(status, footer_row);
 }
 
 /// Step 1 of the new-account wizard: a centered, searchable provider picker.
@@ -396,6 +421,15 @@ fn render_wizard_slug(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(inner);
 
+    // Layout::vertical([Length(2), Length(3), Length(1), Min(1)]) always
+    // yields exactly 4 chunks; a zero-area fallback is harmless to render into.
+    let (header_row, slug_row, error_row, footer_row) = (
+        rows.first().copied().unwrap_or_default(),
+        rows.get(1).copied().unwrap_or_default(),
+        rows.get(2).copied().unwrap_or_default(),
+        rows.get(3).copied().unwrap_or_default(),
+    );
+
     let dim = Style::default().fg(Color::DarkGray);
     let accent = Style::default().fg(Color::Cyan);
 
@@ -413,12 +447,12 @@ fn render_wizard_slug(frame: &mut Frame<'_>, app: &mut App) {
             dim,
         )),
     ];
-    frame.render_widget(Paragraph::new(lines), rows[0]);
+    frame.render_widget(Paragraph::new(lines), header_row);
 
     let border_style = Style::default().fg(Color::Cyan);
     let slug_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("Slug:"))
         .with_block(Block::bordered().border_style(border_style));
-    (&slug_prompt).draw(frame, rows[1], &mut app.ai_providers.wizard.slug);
+    (&slug_prompt).draw(frame, slug_row, &mut app.ai_providers.wizard.slug);
 
     if let Some(ref err) = app.ai_providers.wizard.error {
         frame.render_widget(
@@ -426,7 +460,7 @@ fn render_wizard_slug(frame: &mut Frame<'_>, app: &mut App) {
                 format!("  Error: {err}"),
                 Style::default().fg(Color::Red),
             ))),
-            rows[2],
+            error_row,
         );
     }
 
@@ -434,7 +468,7 @@ fn render_wizard_slug(frame: &mut Frame<'_>, app: &mut App) {
         " enter create account · esc back to provider ",
         Style::default().fg(Color::DarkGray),
     )));
-    frame.render_widget(status, rows[3]);
+    frame.render_widget(status, footer_row);
 }
 
 /// The Polkadot-account import wizard (AI providers page, `p`): a centered
@@ -476,6 +510,15 @@ fn render_polkadot_import(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(inner);
 
+    // Layout::vertical([Length(2), Length(3), Length(1), Min(1)]) always
+    // yields exactly 4 chunks; a zero-area fallback is harmless to render into.
+    let (header_row, input_row, error_row, footer_row) = (
+        rows.first().copied().unwrap_or_default(),
+        rows.get(1).copied().unwrap_or_default(),
+        rows.get(2).copied().unwrap_or_default(),
+        rows.get(3).copied().unwrap_or_default(),
+    );
+
     let dim = Style::default().fg(Color::DarkGray);
 
     // Step-specific title/description line, plus the field name for the input.
@@ -494,7 +537,7 @@ fn render_polkadot_import(frame: &mut Frame<'_>, app: &mut App) {
             dim,
         )),
     ];
-    frame.render_widget(Paragraph::new(lines), rows[0]);
+    frame.render_widget(Paragraph::new(lines), header_row);
 
     let border_style = Style::default().fg(Color::Cyan);
     let prompt = TextPrompt::new(std::borrow::Cow::Owned(field_label.to_string()))
@@ -502,7 +545,7 @@ fn render_polkadot_import(frame: &mut Frame<'_>, app: &mut App) {
     // Note: the password field renders as typed (tui_prompts has no mask
     // support), but its true confidentiality is unaffected — the value never
     // leaves the TUI and is zeroized on close (see `PolkadotImportState`).
-    (&prompt).draw(frame, rows[1], app.ai_providers.polkadot_import.field());
+    (&prompt).draw(frame, input_row, app.ai_providers.polkadot_import.field());
 
     if let Some(ref err) = app.ai_providers.polkadot_import.error {
         frame.render_widget(
@@ -510,7 +553,7 @@ fn render_polkadot_import(frame: &mut Frame<'_>, app: &mut App) {
                 format!("  Error: {err}"),
                 Style::default().fg(Color::Red),
             ))),
-            rows[2],
+            error_row,
         );
     }
 
@@ -523,6 +566,6 @@ fn render_polkadot_import(frame: &mut Frame<'_>, app: &mut App) {
             footer,
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[3],
+        footer_row,
     );
 }

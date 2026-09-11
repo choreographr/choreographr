@@ -34,8 +34,12 @@ fn hmac_sha1(key: &[u8], data: &str) -> String {
     use sha1::Sha1;
     let mut key_buf = [0u8; 64];
     if !key.is_empty() {
+        // HMAC key folding: copy at most 64 bytes; `len <= 64 == key_buf.len()`
+        // per the min(), so the ranges are always in bounds.
         let len = key.len().min(64);
-        key_buf[..len].copy_from_slice(&key[..len]);
+        if let (Some(dst), Some(src)) = (key_buf.get_mut(..len), key.get(..len)) {
+            dst.copy_from_slice(src);
+        }
     }
     let mut mac = Hmac::<Sha1>::new((&key_buf).into());
     mac.update(data.as_bytes());

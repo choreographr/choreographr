@@ -935,7 +935,8 @@ impl MathPretty {
     fn render_sequence(&mut self) -> String {
         if self.depth >= MAX_MATH_DEPTH {
             // Depth cap: emit the rest verbatim rather than recursing deeper.
-            return self.chars[self.pos..].iter().collect();
+            let tail = self.chars.get(self.pos..).unwrap_or_default();
+            return tail.iter().collect();
         }
         let mut out = String::new();
         while let Some(ch) = self.peek() {
@@ -1028,9 +1029,20 @@ impl MathPretty {
                 }
                 '}' => {
                     group_depth -= 1;
+                    // Remember where the `}` sits before consuming it, so the
+                    // group slice can end at (not past) the closing brace.
+                    let closing_brace = self.pos;
                     self.bump();
                     if group_depth == 0 {
-                        return Some(self.chars[start..self.pos - 1].to_vec());
+                        // Bounds hold by construction (we just consumed a char
+                        // past `start`); `get` keeps the slicing lint quiet and
+                        // degrades to an empty group rather than panicking.
+                        return Some(
+                            self.chars
+                                .get(start..closing_brace)
+                                .unwrap_or_default()
+                                .to_vec(),
+                        );
                     }
                 }
                 _ => {
@@ -1109,7 +1121,15 @@ impl MathPretty {
                 break;
             }
         }
-        let name: String = self.chars[name_start..self.pos].iter().collect();
+        // The letter loop above guarantees `name_start <= self.pos`; `get`
+        // still keeps the slicing lint quiet.
+        let command_end = self.pos;
+        let name: String = self
+            .chars
+            .get(name_start..command_end)
+            .unwrap_or_default()
+            .iter()
+            .collect();
         if name.is_empty() {
             // Escaped single character: `\{`, `\&`, `\,`, `\alpha` is handled
             // above via the letter loop; here we reach non-letter escapes.
@@ -1321,7 +1341,12 @@ impl MathPretty {
                         break;
                     }
                 }
-                let name: String = self.chars[start..self.pos].iter().collect();
+                let name: String = self
+                    .chars
+                    .get(start..self.pos)
+                    .unwrap_or_default()
+                    .iter()
+                    .collect();
                 let mapped = match name.as_str() {
                     "lvert" | "rvert" => "|",
                     "Vert" | "lVert" | "rVert" => "‖",
@@ -1384,7 +1409,13 @@ impl MathPretty {
         let body_start = self.pos;
         match self.find_env_end(&env, body_start) {
             Some((end_token_start, after_end)) => {
-                let body: Vec<char> = self.chars[body_start..end_token_start].to_vec();
+                // `find_env_end` returns indices within `self.chars`; `.get`
+                // with an empty fallback keeps the slicing lint quiet.
+                let body: Vec<char> = self
+                    .chars
+                    .get(body_start..end_token_start)
+                    .unwrap_or_default()
+                    .to_vec();
                 self.pos = after_end;
                 out.push_str(&self.render_environment_body(&body, &env_str));
             }
@@ -1405,26 +1436,26 @@ impl MathPretty {
         let chars = &self.chars;
         let mut i = from;
         let mut depth = 1usize;
-        while i < chars.len() {
-            if chars[i] != '\\' {
+        while let Some(&c) = chars.get(i) {
+            if c != '\\' {
                 i += 1;
                 continue;
             }
             let cmd_start = i + 1;
             let mut j = cmd_start;
-            while j < chars.len() && chars[j].is_ascii_alphabetic() {
+            while chars.get(j).is_some_and(char::is_ascii_alphabetic) {
                 j += 1;
             }
-            let cmd: String = chars[cmd_start..j].iter().collect();
+            let cmd: String = chars.get(cmd_start..j).unwrap_or_default().iter().collect();
             if cmd == "begin" || cmd == "end" {
                 let mut k = j;
-                while k < chars.len() && chars[k] != '{' {
+                while chars.get(k).is_some_and(|&c| c != '{') {
                     k += 1;
                 }
                 if k < chars.len() {
                     let name_start = k + 1;
                     let mut name_end = name_start;
-                    while name_end < chars.len() && chars[name_end] != '}' {
+                    while chars.get(name_end).is_some_and(|&c| c != '}') {
                         name_end += 1;
                     }
                     if name_end >= chars.len() {
@@ -1650,7 +1681,10 @@ fn blackboard_char(c: char) -> Option<char> {
         0x1D54C, 0x1D54D, 0x1D54E, 0x1D54F, 0x1D550, 0x2124,
     ];
     match c {
-        'A'..='Z' => char::from_u32(BLACKBOARD_CAPITALS[(c as u32 - 'A' as u32) as usize]),
+        'A'..='Z' => BLACKBOARD_CAPITALS
+            .get((c as u32 - 'A' as u32) as usize)
+            // The `'A'..='Z'` guard pins the table index to 0..26.
+            .and_then(|&cp| char::from_u32(cp)),
         // Lowercase and digits are contiguous runs.
         'a'..='z' => char::from_u32(0x1D552 + (c as u32 - 'a' as u32)),
         '0'..='9' => char::from_u32(0x1D7D8 + (c as u32 - '0' as u32)),
@@ -1667,8 +1701,7 @@ fn split_environment_rows(body: &[char]) -> Vec<Vec<Vec<char>>> {
     let mut cell: Vec<char> = Vec::new();
     let mut depth = 0usize;
     let mut i = 0usize;
-    while i < body.len() {
-        let c = body[i];
+    while let Some(&c) = body.get(i) {
         if c == '\\' {
             if body.get(i + 1) == Some(&'\\') {
                 if depth == 0 {
@@ -1684,19 +1717,19 @@ fn split_environment_rows(body: &[char]) -> Vec<Vec<Vec<char>>> {
             // A nested `\begin` / `\end` — track depth but keep the command
             // text in the cell so the nested structure survives re-parsing.
             let mut j = i + 1;
-            while j < body.len() && body[j].is_ascii_alphabetic() {
+            while body.get(j).is_some_and(char::is_ascii_alphabetic) {
                 j += 1;
             }
-            let cmd: String = body[i + 1..j].iter().collect();
+            let cmd: String = body.get(i + 1..j).unwrap_or_default().iter().collect();
             if cmd == "begin" || cmd == "end" {
                 let mut end_of_cmd = j;
                 let mut k = j;
-                while k < body.len() && body[k] != '{' {
+                while body.get(k).is_some_and(|&c| c != '{') {
                     k += 1;
                 }
                 let mut name_end = k;
                 if k < body.len() {
-                    while name_end < body.len() && body[name_end] != '}' {
+                    while body.get(name_end).is_some_and(|&c| c != '}') {
                         name_end += 1;
                     }
                     if name_end < body.len() {
@@ -1708,8 +1741,10 @@ fn split_environment_rows(body: &[char]) -> Vec<Vec<Vec<char>>> {
                 } else {
                     depth = depth.saturating_sub(1);
                 }
-                for ch in &body[i..end_of_cmd] {
-                    cell.push(*ch);
+                if let Some(span) = body.get(i..end_of_cmd) {
+                    for ch in span {
+                        cell.push(*ch);
+                    }
                 }
                 i = end_of_cmd;
                 continue;

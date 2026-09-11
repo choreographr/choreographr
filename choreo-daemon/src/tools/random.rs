@@ -331,9 +331,9 @@ mod tests {
         // UUID v4 format: 8-4-4-4-12 hex digits
         assert_eq!(result.len(), 36);
         // Check version nibble at position 14 (0-indexed)
-        assert_eq!(&result[14..15], "4");
+        assert_eq!(result.get(14..15), Some("4"));
         // Check variant at position 19
-        assert!(["8", "9", "a", "b"].contains(&&result[19..20]));
+        assert!(["8", "9", "a", "b"].contains(&result.get(19..20).unwrap_or("")));
     }
 
     #[test]

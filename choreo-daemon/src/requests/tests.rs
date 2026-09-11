@@ -1,3 +1,14 @@
+// NOTE: the #[serial_test::serial(...)] attribute on this test module
+// re-emits it without the #[cfg(test)] marker, so clippy's
+// allow-*-in-tests config no longer recognizes it as test code —
+// the AGENTS.md test allowances are spelled out here instead.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::panic_in_result_fn,
+    clippy::indexing_slicing
+)]
 use super::*;
 use crate::context::LoadedSkill;
 use crate::daemon::DaemonCommand;

@@ -39,8 +39,10 @@ fn push_capped(content: &mut String, data: &str) {
     } else {
         // Same byte-cap marker the daemon's `truncate_tool_output` appends,
         // so the live view reads exactly like the final capped result.
+        // cut is a char boundary at or before data.len(), so get(..cut) is
+        // always Some; the fallback only keeps the slice total.
         let cut = data.floor_char_boundary(remaining);
-        content.push_str(&data[..cut]);
+        content.push_str(data.get(..cut).unwrap_or(data));
         content.push_str(TRUNCATION_SUFFIX);
     }
 }
@@ -441,7 +443,11 @@ mod tests {
             assert!(
                 content.ends_with("...[truncated]"),
                 "post-exact-fit chunk must append the marker: {:?}",
-                &content[content.len().saturating_sub(40)..]
+                // char-safe tail (ASCII content, so the fallback is
+                // unreachable; keeps the slice total for the lint)
+                content
+                    .get(content.len().saturating_sub(40)..)
+                    .unwrap_or("")
             );
             content.len()
         };

@@ -111,7 +111,8 @@ fn pick_image_model(
     }
     // No tier matched: the catalog's first listed image-capable model is the
     // least-wrong default (catalog order is quality-curated upstream).
-    Ok(candidates[0].clone())
+    // Non-empty per the guard above; fallback is unreachable.
+    Ok(candidates.first().cloned().unwrap_or_default())
 }
 
 pub struct GenerateImage {}
@@ -464,6 +465,9 @@ mod tests {
 
     /// Run GenerateImage::execute against a mock daemon reply channel that
     /// returns the given handle.
+    // Test helper whose panic paths are intentional test failures;
+    // clippy::panic_in_result_fn has no allow-*-in-tests config option.
+    #[allow(clippy::panic_in_result_fn)]
     fn execute_with_handle(
         handle: ImageProviderHandle,
         args: GenerateImageArgs,

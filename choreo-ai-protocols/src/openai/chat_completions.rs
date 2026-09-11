@@ -746,9 +746,14 @@ impl ChatCompletionsStreamAccumulator {
                             MAX_TOOL_CALLS - 1,
                         ))));
                     }
-                    if !self.seen_tool_call_indices[tc.index as usize] {
-                        self.seen_tool_call_indices[tc.index as usize] = true;
-                        self.distinct_tool_call_count += 1;
+                    // The bounds check above guarantees `tc.index` is within
+                    // the fixed-size array, so this lookup always succeeds;
+                    // the None arm is unreachable.
+                    if let Some(seen) = self.seen_tool_call_indices.get_mut(tc.index as usize) {
+                        if !*seen {
+                            *seen = true;
+                            self.distinct_tool_call_count += 1;
+                        }
                     }
                     self.raw_tool_call_deltas.push(tc.clone());
                 }

@@ -33,18 +33,30 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
+    // Layout::vertical([Min(1), Length(1)]) always yields exactly 2 chunks;
+    // a zero-area fallback rect is harmless to render into.
+    let (list_area, status_area) = (
+        chunks.first().copied().unwrap_or_default(),
+        chunks.get(1).copied().unwrap_or_default(),
+    );
+
     let block = Block::default()
         .title(" Session Manager ")
         .borders(Borders::ALL);
-    let inner = block.inner(chunks[0]);
-    frame.render_widget(block, chunks[0]);
+    let inner = block.inner(list_area);
+    frame.render_widget(block, list_area);
 
     let list_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
+    // Layout::horizontal([Min(1), Length(1)]) always yields exactly 2 chunks.
+    let (list_inner, scrollbar_area) = (
+        list_chunks.first().copied().unwrap_or_default(),
+        list_chunks.get(1).copied().unwrap_or_default(),
+    );
 
-    let max_rows = list_chunks[0].height as usize;
+    let max_rows = list_inner.height as usize;
     let total_items = app.session_mgr.sessions.len();
     // The table header occupies one of `max_rows` rows, so only `list_rows`
     // session rows fit below it.  The window and scrollbar math must use
@@ -60,9 +72,9 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         let err_text = format!("Error: {err}");
         let err_para = Paragraph::new(Line::from(Span::styled(err_text, err_style)));
         let err_area = Rect {
-            x: list_chunks[0].x + 1,
-            y: list_chunks[0].y + 1,
-            width: list_chunks[0].width.saturating_sub(2),
+            x: list_inner.x + 1,
+            y: list_inner.y + 1,
+            width: list_inner.width.saturating_sub(2),
             height: 1,
         };
         frame.render_widget(err_para, err_area);
@@ -70,7 +82,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
 
     if total_items == 0 {
         let msg = Paragraph::new("No sessions. Press 'n' to create one.");
-        frame.render_widget(msg, list_chunks[0]);
+        frame.render_widget(msg, list_inner);
     } else {
         // ── Column layout ────────────────────────────────────────────────
         // The title column is LAST so it absorbs the remaining width via
@@ -87,7 +99,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         let fixed_w = session_w + parent_w + marker_w + status_w + model_w + turns_w + modified_w;
         // The Table adds `column_spacing(1)` between the 8 columns (7 gaps),
         // so the title column gets the remaining width minus those gaps.
-        let title_w = list_chunks[0].width.saturating_sub(fixed_w + 7).max(1) as usize;
+        let title_w = list_inner.width.saturating_sub(fixed_w + 7).max(1) as usize;
 
         let header = Row::new(vec![
             Cell::from(""),
@@ -110,7 +122,11 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         let end = (scroll + list_rows).min(total_items);
         let mut rows = Vec::with_capacity(end.saturating_sub(scroll));
         for i in scroll..end {
-            let session = &app.session_mgr.sessions[i];
+            // `i < end <= total_items == sessions.len()`, so the lookup is
+            // always in bounds; `.get()` keeps it total.
+            let Some(session) = app.session_mgr.sessions.get(i) else {
+                continue;
+            };
             let is_selected = Some(i) == app.session_mgr.selection;
             let is_attached = Some(session.session_id) == app.attached_session_id;
             let row_style = if is_selected {
@@ -183,13 +199,13 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         )
         .header(header)
         .column_spacing(1);
-        frame.render_widget(table, list_chunks[0]);
+        frame.render_widget(table, list_inner);
     }
 
     if total_items > list_rows {
         frame.render_stateful_widget(
             vertical_scrollbar(),
-            list_chunks[1],
+            scrollbar_area,
             &mut SmoothScrollbarState::new(total_items)
                 .position(scroll)
                 .viewport_content_length(list_rows),
@@ -204,7 +220,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             total_items
         )))
     };
-    frame.render_widget(status, chunks[1]);
+    frame.render_widget(status, status_area);
 }
 
 fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
@@ -214,11 +230,18 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
+    // Layout::vertical([Min(1), Length(1)]) always yields exactly 2 chunks;
+    // a zero-area fallback rect is harmless to render into.
+    let (detail_area, status_area) = (
+        chunks.first().copied().unwrap_or_default(),
+        chunks.get(1).copied().unwrap_or_default(),
+    );
+
     let block = Block::default()
         .title(" Session Details ")
         .borders(Borders::ALL);
-    let inner = block.inner(chunks[0]);
-    frame.render_widget(block, chunks[0]);
+    let inner = block.inner(detail_area);
+    frame.render_widget(block, detail_area);
 
     if let Some(ref detail) = app.session_mgr.detail_data {
         let lines = vec![
@@ -288,5 +311,5 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let status = Paragraph::new(Line::from(" <b back>  <Enter switch to this session>"));
-    frame.render_widget(status, chunks[1]);
+    frame.render_widget(status, status_area);
 }

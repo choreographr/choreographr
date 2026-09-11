@@ -1,0 +1,11 @@
+# Workspace-wide clippy configuration. The strict lint set itself lives in
+# [workspace.lints.clippy] in the root Cargo.toml; this file only tunes how
+# individual lints behave.
+#
+# Test allowances: AGENTS.md's error-handling rules permit unwrap()/expect()/
+# panic!()/slicing in #[cfg(test)] modules and tests/ directories — clippy
+# honors these keys so the deny set below only bites production code.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

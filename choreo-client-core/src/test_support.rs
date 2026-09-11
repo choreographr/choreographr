@@ -4,6 +4,12 @@
 //! TESTS ONLY — production consumers must never enable it, since it
 //! drags in `tempfile` and exposes fixtures that make no sense at
 //! runtime.
+//
+// AGENTS.md permits unwrap/expect/panic in test code; clippy's
+// `allow-*-in-tests` config only recognizes `#[cfg(test)]`/`#[test]`
+// contexts, not feature-gated test modules, so the allowance is spelled
+// out here instead of in clippy.toml.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 /// Isolate known_servers writes (bind pre-send recording and the Bound
 /// confirmation record) in a temp config root. Returns the TempDir AND the

@@ -52,6 +52,11 @@ mcp = ["choreo-daemon/mcp"]
 # builds stay on the system allocator and need no C compiler.
 mimalloc = ["dep:mimalloc"]
 
+[lints]
+# Inherit the workspace-wide lint set ([workspace.lints.clippy] below) so the
+# root daemon binary is held to the same standard as every member crate.
+workspace = true
+
 [[bin]]
 name = "choreographr"
 path = "src/bin/choreographr.rs"
@@ -145,6 +150,52 @@ description = "Agentic coding assistant — daemon, TUI, and bridges"
 # manifests on crates.io.
 [workspace.metadata.release]
 dependent-version = "fix"
+
+# Workspace-wide clippy lints, inherited by every member (and the root
+# package) via `[lints] workspace = true`. Modeled on the "strict lints"
+# configuration popularized by No Boilerplate
+# (https://www.namtao.com/rust/), adapted to this workspace's conventions:
+#
+# - The PANIC-FAMILY denies (unwrap/expect/panic/todo/.../exit) enforce
+#   AGENTS.md's error-handling rules mechanically: no crash surfaces in
+#   production code. They are free here — the codebase was already
+#   conformant — and `clippy.toml` re-allows them in tests, matching the
+#   AGENTS.md test exception.
+# - The SLICING denies (indexing_slicing / string_slice) close the other
+#   large panic surface in a daemon that parses untrusted input (image
+#   containers, keystore blobs, markdown, wire frames): indexing can panic
+#   on out-of-bounds or non-char-boundary access; `.get()` makes the
+#   failure explicit and recoverable.
+# - `unchecked_time_subtraction` denies `Instant - Duration` underflow.
+#
+# Deliberately NOT here (yet):
+# - `pedantic` is advisory-only for now (run `cargo clippy -- -W
+#   clippy::pedantic` to see ~800 findings, dominated by
+#   `cast_possible_truncation`); promote it to "deny" once the backlog is
+#   worked off.
+# - `nursery` is never denied: nursery lints are unstable (known false
+#   positives, added/removed between releases) and would hard-break builds
+#   on toolchain updates. Run it occasionally as an advisory pass.
+# - `arithmetic_side_effects` is deferred: ~150 sites (mostly size
+#   estimation in choreo-proto and binary parsing in choreo-image), to be
+#   adopted per-crate starting with the untrusted-input parsers.
+# - `as_conversions` waits until the cast_possible_truncation backlog is
+#   fixed (that work migrates most `as` casts to From/try_from anyway).
+[workspace.lints.clippy]
+# ── panic family: no crash surfaces in production code ──
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+todo = "deny"
+exit = "deny"
+# ── slicing family: indexing/slicing may panic ──
+indexing_slicing = "deny"
+string_slice = "deny"
+# ── time arithmetic that can underflow (Instant - Duration panic) ──
+unchecked_time_subtraction = "deny"
 
 # Dev profile (the default for `cargo build` / `cargo run` / `cargo test`).
 # debug = "line-tables-only": emit line tables (file:line for backtraces)

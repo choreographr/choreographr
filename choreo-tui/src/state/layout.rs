@@ -105,9 +105,11 @@ pub(crate) fn selector_list_layout(area: Rect) -> SelectorLayout {
         ])
         .split(inner);
     SelectorLayout {
-        filter_row: chunks[0],
-        body: chunks[1],
-        footer: chunks[2],
+        // Layout::vertical([Length(1), Min(1), Length(1)]) always yields
+        // exactly 3 chunks; a zero-area fallback is harmless (no-op clicks).
+        filter_row: chunks.first().copied().unwrap_or_default(),
+        body: chunks.get(1).copied().unwrap_or_default(),
+        footer: chunks.get(2).copied().unwrap_or_default(),
     }
 }
 
@@ -267,12 +269,15 @@ pub(crate) fn page_list_content_rect(last_terminal_size: Option<(u16, u16)>) -> 
             width,
             height,
         });
-    let inner = Block::default().borders(Borders::ALL).inner(chunks[0]);
+    // Layout::vertical([Min(1), Length(1)]) always yields exactly 2 chunks.
+    let page = chunks.first().copied().unwrap_or_default();
+    let inner = Block::default().borders(Borders::ALL).inner(page);
     let list = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
-    Some(list[0])
+    // The first chunk always exists in a 2-constraint split.
+    Some(list.first().copied().unwrap_or_default())
 }
 
 /// Bounds-check a full-page-list `(column, row)` left-click against the list's

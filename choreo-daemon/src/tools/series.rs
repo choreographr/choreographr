@@ -135,13 +135,15 @@ fn substitute_args(args: &Value, outputs: &HashMap<usize, String>) -> Value {
             let mut result = String::with_capacity(s.len());
             let mut rest = s.as_str();
             while let Some(start) = rest.find("{{step_") {
-                // Push everything before the placeholder.
-                result.push_str(&rest[..start]);
-                rest = &rest[start + 7..]; // advance past "{{step_"
+                // Push everything before the placeholder. All indices below
+                // derive from `find` (char boundaries); the get() fallbacks
+                // preserve exact behavior if a boundary were ever invalid.
+                result.push_str(rest.get(..start).unwrap_or(""));
+                rest = rest.get(start + 7..).unwrap_or(""); // advance past "{{step_"
 
                 // Find the closing "}}" to extract the index.
                 if let Some(end) = rest.find("}}") {
-                    if let Ok(idx) = rest[..end].parse::<usize>() {
+                    if let Ok(idx) = rest.get(..end).unwrap_or("").parse::<usize>() {
                         if let Some(output) = outputs.get(&idx) {
                             result.push_str(output);
                         } else {
@@ -150,9 +152,9 @@ fn substitute_args(args: &Value, outputs: &HashMap<usize, String>) -> Value {
                         }
                     } else {
                         // Non-numeric index — emit the full placeholder as-is.
-                        result.push_str(&format!("{{{{step_{}}}}}", &rest[..end]));
+                        result.push_str(&format!("{{{{step_{}}}}}", rest.get(..end).unwrap_or("")));
                     }
-                    rest = &rest[end + 2..]; // advance past "}}"
+                    rest = rest.get(end + 2..).unwrap_or(""); // advance past "}}"
                 } else {
                     // No closing "}}" — emit the trailing "{{step_" and stop.
                     result.push_str("{{step_");

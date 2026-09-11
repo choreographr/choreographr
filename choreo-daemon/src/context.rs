@@ -158,8 +158,10 @@ pub fn compute_fingerprint(files: &[DiscoveredFile]) -> u64 {
     }
 
     let hash = hasher.finalize();
+    // Fixed-size 32-byte sha256 digest; the range is always in bounds so the
+    // fallback is unreachable.
     let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&hash[..8]);
+    bytes.copy_from_slice(hash.get(..8).unwrap_or(&[0u8; 8]));
     u64::from_le_bytes(bytes)
 }
 
@@ -296,7 +298,8 @@ fn extract_yaml_frontmatter(content: &str) -> Option<String> {
         .strip_prefix('\n')
         .unwrap_or(content.strip_prefix("---")?);
     let end = rest.find("\n---")?;
-    Some(rest[..end].trim().to_string())
+    // `end` comes from `find`, so it is a char boundary; fallback preserves behavior.
+    Some(rest.get(..end).unwrap_or("").trim().to_string())
 }
 
 pub fn load_skill_body(name: &str, working_dir: &Path) -> Option<String> {
@@ -317,7 +320,8 @@ fn extract_skill_body(content: &str) -> Option<String> {
         .strip_prefix('\n')
         .unwrap_or(content.strip_prefix("---")?);
     let end = rest.find("\n---")?;
-    let body = rest[end + 4..].trim().to_string();
+    // `end` comes from `find`, so `end + 4` is a char boundary; fallback preserves behavior.
+    let body = rest.get(end + 4..).unwrap_or("").trim().to_string();
     if body.is_empty() { None } else { Some(body) }
 }
 

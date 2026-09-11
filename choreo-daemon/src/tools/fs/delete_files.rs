@@ -203,7 +203,10 @@ pub fn describe_delete_files_invocation(args: &DeleteFilesArgs) -> String {
         .count();
     let literal_count = args.targets.len() - glob_count;
     if literal_count == 1 && glob_count == 0 {
-        parts.push(format!("Deleting file `{}`.", args.targets[0]));
+        // Single literal target per the counts above; fallback is unreachable.
+        if let Some(first) = args.targets.first() {
+            parts.push(format!("Deleting file `{first}`."));
+        }
     } else {
         if literal_count > 0 {
             parts.push(format!("Deleting {} path(s).", literal_count));

@@ -18,6 +18,15 @@
 //! bind a real local TCP socket, so per AGENTS.md they live in `tests/` and are
 //! marked `#[ignore]` (run via `cargo test-integration`).
 
+// AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
+// allow-*-in-tests config only recognizes #[test]-annotated functions —
+// helper fns in this file need this file-level allowance.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 use choreo_ai_protocols::anthropic::{AnthropicClient, AnthropicConfig};
 use choreo_ai_protocols::google::{GoogleClient, GoogleConfig};
 use choreo_ai_protocols::openai::{

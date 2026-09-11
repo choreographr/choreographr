@@ -185,7 +185,10 @@ fn lossy_window(bytes: &[u8]) -> Cow<'_, str> {
     // bytes of UTF-8 slop; `prepare_line`'s `cap_line` re-cuts it to the
     // exact cap on a char boundary, so the slop only bounds the
     // lossy-conversion cost.
-    let window = &bytes[..bytes.len().min(MAX_LINE_DISPLAY_BYTES + 4)];
+    // Bounded window; the min() keeps the range in bounds.
+    let window = bytes
+        .get(..bytes.len().min(MAX_LINE_DISPLAY_BYTES + 4))
+        .unwrap_or(bytes);
     String::from_utf8_lossy(window)
 }
 
@@ -238,7 +241,8 @@ fn cap_line(line: &str) -> (Cow<'_, str>, bool) {
     }
     let split = line.floor_char_boundary(MAX_LINE_DISPLAY_BYTES);
     let mut capped = String::with_capacity(split + LINE_TRUNCATED_MARKER.len());
-    capped.push_str(&line[..split]);
+    // `floor_char_boundary` guarantees a char boundary; fallback preserves behavior.
+    capped.push_str(line.get(..split).unwrap_or(line));
     capped.push_str(LINE_TRUNCATED_MARKER);
     (Cow::Owned(capped), true)
 }

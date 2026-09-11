@@ -89,14 +89,18 @@ fn pdf_type_label(t: pdf_inspector::PdfType) -> &'static str {
 /// reject what the parser accepts — a strict `starts_with(b"%PDF-")` would
 /// fail valid BOM-prefixed PDFs before `lopdf` ever sees them.
 fn looks_like_pdf(bytes: &[u8]) -> bool {
-    let head = &bytes[..bytes.len().min(1024)];
+    // Bounded head window; the min() keeps the range in bounds.
+    let head = bytes.get(..bytes.len().min(1024)).unwrap_or(bytes);
     let start = if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
         3
     } else {
         0
     };
-    let trimmed = match head[start..].iter().position(|b| !b.is_ascii_whitespace()) {
-        Some(i) => &head[start + i..],
+    // `start` is 0 or 3, and `position` returns an in-bounds index, so the
+    // ranges below are always valid; fallbacks preserve the empty result.
+    let tail = head.get(start..).unwrap_or(&[]);
+    let trimmed = match tail.iter().position(|b| !b.is_ascii_whitespace()) {
+        Some(i) => tail.get(i..).unwrap_or(&[]),
         None => &[],
     };
     trimmed.starts_with(b"%PDF-")
@@ -253,7 +257,8 @@ fn pdf_text_window(text: &str, budget: usize) -> &str {
     if text.len() <= budget {
         text
     } else {
-        &text[..text.floor_char_boundary(budget)]
+        // `floor_char_boundary` guarantees a char boundary; fallback preserves behavior.
+        text.get(..text.floor_char_boundary(budget)).unwrap_or(text)
     }
 }
 

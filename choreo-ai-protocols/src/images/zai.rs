@@ -247,11 +247,17 @@ impl ZaiImageClient {
             "model": req.model,
             "prompt": req.prompt,
         });
+        // `Map::insert` (instead of `Value`'s IndexMut, which would panic on
+        // a non-object body) is the correct API for setting top-level keys.
         if let Some(size) = size_wire(req.size) {
-            body["size"] = size.into();
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("size".into(), size.into());
+            }
         }
         if let Some(quality) = quality_wire(req.quality) {
-            body["quality"] = quality.into();
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("quality".into(), quality.into());
+            }
         }
         body
     }
@@ -401,7 +407,10 @@ impl ZaiImageClient {
                     "generated image exceeds the adapter's download cap",
                 )));
             }
-            bytes.extend_from_slice(&chunk[..n]);
+            // `read` returns n <= chunk.len() by contract, so the slice always
+            // succeeds; the empty fallback is unreachable.
+            let fresh = chunk.get(..n).unwrap_or(&[]);
+            bytes.extend_from_slice(fresh);
         }
         if bytes.is_empty() {
             // An empty body with an image content type is the same

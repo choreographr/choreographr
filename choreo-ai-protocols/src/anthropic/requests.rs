@@ -300,9 +300,13 @@ where
                             });
                         }
                         let input_str = input.to_string();
-                        pending_tool_calls[idx].id = id.clone();
-                        pending_tool_calls[idx].name = name.clone();
-                        pending_tool_calls[idx].arguments = input_str.clone();
+                        // The vec was grown to cover `idx` above, so the lookup
+                        // always succeeds; the None arm is unreachable.
+                        if let Some(call) = pending_tool_calls.get_mut(idx) {
+                            call.id = id.clone();
+                            call.name = name.clone();
+                            call.arguments = input_str.clone();
+                        }
                         trace!(
                             index = start.index,
                             tool_name = %name,
@@ -345,7 +349,11 @@ where
                         while pending_tool_calls.len() <= idx {
                             pending_tool_calls.push(StreamToolCall::default());
                         }
-                        pending_tool_calls[idx].arguments.push_str(&partial_json);
+                        // The vec was grown to cover `idx` above, so the lookup
+                        // always succeeds; the None arm is unreachable.
+                        if let Some(call) = pending_tool_calls.get_mut(idx) {
+                            call.arguments.push_str(&partial_json);
+                        }
                         trace!(
                             index = delta.index,
                             partial_len = partial_json.len(),
@@ -664,7 +672,10 @@ impl AnthropicSseReader {
                 }
                 Err(e) => return Err(e),
             };
-            self.pending.extend_from_slice(&buf[..n]);
+            // `read` returns n <= buf.len() by contract, so the slice always
+            // succeeds; the empty fallback is unreachable.
+            let bytes = buf.get(..n).unwrap_or(&[]);
+            self.pending.extend_from_slice(bytes);
         }
     }
 

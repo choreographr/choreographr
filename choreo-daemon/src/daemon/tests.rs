@@ -3163,7 +3163,13 @@ fn should_prefetch_models_gates_on_account_flight_and_freshness() {
         "acct".into(),
         (
             vec!["m".into()],
-            Instant::now() - MODEL_CACHE_TTL - Duration::from_secs(1),
+            // checked_sub instead of `-`: Instant - Duration can panic on
+            // underflow (denied lint); the unwrap is test-allowed.
+            Instant::now()
+                .checked_sub(MODEL_CACHE_TTL)
+                .unwrap()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
         ),
     );
     assert!(state.should_prefetch_models("acct"));
@@ -3343,7 +3349,13 @@ fn list_models_serves_stale_cache_without_duplicate_fetch_while_prefetch_in_flig
         "acct".into(),
         (
             vec!["old-model".into()],
-            Instant::now() - MODEL_CACHE_TTL - Duration::from_secs(1),
+            // checked_sub instead of `-`: Instant - Duration can panic on
+            // underflow (denied lint); the unwrap is test-allowed.
+            Instant::now()
+                .checked_sub(MODEL_CACHE_TTL)
+                .unwrap()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
         ),
     );
     state.model_prefetch_in_flight.insert("acct".into());
@@ -3391,7 +3403,13 @@ fn list_models_with_stale_cache_and_no_prefetch_serves_stale_and_warms_backgroun
         "acct".into(),
         (
             vec!["old-model".into()],
-            Instant::now() - MODEL_CACHE_TTL - Duration::from_secs(1),
+            // checked_sub instead of `-`: Instant - Duration can panic on
+            // underflow (denied lint); the unwrap is test-allowed.
+            Instant::now()
+                .checked_sub(MODEL_CACHE_TTL)
+                .unwrap()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
         ),
     );
 

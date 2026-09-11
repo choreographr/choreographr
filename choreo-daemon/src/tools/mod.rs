@@ -1171,8 +1171,9 @@ pub(crate) fn expand_tilde(path: &str) -> String {
                 if path == "~" {
                     home_str.into_owned()
                 } else {
-                    // path starts with "~/" — replace the tilde with the home dir
-                    format!("{home_str}{}", &path[1..])
+                    // path starts with "~/" — replace the tilde with the home dir.
+                    // Index 1 is a char boundary ('~' is ASCII); fallback keeps "~".
+                    format!("{home_str}{}", path.get(1..).unwrap_or(path))
                 }
             }
             None => {

@@ -237,7 +237,13 @@ impl Transport for RegisteredTcpTransport {
             TcpStream::set_write_timeout,
         )?;
 
-        let output = &self.buffers.output()[..amount];
+        // `amount` is the byte count the caller reports as ready in this
+        // buffer (upstream hyper semantics: <= `output().len()`), but the
+        // workspace clippy deny on indexing/slicing means we must slice
+        // total: fall back to the whole buffer if the invariant is somehow
+        // broken rather than panicking the daemon.
+        let buf = self.buffers.output();
+        let output = buf.get(..amount).unwrap_or(buf);
         match self.stream.write_all(output) {
             Ok(v) => Ok(v),
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {

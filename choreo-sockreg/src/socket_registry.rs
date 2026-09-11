@@ -278,9 +278,16 @@ fn prune_locked(sockets: &mut Vec<Entry>) -> usize {
     use std::os::fd::AsFd;
 
     let before = sockets.len();
+    // The loop walks by index because sockets.remove(i) shifts later entries
+    // down — a straightforward `retain`-style iterator cannot express the
+    // explicit per-entry close (which must happen in this order). Using
+    // `.get(i)` instead of `sockets[i]` keeps the loop panic-free as required
+    // by the workspace clippy deny on indexing; `.get` returning None is
+    // unreachable here since `i` never exceeds `len` (the loop exits before
+    // then, and `remove` always leaves i < len when shrinking happens).
     let mut i = 0;
-    while i < sockets.len() {
-        let alive = probe_alive(sockets[i].sock.as_fd());
+    while let Some(entry) = sockets.get(i) {
+        let alive = probe_alive(entry.sock.as_fd());
         if alive {
             i += 1;
             continue;

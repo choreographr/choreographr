@@ -137,8 +137,11 @@ pub(crate) fn sanitize_value(text: &str) -> String {
 /// [`truncate_tool_output`] applies the authoritative cap and marker.
 pub(crate) fn sanitize_json(text: &str, budget: usize) -> String {
     // Clamp before floor_char_boundary: it panics on indices past the string.
+    // end is a char boundary at or before text.len(), so .get(..end) is always
+    // Some — the fallback only keeps the slice total for the lint.
     let end = text.floor_char_boundary(budget.min(text.len()));
-    text[..end]
+    text.get(..end)
+        .unwrap_or(text)
         .lines()
         .map(sanitize_value)
         .collect::<Vec<_>>()

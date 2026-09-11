@@ -1,5 +1,6 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::slice;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
@@ -41,6 +42,75 @@ pub const PREAMBLE_IK: u8 = 0x01;
 /// protocol traffic flows).
 pub const PREAMBLE_XX: u8 = 0x02;
 
+/// Decode a 2-byte big-endian length prefix. `len_buf` always holds exactly
+/// 2 bytes (guaranteed by the preceding `read_handshake_exact(.., 2)`), so
+/// the access is in bounds by construction; `get` + `try_into` keeps it
+/// bounds-checked so a future caller change fails loudly instead of panicking.
+pub(crate) fn be_len16(len_buf: &[u8]) -> Result<u16, TransportError> {
+    len_buf
+        .get(..2)
+        .and_then(|prefix| <&[u8] as TryInto<[u8; 2]>>::try_into(prefix).ok())
+        .map(u16::from_be_bytes)
+        .ok_or_else(|| invalid_slice("length prefix"))
+}
+
+fn invalid_slice(what: &str) -> TransportError {
+    TransportError::InvalidFragment(format!("internal buffer size invariant violated ({what})"))
+}
+
+pub(crate) fn at<'a>(
+    buf: &'a [u8],
+    i: usize,
+    what: &'static str,
+) -> Result<&'a u8, TransportError> {
+    buf.get(i).ok_or_else(|| invalid_slice(what))
+}
+
+pub(crate) fn at_mut<'a>(
+    buf: &'a mut [u8],
+    i: usize,
+    what: &'static str,
+) -> Result<&'a mut u8, TransportError> {
+    buf.get_mut(i).ok_or_else(|| invalid_slice(what))
+}
+
+/// `&buf[range]` composed with the bounds check: `get` returns `None` only if
+/// an internal buffer-size invariant broke (e.g. the `vec![0u8; 2 + 1024]`
+/// handshake frame buffers, or the worst-case reusable Noise frame buffers),
+/// which is turned into the crate's protocol error instead of a panic, in
+/// line with the workspace's no-panic lint policy.
+pub(crate) fn slice<'a, S>(
+    buf: &'a [u8],
+    range: S,
+    what: &'static str,
+) -> Result<&'a [u8], TransportError>
+where
+    S: slice::SliceIndex<[u8], Output = [u8]>,
+{
+    buf.get(range).ok_or_else(|| invalid_slice(what))
+}
+
+/// Mutable counterpart of [`slice`].
+pub(crate) fn slice_mut<'a, S>(
+    buf: &'a mut [u8],
+    range: S,
+    what: &'static str,
+) -> Result<&'a mut [u8], TransportError>
+where
+    S: slice::SliceIndex<[u8], Output = [u8]>,
+{
+    buf.get_mut(range).ok_or_else(|| invalid_slice(what))
+}
+
+/// `&buf[start..]` variant of [`slice`] for `RangeFrom` slices.
+pub(crate) fn slice_from<'a>(
+    buf: &'a [u8],
+    start: usize,
+    what: &'static str,
+) -> Result<&'a [u8], TransportError> {
+    buf.get(start..).ok_or_else(|| invalid_slice(what))
+}
+
 /// Read exactly `len` bytes from `stream`, never taking longer than
 /// `deadline` in total.
 ///
@@ -69,7 +139,10 @@ fn read_handshake_exact(
         // stretch the total past `deadline` by dribbling bytes.
         stream.set_read_timeout(Some(remaining))?;
         let want = (len - buf.len()).min(scratch.len());
-        let n = match stream.read(&mut scratch[..want]) {
+        // `want <= scratch.len()` by the `min` above, and the read returns
+        // `n <= want`, so both accesses are in bounds; bounds-checked anyway
+        // (see the slice helpers).
+        let n = match stream.read(slice_mut(&mut scratch, ..want, "scratch")?) {
             Ok(n) => n,
             // The read timeout was armed to exactly the time remaining until
             // `deadline`, and the socket is BLOCKING (never non-blocking), so
@@ -88,7 +161,7 @@ fn read_handshake_exact(
         if n == 0 {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
-        buf.extend_from_slice(&scratch[..n]);
+        buf.extend_from_slice(slice(&scratch, ..n, "scratch read prefix")?);
     }
     Ok(buf)
 }
@@ -114,7 +187,9 @@ fn write_handshake_all(
         // side: a peer that stops draining the socket (or vanishes) must not
         // be able to hold the handshake past `deadline`.
         stream.set_write_timeout(Some(remaining))?;
-        match stream.write(&data[written..]) {
+        // `written < data.len()` holds from the loop guard above, so the tail
+        // access is in bounds; bounds-checked anyway (see the slice helpers).
+        match stream.write(slice_from(data, written, "data tail")?) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
             Ok(n) => written += n,
             // Same argument as read_handshake_exact: the socket is blocking
@@ -156,7 +231,10 @@ pub fn read_handshake_preamble_with_timeout(
 ) -> Result<u8, TransportError> {
     let deadline = Instant::now() + timeout;
     let byte = read_handshake_exact(stream, deadline, 1)?;
-    Ok(byte[0])
+    // `read_handshake_exact` above returned exactly `len = 1` bytes, so the
+    // index is in bounds by construction; the access is bounds-checked anyway
+    // (see the slice helpers' comment) rather than panicking.
+    Ok(at(&byte, 0, "preamble byte").copied()?)
 }
 
 /// Perform the Noise IK handshake as the **initiator** (client side), using
@@ -200,18 +278,19 @@ pub fn handshake_initiator_with_timeout(
     // cannot hold the client's writer past the deadline — the write side of
     // the handshake is bounded just like the read side.
     let mut buf = vec![0u8; 2 + 1024];
-    let n = handshake.write_message(&[], &mut buf[2..])?;
+    let n = handshake.write_message(&[], slice_mut(&mut buf, 2.., "handshake frame body")?)?;
     // Use 2-byte length prefix for handshake messages (max size < 65535)
-    buf[..2].copy_from_slice(&(n as u16).to_be_bytes());
-    write_handshake_all(&mut stream, deadline, &buf[..2 + n])?;
+    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&(n as u16).to_be_bytes());
+    let frame = slice(&buf, ..2 + n, "handshake frame")?;
+    write_handshake_all(&mut stream, deadline, frame)?;
 
     // Read second handshake message (e, encrypted empty) — every read is
     // bounded by the time remaining until `deadline`, so a stalled server
     // cannot hold the client forever (see read_handshake_exact).
     let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
-    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let msg_len = usize::from(be_len16(&len_buf)?);
     let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
-    handshake.read_message(&rbuf, &mut buf[2..])?;
+    handshake.read_message(&rbuf, slice_mut(&mut buf, 2.., "handshake frame body")?)?;
 
     // Handshake complete — restore the unbounded data-plane I/O. Clear BOTH
     // the read and write timeouts: read_handshake_exact armed SO_RCVTIMEO
@@ -275,7 +354,7 @@ where
     // not be able to hold this thread and FD forever. Cleared once the
     // handshake completes and the client is authenticated.
     let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
-    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let msg_len = usize::from(be_len16(&len_buf)?);
     let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
     let mut out_buf = vec![0u8; 1024];
     handshake.read_message(&rbuf, &mut out_buf)?;
@@ -298,9 +377,10 @@ where
     // reading after msg1 cannot hold the responder's writer past `deadline`
     // (see write_handshake_all).
     let mut buf = vec![0u8; 2 + 1024];
-    let n = handshake.write_message(&[], &mut buf[2..])?;
-    buf[..2].copy_from_slice(&(n as u16).to_be_bytes());
-    write_handshake_all(&mut stream, deadline, &buf[..2 + n])?;
+    let n = handshake.write_message(&[], slice_mut(&mut buf, 2.., "handshake frame body")?)?;
+    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&(n as u16).to_be_bytes());
+    let frame = slice(&buf, ..2 + n, "handshake frame")?;
+    write_handshake_all(&mut stream, deadline, frame)?;
 
     // Handshake complete — restore the unbounded data-plane I/O: clear BOTH
     // the read and write timeouts (see handshake_initiator_with_timeout).
@@ -365,23 +445,25 @@ pub fn handshake_initiator_xx_with_timeout(
     let mut buf = vec![0u8; 2 + 1024];
 
     // Message 1 (-> e): the client's ephemeral key only.
-    let n = handshake.write_message(&[], &mut buf[2..])?;
-    buf[..2].copy_from_slice(&(n as u16).to_be_bytes());
-    write_handshake_all(&mut stream, deadline, &buf[..2 + n])?;
+    let n = handshake.write_message(&[], slice_mut(&mut buf, 2.., "handshake frame body")?)?;
+    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&(n as u16).to_be_bytes());
+    let frame = slice(&buf, ..2 + n, "handshake frame")?;
+    write_handshake_all(&mut stream, deadline, frame)?;
 
     // Message 2 (<- e, ee, s, es): the server's ephemeral AND static keys,
     // with the static authenticated by the DH operations. After reading this
     // the initiator can extract the server's static via get_remote_static().
     let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
-    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let msg_len = usize::from(be_len16(&len_buf)?);
     let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
-    handshake.read_message(&rbuf, &mut buf[2..])?;
+    handshake.read_message(&rbuf, slice_mut(&mut buf, 2.., "handshake frame body")?)?;
 
     // Message 3 (-> s, es): the client's static key, authenticating us to
     // the server (the server's responder-side ACL check consumes it).
-    let n = handshake.write_message(&[], &mut buf[2..])?;
-    buf[..2].copy_from_slice(&(n as u16).to_be_bytes());
-    write_handshake_all(&mut stream, deadline, &buf[..2 + n])?;
+    let n = handshake.write_message(&[], slice_mut(&mut buf, 2.., "handshake frame body")?)?;
+    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&(n as u16).to_be_bytes());
+    let frame = slice(&buf, ..2 + n, "handshake frame")?;
+    write_handshake_all(&mut stream, deadline, frame)?;
 
     // Handshake complete — restore the unbounded data-plane I/O (see
     // handshake_initiator_with_timeout: BOTH timeouts must be cleared,
@@ -454,7 +536,7 @@ where
     // Message 1 (-> e): read the client's ephemeral key. Every read is
     // bounded by the remaining budget — pre-authentication, exactly like IK.
     let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
-    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let msg_len = usize::from(be_len16(&len_buf)?);
     let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
     let mut out_buf = vec![0u8; 1024];
     handshake.read_message(&rbuf, &mut out_buf)?;
@@ -469,14 +551,15 @@ where
     // attacker would have to complete the key exchange to decrypt it — at
     // which point its own static is exposed to the ACL check.
     let mut buf = vec![0u8; 2 + 1024];
-    let n = handshake.write_message(&[], &mut buf[2..])?;
-    buf[..2].copy_from_slice(&(n as u16).to_be_bytes());
-    write_handshake_all(&mut stream, deadline, &buf[..2 + n])?;
+    let n = handshake.write_message(&[], slice_mut(&mut buf, 2.., "handshake frame body")?)?;
+    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&(n as u16).to_be_bytes());
+    let frame = slice(&buf, ..2 + n, "handshake frame")?;
+    write_handshake_all(&mut stream, deadline, frame)?;
 
     // Message 3 (-> s, es): the client's static key arrives here — this is
     // the point where the responder finally learns who it is talking to.
     let len_buf = read_handshake_exact(&mut stream, deadline, 2)?;
-    let msg_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let msg_len = usize::from(be_len16(&len_buf)?);
     let rbuf = read_handshake_exact(&mut stream, deadline, msg_len)?;
     handshake.read_message(&rbuf, &mut out_buf)?;
 

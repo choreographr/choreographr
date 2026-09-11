@@ -62,3 +62,7 @@ zeroize.workspace = true
 # keystore credential (a plain runtime dep, promoted to dev here since only
 # the tests use it directly).
 choreo-keystore.workspace = true
+
+# Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
+[lints]
+workspace = true

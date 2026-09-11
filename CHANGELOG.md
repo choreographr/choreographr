@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Workspace-wide strict clippy lints, modeled on the "strict lints"
+  configuration popularized by No Boilerplate (namtao.com/rust) and adapted
+  to this workspace's conventions: `[workspace.lints.clippy]` in the root
+  Cargo.toml denies the panic family (`unwrap_used`, `expect_used`, `panic`,
+  `panic_in_result_fn`, `unreachable`, `unimplemented`, `todo`, `exit`), the
+  slicing family (`indexing_slicing`, `string_slice`), and
+  `unchecked_time_subtraction`, inherited by every member via
+  `[lints] workspace = true`; a root `clippy.toml` re-allows
+  unwrap/expect/panic/slicing in tests, matching AGENTS.md's error-handling
+  exception. ~350 production indexing/slicing sites were converted to
+  bounds-checked `.get()` access (binary parsers, wire framing, TUI layout
+  chunks, credential parsing), the daemon's one `unreachable!` became a
+  structured error, and the GUI's startup `process::exit` carries a targeted
+  waiver. Deliberately deferred: `pedantic` stays advisory (~800 findings,
+  dominated by `cast_possible_truncation`) until the backlog is worked off;
+  `nursery` is never denied (unstable lints would hard-break builds on
+  toolchain updates); `arithmetic_side_effects` (~150 sites) and
+  `as_conversions` are per-crate follow-ups.
 - New `choreo-power-events` leaf crate: platform suspend/resume notifications
   as crossbeam channel events for the daemon's command loop. `PowerMonitor`
   spawns a dedicated, daemon-like monitor thread and exposes

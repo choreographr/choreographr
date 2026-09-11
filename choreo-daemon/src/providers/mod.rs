@@ -561,6 +561,9 @@ pub(crate) mod test_util {
     #[derive(Debug)]
     pub(crate) struct StubProviderClient;
 
+    // Test stub: the panics are intentional misuse detectors, and
+    // clippy::panic_in_result_fn has no allow-*-in-tests config option.
+    #[allow(clippy::panic_in_result_fn)]
     impl ProviderClient for StubProviderClient {
         fn provider_slug(&self) -> &str {
             "test-stub"

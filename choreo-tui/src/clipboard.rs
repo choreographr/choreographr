@@ -96,8 +96,10 @@ mod tests {
         let seq = build_osc52("→ 😀");
         assert!(seq.starts_with("\x1b]52;c;"));
         assert!(seq.ends_with("\x1b\\"));
-        // Prefix is ESC ] 5 2 ; c ; = 7 bytes; suffix ST = 2 bytes.
-        let b64 = &seq[7..seq.len() - 2];
+        // Prefix is ESC ] 5 2 ; c ; = 7 bytes; suffix ST = 2 bytes.  The
+        // sequence was just built by `build_osc52`, so the strip always
+        // succeeds; `.get()` keeps the slice total for the fixed indices.
+        let b64 = seq.get(7..seq.len().saturating_sub(2)).unwrap_or("");
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .expect("payload must be valid base64");

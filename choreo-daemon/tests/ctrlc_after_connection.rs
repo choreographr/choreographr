@@ -16,6 +16,16 @@
 //! Belongs to the `#[ignore]` integration suite (real sockets, real signal
 //! delivery, real threads).
 
+// AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
+// allow-*-in-tests config only recognizes #[test]-annotated functions —
+// helper fns in this file need this file-level allowance.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::panic_in_result_fn,
+    clippy::indexing_slicing
+)]
 use choreo_client_core::run_daemon_connection;
 use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
 use std::io::Write;

@@ -404,7 +404,13 @@ mod tests {
             rx,
             handle: None,
             abort_tx,
-            deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            // checked_sub instead of `-`: Instant - Duration can panic on
+            // underflow (denied lint); in tests the unwrap is allowed.
+            deadline: Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap(),
+            ),
         };
         match recv_sse_event(&sse, None) {
             Err(ProviderError::DeadlineExceeded) => {}

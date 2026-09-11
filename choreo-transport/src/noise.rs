@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::TransportError;
+use crate::handshake::{at, at_mut, slice, slice_mut};
 use tracing::{debug, trace};
 
 /// AES-256-GCM authentication tag length, appended to every encrypted
@@ -218,16 +219,26 @@ impl NoiseStream {
             // carrying only the cleared continuation header; the peer's
             // recv_message returns Ok(vec![]) for it (the n == 0 guard never
             // triggers — the header byte itself is the plaintext).
-            self.send_frag[0] = 0;
+            // Buffer-size invariants (FRAME_BUF_LEN/FRAG_BUF_LEN above) make
+            // these accesses in bounds by construction; the slice helpers
+            // keep them bounds-checked so a future invariant regression
+            // becomes a per-connection protocol error, never a panic.
+            *at_mut(&mut self.send_frag, 0, "send_frag continuation header")? = 0;
             let n = {
                 let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
                 transport.write_message(
-                    &self.send_frag[..FRAGMENT_HEADER_LEN],
-                    &mut self.send_buf[4..],
+                    slice(&self.send_frag, ..FRAGMENT_HEADER_LEN, "send_frag header")?,
+                    // Ciphertext goes AFTER the 4-byte length-prefix headroom
+                    // (send_buf[4..]); the prefix is written in afterwards —
+                    // slicing the whole buffer here would let the prefix
+                    // overwrite the first 4 ciphertext bytes.
+                    slice_mut(&mut self.send_buf, 4.., "send_buf ciphertext")?,
                 )?
             };
-            self.send_buf[..4].copy_from_slice(&(n as u32).to_be_bytes());
-            self.tcp.write_all(&self.send_buf[..4 + n])?;
+            slice_mut(&mut self.send_buf, ..4, "send_buf length prefix")?
+                .copy_from_slice(&(n as u32).to_be_bytes());
+            self.tcp
+                .write_all(slice(&self.send_buf, ..4 + n, "send_buf frame")?)?;
             return Ok(());
         }
 
@@ -247,22 +258,37 @@ impl NoiseStream {
             // bytes) leaves none.
             let more = remaining > chunk.len();
             remaining -= chunk.len();
-            self.send_frag[0] = if more { FRAGMENT_CONTINUATION } else { 0 };
-            self.send_frag[FRAGMENT_HEADER_LEN..FRAGMENT_HEADER_LEN + chunk.len()]
-                .copy_from_slice(chunk);
+            *at_mut(&mut self.send_frag, 0, "send_frag continuation header")? =
+                if more { FRAGMENT_CONTINUATION } else { 0 };
+            slice_mut(
+                &mut self.send_frag,
+                FRAGMENT_HEADER_LEN..FRAGMENT_HEADER_LEN + chunk.len(),
+                "send_frag plaintext",
+            )?
+            .copy_from_slice(chunk);
             let n = {
                 let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
                 transport.write_message(
-                    &self.send_frag[..FRAGMENT_HEADER_LEN + chunk.len()],
-                    &mut self.send_buf[4..],
+                    slice(
+                        &self.send_frag,
+                        ..FRAGMENT_HEADER_LEN + chunk.len(),
+                        "send_frag header+chunk",
+                    )?,
+                    // Ciphertext goes AFTER the 4-byte length-prefix headroom
+                    // (send_buf[4..]); the prefix is written in afterwards —
+                    // slicing the whole buffer here would let the prefix
+                    // overwrite the first 4 ciphertext bytes.
+                    slice_mut(&mut self.send_buf, 4.., "send_buf ciphertext")?,
                 )?
             };
             // One coalesced write per frame: the 4-byte BE length prefix is
             // written into the headroom ahead of the ciphertext, so a single
             // write_all sends prefix + ciphertext together (one syscall per
             // fragment instead of two).
-            self.send_buf[..4].copy_from_slice(&(n as u32).to_be_bytes());
-            self.tcp.write_all(&self.send_buf[..4 + n])?;
+            slice_mut(&mut self.send_buf, ..4, "send_buf length prefix")?
+                .copy_from_slice(&(n as u32).to_be_bytes());
+            self.tcp
+                .write_all(slice(&self.send_buf, ..4 + n, "send_buf frame")?)?;
         }
         Ok(())
     }
@@ -345,9 +371,16 @@ impl NoiseStream {
             // The continuation flag is read from the AUTHENTICATED plaintext
             // (the GCM tag covers it), so a wire-level tamper with the length
             // prefix cannot change the reassembly decision — see the prefix
-            // validation above.
-            let more = self.recv_pt_buf[0] & FRAGMENT_CONTINUATION != 0;
-            plaintext.extend_from_slice(&self.recv_pt_buf[FRAGMENT_HEADER_LEN..n]);
+            // validation above. `n >= 1` held from the guard above, so both
+            // accesses are in bounds; bounds-checked anyway (slice helpers).
+            let more = (*at(&self.recv_pt_buf, 0, "recv_pt_buf continuation header")?
+                & FRAGMENT_CONTINUATION)
+                != 0;
+            plaintext.extend_from_slice(slice(
+                &self.recv_pt_buf,
+                FRAGMENT_HEADER_LEN..n,
+                "recv_pt_buf payload",
+            )?);
 
             if !more {
                 trace!(message_len = plaintext.len(), "received Noise message");
