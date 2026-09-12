@@ -114,6 +114,9 @@ pub fn spawn_embedded(state: DaemonState, _opts: EmbeddedOptions) -> io::Result<
         CoreOptions {
             acl: None,
             config_watchers: true,
+            // The embedded daemon has no Unix socket and no accept loop to
+            // wake — auto-exit is a CLI-daemon feature only.
+            auto_exit_wake_path: None,
         },
     )?;
     let daemon_tx = core.daemon_tx.clone();

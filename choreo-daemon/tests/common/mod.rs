@@ -274,6 +274,7 @@ impl SpawnedDaemon {
                     Some(tcp_addr_str),
                     transport_sk,
                     acl,
+                    false,
                 )
             }));
 

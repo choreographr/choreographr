@@ -1,3 +1,4 @@
+mod autostart;
 mod cache;
 mod clipboard;
 mod connection;
@@ -85,6 +86,24 @@ pub fn build_picker() -> Picker {
 
 pub mod image_worker;
 pub mod terminal_progress;
+
+use choreo_proto::ProtoError;
+
+/// The quit message to print after the TUI exits with a connection error.
+/// The only case that needs special wording is a protocol-version mismatch:
+/// the daemon and the TUI were built against incompatible wire protocol
+/// versions, and the actionable fix is restarting the daemon (an older build
+/// is still running). Everything else keeps the generic `{error}` rendering.
+pub(crate) fn connection_quit_message(error: &ClientError) -> String {
+    match error {
+        ClientError::Proto(ProtoError::UnsupportedVersion { .. }) => {
+            "connection to the daemon failed: the daemon's protocol version is incompatible — \
+             restart the daemon (it may be an older build)"
+                .to_string()
+        }
+        _ => format!("connection to the daemon failed: {error}"),
+    }
+}
 
 use anyhow::Context;
 use clap::Parser;
@@ -375,7 +394,17 @@ pub fn main() -> anyhow::Result<()> {
             cli.trust_fingerprint.as_deref(),
         )?
     } else {
-        choreo_client_core::ConnectionMode::UnixSocket(choreo_proto::socket_path())
+        // Unix-socket mode: probe for a live daemon BEFORE constructing the
+        // mode, and autostart one if absent. This runs before the alternate
+        // screen starts (the same cooked-mode window the fingerprint prompt
+        // uses), so the "No daemon running…" notice is visible. The TCP
+        // branch above never reaches this — a remote daemon is not
+        // launchable from the client machine, by definition.
+        let socket_path = choreo_proto::socket_path();
+        if !autostart::socket_accepting(&socket_path) {
+            autostart::start_daemon(&socket_path)?;
+        }
+        choreo_client_core::ConnectionMode::UnixSocket(socket_path)
     };
 
     let log_path = init_file_logging();

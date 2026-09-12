@@ -197,6 +197,38 @@ fn handle_accept_error(e: io::Error) {
     }
 }
 
+/// Refuse to delete a live daemon's socket; clean up a stale one.
+///
+/// When the socket path exists, probe it with a `UnixStream::connect`: a
+/// SUCCESSFUL connect means a live daemon is listening, so removing the file
+/// would orphan a working daemon — return an actionable error instead. A
+/// failed connect (ENOENT, ECONNREFUSED, or a regular file at the path) means
+/// nothing is listening: remove the leftover and proceed. The connect has no
+/// timeout by design — a connect to a local listener resolves immediately;
+/// there is no third state.
+pub(crate) fn remove_stale_socket(socket_path: &str) -> io::Result<()> {
+    if !Path::new(socket_path).exists() {
+        return Ok(());
+    }
+    // Probe before removing: the path may be a LIVE daemon's socket, not a
+    // stale leftover from a crash.
+    if UnixStream::connect(socket_path).is_ok() {
+        return Err(io::Error::other(format!(
+            "another daemon is already listening at {socket_path}; it must be \
+             stopped before starting a new one"
+        )));
+    }
+    // Stale: same removal as before, with the path carried in the error — a
+    // bare "Permission denied (os error 13)" (the Termux /tmp failure mode)
+    // with no hint WHICH path failed is undiagnosable.
+    std::fs::remove_file(socket_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("removing the stale socket at {socket_path}: {e}"),
+        )
+    })
+}
+
 pub fn run_server(
     socket_path: &str,
     state: DaemonState,
@@ -204,19 +236,20 @@ pub fn run_server(
     tcp_addr: Option<String>,
     transport_sk: TransportSecretKey,
     acl: std::sync::Arc<crate::server::acl::SharedAcl>,
+    // `--auto-exit`: shut down gracefully when the last client disconnects.
+    // Connection threads then report their disconnect to the command loop
+    // (see `DaemonCommand::LastClientDisconnected`); with this off the send
+    // in the connection-spawn closures below is skipped and behavior is
+    // unchanged.
+    auto_exit: bool,
 ) -> io::Result<()> {
-    // Both operations carry the socket path in the error: a bind/removal
-    // failure otherwise surfaces as a context-free "Permission denied (os
-    // error 13)" (the Termux /tmp failure mode) with no hint WHICH path
-    // was the problem — the path is the entire diagnosis.
-    if Path::new(socket_path).exists() {
-        std::fs::remove_file(socket_path).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("removing the stale socket at {socket_path}: {e}"),
-            )
-        })?;
-    }
+    // Probe-then-remove, with the socket path carried in every error: a
+    // bind/removal failure otherwise surfaces as a context-free "Permission
+    // denied (os error 13)" (the Termux /tmp failure mode) with no hint WHICH
+    // path was the problem. The probe refuses to unlink a socket a live
+    // daemon is still listening on — a second daemon must not orphan the
+    // first one.
+    remove_stale_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -236,6 +269,10 @@ pub fn run_server(
         CoreOptions {
             acl: Some(Arc::clone(&acl)),
             config_watchers: true,
+            // Auto-exit only makes sense for a socket-listening daemon: the
+            // decision arm wakes THIS socket's accept loop. The embedded
+            // daemon passes `None` (no socket, no auto-exit).
+            auto_exit_wake_path: auto_exit.then(|| socket_path.to_string()),
         },
     )?;
     // Local clone of the core's command sender: the accept paths below clone
@@ -422,6 +459,12 @@ pub fn run_server(
                         // the Unix accept path below.
                         crate::metrics::record_connection_accepted();
                         let tx = daemon_tx.clone();
+                        // Auto-exit report sender: `tx` is consumed by the
+                        // handshake/thread below, so the post-disconnect
+                        // report needs its own clone (dropped untouched when
+                        // auto-exit is off — an unused-but-captured clone is
+                        // cheaper than branching the spawn plumbing).
+                        let auto_exit_tx = if auto_exit { Some(tx.clone()) } else { None };
                         let sk_bytes = *transport_sk.as_bytes();
                         let acl = Arc::clone(&acl);
                         let global_lag = Arc::clone(&global_lag_tcp);
@@ -445,13 +488,20 @@ pub fn run_server(
                             // so the accept thread stays a pure spawn loop; it
                             // also unregisters the writer channel on every
                             // pre-transport failure path.
-                            if let Err(e) =
-                                crate::server::connection::tcp_handshake_and_client_thread(
-                                    tcp, sk_bytes, acl, tx, client_id, writer_tx, writer_rx,
-                                    global_lag,
-                                )
-                            {
+                            let result = crate::server::connection::tcp_handshake_and_client_thread(
+                                tcp, sk_bytes, acl, tx, client_id, writer_tx, writer_rx, global_lag,
+                            );
+                            if let Err(e) = result {
                                 error!(error = %e, "TCP client error");
+                            }
+                            // Auto-exit: the connection has fully ended and
+                            // `_slot` is about to drop. Release it FIRST so
+                            // the command loop's count is accurate when it
+                            // processes the report, then send the event (see
+                            // DaemonCommand::LastClientDisconnected).
+                            drop(_slot);
+                            if let Some(tx) = auto_exit_tx {
+                                let _ = tx.send(DaemonCommand::LastClientDisconnected);
                             }
                         });
                         // Ferry the handle back to the main thread so shutdown
@@ -495,6 +545,10 @@ pub fn run_server(
                 };
                 crate::metrics::record_connection_accepted();
                 let tx = daemon_tx.clone();
+                // Auto-exit report sender: `tx` is consumed by client_thread,
+                // so the post-disconnect report needs its own clone (see the
+                // TCP path above for why the slot drop precedes the send).
+                let auto_exit_tx = if auto_exit { Some(tx.clone()) } else { None };
                 let global_lag = Arc::clone(&global_lag);
                 // Register the writer channel with the daemon BEFORE spawning
                 // the connection thread — see register_client_writer for why
@@ -509,10 +563,17 @@ pub fn run_server(
                         // (decrementing the counter) when the connection
                         // thread exits, even on panic.
                         let _slot = slot;
-                        if let Err(e) = crate::server::connection::client_thread(
+                        let result = crate::server::connection::client_thread(
                             stream, tx, client_id, writer_tx, writer_rx, global_lag,
-                        ) {
+                        );
+                        if let Err(e) = result {
                             error!(error = %e, "client error");
+                        }
+                        // Auto-exit: release the slot BEFORE the report so the
+                        // command loop's zero-check sees the true live count.
+                        drop(_slot);
+                        if let Some(tx) = auto_exit_tx {
+                            let _ = tx.send(DaemonCommand::LastClientDisconnected);
                         }
                     }),
                 );
@@ -710,4 +771,33 @@ mod tests {
         tx.send(()).unwrap();
         handles.pop().unwrap().join().unwrap();
     }
+
+    // ── stale-socket probe (remove_stale_socket) ─────────────────────
+
+    /// A regular file at the socket path (crash leftover after the file was
+    /// clobbered, or simply garbage) is stale — connect fails, so the helper
+    /// removes it and proceeds.
+    #[test]
+    fn remove_stale_socket_removes_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+
+        remove_stale_socket(path.to_str().unwrap()).unwrap();
+        assert!(!path.exists(), "stale leftover must be removed");
+    }
+
+    /// A nonexistent path is trivially fine (fresh start) — no error, no
+    /// creation.
+    #[test]
+    fn remove_stale_socket_ignores_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent");
+        remove_stale_socket(path.to_str().unwrap()).unwrap();
+        assert!(!path.exists());
+    }
+
+    // The live-listener refusal case needs a real Unix socket at a real
+    // path — that is a filesystem/IPC boundary test, so it lives in
+    // tests/lifecycle_integration.rs (remove_stale_socket_refuses_live_listener).
 }

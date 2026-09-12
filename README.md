@@ -359,6 +359,12 @@ and follow
 [First conversation](#first-conversation) below. The daemon listens on the
 Unix socket `/tmp/Choreographr.sock` and stores its data under
 `~/.local/share/choreographr/` (see [Configuration](#configuration)).
+You don't strictly need to start the daemon yourself: `choreo-tui`
+autostarts one when it finds nothing listening on the socket (a private
+daemon spawned with `--auto-exit`, which shuts down when the last client
+disconnects; daemon logs land in `$TMPDIR/choreo-daemon-<pid>.log`), and a
+second `choreographr` refuses to start while another daemon is already
+listening.
 
 > **Zig?** Only source builds need it. Homebrew, the `.deb`/`.rpm`, the AUR
 > `-bin` package, the tarball, and `cargo binstall` all use prebuilt
@@ -391,6 +397,10 @@ cargo run --release -p choreographr         # default log level: info
 cargo run --release -p choreographr -- -v   # debug
 cargo run --release -p choreographr -- -vv  # trace
 cargo run --release -p choreographr -- -q   # warnings only
+```
+
+```bash
+cargo run --release -p choreographr -- --log-file /tmp/choreo.log  # log to a file instead of stderr
 ```
 
 `RUST_LOG` takes precedence over the CLI flags:

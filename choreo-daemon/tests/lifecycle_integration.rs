@@ -17,6 +17,41 @@ use std::time::Duration;
 
 mod common;
 
+/// `run_server` must refuse to start over a LIVE daemon's socket: the probe
+/// in `remove_stale_socket` must detect the listening peer via a successful
+/// connect and return an error naming the path, WITHOUT unlinking the socket
+/// (a live daemon keeps working). A regular file at the path, by contrast, is
+/// stale and is removed.
+#[test]
+#[ignore]
+fn remove_stale_socket_refuses_live_listener() {
+    let dir = tempfile::tempdir().expect("tempdir for socket");
+    let path = dir.path().join("live.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind listener");
+
+    // The helper is pub(crate), so go through the same decision via a real
+    // `run_server` start: it must fail before binding (the bind below in the
+    // second server would otherwise just overwrite the path).
+    let state = common::test_daemon_state();
+    let transport_sk = choreo_transport::key::TransportSecretKey::new([0u8; 32]);
+    let acl = choreo_daemon::server::acl::SharedAcl::load(std::path::Path::new("/nonexistent"));
+    let socket_str = path.to_str().expect("valid socket path").to_string();
+
+    let err = run_server(&socket_str, state, None, None, transport_sk, acl, false)
+        .expect_err("run_server over a live socket must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("already listening") && msg.contains("live.sock"),
+        "error must name the path and the conflict: {msg}"
+    );
+
+    // The live daemon's socket file survived the refused start and the
+    // listener is still accepting.
+    assert!(path.exists(), "a live daemon's socket must not be removed");
+    assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+    drop(listener);
+}
+
 #[test]
 #[ignore]
 fn server_accepts_ping_and_shuts_down_on_signal() {
@@ -32,7 +67,7 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
 
     // Run the server in a background thread.
     let handle = thread::spawn(move || {
-        run_server(&socket_str, state, None, None, transport_sk, acl).expect("run_server");
+        run_server(&socket_str, state, None, None, transport_sk, acl, false).expect("run_server");
     });
 
     // Wait for the socket to appear (server is ready).

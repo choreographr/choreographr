@@ -3142,6 +3142,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-prompts",
+ "uds_windows",
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "zeroize",

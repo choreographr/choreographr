@@ -351,6 +351,13 @@ pub enum DaemonCommand {
     ClientDisconnected {
         client_id: u64,
     },
+    /// Auto-exit mode (`--auto-exit`): sent by a connection thread AFTER its
+    /// connection has fully ended and its RAII [`ConnectionSlot`] has been
+    /// released (the live-connection counter decremented). Deliberately
+    /// carries no data — the shutdown DECISION reads the shared counter on
+    /// the command loop, keeping that decision on a single thread (connection
+    /// threads only report the disconnect event; see start_daemon_core).
+    LastClientDisconnected,
     /// Register a connection's writer channel so the shutdown path can route
     /// `ShuttingDown` through that connection's single writer thread.
     RegisterClientWriter {
@@ -737,6 +744,16 @@ impl DaemonState {
             } => self.handle_unload_tools(session_id, groups, reply),
             DaemonCommand::PowerEvent(event) => {
                 handle_suspend_event(&event, &self.daemon_registry, &self.session_registries)
+            }
+            DaemonCommand::LastClientDisconnected => {
+                // Never handled here: the auto-exit decision needs the shared
+                // connection counter and the accept-loop wake probe, neither
+                // of which belongs in DaemonState (the embedded daemon has no
+                // socket to wake). Handled at the command-loop level in
+                // start_daemon_core.
+                debug!(
+                    "unexpected LastClientDisconnected in handle_command; handled at loop level"
+                );
             }
             DaemonCommand::Shutdown => {
                 warn!("unexpected Shutdown command in handle_command; handled at loop level");

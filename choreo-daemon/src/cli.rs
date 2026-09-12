@@ -62,6 +62,20 @@ struct Cli {
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
 
+    /// Write daemon logs to this file instead of stderr (ANSI styling is
+    /// disabled for file output; RUST_LOG/-v/-q level selection is
+    /// unchanged). The daemon refuses to start when the file cannot be
+    /// created or opened.
+    #[arg(long = "log-file")]
+    log_file: Option<String>,
+
+    /// Exit automatically when the last client disconnects (used by
+    /// choreo-tui, which spawns a private daemon); without this flag the
+    /// daemon runs until interrupted. A daemon with this flag that has never
+    /// had a client still runs forever — there is no idle timeout.
+    #[arg(long = "auto-exit")]
+    auto_exit: bool,
+
     /// Optional utility subcommand. When absent (the overwhelmingly common
     /// case) the daemon runs — `choreographr --tcp-addr 0.0.0.0:9443` keeps
     /// working unchanged because the serve flags stay on the parent command.
@@ -195,7 +209,32 @@ pub fn main() -> anyhow::Result<()> {
         None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
     };
 
-    fmt().with_env_filter(env_filter).init();
+    // Logging init happens HERE — before any subcommand/state work — because
+    // everything after it wants to log. With --log-file, open the file first
+    // and make failure fatal: a TUI-spawned daemon whose log path is bad must
+    // fail loudly with the path, not silently lose all diagnostics. ANSI is
+    // always off for file output (escape codes are unreadable in a log file).
+    if let Some(path) = &cli.log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "failed to open --log-file {path} for writing; check that the \
+                     directory exists and is writable"
+                )
+            })?;
+        // `Mutex<File>` is a `MakeWriter`: each tracing event locks the file
+        // briefly, serializing writes without any extra plumbing.
+        fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+    } else {
+        fmt().with_env_filter(env_filter).init();
+    }
 
     info!(effective_level = ?log_level.unwrap_or("from RUST_LOG"), "logging initialized");
 
@@ -278,6 +317,7 @@ pub fn main() -> anyhow::Result<()> {
         cli.tcp_addr,
         transport_sk,
         acl,
+        cli.auto_exit,
     )
     .context("failed to run server")
 }

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `run_server` no longer steals a live daemon's socket: before removing an
+  existing socket file it now probes it with a connect — a successful
+  connect means another daemon is still listening, so startup fails with
+  "another daemon is already listening at …" instead of orphaning the
+  working daemon (the two-daemon race that TUI autostart widens); any
+  failed connect (ENOENT, ECONNREFUSED, a regular file at the path) means
+  stale, and the leftover is removed as before — with the socket path now
+  carried in the removal error so a bare "Permission denied" (the Termux
+  /tmp failure mode) is diagnosable.
+- A daemon protocol-version mismatch surfaces an actionable TUI quit
+  message — "the daemon's protocol version is incompatible — restart the
+  daemon (it may be an older build)" — instead of a raw codec error the
+  user cannot act on; all other connection errors keep the historical
+  wording.
 - Eliminated the last clippy warnings across the workspace so
   `cargo clippy --workspace --all-targets` is warning-free (the only
   remaining notice is the `proc-macro-error2` dependency advisory): removed
@@ -33,6 +47,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Daemon autostart from the TUI (`choreo-tui`, new `autostart` module):**
+  in Unix-socket mode, if nothing is listening on the daemon socket at
+  startup, the TUI prints "No daemon running — starting choreographr…" and
+  spawns the sibling `choreographr` binary (same directory as its own
+  executable, resolved via `current_exe`) as a detached child with
+  `--auto-exit --log-file $TMPDIR/choreo-daemon-<tui-pid>.log`, then polls
+  the socket (100 ms interval, 5 s budget) before starting the UI. Spawn or
+  poll failure kills the child and exits with an error naming the daemon's
+  log path. TCP mode (`--tcp-addr`) never spawns — a remote daemon is not
+  launchable from the client machine. This runs in the same pre-alternate-
+  screen cooked-mode window as the fingerprint prompt, so the notice is
+  visible.
+- `choreographr --log-file <path>`: write daemon logs to a file instead of
+  stderr (ANSI disabled for file output; level control unchanged via
+  `-v`/`-q`/`RUST_LOG`). The daemon refuses to start when the file cannot be
+  created or opened — a TUI-spawned daemon with a bad log path must fail
+  loudly with the path, not silently lose diagnostics.
+- `choreographr --auto-exit`: graceful shutdown when the last client
+  disconnects (used by the TUI's spawned daemon). Connection threads report
+  `DaemonCommand::LastClientDisconnected` on exit (after releasing their
+  `ConnectionSlot`, so the command loop's zero-check of the shared
+  live-connection counter is accurate); the command loop — the single
+  thread that owns every shutdown decision — sets the existing shutdown flag
+  and wakes the accept loop with a self-connect, running the exact SIGINT
+  drain (notify-before-EOF, bounded joins). No idle timeout: a daemon that
+  has never had a client runs forever. The embedded daemon passes `None`
+  (auto-exit is a socket-listening-daemon feature only).
 - Workspace-wide strict clippy lints, modeled on the "strict lints"
   configuration popularized by No Boilerplate (namtao.com/rust) and adapted
   to this workspace's conventions: `[workspace.lints.clippy]` in the root

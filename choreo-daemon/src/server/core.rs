@@ -21,6 +21,15 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+// The auto-exit decision (LastClientDisconnected arm below) wakes the accept
+// loop by connecting to the daemon's own socket — the same probe the signal
+// threads use. On Windows the Unix-socket API comes from `uds_windows`, so
+// mirror lifecycle.rs's cfg split.
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use uds_windows::UnixStream;
+
 /// Assembly options for [`start_daemon_core`].
 pub(crate) struct CoreOptions {
     /// Shared ACL to install into [`DaemonState::acl`] and hot-reload-watch.
@@ -36,6 +45,13 @@ pub(crate) struct CoreOptions {
     /// managed externally (or none at all), so the flag lets the adapter
     /// decide; the shipped binary passes `true`.
     pub config_watchers: bool,
+    /// Auto-exit wake socket (`--auto-exit`): when `Some(path)`, the command
+    /// loop, upon receiving [`DaemonCommand::LastClientDisconnected`] with a
+    /// zero live-connection count, sets the shutdown flag and connects to
+    /// `path` to unblock the accept loop — the exact SIGINT shutdown path.
+    /// `None` when auto-exit is off, and for the embedded daemon (no socket
+    /// to wake; auto-exit is a CLI-daemon feature only).
+    pub auto_exit_wake_path: Option<String>,
 }
 
 /// Transport-independent daemon core assembled by [`start_daemon_core`]: the
@@ -221,10 +237,43 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> io::Re
     // here so the shared Arc exists before any adapter is spawned.
     let conn_count = Arc::new(AtomicUsize::new(0));
 
+    // Auto-exit state for the command loop: the decision must be made on ONE
+    // thread (the command loop — same thread that owns every other shutdown
+    // decision), so it needs its own clone of the connection counter, a clone
+    // of the shutdown flag to set, and the wake path. `opts` moves into the
+    // closure below, so extract these before the move.
+    let auto_exit_wake_path = opts.auto_exit_wake_path.clone();
+    let auto_exit_conn_count = Arc::clone(&conn_count);
+    // The SAME flag the accept loop polls — setting a distinct flag would
+    // never reach run_server's drain.
+    let auto_exit_shutdown = Arc::clone(&shutdown);
+
     // Daemon command handler thread.
     let cmd_handle = thread::spawn(move || {
         loop {
             match daemon_rx.recv() {
+                Ok(DaemonCommand::LastClientDisconnected) => {
+                    // Auto-exit decision. A connection thread reports its
+                    // disconnect AFTER releasing its slot, so a zero count
+                    // here means NO client is connected anywhere (Unix or
+                    // TCP). Anything else — an earlier disconnect while other
+                    // clients remain, or a spurious delivery — is a no-op.
+                    // There is deliberately no idle timer: a daemon that has
+                    // never had a client runs forever.
+                    if let Some(wake_path) = &auto_exit_wake_path
+                        && auto_exit_conn_count.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    {
+                        info!("auto-exit: last client disconnected; beginning graceful shutdown");
+                        auto_exit_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // Wake the blocking accept() with a self-connect so
+                        // run_server observes the flag and runs its normal
+                        // drain (BroadcastShuttingDown → Shutdown → unlink),
+                        // exactly as on SIGINT.
+                        if let Ok(stream) = UnixStream::connect(wake_path) {
+                            drop(stream);
+                        }
+                    }
+                }
                 Ok(DaemonCommand::Shutdown) => {
                     // Announce the stage: everything after this line is
                     // teardown (session joins, MCP shutdown), and each stage

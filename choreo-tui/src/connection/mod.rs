@@ -619,8 +619,9 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
             // Overwrite (not get_or_insert) the quit message: the
             // ui_rx-disconnect arm has already inserted the generic
             // "the connection to the daemon was closed" text, and the
-            // real error is strictly more specific.
-            app.quit_message = Some(format!("connection to the daemon failed: {error}"));
+            // real error is strictly more specific. The version-mismatch
+            // case gets actionable wording (see connection_quit_message).
+            app.quit_message = Some(crate::connection_quit_message(&error));
         }
         Err(_) => {
             app.quit_message
@@ -1913,6 +1914,40 @@ mod tests {
     }
 
     // ── Connection-level termination ────────────────────────────────────
+
+    #[test]
+    fn version_mismatch_quit_message_is_actionable() {
+        // A daemon built against an older PROTOCOL_VERSION must read as a
+        // version incompatibility with a restart hint, never as a raw
+        // codec error the user cannot act on.
+        let error =
+            ClientError::Proto(choreo_proto::ProtoError::UnsupportedVersion { version: 99 });
+        let msg = crate::connection_quit_message(&error);
+        assert!(
+            msg.contains("protocol version is incompatible"),
+            "must name the incompatibility, got: {msg}"
+        );
+        assert!(
+            msg.contains("restart the daemon"),
+            "must carry the restart hint, got: {msg}"
+        );
+        // The prefix stays stable for anything upstream that matches on it.
+        assert!(msg.starts_with("connection to the daemon failed: "));
+    }
+
+    #[test]
+    fn ordinary_connection_errors_keep_the_generic_wording() {
+        // Only the version-mismatch case is remapped; everything else keeps
+        // the historical "connection to the daemon failed: {error}" shape.
+        let error = ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        assert_eq!(
+            crate::connection_quit_message(&error),
+            format!("connection to the daemon failed: {error}")
+        );
+    }
 
     #[test]
     fn reader_closed_quits_with_message() {
