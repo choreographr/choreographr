@@ -9,7 +9,7 @@
 //! `choreo-ai-protocols/tests/reasoning_roundtrip.rs`.
 //!
 //! These tests bind a real local TCP socket (the mock provider), so per
-//! AGENTS.md they live in `tests/` and are marked `#[ignore]` (run via
+//! AGENTS.md they live in `tests/` and are marked `#[ignore = "integration"]` (run via
 //! `cargo test-integration`).
 
 use choreo_ai_protocols::ChatTurnRequest;
@@ -87,7 +87,7 @@ fn final_text_response() -> String {
 /// turn produced by `deepseek-v4-pro` must not replay its payload into a
 /// request for `deepseek-chat` — even though both are tool-involving turns
 /// under a ToolLoop-passback provider.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn builder_model_switch_drops_old_turn_artifacts() {
     let mut session = SessionState::empty();
@@ -137,7 +137,7 @@ fn builder_model_switch_drops_old_turn_artifacts() {
 /// old reasoning on the request sent after the switch (`deepseek-chat` is a
 /// `requires_reasoning_content` provider, so the field is still carried — as
 /// an empty string placeholder — but never the previous model's payload).
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn model_switch_sends_no_reasoning_on_the_wire() {
     const REASONING: &str = "deepseek old reasoning payload";

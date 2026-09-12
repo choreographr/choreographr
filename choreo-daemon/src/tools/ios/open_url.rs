@@ -48,7 +48,7 @@ impl JsonSchema for OpenUrlArgs {
 
 impl OpenUrlArgs {
     /// The executor-side boundary. The JSON Schema is advisory (the model may
-    /// send anything), so execute() re-validates: a REAL URL parse (the `url`
+    /// send anything), so `execute()` re-validates: a REAL URL parse (the `url`
     /// crate — a bare `starts_with("https:")` would accept degenerate strings
     /// like `https:not-a-url`), the scheme allow-list, and a
     /// control-character ban anywhere in the string (control chars could
@@ -79,7 +79,7 @@ impl OpenUrlArgs {
     }
 }
 
-/// `open_url`: hands the URL to the host (SpringBoard on iOS) and waits for
+/// `open_url`: hands the URL to the host (`SpringBoard` on iOS) and waits for
 /// the completion handler. The Rust side parses/validates with the `url`
 /// crate (see [`OpenUrlArgs::validate`]); the Swift host runs the SAME
 /// scheme check independently over its own `URL` parse — both sides gate.
@@ -145,7 +145,7 @@ impl Tool for OpenUrl {
         // reply from tests/older hosts) degrades to success.
         let opened = value
             .get("opened")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         Ok(if opened {
             "URL opened.".to_string()

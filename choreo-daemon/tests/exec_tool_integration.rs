@@ -2,7 +2,7 @@ use choreo_daemon::{ExecArgs, execute_exec_tool};
 use std::path::Path;
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn echo_hello() {
     let result = execute_exec_tool(
         &ExecArgs {
@@ -19,7 +19,7 @@ fn echo_hello() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn exit_nonzero() {
     let result = execute_exec_tool(
         &ExecArgs {
@@ -35,7 +35,7 @@ fn exit_nonzero() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn working_directory() {
     // `pwd` prints the physical (symlink-resolved) directory, so on macOS the
     // expected path must be canonicalized (/var → /private/var).
@@ -54,7 +54,7 @@ fn working_directory() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn timeout_kills_command() {
     let result = execute_exec_tool(
         &ExecArgs {
@@ -71,7 +71,7 @@ fn timeout_kills_command() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn output_truncation() {
     let result = execute_exec_tool(
         &ExecArgs {
@@ -90,7 +90,7 @@ fn output_truncation() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn stderr_output_included() {
     let result = execute_exec_tool(
         &ExecArgs {
@@ -107,7 +107,7 @@ fn stderr_output_included() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn argv_passing() {
     let result = execute_exec_tool(
         &ExecArgs {
@@ -132,7 +132,7 @@ fn argv_passing() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn fast_hello() {
     let result = execute_exec_tool(
         &ExecArgs {

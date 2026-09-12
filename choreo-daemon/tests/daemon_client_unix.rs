@@ -7,7 +7,7 @@
 //! `client_thread` → daemon command loop → session thread → per-client
 //! writer channel → socket → client reader loop → handler channel.
 //!
-//! These tests belong to the `#[ignore]` integration suite (run via
+//! These tests belong to the `#[ignore = "integration"]` integration suite (run via
 //! `cargo test-integration` / nextest `--run-ignored only`): they bind real
 //! sockets and spawn real threads, so they are excluded from the fast unit
 //! suite. The only time-based primitive used is the bounded `recv_timeout`
@@ -22,7 +22,10 @@
     clippy::expect_used,
     clippy::panic,
     clippy::panic_in_result_fn,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    // u8 key fixtures: `std::array::from_fn(|i| (i * K) as u8)` — truncation
+    // is the point (deterministic byte patterns), never a bug.
+    clippy::cast_possible_truncation
 )]
 use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_connection;
@@ -131,7 +134,7 @@ impl Client {
     }
 }
 
-/// The CreateSession request used throughout: every optional field unset, so
+/// The `CreateSession` request used throughout: every optional field unset, so
 /// the tests exercise the default session-creation path.
 fn create_session() -> ClientMessage {
     ClientMessage::CreateSession {
@@ -146,7 +149,7 @@ fn create_session() -> ClientMessage {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn unix_ping_pong_round_trip() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     let client = Client::connect(&daemon.socket_str());
@@ -165,7 +168,7 @@ fn unix_ping_pong_round_trip() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn unix_list_sessions_round_trip() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     let client = Client::connect(&daemon.socket_str());
@@ -173,7 +176,9 @@ fn unix_list_sessions_round_trip() {
     // Fresh daemon: the session list starts empty.
     client.send(ClientMessage::ListSessions);
     match client.recv() {
-        DaemonMessage::Sessions { sessions } => assert!(sessions.is_empty()),
+        DaemonMessage::Sessions { sessions } => {
+            assert_eq!(sessions, [] as [choreo_proto::SessionSummary; 0]);
+        }
         other => panic!("expected empty Sessions, got {other:?}"),
     }
 
@@ -204,7 +209,7 @@ fn unix_list_sessions_round_trip() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn unix_create_session_then_attach() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     let client = Client::connect(&daemon.socket_str());
@@ -244,7 +249,7 @@ fn unix_create_session_then_attach() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn unix_shutdown_notifies_client() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     let client = Client::connect(&daemon.socket_str());
@@ -264,7 +269,7 @@ fn unix_shutdown_notifies_client() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn unix_two_clients_isolated_and_shared_state() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     let client_a = Client::connect(&daemon.socket_str());
@@ -323,7 +328,7 @@ fn unix_two_clients_isolated_and_shared_state() {
 /// Direct `UnixStream` usage (rather than the `Client` helper) keeps the
 /// test minimal: the point is the accept-side cap, not the client protocol.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn unix_connection_cap_rejects_over_limit_with_eof() {
     // Must match MAX_CONCURRENT_CONNECTIONS in server/lifecycle.rs (the
     // constant is private to the crate, so the integration test hardcodes it
@@ -396,7 +401,7 @@ fn recv_until_not_catalog(client: &Client, what: &str) -> DaemonMessage {
     }
 }
 
-/// Drain the subscribe-time push (CatalogUpdated + lock state), tolerating
+/// Drain the subscribe-time push (`CatalogUpdated` + lock state), tolerating
 /// extra async `CatalogUpdated` broadcasts racing with the drain.
 fn drain_subscribe_push(client: &Client) {
     let first = client.recv();
@@ -408,11 +413,11 @@ fn drain_subscribe_push(client: &Client) {
     assert!(matches!(second, DaemonMessage::Locked), "{second:?}");
 }
 
-/// BindKeystore on an unbound daemon adopts the key, replies the targeted
-/// `Bound`, and the daemon is unlocked afterwards (a follow-up AddCredential
+/// `BindKeystore` on an unbound daemon adopts the key, replies the targeted
+/// `Bound`, and the daemon is unlocked afterwards (a follow-up `AddCredential`
 /// succeeds without any adoption).
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn unix_bind_keystore_adopts_and_replies_bound() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     let client = Client::connect(&daemon.socket_str());
@@ -450,10 +455,10 @@ fn unix_bind_keystore_adopts_and_replies_bound() {
 }
 
 /// Unlock on an unbound daemon is VERIFY-ONLY: it must NOT adopt the key.
-/// The client gets the distinct `KeystoreUnbound` (not LockedError), and a
-/// subsequent AddCredential is refused too — proving no binding was created.
+/// The client gets the distinct `KeystoreUnbound` (not `LockedError`), and a
+/// subsequent `AddCredential` is refused too — proving no binding was created.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn unix_unlock_on_unbound_keystore_is_refused_without_adopting() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     let client = Client::connect(&daemon.socket_str());
@@ -501,7 +506,7 @@ fn unix_unlock_on_unbound_keystore_is_refused_without_adopting() {
 /// receives BOTH on the same socket, and its key-recording correctness keys
 /// on the targeted reply coming first.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn unix_targeted_reply_precedes_lock_state_broadcast() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     let client = Client::connect(&daemon.socket_str());

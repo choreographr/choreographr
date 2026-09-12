@@ -124,7 +124,7 @@ pub(crate) fn sanitize_value(text: &str) -> String {
 /// flatten a pretty-printed JSON blob into one long line of literal `\n`
 /// sequences. That is the right policy for *scalar* node strings — a hostile
 /// chain name must not be able to inject a line — but JSON is different:
-/// serde_json never emits an unescaped control character (a hostile value
+/// `serde_json` never emits an unescaped control character (a hostile value
 /// inside a JSON string renders as the two-character `\n` / `\u00xx` escape),
 /// so the *only* literal newlines in JSON output are the structural separators
 /// serde itself emitted. This function splits on those, sanitizes each line
@@ -221,16 +221,13 @@ mod tests {
         // This test must not depend on whether another test initialized the
         // runtime; get() may be Some, in which case block_on succeeds. Only
         // assert the *shape*: a missing runtime maps to RuntimeNotInitialized.
-        match runtime::get() {
-            None => {
-                let fut = async { 42u8 };
-                let err = block_on(fut).unwrap_err();
-                assert!(matches!(err, BlockchainError::RuntimeNotInitialized));
-            }
-            Some(_) => {
-                let fut = async { 42u8 };
-                assert_eq!(block_on(fut).unwrap(), 42);
-            }
+        if runtime::get().is_none() {
+            let fut = async { 42u8 };
+            let err = block_on(fut).unwrap_err();
+            assert!(matches!(err, BlockchainError::RuntimeNotInitialized));
+        } else {
+            let fut = async { 42u8 };
+            assert_eq!(block_on(fut).unwrap(), 42);
         }
     }
 

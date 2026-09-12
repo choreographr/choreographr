@@ -250,17 +250,17 @@ pub(crate) struct SessionDisplayState {
     pub(crate) content_dirty: bool,
     pub(crate) history_scroll: HistoryScrollState,
     pub(crate) turn_layouts: Vec<TurnLayout>,
-    /// Per-turn explicit reasoning visibility (turn_id → expanded) set by
+    /// Per-turn explicit reasoning visibility (`turn_id` → expanded) set by
     /// clicking the reasoning header.  Absent entries fall back to
     /// [`reasoning_expanded_default`] (expanded while streaming, collapsed
     /// once a response exists).
     pub(crate) reasoning_override: HashMap<u32, bool>,
-    /// Per-(turn, tool-call) explicit collapse state (turn_id → call_id →
+    /// Per-(turn, tool-call) explicit collapse state (`turn_id` → `call_id` →
     /// collapsed) set by clicking a tool result's header.  Absent entries
     /// fall back to [`tool_result_default_collapsed`] (quiet tools
     /// collapsed, everything else expanded).  Nested so the per-frame lookup
     /// can borrow the record's `call_id` instead of cloning it; keyed by
-    /// call_id (not position) because a result's position is stable while
+    /// `call_id` (not position) because a result's position is stable while
     /// its content streams in.
     pub(crate) tool_collapse_override: HashMap<u32, HashMap<String, bool>>,
     /// Monotonic per-turn content version, bumped by every event handler
@@ -379,7 +379,7 @@ pub(crate) struct App {
     /// and friends) Ctrl+M is byte 0x0D — identical to Enter — so the model
     /// selector is rebound to Ctrl+O and hints reflect it. Defaults to `true`:
     /// kitty-capable terminals are the desktop majority, and every simulated
-    /// KeyEvent in tests is a kitty-encoding event.
+    /// `KeyEvent` in tests is a kitty-encoding event.
     pub(crate) keyboard_enhanced: bool,
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
@@ -419,9 +419,9 @@ pub(crate) struct App {
     pub(crate) active_session_id: Option<u64>,
     /// The address string this session talks to (dial addr for TCP, unix
     /// socket path otherwise). It keys the per-daemon unlock key in
-    /// known_servers, so every `Unlock`/`AddCredential`/record must use it
+    /// `known_servers`, so every `Unlock`/`AddCredential`/`record` must use it
     /// consistently. Set by `run_app` from the connection mode; defaults to
-    /// the socket path so tests (which bypass run_app) still have a valid
+    /// the socket path so tests (which bypass `run_app`) still have a valid
     /// value.
     pub(crate) connection_addr: String,
     /// The unlock key sent in the most recent `Unlock` or `AddCredential`,
@@ -653,6 +653,9 @@ impl App {
     /// Number of lines needed for the status/error bar, based on the current
     /// message content and the available terminal width.  Returns 0 when there
     /// is no message to display.
+    // Line counts are bounded by the u16 terminal width, so the usize→u16
+    // cast cannot truncate in practice.
+    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn status_error_height(&self, width: u16) -> u16 {
         let text = if let Some(ref err) = self.error {
             err.as_str()
@@ -673,6 +676,9 @@ impl App {
 
     /// Number of visual content lines the input box currently occupies,
     /// computed from the text and terminal width.
+    // Wrapped-line counts are bounded by the u16 terminal width, so the
+    // usize→u16 cast cannot truncate in practice.
+    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn input_bar_content_lines(&mut self, term_width: u16) -> u16 {
         // Must use the same inner width as the renderer (term_width minus the
         // INPUT_PAD padding on each side), or the box height can disagree with
@@ -839,8 +845,8 @@ impl App {
 
     pub(crate) fn total_history_height(&self) -> usize {
         self.active_display_ref()
-            .map(|d| d.total_history_height())
-            .unwrap_or(0)
+            // Method reference: plain forwarding of the display's own method.
+            .map_or(0, SessionDisplayState::total_history_height)
     }
 
     /// Whether the vertical scrollbar is currently rendered.  Must stay in
@@ -862,8 +868,7 @@ impl App {
     pub(crate) fn compute_total_height_and_markers(&mut self) -> usize {
         let vp = self.history_viewport;
         self.active_display()
-            .map(|d| d.compute_total_height_and_markers(&vp))
-            .unwrap_or(1)
+            .map_or(1, |d| d.compute_total_height_and_markers(&vp))
     }
 
     #[cfg(test)]
@@ -875,8 +880,7 @@ impl App {
 
     pub(crate) fn max_scroll_offset(&self) -> usize {
         self.active_display_ref()
-            .map(|d| d.max_scroll_offset(&self.history_viewport))
-            .unwrap_or(0)
+            .map_or(0, |d| d.max_scroll_offset(&self.history_viewport))
     }
 
     pub(crate) fn clamp_scroll_state(&mut self) {
@@ -887,9 +891,8 @@ impl App {
     }
 
     pub(crate) fn image_block_height(&self) -> u16 {
-        self.active_display_ref()
-            .map(|d| d.image_block_height(&self.history_viewport))
-            .unwrap_or(1)
+        // Pure function of the viewport; no display state needed.
+        SessionDisplayState::image_block_height(&self.history_viewport)
     }
 
     pub(crate) fn ensure_cache_synced(&mut self) {
@@ -917,9 +920,8 @@ impl App {
     }
 
     pub(crate) fn apply_image_result(&mut self, result: ImageResult) {
-        let (session_id, turn_id, img_idx) = match self.pending_job_idx.remove(&result.id) {
-            Some(key) => key,
-            None => return,
+        let Some((session_id, turn_id, img_idx)) = self.pending_job_idx.remove(&result.id) else {
+            return;
         };
         if let Some(session_images) = self.rendered_images.get_mut(&session_id)
             && let Some(images) = session_images.get_mut(&turn_id)
@@ -1025,15 +1027,13 @@ impl App {
 
     pub(crate) fn effective_scroll(&self) -> usize {
         self.active_display_ref()
-            .map(|d| d.effective_scroll(&self.history_viewport))
-            .unwrap_or(0)
+            .map_or(0, |d| d.effective_scroll(&self.history_viewport))
     }
 
     #[cfg(test)]
     pub(crate) fn scrollbar_notch(&self) -> usize {
         self.active_display_ref()
-            .map(|d| d.scrollbar_notch(&self.history_viewport))
-            .unwrap_or(1)
+            .map_or(1, |d| d.scrollbar_notch(&self.history_viewport))
     }
 
     pub(crate) fn scroll_up(&mut self, amount: usize) {
@@ -1085,6 +1085,8 @@ impl App {
         }
     }
 
+    // The branches below guarantee a non-negative delta before each cast.
+    #[allow(clippy::cast_sign_loss)]
     pub(crate) fn apply_scroll_delta(&mut self) {
         let delta = self.scroll_accumulator;
         self.scroll_accumulator = 0;
@@ -1364,7 +1366,7 @@ impl App {
             .sessions
             .iter()
             .find(|s| s.session_id == session_id)
-            .map(|s| {
+            .map_or((None, None, None, None, None, None, None, None), |s| {
                 (
                     s.token_usage,
                     s.context_window,
@@ -1375,8 +1377,7 @@ impl App {
                     s.working_dir.clone(),
                     Some(s.status.clone()),
                 )
-            })
-            .unwrap_or((None, None, None, None, None, None, None, None));
+            });
         {
             let display = self.display_for(session_id);
             // Fill gaps from the (potentially stale) session summary, but never
@@ -1408,7 +1409,7 @@ impl App {
                 display.working_dir = working_dir;
             }
             if let Some(ref st) = status {
-                display.status = Some(format!("{:?}", st));
+                display.status = Some(format!("{st:?}"));
             }
         }
         self.attached_status = status;
@@ -1478,6 +1479,9 @@ impl App {
         }
     }
 
+    // Call sites in `connection/daemon.rs` pass `&Option<String>`; changing
+    // the signature would touch files outside this one.
+    #[allow(clippy::ref_option)]
     pub(crate) fn handle_session_working_dir_set(
         &mut self,
         session_id: u64,
@@ -1485,11 +1489,11 @@ impl App {
     ) {
         if self.attached_session_id == Some(session_id) {
             if let Some(d) = self.active_display() {
-                d.working_dir = path.clone();
+                d.working_dir.clone_from(path);
                 d.progress_dirty = true;
             }
             if let Some(s) = self.attached_session_mut() {
-                s.working_dir = path.clone();
+                s.working_dir.clone_from(path);
             }
         }
     }
@@ -1865,10 +1869,7 @@ impl App {
     }
 
     pub(crate) fn handle_session_delete_failed(&mut self, session_id: u64, error: &str) {
-        self.status = Some(format!(
-            "failed to delete session {}: {}",
-            session_id, error
-        ));
+        self.status = Some(format!("failed to delete session {session_id}: {error}"));
     }
 
     pub(crate) fn display_token_usage(&self) -> Option<TokenUsage> {
@@ -1899,6 +1900,9 @@ impl App {
 /// A blind overwrite would regress the status bar's `↑in ↓out` readout until
 /// the next `TokenUsageUpdate` — i.e. until the turn ends — while a `None`
 /// snapshot must never wipe an accumulated total.
+// Call sites in `connection/daemon.rs` pass `&Option<TokenUsage>`;
+// changing the signature would touch files outside this one.
+#[allow(clippy::ref_option)]
 pub(crate) fn merge_token_usage(
     current: &Option<TokenUsage>,
     incoming: &Option<TokenUsage>,
@@ -1917,6 +1921,10 @@ pub(crate) fn merge_token_usage(
 
 // ── SessionDisplayState methods ─────────────────────────────────────
 
+// `HistoryViewport` is a 4-byte Copy struct; every call site already holds a
+// reference (App-level wrappers, tests), so taking it by value would churn
+// signatures across the crate for no measurable gain.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 impl SessionDisplayState {
     pub(crate) fn total_history_height(&self) -> usize {
         self.height_prefix.last().copied().unwrap_or(0)
@@ -1945,7 +1953,8 @@ impl SessionDisplayState {
         *version
     }
 
-    /// Rebuild height_prefix, markers, visible_turn_ids, and populate render_cache.
+    /// Rebuild `height_prefix`, `markers`, `visible_turn_ids`, and populate
+    /// `render_cache`.
     pub(crate) fn rebuild_height_prefix(&mut self, viewport: &HistoryViewport) {
         self.height_prefix.clear();
         self.visible_turn_ids.clear();
@@ -1953,8 +1962,8 @@ impl SessionDisplayState {
         self.turn_layouts.clear();
         self.turn_heights.clear();
         let mut total = 0usize;
-        let virtual_track = self.virtual_track_slots(viewport);
-        let fallback_img_height = self.image_block_height(viewport) as usize;
+        let virtual_track = Self::virtual_track_slots(viewport);
+        let fallback_img_height = Self::image_block_height(viewport) as usize;
         let turn_count = self.view.turns.len();
         tracing::trace!(turn_count, "rebuild_height_prefix");
 
@@ -1963,7 +1972,7 @@ impl SessionDisplayState {
 
         let mut user_text_start_lines: Vec<usize> = Vec::with_capacity(turn_count);
         let mut visible_idx = 0usize;
-        for (&turn_id, turn) in self.view.turns.iter() {
+        for (&turn_id, turn) in &self.view.turns {
             if turn.undone {
                 continue;
             }
@@ -2372,7 +2381,7 @@ impl SessionDisplayState {
                 },
             };
 
-            let full_img_height = self.image_block_height(viewport) as usize;
+            let full_img_height = Self::image_block_height(viewport) as usize;
             let img_count = turn.displayed_images.len();
             let turn_height = text_height + img_count * full_img_height;
 
@@ -2454,7 +2463,7 @@ impl SessionDisplayState {
     fn rebuild_markers(&mut self, viewport: &HistoryViewport) {
         self.markers.clear();
         let total = self.total_history_height().max(1);
-        let virtual_track = self.virtual_track_slots(viewport);
+        let virtual_track = Self::virtual_track_slots(viewport);
         let mut accum = 0usize;
         for (i, &turn_id) in self.visible_turn_ids.iter().enumerate() {
             // `turn_heights` is kept in lockstep with `visible_turn_ids` (one
@@ -2480,7 +2489,8 @@ impl SessionDisplayState {
         total_height.saturating_sub(viewport_height)
     }
 
-    pub(crate) fn virtual_track_slots(&self, viewport: &HistoryViewport) -> usize {
+    // Pure function of the viewport — no display state involved.
+    pub(crate) fn virtual_track_slots(viewport: &HistoryViewport) -> usize {
         2 * viewport.height as usize
     }
 
@@ -2493,7 +2503,8 @@ impl SessionDisplayState {
             .effective_scroll(self.max_scroll_offset(viewport))
     }
 
-    pub(crate) fn image_block_height(&self, viewport: &HistoryViewport) -> u16 {
+    // Pure function of the viewport — no display state involved.
+    pub(crate) fn image_block_height(viewport: &HistoryViewport) -> u16 {
         (viewport.height / 2).max(1)
     }
 
@@ -2512,7 +2523,7 @@ impl SessionDisplayState {
 
     pub(crate) fn scrollbar_notch(&self, viewport: &HistoryViewport) -> usize {
         let max_scroll = self.max_scroll_offset(viewport);
-        let virtual_track = self.virtual_track_slots(viewport);
+        let virtual_track = Self::virtual_track_slots(viewport);
         if virtual_track > 0 {
             ceil_div(max_scroll, virtual_track)
         } else {
@@ -3377,6 +3388,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against []
     fn remove_session_last_item_clears_selection() {
         let mut mgr = SessionManagerState::new();
         mgr.sessions = vec![make_session(1, "a")];
@@ -3678,6 +3690,7 @@ mod tests {
         // The history is shorter than the viewport, so content is anchored to
         // the bottom: content line 0 sits at screen row `vh - total`.
         let total = app.active_display().unwrap().total_history_height();
+        #[allow(clippy::cast_possible_truncation)] // height-derived values fit u16
         let first_row = (app.history_viewport.height as usize - total) as u16;
         let (turn_idx, offset) = find_turn_at_row(&app, first_row).unwrap();
         assert_eq!(turn_idx, 0);
@@ -3735,6 +3748,7 @@ mod tests {
         let (idx, offset) = find_turn_at_row(&app, 0).expect("top row must map to a turn");
         assert_eq!(offset, top_line - turn_start(&app, idx));
 
+        #[allow(clippy::cast_possible_truncation)] // viewport row fits u16
         let bottom_row = (vh - 1) as u16;
         let (idx_b, offset_b) = find_turn_at_row(&app, bottom_row).expect("bottom row must map");
         assert_eq!(
@@ -3744,7 +3758,7 @@ mod tests {
         );
     }
 
-    /// Content line where the turn at `turn_idx` starts (height_prefix
+    /// Content line where the turn at `turn_idx` starts (`height_prefix`
     /// prefix-sum entry, 0 for the first turn).
     fn turn_start(app: &App, turn_idx: usize) -> usize {
         app.active_display_ref()
@@ -3802,6 +3816,7 @@ mod tests {
         // The header is drawn at screen row `vh - total + start` (bottom
         // anchored); clicking that row must resolve to the header's content
         // line `start`.
+        #[allow(clippy::cast_possible_truncation)] // viewport row fits u16
         let screen_row = (app.history_viewport.height as usize - total + start) as u16;
         let (turn_idx, offset) =
             find_turn_at_row(&app, screen_row).expect("row must map to a turn");
@@ -3809,6 +3824,8 @@ mod tests {
         assert_eq!(offset, start);
 
         // The blank band above the content must not map to any turn.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // height-derived; non-negative
         let blank_row = (app.history_viewport.height as usize - total - 1) as u16;
         assert!(
             find_turn_at_row(&app, blank_row).is_none(),
@@ -4271,6 +4288,7 @@ mod tests {
     // ── TurnImageLayout image_ranges ──
 
     #[test]
+    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against []
     fn turn_layout_empty_when_no_images() {
         let mut app = test_app();
         app.history_viewport.width = 80;
@@ -5547,7 +5565,7 @@ mod tests {
         );
         assert!(display.markers_dirty, "markers_dirty should remain true");
         assert!(
-            display.render_cache.iter().all(|c| c.is_none()),
+            display.render_cache.iter().all(Option::is_none),
             "render_cache should be cleared"
         );
         assert_eq!(app.history_viewport.width, 99);
@@ -5597,7 +5615,7 @@ mod tests {
         );
         assert!(display.markers_dirty, "markers_dirty should remain true");
         assert!(
-            display.render_cache.iter().all(|c| c.is_none()),
+            display.render_cache.iter().all(Option::is_none),
             "render_cache should be cleared"
         );
     }
@@ -6081,7 +6099,7 @@ mod tests {
             .rendered
             .lines
             .iter()
-            .map(|l| l.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -6160,7 +6178,7 @@ mod tests {
             .rendered
             .lines
             .iter()
-            .map(|l| l.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -6492,11 +6510,12 @@ mod tests {
     fn selector_with_models(models: &[&str]) -> ModelSelectorState {
         let mut sel = ModelSelectorState::new();
         sel.open();
-        sel.apply_models(models.iter().map(|s| s.to_string()).collect(), None);
+        sel.apply_models(models.iter().map(|s| (*s).to_string()).collect(), None);
         sel
     }
 
     #[test]
+    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against ""
     fn model_selector_open_resets_state_and_marks_loading() {
         let mut sel = ModelSelectorState::new();
         sel.all_models = vec!["a".into()];
@@ -6571,6 +6590,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against []
     fn model_selector_no_match_returns_empty() {
         let mut sel = selector_with_models(&["a", "b"]);
         sel.filter.text = "zzz".to_string();
@@ -6668,6 +6688,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against ""
     fn model_selector_filter_key_consumes_chars_and_backspace() {
         let mut sel = selector_with_models(&["gpt-4o", "claude-3"]);
         sel.filter_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));

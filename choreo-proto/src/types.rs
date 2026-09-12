@@ -15,31 +15,25 @@ impl ReasoningCapability {
     /// Cycle from `current` to the next slug, wrapping around.
     /// Logs a warning if `current` is not found — indicates a desync
     /// between the caller's state and this capability set.
+    #[must_use]
     pub fn cycle_from(&self, current: &str) -> Option<String> {
         if self.available_effort_levels.is_empty() {
             return None;
         }
-        let pos = match self
-            .available_effort_levels
-            .iter()
-            .position(|e| e == current)
-        {
-            Some(p) => p,
-            None => {
-                warn!(
-                    "ReasoningCapability::cycle_from: current slug {current} not in available set {:?}, starting from 0",
-                    self.available_effort_levels,
-                );
-                0
-            }
-        };
+        let pos = self.available_effort_levels.iter().position(|e| e == current).unwrap_or_else(|| {
+            warn!(
+                "ReasoningCapability::cycle_from: current slug {current} not in available set {:?}, starting from 0",
+                self.available_effort_levels,
+            );
+            0
+        });
         let next = (pos + 1) % self.available_effort_levels.len();
         // The modulo guarantees `next` is in bounds; .get keeps the lint total.
         self.available_effort_levels.get(next).cloned()
     }
 }
 
-/// ContextConfig — controls file discovery for session context.
+/// `ContextConfig` — controls file discovery for session context.
 /// Moved here from choreographr so proto messages can carry it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextConfig {
@@ -108,18 +102,28 @@ impl TimestampMs {
     /// DB entries).
     pub const ZERO: Self = Self(0);
 
+    /// Current wall-clock time as `TimestampMs`.
+    ///
+    /// The u128→`i64` narrowing only truncates for clock readings past the
+    /// year 29247 — practically never, so keep the original `as i64` behavior
+    /// here rather than introducing an error path.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn now() -> Self {
         Self(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or_else(|_| {
-                    tracing::warn!("system clock before UNIX_EPOCH, using 0");
-                    0
-                }),
+                .map_or_else(
+                    |_| {
+                        tracing::warn!("system clock before UNIX_EPOCH, using 0");
+                        0
+                    },
+                    |d| d.as_millis() as i64,
+                ),
         )
     }
 
+    #[must_use]
     pub fn as_millis(&self) -> i64 {
         self.0
     }
@@ -187,7 +191,7 @@ pub enum InferenceError {
     Cancelled,
     #[error("total request deadline exceeded while reading streaming response")]
     DeadlineExceeded,
-    #[error("tool call arguments truncated by provider: {}", .discarded.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "))]
+    #[error("tool call arguments truncated by provider: {}", .discarded.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))]
     TruncatedToolCall { discarded: Vec<DiscardedToolCall> },
     #[error("{0}")]
     Io(#[from] std::io::Error),
@@ -196,10 +200,11 @@ pub enum InferenceError {
 impl InferenceError {
     /// Map this error variant to a stable, metrics-safe label string.
     ///
-    /// Labels are lowercase snake_case constants consumed by the daemon's
+    /// Labels are lowercase `snake_case` constants consumed by the daemon's
     /// Prometheus counters (e.g. `choreo_api_errors_total{error_type=...}`).
     /// They are part of the public metrics contract: renaming a label changes
     /// dashboards/alerts, so keep existing values stable.
+    #[must_use]
     pub fn metric_label(&self) -> &'static str {
         match self {
             InferenceError::Unauthorized { .. } => "unauthorized",
@@ -324,9 +329,9 @@ pub enum ChatReasoningField {
 /// Serialized as an externally-tagged enum (`rename_all = "snake_case"`), so
 /// the adapter-ownership tag is the JSON object key (e.g.
 /// `{"chat_reasoning": {"field": "reasoning_content", "bytes": [104,105]}}`)
-/// and the MessagePack variant name — NOT
+/// and the `MessagePack` variant name — NOT
 /// `#[serde(tag = "kind", content = "payload")]`: an internally/adjacently
-/// tagged layout would add nothing here, because named MessagePack (the
+/// tagged layout would add nothing here, because named `MessagePack` (the
 /// workspace wire format, see `frame.rs`) already encodes variants as
 /// `{"variant_name": payload}`, keeping the ownership tag as the object key
 /// just like the JSON shape.
@@ -340,12 +345,12 @@ pub enum ReasoningArtifact {
         field: ChatReasoningField,
         bytes: Vec<u8>,
     },
-    /// Anthropic: ordered thinking / redacted_thinking blocks, JSON as
+    /// Anthropic: ordered thinking / `redacted_thinking` blocks, JSON as
     /// received (signatures + redacted data intact, order preserved).
     AnthropicThinking(Vec<u8>),
     /// Gemini: encrypted thought signatures to send back.
     GoogleSignatures(Vec<u8>),
-    /// OpenAI/xAI Responses: opaque reasoning items (or encrypted_content).
+    /// OpenAI/xAI Responses: opaque reasoning items (or `encrypted_content`).
     ResponsesItems(Vec<u8>),
 }
 
@@ -402,6 +407,7 @@ impl SessionStatus {
     /// Returns `true` when the session is actively processing (inference,
     /// tool call, or retrying).  Returns `false` for idle states (inactive,
     /// sleeping).
+    #[must_use]
     pub fn is_active(&self) -> bool {
         matches!(
             self,
@@ -435,7 +441,7 @@ pub struct SessionSummary {
     /// Model context window size for this session, if known.
     #[serde(default)]
     pub context_window: Option<u32>,
-    /// The prompt_tokens from the most recent API response (the actual
+    /// The `prompt_tokens` from the most recent API response (the actual
     /// context size being sent to the model), if available.
     #[serde(default)]
     pub last_prompt_tokens: Option<u32>,
@@ -493,10 +499,10 @@ pub enum ClientMessage {
     /// X25519 private unlock key. This is the ONLY wire path that can create
     /// the binding: on an unbound keystore the daemon adopts the key (loud
     /// `KEYSTORE BOUND` log), runs the shared unlock tail (same code path as
-    /// AddCredential's implicit unlock), and replies
+    /// `AddCredential`'s implicit unlock), and replies
     /// [`DaemonMessage::Bound`]. On an ALREADY-bound keystore the key is
     /// verified against the binding — a mismatch is rejected with the usual
-    /// wrong-key semantics (no unlock, no overwrite). Unlock and AddCredential
+    /// wrong-key semantics (no unlock, no overwrite). Unlock and `AddCredential`
     /// are strictly VERIFY-ONLY and cannot create a binding.
     BindKeystore {
         key: Vec<u8>,
@@ -553,7 +559,7 @@ pub enum ClientMessage {
     Undo,
     Redo,
     /// Create a new turn with the text "Continue." and run the agent loop.
-    /// Semantically distinct from RunInput — the daemon controls the prompt text.
+    /// Semantically distinct from `RunInput` — the daemon controls the prompt text.
     ContinueGeneration {
         request_id: u32,
     },
@@ -637,11 +643,11 @@ pub enum SessionEvent {
         /// Model context window size for this session, if known.
         #[serde(default)]
         context_window: Option<u32>,
-        /// The prompt_tokens from the most recent API response (the actual
+        /// The `prompt_tokens` from the most recent API response (the actual
         /// context size being sent to the model), if available.
         #[serde(default)]
         last_prompt_tokens: Option<u32>,
-        /// Current session status (Inactive, Inference, ToolCall, etc.).
+        /// Current session status (`Inactive`, `Inference`, `ToolCall`, etc.).
         #[serde(default)]
         status: SessionStatus,
         #[serde(default)]
@@ -657,7 +663,7 @@ pub enum SessionEvent {
         status: SessionStatus,
         /// Unix-epoch-milliseconds timestamp of this status change, so the
         /// TUI can re-sort the sessions list (most recently modified first)
-        /// without waiting for a fresh ListSessions round-trip.
+        /// without waiting for a fresh `ListSessions` round-trip.
         last_modified: i64,
     },
     SessionFailed {
@@ -715,7 +721,7 @@ pub enum SessionEvent {
         request_id: u32,
         /// Token usage for the completed request, if reported by the provider.
         token_usage: Option<TokenUsage>,
-        /// The prompt_tokens from the most recent API response (the actual
+        /// The `prompt_tokens` from the most recent API response (the actual
         /// context size that was sent to the model), if available.
         #[serde(default)]
         last_prompt_tokens: Option<u32>,
@@ -832,7 +838,7 @@ pub enum DaemonMessage {
     /// client can key-record on this message knowing the broadcast cannot
     /// overtake it.
     Bound,
-    /// Error reply for Unlock / AddCredential / BindKeystore against a daemon
+    /// Error reply for `Unlock` / `AddCredential` / `BindKeystore` against a daemon
     /// whose keystore has NO binding yet. Deliberately distinct from
     /// [`DaemonMessage::LockedError`] (which means "bound but wrong key") so
     /// the client knows this daemon has never been bound and can AUTO-BIND it

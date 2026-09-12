@@ -144,7 +144,7 @@ impl Tool for LoadTools {
     fn schema(&self) -> serde_json::Value {
         // Build the schema by hand (rather than deriving it from schemars)
         // so the `groups` enum reflects the live registry group catalog.
-        groups_enum_schema(self.group_names(), "Tool groups to activate")
+        groups_enum_schema(&self.group_names(), "Tool groups to activate")
     }
 
     fn execute(
@@ -177,8 +177,8 @@ mod tests {
     use crate::tools::context::ToolContext;
     use std::sync::Arc;
 
-    /// Build a ToolContext with a mock daemon channel, plus the receiver so
-    /// tests can intercept the DaemonCommand and reply to it.
+    /// Build a `ToolContext` with a mock daemon channel, plus the receiver so
+    /// tests can intercept the `DaemonCommand` and reply to it.
     fn test_context() -> (
         ToolContext,
         std::sync::mpsc::Sender<DaemonCommand>,
@@ -192,8 +192,8 @@ mod tests {
         (ctx, daemon_tx, daemon_rx)
     }
 
-    /// Run execute_load_tools on a thread (it blocks waiting for the daemon's
-    /// reply), intercept the DaemonCommand on the main thread, send the reply,
+    /// Run `execute_load_tools` on a thread (it blocks waiting for the daemon's
+    /// reply), intercept the `DaemonCommand` on the main thread, send the reply,
     /// and join.  Deterministic — no time-based waits: the tool blocks on the
     /// reply channel until this test sends it.  Takes owned args because the
     /// spawned thread must own everything it touches (`'static` bound).

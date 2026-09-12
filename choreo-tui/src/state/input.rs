@@ -82,8 +82,7 @@ impl InputBuffer {
         }
         trimmed
             .rfind(|c: char| c.is_whitespace())
-            .map(|i| i + 1)
-            .unwrap_or(0)
+            .map_or(0, |i| i + 1)
     }
 
     fn word_right_boundary(&self) -> usize {
@@ -103,7 +102,7 @@ impl InputBuffer {
         while chars.peek().is_some_and(|&(_, c)| c.is_whitespace()) {
             chars.next();
         }
-        self.cursor + chars.next().map(|(pos, _)| pos).unwrap_or(s.len())
+        self.cursor + chars.next().map_or(s.len(), |(pos, _)| pos)
     }
 
     pub(crate) fn word_left(&mut self) {
@@ -277,7 +276,8 @@ impl InputBuffer {
     pub(crate) fn cursor_home_line(&mut self) {
         // Char-boundary invariant as in `cursor_left`.
         let prefix = self.text.get(..self.cursor).unwrap_or("");
-        self.cursor = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let last_newline = prefix.rfind('\n');
+        self.cursor = last_newline.map_or(0, |p| p + 1);
     }
 
     /// Move cursor to the end of the current logical line (at the `\n` or at text end).
@@ -330,10 +330,12 @@ impl InputBuffer {
             &mut self.lines_cache,
         );
         let (current_line, col) = find_cursor_pos(&self.text, self.cursor, lines);
+        // `current_line + 1 < lines.len()`: the next line exists; the u16
+        // conversion is bounded by the count this comparison checks.
+        #[allow(clippy::cast_possible_truncation)] // bounds checked against lines.len() as u16
         if current_line + 1 >= lines.len() as u16 {
             return;
         }
-        // `current_line + 1 < lines.len()`, so the next line exists.
         let Some(target) = lines.get(current_line as usize + 1) else {
             return;
         };
@@ -347,8 +349,9 @@ impl InputBuffer {
         self.cursor = target.start_byte + byte_off;
     }
 
-    /// Return the (visual_row, visual_col) of the cursor within wrapped text.
-    /// Both are 0-indexed.
+    /// Return the (`visual_row`, `visual_col`) of the cursor within wrapped text.
+    /// Both are 0-indexed. A cursor past the last visual line is reported at
+    /// the end of the last line (see [`find_cursor_pos`]).
     pub(crate) fn cursor_visual_pos(&mut self, max_width: usize) -> (u16, u16) {
         if max_width < 1 {
             return (0, 0);
@@ -368,6 +371,8 @@ impl InputBuffer {
     }
 
     /// True when the cursor is on the last visual line of the input.
+    // The u16 cast mirrors `cursor_down`'s comparison against `lines.len()`.
+    #[allow(clippy::cast_possible_truncation)] // bounds compared in the same expression
     pub(crate) fn is_on_last_visual_line(&mut self, max_width: usize) -> bool {
         if max_width < 1 {
             return true;
@@ -510,7 +515,9 @@ pub(crate) struct VisualLineInfo {
     pub(crate) display_width: usize,
 }
 
-/// Find the cursor's (visual_row, visual_col) within pre-computed visual lines.
+/// Find the cursor's (`visual_row`, `visual_col`) within pre-computed visual
+/// lines. A cursor past the last line is reported at the end of the last
+/// line.
 pub(crate) fn find_cursor_pos(text: &str, cursor: usize, lines: &[VisualLineInfo]) -> (u16, u16) {
     for (i, vl) in lines.iter().enumerate() {
         if cursor >= vl.start_byte && cursor <= vl.end_byte {
@@ -520,15 +527,21 @@ pub(crate) fn find_cursor_pos(text: &str, cursor: usize, lines: &[VisualLineInfo
                 .get(vl.start_byte..cursor.min(vl.end_byte))
                 .unwrap_or("");
             let col = UnicodeWidthStr::width(line_text);
+            // Row/col indexes are display positions well below u16::MAX for
+            // terminal-sized inputs; wrapping would only occur on absurdly
+            // tall/wide buffers, which the terminal cannot render anyway.
+            #[allow(clippy::cast_possible_truncation)]
+            // display coords fit u16 for terminal-sized input
             return (i as u16, col as u16);
         }
     }
     // Cursor past the last visual line — place at end.
-    let last = match lines.last() {
-        Some(vl) => vl,
-        None => return (0, 0),
+    let Some(last) = lines.last() else {
+        return (0, 0);
     };
     let col = UnicodeWidthStr::width(text.get(last.start_byte..last.end_byte).unwrap_or(""));
+    // Display coords fit u16 for terminal-sized input (see loop above).
+    #[allow(clippy::cast_possible_truncation)] // display coords fit u16 for terminal-sized input
     (lines.len().saturating_sub(1) as u16, col as u16)
 }
 

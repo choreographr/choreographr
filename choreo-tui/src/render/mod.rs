@@ -15,6 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 // The former monolithic render.rs was split into a render/ module.  This file
@@ -85,22 +86,24 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-/// Look up the fullscreen image by (turn_id, img_idx) and render it.
+/// Look up the fullscreen image by (`turn_id`, `img_idx`) and render it.
 pub(crate) fn render_fullscreen_only(frame: &mut Frame<'_>, app: &mut App) -> bool {
     let Some((session_id, turn_id, img_idx)) = app.fullscreen_image_target else {
         return false;
     };
-    if !app
+    // De Morgan: the guard reads clearer as a single negation of "there is a
+    // rendered image for this turn OR the turn still has displayable images".
+    let has_image = app
         .rendered_images
         .get(&session_id)
         .is_some_and(|m| m.contains_key(&turn_id))
-        && !app
+        || app
             .display_for(session_id)
             .view
             .turns
             .get(&turn_id)
-            .is_some_and(|t| !t.displayed_images.is_empty())
-    {
+            .is_some_and(|t| !t.displayed_images.is_empty());
+    if !has_image {
         app.fullscreen_image_target = None;
         return false;
     }
@@ -343,7 +346,12 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     // Clamp to visible area so the cursor is always inside the box,
     // even when scroll_offset hasn't been adjusted yet (e.g. after
     // loading a long history entry that ends at scroll_offset = 0).
+    // Both casts are safe: `visible_count` is bounded by the input box
+    // height (a `u16` area dimension), and `offset <= vrow`, which is itself
+    // a `u16` cursor row.
+    #[allow(clippy::cast_possible_truncation)]
     let max_display_row = (visible_count as u16).saturating_sub(1);
+    #[allow(clippy::cast_possible_truncation)]
     let display_vrow = vrow.saturating_sub(offset as u16).min(max_display_row);
     let cursor_x = input_area.x.saturating_add(INPUT_PAD).saturating_add(vcol);
     let cursor_y = input_area.y.saturating_add(1).saturating_add(display_vrow);
@@ -406,7 +414,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             ) {
                 (Some(limit), Some(current)) => {
                     let ratio = if limit > 0 {
-                        current as f64 / limit as f64
+                        f64::from(current) / f64::from(limit)
                     } else {
                         0.0
                     };
@@ -492,9 +500,8 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     // Clone visible turn IDs upfront to avoid borrow conflicts when
     // accessing display state via app.display_for inside the loop.
-    let session_id = match app.active_session_id {
-        Some(sid) => sid,
-        None => return,
+    let Some(session_id) = app.active_session_id else {
+        return;
     };
     let visible_turn_ids: Vec<u32> = app.display_for(session_id).visible_turn_ids.clone();
     let len = visible_turn_ids.len();
@@ -533,11 +540,10 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             // path free of string scanning; the trim-based derivation is only
             // a defensive fallback for a missing layout.
             let reasoning_expanded = {
-                let default = display
-                    .turn_layouts
-                    .get(i)
-                    .map(|l| l.reasoning_default_expanded)
-                    .unwrap_or_else(|| reasoning_expanded_default(turn));
+                let default = display.turn_layouts.get(i).map_or_else(
+                    || reasoning_expanded_default(turn),
+                    |l| l.reasoning_default_expanded,
+                );
                 display.effective_reasoning_expanded(turn_id, default)
             };
             // Effective per-result collapse state (aligned with
@@ -589,6 +595,9 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 &mut y,
             ) {
                 let fully_visible = visible_height >= full_img_height;
+                // `visible_height` is clamped to the viewport height (a `u16`
+                // area dimension), so the cast never truncates.
+                #[allow(clippy::cast_possible_truncation)]
                 let img_rect = Rect {
                     x: area.x,
                     y,
@@ -686,7 +695,11 @@ fn clipped_area(
     let bottom_line = full_height.saturating_sub(*rows_to_skip);
     let top_line = bottom_line.saturating_sub(visible_height);
 
-    *y = (*y).saturating_sub(visible_height as u16);
+    // `visible_height` is clamped to `rows_remaining`, which starts at the
+    // viewport height (a `u16`), so the cast never truncates.
+    #[allow(clippy::cast_possible_truncation)]
+    let new_y = (*y).saturating_sub(visible_height as u16);
+    *y = new_y;
     *rows_remaining -= visible_height;
     *rows_to_skip = 0;
 
@@ -705,11 +718,15 @@ fn render_text_block(
     y: &mut u16,
     paragraph_style: Style,
 ) {
+    // `visible_height` comes from `clipped_area`, which clamps it to the
+    // viewport height (a `u16`), so the cast never truncates.
+    #[allow(clippy::cast_possible_truncation)]
+    let height = visible_height as u16;
     let rect = Rect {
         x: area.x,
         y: *y,
         width: area.width,
-        height: visible_height as u16,
+        height,
     };
 
     frame.render_widget(
@@ -739,53 +756,50 @@ fn render_turn_image(
     let inline_size = Size::new(area.width, app.image_block_height());
 
     // Extract data we need while the borrow is active.
-    let (needs_job, data, meta) = match app
+    let (needs_job, data, meta) = if let Some(img) = app
         .rendered_images
         .get_mut(&session_id)
         .and_then(|imgs| imgs.get_mut(&turn_id))
         .and_then(|images| images.get_mut(&img_idx))
     {
-        Some(img) => {
-            if let Some(protocol) = img.protocols.get_mut(&inline_size) {
-                let title = format!(
-                    "image {} ({} {}x{})",
-                    turn_id, img.metadata.mime_type, img.metadata.width, img.metadata.height,
-                );
-                let block = Block::default().title(title);
-                let inner = block.inner(area);
-                frame.render_widget(block, area);
-                if fully_visible {
-                    // Center the image within the block using the protocol's actual
-                    // rendered dimensions, preventing visual reflow when only part
-                    // of the block is visible.
-                    let rendered_at = protocol.size_for(crate::IMAGE_RESIZE, inline_size);
-                    let centered = Rect {
-                        x: inner.x + (inner.width.saturating_sub(rendered_at.width)) / 2,
-                        y: inner.y + (inner.height.saturating_sub(rendered_at.height)) / 2,
-                        width: rendered_at.width.min(inner.width),
-                        height: rendered_at.height.min(inner.height),
-                    };
-                    frame.render_stateful_widget(
-                        StatefulImage::new().resize(crate::IMAGE_RESIZE),
-                        centered,
-                        protocol,
-                    );
-                }
-                return;
-            }
-            (
-                img.pending_job.is_none()
-                    && !img.failed_sizes.contains(&inline_size)
-                    && !img.protocols.contains_key(&inline_size),
-                img.data.clone(),
-                img.metadata.clone(),
-            )
-        }
-        None => {
-            let block = Block::default().title(format!("image {turn_id}[{img_idx}] (pending)"));
+        if let Some(protocol) = img.protocols.get_mut(&inline_size) {
+            let title = format!(
+                "image {} ({} {}x{})",
+                turn_id, img.metadata.mime_type, img.metadata.width, img.metadata.height,
+            );
+            let block = Block::default().title(title);
+            let inner = block.inner(area);
             frame.render_widget(block, area);
+            if fully_visible {
+                // Center the image within the block using the protocol's actual
+                // rendered dimensions, preventing visual reflow when only part
+                // of the block is visible.
+                let rendered_at = protocol.size_for(crate::IMAGE_RESIZE, inline_size);
+                let centered = Rect {
+                    x: inner.x + (inner.width.saturating_sub(rendered_at.width)) / 2,
+                    y: inner.y + (inner.height.saturating_sub(rendered_at.height)) / 2,
+                    width: rendered_at.width.min(inner.width),
+                    height: rendered_at.height.min(inner.height),
+                };
+                frame.render_stateful_widget(
+                    StatefulImage::new().resize(crate::IMAGE_RESIZE),
+                    centered,
+                    protocol,
+                );
+            }
             return;
         }
+        (
+            img.pending_job.is_none()
+                && !img.failed_sizes.contains(&inline_size)
+                && !img.protocols.contains_key(&inline_size),
+            img.data.clone(),
+            img.metadata.clone(),
+        )
+    } else {
+        let block = Block::default().title(format!("image {turn_id}[{img_idx}] (pending)"));
+        frame.render_widget(block, area);
+        return;
     };
 
     if needs_job {
@@ -817,15 +831,14 @@ fn render_turn_image(
 /// - this calendar year → "Mar 5"
 /// - older → "Mar 5 2024"
 pub(crate) fn format_timestamp(ts_ms: i64) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+
     if ts_ms <= 0 {
         return "-".to_string();
     }
 
-    use chrono::{Datelike, Local, TimeZone};
-
-    let dt = match Local.timestamp_millis_opt(ts_ms) {
-        chrono::LocalResult::Single(dt) => dt,
-        _ => return "-".to_string(),
+    let chrono::LocalResult::Single(dt) = Local.timestamp_millis_opt(ts_ms) else {
+        return "-".to_string();
     };
 
     let now = Local::now();
@@ -845,6 +858,9 @@ fn set_input_cursor(
     prefix_width: u16,
     text_before_cursor: &str,
 ) {
+    // Cursor columns beyond `u16::MAX` cannot be addressed by any terminal
+    // (ratatui positions are `u16`), so the cast is harmless in practice.
+    #[allow(clippy::cast_possible_truncation)]
     let x = area.x + prefix_width + display_width(text_before_cursor) as u16;
     let y = area.y + line;
     frame.set_cursor_position((x, y));
@@ -880,7 +896,7 @@ pub(crate) fn format_status(status: &SessionStatus) -> String {
 /// Both counters pass through humfmt's compact number formatter so the
 /// readout stays consistent with the context-window fill rendered beside it
 /// (which already uses `humfmt::number`/`humfmt::percent`): small sessions
-/// (< 1_000 tokens) render verbatim, large ones get K/M suffixes.
+/// (< `1_000` tokens) render verbatim, large ones get K/M suffixes.
 pub(crate) fn status_token_readout(usage: &TokenUsage) -> String {
     format!(
         "↑{} ↓{}",
@@ -905,10 +921,9 @@ pub(crate) fn session_detail_tokens_line(usage: &TokenUsage) -> String {
     // Cached prompt tokens are a subset of the input count; annotate only
     // when the provider actually reported them so the common case is unchanged.
     if usage.cached_tokens > 0 {
-        line.push_str(&format!(
-            " ({} cached)",
-            humfmt::number(usage.cached_tokens)
-        ));
+        // `String`'s `fmt::Write` impl is infallible; the `Result` is
+        // discarded on purpose (write! to a String can never fail).
+        let _ = write!(line, " ({} cached)", humfmt::number(usage.cached_tokens));
     }
     line
 }

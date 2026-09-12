@@ -10,7 +10,7 @@ use crate::daemon::DaemonCommand;
 ///
 /// Carries the session ID, database handle, a channel to the daemon
 /// command loop, and parent session config so tools (especially
-/// spawn_subsession) can create child sessions with inherited settings.
+/// `spawn_subsession`) can create child sessions with inherited settings.
 #[derive(Clone)]
 pub struct ToolContext {
     /// The session that initiated this tool call.
@@ -25,7 +25,7 @@ pub struct ToolContext {
     pub reasoning_effort: Option<String>,
     /// Model selected for the parent session (inherited by sub-sessions).
     pub selected_model: Option<String>,
-    /// Working directory for the parent session (used as fallback working_dir).
+    /// Working directory for the parent session (used as fallback `working_dir`).
     pub working_dir: Option<PathBuf>,
     /// Cancellation flag: set to `true` when the parent session is cancelled.
     /// Tools that block indefinitely (e.g. `spawn_subsession`) should poll this
@@ -47,6 +47,7 @@ impl ToolContext {
     /// session ID, database, and daemon channel are needed.
     /// New config fields (`active_tool_groups`, `reasoning_effort`, `selected_model`, `working_dir`, `account_name`)
     /// default to empty/None.
+    #[must_use]
     pub fn new(
         session_id: u64,
         db: Arc<redb::Database>,

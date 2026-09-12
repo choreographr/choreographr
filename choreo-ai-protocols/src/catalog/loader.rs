@@ -30,6 +30,7 @@ use super::{ProviderEntry, merge_overlay};
 /// re-merges the *current* base with the bundled layer plus a user overlay
 /// on every catalog swap — the daemon needs the source to re-apply it, it
 /// cannot reuse the merged result.
+#[must_use]
 pub fn bundled_overlay_src() -> &'static str {
     include_str!("../../catalog/models-overlay.toml")
 }

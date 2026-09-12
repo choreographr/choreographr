@@ -1,5 +1,6 @@
 use super::error::ToolExecError;
 use super::sanitize::sanitize_content;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 
@@ -76,15 +77,12 @@ pub(crate) fn read_line_capped<R: BufRead>(
             // `take <= available.len()`, so all ranges below are in bounds;
             // the get() fallbacks are unreachable.
             let window = available.get(..take).unwrap_or(available);
-            match window.iter().position(|&b| b == b'\n') {
-                Some(idx) => {
-                    buf.extend_from_slice(available.get(..=idx).unwrap_or(available));
-                    (idx + 1, true)
-                }
-                None => {
-                    buf.extend_from_slice(window);
-                    (take, false)
-                }
+            if let Some(idx) = window.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(available.get(..=idx).unwrap_or(available));
+                (idx + 1, true)
+            } else {
+                buf.extend_from_slice(window);
+                (take, false)
             }
         };
         reader.consume(consumed);
@@ -333,7 +331,7 @@ pub(crate) fn render_streamed_line(
     let display = sanitize_content(display);
     let mut display_line = String::new();
     if numbered {
-        display_line.push_str(&format!("{} | {display}", line.line_number));
+        let _ = write!(display_line, "{} | {display}", line.line_number);
     } else {
         display_line.push_str(&display);
     }

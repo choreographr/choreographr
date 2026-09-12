@@ -13,6 +13,7 @@ pub const SOCKET_PATH_ENV: &str = "CHOREOGRAPHR_SOCKET_PATH";
 /// the app's writable prefix tmp dir, which is the difference between the
 /// daemon and TUI working at all and dying with a context-free
 /// "Permission denied (os error 13)" on a hardcoded `/tmp`.
+#[must_use]
 pub fn default_socket_path() -> String {
     std::env::temp_dir()
         .join("choreographr.sock")
@@ -20,6 +21,8 @@ pub fn default_socket_path() -> String {
         .into_owned()
 }
 
+/// Returns the configured socket path, honoring `CHOREOGRAPHR_SOCKET_PATH`.
+#[must_use]
 pub fn socket_path() -> String {
     socket_path_impl(|| std::env::var(SOCKET_PATH_ENV).ok())
 }
@@ -28,6 +31,12 @@ pub(crate) fn socket_path_impl(get_env: impl Fn() -> Option<String>) -> String {
     get_env().unwrap_or_else(default_socket_path)
 }
 
+/// Encode `message` and write the framed payload to `writer`.
+///
+/// # Errors
+///
+/// Fails with `ProtoError` when serialization fails or the underlying writer
+/// rejects the frame bytes.
 pub fn write_message<W, T>(writer: &mut W, message: &T) -> Result<(), ProtoError>
 where
     W: Write,
@@ -38,6 +47,12 @@ where
     Ok(())
 }
 
+/// Read one length-prefixed frame from `reader` and deserialize it as `T`.
+///
+/// # Errors
+///
+/// Fails with `ProtoError` when the frame exceeds [`MAX_FRAME_SIZE`] or the
+/// payload fails to deserialize into `T`.
 pub fn read_message<R, T>(reader: &mut R) -> Result<T, ProtoError>
 where
     R: Read,
@@ -47,6 +62,12 @@ where
     decode_frame(&payload)
 }
 
+/// Read a single length-prefixed frame's raw payload bytes.
+///
+/// # Errors
+///
+/// Fails with `ProtoError` when the length header declares a payload larger
+/// than [`MAX_FRAME_SIZE`] (`FrameTooLarge`), or when I/O on `reader` fails.
 pub fn read_payload<R>(reader: &mut R) -> Result<Vec<u8>, ProtoError>
 where
     R: Read,

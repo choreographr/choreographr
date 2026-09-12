@@ -162,7 +162,7 @@ mod tests {
     use crate::tools::context::ToolContext;
     use std::sync::Arc;
 
-    /// Build a ToolContext with a mock daemon channel.
+    /// Build a `ToolContext` with a mock daemon channel.
     /// Returns (context, sender, receiver) so the test can keep the
     /// receiver alive and verify messages.
     ///
@@ -183,25 +183,31 @@ mod tests {
         (ctx, daemon_tx, daemon_rx)
     }
 
-    /// Run execute_set_working_dir on a thread (it blocks waiting for the
-    /// daemon's reply), intercept the DaemonCommand on the main thread, send
+    /// Run `execute_set_working_dir` on a thread (it blocks waiting for the
+    /// daemon's reply), intercept the `DaemonCommand` on the main thread, send
     /// the reply, and join.  Deterministic — no time-based waits: the tool
     /// blocks on the reply channel until this test sends it.  Takes owned
     /// args because the spawned thread must own everything it touches
     /// (`'static` bound).
     fn run_with_daemon_reply(
-        args: SetWorkingDirArgs,
-        working_dir: Option<PathBuf>,
-        reply: Result<String, String>,
+        args: &SetWorkingDirArgs,
+        working_dir: Option<&Path>,
+        reply: &Result<String, String>,
     ) -> (Result<SetWorkingDirResult, ToolExecError>, DaemonCommand) {
         let (ctx, _daemon_tx, daemon_rx) = test_context();
-        let wd = working_dir.clone();
-        let handle =
-            std::thread::spawn(move || execute_set_working_dir(&args, wd.as_deref(), Some(&ctx)));
+        let wd = working_dir.map(std::path::Path::to_path_buf);
+        // The spawned thread needs owned data (`'static`); the test fn borrows.
+        // `SetWorkingDirArgs` is not `Clone`; rebuild the owned copy manually.
+        let owned_args = SetWorkingDirArgs {
+            path: args.path.clone(),
+        };
+        let handle = std::thread::spawn(move || {
+            execute_set_working_dir(&owned_args, wd.as_deref(), Some(&ctx))
+        });
         let cmd = daemon_rx.recv().unwrap();
         match &cmd {
             DaemonCommand::SetWorkingDir { reply: tx, .. } => {
-                tx.send(reply).unwrap();
+                tx.send(reply.clone()).unwrap();
             }
             other => panic!(
                 "expected SetWorkingDir, got {:?}",
@@ -220,7 +226,7 @@ mod tests {
         let path = canonical.to_string_lossy().into_owned();
         let args = SetWorkingDirArgs { path: path.clone() };
 
-        let (result, cmd) = run_with_daemon_reply(args, None, Ok(path.clone()));
+        let (result, cmd) = run_with_daemon_reply(&args, None, &Ok(path.clone()));
         assert!(result.is_ok(), "expected ok: {:?}", result.err());
         assert_eq!(result.unwrap().path, path);
 
@@ -246,9 +252,9 @@ mod tests {
         let args = SetWorkingDirArgs { path: "sub".into() };
 
         let (result, _cmd) = run_with_daemon_reply(
-            args,
-            Some(dir.path().to_path_buf()),
-            Ok(sub.to_string_lossy().into_owned()),
+            &args,
+            Some(dir.path()),
+            &Ok(sub.to_string_lossy().into_owned()),
         );
         assert!(result.is_ok(), "expected ok: {:?}", result.err());
         assert_eq!(
@@ -265,7 +271,7 @@ mod tests {
         let args = SetWorkingDirArgs { path: "~".into() };
 
         let (result, _cmd) =
-            run_with_daemon_reply(args, None, Ok(home.to_string_lossy().into_owned()));
+            run_with_daemon_reply(&args, None, &Ok(home.to_string_lossy().into_owned()));
         assert!(result.is_ok(), "expected ok: {:?}", result.err());
         assert_eq!(result.unwrap().path, home.to_string_lossy());
     }
@@ -276,7 +282,8 @@ mod tests {
         let path = dir.path().to_string_lossy().into_owned();
         let args = SetWorkingDirArgs { path };
 
-        let (result, _cmd) = run_with_daemon_reply(args, None, Err("session is not active".into()));
+        let (result, _cmd) =
+            run_with_daemon_reply(&args, None, &Err("session is not active".into()));
         assert!(result.is_err());
         assert!(
             result

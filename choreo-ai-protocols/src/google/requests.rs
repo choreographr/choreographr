@@ -28,7 +28,7 @@ pub(super) fn list_models_request(
     api_key: &str,
 ) -> Result<Vec<String>, GoogleError> {
     let base = config.base_url.trim_end_matches('/');
-    let url = format!("{}/models", base);
+    let url = format!("{base}/models");
     let retry_cfg = retry::RetryConfig::new(
         config.retry_max_attempts,
         config.retry_initial_backoff_ms,
@@ -90,7 +90,7 @@ pub(super) fn generate_content_request(
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<ChatTurnResult, GoogleError> {
-    let url = model_url(&config.base_url, model, GENERATE_CONTENT)?;
+    let url = model_url(&config.base_url, model, GENERATE_CONTENT);
     let retry_cfg = retry::RetryConfig::new(
         config.retry_max_attempts,
         config.retry_initial_backoff_ms,
@@ -165,7 +165,7 @@ pub(super) fn generate_content_request_streaming<F>(
 where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
-    let url = model_url(&config.base_url, model, STREAM_GENERATE_CONTENT)?;
+    let url = model_url(&config.base_url, model, STREAM_GENERATE_CONTENT);
     let retry_cfg = retry::RetryConfig::new(
         config.retry_max_attempts,
         config.retry_initial_backoff_ms,
@@ -333,22 +333,22 @@ pub(super) fn handle_stream_part(
 ) -> Result<Option<StreamEvent>, GoogleError> {
     match part {
         ClassifiedPart::Answer(text) => {
-            if !text.is_empty() {
+            if text.is_empty() {
+                Ok(None)
+            } else {
                 *has_any_output = true;
                 full_text.push_str(&text);
                 Ok(Some(StreamEvent::Answer(text)))
-            } else {
-                Ok(None)
             }
         }
         ClassifiedPart::Reasoning { text, signature } => {
             capture_signature(signatures, signature);
-            if !text.is_empty() {
+            if text.is_empty() {
+                Ok(None)
+            } else {
                 *has_any_output = true;
                 full_reasoning.push_str(&text);
                 Ok(Some(StreamEvent::Reasoning(text)))
-            } else {
-                Ok(None)
             }
         }
         ClassifiedPart::ToolCall {
@@ -363,7 +363,7 @@ pub(super) fn handle_stream_part(
                     "too many tool calls (max {MAX_TOOL_CALLS})"
                 ))));
             }
-            let id = format!("fc_{}", name);
+            let id = format!("fc_{name}");
             let args_json = args.to_string();
             trace!(
                 tool_name = %name,
@@ -381,7 +381,7 @@ pub(super) fn handle_stream_part(
     }
 }
 
-/// Map an HTTP status code and detail string to a GoogleError.
+/// Map an HTTP status code and detail string to a `GoogleError`.
 fn status_to_google_error(status: u16, detail: &str) -> GoogleError {
     match status {
         400 | 401 | 403 => GoogleError::Unauthorized {
@@ -482,7 +482,7 @@ impl GeminiSseReader {
         while let Some(line_end) = self.pending.iter().position(|&b| b == b'\n') {
             let mut line: Vec<u8> = self.pending.drain(..=line_end).collect();
             // Strip trailing newline/carriage-return.
-            while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
+            while matches!(line.last(), Some(b'\n' | b'\r')) {
                 line.pop();
             }
 

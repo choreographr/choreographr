@@ -158,7 +158,7 @@ pub(crate) struct ResponseContentPart {
 /// For regular function tools all fields are used; for the
 /// `programmatic_tool_calling` hosted tool only `type` is needed — the
 /// empty name/description/parameters are omitted via `skip_serializing_if`
-/// so the wire format matches the OpenAI spec (just `{"type":"programmatic_tool_calling"}`).
+/// so the wire format matches the `OpenAI` spec (just `{"type":"programmatic_tool_calling"}`).
 /// See <https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>
 #[derive(Debug, Serialize)]
 pub(crate) struct ResponsesTool {
@@ -182,8 +182,8 @@ impl From<&ChatToolDefinition> for ResponsesTool {
     fn from(tool: &ChatToolDefinition) -> Self {
         Self {
             kind: "function".to_string(),
-            name: tool.function.name.to_string(),
-            description: tool.function.description.to_string(),
+            name: tool.function.name.clone(),
+            description: tool.function.description.clone(),
             parameters: tool.function.parameters.clone(),
             strict: false,
             output_schema: tool.function.output_schema.clone(),
@@ -584,7 +584,7 @@ pub(crate) fn responses_request_with_tools(
 /// Build the opaque `ResponsesItems` artifact from the collected reasoning
 /// output items, or `None` when nothing was captured. The payload is the
 /// JSON serialization of the items exactly as received (type tag, id,
-/// summary and — in stateless mode — encrypted_content).
+/// summary and — in stateless mode — `encrypted_content`).
 fn responses_items_artifact(
     items: &[serde_json::Value],
 ) -> Result<Option<ReasoningArtifact>, super::OpenAiError> {
@@ -796,7 +796,7 @@ fn responses_response_to_turn(
 
 // ── Responses tool call accumulator ──────────────────────────────────────
 
-/// Accumulator for Responses API tool call arguments keyed by call_id.
+/// Accumulator for Responses API tool call arguments keyed by `call_id`.
 /// Used in `responses_request_streaming_with_tools` to merge delta chunks.
 ///
 /// # Delta-vs-Done semantics
@@ -809,7 +809,7 @@ fn responses_response_to_turn(
 ///   When received, `arguments` is **replaced** (not appended), overwriting
 ///   any partial accumulation from prior delta events.
 ///
-/// This matches the OpenAI spec: the done event carries the full final
+/// This matches the `OpenAI` spec: the done event carries the full final
 /// arguments JSON, while delta events carry incremental fragments.
 struct AccCall {
     name: Option<String>,
@@ -1937,7 +1937,7 @@ mod tests {
     #[test]
     fn responses_response_deserializes_empty_output() {
         let result: ResponsesResponse = serde_json::from_str(r#"{"output": []}"#).unwrap();
-        assert!(result.output.is_empty());
+        assert_eq!(result.output, [] as [serde_json::Value; 0]);
         assert!(result.id.is_none());
         assert!(result.status.is_none());
         assert!(result.usage.is_none());

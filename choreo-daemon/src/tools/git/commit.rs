@@ -13,6 +13,12 @@ pub struct GitCommitArgs {
     pub allow_empty: Option<bool>,
 }
 
+/// Create a Git commit from the current index.
+///
+/// # Errors
+///
+/// Returns Err if the repository cannot be opened, the message is empty,
+/// the index is empty without `allow_empty`, or the commit fails.
 pub fn execute_git_commit_tool(
     args: &GitCommitArgs,
     working_dir: Option<&std::path::Path>,
@@ -47,7 +53,7 @@ fn git_commit_impl(
         return Err(ToolError::Other("no staged changes to commit".to_string()));
     }
     let tree_id = write_tree_from_index(&repo, &index)?;
-    let parents = current_head_parents(&repo)?;
+    let parents = current_head_parents(&repo);
 
     repo.commit("HEAD", message, tree_id, parents)
         .map_err(io::Error::other)?;
@@ -95,15 +101,17 @@ fn write_tree_from_index(
     }
     editor
         .write()
-        .map(|id| id.detach())
+        .map(gix::Id::detach)
         .map_err(io::Error::other)
         .map_err(ToolError::from)
 }
 
-fn current_head_parents(repo: &gix::Repository) -> Result<Vec<ObjectId>, ToolError> {
+fn current_head_parents(repo: &gix::Repository) -> Vec<ObjectId> {
+    // A missing/ unborn HEAD simply means no parents (root commit), which is
+    // not an error condition — return the (possibly empty) vec directly.
     match repo.head_id() {
-        Ok(head) => Ok(vec![head.detach()]),
-        Err(_) => Ok(Vec::new()),
+        Ok(head) => vec![head.detach()],
+        Err(_) => Vec::new(),
     }
 }
 

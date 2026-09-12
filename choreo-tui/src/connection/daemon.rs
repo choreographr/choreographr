@@ -5,6 +5,10 @@ use choreo_client_core::{ClientError, dispatch_daemon_message, record_unlock_key
 use choreo_proto::{ClientMessage, DaemonMessage, RefreshStatus, SessionEvent};
 use zeroize::Zeroize;
 
+// Owned-message call sites live in test files outside connection/, so the
+// by-value signature is kept and the lint silenced at function level (param
+// attributes are not honoured for this lint).
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn handle_daemon_message(
     message: DaemonMessage,
     app: &mut App,
@@ -225,7 +229,9 @@ pub(crate) fn handle_daemon_message(
                     {
                         display.last_prompt_tokens = Some(*tokens);
                     }
-                    display.working_dir = working_dir.clone();
+                    // Reuse the allocation: `working_dir` is only borrowed
+                    // from the message here.
+                    display.working_dir.clone_from(working_dir);
                     display.progress_dirty = true;
                 }
                 app.attached_status = Some(status.clone());
@@ -720,7 +726,7 @@ pub(crate) fn handle_daemon_message(
 /// `AddCredential`, or (auto-) `BindKeystore` is SENT (see `run_app`'s
 /// auto-unlock, the chat/credential handlers, and the `KeystoreUnbound` arm).
 /// A daemon that accepts the key replies `Unlocked` / `CredentialAdded` /
-/// `Bound` — and only then do we persist it into the daemon's known_servers
+/// `Bound` — and only then do we persist it into the daemon's `known_servers`
 /// entry — the TOFU core of the per-daemon keystore design: a key the daemon
 /// REJECTS (misbound keystore) is never recorded.
 fn record_confirmed_unlock_key(app: &mut App) {
@@ -740,10 +746,10 @@ fn record_confirmed_unlock_key(app: &mut App) {
     }
 }
 
-/// The daemon REJECTED the pending unlock key (an Unlock or AddCredential
+/// The daemon REJECTED the pending unlock key (an `Unlock` or `AddCredential`
 /// failure). Drop the in-flight key — zeroized, since it is secret material —
 /// so a later, unrelated confirmation cannot attribute it. Deliberately does
-/// NOT delete the known_servers record: see the survivor-semantics rationale
+/// NOT delete the `known_servers` record: see the survivor-semantics rationale
 /// in `choreo-client-core` (`resolve_keystore_key`) — the stored key may be a
 /// valid confirmed key (the daemon reports transient failures through the
 /// same error), and manual re-pair (`remove(addr)`) is the recovery path for

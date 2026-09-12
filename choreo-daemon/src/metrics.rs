@@ -2,7 +2,7 @@
 //!
 //! Compiled only when the `metrics` cargo feature is enabled (off by default;
 //! build with `--features metrics` to opt in — plain builds drop the
-//! prometheus and tiny_http dependencies entirely). The public API is
+//! prometheus and `tiny_http` dependencies entirely). The public API is
 //! identical in both configurations — with the feature off, every function is
 //! an inert no-op stub — so the daemon's ~20 instrumentation call sites
 //! compile unchanged and can never drift apart from the real signatures. This
@@ -421,6 +421,10 @@ mod backend {
     use std::sync::atomic::AtomicBool;
 
     /// No-op: metrics support is compiled out, so there is nothing to register.
+    ///
+    /// # Errors
+    ///
+    /// Always returns Ok; this stub never fails.
     pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -451,6 +455,10 @@ mod backend {
 
     /// No-op: the daemon refuses `--metrics-addr` at startup when the feature
     /// is off, so this should never run — warn loudly if something calls it.
+    ///
+    /// # Errors
+    ///
+    /// Always returns Ok; this stub never binds anything and never fails.
     pub fn serve_metrics(_addr: SocketAddr, _shutdown: Arc<AtomicBool>) {
         tracing::warn!("metrics support is compiled out — /metrics server not started");
     }

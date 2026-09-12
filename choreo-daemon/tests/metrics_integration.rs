@@ -17,7 +17,7 @@ use std::time::Duration;
 /// Start a metrics server on a known port, scrape `/metrics`, and verify
 /// that the response contains the expected OpenMetrics format.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn metrics_server_serves_openmetrics_format() {
     let addr: std::net::SocketAddr = "127.0.0.1:19464".parse().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));

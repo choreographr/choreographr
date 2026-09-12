@@ -68,7 +68,7 @@ impl GoogleConfig {
     /// types. `None` fields leave the provider default in place.
     pub fn apply_overrides(&mut self, overrides: &ProviderOverrides) {
         if let Some(base_url) = &overrides.base_url {
-            self.base_url = base_url.clone();
+            self.base_url.clone_from(base_url);
         }
         if let Some(streaming) = overrides.streaming {
             self.streaming = streaming;
@@ -123,6 +123,12 @@ impl std::fmt::Debug for GoogleClient {
 }
 
 impl GoogleClient {
+    /// Create the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` if the shared HTTP agent cannot be built from the
+    /// registry/timeouts.
     pub fn new(
         config: GoogleConfig,
         api_key: String,
@@ -144,10 +150,12 @@ impl GoogleClient {
         })
     }
 
+    #[must_use]
     pub fn config(&self) -> &GoogleConfig {
         &self.config
     }
 
+    #[must_use]
     pub fn api_key(&self) -> &str {
         // `Zeroizing<String>` derefs to `String`, so `as_str()` works directly.
         self.api_key.as_str()
@@ -155,15 +163,29 @@ impl GoogleClient {
 
     /// List available models from the API, falling back to the curated static list
     /// if the endpoint is unreachable or the API key lacks permission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GoogleError`] if the HTTP request fails from a source the
+    /// static fallback cannot cover, or the response cannot be decoded.
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, GoogleError> {
-        crate::shared::list_models_with_fallback(
+        Ok(crate::shared::list_models_with_fallback(
             || requests::list_models_request(&self.http, &self.config, &self.api_key),
             KNOWN_GEMINI_MODELS,
             "Google",
-        )
+        ))
     }
 
     /// Non-streaming chat completion turn via the Gemini generateContent API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GoogleError`] on HTTP, provider, decoding, cancellation,
+    /// or retry-callback failures.
+    // TEMP(`needless_pass_by_value`): the body moves `params`' borrowed
+    // parts straight into `generate_content_request`; taking a reference
+    // would ripple through every caller across the daemon and tests.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn chat_completion_turn(
         &self,
         params: ChatTurnRequest<'_>,
@@ -183,6 +205,12 @@ impl GoogleClient {
     }
 
     /// Streaming chat completion turn via the Gemini streamGenerateContent API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GoogleError`] on HTTP, provider, decoding, cancellation, or
+    /// event-callback failures.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn chat_completion_turn_streaming<F>(
         &self,
         params: ChatTurnRequest<'_>,
@@ -219,7 +247,7 @@ use crate::ProviderClient;
 use choreo_proto::InferenceError;
 
 impl ProviderClient for GoogleClient {
-    fn provider_slug(&self) -> &str {
+    fn provider_slug(&self) -> &'static str {
         "google"
     }
 
@@ -533,12 +561,12 @@ pub(crate) struct GeminiErrorDetail {
 }
 
 /// Gemini uses the REST pattern `models/{model}:{action}` rather than a path-segment
-/// approach like OpenAI.  We append the action as a colon-delimited suffix to keep
+/// approach like `OpenAI`.  We append the action as a colon-delimited suffix to keep
 /// the endpoint self-describing for different capabilities (generateContent vs
 /// streamGenerateContent).
-fn model_url(base_url: &str, model: &str, action: &str) -> io::Result<String> {
+fn model_url(base_url: &str, model: &str, action: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    Ok(format!("{}/models/{}:{}", base, model, action))
+    format!("{base}/models/{model}:{action}")
 }
 
 /// Attach the captured thought signatures from the round-trip artifact to the
@@ -591,24 +619,26 @@ fn attach_thought_signatures(
 /// Convert a list of messages into Gemini contents format.
 ///
 /// System messages are collected into the `system_instruction` field and are
-/// NOT added to `contents` because Gemini (unlike OpenAI) uses a separate
+/// NOT added to `contents` because Gemini (unlike `OpenAI`) uses a separate
 /// top-level field for system instructions, and putting them in contents would
 /// cause a rejection.
 /// Build a Gemini `inline_data` part from a vision image part, or `None` for
 /// an unsupported MIME type (the caller keeps the text it already emitted).
 /// Gemini's `inline_data` is the user-role image carrier; `data` is the
 /// base64 payload (owned), `mime_type` borrows from the message.
-fn google_inline_image<'a>(image: &'a ChatImagePart) -> Option<PartPayload<'a>> {
+fn google_inline_image(image: &ChatImagePart) -> Option<PartPayload<'_>> {
     // Gemini accepts PNG/JPEG/WEBP/GIF/HEIC/HEIF inline. The allowlist below is
     // a superset of what the daemon's `image_prep` normalization can produce
     // (it only ever re-encodes to PNG or JPEG, never WEBP), kept permissive so
     // GIF/WEBP could pass through should they ever arrive, while still
     // rejecting unsupported blobs before they reach the provider.
     const SUPPORTED: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+    // Base64 engine trait, hoisted to the first statement per
+    // clippy::items_after_statements.
+    use base64::Engine as _;
     if !SUPPORTED.contains(&image.mime_type.as_str()) {
         return None;
     }
-    use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD.encode(&image.data);
     Some(PartPayload::InlineData {
         inline_data: InlineDataPayload {
@@ -716,7 +746,7 @@ fn build_message_payloads<'a>(
 /// Map tool definitions to Gemini's tool format.
 ///
 /// Gemini wraps function declarations inside a `functionDeclarations` array per
-/// tool entry (rather than OpenAI's flat `tools` array), because the Gemini API
+/// tool entry (rather than `OpenAI`'s flat `tools` array), because the Gemini API
 /// supports non-function tool types (like code execution and retrieval) that
 /// share the same tool wrapper.
 fn build_tool_payloads(tools: &[ChatToolDefinition]) -> serde_json::Value {
@@ -755,7 +785,7 @@ fn thinking_config_payload(slug: &str) -> Option<ThinkingConfigPayload> {
     }
 }
 
-/// Convert a non-streaming Gemini response into a ChatTurnResult.
+/// Convert a non-streaming Gemini response into a `ChatTurnResult`.
 fn response_to_turn_result(
     response: GenerateContentResponse,
 ) -> Result<ChatTurnResult, GoogleError> {
@@ -799,7 +829,7 @@ fn response_to_turn_result(
                 signature,
             } => {
                 capture_signature(&mut signatures, signature);
-                let id = format!("fc_{}", name);
+                let id = format!("fc_{name}");
                 let args_json = args.to_string();
                 tool_calls.push(ChatToolCall {
                     id,

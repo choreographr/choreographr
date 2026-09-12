@@ -17,14 +17,14 @@ use choreo_daemon::tools::ToolOutputFormat;
 ///
 /// Requires Node.js and `npx` to be available on the system.
 ///
-/// Marked #[ignore] per AGENTS.md — integration tests belong in crate-level
+/// Marked #[ignore = "integration"] per AGENTS.md — integration tests belong in crate-level
 /// tests/ directories and must be ignored; `cargo test` runs only unit tests.
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn mcp_server_everything_tools_are_discovered_and_callable() {
     // The stdlib test harness has no per-test timeout, so a regression in the
     // MCP stack (e.g. a shutdown that blocks) would hang CI forever. Install a

@@ -15,7 +15,7 @@ use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult, SocketRegistry};
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn provider_connection_is_registered_and_shutdown_all_does_not_panic() {
     let registry = SocketRegistry::new();
 

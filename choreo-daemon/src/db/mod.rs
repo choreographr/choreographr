@@ -43,7 +43,7 @@ const CATALOG_LAST_ATTEMPT_KEY: &str = "last_attempt_ms";
 const CATALOG_ETAG_KEY: &str = "etag";
 const SESSION_KV: TableDefinition<(u64, String), Vec<u8>> = TableDefinition::new("session_kv");
 /// Raw, uncompressed image/attachment bytes for a turn, keyed by
-/// (session_id, turn_id, slot). Images (display + vision) are kept OUT of the
+/// (`session_id`, `turn_id`, slot). Images (display + vision) are kept OUT of the
 /// zstd-compressed `session_turns` blob because they are already
 /// incompressible (PNG/JPEG) — storing them raw here avoids wasted zstd CPU
 /// and keeps `MAX_TURN_DECODED_BYTES` meaningful for the text/tool blob.
@@ -61,7 +61,7 @@ const SESSION_ATTACHMENTS: TableDefinition<(u64, u32, String), &[u8]> =
 /// any record bearing this id at next startup" (see [`purge_tombstoned_sessions`]).
 const DELETED_SESSIONS: TableDefinition<u64, ()> = TableDefinition::new("deleted_sessions");
 
-/// Iterator type returned by redb range queries on SESSION_KV.
+/// Iterator type returned by redb range queries on `SESSION_KV`.
 type KvRangeIter<'a> = Box<
     dyn Iterator<
             Item = Result<
@@ -116,6 +116,12 @@ pub struct SessionRecord {
     pub last_response_id_producer: Option<ReasoningProducer>,
 }
 
+/// Resolve the database file path: the `CHOREOGRAPHR_DB_PATH` override when
+/// set, otherwise the standard data directory location.
+///
+/// # Errors
+///
+/// Returns Err if the user's data directory cannot be determined.
 pub fn db_path() -> io::Result<PathBuf> {
     if let Ok(override_path) = std::env::var("CHOREOGRAPHR_DB_PATH") {
         return Ok(PathBuf::from(override_path));
@@ -134,10 +140,10 @@ pub fn db_path() -> io::Result<PathBuf> {
 /// Persisted schema version. Bump on any *breaking* change to persisted
 /// records: codec swap, key-type change, table split/merge, semantic change.
 /// Additive fields (with `#[serde(default)]`) do NOT bump it — named
-/// MessagePack tolerates those without a migration.
+/// `MessagePack` tolerates those without a migration.
 ///
 /// v2 (the current version): the `session_turns` value codec changed from raw
-/// MessagePack to zstd-compressed MessagePack. This IS a breaking codec change
+/// `MessagePack` to zstd-compressed `MessagePack`. This IS a breaking codec change
 /// (an uncompressed legacy blob and a compressed one are mutually undecodable
 /// through the opposite reader), so it owns the 1→2 migration that re-encodes
 /// every existing row.
@@ -205,8 +211,7 @@ fn current_schema_version(db: &redb::Database) -> io::Result<u64> {
     Ok(table
         .get(SCHEMA_VERSION_KEY)
         .map_err(|e| db_err(format!("redb get meta: {e}")))?
-        .map(|guard| guard.value())
-        .unwrap_or(0))
+        .map_or(0, |guard| guard.value()))
 }
 
 /// Read the current schema version of an open database: the value stamped in
@@ -214,6 +219,10 @@ fn current_schema_version(db: &redb::Database) -> io::Result<u64> {
 /// [`current_schema_version`] so callers outside this module (the CLI's
 /// open→version→drop→backup→reopen startup sequence) can read the version
 /// without depending on the internal table layout.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction or the `meta` table read fails.
 pub fn schema_version(db: &redb::Database) -> io::Result<u64> {
     current_schema_version(db)
 }
@@ -245,10 +254,10 @@ fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Result<()> {
 /// so the naming cannot drift between the pre-lock copy (CLI startup) and the
 /// in-runner copy (fallback).
 fn backup_path_for(path: &std::path::Path, from: u64) -> std::path::PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "state.redb".to_string());
+    let file_name = path.file_name().map_or_else(
+        || "state.redb".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     path.with_file_name(format!("{file_name}.bak-v{from}"))
 }
 
@@ -275,6 +284,10 @@ fn backup_path_for(path: &std::path::Path, from: u64) -> std::path::PathBuf {
 /// extends/rewrites the file on committed transactions, and this runs at
 /// startup, single-threaded, before any migration writes — the on-disk image
 /// reflects the last committed transaction.
+///
+/// # Errors
+///
+/// Returns Err if the file copy fails (I/O error on source or destination).
 pub fn backup_database(path: &std::path::Path, from_version: u64) -> io::Result<()> {
     let backup_path = backup_path_for(path, from_version);
     fs::copy(path, &backup_path)?;
@@ -365,12 +378,22 @@ pub(crate) fn migration_backup_version(db: &redb::Database) -> io::Result<Option
 /// with the production version and chain, resolving the database file path
 /// once so the pre-migration backup targets the file that is actually being
 /// migrated (never injected from a test's tempdir).
+///
+/// # Errors
+///
+/// Returns Err if the database path cannot be resolved.
 pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
     run_migrations_at(db, &db_path()?)
 }
 
 /// [`run_migrations`] parameterized by the database file path (the pre-migration
 /// backup targets this file), mirroring [`open_db_at`] for non-CLI embedders.
+///
+/// # Errors
+///
+/// Returns Err if the current version cannot be read, the database is
+/// newer than the target (downgrade protection), the migration chain is
+/// non-contiguous, or any migration step or backup write fails.
 pub fn run_migrations_at(db: &redb::Database, path: &std::path::Path) -> io::Result<()> {
     run_migrations_to(db, SCHEMA_VERSION, MIGRATIONS, path)
 }
@@ -382,7 +405,7 @@ pub fn run_migrations_at(db: &redb::Database, path: &std::path::Path) -> io::Res
 /// The path of the database file being migrated is a parameter, so a unit test
 /// can point the pre-migration backup at its own tempdir instead of leaking a
 /// copy of the *real* data-directory file (the pre-existing design called
-/// `db_path()` here, which made any run_migrations_to test with a non-empty
+/// `db_path()` here, which made any `run_migrations_to` test with a non-empty
 /// chain silently snapshot the real `state.redb`). Production resolves it once
 /// in [`run_migrations`]; tests inject their own path.
 ///
@@ -500,6 +523,10 @@ fn initialize_schema_version(db: &redb::Database) -> io::Result<()> {
 /// before any table access (see `main.rs`). Hard-errors on a database it
 /// cannot open rather than recreating a potentially recoverable file (the
 /// old "trying to recreate" catch-all could silently clobber it).
+///
+/// # Errors
+///
+/// Returns Err if the database path cannot be resolved.
 pub fn open_db() -> io::Result<redb::Database> {
     open_db_at(&db_path()?)
 }
@@ -509,6 +536,12 @@ pub fn open_db() -> io::Result<redb::Database> {
 /// environment-variable override dance (`CHOREOGRAPHR_DB_PATH`). Same
 /// create/stamp/upgrade semantics as `open_db` — this is the function; the
 /// pathless version just resolves the standard location first.
+///
+/// # Errors
+///
+/// Returns Err if the parent directory cannot be created, the file cannot
+/// be created/opened (corruption, permissions, lock contention), or the
+/// initial schema version cannot be stamped.
 pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
     info!(path = %path.display(), "opening database");
     if let Some(parent) = path.parent() {
@@ -563,6 +596,12 @@ pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
     }
 }
 
+/// Serialize and upsert a session record under `session_id`.
+///
+/// # Errors
+///
+/// Returns Err if msgpack encoding, the write transaction, table open,
+/// insert, or commit fails.
 pub fn write_session(
     db: &redb::Database,
     session_id: u64,
@@ -594,6 +633,10 @@ pub fn write_session(
 /// same policy as `read_all_sessions`/`read_turns`. A corrupt record is
 /// unrecoverable, so it must never fail the caller (or the daemon); the
 /// warning keeps the loss loud-but-non-fatal.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction, table open, or row lookup fails.
 pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<SessionRecord>> {
     debug!("read_session: id={}", session_id);
     let read_txn = db
@@ -621,6 +664,14 @@ pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<S
     }
 }
 
+/// Read every session record from the database. Returns an empty vector when
+/// the sessions table does not exist yet (first run); undecodable records
+/// are skipped with a warning, not an error.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction, table iteration, or row decode of
+/// a well-formed entry fails.
 pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRecord)>> {
     debug!("read_all_sessions");
     let read_txn = db.begin_read().map_err(|e| {
@@ -661,7 +712,6 @@ pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRec
                     "read_all_sessions: skipping session {} (decode failed: {e})",
                     key.value()
                 );
-                continue;
             }
         }
     }
@@ -701,7 +751,7 @@ fn delete_session_attachments(
             (session_id, 0u32, String::new())..(session_range_end(session_id), 0u32, String::new()),
         )
         .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
-        .filter_map(|result| result.ok())
+        .filter_map(std::result::Result::ok)
         .map(|(k, _)| k.value())
         .collect();
     for key in att_keys {
@@ -737,7 +787,7 @@ fn delete_turn_attachments(
                 ..(session_id, turn_id.saturating_add(1), String::new()),
         )
         .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
-        .filter_map(|result| result.ok())
+        .filter_map(std::result::Result::ok)
         .map(|(k, _)| k.value())
         .collect();
     for key in att_keys {
@@ -748,6 +798,12 @@ fn delete_turn_attachments(
     Ok(())
 }
 
+/// Delete a session record, its turns, and its attachments.
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open, row removal, or
+/// commit fails.
 pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
     debug!("delete_session: id={}", session_id);
     let write_txn = db
@@ -771,7 +827,7 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
         let keys_to_remove: Vec<(u64, u32)> = turns
             .range::<(u64, u32)>((session_id, 0u32)..(session_range_end(session_id), 0u32))
             .map_err(|e| db_err(format!("redb range turns: {e}")))?
-            .filter_map(|result| result.ok())
+            .filter_map(std::result::Result::ok)
             .map(|(key, _)| key.value())
             .collect();
         for key in keys_to_remove {
@@ -789,7 +845,7 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
                 (session_id, String::new())..(session_range_end(session_id), String::new()),
             )
             .map_err(|e| db_err(format!("redb range session_kv: {e}")))?
-            .filter_map(|result| result.ok())
+            .filter_map(std::result::Result::ok)
             .map(|(k, _)| k.value())
             .collect();
         for key in kv_keys {
@@ -815,6 +871,11 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
 /// daemon crashes before `handle_session_exited` finalizes the delete, the
 /// tombstone survives so [`purge_tombstoned_sessions`] removes the record at
 /// the next startup instead of letting a deleted session reappear.
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open, insert, or commit
+/// fails.
 pub fn mark_session_deleted(db: &redb::Database, session_id: u64) -> io::Result<()> {
     debug!("mark_session_deleted: id={}", session_id);
     let write_txn = db
@@ -839,6 +900,11 @@ pub fn mark_session_deleted(db: &redb::Database, session_id: u64) -> io::Result<
 /// Called once `handle_session_exited` has deleted the record the
 /// still-shutting-down thread re-created, so the tombstone does not
 /// accumulate.
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open, removal, or commit
+/// fails.
 pub fn clear_session_tombstone(db: &redb::Database, session_id: u64) -> io::Result<()> {
     debug!("clear_session_tombstone: id={}", session_id);
     let write_txn = db
@@ -866,6 +932,11 @@ pub fn clear_session_tombstone(db: &redb::Database, session_id: u64) -> io::Resu
 /// then died with a crashed daemon before the delete could be finalized,
 /// must not resurface.  Deleting a record that is already gone is a harmless
 /// no-op.
+///
+/// # Errors
+///
+/// Returns Err if the read or write transactions, table opens/iterations,
+/// or commits fail.
 pub fn purge_tombstoned_sessions(db: &redb::Database) -> io::Result<usize> {
     let read_txn = db
         .begin_read()
@@ -879,7 +950,7 @@ pub fn purge_tombstoned_sessions(db: &redb::Database) -> io::Result<usize> {
     let ids: Vec<u64> = table
         .iter()
         .map_err(|e| db_err(format!("redb iter deleted_sessions: {e}")))?
-        .filter_map(|result| result.ok())
+        .filter_map(std::result::Result::ok)
         .map(|(key, _)| key.value())
         .collect();
     drop(read_txn);
@@ -903,9 +974,9 @@ pub fn purge_tombstoned_sessions(db: &redb::Database) -> io::Result<usize> {
 }
 
 /// The 1 → 2 schema migration: re-encode every `session_turns` value from raw
-/// MessagePack (the v1 codec) to zstd-compressed MessagePack (the v2 codec).
+/// `MessagePack` (the v1 codec) to zstd-compressed `MessagePack` (the v2 codec).
 /// Compression is codec-orthogonal to serialization, so a legacy raw blob is
-/// re-encoded by simply wrapping the SAME MessagePack bytes in a zstd frame —
+/// re-encoded by simply wrapping the SAME `MessagePack` bytes in a zstd frame —
 /// no deserialize/re-serialize of the `Turn` is needed.
 ///
 /// Idempotency (required by the migration framework, whose crash recovery may
@@ -995,6 +1066,13 @@ fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
     Ok(())
 }
 
+/// Compress and persist a turn (payload bytes split into the attachments
+/// table) under `(session_id, turn_id)`.
+///
+/// # Errors
+///
+/// Returns Err if msgpack/zstd encoding, the write transaction, table
+/// opens, inserts, or commit fails.
 pub fn write_turn(
     db: &redb::Database,
     session_id: u64,
@@ -1074,6 +1152,14 @@ pub fn write_turn(
     Ok(())
 }
 
+/// Read all turns of a session, re-attaching payload bytes from the
+/// attachments table. Returns turns sorted by `turn_id`; a missing turns
+/// table reads as empty.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction, table opens, iteration, or decode
+/// of a well-formed entry fails.
 pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, Turn)>> {
     let read_txn = db
         .begin_read()
@@ -1123,7 +1209,7 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
                             }
                         }
                     }
-                    for tr in turn.tool_results.iter_mut() {
+                    for tr in &mut turn.tool_results {
                         if let Some(image) = &mut tr.image
                             && image.data.is_empty()
                         {
@@ -1155,8 +1241,13 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
     Ok(turns)
 }
 
-/// Retry a write_turn on transient storage errors (e.g. I/O contention)
+/// Retry a `write_turn` on transient storage errors (e.g. I/O contention)
 /// with up to 3 retries and a 1ms backoff.
+///
+/// # Errors
+///
+/// Returns Err if [`write_turn`] fails on every attempt (the last error is
+/// propagated).
 pub fn write_turn_retry(
     db: &redb::Database,
     session_id: u64,
@@ -1170,13 +1261,18 @@ pub fn write_turn_retry(
             Err(_e) if attempts < 3 => {
                 attempts += 1;
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
             }
             Err(e) => return Err(e),
         }
     }
 }
 
+/// Delete all turns of a session and its attachment rows.
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open/iteration, row
+/// removal, or commit fails.
 pub fn delete_session_turns(db: &redb::Database, session_id: u64) -> io::Result<()> {
     let write_txn = db
         .begin_write()
@@ -1218,6 +1314,13 @@ pub fn delete_session_turns(db: &redb::Database, session_id: u64) -> io::Result<
     Ok(())
 }
 
+/// Retry `delete_session_turns` on transient storage errors with up to 3
+/// retries and a 1ms backoff.
+///
+/// # Errors
+///
+/// Returns Err if [`delete_session_turns`] fails on every attempt (the
+/// last error is propagated).
 pub fn delete_session_turns_retry(db: &redb::Database, session_id: u64) -> io::Result<()> {
     let mut attempts = 0;
     loop {
@@ -1226,7 +1329,6 @@ pub fn delete_session_turns_retry(db: &redb::Database, session_id: u64) -> io::R
             Err(_e) if attempts < 3 => {
                 attempts += 1;
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
             }
             Err(e) => return Err(e),
         }
@@ -1235,6 +1337,12 @@ pub fn delete_session_turns_retry(db: &redb::Database, session_id: u64) -> io::R
 
 // ── Credential table ────────────────────────────────────────────────────────────
 
+/// Store (or overwrite) the encrypted credential blob for a service.
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open, insert, or commit
+/// fails.
 pub fn set_credential_blob(
     db: &redb::Database,
     service: &str,
@@ -1249,6 +1357,12 @@ pub fn set_credential_blob(
     Ok(())
 }
 
+/// Read all stored credential blobs, keyed by service name. Returns an
+/// empty map when the credentials table does not exist yet.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction, table open, or iteration fails.
 pub fn get_all_credential_blobs(
     db: &redb::Database,
 ) -> Result<HashMap<String, Vec<u8>>, redb::Error> {
@@ -1269,6 +1383,12 @@ pub fn get_all_credential_blobs(
     Ok(map)
 }
 
+/// Remove the stored credential blob for a service (no-op if absent).
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open, removal, or commit
+/// fails.
 pub fn remove_credential_blob(db: &redb::Database, service: &str) -> Result<(), redb::Error> {
     let write_txn = db.begin_write()?;
     {
@@ -1340,6 +1460,10 @@ fn catalog_state_write(db: &redb::Database, key: &str, value: Option<&[u8]>) -> 
 /// write) goes through this, and the outcome (200/304/failure) is irrelevant
 /// to the recorded value — the 25h no-reattempt rule is anchored on "when we
 /// last tried", not "when we last succeeded".
+///
+/// # Errors
+///
+/// Returns Err if the underlying `catalog_state` write fails.
 pub fn set_catalog_last_attempt_ms(db: &redb::Database, ms: u64) -> io::Result<()> {
     catalog_state_write(db, CATALOG_LAST_ATTEMPT_KEY, Some(&ms.to_le_bytes()))
 }
@@ -1350,16 +1474,19 @@ pub fn set_catalog_last_attempt_ms(db: &redb::Database, ms: u64) -> io::Result<(
 /// unexpected length is logged and treated as absent, the same policy as
 /// undecodable session records: the timestamp is advisory pacing, so a corrupt
 /// value must never fail the caller (or the daemon).
+///
+/// # Errors
+///
+/// Returns Err if the underlying `catalog_state` read fails.
 pub fn get_catalog_last_attempt_ms(db: &redb::Database) -> io::Result<Option<u64>> {
     let Some(bytes) = catalog_state_get(db, CATALOG_LAST_ATTEMPT_KEY)? else {
         return Ok(None);
     };
-    match <[u8; 8]>::try_from(bytes.as_slice()) {
-        Ok(bytes) => Ok(Some(u64::from_le_bytes(bytes))),
-        Err(_) => {
-            warn!("catalog last_attempt_ms has an invalid length; treating as absent");
-            Ok(None)
-        }
+    if let Ok(bytes) = <[u8; 8]>::try_from(bytes.as_slice()) {
+        Ok(Some(u64::from_le_bytes(bytes)))
+    } else {
+        warn!("catalog last_attempt_ms has an invalid length; treating as absent");
+        Ok(None)
     }
 }
 
@@ -1367,12 +1494,20 @@ pub fn get_catalog_last_attempt_ms(db: &redb::Database) -> io::Result<Option<u64
 /// (replacing any previous value); `None` removes the key — a fetch that came
 /// back without an etag must not leave a stale one behind (it would be served
 /// as `If-None-Match` forever).
+///
+/// # Errors
+///
+/// Returns Err if the underlying `catalog_state` write fails.
 pub fn set_catalog_etag(db: &redb::Database, etag: Option<&str>) -> io::Result<()> {
     catalog_state_write(db, CATALOG_ETAG_KEY, etag.map(str::as_bytes))
 }
 
 /// Read the stored models.dev etag. `None` when absent or blank (an empty
 /// stored value is treated as absent — it could never be a valid entity-tag).
+///
+/// # Errors
+///
+/// Returns Err if the underlying `catalog_state` read fails.
 pub fn get_catalog_etag(db: &redb::Database) -> io::Result<Option<String>> {
     let Some(bytes) = catalog_state_get(db, CATALOG_ETAG_KEY)? else {
         return Ok(None);
@@ -1401,6 +1536,10 @@ const KEYSTORE_BINDING_KEY: &str = "binding";
 /// tolerant policy as the catalog getters): the binding would be re-adopted
 /// from the next presented key, which is the only sane recovery for a
 /// corrupt/truncated write — the keystore is unusable otherwise.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction, table open, or row lookup fails.
 pub fn get_keystore_binding(db: &redb::Database) -> io::Result<Option<[u8; 32]>> {
     let read_txn = db
         .begin_read()
@@ -1418,15 +1557,14 @@ pub fn get_keystore_binding(db: &redb::Database) -> io::Result<Option<[u8; 32]>>
     else {
         return Ok(None);
     };
-    match <[u8; 32]>::try_from(guard.value()) {
-        Ok(key) => Ok(Some(key)),
-        Err(_) => {
-            warn!(
-                stored_len = guard.value().len(),
-                "keystore binding has an invalid length; treating as unbound"
-            );
-            Ok(None)
-        }
+    if let Ok(key) = <[u8; 32]>::try_from(guard.value()) {
+        Ok(Some(key))
+    } else {
+        warn!(
+            stored_len = guard.value().len(),
+            "keystore binding has an invalid length; treating as unbound"
+        );
+        Ok(None)
     }
 }
 
@@ -1434,6 +1572,11 @@ pub fn get_keystore_binding(db: &redb::Database) -> io::Result<Option<[u8; 32]>>
 /// once per daemon lifetime — on the first TOFU adoption — and never again
 /// afterwards, so callers race nowhere in practice; the write is atomic in
 /// a single redb transaction.
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open, insert, or commit
+/// fails.
 pub fn set_keystore_binding(db: &redb::Database, public_key: &[u8; 32]) -> io::Result<()> {
     let write_txn = db
         .begin_write()
@@ -1456,6 +1599,11 @@ pub fn set_keystore_binding(db: &redb::Database, public_key: &[u8; 32]) -> io::R
 // ── Session KV table ───────────────────────────────────────────────────────────
 
 /// Insert or overwrite a key-value pair for the given session.
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open, insert, or commit
+/// fails.
 pub fn kv_set(db: &redb::Database, session_id: u64, key: &str, value: &[u8]) -> io::Result<()> {
     let write_txn = db
         .begin_write()
@@ -1476,6 +1624,10 @@ pub fn kv_set(db: &redb::Database, session_id: u64, key: &str, value: &[u8]) -> 
 }
 
 /// Retrieve a value by session and key. Returns `None` if the key does not exist.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction, table open, or row lookup fails.
 pub fn kv_get(db: &redb::Database, session_id: u64, key: &str) -> io::Result<Option<Vec<u8>>> {
     let read_txn = db
         .begin_read()
@@ -1487,12 +1639,17 @@ pub fn kv_get(db: &redb::Database, session_id: u64, key: &str) -> io::Result<Opt
         .get((session_id, key.to_string()))
         .map_err(|e| db_err(format!("redb kv_get: {e}")))?
     {
-        Some(guard) => Ok(Some(guard.value().to_vec())),
+        Some(guard) => Ok(Some(guard.value().clone())),
         None => Ok(None),
     }
 }
 
 /// Remove a single key. Returns `true` if the key existed, `false` otherwise.
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open, removal, or commit
+/// fails.
 pub fn kv_delete(db: &redb::Database, session_id: u64, key: &str) -> io::Result<bool> {
     let write_txn = db
         .begin_write()
@@ -1520,6 +1677,11 @@ pub fn kv_delete(db: &redb::Database, session_id: u64, key: &str) -> io::Result<
 ///
 /// If `end` is `None`, removes from `start` to the end of the session's keys.
 /// Returns the number of keys removed.
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open/iteration, removals,
+/// or commit fails.
 pub fn kv_delete_range(
     db: &redb::Database,
     session_id: u64,
@@ -1533,24 +1695,21 @@ pub fn kv_delete_range(
         let mut table = write_txn
             .open_table(SESSION_KV)
             .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
-        let range = match end {
-            Some(end) => {
-                let range_start = (session_id, start.to_string());
-                let range_end = (session_id, end.to_string());
-                table
-                    .range::<(u64, String)>((range_start)..(range_end))
-                    .map_err(|e| db_err(format!("redb range kv_delete_range: {e}")))?
-            }
-            None => {
-                let range_start = (session_id, start.to_string());
-                let range_end = (session_range_end(session_id), String::new());
-                table
-                    .range::<(u64, String)>((range_start)..(range_end))
-                    .map_err(|e| db_err(format!("redb range kv_delete_range: {e}")))?
-            }
+        let range = if let Some(end) = end {
+            let range_start = (session_id, start.to_string());
+            let range_end = (session_id, end.to_string());
+            table
+                .range::<(u64, String)>((range_start)..(range_end))
+                .map_err(|e| db_err(format!("redb range kv_delete_range: {e}")))?
+        } else {
+            let range_start = (session_id, start.to_string());
+            let range_end = (session_range_end(session_id), String::new());
+            table
+                .range::<(u64, String)>((range_start)..(range_end))
+                .map_err(|e| db_err(format!("redb range kv_delete_range: {e}")))?
         };
         let keys: Vec<(u64, String)> = range
-            .filter_map(|r| r.ok())
+            .filter_map(std::result::Result::ok)
             .map(|(k, _)| k.value())
             .collect();
         let count = keys.len() as u64;
@@ -1574,6 +1733,11 @@ pub fn kv_delete_range(
 /// Retrieve all key-value pairs in the range [`start`, `end`) for the given session.
 ///
 /// If `end` is `None`, retrieves from `start` to the end of the session's keys.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction, table open, range iteration, or
+/// row decode fails.
 pub fn kv_get_range(
     db: &redb::Database,
     session_id: u64,
@@ -1586,26 +1750,23 @@ pub fn kv_get_range(
     let table = read_txn
         .open_table(SESSION_KV)
         .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
-    let range = match end {
-        Some(end) => {
-            let range_start = (session_id, start.to_string());
-            let range_end = (session_id, end.to_string());
-            table
-                .range::<(u64, String)>((range_start)..(range_end))
-                .map_err(|e| db_err(format!("redb range kv_get_range: {e}")))?
-        }
-        None => {
-            let range_start = (session_id, start.to_string());
-            let range_end = (session_range_end(session_id), String::new());
-            table
-                .range::<(u64, String)>((range_start)..(range_end))
-                .map_err(|e| db_err(format!("redb range kv_get_range: {e}")))?
-        }
+    let range = if let Some(end) = end {
+        let range_start = (session_id, start.to_string());
+        let range_end = (session_id, end.to_string());
+        table
+            .range::<(u64, String)>((range_start)..(range_end))
+            .map_err(|e| db_err(format!("redb range kv_get_range: {e}")))?
+    } else {
+        let range_start = (session_id, start.to_string());
+        let range_end = (session_range_end(session_id), String::new());
+        table
+            .range::<(u64, String)>((range_start)..(range_end))
+            .map_err(|e| db_err(format!("redb range kv_get_range: {e}")))?
     };
     let mut results = Vec::new();
     for result in range {
         let (key, value) = result.map_err(|e| db_err(format!("redb iter kv_get_range: {e}")))?;
-        results.push((key.value().1, value.value().to_vec()));
+        results.push((key.value().1, value.value().clone()));
     }
     Ok(results)
 }
@@ -1614,6 +1775,11 @@ pub fn kv_get_range(
 ///
 /// Returns only key names (not values). If `start` is `None`, starts from
 /// the beginning of the session's keys. If `end` is `None`, goes to the end.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction, table open, range iteration, or
+/// row decode fails.
 pub fn kv_list(
     db: &redb::Database,
     session_id: u64,
@@ -1674,8 +1840,13 @@ pub fn kv_list(
 
 /// Count keys in the given session, optionally filtered by prefix.
 ///
-/// When `prefix` is `Some(p)`, counts keys in [`p`, `p` + max_char).
+/// When `prefix` is `Some(p)`, counts keys in [`p`, `p` + `max_char`).
 /// When `prefix` is `None`, counts all keys for the session.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction, table open, range iteration, or
+/// row decode fails.
 pub fn kv_count(db: &redb::Database, session_id: u64, prefix: Option<&str>) -> io::Result<u64> {
     let read_txn = db
         .begin_read()
@@ -1683,31 +1854,28 @@ pub fn kv_count(db: &redb::Database, session_id: u64, prefix: Option<&str>) -> i
     let table = read_txn
         .open_table(SESSION_KV)
         .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
-    let range = match prefix {
-        Some(prefix) => {
-            let range_start = (session_id, prefix.to_string());
-            // We need an upper bound for the prefix scan.  Appending 0xFF and feeding
-            // the result through String::from_utf8_lossy replaces the 0xFF with the
-            // Unicode replacement character U+FFFD (UTF-8: EF BF BD), so the actual
-            // end bound is prefix + "\u{FFFD}".  Every valid UTF-8 key that shares the
-            // prefix has a byte sequence strictly less than EF BF BD at the first
-            // differing position, so this bound correctly terminates the range — the
-            // bound value itself is never returned, only used for range termination.
-            let mut end_bytes = prefix.as_bytes().to_vec();
-            end_bytes.push(0xFF);
-            let range_end_str = String::from_utf8_lossy(&end_bytes).into_owned();
-            let range_end = (session_id, range_end_str);
-            table
-                .range::<(u64, String)>((range_start)..(range_end))
-                .map_err(|e| db_err(format!("redb range kv_count: {e}")))?
-        }
-        None => {
-            let range_start = (session_id, String::new());
-            let range_end = (session_range_end(session_id), String::new());
-            table
-                .range::<(u64, String)>((range_start)..(range_end))
-                .map_err(|e| db_err(format!("redb range kv_count: {e}")))?
-        }
+    let range = if let Some(prefix) = prefix {
+        let range_start = (session_id, prefix.to_string());
+        // We need an upper bound for the prefix scan.  Appending 0xFF and feeding
+        // the result through String::from_utf8_lossy replaces the 0xFF with the
+        // Unicode replacement character U+FFFD (UTF-8: EF BF BD), so the actual
+        // end bound is prefix + "\u{FFFD}".  Every valid UTF-8 key that shares the
+        // prefix has a byte sequence strictly less than EF BF BD at the first
+        // differing position, so this bound correctly terminates the range — the
+        // bound value itself is never returned, only used for range termination.
+        let mut end_bytes = prefix.as_bytes().to_vec();
+        end_bytes.push(0xFF);
+        let range_end_str = String::from_utf8_lossy(&end_bytes).into_owned();
+        let range_end = (session_id, range_end_str);
+        table
+            .range::<(u64, String)>((range_start)..(range_end))
+            .map_err(|e| db_err(format!("redb range kv_count: {e}")))?
+    } else {
+        let range_start = (session_id, String::new());
+        let range_end = (session_range_end(session_id), String::new());
+        table
+            .range::<(u64, String)>((range_start)..(range_end))
+            .map_err(|e| db_err(format!("redb range kv_count: {e}")))?
     };
     let mut count: u64 = 0;
     for result in range {
@@ -1717,7 +1885,12 @@ pub fn kv_count(db: &redb::Database, session_id: u64, prefix: Option<&str>) -> i
     Ok(count)
 }
 
-/// Retry a write_session on transient storage errors with up to 3 retries.
+/// Retry a `write_session` on transient storage errors with up to 3 retries.
+///
+/// # Errors
+///
+/// Returns Err if [`write_session`] fails on every attempt (the last error
+/// is propagated).
 pub fn write_session_retry(
     db: &redb::Database,
     session_id: u64,
@@ -1730,7 +1903,6 @@ pub fn write_session_retry(
             Err(_e) if attempts < 3 => {
                 attempts += 1;
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
             }
             Err(e) => return Err(e),
         }
@@ -1758,8 +1930,7 @@ mod tests {
             let current = table
                 .get("next_session_id")
                 .map_err(|e| db_err(format!("redb get meta: {e}")))?
-                .map(|g| g.value())
-                .unwrap_or(1);
+                .map_or(1, |g| g.value());
             table
                 .insert("next_session_id", current.wrapping_add(1))
                 .map_err(|e| db_err(format!("redb set meta: {e}")))?;
@@ -1803,8 +1974,8 @@ mod tests {
             parent_session_id: None,
             working_dir: Some("/tmp".into()),
             turn_count: 1,
-            created_at: 1234567890000,
-            last_modified: 1234567890000,
+            created_at: 1_234_567_890_000,
+            last_modified: 1_234_567_890_000,
             active_tool_groups: vec!["core".into(), "git".into()],
             context_config: ContextConfig::default(),
             account_name: None,
@@ -1846,7 +2017,10 @@ mod tests {
 
         delete_session(&db, id).unwrap();
         assert!(read_session(&db, id).unwrap().is_none());
-        assert!(read_turns(&db, id).unwrap().is_empty());
+        assert_eq!(
+            read_turns(&db, id).unwrap(),
+            [] as [(u32, choreo_proto::Turn); 0]
+        );
 
         drop(db);
     }
@@ -2380,6 +2554,8 @@ mod tests {
                 let mut table = write_txn.open_table(SESSION_TURNS).unwrap();
                 for (i, turn) in turns.iter().enumerate() {
                     let raw = rmp_serde::to_vec_named(turn).unwrap();
+                    // usize→u32 table key: the fixture writes 3 turns.
+                    #[allow(clippy::cast_possible_truncation)]
                     table.insert((sid, i as u32), raw.as_slice()).unwrap();
                 }
             }

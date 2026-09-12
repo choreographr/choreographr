@@ -155,8 +155,7 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         Paragraph::new(Line::from(format!(" Remove \"{name}\"? (y/N)  ")))
     } else {
         Paragraph::new(Line::from(format!(
-            " <j/k nav>  <r remove>  <c credential>  <n new>  <Esc back>  —  {} accounts",
-            total_items
+            " <j/k nav>  <r remove>  <c credential>  <n new>  <Esc back>  —  {total_items} accounts"
         )))
     };
     frame.render_widget(status, status_area);
@@ -325,6 +324,9 @@ fn render_wizard_provider(frame: &mut Frame<'_>, app: &mut App) {
         .text
         .get(..app.ai_providers.wizard.filter.cursor)
         .unwrap_or(&app.ai_providers.wizard.filter.text);
+    // The `.min()` clamp below bounds the column to the row width, and a
+    // filter prefix wider than `u16::MAX` columns cannot fit any terminal.
+    #[allow(clippy::cast_possible_truncation)]
     let cursor_col =
         filter_row.x + filter_prefix.len() as u16 + display_width(before_cursor) as u16;
     let cursor_col = cursor_col.min(filter_row.x + filter_row.width.saturating_sub(1));

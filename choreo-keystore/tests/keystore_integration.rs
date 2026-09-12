@@ -4,7 +4,7 @@
 /// `#[ignore]` — they only run under `cargo test -- --ignored`.
 
 #[test]
-#[ignore]
+#[ignore = "integration: performs real filesystem I/O per workspace test discipline"]
 fn test_override_used_when_set_integration() {
     let temp = std::env::temp_dir().join("choreo-keystore-test-override-int");
     let _guard = choreo_keystore::paths::TestConfigGuard::set_root(Some(temp.clone()));

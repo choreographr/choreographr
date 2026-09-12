@@ -339,10 +339,10 @@ impl super::Tool for DisplayImage {
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Displaying image ({}).", args.mime_type)];
         if let Some(ref p) = args.path {
-            parts.push(format!(" Path: `{}`.", p));
+            parts.push(format!(" Path: `{p}`."));
         }
         if let Some(ref u) = args.url {
-            parts.push(format!(" URL: {}.", u));
+            parts.push(format!(" URL: {u}."));
         }
         if args.base64_data.is_some() {
             parts.push(" Source: base64 data.".to_string());
@@ -351,7 +351,7 @@ impl super::Tool for DisplayImage {
             parts.push(" Source: SVG markup.".to_string());
         }
         if let Some(ref alt) = args.alt {
-            parts.push(format!(" Alt text: {}.", alt));
+            parts.push(format!(" Alt text: {alt}."));
         }
         parts.concat()
     }
@@ -415,6 +415,8 @@ mod tests {
     fn raster_dimension_probe_reports_dimensions() {
         // A valid PNG goes through the guarded decoder and reports its size.
         let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(4, 3, |x, y| {
+            // u8 pixel coordinates (4×3 image): the arithmetic never exceeds u8.
+            #[allow(clippy::cast_possible_truncation)]
             image::Rgba([x as u8 * 60, y as u8 * 80, 0, 255])
         }));
         let mut png = Cursor::new(Vec::new());

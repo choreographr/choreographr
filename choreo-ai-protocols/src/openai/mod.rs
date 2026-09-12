@@ -32,7 +32,7 @@ pub use retry::RetryCallback;
 use serde::{Deserialize, Serialize};
 use std::io;
 
-/// Re-export the shared provider error type so all OpenAI code continues to
+/// Re-export the shared provider error type so all `OpenAI` code continues to
 /// use `super::OpenAiError` without structural changes.
 pub use crate::shared::ProviderError as OpenAiError;
 
@@ -65,10 +65,10 @@ pub(crate) struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
-    /// OpenAI-style per-prompt breakdown. z.ai (and OpenAI itself) report
+    /// OpenAI-style per-prompt breakdown. z.ai (and `OpenAI` itself) report
     /// `prompt_tokens_details.cached_tokens` here; providers that omit the
-    /// object entirely (e.g. plain DeepSeek) still parse via `#[serde(default)]`.
-    /// NOTE: DeepSeek also exposes a differently-shaped flat
+    /// object entirely (e.g. plain `DeepSeek`) still parse via `#[serde(default)]`.
+    /// NOTE: `DeepSeek` also exposes a differently-shaped flat
     /// `prompt_cache_hit_tokens` field — parsing that is a possible follow-up.
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
@@ -117,8 +117,8 @@ pub struct AssistantToolFunction {
 /// `read_image` tool result re-read at request time); each provider adapter
 /// renders them in its own wire format:
 ///
-/// - OpenAI Chat Completions → `{"type":"image_url","image_url":{"url":"data:…;base64,…","detail":"auto"}}`
-/// - OpenAI Responses API → `{"type":"input_image","image_url":"data:…;base64,…"}` (flat string)
+/// - `OpenAI` Chat Completions → `{"type":"image_url","image_url":{"url":"data:…;base64,…","detail":"auto"}}`
+/// - `OpenAI` Responses API → `{"type":"input_image","image_url":"data:…;base64,…"}` (flat string)
 /// - Anthropic Messages → `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`
 /// - Google Gemini → `{"inline_data":{"mime_type":…,"data":…}}`
 ///
@@ -135,8 +135,9 @@ pub struct ChatImagePart {
 }
 
 impl ChatImagePart {
-    /// `data:<mime>;base64,<bytes>` URL — the wire value for OpenAI
+    /// `data:<mime>;base64,<bytes>` URL — the wire value for `OpenAI`
     /// `image_url.url` (chat and Responses).
+    #[must_use]
     pub fn data_url(&self) -> String {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&self.data);
@@ -159,7 +160,7 @@ pub struct ChatRequestMessage {
     pub reasoning_text: Option<String>,
     /// Opaque reasoning round-trip artifact captured by the producing adapter
     /// at parse time (see `ReasoningArtifact`). Never serialized as a field of
-    /// its own — each adapter re-emits it in ITS OWN wire format: OpenAI chat
+    /// its own — each adapter re-emits it in ITS OWN wire format: `OpenAI` chat
     /// writes it back as the field recorded in the artifact
     /// (`reasoning_content` / `reasoning` / `reasoning_text`) on assistant
     /// messages (see the manual `Serialize` impl below), Responses pushes the
@@ -170,8 +171,8 @@ pub struct ChatRequestMessage {
 
 impl Serialize for ChatRequestMessage {
     /// Manual impl: the wire shape is byte-identical to the derived one
-    /// (role, content, tool_call_id, tool_calls, reasoning_content,
-    /// reasoning, reasoning_text — `None` fields omitted) EXCEPT that an
+    /// (role, content, `tool_call_id`, `tool_calls`, `reasoning_content`,
+    /// reasoning, `reasoning_text` — `None` fields omitted) EXCEPT that an
     /// assistant message carrying a `ChatReasoning` artifact re-emits it as
     /// the wire field recorded at capture time (`reasoning_content` /
     /// `reasoning` / `reasoning_text`), decoded from the captured bytes — a
@@ -262,6 +263,7 @@ impl Serialize for ChatRequestMessage {
 }
 
 impl ChatRequestMessage {
+    #[must_use]
     pub fn simple(role: &'static str, content: String) -> Self {
         ChatRequestMessage::with_images(role, content, Vec::new())
     }
@@ -271,6 +273,7 @@ impl ChatRequestMessage {
     /// the images in its own wire format. Only `user`-role messages carry
     /// images (the daemon guarantees this by deferring tool images to
     /// synthetic user messages).
+    #[must_use]
     pub fn with_images(role: &'static str, content: String, images: Vec<ChatImagePart>) -> Self {
         ChatRequestMessage {
             role,
@@ -285,10 +288,11 @@ impl ChatRequestMessage {
         }
     }
 
-    /// The OpenAI chat-completions `content` value for this message: a plain
+    /// The `OpenAI` chat-completions `content` value for this message: a plain
     /// string when it carries no images, or an array of `{type:"text"}` and
     /// `{type:"image_url"}` parts when it does. `detail` is fixed to `"auto"`
     /// (the provider decides; see the vision plan).
+    #[must_use]
     pub fn openai_chat_content_value(&self) -> serde_json::Value {
         if self.images.is_empty() {
             serde_json::Value::String(self.content.clone().unwrap_or_default())
@@ -315,6 +319,7 @@ impl ChatRequestMessage {
     /// `input_image` parts when it carries images. `input_image.image_url` is a
     /// **flat string** (the Responses gotcha — it is not the nested object the
     /// chat-completions `image_url` uses). `detail` fixed to `"auto"`.
+    #[must_use]
     pub fn responses_content_value(&self) -> serde_json::Value {
         if self.images.is_empty() {
             serde_json::Value::String(self.content.clone().unwrap_or_default())
@@ -353,7 +358,7 @@ impl ChatToolDefinition {
         }
     }
 
-    /// Create a tool definition with output_schema and allowed_callers.
+    /// Create a tool definition with `output_schema` and `allowed_callers`.
     pub fn function_with_options(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -395,6 +400,12 @@ impl std::fmt::Debug for OpenAiClient {
 }
 
 impl OpenAiClient {
+    /// Create the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` if the shared HTTP agent cannot be built from
+    /// the registry/timeouts.
     pub fn new(
         config: ServiceConfig,
         api_key: String,
@@ -416,10 +427,12 @@ impl OpenAiClient {
         })
     }
 
+    #[must_use]
     pub fn config(&self) -> &ServiceConfig {
         &self.config
     }
 
+    #[must_use]
     pub fn api_key(&self) -> &str {
         // `Zeroizing<String>` derefs to `String`, so `as_str()` works directly.
         self.api_key.as_str()
@@ -430,6 +443,13 @@ impl OpenAiClient {
     // Each method inspects `self.config.request_format_for_model(model)` to
     // delegate to either Chat Completions or Responses API logic.
 
+    /// List available models; falls back per [`crate::shared::list_models_with_fallback`] when a
+    /// provider path is in play.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenAiError`] on HTTP failure, provider error responses, or
+    /// body decoding failures.
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, OpenAiError> {
         use tracing::info;
         info!("listing models from {}", self.config.base_url);
@@ -456,6 +476,12 @@ impl OpenAiClient {
         Ok(models)
     }
 
+    /// Non-streaming completion in the model's configured wire format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenAiError`] on HTTP, provider, retry, or decoding
+    /// failures.
     pub fn completion(&self, model: &str, prompt: &str) -> Result<String, OpenAiError> {
         match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request(
@@ -477,6 +503,12 @@ impl OpenAiClient {
         }
     }
 
+    /// Streaming completion in the model's configured wire format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenAiError`] on HTTP, provider, cancellation, or
+    /// event-callback failures.
     pub fn completion_stream<F>(
         &self,
         model: &str,
@@ -517,6 +549,16 @@ impl OpenAiClient {
         }
     }
 
+    /// Non-streaming multiline chat-completion dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenAiError`] on HTTP, provider, cancellation, or decoding
+    /// failures.
+    // TEMP(`needless_pass_by_value`): the body moves `params`' borrowed
+    // parts straight into the request builders; taking a reference would
+    // ripple through every caller across the daemon and tests.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn chat_completion_turn(
         &self,
         params: crate::ChatTurnRequest<'_>,
@@ -567,6 +609,13 @@ impl OpenAiClient {
         }
     }
 
+    /// Streaming multiline dispatch (see [`Self::chat_completion_turn`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenAiError`] on HTTP, provider, cancellation, or
+    /// event-callback failures.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn chat_completion_turn_streaming<F>(
         &self,
         params: crate::ChatTurnRequest<'_>,
@@ -633,7 +682,7 @@ impl OpenAiClient {
     }
 }
 
-/// Map reasoning slug string to OpenAI's `reasoning_effort` API value.
+/// Map reasoning slug string to `OpenAI`'s `reasoning_effort` API value.
 /// "off" → None (omit the field). Others → Some(slug).
 pub(crate) fn reasoning_effort_api_value(slug: &str) -> Option<&str> {
     if slug == "off" { None } else { Some(slug) }
@@ -648,12 +697,12 @@ pub(crate) use zhipu::{is_zhipu_provider_slug, zhipu_reasoning_effort_api_value}
 /// helper because the Responses adapter owns the item type but the conversion
 /// happens here, in the shared messages→input builder.
 fn responses_input_item_value(
-    item: responses::ResponsesInputItem,
+    item: &responses::ResponsesInputItem,
 ) -> Result<serde_json::Value, OpenAiError> {
-    serde_json::to_value(&item).map_err(|e| OpenAiError::Io(io::Error::other(e)))
+    serde_json::to_value(item).map_err(|e| OpenAiError::Io(io::Error::other(e)))
 }
 
-/// Convert ChatRequestMessage slice to Responses API input format.
+/// Convert `ChatRequestMessage` slice to Responses API input format.
 /// System messages go into `input` as `{role: "system"}` items (not the
 /// `instructions` field); the `instructions` field is a separate top-level
 /// parameter set via explicit provider configuration.
@@ -673,7 +722,7 @@ pub(crate) fn messages_to_responses_input(
             "system" => {
                 if let Some(ref content) = msg.content {
                     items.push(responses_input_item_value(
-                        responses::ResponsesInputItem::Message {
+                        &responses::ResponsesInputItem::Message {
                             role: "system".to_string(),
                             content: serde_json::Value::String(content.clone()),
                         },
@@ -702,7 +751,7 @@ pub(crate) fn messages_to_responses_input(
                 // empty input item would be meaningless).
                 if msg.content.is_some() || !msg.images.is_empty() {
                     items.push(responses_input_item_value(
-                        responses::ResponsesInputItem::Message {
+                        &responses::ResponsesInputItem::Message {
                             role: msg.role.to_string(),
                             content: msg.responses_content_value(),
                         },
@@ -715,7 +764,7 @@ pub(crate) fn messages_to_responses_input(
                     && let Some(ref content) = msg.content
                 {
                     items.push(responses_input_item_value(
-                        responses::ResponsesInputItem::FunctionCallOutput {
+                        &responses::ResponsesInputItem::FunctionCallOutput {
                             call_id: call_id.clone(),
                             output: content.clone(),
                             caller: None,
@@ -774,7 +823,7 @@ use crate::{ChatTurnRequest, ProviderClient};
 use choreo_proto::InferenceError;
 
 impl ProviderClient for OpenAiClient {
-    fn provider_slug(&self) -> &str {
+    fn provider_slug(&self) -> &'static str {
         "openai"
     }
 

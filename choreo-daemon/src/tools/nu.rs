@@ -45,10 +45,10 @@ impl Tool for NuShell {
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Running nushell command: `{}`.", args.command)];
         if let Some(ref wd) = args.workdir {
-            parts.push(format!(" Working directory: `{}`.", wd));
+            parts.push(format!(" Working directory: `{wd}`."));
         }
         if let Some(timeout) = args.timeout {
-            parts.push(format!(" Timeout: {}ms.", timeout));
+            parts.push(format!(" Timeout: {timeout}ms."));
         }
         parts.concat()
     }
@@ -89,6 +89,12 @@ impl Tool for NuShell {
     }
 }
 
+/// Run a command in `nu` (nushell) and return its output.
+///
+/// # Errors
+///
+/// Returns Err if nushell cannot be spawned, the command times out, or the
+/// command exits non-zero.
 pub fn execute_nu_tool(args: &NuArgs, working_dir: Option<&Path>) -> Result<String, ToolExecError> {
     let command = &args.command;
     let timeout_ms = args.timeout.unwrap_or(30000);
@@ -115,8 +121,8 @@ mod tests {
     #[test]
     fn nushell_tool_has_valid_metadata() {
         let tool = super::NuShell;
-        assert!(!tool.name().is_empty());
-        assert!(!tool.description().is_empty());
+        assert_ne!(tool.name(), "");
+        assert_ne!(tool.description(), "");
         let schema = tool.schema();
         assert!(schema.is_object());
     }

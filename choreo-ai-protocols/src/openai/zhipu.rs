@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 /// chat adapter must apply z.ai's model-specific `reasoning_effort` mapping
 /// to (see [`zhipu_reasoning_effort_api_value`]):
 ///
-/// - `"zai"` — the z.ai PaaS gateway,
+/// - `"zai"` — the z.ai `PaaS` gateway,
 /// - `"zhipuai"` — the mainland bigmodel endpoint.
 ///
 /// This mirrors `images::is_zhipu_image_provider_slug`, which exists for the
@@ -26,7 +26,7 @@ pub(crate) fn is_zhipu_provider_slug(slug: &str) -> bool {
 /// `reasoning_effort` wire value for the given model (chat-completions
 /// API, docs.z.ai — POST /paas/v4/chat/completions).
 ///
-/// z.ai's API does not accept the full OpenAI effort set, and the accepted
+/// z.ai's API does not accept the full `OpenAI` effort set, and the accepted
 /// values differ by model generation:
 ///
 /// - **GLM-5.3 / GLM-5.3-flash** accept ONLY `low` / `high` / `max`, and

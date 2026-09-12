@@ -477,6 +477,48 @@ fn wrap_styled_line_joined(
     out: &mut Vec<Line<'static>>,
     joins: &mut Vec<LineJoin>,
 ) {
+    /// Push the line currently in `line_spans`, recording the join that was
+    /// pending for it, then set the join for the row that follows (a mid-word
+    /// continuation — used by split-word handling).
+    fn push_current(
+        out: &mut Vec<Line<'static>>,
+        joins: &mut Vec<LineJoin>,
+        line_spans: &mut Vec<Span<'static>>,
+        pending_join: &mut LineJoin,
+        line_width: &mut usize,
+    ) {
+        out.push(Line::from(std::mem::take(line_spans)));
+        joins.push(*pending_join);
+        *line_width = 0;
+        *pending_join = LineJoin::Join;
+    }
+
+    /// Split an over-long word across lines, used when the word alone does
+    /// not fit on the current (possibly just-flushed) line.
+    #[allow(clippy::too_many_arguments)] // all args are distinct writer state; a struct would obscure the loop
+    fn push_split_word(
+        text: &str,
+        style: Style,
+        max_width: usize,
+        out: &mut Vec<Line<'static>>,
+        joins: &mut Vec<LineJoin>,
+        pending_join: &mut LineJoin,
+        line_spans: &mut Vec<Span<'static>>,
+        line_width: &mut usize,
+    ) {
+        let chunks = split_word_to_width(text, max_width);
+        for (ci, chunk) in chunks.iter().enumerate() {
+            if ci > 0 {
+                // A new row begins with this chunk — a mid-word continuation
+                // of the previous row's text.
+                push_current(out, joins, line_spans, pending_join, line_width);
+            }
+            let cw = display_width(chunk);
+            line_spans.push(Span::styled(chunk.clone(), style));
+            *line_width += cw;
+        }
+    }
+
     // ── 1. Tokenize the line into (style, text, is_space) triplets ───────
     //
     // We split each span's content at whitespace boundaries so that we can
@@ -538,48 +580,6 @@ fn wrap_styled_line_joined(
     // ([`LineJoin::Space`]); after a split-word flush the next row is a
     // mid-word continuation ([`LineJoin::Join`]).
     let mut pending_join = LineJoin::Break;
-
-    /// Push the line currently in `line_spans`, recording the join that was
-    /// pending for it, then set the join for the row that follows (a mid-word
-    /// continuation — used by split-word handling).
-    fn push_current(
-        out: &mut Vec<Line<'static>>,
-        joins: &mut Vec<LineJoin>,
-        line_spans: &mut Vec<Span<'static>>,
-        pending_join: &mut LineJoin,
-        line_width: &mut usize,
-    ) {
-        out.push(Line::from(std::mem::take(line_spans)));
-        joins.push(*pending_join);
-        *line_width = 0;
-        *pending_join = LineJoin::Join;
-    }
-
-    /// Split an over-long word across lines, used when the word alone does
-    /// not fit on the current (possibly just-flushed) line.
-    #[allow(clippy::too_many_arguments)] // all args are distinct writer state; a struct would obscure the loop
-    fn push_split_word(
-        text: &str,
-        style: Style,
-        max_width: usize,
-        out: &mut Vec<Line<'static>>,
-        joins: &mut Vec<LineJoin>,
-        pending_join: &mut LineJoin,
-        line_spans: &mut Vec<Span<'static>>,
-        line_width: &mut usize,
-    ) {
-        let chunks = split_word_to_width(text, max_width);
-        for (ci, chunk) in chunks.iter().enumerate() {
-            if ci > 0 {
-                // A new row begins with this chunk — a mid-word continuation
-                // of the previous row's text.
-                push_current(out, joins, line_spans, pending_join, line_width);
-            }
-            let cw = display_width(chunk);
-            line_spans.push(Span::styled(chunk.clone(), style));
-            *line_width += cw;
-        }
-    }
 
     for token in &tokens {
         if token.is_space {
@@ -769,6 +769,36 @@ pub(crate) fn render_turn_lines(
     reasoning_expanded: bool,
     tool_results_collapsed: &[bool],
 ) -> RenderedTurnLines {
+    /// Tools whose result content is Markdown by design and may therefore be
+    /// parsed as markdown. `pdf_to_markdown` emits extracted page text;
+    /// `write_file` emits the written file's full contents fenced as a code
+    /// block (daemon `tools/fs/write_file.rs`, fence sized by
+    /// `fence_content` so file bytes — backtick runs included — can never
+    /// close it early, language tag from `ext_to_lang`);
+    /// `git_diff`/`git_show`/`git_add`/`edit_file` emit ` ```diff `-fenced
+    /// unified diffs (the daemon wraps every diff via `diff_util::generate_diff`
+    /// — git tools through `append_fenced_diff`/`git_diff_impl`,
+    /// `tools/git/{diff,show,stage}.rs`; `edit_file` inline at
+    /// `tools/fs/edit_file.rs`) — parsing those results as markdown is
+    /// exactly what lets the renderer's ` ```diff ` handling (see
+    /// `render_markdown_block`) turn each fence interior into a
+    /// side-by-side/unified diff, and turns `write_file`'s fence into a
+    /// syntax-highlighted code block instead of literal fence markers.
+    /// Everything else renders as **plain text** —
+    /// verbatim — so `**` in a grep match or shell line is data, not emphasis,
+    /// and a hostile result cannot weaponize markdown syntax to restyle or
+    /// hide part of the output. Fail-closed: a tool not listed here never
+    /// reaches the markdown parser, and a ` ```diff ` fence outside one of
+    /// these tools is literal data, not diff opt-in.
+    const MARKDOWN_TOOLS: &[&str] = &[
+        "pdf_to_markdown",
+        "git_diff",
+        "git_show",
+        "git_add",
+        "edit_file",
+        "write_file",
+    ];
+
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     // Per-line content column ranges, aligned with `all_lines` (see
     // `RenderedTurnLines::content_ranges`).  Every line kind below records
@@ -923,36 +953,6 @@ pub(crate) fn render_turn_lines(
     // else — including errors — defaults to expanded.
     let mut tool_result_header_idxs: Vec<usize> = Vec::new();
 
-    /// Tools whose result content is Markdown by design and may therefore be
-    /// parsed as markdown. `pdf_to_markdown` emits extracted page text;
-    /// `write_file` emits the written file's full contents fenced as a code
-    /// block (daemon `tools/fs/write_file.rs`, fence sized by
-    /// `fence_content` so file bytes — backtick runs included — can never
-    /// close it early, language tag from `ext_to_lang`);
-    /// `git_diff`/`git_show`/`git_add`/`edit_file` emit ` ```diff `-fenced
-    /// unified diffs (the daemon wraps every diff via `diff_util::generate_diff`
-    /// — git tools through `append_fenced_diff`/`git_diff_impl`,
-    /// `tools/git/{diff,show,stage}.rs`; `edit_file` inline at
-    /// `tools/fs/edit_file.rs`) — parsing those results as markdown is
-    /// exactly what lets the renderer's ` ```diff ` handling (see
-    /// `render_markdown_block`) turn each fence interior into a
-    /// side-by-side/unified diff, and turns `write_file`'s fence into a
-    /// syntax-highlighted code block instead of literal fence markers.
-    /// Everything else renders as **plain text** —
-    /// verbatim — so `**` in a grep match or shell line is data, not emphasis,
-    /// and a hostile result cannot weaponize markdown syntax to restyle or
-    /// hide part of the output. Fail-closed: a tool not listed here never
-    /// reaches the markdown parser, and a ` ```diff ` fence outside one of
-    /// these tools is literal data, not diff opt-in.
-    const MARKDOWN_TOOLS: &[&str] = &[
-        "pdf_to_markdown",
-        "git_diff",
-        "git_show",
-        "git_add",
-        "edit_file",
-        "write_file",
-    ];
-
     for (i, tr) in turn.tool_results.iter().enumerate() {
         let accent = if tr.is_error {
             Color::Red
@@ -1090,7 +1090,7 @@ pub(crate) fn render_turn_lines(
         // the full area width with exactly 1 column of right margin.
         for (line, join) in body.into_iter().zip(body_joins) {
             let mut line = line;
-            let content_sum: usize = line.spans.iter().map(|s| s.width()).sum();
+            let content_sum: usize = line.spans.iter().map(ratatui::prelude::Span::width).sum();
             let fill = (tool_content_width as usize).saturating_sub(content_sum);
             line.spans
                 .push(Span::styled(" ".repeat(fill), Style::default()));
@@ -1294,9 +1294,8 @@ pub(crate) fn markdown_lines_joined(
     // instead of `#`; since the decorative prefixes below are anchored to
     // level 1, we shift every heading down by (first_level - 1) so a
     // `## First / ### Sub` document renders as level 1 + level 2.
-    let heading_shift = first_heading_level(&document.blocks)
-        .map(|level| (level.saturating_sub(1)) as usize)
-        .unwrap_or(0);
+    let heading_shift =
+        first_heading_level(&document.blocks).map_or(0, |level| (level.saturating_sub(1)) as usize);
     let mut lines = Vec::new();
     let mut joins = Vec::new();
     render_markdown_blocks(
@@ -1437,7 +1436,7 @@ fn render_markdown_block(
             let (heading_lines, heading_joins) = inlines_to_lines(
                 content,
                 indent,
-                prefix,
+                prefix.as_deref(),
                 width,
                 Modifier::BOLD | Modifier::UNDERLINED,
             );
@@ -1491,8 +1490,7 @@ fn render_markdown_block(
 
             let header = language
                 .as_deref()
-                .map(|value| format!("```{value}"))
-                .unwrap_or_else(|| "```".to_string());
+                .map_or_else(|| "```".to_string(), |value| format!("```{value}"));
             lines.push(indented_line(indent, header));
             joins.push(LineJoin::Break);
 
@@ -1600,11 +1598,9 @@ fn render_markdown_block(
                 // marker digits at 9, so `start` is small today, but the marker
                 // arithmetic must never be able to overflow (and panic in debug)
                 // if a parser or future input ever allows a larger start.
-                items
-                    .len()
-                    .checked_sub(1)
-                    .map(|last| display_width(&format!("{}. ", start.saturating_add(last))))
-                    .unwrap_or(0)
+                items.len().checked_sub(1).map_or(0, |last| {
+                    display_width(&format!("{}. ", start.saturating_add(last)))
+                })
             } else {
                 display_width("• ")
             };
@@ -1929,8 +1925,7 @@ fn render_table_row_wrapped(
             let cell_line = wrapped_cells
                 .get(column_index)
                 .and_then(|cell| cell.get(line_index))
-                .map(String::as_str)
-                .unwrap_or("");
+                .map_or("", String::as_str);
             let Some(cell_width) = widths.get(column_index) else {
                 continue;
             };
@@ -2079,12 +2074,12 @@ fn append_inline_plain_text(inlines: &[MarkdownInline], text: &mut String) {
             MarkdownInline::Image { alt, destination } => {
                 text.push_str("[image: ");
                 append_inline_plain_text(alt, text);
-                if !destination.is_empty() {
+                if destination.is_empty() {
+                    text.push(']');
+                } else {
                     text.push_str("] (");
                     text.push_str(destination);
                     text.push(')');
-                } else {
-                    text.push(']');
                 }
             }
             MarkdownInline::LineBreak => text.push('\n'),
@@ -2113,7 +2108,7 @@ fn indented_line_as_spans(indent: usize, mut spans: Vec<Span<'static>>) -> Line<
 fn inlines_to_lines(
     inlines: &[MarkdownInline],
     indent: usize,
-    prefix: Option<String>,
+    prefix: Option<&str>,
     width: usize,
     modifier: Modifier,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>) {
@@ -2125,8 +2120,8 @@ fn inlines_to_lines(
         current_spans.push(Span::styled(" ".repeat(indent), Style::default()));
         current_width += indent;
     }
-    if let Some(ref prefix) = prefix {
-        current_spans.push(Span::styled(prefix.clone(), Style::default()));
+    if let Some(prefix) = prefix {
+        current_spans.push(Span::styled(prefix.to_string(), Style::default()));
         current_width += display_width(prefix);
     }
     let mut needs_separator = false;
@@ -2192,7 +2187,7 @@ struct RenderCtx<'a> {
     modifier: Modifier,
 }
 
-impl<'a> RenderCtx<'a> {
+impl RenderCtx<'_> {
     fn base_style(&self) -> Style {
         Style::default().add_modifier(self.modifier)
     }
@@ -2287,10 +2282,10 @@ fn render_inlines_to_lines(inlines: &[MarkdownInline], ctx: &mut RenderCtx) {
 
                 render_inlines_to_lines(alt, ctx);
 
-                let suffix = if !destination.is_empty() {
-                    format!("] ({destination})")
-                } else {
+                let suffix = if destination.is_empty() {
                     "]".to_string()
+                } else {
+                    format!("] ({destination})")
                 };
                 let suffix_width = display_width(&suffix);
                 let projected = *ctx.current_width + suffix_width;
@@ -2496,8 +2491,8 @@ fn render_style_inline(content: &[MarkdownInline], ctx: &mut RenderCtx, modifier
 /// without any link-specific styling (bare `[...]()` with no URL).
 ///
 /// Modifier stacking works the same as [`render_style_inline`]: the BOLD
-/// flag is ORed in for the content, then removed for the separator, then
-/// UNDERLINED is ORed in for the URL alone, then fully restored.
+/// flag is `ORed` in for the content, then removed for the separator, then
+/// UNDERLINED is `ORed` in for the URL alone, then fully restored.
 fn render_link_inline(content: &[MarkdownInline], destination: &str, ctx: &mut RenderCtx) {
     if destination.is_empty() {
         render_inlines_to_lines(content, ctx);

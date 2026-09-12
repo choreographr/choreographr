@@ -12,11 +12,11 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Shell {
-    /// Bourne Again SHell
+    /// Bourne Again `SHell`
     Bash,
-    /// Debian Almquist SHell
+    /// Debian Almquist `SHell`
     Dash,
-    /// Z SHell
+    /// Z `SHell`
     Zsh,
 }
 
@@ -79,7 +79,7 @@ impl Tool for Sh {
         let mut parts = vec![format!("Running shell command: `{}`.", args.command)];
         parts.push(format!(" Shell: {:?}.", args.shell));
         if let Some(timeout) = args.timeout {
-            parts.push(format!(" Timeout: {}ms.", timeout));
+            parts.push(format!(" Timeout: {timeout}ms."));
         }
         parts.concat()
     }
@@ -125,6 +125,13 @@ impl Tool for Sh {
     }
 }
 
+/// Run a command in the selected POSIX-compatible shell and return its
+/// output.
+///
+/// # Errors
+///
+/// Returns Err if the shell cannot be spawned, the command times out, or
+/// the command exits non-zero.
 pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<String, ToolExecError> {
     let shell_str = match args.shell {
         Shell::Bash => "bash",
@@ -161,8 +168,8 @@ mod tests {
     #[test]
     fn sh_tool_has_valid_metadata() {
         let tool = super::Sh;
-        assert!(!tool.name().is_empty());
-        assert!(!tool.description().is_empty());
+        assert_ne!(tool.name(), "");
+        assert_ne!(tool.description(), "");
         let schema = tool.schema();
         assert!(schema.is_object());
     }

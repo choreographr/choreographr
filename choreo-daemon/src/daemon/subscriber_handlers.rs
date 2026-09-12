@@ -15,7 +15,10 @@
 //! `use super::*`. The one shared broadcast helper it needs from outside the
 //! daemon module is imported explicitly.
 
-use super::*;
+use super::{
+    DaemonMessage, DaemonState, Ordering, SessionCommand, SessionEvent, SessionStatus,
+    SubscriberSink, catalog_provider_pairs, debug, info, warn,
+};
 use crate::broadcast::fan_out_evicting;
 
 /// True when a [`DaemonCommand::BroadcastActivity`] command's provenance and
@@ -91,13 +94,13 @@ impl DaemonState {
     /// two fan-outs run on the daemon command thread in the order written
     /// here, so the summary skip always observes the same membership the
     /// activity fan-out just served.
-    pub(super) fn broadcast(&mut self, msg: DaemonMessage) {
+    pub(super) fn broadcast(&mut self, msg: &DaemonMessage) {
         // Lifecycle events ride the activity bus too — an all-activity
         // subscriber must see sessions appear and disappear even though it
         // never joined the session-list bus.
         let (evict_activity, evict_activity_largest) = fan_out_evicting(
             &mut self.activity_subscribers,
-            &msg,
+            msg,
             &self.lag_limits,
             &self.global_lag,
             |_| false, // lifecycle events have no per-session dedup here
@@ -106,7 +109,7 @@ impl DaemonState {
 
         let (evict_clients, evict_largest) = fan_out_evicting(
             &mut self.summary_subscribers,
-            &msg,
+            msg,
             &self.lag_limits,
             &self.global_lag,
             |client_id| {
@@ -137,9 +140,9 @@ impl DaemonState {
     pub(super) fn handle_register_summary_subscriber(
         &mut self,
         client_id: u64,
-        writer: SubscriberSink,
+        writer: &SubscriberSink,
     ) {
-        self.summary_subscribers.insert(client_id, writer);
+        self.summary_subscribers.insert(client_id, writer.clone());
     }
 
     /// Unregister a client from session summary broadcasts.
@@ -153,7 +156,7 @@ impl DaemonState {
     /// This is the choke point that fixes stale statuses on the sessions page:
     /// the session thread broadcasts status changes (see `handle_status_changed`
     /// in sessions.rs) but never updates the daemon's `session_metadata` index,
-    /// so a subsequent ListSessions would serve an outdated status.  Updating
+    /// so a subsequent `ListSessions` would serve an outdated status.  Updating
     /// the index here covers every status-transition path.
     ///
     /// Status transitions are internal pipeline churn, not modifications: the
@@ -238,7 +241,7 @@ impl DaemonState {
     pub(super) fn handle_register_activity_subscriber(
         &mut self,
         client_id: u64,
-        writer: SubscriberSink,
+        writer: &SubscriberSink,
     ) {
         info!("registering activity subscriber: client_id={}", client_id);
         self.activity_subscribers.insert(client_id, writer.clone());
@@ -300,7 +303,7 @@ impl DaemonState {
     /// change).
     ///
     /// Called on a REAL lock-state TRANSITION (locked→unlocked after a
-    /// successful Unlock / AddCredential implicit unlock; unlocked→locked on
+    /// successful Unlock / `AddCredential` implicit unlock; unlocked→locked on
     /// `/lock`) so every connected client re-latches its banner — client B
     /// unlocking updates client A's status bar. `None` provenance (a flat,
     /// empty-variant control message) rides the standard lossless
@@ -310,7 +313,7 @@ impl DaemonState {
     /// keeping one shared broadcast path beats special-casing it away.
     pub(super) fn broadcast_lock_state(&mut self) {
         let msg = self.current_lock_message();
-        self.handle_broadcast_activity(None, msg);
+        self.handle_broadcast_activity(None, &msg);
     }
 
     /// Register a connection's writer channel so the shutdown path can route
@@ -510,7 +513,7 @@ impl DaemonState {
     pub(super) fn handle_broadcast_activity(
         &mut self,
         session_id: Option<u64>,
-        msg: DaemonMessage,
+        msg: &DaemonMessage,
     ) {
         // Tripwire for the dedup contract: the command provenance and the
         // message origin must AGREE. A `Some` origin on a non-session message
@@ -520,7 +523,7 @@ impl DaemonState {
         // origin differs from (or contradicts) the command's ships the event
         // to the wrong subscriber class. No current producer does this; warn
         // loudly if one ever does.
-        if violates_broadcast_origin_contract(session_id, &msg) {
+        if violates_broadcast_origin_contract(session_id, msg) {
             warn!(
                 session_id,
                 "BroadcastActivity violates the origin contract: command provenance and \
@@ -530,7 +533,7 @@ impl DaemonState {
         }
         let (evict_clients, evict_largest) = fan_out_evicting(
             &mut self.activity_subscribers,
-            &msg,
+            msg,
             &self.lag_limits,
             &self.global_lag,
             |client_id| {

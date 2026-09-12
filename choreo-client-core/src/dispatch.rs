@@ -122,7 +122,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
     debug!("dispatching daemon message: {msg:?}");
     match msg {
         DaemonMessage::Session { session_id, event } => {
-            dispatch_session_event(session_id, event, handler);
+            dispatch_session_event(session_id.as_ref(), event, handler);
         }
         flat => dispatch_flat_message(flat, handler),
     }
@@ -299,7 +299,7 @@ fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandle
 /// the no-origin case explicit instead of a magic `session_id: 0` leaking
 /// into handler code.
 fn dispatch_session_event(
-    session_id: &Option<u64>,
+    session_id: Option<&u64>,
     event: &SessionEvent,
     handler: &mut impl TurnEventHandler,
 ) {
@@ -318,18 +318,13 @@ fn dispatch_session_event(
     // touch BOTH sites; new requires-origin events touch only the lower match.
     match event {
         SessionEvent::Failed { request_id, error } => {
-            // `session_id` is `&Option<u64>` here, so `as_ref().copied()`
-            // yields the `Option<u64>` the handler wants (`copied()` itself
-            // only exists on `Option<&T>`).
-            handler.handle_failed(session_id.as_ref().copied(), *request_id, error.clone());
+            // `session_id` is `Option<&u64>` here, so `copied()` yields the
+            // `Option<u64>` the handler wants.
+            handler.handle_failed(session_id.copied(), *request_id, error.clone());
             return;
         }
         SessionEvent::Cancelled { request_id } => {
-            handler.handle_failed(
-                session_id.as_ref().copied(),
-                *request_id,
-                "cancelled".to_string(),
-            );
+            handler.handle_failed(session_id.copied(), *request_id, "cancelled".to_string());
             return;
         }
         SessionEvent::ModelSelectionFailed { model, error } => {
@@ -411,13 +406,13 @@ fn dispatch_session_event(
             });
         }
         SessionEvent::TurnAppended { turn_id, turn } => {
-            handler.handle_turn_appended(*session_id, *turn_id, turn.clone())
+            handler.handle_turn_appended(*session_id, *turn_id, turn.clone());;
         }
         SessionEvent::TurnsUndone { turn_ids } => {
-            handler.handle_turns_undone(*session_id, turn_ids)
+            handler.handle_turns_undone(*session_id, turn_ids);;
         }
         SessionEvent::TurnsRedone { turns } => {
-            handler.handle_turns_redone(*session_id, turns.clone())
+            handler.handle_turns_redone(*session_id, turns.clone());;
         }
         SessionEvent::Started {
             request_id,

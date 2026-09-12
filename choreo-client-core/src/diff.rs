@@ -102,6 +102,6 @@ mod tests {
             new_path: String::new(),
             hunks: vec![],
         };
-        assert!(fd.hunks.is_empty());
+        assert_eq!(fd.hunks, [] as [DiffHunk; 0]);
     }
 }

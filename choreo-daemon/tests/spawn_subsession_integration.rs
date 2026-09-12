@@ -20,10 +20,10 @@ use std::thread;
 
 mod common;
 
-/// Verify that SpawnSubsession::execute correctly communicates with the
-/// daemon to create a child session, sends the prompt via RunChildInput
-/// user_text, and returns the child's output as a tool result.
-#[ignore]
+/// Verify that `SpawnSubsession::execute` correctly communicates with the
+/// daemon to create a child session, sends the prompt via `RunChildInput`
+/// `user_text`, and returns the child's output as a tool result.
+#[ignore = "integration"]
 #[test]
 fn spawn_subsession_happy_path() {
     let db = Arc::new(common::test_db());
@@ -56,7 +56,7 @@ fn spawn_subsession_happy_path() {
                 assert_eq!(account_name, None);
                 // With no explicit categories, the tool inherits from
                 // ToolContext.active_tool_groups (empty in this test).
-                assert!(active_tool_groups.is_empty());
+                assert_eq!(active_tool_groups, [] as [std::string::String; 0]);
 
                 // Create a mock child session channel.
                 let (child_tx, child_rx) = mpsc::channel::<SessionCommand>();
@@ -132,7 +132,7 @@ fn spawn_subsession_happy_path() {
 
 /// When the daemon rejects session creation, the tool should propagate the
 /// error instead of panicking or hanging.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn spawn_subsession_daemon_rejects_creation() {
     let db = Arc::new(common::test_db());
@@ -186,7 +186,7 @@ fn spawn_subsession_daemon_rejects_creation() {
 
 /// When the daemon command channel is dropped before the tool sends its
 /// command, the tool should surface a communication error.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn spawn_subsession_daemon_disconnected() {
     let db = Arc::new(common::test_db());
@@ -228,9 +228,9 @@ fn spawn_subsession_daemon_disconnected() {
     }
 }
 
-/// When no ToolContext is provided, the tool should return an error rather
+/// When no `ToolContext` is provided, the tool should return an error rather
 /// than panicking with unwrap/expect.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn spawn_subsession_no_context() {
     let result = SpawnSubsession.execute(
@@ -256,9 +256,9 @@ fn spawn_subsession_no_context() {
     }
 }
 
-/// Verify that categories are inherited from ToolContext when not specified
+/// Verify that categories are inherited from `ToolContext` when not specified
 /// explicitly in the arguments.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn spawn_subsession_inherits_categories() {
     let db = Arc::new(common::test_db());
@@ -327,8 +327,8 @@ fn spawn_subsession_inherits_categories() {
 }
 
 /// Override categories via explicit argument — should take precedence over
-/// ToolContext.active_tool_groups.
-#[ignore]
+/// `ToolContext.active_tool_groups`.
+#[ignore = "integration"]
 #[test]
 fn spawn_subsession_overrides_categories() {
     let db = Arc::new(common::test_db());
@@ -394,9 +394,9 @@ fn spawn_subsession_overrides_categories() {
     daemon_handle.join().unwrap();
 }
 
-/// Verify that selected_model is inherited from ToolContext when creating a
+/// Verify that `selected_model` is inherited from `ToolContext` when creating a
 /// child session.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn spawn_subsession_inherits_selected_model() {
     let db = Arc::new(common::test_db());

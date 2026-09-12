@@ -2,7 +2,7 @@ use choreo_daemon::{RunRiscVInput, execute_run_riscv_tool};
 use std::path::Path;
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn simple_write() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
@@ -16,7 +16,7 @@ fn simple_write() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn exit_zero() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
@@ -29,13 +29,12 @@ fn exit_zero() {
     // VM should exit cleanly and show the exit banner.
     assert!(
         content.contains("exited with code 0"),
-        "expected exit banner: {}",
-        content
+        "expected exit banner: {content}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn with_args() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
@@ -53,7 +52,7 @@ fn with_args() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn cycle_limit_enforced() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
@@ -63,17 +62,16 @@ fn cycle_limit_enforced() {
         },
         Some(Path::new("/tmp")),
     );
-    assert!(result.is_err(), "expected error: {:?}", result);
+    assert!(result.is_err(), "expected error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("cycle limit") || err.contains("VM error"),
-        "expected cycle limit or VM error: {}",
-        err
+        "expected cycle limit or VM error: {err}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn compilation_error_invalid_rust() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
@@ -82,26 +80,25 @@ fn compilation_error_invalid_rust() {
         },
         Some(Path::new("/tmp")),
     );
-    assert!(result.is_err(), "expected error: {:?}", result);
+    assert!(result.is_err(), "expected error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("compilation error") || err.contains("compile"),
-        "expected compilation error: {}",
-        err
+        "expected compilation error: {err}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn missing_source_and_program() {
     let result = execute_run_riscv_tool(&RunRiscVInput::default(), None);
-    assert!(result.is_err(), "expected error: {:?}", result);
+    assert!(result.is_err(), "expected error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("source") || err.contains("program"), "{}", err);
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn both_source_and_program() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
@@ -111,13 +108,13 @@ fn both_source_and_program() {
         },
         None,
     );
-    assert!(result.is_err(), "expected error: {:?}", result);
+    assert!(result.is_err(), "expected error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("only one of"), "{}", err);
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn memory_size_not_aligned() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
@@ -127,13 +124,13 @@ fn memory_size_not_aligned() {
         },
         None,
     );
-    assert!(result.is_err(), "expected error: {:?}", result);
+    assert!(result.is_err(), "expected error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("multiple of 4096"), "{}", err);
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn memory_size_exceeds_max() {
     // One page over ckb-vm's hard cap (RISCV_MAX_MEMORY = 4MB in 0.24.14).
     // The tool must reject this with a clean validation error — a larger
@@ -146,13 +143,13 @@ fn memory_size_exceeds_max() {
         },
         None,
     );
-    assert!(result.is_err(), "expected error: {:?}", result);
+    assert!(result.is_err(), "expected error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("cannot exceed 4MB"), "{}", err);
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn memory_size_at_cap_passes_validation() {
     // memory_size == ckb-vm's RISCV_MAX_MEMORY (4MB) is the largest valid
     // size; validation must accept it and only fail later at ELF load time
@@ -165,7 +162,7 @@ fn memory_size_at_cap_passes_validation() {
         },
         None,
     );
-    assert!(result.is_err(), "expected error: {:?}", result);
+    assert!(result.is_err(), "expected error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(!err.contains("cannot exceed 4MB"), "{}", err);
     assert!(!err.contains("multiple of 4096"), "{}", err);
@@ -173,7 +170,7 @@ fn memory_size_at_cap_passes_validation() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn bitmanip_source_program() {
     // The daemon compiles `source` guests with -C opt-level=2 -C target-feature=+b,-a
     // (the `-a` disables the A/atomic extension; see atomic_guest_rejected_at_compile_time).
@@ -216,7 +213,7 @@ fn bitmanip_source_program() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn atomic_guest_rejected_at_compile_time() {
     // The daemon compiles `source` guests with -C opt-level=2 -C target-feature=+b,-a:
     // the RISC-V A (atomic) extension is disabled because the VM is single-hart
@@ -239,17 +236,16 @@ fn atomic_guest_rejected_at_compile_time() {
         },
         Some(Path::new("/tmp")),
     );
-    assert!(result.is_err(), "expected compile error: {:?}", result);
+    assert!(result.is_err(), "expected compile error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("compilation error") || err.contains("LLVM"),
-        "expected LLVM backend compile failure: {}",
-        err
+        "expected LLVM backend compile failure: {err}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn invalid_base64_program() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
@@ -258,13 +254,13 @@ fn invalid_base64_program() {
         },
         None,
     );
-    assert!(result.is_err(), "expected error: {:?}", result);
+    assert!(result.is_err(), "expected error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("base64 decode"), "{}", err);
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn program_path_missing_file() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
@@ -273,13 +269,13 @@ fn program_path_missing_file() {
         },
         None,
     );
-    assert!(result.is_err(), "expected error: {:?}", result);
+    assert!(result.is_err(), "expected error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("cannot read program file"), "{}", err);
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn program_path_runs_precompiled_elf() {
     // Compile a minimal no_std ELF externally (as a user would with rustc),
     // then verify the VM runs it straight from disk via `program_path`.
@@ -288,8 +284,7 @@ fn program_path_runs_precompiled_elf() {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let src_path = dir.join("guest.rs");
@@ -349,15 +344,14 @@ pub extern "C" fn _start() -> ! {
     assert!(content.contains("hello from file"), "{}", content);
     assert!(
         content.contains("exited with code 42"),
-        "expected exit banner: {}",
-        content
+        "expected exit banner: {content}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn write_with_vec() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {

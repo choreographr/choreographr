@@ -10,7 +10,7 @@
 /// pipeline) belong in crate-level tests/ directories and must be ignored so
 /// that `cargo test` runs only unit tests.
 #[test]
-#[ignore]
+#[ignore = "integration: spawns an external Node.js/npx subprocess per workspace test discipline"]
 fn mcp_server_everything_can_be_spawned_and_tools_listed() {
     // Watchdog: the stdlib test harness has no per-test timeout, so a
     // regression in spawn/shutdown would hang CI forever. Abort if the test

@@ -19,6 +19,7 @@ pub struct ContextWindowConfig {
 impl ContextWindowConfig {
     /// Resolve the context window for a specific model.
     /// Per-model entries take priority over the global fallback.
+    #[must_use]
     pub fn context_window_for_model(&self, model: &str) -> Option<u32> {
         self.per_model.get(model).copied().or(self.context_window)
     }
@@ -33,7 +34,7 @@ impl ContextWindowConfig {
             self.context_window = Some(cw);
         }
         if let Some(map) = per_model {
-            self.per_model = map.clone();
+            self.per_model.clone_from(map);
         }
     }
 }

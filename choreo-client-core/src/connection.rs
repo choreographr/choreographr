@@ -23,11 +23,19 @@ use tracing::{debug, error, info, warn};
 #[cfg(windows)]
 use uds_windows::UnixStream;
 
-/// Read DaemonMessages from `reader` in a blocking loop, calling
+/// Poll step for the writer's shutdown/queue select loop.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Read `DaemonMessages` from `reader` in a blocking loop, calling
 /// `handle_daemon_message` for each successfully decoded message.
 ///
 /// Returns `Ok(())` when the stream ends cleanly (EOF / connection reset).
 /// Returns `Err` on protocol or I/O errors.
+/// Drain a `BufRead` of framed `DaemonMessages` until EOF.
+///
+/// # Errors
+///
+/// Returns [`ClientError`] when the stream ends (EOF/closed connection), a
+/// frame fails to decode, or an I/O error occurs mid-stream.
 pub fn run_daemon_reader<R: BufRead>(
     mut reader: R,
     mut handle_daemon_message: impl FnMut(DaemonMessage),
@@ -67,6 +75,16 @@ pub fn run_daemon_reader<R: BufRead>(
     Ok(())
 }
 
+
+///
+/// # Errors
+///
+/// Returns [`ClientError`] if the unix socket cannot be connected, the
+/// Noise handshake fails, or the connection loop hits an I/O or protocol
+/// error.
+// needless_pass_by_value waived: the receivers are channel endpoints the
+// caller must move in; external TUI/GUI/IM callers rely on this signature.
+#[allow(clippy::needless_pass_by_value)]
 pub fn run_daemon_connection(
     socket_path: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
@@ -80,7 +98,7 @@ pub fn run_daemon_connection(
 
     // Channel to signal the writer thread to stop when the reader finishes.
     let (writer_shutdown_tx, writer_shutdown_rx) = mpsc::channel::<()>();
-    const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    
 
     let writer_handle = thread::spawn(move || {
         loop {
@@ -135,7 +153,7 @@ pub enum ConnectionMode {
     /// `known_servers.toml` for the address. The pin is loaded at connect
     /// time; a handshake failure is reported WITH the pinned fingerprint and
     /// the re-pair guidance, so a server key change is loud instead of an
-    /// opaque connection error (the known_hosts behavior).
+    /// opaque connection error (the `known_hosts` behavior).
     TcpPinned(String),
     /// Connect to an EMBEDDED daemon in the same process: `daemon_tx` is the
     /// client→daemon channel end, `daemon_rx` the daemon→client end (the raw
@@ -182,13 +200,22 @@ impl Default for ConnectionMode {
 /// Connect to a daemon via Noise IK over TCP.
 ///
 /// Uses two blocking threads:
-/// - Reader thread: blocks on NoiseStream::recv_daemon_message()
-/// - Writer thread: blocks on from_ui.recv_timeout()
-/// - Shutdown: blocks on shutdown_rx.recv(), then shuts down the TCP stream
+/// - Reader thread: blocks on `NoiseStream::recv_daemon_message()`
+/// - Writer thread: blocks on `from_ui.recv_timeout()`
+/// - Shutdown: blocks on `shutdown_rx.recv()`, then shuts down the TCP stream
 ///
 /// The reader thread has no read timeout — it blocks until a message arrives
 /// or the connection is closed. The writer thread uses a short timeout on its
 /// channel receive so it can also check for shutdown signals.
+
+///
+/// # Errors
+///
+/// Returns [`ClientError`] if dialing fails, the Noise IK handshake fails,
+/// or any reader/writer I/O error kills the connection.
+// needless_pass_by_value waived: same channel-endpoint ownership as
+// run_daemon_connection; external callers rely on this signature.
+#[allow(clippy::needless_pass_by_value)]
 pub fn run_daemon_tcp_connection(
     addr: &str,
     server_pk: &[u8; 32],
@@ -222,7 +249,7 @@ pub fn run_daemon_tcp_connection(
 /// The 1-byte handshake-mode preamble (TCP wire v5) goes out BEFORE any
 /// handshake message, then the Noise IK handshake runs. Returns the raw
 /// `TransportError` so callers can classify the failure (the
-/// ConnectionRefused wrapping lives one layer up, in
+/// `ConnectionRefused` wrapping lives one layer up, in
 /// [`ik_handshake_and_serve`]). Shared by the session-opening path and the
 /// [`verify_daemon_authorization`] preflight so both exercise the exact
 /// same wire sequence the daemon will judge.
@@ -285,6 +312,13 @@ fn ik_handshake_and_serve(
 ///
 /// Otherwise identical to [`run_daemon_tcp_connection`] (same reader/writer
 /// thread shape, same shutdown semantics — see [`serve_noise_connection`]).
+
+///
+/// # Errors
+///
+/// Returns [`ClientError`] if dialing fails, the XX handshake fails, the
+/// learned server key is rejected by `on_first_contact`, or an I/O error
+/// kills the connection.
 pub fn run_daemon_tcp_connection_xx_first_contact(
     addr: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
@@ -326,9 +360,9 @@ pub fn run_daemon_tcp_connection_xx_first_contact(
 /// an already-established `NoiseStream`.
 ///
 /// Uses two blocking threads:
-/// - Reader thread (the caller's): blocks on NoiseStream::recv_daemon_message()
-/// - Writer thread: blocks on from_ui.recv_timeout()
-/// - Shutdown: blocks on shutdown_rx.recv(), then shuts down the TCP stream
+/// - Reader thread (the caller's): blocks on `NoiseStream::recv_daemon_message()`
+/// - Writer thread: blocks on `from_ui.recv_timeout()`
+/// - Shutdown: blocks on `shutdown_rx.recv()`, then shuts down the TCP stream
 ///
 /// Extracted so [`run_daemon_tcp_connection`] (IK) and
 /// [`run_daemon_tcp_connection_xx_first_contact`] (XX) share one writer/reader
@@ -342,7 +376,7 @@ fn serve_noise_connection(
 ) -> Result<(), ClientError> {
     // Channel to signal writer thread to stop when reader finishes.
     let (writer_shutdown_tx, writer_shutdown_rx) = mpsc::channel::<()>();
-    const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    
 
     // Writer thread: blocks on from_ui.recv_timeout(), sends via NoiseStream.
     // The timeout is only so the writer can check the shutdown signal —
@@ -430,6 +464,10 @@ fn serve_noise_connection(
 /// daemon, so the daemon's ACL applies: probing requires the client's key
 /// to be enrolled. The daemon ACL check completes inside the XX handshake
 /// (after message 3), so a not-yet-enrolled client gets `Err` here too.
+///
+/// # Errors
+///
+/// Returns [`ClientError`] on connect/handshake/I/O failures while probing.
 pub fn probe_server_key(addr: &str) -> Result<[u8; 32], ClientError> {
     info!("probing server key at {addr} (XX first contact)");
 
@@ -479,6 +517,11 @@ pub enum PreflightError {
 /// keypair first if absent). This is the identity the daemon's ACL judges:
 /// UIs embed it (and its fingerprint) in enrollment-remediation messages so
 /// a TUI-only user never needs the daemon binary just to read out their key.
+///
+/// # Errors
+///
+/// Returns [`ClientError`] if the local transport keypair cannot be loaded
+/// or generated.
 pub fn own_transport_pubkey() -> Result<[u8; 32], ClientError> {
     let (_sk, pk) =
         ensure_transport_keypair().map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
@@ -503,6 +546,11 @@ pub fn own_transport_pubkey() -> Result<[u8; 32], ClientError> {
 /// The cost is one extra handshake per connect — negligible against the
 /// session it gates, and it converts "TUI starts, then dies with a cryptic
 /// I/O error on first use" into a clear refusal before any UI exists.
+///
+/// # Errors
+///
+/// Returns [`PreflightError`] if the recorded key is missing, unreadable,
+/// corrupt, or does not match `server_pk`.
 pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(), PreflightError> {
     info!(
         addr,
@@ -536,7 +584,7 @@ pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(
 /// The whole point of this wrapper is the failure UX: a HANDSHAKE failure
 /// against the pinned key carries the pinned fingerprint and the explicit
 /// re-pair instructions, so a server key change is a loud, actionable
-/// message rather than an opaque error (the known_hosts behavior). The
+/// message rather than an opaque error (the `known_hosts` behavior). The
 /// dial is performed HERE, as a separate step, so a network-down daemon is
 /// reported as a plain connect error WITHOUT the re-pair guidance — the
 /// remediation advice is reserved for the one failure it actually applies
@@ -544,6 +592,12 @@ pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(
 ///
 /// Errors if no pin exists for `addr` — callers must resolve first contact
 /// (probe + confirm + [`KnownServers::pin`]) before using this mode.
+
+///
+/// # Errors
+///
+/// Returns [`ClientError`] if dialing or the pinned-key IK handshake fails,
+/// or an I/O error kills the connection.
 pub fn run_daemon_tcp_connection_pinned(
     addr: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
@@ -639,7 +693,7 @@ fn run_daemon_connection_in_process(
     mut handle_daemon_message: impl FnMut(DaemonMessage),
     from_ui: mpsc::Receiver<ClientMessage>,
     shutdown_rx: Option<mpsc::Receiver<()>>,
-) -> Result<(), ClientError> {
+) {
     info!("serving in-process (embedded daemon) connection");
 
     // Internal writer-shutdown channel — same shape as the socket modes: the
@@ -652,7 +706,7 @@ fn run_daemon_connection_in_process(
     // The `from_ui` parameter itself stays std `mpsc`: its type is the
     // pre-existing public signature shared with the socket modes.
     let (writer_shutdown_tx, writer_shutdown_rx) = crossbeam_channel::bounded::<()>(0);
-    const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    
 
     // Writer thread: drains `from_ui` into `daemon_tx` — the identical
     // recv_timeout + shutdown-check loop the socket writer threads run; a
@@ -695,7 +749,7 @@ fn run_daemon_connection_in_process(
         thread::spawn(move || {
             // A send failure here is benign: the reader finished first and
             // dropped the writer-shutdown sender side.
-            let _ = shutdown_rx.recv().map(|_| writer_tx.send(()));
+            let _ = shutdown_rx.recv().map(|()| writer_tx.send(()));
         });
     }
 
@@ -709,11 +763,16 @@ fn run_daemon_connection_in_process(
     // Signal the writer to stop and wait for it (same tail as the unix path).
     let _ = writer_shutdown_tx.send(());
     let _ = writer_handle.join();
-    Ok(())
 }
 
 /// Connect to a daemon using the given connection mode.
 /// Dispatches to the appropriate connection function.
+
+///
+/// # Errors
+///
+/// Returns [`ClientError`] as raised by the connection mode actually used
+/// (unix, TCP variants, first-contact preflight, or in-process).
 pub fn run_daemon_connection_with_mode(
     mode: ConnectionMode,
     handle_daemon_message: impl FnMut(DaemonMessage),
@@ -737,13 +796,16 @@ pub fn run_daemon_connection_with_mode(
         ConnectionMode::InProcess {
             daemon_tx,
             daemon_rx,
-        } => run_daemon_connection_in_process(
-            daemon_tx,
-            daemon_rx,
-            handle_daemon_message,
-            from_ui,
-            shutdown_rx,
-        ),
+        } => {
+            run_daemon_connection_in_process(
+                daemon_tx,
+                daemon_rx,
+                handle_daemon_message,
+                from_ui,
+                shutdown_rx,
+            );
+            Ok(())
+        }
     }
 }
 

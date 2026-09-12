@@ -96,7 +96,7 @@ fn build_chat_request_messages_with_tool_calls() {
     );
     // Placeholder results are seeded in call order; the finished tool
     // updates its slot in place.
-    session.seed_tool_results(tid, &records, &["".into()]);
+    session.seed_tool_results(tid, &records, &[String::new()]);
     session.update_tool_result(
         tid,
         "call_1",
@@ -121,6 +121,8 @@ fn build_chat_request_messages_with_tool_calls() {
 /// Write a tiny opaque PNG to a temp file and return the handle plus its path.
 fn write_temp_png() -> tempfile::NamedTempFile {
     let buf = image::ImageBuffer::from_fn(3, 2, |x, y| {
+        // u8 pixel coordinates (3×2 image): the arithmetic never exceeds u8.
+        #[allow(clippy::cast_possible_truncation)]
         image::Rgb([(x * 80) as u8, (y * 90) as u8, 40])
     });
     let mut file = tempfile::NamedTempFile::new().expect("temp png");
@@ -149,7 +151,7 @@ fn session_with_image_result() -> (SessionState, tempfile::NamedTempFile) {
         },
     );
     let calls = session.turns[&tid].tool_calls.clone();
-    session.seed_tool_results(tid, &calls, &["".into()]);
+    session.seed_tool_results(tid, &calls, &[String::new()]);
     let img_ref = choreo_proto::ImageReference {
         path: file.path().display().to_string(),
         mime_type: "image/jpeg".into(),
@@ -230,13 +232,13 @@ fn build_chat_request_messages_vision_model_empty_bytes_places_placeholder() {
             tool_calls: vec![AssistantToolCallRecord {
                 call_id: "c".into(),
                 name: "read_image".into(),
-                arguments_json: r#"{}"#.into(),
+                arguments_json: r"{}".into(),
             }],
             ..Default::default()
         },
     );
     let calls = session.turns[&tid].tool_calls.clone();
-    session.seed_tool_results(tid, &calls, &["".into()]);
+    session.seed_tool_results(tid, &calls, &[String::new()]);
     session.update_tool_result(
         tid,
         "c",
@@ -322,7 +324,7 @@ fn anthropic_producer() -> ReasoningProducer {
     }
 }
 
-/// Non-DeepSeek OpenAI-compat chat provider: ToolLoop passback but no
+/// Non-DeepSeek OpenAI-compat chat provider: `ToolLoop` passback but no
 /// `reasoning_content` injection — the generalized fallback must cover it.
 const GROQ_MODEL: &str = "groq/llama-3.3-70b-versatile";
 
@@ -350,7 +352,7 @@ fn artifact(bytes: &[u8]) -> ReasoningArtifact {
 }
 
 /// Add a turn with an optional artifact/producer and optional assistant
-/// tool calls, returning its turn_id.
+/// tool calls, returning its `turn_id`.
 fn add_turn(
     session: &mut SessionState,
     user_text: &str,
@@ -1019,7 +1021,7 @@ fn guard_warns_when_tool_involving_turn_lacks_artifact() {
             ..Default::default()
         },
     );
-    session.seed_tool_results(tid, &records, &["".into()]);
+    session.seed_tool_results(tid, &records, &[String::new()]);
     // Tool-involving turn WITH an artifact: clean.
     add_turn(
         &mut session,
@@ -1166,7 +1168,7 @@ fn guard_skipped_for_non_echo_policies() {
             ..Default::default()
         },
     );
-    session.seed_tool_results(tid, &records, &["".into()]);
+    session.seed_tool_results(tid, &records, &[String::new()]);
     // ResponseId policy: artifacts flow via previous_response_id, so the
     // guard must not flag the missing message artifact.
     assert_eq!(
@@ -1229,7 +1231,7 @@ fn config_change_call(name: &str, arguments_json: &str) -> ChatToolCall {
 }
 
 /// A successful tool output with the given structured result (or `None`
-/// for tools whose result_json wasn't captured).
+/// for tools whose `result_json` wasn't captured).
 fn ok_output(result_json: Option<serde_json::Value>) -> ToolOutput {
     ToolOutput {
         content: String::new(),
@@ -1563,7 +1565,7 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
         7,
         &cancel_rx,
         &ctx,
-        Some("hi".into()),
+        Some("hi"),
     );
 
     // The inference error propagates to the caller unchanged.
@@ -1887,7 +1889,7 @@ fn run_exec_tool(
     tool_name: &str,
     tool_args: &str,
     timeout_dur: Duration,
-    cancel_rx: crossbeam_channel::Receiver<()>,
+    cancel_rx: &crossbeam_channel::Receiver<()>,
 ) -> (ToolOutput, bool, mpsc::Receiver<SessionCommand>) {
     let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
@@ -1927,7 +1929,7 @@ fn run_exec_tool(
         1,
         1,
         &mut session,
-        &cancel_rx,
+        cancel_rx,
         &ctx,
         "test invocation",
     );
@@ -1942,7 +1944,7 @@ fn execute_tool_normal_completion() {
         "_test_fast",
         "{}",
         Duration::from_secs(60),
-        cancel_rx,
+        &cancel_rx,
     );
     assert!(!result.is_error, "expected success: {}", result.content);
     assert!(result.content.contains("fast result"), "{}", result.content);
@@ -1968,7 +1970,7 @@ fn execute_tool_cancelled_before_execution() {
         "_test_blocking",
         "{}",
         Duration::from_secs(60),
-        cancel_rx,
+        &cancel_rx,
     );
     assert!(result.is_error, "expected error: {}", result.content);
     assert!(result.content.contains("cancelled"), "{}", result.content);
@@ -2003,7 +2005,7 @@ fn execute_tool_timeout() {
         "_test_blocking",
         "{}",
         Duration::ZERO,
-        cancel_rx,
+        &cancel_rx,
     );
 
     assert!(result.is_error, "expected error: {}", result.content);
@@ -2148,7 +2150,7 @@ fn execute_tool_forwards_streaming_output() {
         "_test_streaming",
         "{}",
         Duration::from_secs(60),
-        cancel_rx,
+        &cancel_rx,
     );
 
     assert!(!result.is_error, "expected success: {}", result.content);
@@ -2356,7 +2358,7 @@ fn determine_tool_timeout_requested_above_base_raises_deadline() {
     // request plus the teardown grace (5s).
     assert_eq!(
         determine_tool_timeout("sh", r#"{"timeout": 1800000}"#),
-        Some(Duration::from_millis(1_800_000) + TOOL_TIMEOUT_GRACE),
+        Some(Duration::from_mins(30) + TOOL_TIMEOUT_GRACE),
     );
 }
 
@@ -2424,13 +2426,17 @@ fn determine_tool_timeout_generate_image_covers_adapter_worst_case() {
 /// assertion inspects the daemon or session command streams here.
 fn spawn_test_ctx() -> (ToolContext, mpsc::Sender<SessionCommand>) {
     let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
-    let (_daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+    // Receiver is intentionally dropped immediately (see doc comment above);
+    // the sender is moved into the ToolContext, so no underscore binding is
+    // ever referenced.
+    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+    drop(daemon_rx);
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).expect("Database"));
     let ctx = ToolContext {
         session_id: 1,
         db,
-        daemon_tx: _daemon_tx,
+        daemon_tx,
         active_tool_groups: std::collections::HashSet::new(),
         reasoning_effort: None,
         selected_model: None,
@@ -2875,7 +2881,7 @@ fn persist_loaded_skill_skips_non_load_skill() {
 fn persist_loaded_skill_skips_missing_name() {
     let mut session = SessionState::empty();
     session.config.working_dir = Some(PathBuf::from("/tmp"));
-    persist_loaded_skill(&mut session, "load_skill", r#"{}"#);
+    persist_loaded_skill(&mut session, "load_skill", r"{}");
     assert!(session.loaded_skill_bodies.is_empty());
 }
 
@@ -2901,15 +2907,15 @@ fn setup_build_system_content_session() -> (SessionState, Arc<ToolRegistry>, tem
     (session, registry, dir)
 }
 
-/// Call build_system_content with standard defaults derived from the
-/// session state and optional pending_hints overrides.
+/// Call `build_system_content` with standard defaults derived from the
+/// session state and optional `pending_hints` overrides.
 fn test_build_content(
     session: &mut SessionState,
     registry: &ToolRegistry,
     pending_hints: &[String],
 ) -> Option<String> {
     build_system_content(
-        SystemContentParams {
+        &SystemContentParams {
             working_dir: session.config.working_dir.as_deref(),
             context_config: &session.config.context_config,
             skills: &[],
@@ -3002,7 +3008,7 @@ fn build_system_content_omits_empty_title() {
     assert!(!content.contains("## Current Session Title"));
 
     // Also omit when the title is an empty string.
-    session.config.title = Some("".into());
+    session.config.title = Some(String::new());
     let content2 = test_build_content(&mut session, &registry, &[]);
     assert!(content2.is_some());
     let content2 = content2.unwrap();

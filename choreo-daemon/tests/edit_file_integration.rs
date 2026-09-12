@@ -1,8 +1,8 @@
 //! Integration tests for the `edit_file` tool.
 //!
-//! These exercise real filesystem I/O (TempDir + writes + permission bits) and
+//! These exercise real filesystem I/O (`TempDir` + writes + permission bits) and
 //! therefore live in `tests/` per the project's Test Discipline policy rather
-//! than in `src/` unit-test modules. They are marked `#[ignore]` so `cargo
+//! than in `src/` unit-test modules. They are marked `#[ignore = "integration"]` so `cargo
 //! test` runs only unit tests; run with `cargo test-integration`.
 
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
@@ -37,7 +37,7 @@ fn edit_args(path: &Path, old: &str, new: &str) -> EditFileArgs {
 // copy behind (a `Permission denied` for `./script.sh`).
 #[cfg(unix)]
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn edit_preserves_execute_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -63,7 +63,7 @@ fn edit_preserves_execute_permissions() {
 // is 0600), rather than widening them.
 #[cfg(unix)]
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn edit_preserves_group_readable_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -79,7 +79,7 @@ fn edit_preserves_group_readable_permissions() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn edit_replaces_content() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("note.txt");
@@ -97,7 +97,7 @@ fn edit_replaces_content() {
 // with a regular file.
 #[cfg(unix)]
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn edit_through_symlink_updates_target_and_keeps_link() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -8,6 +8,7 @@ use alloy::primitives::{Address, Bytes};
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol_types::SolCall;
+use std::fmt::Write;
 use std::str::FromStr;
 
 async fn evm_token_balance_impl(
@@ -33,9 +34,9 @@ async fn evm_token_balance_impl(
     let balance = balanceOfCall::abi_decode_returns(&result).map_err(alloy_err)?;
 
     let mut out = String::new();
-    out.push_str(&format!("token_address: {token_address_str}\n"));
-    out.push_str(&format!("owner_address: {address_str}\n"));
-    out.push_str(&format!("balance: {balance}"));
+    let _ = write!(out, "token_address: {token_address_str}\n");
+    let _ = write!(out, "owner_address: {address_str}\n");
+    let _ = write!(out, "balance: {balance}");
 
     // Best-effort ERC-20 `symbol()` fetch — a non-standard token may revert,
     // in which case the balance result still stands without the symbol.
@@ -49,7 +50,7 @@ async fn evm_token_balance_impl(
     {
         // `symbol()` is contract-controlled free-form text — sanitize it so a
         // hostile token cannot corrupt the line-oriented output.
-        out.push_str(&format!("\nsymbol: {}\n", sanitize_value(&sym_ret)));
+        let _ = write!(out, "\nsymbol: {}\n", sanitize_value(&sym_ret));
     }
 
     Ok(out)
@@ -57,6 +58,11 @@ async fn evm_token_balance_impl(
 
 /// Synchronous entry point: runs [`evm_token_balance_impl`] on the sidecar
 /// runtime and caps the output at the shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`BlockchainError`] when the node is unreachable, the RPC call
+/// fails, or the capped sanitized output cannot be produced.
 pub fn execute_evm_token_balance(args: &EvmTokenBalanceArgs) -> Result<String, BlockchainError> {
     log_execution("evm_token_balance", &args.rpc_url);
     let output = block_on(rpc_call(evm_token_balance_impl(
@@ -67,6 +73,7 @@ pub fn execute_evm_token_balance(args: &EvmTokenBalanceArgs) -> Result<String, B
     Ok(truncate_tool_output(&output))
 }
 
+#[must_use]
 pub fn describe_evm_token_balance_invocation(args: &EvmTokenBalanceArgs) -> String {
     format!(
         "Querying ERC-20 balance of {} for token {} on {}.",

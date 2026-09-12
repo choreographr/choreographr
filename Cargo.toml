@@ -169,10 +169,6 @@ dependent-version = "fix"
 # - `unchecked_time_subtraction` denies `Instant - Duration` underflow.
 #
 # Deliberately NOT here (yet):
-# - `pedantic` is advisory-only for now (run `cargo clippy -- -W
-#   clippy::pedantic` to see ~800 findings, dominated by
-#   `cast_possible_truncation`); promote it to "deny" once the backlog is
-#   worked off.
 # - `nursery` is never denied: nursery lints are unstable (known false
 #   positives, added/removed between releases) and would hard-break builds
 #   on toolchain updates. Run it occasionally as an advisory pass.
@@ -181,7 +177,30 @@ dependent-version = "fix"
 #   adopted per-crate starting with the untrusted-input parsers.
 # - `as_conversions` waits until the cast_possible_truncation backlog is
 #   fixed (that work migrates most `as` casts to From/try_from anyway).
+#
+# `pedantic` is denied as a group with a small documented allow-list of
+# lints that conflict with this codebase's conventions (fixed the rest of
+# the pedantic backlog — casts, error docs, style — before flipping):
+# - too_many_lines: the workspace's parsers/renderers are long by design;
+#   denying would force artificial function splits with no payoff.
+# - match_same_arms: merging identical arms destroys the per-arm comments
+#   that document WHY distinct protocol states share a body (e.g. EAGAIN
+#   vs EINTR both meaning "retry").
+# - similar_names: binary-format code legitimately uses related
+#   identifiers (send_buf/send_frag, off/offset).
+# - struct_excessive_bools / struct_field_names: daemon/TUI state structs
+#   are flat snapshots by design; splitting them would fight the wire
+#   format.
 [workspace.lints.clippy]
+# ── pedantic group ──
+# priority = -1: the group must run BEFORE the individual allow entries
+# below it, or cargo rejects the same-priority mix.
+pedantic = { level = "deny", priority = -1 }
+too_many_lines = "allow"
+match_same_arms = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+struct_field_names = "allow"
 # ── panic family: no crash surfaces in production code ──
 unwrap_used = "deny"
 expect_used = "deny"

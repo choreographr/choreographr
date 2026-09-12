@@ -80,7 +80,7 @@ use crossterm::event::KeyEvent;
 /// `REPORT_ALL_KEYS_AS_ESCAPE_CODES` is deliberately **not** requested.  With
 /// it enabled, kitty-protocol terminals report *every* key as a CSI-u event,
 /// and text produced by an input method (IME) — e.g. Vietnamese composed by
-/// OpenKey — arrives as a pure "text event" with key number 0
+/// `OpenKey` — arrives as a pure "text event" with key number 0
 /// (`CSI 0;;<codepoints>u`, the third field carrying the composed text).
 /// crossterm 0.29 has no `KeyEvent` text field and silently drops that third
 /// field, turning the event into `KeyCode::Char('\0')`; the composed text is
@@ -118,7 +118,9 @@ const UI_EVENT_QUEUE_HIGH_WATER_MARK: usize = 16_384;
 /// On Windows the variants are never constructed (there is no job-control
 /// suspend and no SIGCONT/SIGTSTP), but the type is still referenced by
 /// `run_ui_loop`'s `select!` arm, so the dead-code lint is suppressed there.
-#[derive(Debug)]
+/// A `Copy` enum keeps `handle_resume_command(cmd, …)` call sites
+/// pass-by-value without triggering `needless_pass_by_value`.
+#[derive(Debug, Clone, Copy)]
 #[cfg_attr(windows, allow(dead_code))]
 enum ResumeCommand {
     /// SIGCONT was received — re-initialise raw mode, alternate screen,
@@ -567,7 +569,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         &mut app,
         &client_tx,
         &ui_rx,
-        worker.result_rx,
+        &worker.result_rx,
         &terminal_rx,
         &resume_rx,
     )
@@ -636,7 +638,7 @@ fn run_ui_loop(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
     ui_rx: &channel::Receiver<UiEvent>,
-    image_result_rx: channel::Receiver<ImageResult>,
+    image_result_rx: &channel::Receiver<ImageResult>,
     terminal_rx: &channel::Receiver<Event>,
     resume_rx: &channel::Receiver<ResumeCommand>,
 ) -> Result<(), ClientError> {
@@ -662,22 +664,19 @@ fn run_ui_loop(
                 }
             }
             recv(ui_rx) -> msg => {
-                match msg {
-                    Ok(event) => {
-                        if handle_ui_event(event, app, client_tx)? {
-                            dirty = true;
-                        }
+                if let Ok(event) = msg {
+                    if handle_ui_event(event, app, client_tx)? {
+                        dirty = true;
                     }
-                    Err(_) => {
-                        // Daemon channel disconnected — treat as closed.
-                        app.should_quit = true;
-                        // ReaderClosed normally carries the reason; this arm
-                        // only fires if the connection thread dropped its
-                        // sender without one (e.g. a panic mid-read).
-                        app.quit_message.get_or_insert_with(|| {
-                            "the connection to the daemon was closed".to_string()
-                        });
-                    }
+                } else {
+                    // Daemon channel disconnected — treat as closed.
+                    app.should_quit = true;
+                    // ReaderClosed normally carries the reason; this arm
+                    // only fires if the connection thread dropped its
+                    // sender without one (e.g. a panic mid-read).
+                    app.quit_message.get_or_insert_with(|| {
+                        "the connection to the daemon was closed".to_string()
+                    });
                 }
             }
             recv(image_result_rx) -> msg => {
@@ -766,11 +765,7 @@ fn run_ui_loop(
         // Clear the terminal-native progress bar when leaving Chat.
         // Updates are driven directly by the event handlers (Done,
         // SessionState) rather than through progress_dirty.
-        if app
-            .active_display_ref()
-            .map(|d| d.progress_dirty)
-            .unwrap_or(false)
-        {
+        if app.active_display_ref().is_some_and(|d| d.progress_dirty) {
             if let Some(d) = app.active_display() {
                 d.progress_dirty = false;
             }
@@ -920,7 +915,8 @@ pub(crate) fn handle_terminal_event(
             return Ok(());
         }
         tracing::debug!("[choreo-tui] handling paste event");
-        return handle_paste_event(data, app);
+        handle_paste_event(data, app);
+        return Ok(());
     }
 
     // Terminal-resize events are handled irrespective of page or fullscreen
@@ -943,13 +939,14 @@ pub(crate) fn handle_terminal_event(
     }
     // Fullscreen image overlay takes priority over page content.
     if app.fullscreen_image_target.is_some() {
-        return handle_fullscreen_event(event, app, client_tx);
+        handle_fullscreen_event(&event, app, client_tx);
+        return Ok(());
     }
     // The model selector overlay (Chat page) also takes priority over page
     // content, mirroring the fullscreen guard above.  Ctrl+Q is handled
     // before this point so the user can always quit while it is open.
     if app.model_selector.is_open() {
-        return handle_model_selector_event(event, app, client_tx);
+        return handle_model_selector_event(&event, app, client_tx);
     }
     // The account modals (new-account wizard + API-key entry) take the same
     // overlay priority over the AI providers page.  They can only be opened
@@ -959,18 +956,20 @@ pub(crate) fn handle_terminal_event(
     // are open: the wizard closes before the credential modal auto-opens
     // after account creation.
     if app.ai_providers.credential.is_open() {
-        return handle_credential_modal_event(event, app, client_tx);
+        handle_credential_modal_event(&event, app, client_tx);
+        return Ok(());
     }
     if app.ai_providers.wizard.is_open() {
-        return handle_account_wizard_event(event, app, client_tx);
+        return handle_account_wizard_event(&event, app, client_tx);
     }
     if app.ai_providers.polkadot_import.is_open() {
-        return handle_polkadot_import_event(event, app, client_tx);
+        handle_polkadot_import_event(&event, app, client_tx);
+        return Ok(());
     }
     match app.page {
-        Page::SessionManager => handle_session_manager_event(event, app, client_tx),
-        Page::AIProviders => handle_ai_providers_event(event, app, client_tx),
-        Page::Chat => handle_chat_event(event, app, client_tx),
+        Page::SessionManager => handle_session_manager_event(&event, app, client_tx),
+        Page::AIProviders => handle_ai_providers_event(&event, app, client_tx),
+        Page::Chat => handle_chat_event(&event, app, client_tx),
     }
 }
 
@@ -981,7 +980,7 @@ pub(crate) fn handle_terminal_event(
 /// selector's filter, when it is open) receives the paste; on the AI
 /// Providers page the credential modal's key input, or the wizard's
 /// provider filter / slug field, receives it.
-fn handle_paste_event(data: &str, app: &mut App) -> Result<(), ClientError> {
+fn handle_paste_event(data: &str, app: &mut App) {
     match app.page {
         Page::Chat => {
             // While the model selector is open, pasted text goes into its
@@ -989,7 +988,7 @@ fn handle_paste_event(data: &str, app: &mut App) -> Result<(), ClientError> {
             if app.model_selector.is_open() {
                 tracing::debug!("[choreo-tui] pasting into model selector filter");
                 app.model_selector.filter.insert_str_at_cursor(data);
-                return Ok(());
+                return;
             }
             tracing::debug!("[choreo-tui] pasting into chat input buffer");
             app.input.insert_str_at_cursor(data);
@@ -1021,9 +1020,11 @@ fn handle_paste_event(data: &str, app: &mut App) -> Result<(), ClientError> {
                 app.ai_providers.polkadot_import.handle_paste(data);
             }
         }
-        _ => {}
+        // Only three pages exist; `SessionManager` has no paste target, so
+        // name it instead of a wildcard that would silently absorb any new
+        // page added later.
+        Page::SessionManager => {}
     }
-    Ok(())
 }
 
 /// Efficiently insert a string at the cursor position of a `tui_prompts::State`.
@@ -1059,24 +1060,23 @@ fn paste_into_text_state(state: &mut impl tui_prompts::State, data: &str) {
 /// Only `Esc` (dismiss) is accepted; all other events are silently
 /// consumed.  Quit is handled via Ctrl+Q on the Chat page.
 fn handle_fullscreen_event(
-    event: Event,
+    event: &Event,
     app: &mut App,
     _client_tx: &std::sync::mpsc::Sender<ClientMessage>,
-) -> Result<(), ClientError> {
+) {
     let Event::Key(key) = event else {
-        return Ok(());
+        return;
     };
     if key.kind != KeyEventKind::Press {
-        return Ok(());
+        return;
     }
     if key.code == KeyCode::Esc {
         app.fullscreen_image_target = None;
     }
-    Ok(())
 }
 
-/// Process a single UiEvent and return whether the event was meaningful
-/// (i.e., not a control-flow event like ReaderClosed).
+/// Process a single `UiEvent` and return whether the event was meaningful
+/// (i.e., not a control-flow event like `ReaderClosed`).
 ///
 /// Returns `Ok(true)` when the event warrants a re-render, `Ok(false)` for
 /// control flow events, or `Err` on error.
@@ -1162,6 +1162,10 @@ pub(super) fn route_session_update(
 ///
 /// Kept out of the per-page modules so the confirm guard, the wheel scroll,
 /// and the left-click dispatch are written once instead of twice.
+// session_manager.rs also calls this with `&MouseEvent`; the signature is
+// shared, so the lint is silenced at function level (param attributes are not
+// honoured for this lint).
+#[allow(clippy::trivially_copy_pass_by_ref)]
 pub(super) fn handle_full_page_list_mouse(
     app: &mut App,
     mouse: &MouseEvent,
@@ -1427,6 +1431,9 @@ mod tests {
         let markers: Vec<Marker> = app.active_display_ref().unwrap().markers.clone();
         for marker in &markers {
             let row = marker.virtual_slot / 2;
+            // `virtual_slot` is a u16 track coordinate, so halving it always
+            // fits back into u16.
+            #[allow(clippy::cast_possible_truncation)]
             let found = find_marker_by_row(&app, row as u16);
             assert!(
                 found.is_some(),
@@ -1479,8 +1486,7 @@ mod tests {
             let first_visible = total.saturating_sub(scroll + vh);
             assert_eq!(
                 first_visible, cl,
-                "click on marker at content_line {} should make it the first visible line",
-                cl,
+                "click on marker at content_line {cl} should make it the first visible line",
             );
         }
     }

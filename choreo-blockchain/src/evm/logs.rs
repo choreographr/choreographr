@@ -6,6 +6,7 @@ use crate::{BlockchainError, truncate_tool_output};
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::Filter;
+use std::fmt::Write;
 use std::str::FromStr;
 
 async fn evm_logs_impl(
@@ -48,16 +49,17 @@ async fn evm_logs_impl(
     }
 
     let mut out = String::new();
-    out.push_str(&format!("log_count: {}\n\n", logs.len()));
+    let _ = writeln!(out, "log_count: {}\n\n", logs.len());
 
     for (i, log) in logs.iter().enumerate() {
         let log_address = log.address();
         let topics: Vec<String> = log.topics().iter().map(|t| format!("{t:#x}")).collect();
         let data_hex = hex::encode(log.data().data.clone());
-        out.push_str(&format!(
+        let _ = writeln!(
+            out,
             "log[{i}]:\n  address: {log_address}\n  topics: [{}]\n  data: 0x{data_hex}\n\n",
             topics.join(", ")
-        ));
+        );
     }
 
     Ok(out)
@@ -65,6 +67,11 @@ async fn evm_logs_impl(
 
 /// Synchronous entry point: runs [`evm_logs_impl`] on the sidecar runtime and
 /// caps the output at the shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`BlockchainError`] when the node is unreachable, the RPC call
+/// fails, or the capped sanitized output cannot be produced.
 pub fn execute_evm_logs(args: &EvmLogsArgs) -> Result<String, BlockchainError> {
     log_execution("evm_logs", &args.rpc_url);
     let output = block_on(rpc_call(evm_logs_impl(
@@ -77,13 +84,14 @@ pub fn execute_evm_logs(args: &EvmLogsArgs) -> Result<String, BlockchainError> {
     Ok(truncate_tool_output(&output))
 }
 
+#[must_use]
 pub fn describe_evm_logs_invocation(args: &EvmLogsArgs) -> String {
     let mut desc = format!("Querying event logs on {}.", args.rpc_url);
     if let Some(addr) = args.address.as_deref() {
-        desc.push_str(&format!(" Address: {addr}."));
+        let _ = write!(desc, " Address: {addr}.");
     }
     if let Some(t0) = args.topic0.as_deref() {
-        desc.push_str(&format!(" Topic0: {t0}."));
+        let _ = write!(desc, " Topic0: {t0}.");
     }
     desc
 }

@@ -39,7 +39,7 @@ pub struct OpenOptions {
     /// env/config; an embedder decides it directly.
     pub max_turns: u32,
     /// Optional bridge to the host's platform-native tools (clipboard,
-    /// open_url, notify on iOS). When `Some`, the `ios` tool group is
+    /// `open_url`, notify on iOS). When `Some`, the `ios` tool group is
     /// registered and PROTECTED (always active, unloadable by no one); the
     /// bridge's PRESENCE is the gate — a desktop embedder passes `None` and
     /// the group simply never exists. No `cfg` here on purpose: that keeps
@@ -56,6 +56,13 @@ impl DaemonState {
     /// Returns `io::Result` (not anyhow) so an embedder without the CLI's
     /// error-reporting stack can consume it directly; every failure carries
     /// its stage in the message.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the database cannot be opened or backed up, the
+    /// schema version cannot be read, tombstone purge or session index
+    /// load fails, accounts cannot be loaded, or tool registration under
+    /// `tool_policy` fails.
     pub fn open(opts: OpenOptions) -> io::Result<Self> {
         // Windows-safe startup sequence (verbatim from the CLI): redb holds a
         // whole-file exclusive lock on the database for as long as a
@@ -156,12 +163,7 @@ impl DaemonState {
             daemon_tx: mpsc::channel().0,
             // Derive the next session ID from the highest existing record so a
             // fresh daemon never collides with a persisted session.
-            next_session_id: session_metadata
-                .keys()
-                .max()
-                .copied()
-                .map(|m| m + 1)
-                .unwrap_or(1),
+            next_session_id: session_metadata.keys().max().copied().map_or(1, |m| m + 1),
             max_turns: opts.max_turns,
             active_sessions: HashMap::new(),
             session_metadata,
@@ -276,7 +278,7 @@ mod tests {
     /// bridge-gated, not platform-gated. They are available WITHOUT "ios"
     /// being in the caller-supplied active set (the protected-groups union
     /// rule), excluded from `group_names()` (no load/unload schema slot),
-    /// and an unload_tools("ios") style request is impossible through the
+    /// and an `unload_tools("ios")` style request is impossible through the
     /// schema — the group is simply always active.
     #[test]
     fn open_with_platform_bridge_registers_protected_ios_group() {

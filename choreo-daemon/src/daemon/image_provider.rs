@@ -12,13 +12,13 @@
 //! items (`DaemonState` fields, ...) via `use super::*`.
 //!
 //! [`ImageProviderHandle`] itself stays in `crate::providers`: it is the
-//! protocol-erased companion of [`InferenceProvider`](crate::providers::
-//! InferenceProvider) (constructed by `InferenceProvider::image_client()`,
+//! protocol-erased companion of [`InferenceProvider`](crate::providers::InferenceProvider) (constructed by
+//! `InferenceProvider::image_client()`,
 //! consumed by `tools/image_gen.rs` next to the other provider facade
 //! types), so it belongs with the provider facade, not with the command
 //! plumbing that hands it out.
 
-use super::*;
+use super::{DaemonState, InferenceProvider, info, warn};
 use thiserror::Error;
 
 /// Why image-generation provider resolution failed.
@@ -60,12 +60,12 @@ impl DaemonState {
     pub(super) fn handle_get_image_generation_provider(
         &self,
         session_id: u64,
-        account_name: Option<String>,
-        reply: crossbeam_channel::Sender<
+        account_name: Option<&str>,
+        reply: &crossbeam_channel::Sender<
             Result<crate::providers::ImageProviderHandle, ImageProviderError>,
         >,
     ) {
-        let result = self.resolve_image_generation_provider(session_id, account_name.as_deref());
+        let result = self.resolve_image_generation_provider(session_id, account_name);
         match &result {
             Ok(handle) => {
                 info!(
@@ -96,7 +96,7 @@ impl DaemonState {
     /// there is no persistent "default account" concept in `DaemonState`, so
     /// the deterministic pick is the FIRST image-capable credentialed account
     /// in sorted order (sorted, not map order, so the answer does not depend
-    /// on HashMap iteration noise).
+    /// on `HashMap` iteration noise).
     ///
     /// The client is built against the REQUESTING SESSION's socket registry
     /// (its clone lives in `session_registries`), so image sockets land in
@@ -120,12 +120,11 @@ impl DaemonState {
         // Registry scope: the session's clone when it is still alive, else
         // the daemon-owned registry.
         let fallback;
-        let registry = match self.session_registries.get(&session_id) {
-            Some(r) => r,
-            None => {
-                fallback = &self.daemon_registry;
-                fallback
-            }
+        let registry = if let Some(r) = self.session_registries.get(&session_id) {
+            r
+        } else {
+            fallback = &self.daemon_registry;
+            fallback
         };
         let build = |name: &str| {
             self.accounts
@@ -139,54 +138,51 @@ impl DaemonState {
                 })
         };
 
-        match account_name {
-            Some(name) => {
-                // Name the missing account explicitly — a generic "no
-                // account is configured" here would misdiagnose the
-                // (common) typo/wrong-session-account case.
-                let provider = build(name)?;
-                let client =
-                    provider
-                        .image_client()
-                        .ok_or_else(|| ImageProviderError::NoImageBackend {
-                            slug: provider.provider_slug().to_string(),
-                        })?;
-                Ok(crate::providers::ImageProviderHandle {
-                    slug: provider.provider_slug().to_string(),
-                    client,
-                })
-            }
-            None => {
-                // Deterministic default: lowest credentialed account name
-                // that has an image backend. HashMap order is not stable
-                // between runs, so sorting keeps "only one image-capable
-                // account" unambiguous and repeatable.
-                let mut names: Vec<String> = self
-                    .accounts
-                    .all_configs()
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect();
-                names.sort();
-                let mut inspected_slug = String::new();
-                for name in names {
-                    let Ok(provider) = build(name.as_str()) else {
-                        continue;
-                    };
-                    if inspected_slug.is_empty() {
-                        inspected_slug = provider.provider_slug().to_string();
-                    }
-                    if let Some(client) = provider.image_client() {
-                        return Ok(crate::providers::ImageProviderHandle {
-                            slug: provider.provider_slug().to_string(),
-                            client,
-                        });
-                    }
+        if let Some(name) = account_name {
+            // Name the missing account explicitly — a generic "no
+            // account is configured" here would misdiagnose the
+            // (common) typo/wrong-session-account case.
+            let provider = build(name)?;
+            let client =
+                provider
+                    .image_client()
+                    .ok_or_else(|| ImageProviderError::NoImageBackend {
+                        slug: provider.provider_slug().to_string(),
+                    })?;
+            Ok(crate::providers::ImageProviderHandle {
+                slug: provider.provider_slug().to_string(),
+                client,
+            })
+        } else {
+            // Deterministic default: lowest credentialed account name
+            // that has an image backend. HashMap order is not stable
+            // between runs, so sorting keeps "only one image-capable
+            // account" unambiguous and repeatable.
+            let mut names: Vec<String> = self
+                .accounts
+                .all_configs()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            names.sort();
+            let mut inspected_slug = String::new();
+            for name in names {
+                let Ok(provider) = build(name.as_str()) else {
+                    continue;
+                };
+                if inspected_slug.is_empty() {
+                    inspected_slug = provider.provider_slug().to_string();
                 }
-                Err(ImageProviderError::NoImageCapableAccount {
-                    slug: inspected_slug,
-                })
+                if let Some(client) = provider.image_client() {
+                    return Ok(crate::providers::ImageProviderHandle {
+                        slug: provider.provider_slug().to_string(),
+                        client,
+                    });
+                }
             }
+            Err(ImageProviderError::NoImageCapableAccount {
+                slug: inspected_slug,
+            })
         }
     }
 }
@@ -194,7 +190,11 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The glob above only reaches the parent's own imports; these test-only
+    // names come from further up the tree and must be named explicitly.
+    use crate::DaemonCommand;
     use crate::daemon::tests::make_daemon_state;
+    use crate::daemon::{AccountConfig, ServiceCredential};
 
     /// Send a `GetImageGenerationProvider` command and wait for the crossbeam
     /// reply (the same channel shape the tool thread will use in production).

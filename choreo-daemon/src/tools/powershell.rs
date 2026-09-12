@@ -97,7 +97,7 @@ impl Tool for PowerShell {
         let mut parts = vec![format!("Running PowerShell command: `{}`.", args.command)];
         parts.push(format!(" Shell: {:?}.", args.shell));
         if let Some(timeout) = args.timeout {
-            parts.push(format!(" Timeout: {}ms.", timeout));
+            parts.push(format!(" Timeout: {timeout}ms."));
         }
         parts.concat()
     }
@@ -157,10 +157,7 @@ fn build_ps_script(command: &str) -> String {
 /// command containing any mix of single/double quotes, `%VAR%`, `!`, or
 /// caret characters arrives byte-exact at the shell.
 fn encode_ps_script(script: &str) -> String {
-    let utf16le: Vec<u8> = script
-        .encode_utf16()
-        .flat_map(|unit| unit.to_le_bytes())
-        .collect();
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     base64::engine::general_purpose::STANDARD.encode(utf16le)
 }
 
@@ -217,8 +214,8 @@ mod tests {
     #[test]
     fn powershell_tool_has_valid_metadata() {
         let tool = super::PowerShell;
-        assert!(!tool.name().is_empty());
-        assert!(!tool.description().is_empty());
+        assert_ne!(tool.name(), "");
+        assert_ne!(tool.description(), "");
         let schema = tool.schema();
         assert!(schema.is_object());
     }

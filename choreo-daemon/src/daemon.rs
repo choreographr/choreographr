@@ -48,9 +48,15 @@ pub use open::OpenOptions;
 /// (`should_prefetch_models`) so both paths agree on what "fresh" means.
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 
-/// Reply type for the ListModels command.
+/// Reply type for the `ListModels` command.
 pub(super) type ListModelsReply =
     std::sync::mpsc::Sender<Result<(Vec<String>, Option<String>), String>>;
+
+/// Reply channel for `ResolveAccountCmd`: the resolved account config plus its
+/// API key wrapped in `Zeroizing` (wipe-on-drop). Aliased because the
+/// reference-taking handler signature otherwise trips `type_complexity`.
+type ResolveAccountReply =
+    crossbeam_channel::Sender<Option<(crate::accounts::AccountConfig, Option<Zeroizing<String>>)>>;
 
 pub struct DaemonState {
     pub next_session_id: u64,
@@ -93,7 +99,7 @@ pub struct DaemonState {
     /// Whether the credential keystore is currently locked (no decrypted
     /// credentials in memory). Starts `true` at daemon startup — the keystore
     /// is only decrypted into memory once a valid unlock key is presented —
-    /// flips to `false` on a successful Unlock / AddCredential implicit
+    /// flips to `false` on a successful Unlock / `AddCredential` implicit
     /// unlock, and back to `true` on `/lock`. This is the authoritative
     /// daemon-side lock state: it is broadcast to all activity subscribers on
     /// every transition and pushed to each fresh activity subscriber at
@@ -134,11 +140,11 @@ pub struct DaemonState {
     pub mcp_manager: McpManager,
     /// Sender to the ONE background catalog-maintenance thread (see
     /// `crate::catalog`). `None` until `run_server` spawns the thread — a
-    /// unit-test DaemonState has no maintenance thread, and `/refresh-models`
+    /// unit-test `DaemonState` has no maintenance thread, and `/refresh-models`
     /// then replies with an error instead of hanging.
     pub maintenance_tx: Option<crossbeam_channel::Sender<MaintenanceEvent>>,
     /// The hot-reloadable client ACL (see `crate::server::acl::SharedAcl`).
-    /// `None` until `run_server` installs it — a unit-test DaemonState has
+    /// `None` until `run_server` installs it — a unit-test `DaemonState` has
     /// no ACL file to reload, and `AclReload` then logs and no-ops instead
     /// of touching state it does not own.
     pub acl: Option<std::sync::Arc<crate::server::acl::SharedAcl>>,
@@ -156,7 +162,7 @@ pub struct DaemonState {
 #[derive(Debug, thiserror::Error)]
 pub enum KeystoreOpError {
     /// The daemon's keystore has no binding at all: verify-only operations
-    /// (Unlock / AddCredential) must not adopt a key, so they fail with this.
+    /// (Unlock / `AddCredential`) must not adopt a key, so they fail with this.
     #[error(
         "keystore not initialized — no key is bound to this daemon yet; it will be bound automatically on next client connect"
     )]
@@ -256,7 +262,7 @@ pub enum DaemonCommand {
     /// Enroll a client key in the ACL (from a LOCAL connection only — the
     /// transport check lives in the connection dispatch). The handler
     /// validates, appends to `authorized_clients.toml` under the advisory
-    /// file lock, hot-reloads the SharedAcl (single writer), broadcasts
+    /// file lock, hot-reloads the `SharedAcl` (single writer), broadcasts
     /// `AclUpdated`, and replies with the new total.
     AclAddCmd {
         pubkey: String,
@@ -418,7 +424,7 @@ pub enum DaemonCommand {
     AccountsReload,
     /// The config watcher detected an `authorized_clients.toml` edit. The
     /// command loop is the SINGLE WRITER of the client ACL (`SharedAcl`, the
-    /// sanctioned ArcSwap exception #4): it is the one that calls
+    /// sanctioned `ArcSwap` exception #4): it is the one that calls
     /// `SharedAcl::reload` (re-read, parse-compare, atomic swap). The TCP
     /// accept path only ever READS lock-free snapshots. No reply:
     /// fire-and-forget, like `AccountsReload`.
@@ -521,15 +527,15 @@ pub enum DaemonCommand {
 /// the marker (and tombstone) stay in place so the session cannot be attached
 /// or resurrected; `purge_tombstoned_sessions` at the next startup retries.
 fn finalize_session_delete(
-    db: Arc<redb::Database>,
+    db: &Arc<redb::Database>,
     session_id: u64,
-    daemon_tx: mpsc::Sender<DaemonCommand>,
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
 ) {
-    match db::delete_session(&db, session_id) {
+    match db::delete_session(db, session_id) {
         Ok(()) => {
             // The deletion tombstone (written by `delete_session_inner`) is no
             // longer needed now that the record is gone for good.
-            if let Err(e) = db::clear_session_tombstone(&db, session_id) {
+            if let Err(e) = db::clear_session_tombstone(db, session_id) {
                 warn!(session_id, error = %e, "failed to clear session-deletion tombstone");
             }
             let _ = daemon_tx.send(DaemonCommand::SessionDeleteFinalized { session_id });
@@ -563,20 +569,20 @@ impl DaemonState {
             } => self.handle_create_session(
                 title,
                 parent_session_id,
-                working_dir,
+                working_dir.as_ref(),
                 reasoning_effort,
                 selected_model,
-                context_config,
+                context_config.as_ref(),
                 account_name,
-                active_tool_groups,
-                reply,
+                &active_tool_groups,
+                &reply,
             ),
             DaemonCommand::AttachSession { session_id, reply } => {
-                self.handle_attach_session(session_id, reply)
+                self.handle_attach_session(session_id, &reply);
             }
-            DaemonCommand::ListSessions { reply } => self.handle_list_sessions(reply),
+            DaemonCommand::ListSessions { reply } => self.handle_list_sessions(&reply),
             DaemonCommand::GetSession { session_id, reply } => {
-                self.handle_get_session(session_id, reply)
+                self.handle_get_session(session_id, &reply);
             }
             DaemonCommand::UpdateMetadata {
                 session_id,
@@ -584,19 +590,19 @@ impl DaemonState {
             } => self.handle_update_metadata(session_id, metadata),
             DaemonCommand::SessionExited { session_id } => self.handle_session_exited(session_id),
             DaemonCommand::SessionDeleteFinalized { session_id } => {
-                self.handle_session_delete_finalized(session_id)
+                self.handle_session_delete_finalized(session_id);
             }
             DaemonCommand::Unlock {
                 private_key,
                 client_writer,
                 reply,
-            } => self.handle_unlock(private_key, client_writer, reply),
+            } => self.handle_unlock(private_key, client_writer.as_ref(), &reply),
             DaemonCommand::BindKeystore {
                 key,
                 client_writer,
                 reply,
-            } => self.handle_bind_keystore(key, client_writer, reply),
-            DaemonCommand::Lock { reply } => self.handle_lock(reply),
+            } => self.handle_bind_keystore(key, client_writer.as_ref(), &reply),
+            DaemonCommand::Lock { reply } => self.handle_lock(&reply),
             DaemonCommand::SaveCredential {
                 service,
                 encrypted_blob,
@@ -605,20 +611,20 @@ impl DaemonState {
                 reply,
             } => self.handle_save_credential(
                 service,
-                encrypted_blob,
+                &encrypted_blob,
                 unlock_key,
-                client_writer,
-                reply,
+                client_writer.as_ref(),
+                &reply,
             ),
             DaemonCommand::RemoveCredentialCmd { service, reply } => {
-                self.handle_remove_credential(service, reply)
+                self.handle_remove_credential(&service, &reply);
             }
-            DaemonCommand::AclAddCmd { pubkey, reply } => self.handle_acl_add(pubkey, reply),
+            DaemonCommand::AclAddCmd { pubkey, reply } => self.handle_acl_add(&pubkey, &reply),
             DaemonCommand::ListModels { session_id, reply } => {
-                self.handle_list_models(session_id, reply)
+                self.handle_list_models(session_id, &reply);
             }
             DaemonCommand::RefreshModels { force, reply } => {
-                self.handle_refresh_models(force, reply)
+                self.handle_refresh_models(force, &reply);
             }
             DaemonCommand::CatalogBaseChanged {
                 base,
@@ -626,25 +632,33 @@ impl DaemonState {
                 user_overlay,
                 persist,
                 reply,
-            } => self.handle_catalog_base_changed(base, etag, user_overlay, persist, reply),
-            DaemonCommand::CatalogNotModified { reply } => self.handle_catalog_not_modified(reply),
+            } => self.handle_catalog_base_changed(
+                &base,
+                etag.as_deref(),
+                user_overlay.as_deref(),
+                persist,
+                reply,
+            ),
+            DaemonCommand::CatalogNotModified { reply } => {
+                Self::handle_catalog_not_modified(reply);
+            }
             DaemonCommand::GetCredential { service, reply } => {
-                self.handle_get_credential(service, reply)
+                self.handle_get_credential(&service, &reply);
             }
             DaemonCommand::ModelPrefetchResult { account, result } => {
-                self.handle_model_prefetch_result(account, result)
+                self.handle_model_prefetch_result(account, result);
             }
             DaemonCommand::RegisterSummarySubscriber { client_id, writer } => {
-                self.handle_register_summary_subscriber(client_id, writer)
+                self.handle_register_summary_subscriber(client_id, &writer);
             }
             DaemonCommand::UnregisterSummarySubscriber { client_id } => {
-                self.handle_unregister_summary_subscriber(client_id)
+                self.handle_unregister_summary_subscriber(client_id);
             }
             DaemonCommand::RegisterActivitySubscriber { client_id, writer } => {
-                self.handle_register_activity_subscriber(client_id, writer)
+                self.handle_register_activity_subscriber(client_id, &writer);
             }
             DaemonCommand::UnregisterActivitySubscriber { client_id } => {
-                self.handle_unregister_activity_subscriber(client_id)
+                self.handle_unregister_activity_subscriber(client_id);
             }
             DaemonCommand::TrackSessionSubscription {
                 client_id,
@@ -655,22 +669,22 @@ impl DaemonState {
                 session_id,
             } => self.handle_untrack_session_subscription(client_id, session_id),
             DaemonCommand::ClientDisconnected { client_id } => {
-                self.handle_client_disconnected(client_id)
+                self.handle_client_disconnected(client_id);
             }
             DaemonCommand::RegisterClientWriter { client_id, writer } => {
-                self.handle_register_client_writer(client_id, writer)
+                self.handle_register_client_writer(client_id, writer);
             }
             DaemonCommand::EvictClient { client_id } => self.handle_evict_client(client_id),
             DaemonCommand::EvictLargestLagging => self.handle_evict_largest_lagging(),
             DaemonCommand::BroadcastShuttingDown => self.handle_broadcast_shutting_down(),
             DaemonCommand::BroadcastActivity { session_id, msg } => {
-                self.handle_broadcast_activity(session_id, msg)
+                self.handle_broadcast_activity(session_id, &msg);
             }
             DaemonCommand::BroadcastSessionStatus { session_id, status } => {
-                self.handle_broadcast_session_status(session_id, status)
+                self.handle_broadcast_session_status(session_id, status);
             }
             DaemonCommand::DeleteSession { session_id, reply } => {
-                self.handle_delete_session(session_id, reply)
+                self.handle_delete_session(session_id, &reply);
             }
             DaemonCommand::AddAccountCmd {
                 name,
@@ -683,42 +697,48 @@ impl DaemonState {
                 total_timeout_secs,
                 reply,
             } => self.handle_add_account(
-                name,
-                provider,
+                &name,
+                &provider,
                 base_url,
                 streaming,
                 retry_max_attempts,
                 connect_timeout_secs,
                 request_timeout_secs,
                 total_timeout_secs,
-                reply,
+                &reply,
             ),
             DaemonCommand::RemoveAccountCmd { name, reply } => {
-                self.handle_remove_account(name, reply)
+                self.handle_remove_account(&name, &reply);
             }
-            DaemonCommand::ListAccountsCmd { reply } => self.handle_list_accounts(reply),
+            DaemonCommand::ListAccountsCmd { reply } => self.handle_list_accounts(&reply),
             DaemonCommand::AccountsReload => self.handle_accounts_reload(),
             DaemonCommand::AclReload => self.handle_acl_reload(),
             DaemonCommand::ResolveAccountCmd { account, reply } => {
-                self.handle_resolve_account(account, reply)
+                self.handle_resolve_account(&account, &reply);
             }
             DaemonCommand::GetImageGenerationProvider {
                 session_id,
                 account_name,
                 reply,
-            } => self.handle_get_image_generation_provider(session_id, account_name, reply),
-            DaemonCommand::AccountExists { name, reply } => self.handle_account_exists(name, reply),
+            } => self.handle_get_image_generation_provider(
+                session_id,
+                account_name.as_deref(),
+                &reply,
+            ),
+            DaemonCommand::AccountExists { name, reply } => {
+                self.handle_account_exists(&name, &reply);
+            }
             DaemonCommand::ValidateModel {
                 session_id,
                 model,
                 reply,
-            } => self.handle_validate_model(session_id, model, reply),
+            } => self.handle_validate_model(session_id, &model, &reply),
             DaemonCommand::CancelRequest {
                 session_id,
                 request_id,
             } => self.handle_cancel_request(session_id, request_id),
             DaemonCommand::SetSessionTitle { session_id, title } => {
-                self.handle_set_session_title(session_id, title)
+                self.handle_set_session_title(session_id, title);
             }
             DaemonCommand::SetWorkingDir {
                 session_id,
@@ -736,7 +756,7 @@ impl DaemonState {
                 reply,
             } => self.handle_unload_tools(session_id, groups, reply),
             DaemonCommand::PowerEvent(event) => {
-                handle_suspend_event(&event, &self.daemon_registry, &self.session_registries)
+                handle_suspend_event(event, &self.daemon_registry, &self.session_registries);
             }
             DaemonCommand::Shutdown => {
                 warn!("unexpected Shutdown command in handle_command; handled at loop level");
@@ -794,12 +814,12 @@ impl DaemonState {
 
         let handle = thread::spawn(move || {
             session_main(
-                session_rx,
+                &session_rx,
                 provider,
                 session_registry,
                 account_name,
-                Some(record),
-                RequestContext {
+                Some(&record),
+                &RequestContext {
                     cmd_tx,
                     session_id,
                     db,
@@ -957,12 +977,9 @@ impl DaemonState {
         // provider cache anymore. `should_prefetch_models` guarantees config
         // + credential exist; the None arm is belt-and-braces so the
         // in-flight guard can never leak.
-        let provider = match self.build_daemon_provider(account) {
-            Some(p) => p,
-            None => {
-                self.model_prefetch_in_flight.remove(account);
-                return;
-            }
+        let Some(provider) = self.build_daemon_provider(account) else {
+            self.model_prefetch_in_flight.remove(account);
+            return;
         };
         let daemon_tx = self.daemon_tx.clone();
         let account_name = account.to_string();
@@ -1064,13 +1081,13 @@ impl DaemonState {
         &mut self,
         title: Option<String>,
         parent_session_id: Option<u64>,
-        working_dir: Option<PathBuf>,
+        working_dir: Option<&PathBuf>,
         reasoning_effort: Option<String>,
         selected_model: Option<String>,
-        context_config: Option<ContextConfig>,
+        context_config: Option<&ContextConfig>,
         account_name: Option<String>,
-        active_tool_groups: Vec<String>,
-        reply: std::sync::mpsc::Sender<io::Result<(u64, std::sync::mpsc::Sender<SessionCommand>)>>,
+        active_tool_groups: &[String],
+        reply: &std::sync::mpsc::Sender<io::Result<(u64, std::sync::mpsc::Sender<SessionCommand>)>>,
     ) {
         // A session is just a conversation container — it can be
         // created, browsed, and deleted regardless of whether the
@@ -1080,7 +1097,7 @@ impl DaemonState {
         self.next_session_id += 1;
         info!("CreateSession: id={}, title={:?}", sid, title);
 
-        let cwd_str = working_dir.as_ref().map(|p| p.display().to_string());
+        let cwd_str = working_dir.map(|p| p.display().to_string());
         // The default active groups mirror the always-on groups; the
         // Coordination Platform group is included only when the `content`
         // feature is compiled in. Stale persisted names (e.g. `coord` from
@@ -1102,7 +1119,7 @@ impl DaemonState {
         let active_cats = if active_tool_groups.is_empty() {
             default_groups
         } else {
-            active_tool_groups.clone()
+            active_tool_groups.to_vec()
         };
 
         // Resolve context window from the provider catalog at creation time
@@ -1132,7 +1149,7 @@ impl DaemonState {
             created_at,
             last_modified: created_at,
             active_tool_groups: active_cats.clone(),
-            context_config: context_config.clone().unwrap_or_default(),
+            context_config: context_config.cloned().unwrap_or_default(),
             account_name: account_name.clone(),
             last_response_id: None,
             last_response_id_producer: None,
@@ -1195,8 +1212,8 @@ impl DaemonState {
                 last_modified: created_at,
             },
         };
-        self.broadcast(created_msg);
-        self.broadcast(status_msg);
+        self.broadcast(&created_msg);
+        self.broadcast(&status_msg);
     }
 
     /// Attach to an existing session by ID. Loads from the database if the
@@ -1204,7 +1221,7 @@ impl DaemonState {
     fn handle_attach_session(
         &mut self,
         session_id: u64,
-        reply: std::sync::mpsc::Sender<io::Result<std::sync::mpsc::Sender<SessionCommand>>>,
+        reply: &std::sync::mpsc::Sender<io::Result<std::sync::mpsc::Sender<SessionCommand>>>,
     ) {
         debug!("AttachSession: id={}", session_id);
         // Attaching to a session is allowed regardless of lock state.
@@ -1280,7 +1297,7 @@ impl DaemonState {
 
     /// Return a list of all active session summaries, most recently
     /// modified first.
-    fn handle_list_sessions(&mut self, reply: std::sync::mpsc::Sender<Vec<SessionSummary>>) {
+    fn handle_list_sessions(&mut self, reply: &std::sync::mpsc::Sender<Vec<SessionSummary>>) {
         let mut summaries: Vec<SessionSummary> = self
             .session_metadata
             .iter()
@@ -1301,7 +1318,7 @@ impl DaemonState {
     fn handle_get_session(
         &mut self,
         session_id: u64,
-        reply: std::sync::mpsc::Sender<Option<SessionSummary>>,
+        reply: &std::sync::mpsc::Sender<Option<SessionSummary>>,
     ) {
         let summary = self
             .session_metadata
@@ -1418,7 +1435,7 @@ impl DaemonState {
                     last_modified,
                 },
             };
-            self.broadcast(msg);
+            self.broadcast(&msg);
         }
 
         // Finalize a pending delete: the thread has fully exited and
@@ -1434,7 +1451,7 @@ impl DaemonState {
             // reports back with `SessionDeleteFinalized`.
             let db = Arc::clone(&self.db);
             let daemon_tx = self.daemon_tx.clone();
-            std::thread::spawn(move || finalize_session_delete(db, session_id, daemon_tx));
+            std::thread::spawn(move || finalize_session_delete(&db, session_id, &daemon_tx));
         }
     }
 
@@ -1454,12 +1471,12 @@ impl DaemonState {
     /// — so the reply must be enqueued HERE, by this thread, into the same
     /// FIFO queue the broadcast uses, BEFORE the broadcast.
     fn send_targeted(
-        writer: &Option<SubscriberSink>,
+        writer: Option<&SubscriberSink>,
         global_lag: &Arc<AtomicUsize>,
-        msg: DaemonMessage,
+        msg: &DaemonMessage,
     ) {
         if let Some(w) = writer {
-            w.send_accounted(&msg, global_lag);
+            w.send_accounted(msg, global_lag);
         } else {
             warn!(
                 ?msg,
@@ -1477,8 +1494,8 @@ impl DaemonState {
     fn handle_unlock(
         &mut self,
         private_key: Vec<u8>,
-        client_writer: Option<SubscriberSink>,
-        reply: std::sync::mpsc::Sender<()>,
+        client_writer: Option<&SubscriberSink>,
+        reply: &std::sync::mpsc::Sender<()>,
     ) {
         info!("Unlock attempt");
         // Capture the pre-unlock lock state so the transition broadcast below
@@ -1500,7 +1517,7 @@ impl DaemonState {
             },
             Err(KeystoreOpError::Other(e)) => DaemonMessage::LockedError { error: e.clone() },
         };
-        Self::send_targeted(&client_writer, &self.global_lag, reply_msg);
+        Self::send_targeted(client_writer, &self.global_lag, &reply_msg);
         let _ = reply.send(());
         // A successful unlock is a lock-state transition: fan it out to ALL
         // activity subscribers (the acting client already has its targeted
@@ -1523,8 +1540,8 @@ impl DaemonState {
     fn handle_bind_keystore(
         &mut self,
         key: Vec<u8>,
-        client_writer: Option<SubscriberSink>,
-        reply: mpsc::Sender<()>,
+        client_writer: Option<&SubscriberSink>,
+        reply: &mpsc::Sender<()>,
     ) {
         info!("BindKeystore attempt");
         let was_locked = self.locked;
@@ -1539,7 +1556,7 @@ impl DaemonState {
             },
             Err(KeystoreOpError::Other(e)) => DaemonMessage::LockedError { error: e.clone() },
         };
-        Self::send_targeted(&client_writer, &self.global_lag, reply_msg);
+        Self::send_targeted(client_writer, &self.global_lag, &reply_msg);
         let _ = reply.send(());
         if result.is_ok() && was_locked {
             self.broadcast_lock_state();
@@ -1555,7 +1572,7 @@ impl DaemonState {
     /// stay browsable — only inference requires credentials), so locking just
     /// drops cleartext from memory and re-latches the banner. The encrypted
     /// blobs remain in the DB and re-decrypt on the next Unlock.
-    fn handle_lock(&mut self, reply: mpsc::Sender<Result<(), String>>) {
+    fn handle_lock(&mut self, reply: &mpsc::Sender<Result<(), String>>) {
         let was_locked = self.locked;
         // Wipe decrypted credentials (and their derived providers) from memory
         // now that the keystore is locked. `credentials` holds the plaintext
@@ -1593,16 +1610,16 @@ impl DaemonState {
     /// decrypt is rejected and never persisted — this enforces "the
     /// credential was encrypted with the same key as the rest of the
     /// keystore"), persist, then run the IMPLICIT UNLOCK (shared tail) — so a
-    /// valid AddCredential to a locked daemon unlocks it. The caller
+    /// valid `AddCredential` to a locked daemon unlocks it. The caller
     /// (connection layer) replies `CredentialAdded` and emits `Unlocked`
     /// exactly like a successful `Unlock`.
     fn handle_save_credential(
         &mut self,
         service: String,
-        encrypted_blob: Vec<u8>,
+        encrypted_blob: &[u8],
         mut unlock_key: Vec<u8>,
-        client_writer: Option<SubscriberSink>,
-        reply: mpsc::Sender<()>,
+        client_writer: Option<&SubscriberSink>,
+        reply: &mpsc::Sender<()>,
     ) {
         // Capture the pre-operations lock state so the implicit-unlock
         // transition broadcast below fires only on a REAL locked→unlocked
@@ -1615,23 +1632,22 @@ impl DaemonState {
         // early-return error paths below, `?`, even a panic — so no per-path
         // zeroize call can be forgotten by a future edit (this mirrors
         // handle_unlock_inner).
-        let key = Zeroizing::new(match unlock_key.as_slice().try_into() {
-            Ok(k) => k,
-            Err(_) => {
-                // The rejected bytes are still secret material — wipe them so
-                // a failed add does not leave the key in a freed allocation.
-                unlock_key.zeroize();
-                Self::send_targeted(
-                    &client_writer,
-                    &self.global_lag,
-                    DaemonMessage::CredentialAddFailed {
-                        service: service.clone(),
-                        error: "invalid unlock_key: expected exactly 32 bytes".to_string(),
-                    },
-                );
-                let _ = reply.send(());
-                return;
-            }
+        let key = Zeroizing::new(if let Ok(k) = unlock_key.as_slice().try_into() {
+            k
+        } else {
+            // The rejected bytes are still secret material — wipe them so
+            // a failed add does not leave the key in a freed allocation.
+            unlock_key.zeroize();
+            Self::send_targeted(
+                client_writer,
+                &self.global_lag,
+                &DaemonMessage::CredentialAddFailed {
+                    service: service.clone(),
+                    error: "invalid unlock_key: expected exactly 32 bytes".to_string(),
+                },
+            );
+            let _ = reply.send(());
+            return;
         });
         // Wipe the heap `Vec` copy; only the stack `key` array is used below
         // and the Zeroizing wrapper wipes it on every exit path.
@@ -1655,7 +1671,7 @@ impl DaemonState {
                     error: e,
                 },
             };
-            Self::send_targeted(&client_writer, &self.global_lag, reply_msg);
+            Self::send_targeted(client_writer, &self.global_lag, &reply_msg);
             let _ = reply.send(());
             return;
         }
@@ -1667,7 +1683,7 @@ impl DaemonState {
         // forever, and the credential would look saved but be unusable.
         let plaintext = match choreo_keystore::crypto::decrypt_with_private_key(
             &key,
-            &encrypted_blob,
+            encrypted_blob,
         ) {
             Ok(pt) => pt,
             Err(e) => {
@@ -1678,9 +1694,9 @@ impl DaemonState {
                      rejecting without persisting"
                 );
                 Self::send_targeted(
-                    &client_writer,
+                    client_writer,
                     &self.global_lag,
-                    DaemonMessage::CredentialAddFailed {
+                    &DaemonMessage::CredentialAddFailed {
                         service: service.clone(),
                         error: format!(
                             "credential blob failed to decrypt with the provided unlock key: {e}"
@@ -1695,9 +1711,9 @@ impl DaemonState {
             Ok(c) => c,
             Err(e) => {
                 Self::send_targeted(
-                    &client_writer,
+                    client_writer,
                     &self.global_lag,
-                    DaemonMessage::CredentialAddFailed {
+                    &DaemonMessage::CredentialAddFailed {
                         service: service.clone(),
                         error: format!("credential payload is not a valid ServiceCredential: {e}"),
                     },
@@ -1708,11 +1724,11 @@ impl DaemonState {
         };
 
         // Persist to DB only after both checks passed.
-        if let Err(e) = db::set_credential_blob(&self.db, &service, &encrypted_blob) {
+        if let Err(e) = db::set_credential_blob(&self.db, &service, encrypted_blob) {
             Self::send_targeted(
-                &client_writer,
+                client_writer,
                 &self.global_lag,
-                DaemonMessage::CredentialAddFailed {
+                &DaemonMessage::CredentialAddFailed {
                     service: service.clone(),
                     error: format!("failed to save credential: {e}"),
                 },
@@ -1747,9 +1763,9 @@ impl DaemonState {
                 "AddCredential: persisted credential but implicit unlock failed"
             );
             Self::send_targeted(
-                &client_writer,
+                client_writer,
                 &self.global_lag,
-                DaemonMessage::CredentialAddFailed {
+                &DaemonMessage::CredentialAddFailed {
                     service: service.clone(),
                     error: format!("credential saved but unlock failed: {e}"),
                 },
@@ -1766,11 +1782,11 @@ impl DaemonState {
         // (see handle_unlock) — the acting client keys its key-recording on
         // the CredentialAdded confirmation, so the broadcast must never
         // overtake it on the same writer queue.
-        Self::send_targeted(&client_writer, &self.global_lag, DaemonMessage::Unlocked);
+        Self::send_targeted(client_writer, &self.global_lag, &DaemonMessage::Unlocked);
         Self::send_targeted(
-            &client_writer,
+            client_writer,
             &self.global_lag,
-            DaemonMessage::CredentialAdded { service },
+            &DaemonMessage::CredentialAdded { service },
         );
         let _ = reply.send(());
         // A valid AddCredential to a locked daemon IS a lock-state transition
@@ -1784,19 +1800,19 @@ impl DaemonState {
     /// Remove a stored credential for a service.
     fn handle_remove_credential(
         &mut self,
-        service: String,
-        reply: mpsc::Sender<Result<(), String>>,
+        service: &str,
+        reply: &mpsc::Sender<Result<(), String>>,
     ) {
         // Remove from DB
-        if let Err(e) = db::remove_credential_blob(&self.db, &service) {
+        if let Err(e) = db::remove_credential_blob(&self.db, service) {
             let _ = reply.send(Err(format!("failed to remove credential: {e}")));
             return;
         }
         // Remove from in-memory state. No provider cache to drop — instead
         // invalidate the cached client of every session bound to this
         // account so it rebuilds (and fails with clean guidance) on next use.
-        self.credentials.remove(&service);
-        self.drop_session_clients(Some(&service));
+        self.credentials.remove(service);
+        self.drop_session_clients(Some(service));
         if service == "twitter" {
             self.x_credentials = None;
         }
@@ -1804,7 +1820,7 @@ impl DaemonState {
     }
 
     /// List available models, optionally scoped to a session's account.
-    fn handle_list_models(&mut self, session_id: Option<u64>, reply: ListModelsReply) {
+    fn handle_list_models(&mut self, session_id: Option<u64>, reply: &ListModelsReply) {
         debug!("ListModels: session_id={:?}", session_id);
         let result = handle_list_models_inner(self, session_id);
         let _ = reply.send(result);
@@ -1818,36 +1834,30 @@ impl DaemonState {
     fn handle_refresh_models(
         &mut self,
         force: bool,
-        reply: mpsc::Sender<Result<RefreshReport, String>>,
+        reply: &mpsc::Sender<Result<RefreshReport, String>>,
     ) {
-        match &self.maintenance_tx {
-            Some(tx) => {
-                info!(
+        if let Some(tx) = &self.maintenance_tx {
+            info!(
+                force,
+                "RefreshModels: handing fetch to the maintenance thread"
+            );
+            // Clone the reply: on a dead thread the request must still
+            // get a structured error instead of silently vanishing (the
+            // clone rides the maintenance channel; the original replies
+            // on send failure).
+            if tx
+                .send(MaintenanceEvent::RefreshNow {
                     force,
-                    "RefreshModels: handing fetch to the maintenance thread"
-                );
-                // Clone the reply: on a dead thread the request must still
-                // get a structured error instead of silently vanishing (the
-                // clone rides the maintenance channel; the original replies
-                // on send failure).
-                if tx
-                    .send(MaintenanceEvent::RefreshNow {
-                        force,
-                        reply: reply.clone(),
-                    })
-                    .is_err()
-                {
-                    warn!("RefreshModels: maintenance thread is gone; replying with an error");
-                    let _ =
-                        reply.send(Err("catalog maintenance thread is not running".to_string()));
-                }
-            }
-            None => {
-                warn!(
-                    "RefreshModels: no maintenance thread (unit-test state); replying with an error"
-                );
+                    reply: reply.clone(),
+                })
+                .is_err()
+            {
+                warn!("RefreshModels: maintenance thread is gone; replying with an error");
                 let _ = reply.send(Err("catalog maintenance thread is not running".to_string()));
             }
+        } else {
+            warn!("RefreshModels: no maintenance thread (unit-test state); replying with an error");
+            let _ = reply.send(Err("catalog maintenance thread is not running".to_string()));
         }
     }
 
@@ -1865,9 +1875,9 @@ impl DaemonState {
     /// broadcast → reply) so each stage stays readable and unit-testable.
     fn handle_catalog_base_changed(
         &mut self,
-        base: Vec<choreo_ai_protocols::ProviderEntry>,
-        etag: Option<String>,
-        user_overlay: Option<String>,
+        base: &[choreo_ai_protocols::ProviderEntry],
+        etag: Option<&str>,
+        user_overlay: Option<&str>,
         persist: bool,
         reply: Vec<RefreshRequester>,
     ) {
@@ -1879,7 +1889,7 @@ impl DaemonState {
         );
 
         // Lowest → highest: base → bundled overlay → user overlay.
-        let effective = merge_catalog_layers(&base, user_overlay.as_deref());
+        let effective = merge_catalog_layers(base, user_overlay);
 
         if effective.is_empty() {
             // Never swap in an empty catalog: keep the current one and tell
@@ -1896,12 +1906,12 @@ impl DaemonState {
 
         // Single-writer point: the atomic swap. Readers are lock-free.
         replace_catalog(effective.clone());
-        self.persist_catalog_cache(&base, etag.as_deref(), persist);
+        self.persist_catalog_cache(base, etag, persist);
 
         // Broadcast the new provider list to all activity subscribers so the
         // TUI's provider picker tracks the live catalog.
         let providers = catalog_provider_pairs();
-        self.handle_broadcast_activity(None, DaemonMessage::CatalogUpdated { providers });
+        self.handle_broadcast_activity(None, &DaemonMessage::CatalogUpdated { providers });
 
         let models: usize = effective.iter().map(|e| e.models.len()).sum();
         info!(providers = effective.len(), models, "catalog updated",);
@@ -1915,7 +1925,7 @@ impl DaemonState {
     /// orders the swap ahead of this reply, so the `UpToDate` counts reflect
     /// the post-reload catalog rather than stale pre-reload numbers. Carries
     /// no base — nothing is swapped, nothing persisted, nothing broadcast.
-    fn handle_catalog_not_modified(&mut self, reply: Vec<RefreshRequester>) {
+    fn handle_catalog_not_modified(reply: Vec<RefreshRequester>) {
         if reply.is_empty() {
             return;
         }
@@ -1981,8 +1991,8 @@ impl DaemonState {
     fn handle_validate_model(
         &mut self,
         session_id: u64,
-        model: String,
-        reply: mpsc::Sender<Result<(), String>>,
+        model: &str,
+        reply: &mpsc::Sender<Result<(), String>>,
     ) {
         debug!("ValidateModel: session_id={}, model={}", session_id, model);
 
@@ -2019,7 +2029,7 @@ impl DaemonState {
         // allow through rather than reject a potentially valid model.
         match self.model_cache.get(&account_name) {
             Some((cached_models, _cached_at)) if !cached_models.is_empty() => {
-                if cached_models.contains(&model) {
+                if cached_models.iter().any(|m| m == model) {
                     let _ = reply.send(Ok(()));
                 } else {
                     let available = humfmt::list(cached_models);
@@ -2051,10 +2061,10 @@ impl DaemonState {
     /// Get the API key for a stored credential (returns None if not found).
     fn handle_get_credential(
         &mut self,
-        service: String,
-        reply: std::sync::mpsc::Sender<Option<String>>,
+        service: &str,
+        reply: &std::sync::mpsc::Sender<Option<String>>,
     ) {
-        let key = self.credentials.get(&service).and_then(|c| match c {
+        let key = self.credentials.get(service).and_then(|c| match c {
             ServiceCredential::ApiKey { key } => Some(key.clone()),
             _ => None,
         });
@@ -2186,18 +2196,15 @@ impl DaemonState {
         reply: mpsc::Sender<Result<String, String>>,
     ) {
         debug!(session_id, path = %path.display(), "forwarding working dir change to session");
-        match self.active_sessions.get(&session_id) {
-            Some(entry) => {
-                let _ = entry
-                    .cmd_tx
-                    .send(SessionCommand::SetWorkingDir { path, reply });
-            }
-            None => {
-                warn!(session_id, "cannot set working dir: session is not active");
-                // Reply immediately so the caller (a blocked tool execution)
-                // doesn't hang waiting on a session that doesn't exist.
-                let _ = reply.send(Err("session is not active".into()));
-            }
+        if let Some(entry) = self.active_sessions.get(&session_id) {
+            let _ = entry
+                .cmd_tx
+                .send(SessionCommand::SetWorkingDir { path, reply });
+        } else {
+            warn!(session_id, "cannot set working dir: session is not active");
+            // Reply immediately so the caller (a blocked tool execution)
+            // doesn't hang waiting on a session that doesn't exist.
+            let _ = reply.send(Err("session is not active".into()));
         }
     }
 
@@ -2210,18 +2217,15 @@ impl DaemonState {
         reply: mpsc::Sender<Result<String, String>>,
     ) {
         debug!(session_id, groups = ?groups, "forwarding load_tools to session");
-        match self.active_sessions.get(&session_id) {
-            Some(entry) => {
-                let _ = entry
-                    .cmd_tx
-                    .send(SessionCommand::LoadTools { groups, reply });
-            }
-            None => {
-                warn!(session_id, "cannot load tools: session is not active");
-                // Reply immediately so the caller (a blocked tool execution)
-                // doesn't hang waiting on a session that doesn't exist.
-                let _ = reply.send(Err("session is not active".into()));
-            }
+        if let Some(entry) = self.active_sessions.get(&session_id) {
+            let _ = entry
+                .cmd_tx
+                .send(SessionCommand::LoadTools { groups, reply });
+        } else {
+            warn!(session_id, "cannot load tools: session is not active");
+            // Reply immediately so the caller (a blocked tool execution)
+            // doesn't hang waiting on a session that doesn't exist.
+            let _ = reply.send(Err("session is not active".into()));
         }
     }
 
@@ -2235,18 +2239,15 @@ impl DaemonState {
         reply: mpsc::Sender<Result<String, String>>,
     ) {
         debug!(session_id, groups = ?groups, "forwarding unload_tools to session");
-        match self.active_sessions.get(&session_id) {
-            Some(entry) => {
-                let _ = entry
-                    .cmd_tx
-                    .send(SessionCommand::UnloadTools { groups, reply });
-            }
-            None => {
-                warn!(session_id, "cannot unload tools: session is not active");
-                // Reply immediately so the caller (a blocked tool execution)
-                // doesn't hang waiting on a session that doesn't exist.
-                let _ = reply.send(Err("session is not active".into()));
-            }
+        if let Some(entry) = self.active_sessions.get(&session_id) {
+            let _ = entry
+                .cmd_tx
+                .send(SessionCommand::UnloadTools { groups, reply });
+        } else {
+            warn!(session_id, "cannot unload tools: session is not active");
+            // Reply immediately so the caller (a blocked tool execution)
+            // doesn't hang waiting on a session that doesn't exist.
+            let _ = reply.send(Err("session is not active".into()));
         }
     }
 
@@ -2256,11 +2257,11 @@ impl DaemonState {
     /// Sessions are just conversation containers — they can be deleted
     /// regardless of whether the daemon is locked, just like they can
     /// be created and browsed freely.  Credentials are only needed to
-    /// run models (RunInput).
+    /// run models (`RunInput`).
     fn handle_delete_session(
         &mut self,
         session_id: u64,
-        reply: std::sync::mpsc::Sender<io::Result<()>>,
+        reply: &std::sync::mpsc::Sender<io::Result<()>>,
     ) {
         info!("DeleteSession: id={}", session_id);
 
@@ -2310,7 +2311,7 @@ impl DaemonState {
             warn!(session_id, error = %e, "failed to clear stale session-deletion tombstone");
         }
         self.session_metadata.remove(&session_id);
-        self.broadcast(DaemonMessage::Session {
+        self.broadcast(&DaemonMessage::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionDeleted,
         });
@@ -2393,7 +2394,7 @@ impl DaemonState {
         // unattachable (deleted marker), even while its record is still being
         // cleaned up in the background.
         self.session_metadata.remove(&session_id);
-        self.broadcast(DaemonMessage::Session {
+        self.broadcast(&DaemonMessage::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionDeleted,
         });
@@ -2404,15 +2405,15 @@ impl DaemonState {
     #[expect(clippy::too_many_arguments)]
     fn handle_add_account(
         &mut self,
-        name: String,
-        provider: String,
+        name: &str,
+        provider: &str,
         base_url: Option<String>,
         streaming: Option<bool>,
         retry_max_attempts: Option<u32>,
         connect_timeout_secs: Option<u64>,
         request_timeout_secs: Option<u64>,
         total_timeout_secs: Option<u64>,
-        reply: std::sync::mpsc::Sender<Result<(), String>>,
+        reply: &std::sync::mpsc::Sender<Result<(), String>>,
     ) {
         let config = AccountConfig {
             base_url,
@@ -2421,7 +2422,7 @@ impl DaemonState {
             connect_timeout_secs,
             request_timeout_secs,
             total_timeout_secs,
-            ..AccountConfig::simple(&name, &provider)
+            ..AccountConfig::simple(name, provider)
         };
         let result = self.accounts.add(config);
         match &result {
@@ -2443,7 +2444,7 @@ impl DaemonState {
         // different provider/base_url). The model list warms in the
         // background on session join.
         if result.is_ok() {
-            self.drop_session_clients(Some(&name));
+            self.drop_session_clients(Some(name));
         }
         let _ = reply.send(result);
     }
@@ -2451,21 +2452,21 @@ impl DaemonState {
     /// Remove an inference account.
     fn handle_remove_account(
         &mut self,
-        name: String,
-        reply: std::sync::mpsc::Sender<Result<(), String>>,
+        name: &str,
+        reply: &std::sync::mpsc::Sender<Result<(), String>>,
     ) {
-        let result = self.accounts.remove(&name);
+        let result = self.accounts.remove(name);
         match &result {
             Ok(()) => info!(account = %name, "removed inference account"),
             Err(e) => {
-                error!(account = %name, error = %e, "failed to remove inference account")
+                error!(account = %name, error = %e, "failed to remove inference account");
             }
         }
         if result.is_ok() {
             // Invalidate sessions bound to the removed account so their next
             // request surfaces the clean "account not configured" guidance
             // instead of silently dialing the deleted provider.
-            self.drop_session_clients(Some(&name));
+            self.drop_session_clients(Some(name));
         }
         let _ = reply.send(result);
     }
@@ -2473,7 +2474,7 @@ impl DaemonState {
     /// List all inference accounts (with credential status).
     fn handle_list_accounts(
         &mut self,
-        reply: std::sync::mpsc::Sender<Result<Vec<AccountInfo>, String>>,
+        reply: &std::sync::mpsc::Sender<Result<Vec<AccountInfo>, String>>,
     ) {
         let _ = reply.send(Ok(self.account_infos()));
     }
@@ -2495,13 +2496,13 @@ impl DaemonState {
 
     /// Enroll a client key: validate the base64/32-byte key, append a
     /// `[[client]]` entry via [`acl::append_key_locked`] (the shared
-    /// lock-discipline write used by the CLI too), hot-reload the SharedAcl
+    /// lock-discipline write used by the CLI too), hot-reload the `SharedAcl`
     /// (this loop is its single writer), broadcast `AclUpdated` so connected
     /// clients see the new trust total, and reply with the count.
     ///
     /// Re-authorizing an ALREADY-present key is a success reply with no
     /// write — idempotent for a client that retries a slow request.
-    fn handle_acl_add(&mut self, pubkey: String, reply: mpsc::Sender<Result<usize, String>>) {
+    fn handle_acl_add(&mut self, pubkey: &str, reply: &mpsc::Sender<Result<usize, String>>) {
         use base64::Engine as _;
         let result = (|| -> Result<usize, String> {
             let Some(acl) = &self.acl else {
@@ -2542,7 +2543,7 @@ impl DaemonState {
             // connected client learns the new trust total.
             self.handle_broadcast_activity(
                 None,
-                DaemonMessage::AclUpdated {
+                &DaemonMessage::AclUpdated {
                     clients: *count as u64,
                 },
             );
@@ -2553,7 +2554,7 @@ impl DaemonState {
     /// Handle an `authorized_clients.toml` watcher event: hand the reload to
     /// the `SharedAcl` (the command loop is its single writer — re-read,
     /// parse-compare, atomic swap all live inside `reload`). A unit-test
-    /// DaemonState has no ACL (`None`) and the event is a logged no-op.
+    /// `DaemonState` has no ACL (`None`) and the event is a logged no-op.
     /// No reply: fire-and-forget, mirroring `handle_accounts_reload`.
     fn handle_acl_reload(&mut self) {
         match &self.acl {
@@ -2693,7 +2694,7 @@ impl DaemonState {
         // provenance — a flat, non-session message — so no origin-contract
         // dedup runs). Clients can refresh their account pickers live.
         let accounts = self.account_infos();
-        self.handle_broadcast_activity(None, DaemonMessage::Accounts { accounts });
+        self.handle_broadcast_activity(None, &DaemonMessage::Accounts { accounts });
     }
 
     /// Reply to a session's lazy provider-resolution request with the raw
@@ -2701,28 +2702,22 @@ impl DaemonState {
     /// itself, against its own socket registry. The key is wrapped in
     /// `Zeroizing` here — the single hop where the daemon hands cleartext
     /// across a thread boundary — so unconsumed replies are wiped on drop.
-    fn handle_resolve_account(
-        &mut self,
-        account: String,
-        reply: crossbeam_channel::Sender<
-            Option<(crate::accounts::AccountConfig, Option<Zeroizing<String>>)>,
-        >,
-    ) {
-        let resolved = self.accounts.get(&account).map(|config| {
+    fn handle_resolve_account(&mut self, account: &str, reply: &ResolveAccountReply) {
+        let resolved = self.accounts.get(account).map(|config| {
             (
                 config.clone(),
                 // api_key_for returns an inert String for internal gates
                 // (prefetch/validate checks); this reply is the credential
                 // EXIT point, so the wipe-on-drop wrapper goes on here.
-                self.api_key_for(&account).map(Zeroizing::new),
+                self.api_key_for(account).map(Zeroizing::new),
             )
         });
         let _ = reply.send(resolved);
     }
 
     /// Check whether an account with the given name exists.
-    fn handle_account_exists(&mut self, name: String, reply: std::sync::mpsc::Sender<bool>) {
-        let _ = reply.send(self.accounts.contains(&name));
+    fn handle_account_exists(&mut self, name: &str, reply: &std::sync::mpsc::Sender<bool>) {
+        let _ = reply.send(self.accounts.contains(name));
     }
 }
 
@@ -2780,17 +2775,16 @@ fn zeroized_key_or_wipe(key: &mut Vec<u8>) -> Result<Zeroizing<[u8; 32]>, Keysto
     // Zeroizing makes the wipe structural: the stack array is zeroed on EVERY
     // exit — early returns, the `?` operator, even a panic — so no per-path
     // zeroize call can be forgotten by a future edit.
-    match key.as_slice().try_into() {
-        Ok(k) => Ok(Zeroizing::new(k)),
-        Err(_) => {
-            // The presented bytes are unusable, but still secret material —
-            // wipe the heap copy before returning so a failed operation does
-            // not leave the key lying in a freed allocation.
-            key.zeroize();
-            Err(KeystoreOpError::Other(
-                "invalid key: expected exactly 32 bytes".to_string(),
-            ))
-        }
+    if let Ok(k) = key.as_slice().try_into() {
+        Ok(Zeroizing::new(k))
+    } else {
+        // The presented bytes are unusable, but still secret material —
+        // wipe the heap copy before returning so a failed operation does
+        // not leave the key lying in a freed allocation.
+        key.zeroize();
+        Err(KeystoreOpError::Other(
+            "invalid key: expected exactly 32 bytes".to_string(),
+        ))
     }
 }
 
@@ -2845,7 +2839,7 @@ fn bind_keystore(state: &DaemonState, key: &[u8; 32]) -> Result<(), KeystoreOpEr
 ///   presented.
 /// * Bound keystore: derive the presented key's public key and compare
 ///   against the binding; a mismatch is `KeystoreOpError::Other`
-///   (LockedError for Unlock, CredentialAddFailed for AddCredential).
+///   (`LockedError` for Unlock, `CredentialAddFailed` for `AddCredential`).
 pub(crate) fn verify_keystore_binding(
     state: &DaemonState,
     key: &[u8; 32],
@@ -3035,7 +3029,8 @@ fn send_catalog_reply(reply: Vec<RefreshRequester>, providers: usize, models: us
 ///   `shutdown_all` on wake would add nothing (the sleep path already
 ///   cleared the registry) and could only disturb fresh connections.
 fn handle_suspend_event(
-    event: &SuspendEvent,
+    // Copy enum: taken by value (the lint flags the needless `&`).
+    event: SuspendEvent,
     daemon_registry: &SocketRegistry,
     session_registries: &HashMap<u64, SocketRegistry>,
 ) {
@@ -3046,7 +3041,7 @@ fn handle_suspend_event(
             let daemon_sockets = daemon_registry.registered_count();
             let session_sockets: usize = session_registries
                 .values()
-                .map(|r| r.registered_count())
+                .map(choreo_ai_protocols::SocketRegistry::registered_count)
                 .sum();
             info!(
                 daemon_sockets,

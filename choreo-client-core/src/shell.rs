@@ -7,12 +7,12 @@ const INVALID_ACCOUNT_NAME: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnlockMethod {
     /// Unlock with the key ALREADY associated with this daemon: the stored
-    /// known_servers unlock_key, falling back to the legacy raw `identity.pk`
-    /// file (which is then COPIED into known_servers.toml so the store becomes
+    /// `known_servers` `unlock_key`, falling back to the legacy raw `identity.pk`
+    /// file (which is then COPIED into `known_servers.toml` so the store becomes
     /// the single source of truth).
     Raw,
     /// Unlock with the base64-encoded 32-byte key given by the user. The key
-    /// is recorded into known_servers.toml for `addr` BEFORE the Unlock is
+    /// is recorded into `known_servers.toml` for `addr` BEFORE the Unlock is
     /// sent (survivor semantics: a wrong key simply replays its rejection
     /// until manually replaced).
     Key(String),
@@ -58,6 +58,7 @@ pub enum ShellCommand {
 
 /// Returns `true` if `name` is a valid account name: non-empty and matching
 /// `[a-z0-9_-]` (lowercase alphanumeric, hyphens, underscores).
+#[must_use]
 pub fn is_valid_account_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -178,10 +179,10 @@ fn parse_account_subcommand(rest: &str) -> Option<ShellCommand> {
             }
             _ => {
                 let name = args.to_string();
-                if !is_valid_account_name(&name) {
-                    ShellCommand::UnknownCommand(INVALID_ACCOUNT_NAME.to_string())
-                } else {
+                if is_valid_account_name(&name) {
                     ShellCommand::Send(ClientMessage::SetSessionAccount { name })
+                } else {
+                    ShellCommand::UnknownCommand(INVALID_ACCOUNT_NAME.to_string())
                 }
             }
         });
@@ -465,6 +466,7 @@ fn parse_command(
     ShellCommand::UnknownCommand(format!("unknown command: /{rest}"))
 }
 
+#[must_use]
 pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
     match command {
         ShellCommand::Send(message) => match message {

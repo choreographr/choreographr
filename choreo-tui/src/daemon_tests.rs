@@ -8,6 +8,9 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 // ── handle_daemon_message progress bar integration ──
 
+// fn-level #[allow]: clippy's assert_is_empty rewrite is worse than the
+// deliberate `assert!(x.is_empty())` check below.
+#[allow(clippy::assert_is_empty)]
 #[test]
 fn daemon_message_session_state_updates_progress_for_attached_session() {
     let mut app = test_app();

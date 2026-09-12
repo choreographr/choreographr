@@ -1,13 +1,13 @@
 //! Integration tests for the `write_file` tool's overwrite path.
 //!
-//! These exercise real filesystem I/O (TempDir + writes + permission bits) and
+//! These exercise real filesystem I/O (`TempDir` + writes + permission bits) and
 //! therefore live in `tests/` per the project's Test Discipline policy rather
-//! than in `src/` unit-test modules. They are marked `#[ignore]` so `cargo
+//! than in `src/` unit-test modules. They are marked `#[ignore = "integration"]` so `cargo
 //! test` runs only unit tests; run with `cargo test-integration`.
 //!
 //! `write_file` shares its atomic-replace helper (`atomic_write_text_file` in
 //! `tools/fs/mod.rs`) with `edit_file`; these tests pin down the permission
-//! behavior of that shared path from write_file's side.
+//! behavior of that shared path from `write_file`'s side.
 
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
 // allow-*-in-tests config only recognizes #[test]-annotated functions —
@@ -37,7 +37,7 @@ fn write_args(path: &Path, content: &str, overwrite: bool) -> WriteFileArgs {
 // silently lose its +x bit.
 #[cfg(unix)]
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn overwrite_preserves_execute_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -65,7 +65,7 @@ fn overwrite_preserves_execute_permissions() {
 // replace path deliberately keeps the tempfile default (0600 on Unix).
 #[cfg(unix)]
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn overwrite_new_file_keeps_tempfile_default_mode() {
     use std::os::unix::fs::PermissionsExt;
 

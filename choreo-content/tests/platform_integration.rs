@@ -30,7 +30,6 @@
     clippy::indexing_slicing
 )]
 use choreo_content::chain::{ChainAccount, account_id_from_address};
-use choreo_content::encode::{ContentInput, ContentType};
 use choreo_content::orchestrate;
 
 /// A content digest hex that must not collide with the test's own upload.
@@ -40,6 +39,9 @@ fn test_digest_hex() -> String {
 
 /// Build a `ChainAccount` for signing from a Substrate credential, defaulting
 /// to the dev "Alice" account when none is supplied via the environment.
+// Only used by the commented-out round-trip test below; kept so the harness
+// is ready to restore once a self-contained fixture exists.
+#[allow(dead_code)]
 fn test_account() -> ChainAccount {
     if let (Ok(json), Ok(password)) = (
         std::env::var("CHOREOGRAPHR_SUBSTRATE_JSON"),
@@ -62,8 +64,8 @@ fn test_account() -> ChainAccount {
     ChainAccount::from_parts(account_id, view.secret.to_vec())
 }
 
-/// Round-trip a document through the platform: encode -> IPFS -> derive id ->
-/// submit -> read back via indexer/IPFS -> verify content.
+// Round-trip a document through the platform: encode -> IPFS -> derive id ->
+// submit -> read back via indexer/IPFS -> verify content.
 // TEMPORARILY DISABLED: requires a live Coordination Platform (node,
 // indexer, IPFS) and fails in environments without them, including
 // `cargo test-all`'s `--run-ignored all`. Restore when a self-contained

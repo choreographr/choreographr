@@ -1,5 +1,6 @@
 use super::render::*;
 use choreo_proto::{SessionStatus, SessionSummary, TokenUsage};
+use ratatui::buffer::Cell;
 
 // ── format_status tests ──
 
@@ -142,7 +143,7 @@ fn render_model_selector_shows_title_filter_and_models() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(content.contains("Select Model"), "popup title is drawn");
     assert!(content.contains("gpt-4o"), "all models are listed");
@@ -170,7 +171,7 @@ fn render_model_selector_loading_and_error_states() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(content.contains("Loading models"), "loading row is drawn");
 
@@ -188,7 +189,7 @@ fn render_model_selector_loading_and_error_states() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(content.contains("no credential"), "error row is drawn");
 }
@@ -216,7 +217,7 @@ fn render_wizard_provider_shows_filter_and_providers() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(content.contains("Select Provider"), "popup title is drawn");
     // The picker is alphabetical by display name, so the first provider is
@@ -248,7 +249,7 @@ fn render_wizard_provider_shows_filter_and_providers() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(
         content.contains("No providers match the filter."),
@@ -282,7 +283,7 @@ fn render_wizard_slug_shows_picked_provider_and_slug_prompt() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(content.contains("Add Account"), "popup title is drawn");
     assert!(
@@ -316,7 +317,7 @@ fn render_credential_modal_shows_title_and_masked_key() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(
         content.contains("API Key for \"my-account\""),
@@ -363,7 +364,7 @@ fn render_credential_modal_short_key_mid_cursor_does_not_panic() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(
         content.contains("API Key for \"my-account\""),
@@ -396,8 +397,8 @@ fn render_session_list_shows_ids_parents_and_titles() {
             reasoning_effort: None,
             parent_session_id: None,
             working_dir: None,
-            created_at: 1705314000000,
-            last_modified: 1705314000000,
+            created_at: 1_705_314_000_000,
+            last_modified: 1_705_314_000_000,
             turn_count: 3,
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
@@ -413,8 +414,8 @@ fn render_session_list_shows_ids_parents_and_titles() {
             reasoning_effort: None,
             parent_session_id: Some(9001),
             working_dir: None,
-            created_at: 1705314000000,
-            last_modified: 1705314000001,
+            created_at: 1_705_314_000_000,
+            last_modified: 1_705_314_000_001,
             turn_count: 12,
             status: SessionStatus::Inference,
             active_tool_groups: vec![],
@@ -435,7 +436,7 @@ fn render_session_list_shows_ids_parents_and_titles() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
 
     // Table headers are drawn, including the new id columns.
@@ -469,6 +470,10 @@ fn render_session_list_shows_ids_parents_and_titles() {
 
 // ── Selected-row highlight spans the full content width ────────────────
 
+// Indices 1..=30 fit every narrower field they are cast into in the session
+// fixtures below (closures are separate HIR bodies, so the allow lives on the
+// test fn).
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 #[test]
 fn session_list_selected_row_highlight_is_solid_across_width() {
     use crate::test_util::test_app;
@@ -487,8 +492,8 @@ fn session_list_selected_row_highlight_is_solid_across_width() {
             reasoning_effort: None,
             parent_session_id: None,
             working_dir: None,
-            created_at: 1705314000000 + i as i64,
-            last_modified: 1705314000000 + i as i64,
+            created_at: 1_705_314_000_000 + i as i64,
+            last_modified: 1_705_314_000_000 + i as i64,
             turn_count: i as u32,
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
@@ -559,6 +564,8 @@ fn session_list_selected_row_highlight_is_solid_across_width() {
 
 // ── Session list scrolls with selection ──────────────────────────────
 
+// Indices 1..=30 fit u32, so the `turn_count` cast never truncates.
+#[allow(clippy::cast_possible_truncation)]
 #[test]
 fn session_list_scrolls_to_keep_selection_visible() {
     use crate::test_util::test_app;
@@ -582,8 +589,8 @@ fn session_list_scrolls_to_keep_selection_visible() {
             reasoning_effort: None,
             parent_session_id: None,
             working_dir: None,
-            created_at: 1705314000000,
-            last_modified: 1705314000000,
+            created_at: 1_705_314_000_000,
+            last_modified: 1_705_314_000_000,
             turn_count: i as u32,
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
@@ -606,7 +613,7 @@ fn session_list_scrolls_to_keep_selection_visible() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
 
     // First visible row is index 6 ("session 7"); the selected row 25
@@ -626,6 +633,8 @@ fn session_list_scrolls_to_keep_selection_visible() {
 
 // ── Session list directional scrolling ──────────────────────────────
 
+// Indices 1..=30 fit u32, so the `turn_count` cast never truncates.
+#[allow(clippy::cast_possible_truncation)]
 #[test]
 fn session_list_scrolls_down_then_up_directionally() {
     use crate::connection::handle_terminal_event;
@@ -644,8 +653,8 @@ fn session_list_scrolls_down_then_up_directionally() {
             reasoning_effort: None,
             parent_session_id: None,
             working_dir: None,
-            created_at: 1705314000000,
-            last_modified: 1705314000000,
+            created_at: 1_705_314_000_000,
+            last_modified: 1_705_314_000_000,
             turn_count: i as u32,
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
@@ -677,7 +686,7 @@ fn session_list_scrolls_down_then_up_directionally() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(content.contains("session 11 "), "scrolled past the fold");
     assert!(content.contains("session 30 "), "last session visible");
@@ -697,7 +706,7 @@ fn session_list_scrolls_down_then_up_directionally() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(
         content.contains("session 11 "),
@@ -720,7 +729,7 @@ fn session_list_scrolls_down_then_up_directionally() {
         .buffer()
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(Cell::symbol)
         .collect();
     assert!(
         content.contains("session 10 "),

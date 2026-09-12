@@ -85,11 +85,11 @@ fn read_exact_or_closed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), Tr
 
 /// An encrypted Noise IK transport stream.
 ///
-/// Wraps a TcpStream with a snow TransportState. Every message is
+/// Wraps a `TcpStream` with a snow `TransportState`. Every message is
 /// length-prefixed (4-byte BE u32) and encrypted with AES-256-GCM.
 ///
-/// The TransportState is behind an Arc<Mutex<>> so the stream can be
-/// cloned for concurrent reader/writer threads via try_clone().
+/// The `TransportState` is behind an Arc<Mutex<>> so the stream can be
+/// cloned for concurrent reader/writer threads via `try_clone()`.
 pub struct NoiseStream {
     tcp: TcpStream,
     transport: Arc<Mutex<TransportState>>,
@@ -120,7 +120,7 @@ pub struct NoiseStream {
 }
 
 impl NoiseStream {
-    /// Create a new NoiseStream wrapping a TcpStream and TransportState.
+    /// Create a new `NoiseStream` wrapping a `TcpStream` and `TransportState`.
     pub fn new(tcp: TcpStream, transport: TransportState) -> Self {
         trace!("NoiseStream created");
         NoiseStream {
@@ -138,8 +138,12 @@ impl NoiseStream {
     }
 
     /// Clone the stream for concurrent reader/writer threads.
-    /// The underlying TcpStream is cloned; the TransportState is shared
+    /// The underlying `TcpStream` is cloned; the `TransportState` is shared
     /// via Arc<Mutex<>> so encrypt/decrypt calls are serialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` if the underlying stream cannot be cloned.
     pub fn try_clone(&self) -> std::io::Result<Self> {
         Ok(NoiseStream {
             tcp: self.tcp.try_clone()?,
@@ -178,6 +182,17 @@ impl NoiseStream {
     /// — never allocated per call — and each frame is written as ONE
     /// coalesced `write_all` (4-byte prefix + ciphertext, one syscall per
     /// fragment).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::InvalidFragment`] if another thread is
+    /// concurrently sending on this stream or the plaintext exceeds
+    /// [`MAX_FRAME_SIZE`], [`TransportError::ConnectionClosed`]/I/O errors
+    /// from the socket, or snow errors from encryption.
+    // The `usize` ciphertext length `n` is snow's plaintext-plus-tag output
+    // and is bounded by the [`MAX_FRAME_SIZE`] check above, far under
+    // `u32::MAX`; keeping the plain cast preserves exact wire behavior.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
         // The single-writer-per-connection invariant is load-bearing:
         // fragments of one logical message must never interleave with
@@ -225,7 +240,10 @@ impl NoiseStream {
             // becomes a per-connection protocol error, never a panic.
             *at_mut(&mut self.send_frag, 0, "send_frag continuation header")? = 0;
             let n = {
-                let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
+                let mut transport = self
+                    .transport
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 transport.write_message(
                     slice(&self.send_frag, ..FRAGMENT_HEADER_LEN, "send_frag header")?,
                     // Ciphertext goes AFTER the 4-byte length-prefix headroom
@@ -267,7 +285,10 @@ impl NoiseStream {
             )?
             .copy_from_slice(chunk);
             let n = {
-                let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
+                let mut transport = self
+                    .transport
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 transport.write_message(
                     slice(
                         &self.send_frag,
@@ -302,6 +323,13 @@ impl NoiseStream {
     /// (EOF before a full frame, or a reset) `Err(TransportError::ConnectionClosed)`
     /// is returned — the read-loop callers treat that as a graceful
     /// disconnect, distinct from a protocol failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ConnectionClosed`] on EOF before a complete
+    /// message, [`TransportError::InvalidFragment`] on a frame exceeding the
+    /// reassembly cap or a continuation-header violation, and I/O or snow
+    /// errors otherwise.
     pub fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
         let mut plaintext = Vec::new();
         loop {
@@ -357,7 +385,7 @@ impl NoiseStream {
             let n = self
                 .transport
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .read_message(&self.recv_ct_buf, &mut self.recv_pt_buf)?;
             // Every fragment from this implementation carries the 1-byte
             // continuation header, so a zero-length plaintext is impossible
@@ -389,31 +417,52 @@ impl NoiseStream {
         }
     }
 
-    /// Send a typed ClientMessage (convenience for clients).
+    /// Send a typed `ClientMessage` (convenience for clients).
+    ///
+    /// # Errors
+    ///
+    /// Returns any error propagated by [`Self::send_message`] or the payload
+    /// encoding.
     pub fn send_client_message(&mut self, msg: &ClientMessage) -> Result<(), TransportError> {
         let payload = encode_payload(msg)?;
         self.send_message(&payload)
     }
 
-    /// Receive a typed DaemonMessage (convenience for clients).
+    /// Receive a typed `DaemonMessage` (convenience for clients).
+    ///
+    /// # Errors
+    ///
+    /// Returns any error propagated by [`Self::recv_message`] or the payload
+    /// decoding.
     pub fn recv_daemon_message(&mut self) -> Result<DaemonMessage, TransportError> {
         let payload = self.recv_message()?;
         Ok(decode_frame(&payload)?)
     }
 
-    /// Send a typed DaemonMessage (convenience for servers).
+    /// Send a typed `DaemonMessage` (convenience for servers).
+    ///
+    /// # Errors
+    ///
+    /// Returns any error propagated by [`Self::send_message`] or the payload
+    /// encoding.
     pub fn send_daemon_message(&mut self, msg: &DaemonMessage) -> Result<(), TransportError> {
         let payload = encode_payload(msg)?;
         self.send_message(&payload)
     }
 
-    /// Receive a typed ClientMessage (convenience for servers).
+    /// Receive a typed `ClientMessage` (convenience for servers).
+    ///
+    /// # Errors
+    ///
+    /// Returns any error propagated by [`Self::recv_message`] or the payload
+    /// decoding.
     pub fn recv_client_message(&mut self) -> Result<ClientMessage, TransportError> {
         let payload = self.recv_message()?;
         Ok(decode_frame(&payload)?)
     }
 
-    /// Access the underlying TcpStream for shutdown etc.
+    /// Access the underlying `TcpStream` for shutdown etc.
+    #[must_use]
     pub fn get_ref(&self) -> &TcpStream {
         &self.tcp
     }

@@ -138,6 +138,16 @@ impl From<chain::ChainStatus> for ChainStatus {
 
 /// Resolve one item: latest (or a specific) revision, decoded from IPFS,
 /// merged with the on-chain control state.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Cid`] when `item_id_hex` is not 32 bytes of
+/// hex; with [`ContentError::Substrate`]/[`ContentError::Content`] from the
+/// on-chain state probe (unreachable node, missing item); with
+/// [`ContentError::Indexer`] when the revision lookup fails and
+/// [`ContentError::Content`] when no indexed revision (or the requested one)
+/// exists; with [`ContentError::Ipfs`] when the content cannot be fetched;
+/// and with [`ContentError::Content`] when the payload does not decode.
 pub fn item(item_id_hex: &str, revision_id: Option<u32>) -> Result<ResolvedItem, ContentError> {
     let item_id = encode::hex_to_bytes(item_id_hex)?;
 
@@ -205,6 +215,15 @@ fn select_image_level(
 /// Fetch an item's embedded image from IPFS: resolve the revision's content
 /// hash, decode the image mixin, and `cat` the requested mipmap level
 /// (`level = 0` is the full-resolution encode; `None` defaults to it).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Indexer`] when the revision lookup fails and
+/// [`ContentError::Content`] when no (or the requested) revision is indexed,
+/// the item has no embedded image, or the mipmap level is out of range; with
+/// [`ContentError::Ipfs`] when the content or the level's CID cannot be
+/// fetched; with [`ContentError::Cid`] when `item_id_hex` is not 32 bytes of
+/// hex; and with [`ContentError::Content`] when the payload does not decode.
 pub fn item_image(
     item_id_hex: &str,
     revision_id: Option<u32>,
@@ -218,10 +237,15 @@ pub fn item_image(
     })?;
     let (index, spec) = select_image_level(&image, level)?;
     let data = crate::ipfs::cat_by_cid(&spec.cid)?;
+    // `index` comes from `select_image_level`, which only returns valid
+    // indices into `mipmap_levels` (a Vec, far below u32::MAX in any real
+    // pyramid); keep the reference's narrowing cast semantics.
+    #[allow(clippy::cast_possible_truncation)]
+    let level = index as u32;
     Ok(ItemImage {
         width: image.width,
         height: image.height,
-        level: index as u32,
+        level,
         cid: spec.cid,
         filesize: spec.filesize,
         data,
@@ -248,6 +272,10 @@ fn revision_entries_from_events(item_id_hex: &str, events: &[DecodedEvent]) -> V
                 .is_some_and(|id| id.eq_ignore_ascii_case(item_id_hex))
         })
         .filter_map(|e| {
+            // The indexer renders `revision_id` as a u32 scalar (see the
+            // `custom_scalar("u32", …)` key encoding); keep the reference's
+            // wrapping truncation semantics for out-of-range values.
+            #[allow(clippy::cast_possible_truncation)]
             let rev = e.field_u64("revision_id")? as u32;
             let hash = e.field_str("ipfs_hash")?.to_string();
             Some(RevisionEntry {
@@ -298,6 +326,13 @@ fn resolve_revision(
 }
 
 /// Full revision history of an item, newest-first.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Cid`] when `item_id_hex` is not 32 bytes of
+/// hex, and with [`ContentError::Indexer`] when the indexer WebSocket
+/// connection or `acuity_getEvents` round-trip fails. An item with no
+/// indexed revisions yields an empty list, not an error.
 pub fn revisions(item_id_hex: &str) -> Result<Vec<RevisionEntry>, ContentError> {
     let events = indexer::get_events(&indexer::item_id_key(item_id_hex)?, 512, None)?;
     let mut list = revision_entries_from_events(item_id_hex, &events);
@@ -306,6 +341,12 @@ pub fn revisions(item_id_hex: &str) -> Result<Vec<RevisionEntry>, ContentError> 
 }
 
 /// Query the indexer for events matching a key (low-level read primitive).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Indexer`] when the WebSocket connection to the
+/// indexer or the `acuity_getEvents` JSON-RPC round-trip fails, or the
+/// result cannot be decoded.
 pub fn events(
     key: &QueryKey,
     limit: u16,
@@ -316,6 +357,13 @@ pub fn events(
 
 /// List an account's pinned content items, resolving each title via the
 /// indexer+IPFS (items that fail to resolve fall back to id-only).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::InvalidArgument`] when `account_addr` is not a
+/// valid SS58 address; with [`ContentError::Substrate`] when the pinned item
+/// ids cannot be read from chain; with [`ContentError::Indexer`] when the
+/// indexer is unreachable (titles then degrade to `None` per item).
 pub fn account_items(account_addr: &str) -> Result<Vec<AccountItem>, ContentError> {
     let account = chain::account_id_from_address(account_addr)?;
     let ids = chain::account_item_ids(account)?;
@@ -340,6 +388,13 @@ fn resolve_title(item_id_hex: &str) -> Result<Option<String>, ContentError> {
 }
 
 /// Resolve an account's profile.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::InvalidArgument`] when `account_addr` is not a
+/// valid SS58 address; with [`ContentError::Substrate`] when the profile
+/// item id cannot be read from chain. Content-resolution failures degrade
+/// to a default [`ProfileResult`] with just the item id set.
 pub fn profile(account_addr: &str) -> Result<ProfileResult, ContentError> {
     let account = chain::account_id_from_address(account_addr)?;
     let Some(profile_item_id) = chain::profile_item(account)? else {
@@ -373,6 +428,12 @@ pub fn profile(account_addr: &str) -> Result<ProfileResult, ContentError> {
 }
 
 /// Decode arbitrary content bytes from IPFS (by digest hex or CID) — no chain.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Cid`] when a `0x`-prefixed input is not 32
+/// bytes of hex; with [`ContentError::Ipfs`] when the IPFS fetch fails; and
+/// with [`ContentError::Content`] when the bytes do not decode as an item.
 pub fn decode_content(ipfs_hash_or_cid: &str) -> Result<DecodedItem, ContentError> {
     let bytes = if ipfs_hash_or_cid.starts_with("0x") {
         crate::ipfs::cat(ipfs_hash_or_cid)?
@@ -383,6 +444,13 @@ pub fn decode_content(ipfs_hash_or_cid: &str) -> Result<DecodedItem, ContentErro
 }
 
 /// Aggregate status across all three services (each is best-effort).
+///
+/// # Errors
+///
+/// Practically infallible: each service probe is downgraded to `None` in the
+/// returned [`CoordStatus`] when it fails, so this only errors via
+/// [`ContentError::RuntimeNotInitialized`] if the sidecar runtime was never
+/// initialized (the chain probe needs it even to report unavailability).
 pub fn status() -> Result<CoordStatus, ContentError> {
     let indexer = indexer::index_status().ok().map(IndexerStatus::from);
     let ipfs = crate::ipfs::id().ok().map(|peer| ipfs::IpfsStatus {
@@ -441,12 +509,24 @@ fn resolve_content(input: &ContentInput) -> Result<PreparedContent, ContentError
 }
 
 /// Publish a brand-new item: encode → IPFS → derive id → submit.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::InvalidArgument`] when `flags` is outside
+/// [`crate::config::VALID_PUBLISH_FLAGS`] or the image input is ambiguous
+/// (via [`resolve_content`]); with [`ContentError::Image`]/[`ContentError::Ipfs`]/[`ContentError::Cid`]
+/// when a `path`-based image cannot be prepared or the encoded payload
+/// cannot be uploaded to IPFS; with [`ContentError::Cid`] when the returned
+/// digest is malformed; and with [`ContentError::Transaction`],
+/// [`ContentError::Substrate`], [`ContentError::Account`], or
+/// [`ContentError::RuntimeNotInitialized`] from the chain submission (see
+/// [`chain::publish_item`]).
 pub fn publish_item(
     account: &ChainAccount,
     content: &ContentInput,
-    parents: Vec<[u8; 32]>,
-    links: Vec<[u8; 32]>,
-    mentions: Vec<[u8; 32]>,
+    parents: &[[u8; 32]],
+    links: &[[u8; 32]],
+    mentions: &[[u8; 32]],
     flags: Option<u8>,
     nonce: Option<[u8; 32]>,
 ) -> Result<chain::TxOutcome, ContentError> {
@@ -483,12 +563,22 @@ pub fn publish_item(
 }
 
 /// Publish a new revision of an existing item.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Image`], [`ContentError::Ipfs`], or
+/// [`ContentError::Cid`] when a `path`-based image cannot be prepared (via
+/// [`resolve_content`]) or the encoded payload cannot be uploaded to IPFS;
+/// with [`ContentError::Content`] when the payload cannot be encoded; and
+/// with [`ContentError::Transaction`], [`ContentError::Substrate`],
+/// [`ContentError::Account`], or [`ContentError::RuntimeNotInitialized`]
+/// from the chain submission (see [`chain::publish_revision`]).
 pub fn publish_revision(
     account: &ChainAccount,
     item_id: [u8; 32],
     content: &ContentInput,
-    links: Vec<[u8; 32]>,
-    mentions: Vec<[u8; 32]>,
+    links: &[[u8; 32]],
+    mentions: &[[u8; 32]],
 ) -> Result<chain::TxOutcome, ContentError> {
     let bytes = encode::encode_item(&resolve_content(content)?)?;
     let ipfs_hash = crate::ipfs::add(&bytes, "content.bin")?;
@@ -497,6 +587,15 @@ pub fn publish_revision(
 }
 
 /// Apply a lifecycle state transition (retract / freeze flags).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Transaction`] when the chosen extrinsic cannot
+/// be submitted or is not finalized successfully; with
+/// [`ContentError::Substrate`] when the node is unreachable or the genesis
+/// hash mismatches; with [`ContentError::Account`] when the stored secret
+/// cannot be rebuilt into a signer; with [`ContentError::RuntimeNotInitialized`]
+/// when the sidecar runtime was never initialized.
 pub fn lifecycle(
     account: &ChainAccount,
     action: LifecycleAction,
@@ -510,6 +609,16 @@ pub fn lifecycle(
 }
 
 /// Pin/unpin an item to/from an account.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Transaction`] when the chosen extrinsic cannot
+/// be submitted or is not finalized successfully; with
+/// [`ContentError::Substrate`] when the node is unreachable or the genesis
+/// hash mismatches; with [`ContentError::Account`] when the stored secret
+/// cannot be rebuilt into a signer; with
+/// [`ContentError::RuntimeNotInitialized`] when the sidecar runtime was
+/// never initialized.
 pub fn account_link(
     account: &ChainAccount,
     action: AccountLinkAction,
@@ -522,6 +631,16 @@ pub fn account_link(
 }
 
 /// Point an account's profile at a freshly published profile item.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Image`]/[`ContentError::Ipfs`]/[`ContentError::Cid`]
+/// when a `path`-based image cannot be prepared (via [`resolve_content`]) or
+/// the encoded payload cannot be uploaded to IPFS; with
+/// [`ContentError::Content`] when the payload cannot be encoded; and with
+/// [`ContentError::Transaction`], [`ContentError::Substrate`],
+/// [`ContentError::Account`], or [`ContentError::RuntimeNotInitialized`]
+/// from the profile publish or `set_profile` chain submission.
 pub fn set_profile(
     account: &ChainAccount,
     content: &ContentInput,
@@ -539,10 +658,10 @@ pub fn set_profile(
     let outcome = chain::publish_item(
         account,
         nonce,
-        vec![],
+        &[],
         crate::config::DEFAULT_ITEM_FLAGS,
-        vec![],
-        vec![],
+        &[],
+        &[],
         digest,
     )?;
     chain::set_profile(account, item_id)?;

@@ -75,7 +75,7 @@ impl McpManager {
                     );
                     registry.register_dynamic(
                         wrapper.name().to_string(),
-                        wrapper.group().to_string(),
+                        wrapper.group(),
                         Box::new(wrapper),
                     );
                 }
@@ -207,7 +207,7 @@ impl Drop for McpManager {
 mod imp {
     use crate::tools::ToolRegistry;
 
-    /// No-op stand-in for the real McpManager (see the module-level cfg note).
+    /// No-op stand-in for the real `McpManager` (see the module-level cfg note).
     pub struct McpManager;
 
     impl McpManager {
@@ -221,6 +221,7 @@ mod imp {
 
         /// Stub: creates an empty manager (same seam the real one exposes for
         /// tests).
+        #[must_use]
         pub fn empty() -> Self {
             Self
         }

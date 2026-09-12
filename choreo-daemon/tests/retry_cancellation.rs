@@ -87,7 +87,7 @@ fn spawn_http_server(responses: Vec<Vec<u8>>) -> (u16, thread::JoinHandle<()>) {
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn retry_succeeds_with_callback() {
     let (port, _server) = spawn_http_server(vec![
         http_response(
@@ -158,7 +158,7 @@ fn retry_succeeds_with_callback() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn retry_cancelled_during_backoff() {
     // Server returns 429 and will NOT receive a second request because
     // the client should cancel during the backoff wait.
@@ -217,7 +217,7 @@ fn retry_cancelled_during_backoff() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn hard_rate_limit_fails_without_retrying() {
     // A 429 whose Retry-After exceeds the backoff budget must fail on the
     // FIRST attempt: the server sees exactly one connection and the retry
@@ -292,7 +292,7 @@ fn hard_rate_limit_fails_without_retrying() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn server_503_with_long_retry_after_fails_without_retrying() {
     // RFC 7231 defines Retry-After for 503 just as for 429.  A 503 whose
     // Retry-After exceeds the backoff budget must fail on the FIRST attempt
@@ -355,7 +355,7 @@ fn server_503_with_long_retry_after_fails_without_retrying() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn retry_after_in_budget_is_honored_on_503() {
     // A 503 whose Retry-After fits the budget is retried exactly once,
     // waiting the server's stated duration — not a shorter exponential
@@ -491,7 +491,7 @@ fn sse_test_config(port: u16) -> ServiceConfig {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn streaming_cancelled_during_sse_events() {
     let (port, event_tx, _server) = spawn_sse_server();
     let client = OpenAiClient::new(
@@ -538,7 +538,7 @@ fn streaming_cancelled_during_sse_events() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn streaming_cancelled_before_first_event() {
     let (port, _event_tx, _server) = spawn_sse_server();
     let client = OpenAiClient::new(

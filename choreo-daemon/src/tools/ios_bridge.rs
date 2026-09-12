@@ -8,8 +8,8 @@
 //! # Architecture
 //!
 //! On iOS the GUI hosts the daemon in-process (`choreo-daemon/src/embedded.rs`)
-//! inside an app that also owns the UIKit main thread. Tool execution happens
-//! on daemon worker threads, but UIKit calls must happen on (or be serialized
+//! inside an app that also owns the `UIKit` main thread. Tool execution happens
+//! on daemon worker threads, but `UIKit` calls must happen on (or be serialized
 //! onto) the main queue. The seam is therefore:
 //!
 //! ```text
@@ -79,7 +79,7 @@ use std::time::{Duration, Instant};
 
 /// Deadline for `clipboard_write` / `clipboard_read`.
 pub const CLIPBOARD_TIMEOUT: Duration = Duration::from_millis(1500);
-/// Deadline for `open_url` (SpringBoard handoff + completion handler).
+/// Deadline for `open_url` (`SpringBoard` handoff + completion handler).
 pub const OPEN_URL_TIMEOUT: Duration = Duration::from_millis(3000);
 /// Deadline for `notify` (may include a lazy provisional-authorization trip).
 pub const NOTIFY_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -117,7 +117,7 @@ pub enum ToolBridgeError {
 /// Envelope sent Rust → Swift. `name` selects the Swift handler
 /// (`clipboard_write` | `clipboard_read` | `open_url` | `notify`);
 /// `args_json` is the tool's JSON arguments verbatim (Swift decodes with
-/// JSONSerialization — no shared schema on this boundary, only the
+/// `JSONSerialization` — no shared schema on this boundary, only the
 /// per-handler convention documented in IosToolHost.swift).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IosToolRequest {
@@ -158,6 +158,7 @@ impl IosToolPending {
     /// The only construction path. Public because the concrete bridge lives
     /// in another crate (choreo-gui); the private field keeps the cancel hook
     /// inaccessible afterwards (cancel is exclusively via `cancel(self)`).
+    #[must_use]
     pub fn new(
         request_id: u64,
         reply_rx: Receiver<ToolBridgeReply>,
@@ -183,6 +184,12 @@ impl IosToolPending {
     ///
     /// `Duration::ZERO` (or an already-elapsed deadline) returns `Timeout`
     /// immediately without ever blocking — the deterministic test path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Timeout` when the deadline elapses without a reply,
+    /// `Canceled` when the cancel flag is observed, and
+    /// [`ToolBridgeError::Platform`] when Swift reports a failure.
     pub fn wait(&self, deadline: Duration, is_canceled: &dyn Fn() -> bool) -> ToolBridgeReply {
         // Absolute deadline so per-iteration select slices can never stretch
         // the total (the same absolute-budget discipline the Noise handshake
@@ -204,9 +211,9 @@ impl IosToolPending {
             // Slice the remaining budget so the flag is re-checked at least
             // every CANCEL_POLL_SLICE; the reply arm fires the moment a reply
             // lands regardless of the slice.
-            let slice = deadline_at
-                .map(|d| CANCEL_POLL_SLICE.min(d.saturating_duration_since(now)))
-                .unwrap_or(CANCEL_POLL_SLICE);
+            let slice = deadline_at.map_or(CANCEL_POLL_SLICE, |d| {
+                CANCEL_POLL_SLICE.min(d.saturating_duration_since(now))
+            });
             select! {
                 recv(self.reply_rx) -> res => {
                     match res {
@@ -227,7 +234,7 @@ impl IosToolPending {
                 recv(crossbeam_channel::after(slice)) -> _ => {
                     // Timer slice elapsed: loop re-checks the flag, then the
                     // deadline. No sleep anywhere — the select IS the wait.
-                    continue;
+                    // (Falling through re-enters the select; no continue needed.)
                 }
             }
         }
@@ -256,13 +263,18 @@ pub trait IosToolBridge: Send + Sync {
     /// produced BEFORE the request ever reached Swift (e.g. the concrete
     /// bridge failing to encode strings). Must not block: the Swift bridge's
     /// implementation only enqueues onto the main queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the concrete bridge fails to encode or enqueue the
+    /// request before it reaches the host.
     fn dispatch(&self, request: IosToolRequest) -> Result<IosToolPending, ToolBridgeError>;
 }
 
 // ── MockBridge ──────────────────────────────────────────────────────────────
 
 /// Scripted in-process bridge for unit tests (and any host that wants to
-/// exercise tool logic without UIKit). Replies are popped FIFO from a
+/// exercise tool logic without `UIKit`). Replies are popped FIFO from a
 /// script queue; with an empty queue the reply sender is DROPPED (the
 /// abandoned-request path → `BridgeUnavailable`), which is the safest
 /// default: an unscripted test failure surfaces loudly instead of
@@ -299,7 +311,7 @@ impl MockBridge {
     pub fn script(&self, response: MockResponse) {
         self.script
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(response);
     }
 
@@ -307,7 +319,7 @@ impl MockBridge {
     pub fn dispatched(&self) -> Vec<IosToolRequest> {
         self.dispatched
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -315,7 +327,7 @@ impl MockBridge {
     pub fn cancels(&self) -> Vec<u64> {
         self.cancels
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 }
@@ -329,7 +341,7 @@ impl IosToolBridge for MockBridge {
         };
         self.dispatched
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(request.clone());
         let (tx, rx) = bounded::<ToolBridgeReply>(1);
         // Bounded(1): a scripted reply never blocks the mock (capacity fits
@@ -337,7 +349,7 @@ impl IosToolBridge for MockBridge {
         let response = self
             .script
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop_front()
             .unwrap_or(MockResponse::DropSender);
         match response {
@@ -357,7 +369,7 @@ impl IosToolBridge for MockBridge {
                 move || {
                     cancels
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(request_id);
                 }
             }),

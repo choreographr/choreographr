@@ -49,6 +49,7 @@ impl ImageWorker {
     ///
     /// The worker owns a clone of `picker` and uses it to create and encode
     /// terminal protocols from raw image bytes.
+    #[must_use]
     pub fn spawn(picker: Picker) -> Self {
         let (job_tx, job_rx) = channel::unbounded::<ImageJob>();
         let (result_tx, result_rx) = channel::unbounded::<ImageResult>();
@@ -60,7 +61,7 @@ impl ImageWorker {
                         tracing::debug!("[choreo-tui] image worker shutting down");
                         break;
                     }
-                    Ok(job) => process_job(&picker, &result_tx, job),
+                    Ok(job) => process_job(&picker, &result_tx, &job),
                 }
             }
         });
@@ -79,7 +80,7 @@ impl ImageWorker {
 ///
 /// On failure, a result with `protocol: None` is still sent so the caller
 /// can clear `pending_job` and allow a retry on the next frame.
-fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: ImageJob) {
+fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: &ImageJob) {
     tracing::debug!(
         "[choreo-tui] image worker processing job {} ({} {}x{})",
         job.id,
@@ -89,8 +90,11 @@ fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: I
     );
 
     let font_size = picker.font_size();
-    let target_px_w = (job.cell_size.width as u32).saturating_mul(font_size.width as u32);
-    let target_px_h = (job.cell_size.height as u32).saturating_mul(font_size.height as u32);
+    // u16 -> u32 is provably lossless, so `From` is preferred over `as`
+    // (an `as` cast would silently truncate if the cell-size type ever
+    // widened/shrunk).
+    let target_px_w = u32::from(job.cell_size.width).saturating_mul(u32::from(font_size.width));
+    let target_px_h = u32::from(job.cell_size.height).saturating_mul(u32::from(font_size.height));
 
     let image = match decode_image(&job.metadata, &job.data, target_px_w, target_px_h) {
         Ok(img) => img,
@@ -169,10 +173,22 @@ fn rasterize_svg_at_size(
 
     // Compute a uniform scale that fits the SVG within the target pixel
     // bounds while preserving aspect ratio.
+    // Pixel/area math is intentionally f32: the u32 -> f32 conversion may
+    // lose precision for huge dimensions, and the f32 -> u32 ceiling casts
+    // can truncate, but both are harmless here — the result is only a
+    // raster size, clamped to >= 1 below and bounded by the target box.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let scale = (target_px_w as f32 / svg_size.width()).min(target_px_h as f32 / svg_size.height());
 
-    let out_w = (svg_size.width() * scale).ceil() as u32;
-    let out_h = (svg_size.height() * scale).ceil() as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (out_w, out_h) = (
+        (svg_size.width() * scale).ceil() as u32,
+        (svg_size.height() * scale).ceil() as u32,
+    );
     let out_w = out_w.max(1);
     let out_h = out_h.max(1);
 
@@ -201,7 +217,7 @@ mod tests {
 
     #[test]
     fn rasterize_svg_at_size_produces_correct_dimensions() {
-        let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><rect width='100' height='50' fill='blue'/></svg>"#;
+        let svg = br"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><rect width='100' height='50' fill='blue'/></svg>";
         let image = rasterize_svg_at_size(svg, 200, 100).expect("should rasterize");
         let (w, h) = image.dimensions();
         assert_eq!(w, 200, "width constrained by target width");
@@ -210,7 +226,7 @@ mod tests {
 
     #[test]
     fn rasterize_svg_at_size_preserves_aspect_ratio() {
-        let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><rect width='100' height='50' fill='green'/></svg>"#;
+        let svg = br"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><rect width='100' height='50' fill='green'/></svg>";
         let image = rasterize_svg_at_size(svg, 100, 100).expect("should rasterize");
         let (w, h) = image.dimensions();
         assert_eq!(w, 100, "width constrained by target width");
@@ -219,7 +235,7 @@ mod tests {
 
     #[test]
     fn decode_image_accepts_svg() {
-        let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='red'/></svg>"#;
+        let svg = br"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='red'/></svg>";
         let metadata = ImageMetadata {
             mime_type: "image/svg+xml".to_string(),
             width: 4,
@@ -271,7 +287,11 @@ mod tests {
         // A valid PNG with no EXIF orientation decodes to the same dimensions
         // (the orientation path must be a no-op for default orientation).
         let buf = image::RgbaImage::from_fn(4, 3, |x, y| {
-            image::Rgba([x as u8 * 60, y as u8 * 80, 0, 255])
+            // Test-gradient values (x < 4, y < 3) always fit in u8; the cast
+            // cannot truncate for these dimensions.
+            #[allow(clippy::cast_possible_truncation)]
+            let px = |v: u32| v as u8;
+            image::Rgba([px(x) * 60, px(y) * 80, 0, 255])
         });
         let mut png = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(buf)
@@ -290,11 +310,11 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             if let Ok(job) = job_rx.recv() {
-                process_job(&picker, &result_tx, job);
+                process_job(&picker, &result_tx, &job);
             }
         });
 
-        let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='red'/></svg>"#;
+        let svg = br"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='red'/></svg>";
         job_tx
             .send(ImageJob {
                 id: 42,
@@ -328,7 +348,7 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             if let Ok(job) = job_rx.recv() {
-                process_job(&picker, &result_tx, job);
+                process_job(&picker, &result_tx, &job);
             }
         });
 

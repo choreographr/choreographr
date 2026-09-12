@@ -35,7 +35,7 @@ use std::net::IpAddr;
 /// Reject URLs whose host is an IP literal in a range that must never be
 /// dereferenced from provider-controlled response data (SSRF guard).
 ///
-/// Blocks loopback (127/8, ::1), private (RFC 1918, RFC 4193 `fc00::/7`),
+/// Blocks loopback (127/8, `::1`), private (RFC 1918, RFC 4193 `fc00::/7`),
 /// and link-local (169.254/16, `fe80::/10`) addresses. Non-IP hostnames
 /// (e.g. `mfile.z.ai`) are ALLOWED — recorded security decision:
 /// the URL's hostname is provider-controlled, but DNS pinning for arbitrary
@@ -107,15 +107,15 @@ fn is_blocked_ip_literal(ip: IpAddr) -> bool {
 /// ends at `/api/paas/v4`, so the composed URL is `/paas/v4/images/generations`).
 const IMAGE_GENERATIONS_PATH: &str = "/images/generations";
 
-/// z.ai chat accounts resolve to the documented standard PaaS base
+/// z.ai chat accounts resolve to the documented standard `PaaS` base
 /// (`https://api.z.ai/api/paas/v4` — see the overlay's `[provider.zai]`
-/// base_url), so this rewrite is a NO-OP PASSTHROUGH for the default
+/// `base_url`), so this rewrite is a NO-OP PASSTHROUGH for the default
 /// configuration. It stays as a safety net for Coding-Plan subscribers
-/// who override their account's base_url to the coding gateway
+/// who override their account's `base_url` to the coding gateway
 /// (`https://api.z.ai/api/coding/paas/v4`): the Images API is NOT served
 /// under the `/coding` plan path — the docs pin it at
 /// `https://api.z.ai/api/paas/v4`. Strip the `/coding` segment so the
-/// image request lands on the plain PaaS base. The rewrite is a no-op
+/// image request lands on the plain `PaaS` base. The rewrite is a no-op
 /// for any other base — the default z.ai base already ends at
 /// `/api/paas/v4`, the mainland zhipuai base does too, proxies and test
 /// mocks don't carry the segment at all — so it can never corrupt an
@@ -140,7 +140,7 @@ fn quality_wire(quality: super::ImageQuality) -> Option<&'static str> {
 /// Wire mapping of our [`super::ImageSize`] to z.ai's `size` string.
 /// All three non-auto variants are legal for glm-image's custom-size rule
 /// (width/height in 1024..=2048, divisible by 32 — `1024`, `1536` both
-/// qualify), and the strings are identical to the OpenAI wire strings.
+/// qualify), and the strings are identical to the `OpenAI` wire strings.
 /// `Auto` is omitted: `1280x1280` is glm-image's own default, and z.ai
 /// documents no `auto` sentinel value — sending nothing is the only way to
 /// express "provider decides" without guessing an undocumented literal.
@@ -157,7 +157,7 @@ fn size_wire(size: super::ImageSize) -> Option<&'static str> {
 ///
 /// Construction mirrors [`super::OpenAiImageClient::new`]: it takes the same
 /// [`ServiceConfig`] shape so the chat account's config clones as-is (the
-/// daemon dispatch keeps base_url/user_agent/slug shared), then overrides
+/// daemon dispatch keeps `base_url/user_agent/slug` shared), then overrides
 /// the two knobs the image path must set differently (the 180 s attempt
 /// deadline and the 2-attempt retry budget — see the shared constants in
 /// [`super`]).
@@ -183,6 +183,7 @@ impl ZaiImageClient {
     /// The agent is built with the image attempt deadline (see
     /// [`IMAGE_TOTAL_TIMEOUT_SECS`]) rather than the chat config's total
     /// timeout — same override pattern as [`super::OpenAiImageClient::new`].
+    #[must_use]
     pub fn new(mut config: ServiceConfig, api_key: String, registry: &SocketRegistry) -> Self {
         let http = crate::shared::build_agent(
             registry,
@@ -204,6 +205,7 @@ impl ZaiImageClient {
         }
     }
 
+    #[must_use]
     pub fn config(&self) -> &ServiceConfig {
         &self.config
     }
@@ -249,15 +251,15 @@ impl ZaiImageClient {
         });
         // `Map::insert` (instead of `Value`'s IndexMut, which would panic on
         // a non-object body) is the correct API for setting top-level keys.
-        if let Some(size) = size_wire(req.size) {
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("size".into(), size.into());
-            }
+        if let Some(size) = size_wire(req.size)
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("size".into(), size.into());
         }
-        if let Some(quality) = quality_wire(req.quality) {
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("quality".into(), quality.into());
-            }
+        if let Some(quality) = quality_wire(req.quality)
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("quality".into(), quality.into());
         }
         body
     }
@@ -373,8 +375,7 @@ impl ZaiImageClient {
             .map(str::to_owned);
         let mime_ok = content_type
             .as_deref()
-            .map(|ct| ct.starts_with("image/"))
-            .unwrap_or(true); // absent header → defer to byte-level validation
+            .is_none_or(|ct| ct.starts_with("image/")); // absent header → defer to byte-level validation
         if !mime_ok {
             tracing::warn!(
                 url = %url,

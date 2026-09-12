@@ -101,6 +101,7 @@ pub(crate) fn endpoint_url(base_url: &str, path: &str) -> io::Result<String> {
 impl ServiceConfig {
     /// Resolve the request format for a model: catalog lookup first,
     /// falling back to the configured default for unknown models.
+    #[must_use]
     pub fn request_format_for_model(&self, model: &str) -> RequestFormat {
         crate::catalog::model_request_format(&self.provider_slug, model)
             .unwrap_or(self.default_request_format)
@@ -133,6 +134,7 @@ impl ServiceConfig {
         }
     }
 
+    #[must_use]
     pub fn max_output_tokens_for_model(&self, model: &str) -> Option<u32> {
         // Clamp-down against the catalog ceiling at the single resolution
         // point so every Responses-path caller inherits the clamp without
@@ -144,6 +146,7 @@ impl ServiceConfig {
             .map(|requested| self.clamp_output_to_catalog(model, requested))
     }
 
+    #[must_use]
     pub fn max_tokens_for_model(&self, model: &str) -> Option<u32> {
         self.model_max_tokens
             .get(model)
@@ -151,6 +154,7 @@ impl ServiceConfig {
             .or(self.chat_completions_max_tokens)
     }
 
+    #[must_use]
     pub fn context_window_for_model(&self, model: &str) -> Option<u32> {
         self.context_window_config.context_window_for_model(model)
     }
@@ -159,6 +163,7 @@ impl ServiceConfig {
     ///
     /// Auto-enables for gpt-5.6+ models when the default is the Responses API.
     /// The account-level `programmatic_tool_calling` override takes precedence.
+    #[must_use]
     pub fn programmatic_tool_calling_for_model(&self, model: &str) -> bool {
         if self.programmatic_tool_calling {
             return true;
@@ -207,6 +212,13 @@ impl ServiceConfig {
     }
 }
 
+/// List models via the provider's own base/config (used by the
+/// /refresh-models path that has no client instance).
+///
+/// # Errors
+///
+/// Returns `io::Error` on HTTP failure, provider error responses, or body
+/// decoding failures.
 pub fn validate_and_list_models(config: &ServiceConfig, api_key: &str) -> io::Result<Vec<String>> {
     // Standalone helper (no callers in the workspace): builds its own
     // throwaway registry — callers wanting force-close coverage should use
@@ -216,6 +228,12 @@ pub fn validate_and_list_models(config: &ServiceConfig, api_key: &str) -> io::Re
     Ok(client.validate_and_list_models()?)
 }
 
+/// Non-streaming completion built straight from a [`ServiceConfig`].
+///
+/// # Errors
+///
+/// Returns `io::Error` on HTTP failure, provider error responses, or body
+/// decoding failures.
 pub fn completion(
     config: &ServiceConfig,
     api_key: &str,

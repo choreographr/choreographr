@@ -2,6 +2,7 @@ use super::{EvmBlockArgs, alloy_err, block_on, connect, log_execution, parse_blo
 use crate::{BlockchainError, truncate_tool_output};
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::BlockNumberOrTag;
+use std::fmt::Write;
 
 async fn evm_block_impl(rpc_url: &str, block_tag: Option<&str>) -> Result<String, BlockchainError> {
     let provider = connect(rpc_url)?;
@@ -26,18 +27,23 @@ async fn evm_block_impl(rpc_url: &str, block_tag: Option<&str>) -> Result<String
     let base_fee = block.header.base_fee_per_gas.unwrap_or(0);
 
     let mut out = String::new();
-    out.push_str(&format!("block: #{number}\n"));
-    out.push_str(&format!("hash: {hash:#x}\n"));
-    out.push_str(&format!("timestamp: {timestamp}\n"));
-    out.push_str(&format!("transactions: {tx_count}\n"));
-    out.push_str(&format!("gas_used: {gas_used}\n"));
-    out.push_str(&format!("gas_limit: {gas_limit}\n"));
-    out.push_str(&format!("base_fee: {base_fee} wei"));
+    let _ = write!(out, "block: #{number}\n");
+    let _ = write!(out, "hash: {hash:#x}\n");
+    let _ = write!(out, "timestamp: {timestamp}\n");
+    let _ = write!(out, "transactions: {tx_count}\n");
+    let _ = write!(out, "gas_used: {gas_used}\n");
+    let _ = write!(out, "gas_limit: {gas_limit}\n");
+    let _ = write!(out, "base_fee: {base_fee} wei");
     Ok(out)
 }
 
 /// Synchronous entry point: runs [`evm_block_impl`] on the sidecar runtime and
 /// caps the output at the shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`BlockchainError`] when the node is unreachable, the RPC call
+/// fails, or the capped sanitized output cannot be produced.
 pub fn execute_evm_block(args: &EvmBlockArgs) -> Result<String, BlockchainError> {
     log_execution("evm_block", &args.rpc_url);
     let output = block_on(rpc_call(evm_block_impl(
@@ -47,6 +53,7 @@ pub fn execute_evm_block(args: &EvmBlockArgs) -> Result<String, BlockchainError>
     Ok(truncate_tool_output(&output))
 }
 
+#[must_use]
 pub fn describe_evm_block_invocation(args: &EvmBlockArgs) -> String {
     match args.block_tag.as_deref() {
         Some(tag) => format!("Querying EVM block {tag} on {}.", args.rpc_url),

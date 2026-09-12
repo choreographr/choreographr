@@ -58,7 +58,7 @@ impl ServerKeys {
 /// construction, and [`spawn_connection_thread`] re-installs both inside the
 /// connection thread before it dials. Without the re-install, the connection
 /// thread would read the user's REAL config directory — a real keypair the
-/// responder's ACL does not authorize, and a real known_servers store the
+/// responder's ACL does not authorize, and a real `known_servers` store the
 /// pin is not in.
 struct TestRoots {
     /// Held so the temp dirs outlive the test body.
@@ -123,7 +123,7 @@ fn spawn_connection_thread(
 /// First contact through `probe_server_key`: the learned key must be exactly
 /// the server's static.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn probe_server_key_learns_server_static() {
     let roots = TestRoots::install();
     let _ = &roots; // overrides live for the whole test body
@@ -165,7 +165,7 @@ fn probe_server_key_learns_server_static() {
 /// preamble + IK responder with an ACL closure) must succeed without any
 /// protocol message being exchanged — the preflight drops the transport.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn verify_daemon_authorization_accepts_enrolled_client() {
     let roots = TestRoots::install();
     let _ = &roots;
@@ -207,7 +207,7 @@ fn verify_daemon_authorization_accepts_enrolled_client() {
 /// detect this (it completes client-side before the daemon's check), which
 /// is why the preflight speaks IK.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn verify_daemon_authorization_rejects_unenrolled_client() {
     let roots = TestRoots::install();
     let _ = &roots;
@@ -250,7 +250,7 @@ fn verify_daemon_authorization_rejects_unenrolled_client() {
 /// encrypted Ping → Pong round trip over the pinned-IK connection, with the
 /// responder replicating the daemon's preamble + IK accept path.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn pinned_mode_connects_and_round_trips() {
     let roots = TestRoots::install();
     let server = ServerKeys::generate();
@@ -309,11 +309,11 @@ fn pinned_mode_connects_and_round_trips() {
         .expect("clean close");
 }
 
-/// THE known_hosts pin: connecting in pinned mode when the server's key has
+/// THE `known_hosts` pin: connecting in pinned mode when the server's key has
 /// CHANGED must fail, and the error must carry the pinned fingerprint and
-/// the explicit re-pair guidance — not a bare ConnectionRefused.
+/// the explicit re-pair guidance — not a bare `ConnectionRefused`.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn pinned_mode_key_change_fails_loud() {
     let roots = TestRoots::install();
 
@@ -374,7 +374,7 @@ fn pinned_mode_key_change_fails_loud() {
 /// The store must gate pinned mode: `TcpPinned` with NO pin errors with
 /// guidance instead of dialing (the caller skipped first contact).
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn pinned_mode_without_pin_errors() {
     let roots = TestRoots::install();
 

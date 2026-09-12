@@ -11,7 +11,7 @@
 //! Supported sources, all normalized to provider-allowlisted PNG (alpha) or
 //! JPEG (opaque):
 //!   - every raster format the `image` crate decodes (JPEG, PNG, GIF, WebP,
-//!     BMP, TIFF, TGA, DDS, ICO, PNM, HDR/Radiance, OpenEXR, Farbfeld, QOI);
+//!     BMP, TIFF, TGA, DDS, ICO, PNM, HDR/Radiance, `OpenEXR`, Farbfeld, QOI);
 //!   - AVIF — only when the gated `avif` feature is enabled (`image/avif-native`,
 //!     dav1d). Recognized but rejected otherwise.
 //!   - HEIC/HEIF — decoded via the pure-Rust `heif-oxide` crate (built in);
@@ -63,6 +63,11 @@ pub struct PreparedVisionImage {
 /// Fails (never panics) on: an oversized/unreadable file, an unsupported or
 /// undecodable image format, or a decompression-bomb allocation. The caller
 /// surfaces the error as a tool error or a placeholder text, never a crash.
+///
+/// # Errors
+///
+/// Returns Err if the file cannot be read (missing, unreadable, or over
+/// [`MAX_SOURCE_BYTES`]) or normalization fails (see [`normalize_bytes`]).
 pub fn load_and_normalize(path: &Path) -> std::io::Result<PreparedVisionImage> {
     let bytes = read_bounded(path)?;
     normalize_bytes(&bytes)
@@ -97,6 +102,11 @@ fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
 
 /// Normalize raw image bytes: sniff the format, decode under limits, resize
 /// to [`MAX_IMAGE_DIMENSION`], and re-encode to PNG (alpha) or JPEG (opaque).
+///
+/// # Errors
+///
+/// Returns Err on an unsupported or undecodable image format, a
+/// decompression-bomb allocation, or a re-encode failure.
 pub fn normalize_bytes(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
     if is_heic(bytes) {
         normalize_heic(bytes)
@@ -227,12 +237,21 @@ fn rasterize_svg(bytes: &[u8]) -> std::io::Result<DynamicImage> {
     let intrinsic_w = size.width();
     let intrinsic_h = size.height();
     let longest = intrinsic_w.max(intrinsic_h);
+    // f64→f32: the SVG intrinsic size feeds a raster target capped at
+    // MAX_IMAGE_DIMENSION (2000 px), where f32 precision is far beyond pixel
+    // granularity.
+    #[allow(clippy::cast_precision_loss)]
     let scale = if longest > MAX_IMAGE_DIMENSION as f32 {
         MAX_IMAGE_DIMENSION as f32 / longest
     } else {
         1.0
     };
+    // f64→u32 raster dimensions: values are ceil()ed and clamped to >= 1
+    // before the cast, and the Pixmap::new allocation below fails if they
+    // exceed the rasterizer's limits — identical behavior, just lint-silenced.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let out_w = (intrinsic_w * scale).ceil().max(1.0) as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let out_h = (intrinsic_h * scale).ceil().max(1.0) as u32;
 
     let mut pixmap = tiny_skia::Pixmap::new(out_w, out_h).ok_or_else(|| {
@@ -264,9 +283,8 @@ fn is_heic(bytes: &[u8]) -> bool {
     // Compose the length guard with the accesses so every index is proven in
     // bounds (clippy::indexing_slicing); `bytes.get(..8)` over the guarded
     // prefix keeps the same `b"ftyp"` comparison.
-    let head = match bytes.get(..12) {
-        Some(h) => h,
-        None => return false,
+    let Some(head) = bytes.get(..12) else {
+        return false;
     };
     if bytes.get(4..8) != Some(b"ftyp") {
         return false;
@@ -329,7 +347,8 @@ fn is_svg(bytes: &[u8]) -> bool {
 /// alpha channel so transparency survives).
 fn encode_png(img: &DynamicImage) -> std::io::Result<Vec<u8>> {
     let mut out = Cursor::new(Vec::new());
-    img.write_to(&mut out, ImageFormat::Png).map_err(io_err)?;
+    img.write_to(&mut out, ImageFormat::Png)
+        .map_err(|e| io_err(&e))?;
     Ok(out.into_inner())
 }
 
@@ -343,11 +362,11 @@ fn encode_jpeg(img: &DynamicImage) -> std::io::Result<Vec<u8>> {
     let mut encoder = JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
     encoder
         .encode(&rgb, rgb.width(), rgb.height(), ExtendedColorType::Rgb8)
-        .map_err(io_err)?;
+        .map_err(|e| io_err(&e))?;
     Ok(out.into_inner())
 }
 
-fn io_err(e: image::ImageError) -> std::io::Error {
+fn io_err(e: &image::ImageError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
 }
 
@@ -358,8 +377,11 @@ mod tests {
 
     /// A tiny opaque image (3×2) to exercise the JPEG re-encode path.
     fn opaque_rgb() -> DynamicImage {
-        let buf: ImageBuffer<Rgb<u8>, Vec<u8>> =
-            ImageBuffer::from_fn(3, 2, |x, y| Rgb([(x * 80) as u8, (y * 90) as u8, 40]));
+        let buf: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(3, 2, |x, y| {
+            // u8 pixel coordinates (3×2 image): the arithmetic never exceeds u8.
+            #[allow(clippy::cast_possible_truncation)]
+            Rgb([(x * 80) as u8, (y * 90) as u8, 40])
+        });
         DynamicImage::ImageRgb8(buf)
     }
 
@@ -384,6 +406,8 @@ mod tests {
     #[test]
     fn transparent_image_reencodes_to_png() {
         let buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(4, 4, |x, y| {
+            // u8 pixel coordinates (4×4 image): the arithmetic never exceeds u8.
+            #[allow(clippy::cast_possible_truncation)]
             Rgba([x as u8, y as u8, 0, if x % 2 == 0 { 0 } else { 255 }])
         });
         let img = DynamicImage::ImageRgba8(buf);
@@ -397,8 +421,12 @@ mod tests {
     #[test]
     fn oversized_image_is_downscaled() {
         // A 4000×2000 image (longest edge 4000 > 2000) is downscaled to fit.
-        let buf: ImageBuffer<Rgba<u8>, Vec<u8>> =
-            ImageBuffer::from_fn(4000, 2000, |x, y| Rgba([x as u8, y as u8, 100, 255]));
+        let buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(4000, 2000, |x, y| {
+            // u8 pixel coordinates: x wraps by design across the 4000-px width,
+            // y (0..2000) is truncated mod 256 — the pattern is cosmetic.
+            #[allow(clippy::cast_possible_truncation)]
+            Rgba([x as u8, y as u8, 100, 255])
+        });
         let img = DynamicImage::ImageRgba8(buf);
         let bytes = as_png(&img);
         let out = normalize_bytes(&bytes).unwrap();

@@ -1,10 +1,10 @@
 //! Integration test for the `generate_image` tool.
 //!
 //! Spins a local mock HTTP server returning a tiny valid PNG (base64) in the
-//! OpenAI Images API response shape, builds a full `ToolContext` with a
+//! `OpenAI` Images API response shape, builds a full `ToolContext` with a
 //! crossbeam reply channel pre-loaded with an `ImageProviderHandle` wired to
 //! `OpenAiImageClient` pointed at the mock URL, and executes the tool
-//! end-to-end. Real sockets + real HTTP → `tests/` + `#[ignore]` per the
+//! end-to-end. Real sockets + real HTTP → `tests/` + `#[ignore = "integration"]` per the
 //! Test Discipline policy (run via `cargo test-integration`).
 
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
@@ -41,8 +41,8 @@ const TINY_PNG: &[u8] = &[
     0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
-/// Mock OpenAI Images API server: serves one POST /v1/images/generations and
-/// replies with the standard envelope carrying the tiny PNG as b64_json.
+/// Mock `OpenAI` Images API server: serves one POST /v1/images/generations and
+/// replies with the standard envelope carrying the tiny PNG as `b64_json`.
 fn start_mock_images_server() -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().unwrap().to_string();
@@ -71,14 +71,14 @@ fn start_mock_images_server() -> (String, thread::JoinHandle<()>) {
         );
         stream
             .write_all(response.as_bytes())
-            .and_then(|_| stream.flush())
+            .and_then(|()| stream.flush())
             .expect("write response");
     });
     (format!("http://{addr}/v1"), handle)
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn generate_image_end_to_end_against_mock_server() {
     let (base_url, server) = start_mock_images_server();
 

@@ -54,20 +54,29 @@ impl PopupSize {
 /// and the account/credential modals so every overlay uses the same centering
 /// and clamping rules.  Lives here (state/layout.rs) so both the renderers and
 /// the connection-layer mouse handlers can use it without an import cycle.
+// `size` is not consumed, but taking a reference would change the signature
+// used by the render-layer call sites; a small owned struct is intentional.
+#[allow(clippy::needless_pass_by_value)] // keep the shared call-site signature
 pub(crate) fn centered_popup(area: Rect, size: PopupSize) -> Rect {
-    let width = ((area.width as u32 * size.w_num / size.w_den) as u16)
-        .clamp(size.min_w, size.max_w)
-        .min(area.width.saturating_sub(4))
-        .max(1);
-    let height = ((area.height as u32 * size.h_num / size.h_den) as u16)
-        .clamp(size.min_h, size.max_h)
-        .min(area.height.saturating_sub(2))
-        .max(1);
-    Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
+    // u16 → u32 widening is lossless and the divided fraction always fits
+    // back in u16 here because it is subsequently clamped to `max_w`/`max_h`
+    // (both u16) before any other use.
+    #[allow(clippy::cast_possible_truncation)] // clamped to u16 maxes below
+    {
+        let width = ((u32::from(area.width) * size.w_num / size.w_den) as u16)
+            .clamp(size.min_w, size.max_w)
+            .min(area.width.saturating_sub(4))
+            .max(1);
+        let height = ((u32::from(area.height) * size.h_num / size.h_den) as u16)
+            .clamp(size.min_h, size.max_h)
+            .min(area.height.saturating_sub(2))
+            .max(1);
+        Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        }
     }
 }
 
@@ -156,7 +165,7 @@ pub(crate) enum SelectorClick {
     /// The click landed on filtered-list index `idx`.  The index is resolved
     /// through the *rendered* window start (see `window()`/`picker_window`),
     /// never the stored `scroll` — which can be stale (a filter narrowing or
-    /// a PgUp/PgDn jump leaves it past the new max_scroll), and the raw value
+    /// a PgUp/PgDn jump leaves it past the new `max_scroll`), and the raw value
     /// would then map the click onto a different row than the one drawn.
     Row(usize),
     /// The click landed on the filter row; `filter_row_x` is its left edge

@@ -264,7 +264,7 @@ where
     // Track input/output tokens delivered via message_start and message_delta.
     let mut input_tokens: Option<u32> = None;
     let mut output_tokens: Option<u32> = None;
-    // Reconstructs the thinking / redacted_thinking blocks in wire order for
+    // Reconstructs the thinking / `redacted_thinking` blocks in wire order for
     // the opaque round-trip artifact (same shape as the non-streaming path).
     let mut thinking_blocks = ThinkingBlockAccumulator::new();
 
@@ -303,9 +303,9 @@ where
                         // The vec was grown to cover `idx` above, so the lookup
                         // always succeeds; the None arm is unreachable.
                         if let Some(call) = pending_tool_calls.get_mut(idx) {
-                            call.id = id.clone();
-                            call.name = name.clone();
-                            call.arguments = input_str.clone();
+                            call.id.clone_from(&id);
+                            call.name.clone_from(&name);
+                            call.arguments.clone_from(&input_str);
                         }
                         trace!(
                             index = start.index,
@@ -484,7 +484,7 @@ struct StreamToolCall {
     arguments: String,
 }
 
-/// SSE event for content_block_start.
+/// SSE event for `content_block_start`.
 #[derive(Debug, Deserialize)]
 struct ContentBlockStart {
     index: u32,
@@ -509,7 +509,7 @@ enum StreamContentBlock {
     RedactedThinking { data: String },
 }
 
-/// SSE event for content_block_delta.
+/// SSE event for `content_block_delta`.
 #[derive(Debug, Deserialize)]
 struct ContentBlockDelta {
     index: u32,
@@ -530,20 +530,20 @@ enum StreamDelta {
     SignatureDelta { signature: String },
 }
 
-/// Accumulates thinking / redacted_thinking blocks in wire order during
+/// Accumulates thinking / `redacted_thinking` blocks in wire order during
 /// streaming, mirroring the non-streaming artifact assembly in `mod.rs`.
 ///
 /// Thinking text arrives piecemeal across a `content_block_start` (initial
 /// text) plus `thinking_delta` fragments, while the encrypted signature
 /// arrives as one or more `signature_delta` fragments before the block's
 /// `content_block_stop`. Redacted blocks carry all their data in the start
-/// event. Text / tool_use blocks never appear in the artifact and are
+/// event. Text / `tool_use` blocks never appear in the artifact and are
 /// ignored.
 struct ThinkingBlockAccumulator {
     /// Completed blocks in original order.
     blocks: Vec<ThinkingArtifactBlock>,
     /// The thinking block currently open (between start and stop), being
-    /// filled by thinking_delta / signature_delta fragments.
+    /// filled by `thinking_delta` / `signature_delta` fragments.
     open: Option<StreamThinkingBlock>,
 }
 
@@ -687,7 +687,7 @@ impl AnthropicSseReader {
             self.line_buf.clear();
             self.line_buf.extend(self.pending.drain(..=line_end));
             // Strip trailing newline/carriage-return.
-            while matches!(self.line_buf.last(), Some(b'\n') | Some(b'\r')) {
+            while matches!(self.line_buf.last(), Some(b'\n' | b'\r')) {
                 self.line_buf.pop();
             }
 
@@ -736,7 +736,7 @@ impl AnthropicSseReader {
 
 // ── Streaming usage types ─────────────────────────────────────────────
 
-/// SSE event for message_start — carries input_tokens.
+/// SSE event for `message_start` — carries `input_tokens`.
 #[derive(Debug, Deserialize)]
 struct MessageStart {
     #[serde(rename = "message")]
@@ -749,7 +749,7 @@ struct MessageStartMessage {
     usage: Option<AnthropicStreamUsage>,
 }
 
-/// SSE event for message_delta — carries output_tokens.
+/// SSE event for `message_delta` — carries `output_tokens`.
 #[derive(Debug, Deserialize)]
 struct MessageDelta {
     #[serde(default)]
@@ -774,10 +774,10 @@ mod tests {
 
     /// Feed the accumulator the SSE-shaped events for a signed thinking block
     /// (text split across start + delta, signature split across two deltas)
-    /// followed by a redacted_thinking block, and assert the assembled artifact
+    /// followed by a `redacted_thinking` block, and assert the assembled artifact
     /// is byte-exact: block order preserved, signature and redacted data
-    /// intact. Object keys serialize alphabetically (serde_json default
-    /// BTreeMap ordering without `preserve_order`).
+    /// intact. Object keys serialize alphabetically (`serde_json` default
+    /// `BTreeMap` ordering without `preserve_order`).
     #[test]
     fn signature_delta_accumulates_into_thinking_artifact() {
         let mut acc = ThinkingBlockAccumulator::new();

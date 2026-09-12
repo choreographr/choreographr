@@ -51,6 +51,7 @@ impl RenderedImage {
     /// Create a placeholder image.  The render path will submit an encoding
     /// job to the background worker when the image becomes visible — no job
     /// is enqueued here so there is nothing to cancel.
+    #[must_use]
     pub fn new_placeholder(metadata: ImageMetadata, data: Arc<[u8]>) -> Self {
         RenderedImage {
             metadata,
@@ -79,6 +80,7 @@ impl RenderedImage {
     }
 }
 
+#[must_use]
 pub fn build_picker() -> Picker {
     Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
 }
@@ -127,7 +129,7 @@ struct Cli {
     tcp_addr: Option<String>,
 
     /// Path to the server's Noise IK public key (defaults to the pinned key
-    /// in known_servers.toml; on first contact the key is learned via the
+    /// in `known_servers.toml`; on first contact the key is learned via the
     /// Noise XX handshake and must be confirmed interactively)
     #[arg(long = "server-pk")]
     server_pk: Option<String>,
@@ -148,11 +150,11 @@ struct Cli {
 ///    (IK against it; this is the original out-of-band mechanism and wins
 ///    over everything);
 /// 2. a pin in `known_servers.toml` — IK against the pinned key, with the
-///    loud re-pair guidance on handshake failure (TcpPinned);
+///    loud re-pair guidance on handshake failure (`TcpPinned`);
 /// 3. otherwise FIRST CONTACT: probe the daemon's key with the Noise XX
 ///    handshake and require the human to confirm its fingerprint (either
 ///    `expected_fingerprint` for headless use, or an interactive y/N prompt
-///    — this runs in main() while the terminal is still in cooked mode, so
+///    — this runs in `main()` while the terminal is still in cooked mode, so
 ///    the prompt is a plain stdout/stdin exchange, no TUI involved) before
 ///    pinning and connecting.
 ///
@@ -202,28 +204,25 @@ fn resolve_connect_mode(
         .context("first-contact probe failed (is the daemon running with --tcp-addr, and is this client's key enrolled in its ACL?)")?;
     let fp = choreo_client_core::fingerprint(&learned);
 
-    let confirmed = match expected_fingerprint {
+    let confirmed = if let Some(expected) = expected_fingerprint {
         // Headless: compare against the pre-approved fingerprint (whitespace
         // is insignificant — accept either the grouped or the plain form).
-        Some(expected) => {
-            let matches = strip_fp_whitespace(expected) == strip_fp_whitespace(&fp);
-            if !matches {
-                tracing::error!(
-                    addr,
-                    expected = %expected,
-                    actual = %fp,
-                    "--trust-fingerprint does not match the server's key"
-                );
-            }
-            matches
+        let matches = strip_fp_whitespace(expected) == strip_fp_whitespace(&fp);
+        if !matches {
+            tracing::error!(
+                addr,
+                expected = %expected,
+                actual = %fp,
+                "--trust-fingerprint does not match the server's key"
+            );
         }
+        matches
+    } else {
         // Interactive: ask the human. The daemon operator should have sent
         // this fingerprint out-of-band in the enrollment conversation.
-        None => {
-            let mut stdin = std::io::stdin().lock();
-            let mut stdout = std::io::stdout();
-            confirm_first_contact(addr, &fp, &mut stdin, &mut stdout)?
-        }
+        let mut stdin = std::io::stdin().lock();
+        let mut stdout = std::io::stdout();
+        confirm_first_contact(addr, &fp, &mut stdin, &mut stdout)?
     };
 
     if !confirmed {
@@ -280,8 +279,12 @@ fn preflight_failure_message(
             // raw base64 pubkey the operator's enrollment command consumes —
             // everything the TUI-only user needs, nothing left for them to
             // run on this machine.
-            let identity = client_pk
-                .map(|pk| {
+            let identity = client_pk.map_or_else(
+                || {
+                    "your client key could not be read from this machine's config directory.\n"
+                        .to_string()
+                },
+                |pk| {
                     use base64::Engine as _;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(pk);
                     format!(
@@ -294,11 +297,8 @@ fn preflight_failure_message(
                          (or '/acl add {b64}' from a local TUI connection there)\n",
                         choreo_client_core::fingerprint(pk),
                     )
-                })
-                .unwrap_or_else(|| {
-                    "your client key could not be read from this machine's config directory.\n"
-                        .to_string()
-                });
+                },
+            );
             format!(
                 "the daemon at {addr} did not authorize this client's transport key.\n\
                  {identity}\
@@ -365,6 +365,13 @@ fn confirm_first_contact(
 ///
 /// The root `choreographr` package declares `choreo-tui` as a thin binary
 /// that calls this function, so the TUI lives entirely in this library crate.
+///
+/// # Errors
+///
+/// Returns an error when CLI argument parsing fails, the TCP connection
+/// mode cannot be resolved (server-key probe, fingerprint confirmation, or
+/// daemon-authorization preflight), or the TUI application itself fails
+/// while running.
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -400,13 +407,12 @@ fn init_file_logging() -> Option<std::path::PathBuf> {
     use tracing_subscriber::prelude::*;
 
     let log_path = log_file_path();
-    let log_file = match std::fs::File::create(&log_path) {
-        Ok(file) => file,
+    let Ok(log_file) = std::fs::File::create(&log_path) else {
         // No panic, no error exit: a missing log must not take the TUI down
         // (the observed Termux failure mode). Diagnostics for THIS decision
         // cannot go through tracing (no subscriber yet) — the silent
         // degradation is documented here and pinned by the tests below.
-        Err(_) => return None,
+        return None;
     };
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(log_file)
@@ -428,16 +434,15 @@ mod cli_tests {
 
     /// `--version` is handled by clap before any real arg parsing: it exits
     /// with a `DisplayVersion` error whose message is the version string.
-    /// Assert both so the flag stays wired to CARGO_PKG_VERSION (it breaks
+    /// Assert both so the flag stays wired to `CARGO_PKG_VERSION` (it breaks
     /// silently if the derive attribute loses the bare `version` marker).
     #[test]
     fn version_flag_displays_package_version() {
         // clap returns the version as a `DisplayVersion` error instead of a
         // value; match it out by hand (Cli doesn't derive Debug, so
         // `unwrap_err()`'s Debug bound doesn't apply).
-        let err = match Cli::try_parse_from(["choreo-tui", "--version"]) {
-            Err(e) => e,
-            Ok(_) => panic!("--version should short-circuit before arg validation"),
+        let Err(err) = Cli::try_parse_from(["choreo-tui", "--version"]) else {
+            panic!("--version should short-circuit before arg validation");
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
@@ -547,6 +552,8 @@ mod cli_tests {
     /// copy-pasteable base64 pubkey.
     #[test]
     fn preflight_rejected_message_carries_enrollment_remediation() {
+        use base64::Engine as _;
+
         let err = choreo_client_core::PreflightError::Rejected(
             choreo_transport::error::TransportError::AuthFailed,
         );
@@ -555,7 +562,6 @@ mod cli_tests {
             0xB7, 0xE2, 0x5D, 0x60, 0x19, 0xAB, 0xCC, 0x37, 0x84, 0x0E, 0x71, 0xFA, 0x92, 0x63,
             0xDD, 0x4B, 0x26, 0x50,
         ];
-        use base64::Engine as _;
         let pk_b64 = base64::engine::general_purpose::STANDARD.encode(pk);
         let msg = preflight_failure_message("host:9443", &err, Some(&pk));
         assert!(
@@ -619,7 +625,10 @@ mod cli_tests {
             .and_then(|n| n.to_str())
             .expect("utf8 name");
         assert!(
-            name.starts_with("choreo-tui-") && name.ends_with(".log"),
+            name.starts_with("choreo-tui-")
+                && std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("log")),
             "the log name must be choreo-tui-<pid>.log, got {name}"
         );
     }

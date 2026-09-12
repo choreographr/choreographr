@@ -24,6 +24,7 @@ pub struct TestConfigGuard;
 #[doc(hidden)]
 impl TestConfigGuard {
     /// Set a new test config root, returning a guard that resets it to `None`.
+    #[must_use]
     pub fn set_root(root: Option<PathBuf>) -> Self {
         set_test_config_root(root);
         TestConfigGuard
@@ -40,6 +41,11 @@ impl Drop for TestConfigGuard {
 /// Returns the config directory (`{config}/choreographr`).
 ///
 /// Under test, this can be overridden with [`set_test_config_root`].
+///
+/// # Errors
+///
+/// Returns [`KeystoreError::ConfigDirNotFound`] when the OS provides no
+/// configuration directory.
 pub fn config_dir() -> Result<PathBuf, KeystoreError> {
     if let Some(root) = TEST_CONFIG_ROOT.with(|cell| cell.borrow().clone()) {
         let path = root.join("choreographr");
@@ -52,11 +58,21 @@ pub fn config_dir() -> Result<PathBuf, KeystoreError> {
     Ok(path)
 }
 
+#[must_use]
+/// Path to the identity private key file (`identity.pk` in [`config_dir`]).
+///
+/// # Errors
+///
+/// Propagates [`KeystoreError::ConfigDirNotFound`] from [`config_dir`].
 pub fn private_key_path() -> Result<PathBuf, KeystoreError> {
     Ok(config_dir()?.join("identity.pk"))
 }
 
-/// Path to the authorized clients ACL file (~/.config/choreographr/authorized_clients.toml)
+/// Path to the authorized clients ACL file (`~/.config/choreographr/authorized_clients.toml`).
+///
+/// # Errors
+///
+/// Propagates [`KeystoreError::ConfigDirNotFound`] from [`config_dir`].
 pub fn authorized_clients_path() -> Result<PathBuf, KeystoreError> {
     Ok(config_dir()?.join("authorized_clients.toml"))
 }

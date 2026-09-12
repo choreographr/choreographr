@@ -19,7 +19,9 @@ fn build_seq(context_window: Option<u32>, last_prompt_tokens: Option<u32>) -> St
             Some(current) => {
                 // Use u64 for intermediate arithmetic to avoid any surprise
                 // around u32::MAX * 100 overflowing.
-                let pct = (current as u64).saturating_mul(100) / cw as u64;
+                // u32 -> u64 is provably lossless, so `From` is preferred
+                // over `as`.
+                let pct = u64::from(current).saturating_mul(100) / u64::from(cw);
                 let pct = pct.min(100);
                 format!("\x1b]9;4;1;{pct}\x1b\\")
             }

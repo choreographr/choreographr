@@ -1,3 +1,4 @@
+#![allow(clippy::match_wildcard_for_single_variants)] // test-only exhaustive-ish matches
 use super::*;
 use crate::google::requests::extract_error_detail;
 use crate::openai::{AssistantToolCall, AssistantToolFunction};
@@ -419,7 +420,7 @@ fn google_client_list_models() {
     )
     .unwrap();
     let models = client.validate_and_list_models().unwrap();
-    assert!(!models.is_empty());
+    assert_ne!(models, [] as [String; 0]);
     assert!(models.contains(&"gemini-2.5-pro".to_string()));
     assert!(models.contains(&"gemini-2.5-flash".to_string()));
 }
@@ -521,7 +522,7 @@ fn streaming_captures_thought_signatures() {
     assert_eq!(full_text, "Final answer.");
     assert_eq!(events, vec!["R:Let me think...", "A:Final answer."]);
     assert!(has_any_output);
-    assert!(pending_tool_calls.is_empty());
+    assert_eq!(pending_tool_calls, [] as [crate::types::ChatToolCall; 0]);
 
     // Signature captured from the streamed thinking part, byte-exact payload.
     assert_eq!(signatures, vec!["sig-abc"]);
@@ -542,8 +543,7 @@ fn model_url_generate_content() {
         "https://generativelanguage.googleapis.com/v1beta",
         "gemini-2.5-pro",
         "generateContent",
-    )
-    .unwrap();
+    );
     assert_eq!(
         url,
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
@@ -556,8 +556,7 @@ fn model_url_stream_generate() {
         "https://generativelanguage.googleapis.com/v1beta",
         "gemini-2.5-flash",
         "streamGenerateContent?alt=sse",
-    )
-    .unwrap();
+    );
     assert_eq!(
         url,
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
@@ -570,8 +569,7 @@ fn model_url_with_trailing_slash() {
         "https://generativelanguage.googleapis.com/v1beta/",
         "gemini-2.5-pro",
         "generateContent",
-    )
-    .unwrap();
+    );
     assert_eq!(
         url,
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
@@ -621,7 +619,7 @@ fn error_type_label_maps_correctly() {
 #[test]
 fn known_gemini_models_are_present() {
     let models = KNOWN_GEMINI_MODELS;
-    assert!(!models.is_empty());
+    assert_ne!(models, [] as [String; 0]);
     assert!(models.contains(&"gemini-2.5-pro"));
     assert!(models.contains(&"gemini-2.5-flash"));
     assert!(models.contains(&"gemini-1.5-pro"));

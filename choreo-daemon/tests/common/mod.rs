@@ -10,7 +10,7 @@
 //!
 //! Each integration-test binary that declares `mod common;` compiles this
 //! module standalone, so an item unused by a particular binary (e.g. `test_db`
-//! in the lifecycle test, or `SpawnedDaemon` until the daemon_client_* tests
+//! in the lifecycle test, or `SpawnedDaemon` until the `daemon_client`_* tests
 //! land) would otherwise trip `dead_code`. The harness is intentionally a
 //! superset of what any single test file uses.
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
@@ -33,6 +33,7 @@ use choreo_daemon::server::acl::SharedAcl;
 use choreo_daemon::{DaemonState, run_server};
 use choreo_keystore::ServiceCredential;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -112,11 +113,11 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
 /// Seed `state` with a credentialed OpenAI-protocol account whose base URL
 /// is a local mock server, plus (optionally) a fresh model-cache entry.
 /// This replaces the old `state.providers` injection: provider clients are
-/// now built lazily by the SESSION (via the daemon's ResolveAccountCmd),
+/// now built lazily by the SESSION (via the daemon's `ResolveAccountCmd`),
 /// against the session's own socket registry — so the injected ingredients
 /// are the account config + decrypted key, exactly what production holds.
 /// The warm model cache also suppresses the create-session background
-/// prefetch (no stray mock hits) and lets SetModel validate locally.
+/// prefetch (no stray mock hits) and lets `SetModel` validate locally.
 pub fn seed_mock_account(state: &mut DaemonState, name: &str, base_url: String, models: &[&str]) {
     let mut config = AccountConfig::simple(name, "openai");
     config.base_url = Some(base_url);
@@ -137,7 +138,10 @@ pub fn seed_mock_account(state: &mut DaemonState, name: &str, base_url: String, 
         state.model_cache.insert(
             name.to_string(),
             (
-                models.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+                models
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>(),
                 std::time::Instant::now(),
             ),
         );
@@ -248,7 +252,7 @@ impl SpawnedDaemon {
         let acl_path = tmp.path().join("authorized_clients.toml");
         let mut acl_toml = String::new();
         for pk in authorized_pks {
-            acl_toml.push_str(&format!("[[client]]\npubkey = \"{}\"\n", BASE64.encode(pk)));
+            let _ = write!(acl_toml, "[[client]]\npubkey = \"{}\"\n", BASE64.encode(pk));
         }
         std::fs::write(&acl_path, acl_toml).expect("write ACL file");
         let acl = SharedAcl::load(&acl_path);
@@ -271,9 +275,9 @@ impl SpawnedDaemon {
                     &socket_str,
                     state,
                     None,
-                    Some(tcp_addr_str),
+                    Some(&tcp_addr_str),
                     transport_sk,
-                    acl,
+                    &acl,
                 )
             }));
 
@@ -291,7 +295,10 @@ impl SpawnedDaemon {
         // for the daemon struct.
         let deadline = Instant::now() + Duration::from_secs(5);
         let ready = loop {
-            if handle.as_ref().is_some_and(|h| h.is_finished()) {
+            if handle
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
                 let result = handle
                     .take()
                     .expect("server thread panicked")
@@ -329,12 +336,11 @@ impl SpawnedDaemon {
 
     /// Gracefully shut the daemon down (SIGINT) and join the server thread.
     /// Idempotent. If the server thread already exited, just reclaims the
-    /// JoinHandle result without sending a signal (sending SIGINT after the
-    /// signal_hook handler is unregistered would kill the test process!).
+    /// `JoinHandle` result without sending a signal (sending SIGINT after the
+    /// `signal_hook` handler is unregistered would kill the test process!).
     pub fn shutdown(&mut self) {
-        let handle = match self.handle.take() {
-            Some(h) => h,
-            None => return, // already shut down (or never started)
+        let Some(handle) = self.handle.take() else {
+            return;
         };
 
         if handle.is_finished() {
@@ -359,7 +365,7 @@ impl SpawnedDaemon {
         }
     }
 
-    /// Reclaim the server thread's JoinHandle without signaling or joining.
+    /// Reclaim the server thread's `JoinHandle` without signaling or joining.
     /// For tests that deliver SIGINT themselves and poll — rather than join —
     /// the server thread, so a wedged shutdown fails the test instead of
     /// hanging the teardown's unbounded `handle.join()`.

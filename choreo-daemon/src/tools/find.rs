@@ -294,6 +294,11 @@ fn run_find_walk(
     Ok(finish_tool_output(&results.join("\n"), marker))
 }
 
+/// Search for files matching a pattern and return the formatted results.
+///
+/// # Errors
+///
+/// Returns Err if the search root cannot be read or the walker fails.
 pub fn execute_find_tool(
     args: &FindArgs,
     working_dir: Option<&Path>,
@@ -341,11 +346,11 @@ impl Tool for Find {
             parts.push(" Using substring matching.".to_string());
         }
         match &args.path {
-            Some(p) => parts.push(format!(" In path: `{}`.", p)),
+            Some(p) => parts.push(format!(" In path: `{p}`.")),
             None => parts.push(" In working directory.".to_string()),
         }
         if let Some(max) = args.max_results {
-            parts.push(format!(" Max results: {}.", max));
+            parts.push(format!(" Max results: {max}."));
         }
         parts.concat()
     }

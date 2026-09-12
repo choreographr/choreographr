@@ -3,10 +3,10 @@
 //! credentials from raw sr25519 material.
 //!
 //! The Polkadot-JS keyring export format (`@polkadot/util-crypto`) stores the
-//! account as a password-encrypted `pkcs8`/`sr25519` secret using scrypt key
-//! derivation followed by NaCl's `crypto_secretbox` (XSalsa20-Poly1305). On
+//! account as a password-encrypted `pkcs8`/`sr25519` secret using `scrypt` key
+//! derivation followed by `NaCl`'s `crypto_secretbox` (`XSalsa20-Poly1305`). On
 //! import we decrypt the payload, validate its fixed STRUCTURE (a DER-ish
-//! header, the 64-byte expanded ed25519 secret, a static divider tag, and the
+//! header, the 64-byte expanded `ed25519` secret, a static divider tag, and the
 //! 32-byte public key), and verify the material is a self-consistent sr25519
 //! keypair before handing it to the daemon.
 
@@ -32,8 +32,8 @@ const NONCE_LEN: usize = 24;
 /// salt(32) || n(4) || p(4) || r(4) || nonce(24) = 68 bytes.
 const PREFIX_LEN: usize = PARAMS_LEN + NONCE_LEN;
 
-/// Decrypted keystore payload layout: header(16) || secret_key(64) ||
-/// div(5) || public_key(32) = 117 bytes.
+/// Decrypted keystore payload layout: `header(16) || secret_key(64) ||`
+/// `div(5) || public_key(32)` = 117 bytes.
 const PLAINTEXT_LEN: usize = 117;
 
 /// DER-ish ASN.1 header that must prefix a pkcs8 sr25519 secret.
@@ -106,7 +106,10 @@ fn derive_scrypt_key(
     let log_n = ALLOWED_SCRYPT_PARAMS
         .iter()
         .find(|&&(nn, pp, rr)| nn == n && pp == p && rr == r)
-        .map(|&(nn, _, _)| nn.trailing_zeros() as u8)
+        // trailing_zeros of a u32 is at most 31, so the conversion is always
+        // representable for the allow-listed params; if it ever were not (a
+        // future param list bug), rejecting the keystore is the safe outcome.
+        .and_then(|&(nn, _, _)| u8::try_from(nn.trailing_zeros()).ok())
         .ok_or(KeystoreError::UnsupportedKeystoreFormat)?;
 
     // Note: scrypt 0.12's `Params::new` takes only (log_n, r, p); the output
@@ -122,10 +125,10 @@ fn derive_scrypt_key(
     Ok(key)
 }
 
-/// Decrypt a NaCl secretbox payload with `key` + 24-byte `nonce`.
+/// Decrypt a `NaCl` secretbox payload with `key` + 24-byte `nonce`.
 ///
 /// The Polkadot-JS ciphertext layout prepends the 16-byte Poly1305 tag to the
-/// message (exactly the NaCl `crypto_secretbox` wire format). `decrypt_in_place`
+/// message (exactly the `NaCl` `crypto_secretbox` wire format). `decrypt_in_place`
 /// verifies the tag then decrypts the remaining bytes in place, leaving the
 /// 117-byte plaintext in the returned buffer.
 fn decrypt_secretbox(
@@ -147,10 +150,10 @@ fn decrypt_secretbox(
 }
 
 /// Derive the SS58-check display address (prefix 42) for a raw public key.
-fn ss58_address(public: &[u8; 32]) -> Result<String, KeystoreError> {
+fn ss58_address(public: &[u8; 32]) -> String {
     let pk = Sr25519Public::from(*public);
     let format = Ss58AddressFormat::from(SS58_SUBSTRATE_PREFIX);
-    Ok(pk.to_ss58check_with_version(format))
+    pk.to_ss58check_with_version(format)
 }
 
 /// Import a Polkadot-JS `KeyringPairJson` keystore export.
@@ -158,6 +161,15 @@ fn ss58_address(public: &[u8; 32]) -> Result<String, KeystoreError> {
 /// Decrypts `json` with `password` and returns a [`ServiceCredential::Substrate`]
 /// carrying the account name, SS58 address, expanded 64-byte ed25519 secret and
 /// 32-byte public key.
+///
+/// # Errors
+///
+/// Returns [`KeystoreError::InvalidKeystoreData`] when the JSON cannot be
+/// parsed, the encoding is not the supported pkcs8/sr25519 scrypt/secretbox
+/// v3 layout, or the payload's structure or keypair consistency checks fail;
+/// [`KeystoreError::UnsupportedKeystoreFormat`] for non-allow-listed scrypt
+/// parameters; and [`KeystoreError::DecryptionFailed`] when the password is
+/// wrong or the ciphertext is corrupt.
 pub fn import_from_json(
     json: &str,
     name: &str,
@@ -266,7 +278,7 @@ pub fn import_from_json(
     // export) would otherwise yield a credential whose stored `account_id`
     // does not match the key that actually signs. `from_raw` derives the
     // address from the public key for exactly this reason.
-    let derived_address = ss58_address(&public_key)?;
+    let derived_address = ss58_address(&public_key);
     if derived_address != pair.address {
         warn!(
             advertised = %pair.address,
@@ -293,6 +305,11 @@ pub fn import_from_json(
 ///
 /// Validates that `public` actually derives from `secret` and that the SS58
 /// address is a valid prefix-42 encoding of that public key.
+///
+/// # Errors
+///
+/// Returns [`KeystoreError::InvalidKeystoreData`] when `secret` is not valid
+/// ed25519-expanded material or does not derive `public`.
 pub fn from_raw(
     name: &str,
     secret: &[u8; 64],
@@ -303,7 +320,7 @@ pub fn from_raw(
     if secret_key.to_public().to_bytes() != *public {
         return Err(KeystoreError::InvalidKeystoreData);
     }
-    let account_id = ss58_address(public)?;
+    let account_id = ss58_address(public);
 
     debug!(account_id = %account_id, "built Substrate credential from raw material");
 
@@ -321,12 +338,11 @@ pub fn from_raw(
 /// expected to have already verified the variant via the `as_substrate`
 /// helper).
 pub fn credential_address(cred: &ServiceCredential) -> String {
-    match cred {
-        ServiceCredential::Substrate { account_id, .. } => account_id.clone(),
-        _ => {
-            warn!(credential = %cred, "credential_address called on non-Substrate credential");
-            String::new()
-        }
+    if let ServiceCredential::Substrate { account_id, .. } = cred {
+        account_id.clone()
+    } else {
+        warn!(credential = %cred, "credential_address called on non-Substrate credential");
+        String::new()
     }
 }
 
@@ -375,7 +391,7 @@ mod tests {
 
         // The stored public key must round-trip back to the same SS58 address.
         let public_key: [u8; 32] = view.public.try_into().expect("32-byte public");
-        assert_eq!(ss58_address(&public_key).unwrap(), view.account_id);
+        assert_eq!(ss58_address(&public_key), view.account_id);
     }
 
     #[test]
@@ -395,8 +411,7 @@ mod tests {
         let result = import_from_json(ALICE_JSON, "main", "not-whoisalice");
         assert!(
             matches!(result, Err(KeystoreError::DecryptionFailed)),
-            "expected DecryptionFailed, got {:?}",
-            result
+            "expected DecryptionFailed, got {result:?}"
         );
     }
 
@@ -412,8 +427,7 @@ mod tests {
         let result = import_from_json(&json, "main", "whoisalice");
         assert!(
             matches!(result, Err(KeystoreError::InvalidKeystoreData)),
-            "expected InvalidKeystoreData for a mismatched address, got {:?}",
-            result
+            "expected InvalidKeystoreData for a mismatched address, got {result:?}"
         );
     }
 

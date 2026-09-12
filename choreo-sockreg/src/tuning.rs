@@ -38,6 +38,11 @@ impl SocketTuning {
     /// Applies the tuning to a connected `TcpStream` (any platform).
     /// Convenience wrapper over [`Self::apply`] so callers never deal with
     /// the fd-vs-SOCKET distinction themselves.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the platform [`Self::apply`] error (only the fatal
+    /// `SO_KEEPALIVE` set failure; see its docs).
     pub fn apply_stream(&self, stream: &std::net::TcpStream) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -55,6 +60,11 @@ impl SocketTuning {
     ///
     /// Returns `Err` only if the fundamental `SO_KEEPALIVE` set fails (see
     /// the module docs for why the rest is best-effort with a warn! log).
+    ///
+    /// # Errors
+    ///
+    /// `Err` when the `SO_KEEPALIVE` set fails, when the follow-up get
+    /// round-trip fails, or when the get shows the kernel ignored the set.
     #[cfg(unix)]
     pub fn apply(&self, fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
         use nix::sys::socket::sockopt;
@@ -70,15 +80,15 @@ impl SocketTuning {
             // as distinct sockopts.
             best_effort(
                 "TCP_KEEPIDLE",
-                setsockopt(&fd, sockopt::TcpKeepIdle, &Self::IDLE_SECS),
+                &setsockopt(&fd, sockopt::TcpKeepIdle, &Self::IDLE_SECS),
             );
             best_effort(
                 "TCP_KEEPINTVL",
-                setsockopt(&fd, sockopt::TcpKeepInterval, &Self::INTERVAL_SECS),
+                &setsockopt(&fd, sockopt::TcpKeepInterval, &Self::INTERVAL_SECS),
             );
             best_effort(
                 "TCP_KEEPCNT",
-                setsockopt(&fd, sockopt::TcpKeepCount, &Self::PROBE_COUNT),
+                &setsockopt(&fd, sockopt::TcpKeepCount, &Self::PROBE_COUNT),
             );
             // TCP_USER_TIMEOUT specifically: nix 0.31 gates this sockopt to
             // `fuchsia | linux` (NOT android), and the same split as the
@@ -89,7 +99,7 @@ impl SocketTuning {
             #[cfg(target_os = "linux")]
             best_effort(
                 "TCP_USER_TIMEOUT",
-                setsockopt(&fd, sockopt::TcpUserTimeout, &Self::USER_TIMEOUT_MS),
+                &setsockopt(&fd, sockopt::TcpUserTimeout, &Self::USER_TIMEOUT_MS),
             );
         }
 
@@ -99,7 +109,7 @@ impl SocketTuning {
             // knob is TCP_KEEPALIVE (the idle-time constant, seconds).
             best_effort(
                 "TCP_KEEPALIVE",
-                setsockopt(&fd, sockopt::TcpKeepAlive, &Self::IDLE_SECS),
+                &setsockopt(&fd, sockopt::TcpKeepAlive, &Self::IDLE_SECS),
             );
         }
 
@@ -134,8 +144,9 @@ impl SocketTuning {
 
 #[cfg(unix)]
 /// Logs a failed best-effort sockopt at warn and continues — never panics,
-/// never fails the enclosing `apply`.
-fn best_effort<T>(option: &str, result: nix::Result<T>) {
+/// never fails the enclosing `apply`. Borrows the result because `T` (the
+/// sockopt value type) is not necessarily `Copy` and is never consumed here.
+fn best_effort<T>(option: &str, result: &nix::Result<T>) {
     if let Err(e) = result {
         tracing::warn!(option, error = %e, "best-effort socket option could not be set");
     }

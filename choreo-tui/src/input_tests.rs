@@ -655,7 +655,11 @@ fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
     app.input.cursor = 1;
 
     // Insert a long multi-line history entry (20 visual lines at 80-wide terminal)
-    let long_text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+    // Vec-then-concat instead of format!.collect::<String>() (clippy::format_collect)
+    let long_text: String = (0..20)
+        .map(|i| format!("line {i}\n"))
+        .collect::<Vec<_>>()
+        .concat();
     let id = app.next_request_id;
     app.display_for(0).view.insert_or_replace(
         id,
@@ -702,7 +706,10 @@ fn navigate_history_down_adjusts_scroll_offset_for_long_draft() {
     let mut app = test_app();
     app.last_terminal_size = Some((80, 24));
     // A long multi-line draft saved in history state
-    let long_draft: String = (0..20).map(|i| format!("line {i}\n")).collect();
+    let long_draft: String = (0..20)
+        .map(|i| format!("line {i}\n"))
+        .collect::<Vec<_>>()
+        .concat();
     app.saved_draft = long_draft.clone();
     app.input.text = "x".to_string();
     app.input.cursor = 1;
@@ -1268,6 +1275,7 @@ fn navigate_history_up_empty_history_does_nothing() {
     assert!(app.history_index.is_none());
 }
 
+#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn navigate_history_down_restores_draft() {
     let mut app = test_app();
@@ -1304,6 +1312,7 @@ fn navigate_history_down_moves_to_newer() {
     assert!(app.history_index.is_none());
 }
 
+#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn navigate_history_down_survives_shrunk_history() {
     let mut app = test_app();
@@ -1353,6 +1362,7 @@ fn navigate_history_down_survives_shrunk_history() {
     assert!(app.saved_draft.is_empty());
 }
 
+#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn navigate_history_down_empty_history_restores_draft() {
     let mut app = test_app();
@@ -1367,6 +1377,7 @@ fn navigate_history_down_empty_history_restores_draft() {
     assert!(app.saved_draft.is_empty());
 }
 
+#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn navigate_history_up_survives_shrunk_history() {
     let mut app = test_app();
@@ -1422,6 +1433,7 @@ fn navigate_history_up_survives_shrunk_history() {
     assert!(app.saved_draft.is_empty());
 }
 
+#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn history_nav_resets_after_commit() {
     let mut app = test_app();
@@ -1435,6 +1447,7 @@ fn history_nav_resets_after_commit() {
     assert!(app.saved_draft.is_empty());
 }
 
+#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn terminal_event_up_down_navigates_history() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1624,6 +1637,7 @@ fn commit_does_not_duplicate_user_text() {
     assert_eq!(app.user_texts()[0], "hello");
 }
 
+#[allow(clippy::cast_possible_truncation)] // test indices/heights far below u16::MAX
 #[test]
 fn click_on_reasoning_header_toggles_collapse() {
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1685,6 +1699,7 @@ fn click_on_reasoning_header_toggles_collapse() {
     );
 }
 
+#[allow(clippy::cast_possible_truncation)] // test indices/heights far below u16::MAX
 #[test]
 fn click_on_reasoning_header_toggles_collapse_when_content_fits_viewport() {
     // Regression: on sessions whose history is shorter than the viewport (no
@@ -1749,6 +1764,7 @@ fn click_on_reasoning_header_toggles_collapse_when_content_fits_viewport() {
     );
 }
 
+#[allow(clippy::cast_possible_truncation)] // test indices/heights far below u16::MAX
 #[test]
 fn click_on_tool_result_header_toggles_collapse() {
     // Clicking a tool result's header row (triangle + description) toggles
@@ -1845,6 +1861,11 @@ fn click_on_tool_result_header_toggles_collapse() {
     );
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)] // test-index/scroll arithmetic with values guaranteed in range
 #[test]
 fn click_on_reasoning_header_toggles_collapse_when_scrolled() {
     // Regression: on sessions with a scrollbar, once the user scrolls away

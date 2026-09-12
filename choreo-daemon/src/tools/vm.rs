@@ -25,7 +25,7 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tracing::{debug, error, info, trace, warn};
 
-const BOILERPLATE_HEAD: &str = r#"
+const BOILERPLATE_HEAD: &str = r"
 #![no_std]
 #![no_main]
 #![allow(unused_imports)]
@@ -38,7 +38,7 @@ fn panic(_: &PanicInfo) -> ! {
     choreo::exit(1)
 }
 
-"#;
+";
 
 const BOILERPLATE_ALLOC_DYNAMIC: &str = include_str!("vm_allocator_dynamic_inner.rs");
 
@@ -133,7 +133,7 @@ pub mod choreo {
     }
 "#;
 
-const BOILERPLATE_TAIL_ALLOC: &str = r#"
+const BOILERPLATE_TAIL_ALLOC: &str = r"
     use alloc::vec::Vec;
     use alloc::string::String;
     use alloc::string::ToString;
@@ -155,7 +155,7 @@ const BOILERPLATE_TAIL_ALLOC: &str = r#"
             result
         }
     }
-"#;
+";
 
 const BOILERPLATE_TAIL_CLOSE: &str = r#"
 }
@@ -219,13 +219,13 @@ pub extern "C" fn _start() {
 /// These are pre-imported so user code can use `Vec`, `String`, `Box`,
 /// `format!`, and `.to_string()` without explicit imports.  They live
 /// outside `pub mod choreo` so they're in scope for the user's `fn main()`.
-const BOILERPLATE_CONVENIENCE_IMPORTS: &str = r#"
+const BOILERPLATE_CONVENIENCE_IMPORTS: &str = r"
 use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::boxed::Box;
 use alloc::format;
-"#;
+";
 
 const BOILERPLATE_TAIL_ENCODING: &str = r#"
     // ── Postcard-format encoding helpers ──────────────────────────────
@@ -666,14 +666,13 @@ fn build_boilerplate() -> String {
 /// be spawned, or exits with a non-success status.  This keeps the tool
 /// resilient in environments where `rustfmt` is unavailable.
 fn format_rust_source(source: &str) -> String {
-    let mut child = match Command::new("rustfmt")
+    let Ok(mut child) = Command::new("rustfmt")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return source.to_string(),
+    else {
+        return source.to_string();
     };
 
     // Write the source to rustfmt's stdin.  If the write fails we still
@@ -797,6 +796,9 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
                     self.ctx.as_ref(),
                 );
 
+                // u64→usize register read: guest buffer sizes are bounded by
+                // the VM's memory (far below usize::MAX on all targets).
+                #[allow(clippy::cast_possible_truncation)]
                 let to_write = result_bytes.len().min(out_size as usize);
                 if to_write > 0 {
                     // `to_write <= result_bytes.len()` per the min() above.
@@ -928,10 +930,16 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
                 // Result<Result<R, E>, ToolError>.  Since the guest doesn't know R's
                 // postcard length at compile time, we prefix each frame with a varint
                 // length so the guest's dec_result_raw can find frame boundaries.
+                // usize→u32 frame count: a batch of 4 billion tool calls is
+                // impossible (each call is a full tool execution).
+                #[allow(clippy::cast_possible_truncation)]
                 let count_encoded: Vec<u8> = postcard::to_allocvec(&(results.len() as u32))
                     .map_err(|_| VmError::Unexpected("batch encode count failed".into()))?;
                 let mut response = count_encoded;
                 for r in &results {
+                    // usize→u32 frame length: single tool results are far
+                    // below u32::MAX bytes (the guest buffer is smaller yet).
+                    #[allow(clippy::cast_possible_truncation)]
                     let frame_len: u32 = r.len() as u32;
                     let len_encoded = postcard::to_allocvec(&frame_len)
                         .map_err(|_| VmError::Unexpected("batch encode len failed".into()))?;
@@ -939,6 +947,9 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
                     response.extend_from_slice(r);
                 }
 
+                // u64→usize register read: guest buffer sizes are bounded by
+                // the VM's memory (far below usize::MAX on all targets).
+                #[allow(clippy::cast_possible_truncation)]
                 let to_write = response.len().min(out_size as usize);
                 if to_write > 0 {
                     // `to_write <= response.len()` per the min() above.
@@ -1210,7 +1221,7 @@ fn run_riscv_impl(
     let syscall = ChoreographrSyscall {
         registry,
         x_credentials: x_credentials.cloned(),
-        working_dir: working_dir.map(|p| p.to_path_buf()),
+        working_dir: working_dir.map(std::path::Path::to_path_buf),
         output_tx,
         write_tx,
         ctx,
@@ -1392,7 +1403,7 @@ impl Tool for RunRiscV {
                 if let Some(ref prog_args) = args.args
                     && !prog_args.is_empty()
                 {
-                    parts.push(format!("\nProgram args: {:?}.", prog_args));
+                    parts.push(format!("\nProgram args: {prog_args:?}."));
                 }
                 parts.push(String::from("\nAllocator: included."));
                 parts.push(format!(
@@ -1443,7 +1454,7 @@ impl Tool for RunRiscV {
 
                 "max_cycles": {
                     "type": "integer",
-                    "description": &format!("Maximum CPU cycles before VM termination (default: {})", DEFAULT_MAX_CYCLES)
+                    "description": &format!("Maximum CPU cycles before VM termination (default: {DEFAULT_MAX_CYCLES})")
                 },
                 "memory_size": {
                     "type": "integer",
@@ -1507,6 +1518,12 @@ impl Tool for RunRiscV {
     }
 }
 
+/// Execute a RISC-V sandboxed program and return its output.
+///
+/// # Errors
+///
+/// Returns Err if the program cannot be assembled/executed or the sandbox
+/// reports an error (the sandbox output becomes the error message).
 pub fn execute_run_riscv_tool(
     input: &RunRiscVInput,
     working_dir: Option<&Path>,
@@ -1543,8 +1560,7 @@ mod tests {
         let has_rustfmt = Command::new("rustfmt")
             .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         if !has_rustfmt {
             return;
         }
@@ -1564,8 +1580,7 @@ mod tests {
         let has_rustfmt = Command::new("rustfmt")
             .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         if !has_rustfmt {
             return;
         }
@@ -1910,7 +1925,7 @@ mod tests {
         while let Ok(chunk) = rx.recv() {
             out.extend_from_slice(&chunk);
         }
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
     }
 
     #[test]
@@ -2121,6 +2136,16 @@ mod tests {
 
     #[test]
     fn concurrent_tool_dispatch_via_thread_scope() {
+        // Decode helper: postcard-encoded Result<Result<Vec<u8>, E>, ToolError>
+        // for Ok(Ok(...)) is 0x00 (outer Ok) + 0x00 (inner Ok) + payload.
+        // (Hoisted: items must precede statements in the block.)
+        fn decode_ok_payload(data: &[u8]) -> Vec<u8> {
+            assert_eq!(data[0], 0, "expected outer Ok tag byte");
+            assert_eq!(data[1], 0, "expected inner Ok tag byte");
+            let (payload, _rest): (Vec<u8>, &[u8]) = postcard::take_from_bytes(&data[2..]).unwrap();
+            payload
+        }
+
         // Register two tools with different names, then dispatch both
         // concurrently via thread::scope — the same pattern used in
         // the batch ecall (ecall 3). Verify both results come back.
@@ -2170,13 +2195,6 @@ mod tests {
         }
 
         // Decode payloads to verify they match expected responses.
-        fn decode_ok_payload(data: &[u8]) -> Vec<u8> {
-            assert_eq!(data[0], 0, "expected outer Ok tag byte");
-            assert_eq!(data[1], 0, "expected inner Ok tag byte");
-            let (payload, _rest): (Vec<u8>, &[u8]) = postcard::take_from_bytes(&data[2..]).unwrap();
-            payload
-        }
-
         assert_eq!(
             decode_ok_payload(&results[0]),
             b"result_a",
@@ -2263,7 +2281,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             assert_eq!(list.hole_count(), 1, "should have exactly one hole");
@@ -2278,7 +2296,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
@@ -2302,7 +2320,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let a = list.allocate_first_fit(Layout::from_size_align(64, 4).unwrap());
@@ -2340,7 +2358,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             // Allocate the entire heap.  The fixed allocator reuses the hole
@@ -2362,7 +2380,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let a = list.allocate_first_fit(Layout::from_size_align(TEST_HEAP_SIZE, 1).unwrap());
@@ -2379,7 +2397,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             for align in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
@@ -2404,7 +2422,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             // Allocate a small block, then a large one, then free the small one.
@@ -2415,16 +2433,16 @@ mod tests {
 
             let a = list.allocate_first_fit(small);
             assert!(!a.is_null());
-            let _b = list.allocate_first_fit(large);
-            assert!(!_b.is_null());
+            let b = list.allocate_first_fit(large);
+            assert!(!b.is_null());
 
             // Free the first (lowest-address) allocation.
             list.deallocate(a, small);
 
             // Allocate a similar-sized block — first-fit should pick the
             // freed front hole (lower address), not the tail.
-            let _c = list.allocate_first_fit(small);
-            assert!(!_c.is_null(), "re-allocation should succeed");
+            let c = list.allocate_first_fit(small);
+            assert!(!c.is_null(), "re-allocation should succeed");
 
             // Verify the number of holes after freeing `a` and then
             // re-allocating.  First-fit from the front should consume
@@ -2447,7 +2465,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             // A 1-byte allocation rounds up to Hole::min_size() bytes.
@@ -2470,7 +2488,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
@@ -2508,7 +2526,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
@@ -2540,7 +2558,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
@@ -2574,7 +2592,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
@@ -2602,7 +2620,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             // Allocate a min-sized anchor block from the front.
@@ -2652,7 +2670,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(32, 4).unwrap();
@@ -2709,7 +2727,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(32, 4).unwrap();
@@ -2744,15 +2762,20 @@ mod tests {
         // Deterministic LCG for reproducibility.
         fn lcg(state: &mut u64) -> usize {
             *state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *state as usize
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            // u64→usize: on 64-bit targets identical; the heap index only
+            // needs the low bits regardless.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                *state as usize
+            }
         }
 
         unsafe {
             let mut list = HoleList::new();
             let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
-            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            let heap = (&raw mut heap_buf).cast::<u8>();
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let mut rng: u64 = 42;
@@ -2818,7 +2841,7 @@ mod tests {
         // encoded[2..] is the raw postcard of the Vec<u8> = varint(5) b"hello"
         let (payload, rest): (Vec<u8>, &[u8]) = postcard::take_from_bytes(&encoded[2..]).unwrap();
         assert_eq!(payload, b"hello");
-        assert!(rest.is_empty());
+        assert_eq!(rest, [] as [u8; 0]);
     }
 
     #[test]
@@ -2833,7 +2856,7 @@ mod tests {
         assert_eq!(encoded[1], 0x01, "expected inner Err tag");
         let (err_msg, rest): (String, &[u8]) = postcard::take_from_bytes(&encoded[2..]).unwrap();
         assert_eq!(err_msg, "permission denied");
-        assert!(rest.is_empty());
+        assert_eq!(rest, [] as [u8; 0]);
     }
 
     #[test]
@@ -2846,7 +2869,7 @@ mod tests {
         assert_eq!(encoded[0], 0x01, "expected outer Err tag");
         let (err_msg, rest): (String, &[u8]) = postcard::take_from_bytes(&encoded[1..]).unwrap();
         assert_eq!(err_msg, "unknown tool");
-        assert!(rest.is_empty());
+        assert_eq!(rest, [] as [u8; 0]);
     }
 
     #[test]
@@ -2864,7 +2887,7 @@ mod tests {
         assert_eq!(encoded[2], 0x01, "expected Option::Some tag");
         let (s, rest): (String, &[u8]) = postcard::take_from_bytes(&encoded[3..]).unwrap();
         assert_eq!(s, "val");
-        assert!(rest.is_empty());
+        assert_eq!(rest, [] as [u8; 0]);
     }
 
     #[test]
@@ -2893,7 +2916,7 @@ mod tests {
         assert_eq!(encoded[1], 0x01);
         let (err_msg, rest): (String, &[u8]) = postcard::take_from_bytes(&encoded[2..]).unwrap();
         assert_eq!(err_msg, "db error");
-        assert!(rest.is_empty());
+        assert_eq!(rest, [] as [u8; 0]);
     }
 
     #[test]
@@ -2906,7 +2929,7 @@ mod tests {
         assert_eq!(encoded[0], 0x01);
         let (err_msg, rest): (String, &[u8]) = postcard::take_from_bytes(&encoded[1..]).unwrap();
         assert_eq!(err_msg, "infra failure");
-        assert!(rest.is_empty());
+        assert_eq!(rest, [] as [u8; 0]);
     }
 
     // ── Heap bounds computation tests ──────────────────────────────────
@@ -2920,7 +2943,7 @@ mod tests {
         //   heap_end   = 0x300000 - 0x10000 = 0x2F0000
         //   heap_size  = 0x2F0000 - 0x040000 = 0x2B0000 (~2.75 MB)
         assert_eq!(base, 262_144);
-        assert_eq!(size, 0x2B0000);
+        assert_eq!(size, 0x002B_0000);
     }
 
     #[test]

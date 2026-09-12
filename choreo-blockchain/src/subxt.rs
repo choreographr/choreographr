@@ -19,6 +19,7 @@ use crate::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::fmt::Write;
 use std::str::FromStr;
 use subxt::rpcs::RpcClient as SubxtRpcClient;
 
@@ -30,7 +31,7 @@ type SubxtClient = subxt::OnlineClient<subxt::PolkadotConfig>;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubxtChainArgs {
-    /// WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)
+    /// WebSocket URL of the Substrate node (e.g., `<wss://rpc.polkadot.io>`)
     pub ws_url: Option<String>,
 }
 
@@ -38,15 +39,15 @@ pub struct SubxtChainArgs {
 pub struct SubxtBalanceArgs {
     /// SS58-encoded account address
     pub address: String,
-    /// WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)
+    /// WebSocket URL of the Substrate node (e.g., `<wss://rpc.polkadot.io>`)
     pub ws_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubxtQueryArgs {
-    /// Pallet name (e.g., System, Balances, Staking)
+    /// Pallet name (e.g., `System`, `Balances`, `Staking`)
     pub pallet: String,
-    /// Storage item name (e.g., Account, TotalIssuance, Validators)
+    /// Storage item name (e.g., `Account`, `TotalIssuance`, `Validators`)
     pub storage_item: String,
     /// Optional hex-encoded bytes for the storage key — the *un-hashed* value
     /// the pallet's hasher expects (e.g. the raw 32-byte account id for
@@ -54,7 +55,7 @@ pub struct SubxtQueryArgs {
     /// the pallet's hasher itself, so a pre-hashed key would be double-hashed
     /// and never match. 0x prefix optional.
     pub key: Option<String>,
-    /// WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)
+    /// WebSocket URL of the Substrate node (e.g., `<wss://rpc.polkadot.io>`)
     pub ws_url: Option<String>,
 }
 
@@ -62,12 +63,19 @@ pub struct SubxtQueryArgs {
 pub struct SubxtBlockArgs {
     /// Optional block number (if omitted, gets the latest finalized block)
     pub block_number: Option<u64>,
-    /// WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)
+    /// WebSocket URL of the Substrate node (e.g., `<wss://rpc.polkadot.io>`)
     pub ws_url: Option<String>,
 }
 
 // ── Synchronous entry points (used by the daemon's Tool wrappers) ────────
 
+/// Synchronous entry point: runs the matching async impl on the sidecar
+/// runtime and caps the output at the shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`BlockchainError`] when no sidecar runtime was initialized, the
+/// node is unreachable, or the call fails.
 pub fn execute_subxt_chain(args: &SubxtChainArgs) -> Result<String, BlockchainError> {
     let ws_url = args
         .ws_url
@@ -78,6 +86,13 @@ pub fn execute_subxt_chain(args: &SubxtChainArgs) -> Result<String, BlockchainEr
     Ok(truncate_tool_output(&output))
 }
 
+/// Synchronous entry point: runs the matching async impl on the sidecar
+/// runtime and caps the output at the shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`BlockchainError`] when no sidecar runtime was initialized, the
+/// node is unreachable, or the call fails.
 pub fn execute_subxt_balance(args: &SubxtBalanceArgs) -> Result<String, BlockchainError> {
     let ws_url = args
         .ws_url
@@ -88,6 +103,13 @@ pub fn execute_subxt_balance(args: &SubxtBalanceArgs) -> Result<String, Blockcha
     Ok(truncate_tool_output(&output))
 }
 
+/// Synchronous entry point: runs the matching async impl on the sidecar
+/// runtime and caps the output at the shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`BlockchainError`] when no sidecar runtime was initialized, the
+/// node is unreachable, or the call fails.
 pub fn execute_subxt_query(args: &SubxtQueryArgs) -> Result<String, BlockchainError> {
     let ws_url = args
         .ws_url
@@ -103,6 +125,13 @@ pub fn execute_subxt_query(args: &SubxtQueryArgs) -> Result<String, BlockchainEr
     Ok(truncate_tool_output(&output))
 }
 
+/// Synchronous entry point: runs the matching async impl on the sidecar
+/// runtime and caps the output at the shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`BlockchainError`] when no sidecar runtime was initialized, the
+/// node is unreachable, or the call fails.
 pub fn execute_subxt_block(args: &SubxtBlockArgs) -> Result<String, BlockchainError> {
     let ws_url = args
         .ws_url
@@ -115,16 +144,19 @@ pub fn execute_subxt_block(args: &SubxtBlockArgs) -> Result<String, BlockchainEr
 
 // ── Invocation descriptions (shown in the TUI / tool transcripts) ────────
 
+#[must_use]
 pub fn describe_subxt_chain_invocation(args: &SubxtChainArgs) -> String {
     let url = args.ws_url.as_deref().unwrap_or(DEFAULT_WS_URL);
     format!("Querying Substrate/Polkadot chain info from {url}.")
 }
 
+#[must_use]
 pub fn describe_subxt_balance_invocation(args: &SubxtBalanceArgs) -> String {
     let url = args.ws_url.as_deref().unwrap_or(DEFAULT_WS_URL);
     format!("Querying balance of {} on {url}.", args.address)
 }
 
+#[must_use]
 pub fn describe_subxt_query_invocation(args: &SubxtQueryArgs) -> String {
     let url = args.ws_url.as_deref().unwrap_or(DEFAULT_WS_URL);
     format!(
@@ -133,6 +165,7 @@ pub fn describe_subxt_query_invocation(args: &SubxtQueryArgs) -> String {
     )
 }
 
+#[must_use]
 pub fn describe_subxt_block_invocation(args: &SubxtBlockArgs) -> String {
     let url = args.ws_url.as_deref().unwrap_or(DEFAULT_WS_URL);
     match args.block_number {
@@ -243,21 +276,23 @@ async fn subxt_chain_impl(ws_url: &str) -> Result<String, BlockchainError> {
     // properties/health blobs are serde-rendered JSON: sanitize_json keeps
     // their (structural) line breaks and bounds the pass to the byte budget.
     let mut out = String::new();
-    out.push_str(&format!("chain: {}\n", sanitize_value(&chain)));
-    out.push_str(&format!("chain_type: {}\n", sanitize_value(&chain_type)));
-    out.push_str(&format!("node_name: {}\n", sanitize_value(&name)));
-    out.push_str(&format!("node_version: {}\n", sanitize_value(&version)));
-    out.push_str(&format!("genesis_hash: {genesis_hash:#x}\n"));
-    out.push_str(&format!("best_block: #{best_number} ({best_hash:#x})\n"));
-    out.push_str(&format!("finalized_head: {finalized_hash}\n"));
-    out.push_str(&format!(
+    let _ = writeln!(out, "chain: {}\n", sanitize_value(&chain));
+    let _ = writeln!(out, "chain_type: {}\n", sanitize_value(&chain_type));
+    let _ = writeln!(out, "node_name: {}\n", sanitize_value(&name));
+    let _ = writeln!(out, "node_version: {}\n", sanitize_value(&version));
+    let _ = write!(out, "genesis_hash: {genesis_hash:#x}\n");
+    let _ = write!(out, "best_block: #{best_number} ({best_hash:#x})\n");
+    let _ = write!(out, "finalized_head: {finalized_hash}\n");
+    let _ = writeln!(
+        out,
         "properties: {}\n",
         sanitize_json(&props.to_string(), MAX_TOOL_OUTPUT_BYTES)
-    ));
-    out.push_str(&format!(
+    );
+    let _ = writeln!(
+        out,
         "health: {}",
         sanitize_json(&health.to_string(), MAX_TOOL_OUTPUT_BYTES)
-    ));
+    );
     Ok(out)
 }
 
@@ -370,31 +405,36 @@ async fn subxt_block_impl(
         .map_err(subxt_err)?;
 
     let mut out = String::new();
-    out.push_str(&format!("block: #{number} ({hash:#x})\n"));
-    out.push_str(&format!("spec_version: {spec_version}\n"));
-    out.push_str(&format!(
+    let _ = write!(out, "block: #{number} ({hash:#x})\n");
+    let _ = write!(out, "spec_version: {spec_version}\n");
+    let _ = writeln!(
+        out,
         "header parent_hash: {parent_hash:#x}\n",
         parent_hash = header.parent_hash
-    ));
-    out.push_str(&format!(
+    );
+    let _ = writeln!(
+        out,
         "header state_root: {state_root:#x}\n",
         state_root = header.state_root
-    ));
-    out.push_str(&format!(
+    );
+    let _ = writeln!(
+        out,
         "header extrinsics_root: {extrinsics_root:#x}\n",
         extrinsics_root = header.extrinsics_root
-    ));
-    out.push_str(&format!(
+    );
+    let _ = writeln!(
+        out,
         "header number: {header_number}\n",
         header_number = header.number
-    ));
+    );
     // The full block JSON is node-supplied — run the rendered text through
     // the capped JSON sanitizer: bounded before the sanitize pass (a full
     // block dump can be megabytes) and keeps the model readable output.
-    out.push_str(&format!(
+    let _ = writeln!(
+        out,
         "full_block: {}",
         sanitize_json(&block_json.to_string(), MAX_TOOL_OUTPUT_BYTES)
-    ));
+    );
     Ok(out)
 }
 

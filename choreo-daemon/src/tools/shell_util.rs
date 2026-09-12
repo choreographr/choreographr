@@ -108,15 +108,13 @@ pub(crate) fn binary_exists(name: &str) -> bool {
     let windows = cfg!(windows);
     let pathext = std::env::var("PATHEXT").ok();
     let candidates = executable_candidate_names(name, pathext.as_deref(), windows);
-    std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path).any(|dir| {
-                candidates
-                    .iter()
-                    .any(|candidate| dir.join(candidate).is_file())
-            })
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            candidates
+                .iter()
+                .any(|candidate| dir.join(candidate).is_file())
         })
-        .unwrap_or(false)
+    })
 }
 
 /// Resolve the working directory the child process should start in.
@@ -188,6 +186,8 @@ fn open_pidfd(pid: u32) -> Option<OwnedFd> {
     // an OwnedFd, so it is closed automatically when the watchdog thread
     // exits. `Pid::from_raw` yields None only for pid 0, which child.id()
     // never produces — kept defensive rather than unwrapping.
+    // u32→i32 pid: pids live in the positive i32 range by kernel ABI.
+    #[allow(clippy::cast_possible_wrap)]
     let pid = rustix::process::Pid::from_raw(pid as i32)?;
     match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
         Ok(fd) => Some(fd),
@@ -238,6 +238,8 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
     // `child.id()` is never 0, but rustix's `Pid::from_raw` returns an
     // `Option` and production code must not unwrap — keep the conversion
     // defensive rather than assuming.
+    // u32→i32 pid: pids live in the positive i32 range by kernel ABI.
+    #[allow(clippy::cast_possible_wrap)]
     let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
         debug!(raw_pid = pid, "refusing to signal pid 0");
         return false;
@@ -291,9 +293,7 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
     // exited (even unreaped) getpgid can still succeed — matching kill(2),
     // which also "succeeds" on zombies — so the was_killed flag stays accurate
     // for the narrow finish-vs-timeout race exactly as before.
-    let is_group_leader = rustix::process::getpgid(Some(pid))
-        .map(|pgid| pgid == pid)
-        .unwrap_or(false);
+    let is_group_leader = rustix::process::getpgid(Some(pid)).is_ok_and(|pgid| pgid == pid);
     if is_group_leader
         && rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).is_ok()
     {
@@ -592,7 +592,7 @@ fn collect_line_drains(
 /// case) — past it the handle is dropped to detach rather than hang.
 fn collect_merger_body(
     handle: std::thread::JoinHandle<()>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: &mpsc::Receiver<Vec<u8>>,
 ) -> Vec<u8> {
     match rx.recv_timeout(DRAIN_DETACH_GRACE) {
         Ok(body) => {
@@ -690,9 +690,12 @@ fn poll_readable(
     )];
     // poll(2) takes a timespec; the drain slices come in as a Duration.
     // (`Timespec` is re-exported from rustix::event; rustix::timespec is private.)
+    // u64→i64 seconds: poll slices are bounded by tool timeouts (minutes),
+    // never anywhere near i64::MAX.
+    #[allow(clippy::cast_possible_wrap)]
     let timeout = rustix::event::Timespec {
         tv_sec: poll.as_secs() as i64,
-        tv_nsec: poll.subsec_nanos() as i64,
+        tv_nsec: i64::from(poll.subsec_nanos()),
     };
     loop {
         // rustix does not auto-retry EINTR, so the INTR branch loops back to
@@ -705,12 +708,11 @@ fn poll_readable(
                 if stop_rx.try_recv().is_ok() {
                     return false;
                 }
-                continue;
             }
             // Data available or EOF (POLLHUP|POLLIN) — attempt a read.
             Ok(_) => return true,
             // EINTR: retry the poll.
-            Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::INTR) => {}
             Err(e) => {
                 debug!(error = %e, "poll on child pipe failed; stopping drain");
                 return false;
@@ -765,7 +767,7 @@ fn accumulate_chunk(budget: &mut Option<ByteBudget>, full: &mut Vec<u8>, chunk: 
 #[cfg(unix)]
 fn drain_fd<R: Read + AsFd>(
     mut reader: R,
-    stop_rx: mpsc::Receiver<()>,
+    stop_rx: &mpsc::Receiver<()>,
     poll: Duration,
     on_data: &mut dyn FnMut(&[u8]),
     accumulate: DrainAccumulate,
@@ -792,7 +794,7 @@ fn drain_fd<R: Read + AsFd>(
     };
     let mut buf = [0u8; 8192];
     loop {
-        if !poll_readable(reader.as_fd(), &stop_rx, poll) {
+        if !poll_readable(reader.as_fd(), stop_rx, poll) {
             break;
         }
         // Drain everything currently buffered (non-blocking reads loop until
@@ -822,7 +824,6 @@ fn drain_fd<R: Read + AsFd>(
                     if !nonblocking {
                         break; // avoid a blocking re-read on the fallback path
                     }
-                    continue;
                 }
                 Err(e) => {
                     debug!(error = %e, "read from child pipe failed; stopping drain");
@@ -1008,7 +1009,7 @@ fn spawn_capped_drain<R: Read + AsFd + Send + 'static>(
     let handle = std::thread::spawn(move || {
         let buf = drain_fd(
             reader,
-            stop_rx,
+            &stop_rx,
             DRAIN_POLL_INTERVAL,
             &mut |_| {},
             DrainAccumulate::Capped(MAX_TOOL_OUTPUT_BYTES),
@@ -1257,15 +1258,16 @@ impl StreamByteCap {
     /// already decided, and a permanently-wedged consumer is bounded by the
     /// merger's collect grace).
     fn forward(&self, bytes: &[u8]) -> bool {
-        match self.tx.try_send(bytes.to_vec()) {
-            Ok(()) => true,
-            Err(_) => crossbeam_channel::select! {
+        if let Ok(()) = self.tx.try_send(bytes.to_vec()) {
+            true
+        } else {
+            crossbeam_channel::select! {
                 send(self.tx, bytes.to_vec()) -> res => res.is_ok(),
                 recv(self.abort_rx) -> abort => match abort {
                     Ok(()) => false,
                     Err(_) => self.tx.send(bytes.to_vec()).is_ok(),
                 },
-            },
+            }
         }
     }
 }
@@ -1303,7 +1305,7 @@ where
         let mut pending: Vec<u8> = Vec::new();
         drain_fd(
             reader,
-            stop_rx,
+            &stop_rx,
             DRAIN_POLL_INTERVAL,
             &mut |chunk: &[u8]| {
                 forward_complete_lines(chunk, &mut pending, &mut |line| {
@@ -1377,12 +1379,14 @@ impl RecordFraming {
     /// No record framing: the stream caps at the full
     /// [`MAX_TOOL_OUTPUT_BYTES`] budget (the caller formats the output
     /// without a reserved frame).
+    #[must_use]
     pub const fn none() -> Self {
         Self(0)
     }
 
     /// Framing for `format_shell_output`'s `$ {display_cmd}\n` record,
     /// computed from the same display command that will be formatted.
+    #[must_use]
     pub fn shell(display_cmd: &str) -> Self {
         Self(shell_output_framing_reservation(display_cmd))
     }
@@ -1428,6 +1432,12 @@ impl RecordFraming {
 /// stalled subscriber can never wedge the tool past its timeout (the abort
 /// drops the merge receiver, the drains' sends fail, and every thread joins
 /// promptly).
+///
+/// # Errors
+///
+/// Returns Err if the child cannot be spawned, the output channels cannot
+/// be opened, the watchdog fails, or the child times out (with a partial
+/// output capture in the error).
 pub fn spawn_with_streaming(
     cmd: &mut Command,
     timeout_ms: u64,
@@ -1602,7 +1612,7 @@ pub fn spawn_with_streaming(
                 job.terminate();
                 collect_line_drains(stdout_thread, stderr_thread, &job);
             }
-            let _ = collect_merger_body(merger_thread, merger_done_rx);
+            let _ = collect_merger_body(merger_thread, &merger_done_rx);
             if let Err(e) = watchdog.join() {
                 warn!("watchdog thread panicked: {:?}", e);
             }
@@ -1630,7 +1640,7 @@ pub fn spawn_with_streaming(
     collect_line_drains(stdout_thread, stderr_thread, DRAIN_COMPLETION_GRACE);
     #[cfg(windows)]
     collect_line_drains(stdout_thread, stderr_thread, &job);
-    let body = collect_merger_body(merger_thread, merger_done_rx);
+    let body = collect_merger_body(merger_thread, &merger_done_rx);
     if let Err(e) = watchdog.join() {
         warn!("watchdog thread panicked: {:?}", e);
     }
@@ -1666,10 +1676,10 @@ pub fn spawn_with_streaming(
 /// expand and must be reserved at their escaped size or the cap could still
 /// re-cut the body.
 fn shell_output_framing_reservation(display_cmd: &str) -> usize {
-    let escaped_header_len = sanitize_transcript(&format!("$ {display_cmd}\n")).len();
     // `format_shell_output` renders the footer as `\n` + `\nExit code: {code}`;
     // i32::MIN ("-2147483648") is the longest possible exit code.
     const WORST_CASE_FOOTER_LEN: usize = "\n\nExit code: -2147483648".len();
+    let escaped_header_len = sanitize_transcript(&format!("$ {display_cmd}\n")).len();
     escaped_header_len + WORST_CASE_FOOTER_LEN + 2 * TRUNCATION_SUFFIX.len()
 }
 
@@ -1684,6 +1694,11 @@ fn shell_output_framing_reservation(display_cmd: &str) -> usize {
 /// to the live view even when the output is truncated.
 ///
 /// The caller must have set `Stdio::piped()` on both stdout and stderr.
+///
+/// # Errors
+///
+/// Returns Err under the same conditions as [`spawn_with_streaming`]
+/// (spawn failure, timeout, watchdog error).
 pub fn run_shell_streaming(
     cmd: &mut Command,
     display_cmd: &str,
@@ -1816,14 +1831,14 @@ mod tests {
         cmd.args(["-c", "exec sleep 30"]);
         let child = cmd.spawn().expect("spawn child");
         let pid = child.id();
-        let mut _reap = ReapOnDrop(child);
+        let mut reap = ReapOnDrop(child);
 
         assert!(
             kill_child_tree(pid, None),
             "direct-kill fallback must reap a non-leader child"
         );
         // The child must have been SIGKILLed, not exited cleanly.
-        assert!(!_reap.0.wait().expect("wait on killed child").success());
+        assert!(!reap.0.wait().expect("wait on killed child").success());
     }
 
     #[test]
@@ -1840,7 +1855,7 @@ mod tests {
         // Wrap the child before the pidfd-unavailable early return below so it
         // is always reaped (a `sleep 30` would otherwise linger until the test
         // process exits).
-        let mut _reap = ReapOnDrop(child);
+        let mut reap = ReapOnDrop(child);
         // pidfd_open can be unavailable (kernel < 5.3, seccomp policy) even
         // though the child is alive; production degrades to the PID-based
         // path in exactly that case, so the test skips rather than failing.
@@ -1854,7 +1869,7 @@ mod tests {
             "pinned pidfd kill must reap a leader child"
         );
         // The child must have been SIGKILLed, not exited cleanly.
-        assert!(!_reap.0.wait().expect("wait on killed child").success());
+        assert!(!reap.0.wait().expect("wait on killed child").success());
     }
 
     #[test]
@@ -1870,7 +1885,7 @@ mod tests {
         let (_stop_tx, stop_rx) = mpsc::channel::<()>();
         let got = drain_fd(
             reader,
-            stop_rx,
+            &stop_rx,
             Duration::ZERO,
             &mut |_| {},
             DrainAccumulate::None,
@@ -1892,7 +1907,7 @@ mod tests {
         let (_stop_tx, stop_rx) = mpsc::channel::<()>();
         let got = drain_fd(
             reader,
-            stop_rx,
+            &stop_rx,
             Duration::ZERO,
             &mut |_| {},
             DrainAccumulate::None,
@@ -1914,7 +1929,7 @@ mod tests {
 
         let got = drain_fd(
             reader,
-            stop_rx,
+            &stop_rx,
             Duration::ZERO,
             &mut |_| {},
             DrainAccumulate::None,
@@ -1944,7 +1959,7 @@ mod tests {
         let mut seen = 0usize;
         let got = drain_fd(
             reader,
-            stop_rx,
+            &stop_rx,
             Duration::ZERO,
             &mut |chunk: &[u8]| seen += chunk.len(),
             DrainAccumulate::Capped(8 * 1024),
@@ -2013,7 +2028,7 @@ mod tests {
         assert_eq!(pending, b"\r", "trailing CR held back for CRLF folding");
         forward_complete_lines(b"\n", &mut pending, &mut |l| parts.push(l));
         assert_eq!(parts[1], b"\n", "the held-back CR folds with the LF");
-        assert!(pending.is_empty());
+        assert_eq!(pending, [] as [u8; 0]);
     }
 
     #[test]

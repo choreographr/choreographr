@@ -128,8 +128,8 @@ mod tests {
 
     #[test]
     fn execute_get_session_disconnected() {
-        let (tx, _rx) = std::sync::mpsc::channel::<DaemonCommand>();
-        drop(_rx);
+        let (tx, rx) = std::sync::mpsc::channel::<DaemonCommand>();
+        drop(rx);
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let ctx = ToolContext::new(42, db, tx);

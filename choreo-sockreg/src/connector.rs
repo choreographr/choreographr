@@ -8,7 +8,6 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::ops::Deref;
 use std::time;
 
 use ureq::unversioned::resolver::ResolvedSocketAddrs;
@@ -31,6 +30,7 @@ pub struct RegisteringTcpConnector {
 
 impl RegisteringTcpConnector {
     /// Creates a connector feeding the given registry.
+    #[must_use]
     pub fn new(registry: SocketRegistry) -> Self {
         Self { registry }
     }
@@ -103,7 +103,7 @@ impl<In: Transport> Connector<In> for RegisteringTcpConnector {
 
 /// Dials the first reachable address.
 ///
-/// DEVIATION from ureq's TcpConnector: ureq splits the total timeout across
+/// DEVIATION from ureq's `TcpConnector`: ureq splits the total timeout across
 /// addresses with a geometric series (curl's RFC); we give every attempt the
 /// FULL remaining budget, stopping at the first success. For our use (loopback
 /// / direct IP endpoints, rarely >1 resolved address) the geometric splitting
@@ -117,7 +117,6 @@ fn try_connect(addrs: &ResolvedSocketAddrs, timeout: NextTimeout) -> Result<TcpS
             // aggregate failure if none connect.
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                 tracing::debug!(%addr, "connection refused; trying next address");
-                continue;
             }
             Err(e) => return Err(e),
         }
@@ -194,7 +193,7 @@ impl RegisteredTcpTransport {
             // ureq's `Duration` is its own enum wrapper (Exact/NotHappening)
             // that derefs to std's; normalize to std's Duration here so the
             // memoized state and the socket setters share one type.
-            timeout.not_zero().map(|d| *d.deref());
+            timeout.not_zero().map(|d| *d);
 
         if maybe_timeout != *previous {
             (f)(stream, maybe_timeout)?;
@@ -302,6 +301,9 @@ impl fmt::Debug for RegisteredTcpTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RegisteredTcpTransport")
             .field("addr", &self.stream.peer_addr().ok())
-            .finish()
+            // buffers/registration/timeouts are internal plumbing, not part
+            // of the identity the caller logs; expose them as TODO-style
+            // non-exhaustive markers instead of fd-bearing TcpStream Debug.
+            .finish_non_exhaustive()
     }
 }

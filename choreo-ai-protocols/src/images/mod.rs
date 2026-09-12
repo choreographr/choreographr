@@ -2,7 +2,7 @@
 //! request/result types it is expressed in.
 //!
 //! This mirrors the [`crate::ProviderClient`] split: a provider-agnostic
-//! trait plus per-provider adapters (the OpenAI Images API,
+//! trait plus per-provider adapters (the `OpenAI` Images API,
 //! [`OpenAiImageClient`], and the z.ai / Zhipu GLM Images API,
 //! [`ZaiImageClient`]). Errors reuse [`InferenceError`] so callers of the
 //! chat trait and of this trait share one error type and one metrics-label
@@ -75,18 +75,19 @@ pub use zai::ZaiImageClient;
 /// Whether a catalog provider slug is one of the two Zhipu image-provider
 /// slugs the daemon must route to the dedicated [`ZaiImageClient`]:
 ///
-/// - `"zai"` — the z.ai PaaS gateway
+/// - `"zai"` — the z.ai `PaaS` gateway
 ///   (`https://api.z.ai/api/paas/v4`), the documented default chat base;
 ///   the adapter's coding-gateway rewrite is a no-op passthrough at this
-///   base (it still applies if an account's base_url override points at
+///   base (it still applies if an account's `base_url` override points at
 ///   `https://api.z.ai/api/coding/paas/v4`);
 /// - `"zhipuai"` — the mainland bigmodel endpoint
-///   (`https://open.bigmodel.cn/api/paas/v4`), already at the plain PaaS base.
+///   (`https://open.bigmodel.cn/api/paas/v4`), already at the plain `PaaS` base.
 ///
 /// Both serve the same URL-returning glm-image Images contract (see the
 /// module docs on [`ZaiImageClient`]); every other slug uses the generic
 /// [`OpenAiImageClient`]. The client crate owns this knowledge so the
 /// daemon's dispatch does not hardcode provider-family facts.
+#[must_use]
 pub fn is_zhipu_image_provider_slug(slug: &str) -> bool {
     matches!(slug, "zai" | "zhipuai")
 }
@@ -97,9 +98,9 @@ use serde::{Deserialize, Serialize};
 /// Output canvas size for an image generation.
 ///
 /// Every variant defaults to `Auto` (the provider decides); the non-auto
-/// values are the exact wire strings the OpenAI Images API accepts for
+/// values are the exact wire strings the `OpenAI` Images API accepts for
 /// gpt-image models. Explicit `rename`s rather than `rename_all` because
-/// serde's derived snake_case of a variant like `Size1024x1024` is fragile
+/// serde's derived `snake_case` of a variant like `Size1024x1024` is fragile
 /// around digit runs — the wire strings are pinned verbatim instead.
 #[derive(
     Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
@@ -188,21 +189,27 @@ pub struct ImageGenerationRequest {
 // give the comparison, these name it per field type. `is_default` stays
 // private — it is a serialization detail, not public API.
 impl ImageSize {
+    // `skip_serializing_if` needs a path-callable `&Self` predicate, so the
+    // by-ref signature is required; the tiny enum Copy loss is immaterial.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn is_default(v: &Self) -> bool {
         *v == Self::default()
     }
 }
 impl ImageQuality {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn is_default(v: &Self) -> bool {
         *v == Self::default()
     }
 }
 impl OutputFormat {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn is_default(v: &Self) -> bool {
         *v == Self::default()
     }
 }
 impl Background {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn is_default(v: &Self) -> bool {
         *v == Self::default()
     }
@@ -290,6 +297,12 @@ pub trait ImageGenerationClient: std::fmt::Debug + Send + Sync {
     /// [`crate::ProviderClient::provider_slug`].
     fn provider_slug(&self) -> &str;
 
+    /// Generate one image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] on HTTP failure, provider error
+    /// responses, decoding failures, or cancellation.
     fn generate_image(
         &self,
         req: &ImageGenerationRequest,

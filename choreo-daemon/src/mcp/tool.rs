@@ -57,7 +57,7 @@ fn parse_json_args(args_json: &str) -> Result<Value, ToolError> {
 
 fn parse_binary_args(args_bytes: &[u8]) -> Result<Value, Vec<u8>> {
     postcard::from_bytes(args_bytes).map_err(|e| {
-        encode_outer::<String, String>(Err(ToolError::Postcard(format!(
+        encode_outer::<String, String>(&Err(ToolError::Postcard(format!(
             "invalid binary arguments: {e}"
         ))))
     })
@@ -162,7 +162,7 @@ impl ToolDyn for McpToolWrapper {
             Ok(call_result) => Ok(mcp_result_to_string(call_result)),
             Err(e) => Err(format!("{e:#}")),
         };
-        encode_outer::<String, String>(Ok(result))
+        encode_outer::<String, String>(&Ok(result))
     }
 
     fn execute_streaming_json(

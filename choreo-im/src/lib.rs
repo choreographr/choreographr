@@ -57,6 +57,11 @@ struct Cli {
 ///
 /// The workspace root declares this crate's binary as a thin wrapper that
 /// simply calls this function, so the actual logic lives here in the lib.
+///
+/// # Errors
+///
+/// Returns an error when tracing initialization fails or the daemon
+/// connection/bridge loop surfaces an unrecoverable error.
 pub fn main() -> anyhow::Result<()> {
     fmt()
         .with_env_filter(
@@ -125,6 +130,11 @@ pub fn main() -> anyhow::Result<()> {
 /// Generic over the socket's read/write halves so both std and `uds_windows`
 /// Unix streams fit (they implement the same std traits); this keeps the code
 /// cfg-independent instead of forking on `#[cfg(windows)]`.
+///
+/// # Errors
+///
+/// Returns an error when the keystore unlock/bind handshake fails at any
+/// step (I/O, protocol, or daemon-reported failure).
 pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
     addr: &str,
     mut reader: &mut BufReader<R>,
@@ -280,16 +290,15 @@ mod tests {
 
     /// `--version` is handled by clap before any real arg parsing: it exits
     /// with a `DisplayVersion` error whose message is the version string.
-    /// Assert both so the flag stays wired to CARGO_PKG_VERSION (it breaks
+    /// Assert both so the flag stays wired to `CARGO_PKG_VERSION` (it breaks
     /// silently if the derive attribute loses the bare `version` marker).
     #[test]
     fn version_flag_displays_package_version() {
         // clap returns the version as a `DisplayVersion` error instead of a
         // value; match it out by hand (Cli doesn't derive Debug, so
         // `unwrap_err()`'s Debug bound doesn't apply).
-        let err = match super::Cli::try_parse_from(["choreo-im", "--version"]) {
-            Err(e) => e,
-            Ok(_) => panic!("--version should short-circuit before arg validation"),
+        let Ok(err) = super::Cli::try_parse_from(["choreo-im", "--version"]) else {
+            panic!("--version should short-circuit before arg validation")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));

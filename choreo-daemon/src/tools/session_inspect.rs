@@ -4,7 +4,7 @@
 //! reports, per assistant turn, whether the provider's reasoning wire field
 //! (`reasoning_content` for DeepSeek/Kimi chat) would be echoed back — and
 //! which turns would be sent bare, risking a provider rejection like
-//! DeepSeek's "The `reasoning_content` in the thinking mode must be passed
+//! `DeepSeek`'s "The `reasoning_content` in the thinking mode must be passed
 //! back to the API".
 //!
 //! Everything is computed from the persisted session record + turns using the
@@ -13,7 +13,7 @@
 //! report is a faithful dry-run rather than a reimplementation that can drift.
 //! The request messages themselves are serialized the way the provider
 //! adapter would emit them (the manual `Serialize` impl re-emits artifacts
-//! into the wire field), so the "would carry reasoning_content on the wire"
+//! into the wire field), so the "would carry `reasoning_content` on the wire"
 //! count is exactly what the upstream would see. Read-only: only redb read
 //! transactions are opened; session state is never mutated.
 //!
@@ -40,6 +40,7 @@ use choreo_proto::{ChatReasoningField, ReasoningArtifact, ReasoningProducer, Tur
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use tracing::info;
 
 /// Default cap on the per-turn ledger rows (computation always covers all
@@ -222,8 +223,7 @@ fn build_report(
         let has_tools = value
             .get("tool_calls")
             .and_then(|tc| tc.as_array())
-            .map(|arr| !arr.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|arr| !arr.is_empty());
         if has_rc {
             wire_rc_count += 1;
         }
@@ -319,11 +319,11 @@ fn build_report(
         let art = turn
             .reasoning_artifact
             .as_ref()
-            .map(fmt_artifact)
-            .unwrap_or_else(|| "-".into());
-        let prod = producer
-            .map(|p| format!("{}/{}", p.provider_slug, p.model))
-            .unwrap_or_else(|| "-".into());
+            .map_or_else(|| "-".into(), fmt_artifact);
+        let prod = producer.map_or_else(
+            || "-".into(),
+            |p| format!("{}/{}", p.provider_slug, p.model),
+        );
         let same = if same_model { "y" } else { "n" };
         let user_len = turn.user_text.as_deref().map_or(0, str::len);
         let asst_len = turn.assistant_text.as_deref().map_or(0, str::len);
@@ -400,7 +400,7 @@ fn build_report(
             let text = String::from_utf8_lossy(bytes);
             raw_lines.push(format!(
                 "  t{turn_id} [{}]: {}",
-                fmt_field(field),
+                fmt_field(*field),
                 truncate(&text, RAW_LEN)
             ));
         }
@@ -413,79 +413,91 @@ fn build_report(
     };
 
     let mut out = String::new();
-    out.push_str(&format!("session_inspect: session {session_id}\n"));
-    out.push_str(&format!("  model={model} (from: {model_source})\n"));
-    out.push_str(&format!(
-        "  provider={provider} (from: {provider_source}) passback={passback:?}\n"
-    ));
-    out.push_str(&format!(
-        "  record: title={} working_dir={} account={} groups={:?}\n",
+    let _ = writeln!(out, "session_inspect: session {session_id}");
+    let _ = writeln!(out, "  model={model} (from: {model_source})");
+    let _ = writeln!(
+        out,
+        "  provider={provider} (from: {provider_source}) passback={passback:?}"
+    );
+    let _ = writeln!(
+        out,
+        "  record: title={} working_dir={} account={} groups={:?}",
         record.title.as_deref().unwrap_or("-"),
         record.working_dir.as_deref().unwrap_or("-"),
         record.account_name.as_deref().unwrap_or("-"),
-        record.active_tool_groups,
-    ));
-    out.push_str(&format!(
-        "  turns={} assistant_messages={} messages_on_wire={}\n",
+        record.active_tool_groups
+    );
+    let _ = writeln!(
+        out,
+        "  turns={} assistant_messages={} messages_on_wire={}",
         state.turns.len(),
         assistant_count,
-        messages.len(),
-    ));
+        messages.len()
+    );
     out.push('\n');
-    out.push_str(&format!(
-        "  daemon guard warn_on_missing_reasoning_artifacts: {guard_problems} problem(s)\n"
-    ));
-    out.push_str(&format!(
-        "  wire dry-run: {wire_rc_count}/{assistant_count} assistant messages carry reasoning_content;\n"
-    ));
-    out.push_str(&format!(
-        "  {wire_tool_no_rc} assistant tool-call message(s) carry NONE (provider-reject risk); ledger vs wire: {mismatch}\n"
-    ));
+    let _ = writeln!(
+        out,
+        "  daemon guard warn_on_missing_reasoning_artifacts: {guard_problems} problem(s)"
+    );
+    let _ = writeln!(
+        out,
+        "  wire dry-run: {wire_rc_count}/{assistant_count} assistant messages carry reasoning_content;"
+    );
+    let _ = writeln!(
+        out,
+        "  {wire_tool_no_rc} assistant tool-call message(s) carry NONE (provider-reject risk); ledger vs wire: {mismatch}"
+    );
     if wire_empty.is_empty() {
         out.push_str("  empty assistant message(s) on the wire: none\n");
     } else {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "  empty assistant message(s) on the wire (\"must not be empty\" 400 candidates):\n{}\n",
-            wire_empty.join("\n"),
-        ));
+            wire_empty.join("\n")
+        );
     }
     out.push('\n');
 
     if risks.is_empty() {
         out.push_str("RISK (tool-call turns with reasoning evidence but no wire echo): none\n");
     } else {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "RISK (tool-call turns with reasoning evidence but no wire echo — DeepSeek-style 400 candidates):\n{}\n",
-            risks.join("\n"),
-        ));
+            risks.join("\n")
+        );
     }
     if !notes.is_empty() {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "NOTE (tool calls with no reasoning evidence at all — unverifiable):\n{}\n",
-            notes.join("\n"),
-        ));
+            notes.join("\n")
+        );
     }
     if !infos.is_empty() {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "INFO (policy-skips — expected under this passback policy):\n{}\n",
-            infos.join("\n"),
-        ));
+            infos.join("\n")
+        );
     }
     if !raw_lines.is_empty() {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "RAW reasoning (include_raw, own session):\n{}\n",
-            raw_lines.join("\n"),
-        ));
+            raw_lines.join("\n")
+        );
     }
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "\nper-turn ledger{}:\n{}\n",
         if state.turns.len() > cap {
             format!(" (first {cap} of {})", state.turns.len())
         } else {
             String::new()
         },
-        ledger.join("\n"),
-    ));
+        ledger.join("\n")
+    );
     Ok(out)
 }
 
@@ -515,7 +527,7 @@ fn dominant_producer(turns: &BTreeMap<u32, Turn>) -> Option<ReasoningProducer> {
 fn fmt_artifact(artifact: &ReasoningArtifact) -> String {
     match artifact {
         ReasoningArtifact::ChatReasoning { field, bytes } => {
-            format!("chat[{};{}B]", fmt_field(field), bytes.len())
+            format!("chat[{};{}B]", fmt_field(*field), bytes.len())
         }
         ReasoningArtifact::AnthropicThinking(bytes) => format!("anthropic[{}B]", bytes.len()),
         ReasoningArtifact::GoogleSignatures(bytes) => format!("google-sig[{}B]", bytes.len()),
@@ -523,7 +535,7 @@ fn fmt_artifact(artifact: &ReasoningArtifact) -> String {
     }
 }
 
-fn fmt_field(field: &ChatReasoningField) -> &'static str {
+fn fmt_field(field: ChatReasoningField) -> &'static str {
     match field {
         ChatReasoningField::ReasoningContent => "reasoning_content",
         ChatReasoningField::Reasoning => "reasoning",
@@ -575,11 +587,18 @@ mod tests {
             selected_model: Some(selected_model.into()),
             parent_session_id: None,
             working_dir: None,
-            turn_count: turns.len() as u32,
+            // usize→u32 turn count: test fixtures carry a handful of turns.
+            turn_count: {
+                let n = turns.len();
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    n as u32
+                }
+            },
             created_at: now,
             last_modified: now,
             active_tool_groups: vec!["core".into()],
-            context_config: Default::default(),
+            context_config: choreo_proto::ContextConfig::default(),
             account_name: None,
             reasoning_effort: None,
             last_response_id: None,
@@ -656,9 +675,9 @@ mod tests {
         }
     }
 
-    /// A non-DeepSeek OpenAI-compat chat producer (ToolLoop passback but no
+    /// A non-DeepSeek OpenAI-compat chat producer (`ToolLoop` passback but no
     /// `reasoning_content` injection) so the bare-turn classification paths
-    /// stay exercisable independent of the DeepSeek injection behavior.
+    /// stay exercisable independent of the `DeepSeek` injection behavior.
     fn groq_producer(model: &str) -> ReasoningProducer {
         ReasoningProducer {
             provider_slug: "groq".into(),

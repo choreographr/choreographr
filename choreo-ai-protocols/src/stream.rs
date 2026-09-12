@@ -230,35 +230,34 @@ pub(crate) fn recv_sse_event<T>(
     // cancel is observed on the next call.  (The cancel sender outlives the
     // worker, so the arm cannot spuriously fire on disconnect during a live
     // stream.)
-    match sse.deadline {
+    if let Some(deadline) = sse.deadline {
         // With a deadline, also wait on an exact timer for the remaining
         // budget — the timer, not a poll interval, bounds the wait.
-        Some(deadline) => {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            crossbeam_channel::select_biased! {
-                recv(cancel) -> _ => {
-                    let _ = sse.abort_tx.send(());
-                    tracing::debug!("SSE stream cancelled by user");
-                    Err(ProviderError::Cancelled)
-                }
-                recv(sse.rx) -> msg => handle_sse_msg(msg),
-                recv(crossbeam_channel::after(remaining)) -> _ => {
-                    let _ = sse.abort_tx.send(());
-                    tracing::warn!("SSE stream exceeded total request deadline");
-                    Err(ProviderError::DeadlineExceeded)
-                }
-            }
-        }
-        // Without a deadline, only an event or a cancellation can wake
-        // this wait — both handled by `select!`, so no timer is needed.
-        None => crossbeam_channel::select_biased! {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        crossbeam_channel::select_biased! {
             recv(cancel) -> _ => {
                 let _ = sse.abort_tx.send(());
                 tracing::debug!("SSE stream cancelled by user");
                 Err(ProviderError::Cancelled)
             }
             recv(sse.rx) -> msg => handle_sse_msg(msg),
-        },
+            recv(crossbeam_channel::after(remaining)) -> _ => {
+                let _ = sse.abort_tx.send(());
+                tracing::warn!("SSE stream exceeded total request deadline");
+                Err(ProviderError::DeadlineExceeded)
+            }
+        }
+    } else {
+        // Without a deadline, only an event or a cancellation can wake
+        // this wait — both handled by `select!`, so no timer is needed.
+        crossbeam_channel::select_biased! {
+            recv(cancel) -> _ => {
+                let _ = sse.abort_tx.send(());
+                tracing::debug!("SSE stream cancelled by user");
+                Err(ProviderError::Cancelled)
+            }
+            recv(sse.rx) -> msg => handle_sse_msg(msg),
+        }
     }
 }
 
@@ -385,7 +384,7 @@ mod tests {
         };
         match recv_sse_event(&sse, None) {
             Err(ProviderError::Io(e)) => {
-                assert!(e.to_string().contains("terminated unexpectedly"))
+                assert!(e.to_string().contains("terminated unexpectedly"));
             }
             other => panic!("expected Io error on disconnect, got {other:?}"),
         }

@@ -25,6 +25,11 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     /// Spawn a subprocess and connect its stdio.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::SpawnFailed`] when the process cannot be spawned
+    /// or its stdio pipes cannot be captured.
     pub fn spawn(
         command: &str,
         args: &[String],
@@ -85,7 +90,10 @@ impl StdioTransport {
         let reader_handle = thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
-                if *shutdown_clone.lock().unwrap_or_else(|e| e.into_inner()) {
+                if *shutdown_clone
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                {
                     break;
                 }
                 let line = match line {
@@ -122,6 +130,12 @@ impl StdioTransport {
     }
 
     /// Write a JSON-RPC request to the subprocess' stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::ProtocolError`] when serialization fails,
+    /// [`McpError::ServerShutdown`] when the stdin pipe is already closed,
+    /// and [`McpError::Io`] on write/flush failures.
     pub fn send_request(&mut self, req: &JsonRpcRequest) -> Result<(), McpError> {
         let json = serde_json::to_string(req)
             .map_err(|e| McpError::ProtocolError(format!("serialization error: {e}")))?;
@@ -133,6 +147,12 @@ impl StdioTransport {
     }
 
     /// Write a JSON-RPC notification (no `id` field) to the subprocess' stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::ProtocolError`] when serialization fails,
+    /// [`McpError::ServerShutdown`] when the stdin pipe is already closed,
+    /// and [`McpError::Io`] on write/flush failures.
     pub fn send_notification(&mut self, notif: &JsonRpcNotification) -> Result<(), McpError> {
         let json = serde_json::to_string(notif)
             .map_err(|e| McpError::ProtocolError(format!("serialization error: {e}")))?;
@@ -145,6 +165,13 @@ impl StdioTransport {
 
     /// Block until a response with the given `id` arrives, draining
     /// notifications that arrive before it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when no matching response arrives before
+    /// `timeout` elapses and [`McpError::ServerShutdown`] when the reader
+    /// thread has exited. An error payload from the server is returned inside
+    /// the `Ok` response, not as an `Err`.
     pub fn recv_response(
         &self,
         id: u64,
@@ -178,7 +205,6 @@ impl StdioTransport {
                         got = %resp_id,
                         "MCP response ID mismatch, retrying"
                     );
-                    continue;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => return Err(McpError::Timeout),
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Err(McpError::ServerShutdown),
@@ -226,7 +252,10 @@ impl StdioTransport {
 /// target addresses that group.
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {
-    // SAFETY: `-pgid` targets the process group created at spawn time.
+    // SAFETY: `-pgid` targets the process group created at spawn time. The
+    // cast is intentional: pid values from the kernel fit in i32 on every
+    // supported platform (pid_t is i32), so wrapping cannot occur in practice.
+    #[allow(clippy::cast_possible_wrap)]
     let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     if rc != 0 {
         // E.g. ESRCH if the group is already gone — nothing to do.
@@ -287,7 +316,7 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.bytes
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .extend_from_slice(buf);
             Ok(buf.len())
         }
@@ -326,8 +355,13 @@ mod tests {
         transport
             .send_notification(&notif)
             .expect("send should succeed");
-        let wire = String::from_utf8(bytes.lock().unwrap_or_else(|e| e.into_inner()).clone())
-            .expect("wire should be UTF-8");
+        let wire = String::from_utf8(
+            bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("wire should be UTF-8");
         assert_eq!(
             wire.trim(),
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
@@ -345,8 +379,13 @@ mod tests {
             params: None,
         };
         transport.send_request(&req).expect("send should succeed");
-        let wire = String::from_utf8(bytes.lock().unwrap_or_else(|e| e.into_inner()).clone())
-            .expect("wire should be UTF-8");
+        let wire = String::from_utf8(
+            bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("wire should be UTF-8");
         assert!(wire.contains(r#""id":42"#), "request must keep id: {wire}");
     }
 }

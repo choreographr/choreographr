@@ -18,6 +18,12 @@ pub struct GitPushArgs {
     pub dry_run: Option<bool>,
 }
 
+/// Push to a Git remote branch.
+///
+/// # Errors
+///
+/// Returns Err if the repository cannot be opened, the remote/branch names
+/// are invalid, or the push command fails.
 pub fn execute_git_push_tool(
     args: &GitPushArgs,
     working_dir: Option<&std::path::Path>,
@@ -108,7 +114,7 @@ fn git_push_impl(
 pub fn describe_git_push_invocation(args: &GitPushArgs) -> String {
     let mut parts = vec![format!("Pushing to `{}`.", args.remote)];
     if let Some(ref branch) = args.branch {
-        parts.push(format!(" Branch: `{}`.", branch));
+        parts.push(format!(" Branch: `{branch}`."));
     }
     if args.set_upstream.unwrap_or(false) {
         parts.push(" Setting upstream.".to_string());

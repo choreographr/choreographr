@@ -124,6 +124,7 @@ impl Default for GenerateImage {
 }
 
 impl GenerateImage {
+    #[must_use]
     pub fn new() -> Self {
         GenerateImage {}
     }
@@ -337,7 +338,7 @@ mod tests {
     use std::sync::mpsc;
 
     fn candidates(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
+        list.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]
@@ -417,7 +418,7 @@ mod tests {
         assert!(args.model.is_none());
         assert!(args.size.is_none());
         // Missing prompt is a deserialization error (schema `required`).
-        assert!(serde_json::from_str::<GenerateImageArgs>(r#"{}"#).is_err());
+        assert!(serde_json::from_str::<GenerateImageArgs>(r"{}").is_err());
         // Typed enum args deserialize from their wire strings.
         let args: GenerateImageArgs = serde_json::from_str(
             r#"{"prompt": "p", "size": "1024x1024", "quality": "high", "output_format": "webp", "background": "transparent"}"#,
@@ -432,6 +433,8 @@ mod tests {
     /// Build a real 4x3 PNG like image.rs's tests do, return its base64.
     fn sample_png_b64() -> String {
         let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(4, 3, |x, y| {
+            // u8 pixel coordinates (4×3 image): the arithmetic never exceeds u8.
+            #[allow(clippy::cast_possible_truncation)]
             image::Rgba([x as u8 * 60, y as u8 * 80, 0, 255])
         }));
         let mut png = Cursor::new(Vec::new());
@@ -447,23 +450,32 @@ mod tests {
     }
 
     impl ImageGenerationClient for StubImageClient {
+        // &'static str is the trait's required return lifetime for
+        // `provider_slug`, not an over-bound string literal.
+        #[allow(clippy::unnecessary_literal_bound)]
         fn provider_slug(&self) -> &str {
             "openai"
         }
         fn generate_image(
             &self,
-            _req: &ImageGenerationRequest,
+            req: &ImageGenerationRequest,
             _cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
         ) -> Result<ImageGenerationResult, InferenceError> {
+            // The stub ignores the cancel channel but must echo the request's
+            // model; `revised_prompt` comes from the stub's field (the request
+            // carries no prompt-rewrite). The `Some(..)` literal is the
+            // per-test override path, hence the field + allow.
+            #[allow(clippy::unnecessary_literal_bound)]
+            let revised_prompt = self.revised_prompt.clone();
             Ok(ImageGenerationResult {
                 image_b64: self.png_b64.clone(),
-                revised_prompt: self.revised_prompt.clone(),
-                model: _req.model.clone(),
+                revised_prompt,
+                model: req.model.clone(),
             })
         }
     }
 
-    /// Run GenerateImage::execute against a mock daemon reply channel that
+    /// Run `GenerateImage::execute` against a mock daemon reply channel that
     /// returns the given handle.
     // Test helper whose panic paths are intentional test failures;
     // clippy::panic_in_result_fn has no allow-*-in-tests config option.

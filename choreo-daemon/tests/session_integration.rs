@@ -30,12 +30,12 @@ fn spawn_session(
 
     let handle = std::thread::spawn(move || {
         session_main(
-            session_rx,
+            &session_rx,
             None,
             choreo_ai_protocols::SocketRegistry::default(),
             None,
             None,
-            RequestContext {
+            &RequestContext {
                 cmd_tx,
                 session_id,
                 db,
@@ -52,7 +52,7 @@ fn spawn_session(
     (session_tx, handle)
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn session_starts_and_accepts_commands() {
     let db = Arc::new(common::test_db());
@@ -98,7 +98,7 @@ fn session_starts_and_accepts_commands() {
     drop(writer_rx);
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn session_shutdown_exits_without_active_requests() {
     let db = Arc::new(common::test_db());
@@ -110,7 +110,7 @@ fn session_shutdown_exits_without_active_requests() {
     handle.join().unwrap();
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn session_cancel_nonexistent_request_does_not_panic() {
     let db = Arc::new(common::test_db());
@@ -137,7 +137,7 @@ fn session_cancel_nonexistent_request_does_not_panic() {
     handle.join().unwrap();
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn session_config_tools_mutate_authoritative_state_and_persist() {
     let db = Arc::new(common::test_db());
@@ -169,7 +169,7 @@ fn session_config_tools_mutate_authoritative_state_and_persist() {
         })
         .unwrap();
     match lt_reply_rx.recv().unwrap() {
-        Ok(msg) => assert!(msg.contains("x"), "unexpected summary: {msg}"),
+        Ok(msg) => assert!(msg.contains('x'), "unexpected summary: {msg}"),
         Err(e) => panic!("load_tools rejected: {e}"),
     }
 

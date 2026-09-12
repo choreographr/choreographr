@@ -44,12 +44,12 @@ impl QueryKey {
     /// Serialize into the wire `CustomKey` object (`name` + flattened value).
     fn to_custom_key(&self) -> Value {
         match self {
-            QueryKey::ItemId(b) => custom_key("item_id", "bytes32", Value::from(bytes_to_hex(b))),
+            QueryKey::ItemId(b) => custom_key("item_id", "bytes32", &Value::from(bytes_to_hex(b))),
             QueryKey::AccountId(b) => {
-                custom_key("account_id", "bytes32", Value::from(bytes_to_hex(b)))
+                custom_key("account_id", "bytes32", &Value::from(bytes_to_hex(b)))
             }
             QueryKey::IpfsHash(b) => {
-                custom_key("ipfs_hash", "bytes32", Value::from(bytes_to_hex(b)))
+                custom_key("ipfs_hash", "bytes32", &Value::from(bytes_to_hex(b)))
             }
             QueryKey::ItemRevision {
                 item_id,
@@ -57,16 +57,16 @@ impl QueryKey {
             } => custom_key(
                 "item_id_revision_id",
                 "composite",
-                Value::Array(vec![
-                    custom_scalar("bytes32", Value::from(bytes_to_hex(item_id))),
-                    custom_scalar("u32", Value::from(*revision_id)),
+                &Value::Array(vec![
+                    custom_scalar("bytes32", &Value::from(bytes_to_hex(item_id))),
+                    custom_scalar("u32", &Value::from(*revision_id)),
                 ]),
             ),
             QueryKey::Raw { name, value } => {
                 // A raw key carries an already-shaped CustomValue object.
                 let kind = value["kind"].clone();
                 let inner = value["value"].clone();
-                custom_key(name, kind.as_str().unwrap_or("bytes32"), inner)
+                custom_key(name, kind.as_str().unwrap_or("bytes32"), &inner)
             }
         }
     }
@@ -76,17 +76,17 @@ impl QueryKey {
 /// The indexer's `Key` enum is tagged `#[serde(tag = "type", content = "value")]`,
 /// so the `CustomKey` payload must be wrapped as `{"type":"Custom","value":…}`;
 /// sending the bare `CustomKey` fails to deserialize with `invalid_key`.
-fn wire_key(custom: Value) -> Value {
+fn wire_key(custom: &Value) -> Value {
     serde_json::json!({ "type": "Custom", "value": custom })
 }
 
 /// Build the inner `CustomKey` object `{"name":..., "kind":..., "value":...}`.
-fn custom_key(name: &str, kind: &str, value: Value) -> Value {
+fn custom_key(name: &str, kind: &str, value: &Value) -> Value {
     serde_json::json!({ "name": name, "kind": kind, "value": value })
 }
 
 /// Build a nested `CustomValue` object (used inside a composite).
-fn custom_scalar(kind: &str, value: Value) -> Value {
+fn custom_scalar(kind: &str, value: &Value) -> Value {
     serde_json::json!({ "kind": kind, "value": value })
 }
 
@@ -119,14 +119,17 @@ pub struct StoredEvent {
 
 impl DecodedEvent {
     /// The pallet name of this event.
+    #[must_use]
     pub fn pallet_name(&self) -> &str {
         &self.event.pallet_name
     }
     /// The event variant name.
+    #[must_use]
     pub fn event_name(&self) -> &str {
         &self.event.event_name
     }
     /// Look up a field by name, returning the JSON value.
+    #[must_use]
     pub fn field(&self, name: &str) -> Option<&Value> {
         self.event.fields.get(name)
     }
@@ -136,6 +139,7 @@ impl DecodedEvent {
     }
     /// Look up a numeric field (accepts integer or numeric string; the indexer
     /// renders some scalars as strings).
+    #[must_use]
     pub fn field_u64(&self, name: &str) -> Option<u64> {
         self.field(name)
             .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
@@ -185,7 +189,7 @@ impl Connection {
         Ok(Self { ws, next_id: 1 })
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Result<Value, ContentError> {
+    fn request(&mut self, method: &str, params: &Value) -> Result<Value, ContentError> {
         let id = self.next_id;
         self.next_id += 1;
         let req =
@@ -230,19 +234,26 @@ impl Connection {
 }
 
 /// Query the indexer for events matching `key`, newest-first, up to `limit`.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Indexer`] when the WebSocket connection to the
+/// indexer cannot be opened, the JSON-RPC request write/read fails, the
+/// indexer closes the connection or returns a JSON-RPC error, or the result
+/// cannot be decoded as [`GetEventsResult`].
 pub fn get_events(
     key: &QueryKey,
     limit: u16,
     before: Option<(u32, u32)>,
 ) -> Result<Vec<DecodedEvent>, ContentError> {
     let mut conn = Connection::open()?;
-    let key_json = wire_key(key.to_custom_key());
+    let key_json = wire_key(&key.to_custom_key());
     let params = serde_json::json!({
         "key": key_json,
         "limit": limit,
         "before": before.map(|(b, e)| serde_json::json!({ "blockNumber": b, "eventIndex": e })),
     });
-    let result = conn.request("acuity_getEvents", params)?;
+    let result = conn.request("acuity_getEvents", &params)?;
     conn.close();
     let parsed: GetEventsResult = serde_json::from_value(result)
         .map_err(|e| ContentError::Indexer(format!("failed to decode get_events result: {e}")))?;
@@ -250,20 +261,36 @@ pub fn get_events(
 }
 
 /// Query the current indexer status (indexed spans).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Indexer`] when the WebSocket connection or the
+/// `acuity_indexStatus` JSON-RPC round-trip fails, or the result cannot be
+/// decoded as [`IndexStatusResult`].
 pub fn index_status() -> Result<IndexStatusResult, ContentError> {
     let mut conn = Connection::open()?;
-    let result = conn.request("acuity_indexStatus", serde_json::json!({}))?;
+    let result = conn.request("acuity_indexStatus", &serde_json::json!({}))?;
     conn.close();
     serde_json::from_value(result)
         .map_err(|e| ContentError::Indexer(format!("failed to decode index status: {e}")))
 }
 
 /// Convert a hex item id string (or `0x` hex) to a [`QueryKey::ItemId`].
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Cid`] (via [`hex_to_bytes`]) when
+/// `item_id_hex` is not exactly 32 bytes of hex.
 pub fn item_id_key(item_id_hex: &str) -> Result<QueryKey, ContentError> {
     Ok(QueryKey::ItemId(hex_to_bytes(item_id_hex)?))
 }
 
 /// Build a composite [`QueryKey::ItemRevision`] from an item id + revision id.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Cid`] (via [`hex_to_bytes`]) when
+/// `item_id_hex` is not exactly 32 bytes of hex.
 pub fn item_revision_key(item_id_hex: &str, revision_id: u32) -> Result<QueryKey, ContentError> {
     Ok(QueryKey::ItemRevision {
         item_id: hex_to_bytes(item_id_hex)?,
@@ -280,7 +307,7 @@ mod tests {
         // The get_events params must carry the tagged `Key` shape the indexer
         // deserializes, not the bare CustomKey.
         let item_id = [0x11u8; 32];
-        let key = wire_key(QueryKey::ItemId(item_id).to_custom_key());
+        let key = wire_key(&QueryKey::ItemId(item_id).to_custom_key());
         assert_eq!(key["type"], "Custom");
         assert_eq!(key["value"]["name"], "item_id");
         assert_eq!(key["value"]["kind"], "bytes32");

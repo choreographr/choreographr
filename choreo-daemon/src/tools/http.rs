@@ -16,7 +16,7 @@ use ureq::RequestBuilder;
 /// regardless.
 const MAX_HTTP_BODY_BYTES: usize = MAX_TOOL_OUTPUT_BYTES + 64 * 1024;
 
-/// HTTP tool errors — a structured error type for http_request failures.
+/// HTTP tool errors — a structured error type for `http_request` failures.
 #[derive(Debug, Serialize, Deserialize, thiserror::Error)]
 pub enum HttpError {
     #[error("unsupported method: {0}")]
@@ -46,6 +46,12 @@ pub struct HttpRequestArgs {
     pub timeout_secs: Option<u64>,
 }
 
+/// Make an HTTP request and return status, headers, and body text.
+///
+/// # Errors
+///
+/// Returns Err on an unsupported method, an invalid URL, a timeout, or a
+/// transport/request failure.
 pub fn execute_http_request_tool(
     args: &HttpRequestArgs,
     _working_dir: Option<&Path>,
@@ -334,7 +340,7 @@ mod tests {
         let args = HttpRequestArgs {
             method: "GET".into(),
             url: "http://example.com".into(),
-            headers: [("".into(), "value".into())].into(),
+            headers: [(String::new(), "value".into())].into(),
             body: None,
             timeout_secs: None,
         };

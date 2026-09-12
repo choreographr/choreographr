@@ -100,7 +100,7 @@ fn main() -> Result<()> {
                 let json = match outcome {
                     RefreshOutcome::Fetched { json, .. } => json,
                     // A forced fetch (no etag, no-cache) cannot legitimately 304.
-                    other => bail!(
+                    other @ RefreshOutcome::NotModified => bail!(
                         "expected a fresh models.dev snapshot, got {other:?} \
                          (a forced no-cache fetch cannot 304)",
                     ),

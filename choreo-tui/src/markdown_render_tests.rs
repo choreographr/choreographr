@@ -70,12 +70,14 @@ fn highlight_code_unknown_language_produces_output() {
 }
 
 #[test]
+#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn highlight_code_none_language_uses_plain_text() {
     let lines = highlight_code(None, "plain text");
     assert!(!lines.is_empty());
 }
 
 #[test]
+#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn highlight_code_empty_string() {
     let lines = highlight_code(Some("rust"), "");
     assert!(!lines.is_empty());
@@ -128,7 +130,7 @@ fn plain_text_lines_wraps_long_line() {
         );
     }
     // Concatenation reproduces the input exactly (nothing dropped).
-    let joined: String = result.iter().map(|l| l.to_string()).collect();
+    let joined: String = result.iter().map(ToString::to_string).collect();
     assert_eq!(joined, long);
 }
 
@@ -138,9 +140,9 @@ fn plain_text_lines_wraps_at_word_boundary() {
     // next line — but never dropping content (the space stays as trailing
     // whitespace on the wrapped line, so concatenation is verbatim).
     let result = plain_text_lines("hello world", 6);
-    let lines: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let lines: Vec<String> = result.iter().map(ToString::to_string).collect();
     assert_eq!(lines, vec!["hello ", "world"]);
-    let joined: String = result.iter().map(|l| l.to_string()).collect();
+    let joined: String = result.iter().map(ToString::to_string).collect();
     assert_eq!(joined, "hello world", "content preserved verbatim");
 }
 
@@ -149,7 +151,7 @@ fn plain_text_lines_preserves_leading_whitespace() {
     // Indented plain output (code, aligned columns) must keep its
     // indentation when wrapped — no whitespace collapsing.
     let result = plain_text_lines("        let x = a_very_long_identifier;", 16);
-    let joined: String = result.iter().map(|l| l.to_string()).collect();
+    let joined: String = result.iter().map(ToString::to_string).collect();
     assert!(
         joined.starts_with("        let"),
         "leading indent must survive wrapping: {joined:?}"
@@ -167,9 +169,9 @@ fn plain_text_lines_preserves_leading_whitespace() {
 fn plain_text_lines_splits_oversized_word() {
     // A single word wider than the width is hard-split by grapheme.
     let result = plain_text_lines("abcdefghij", 3);
-    let lines: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let lines: Vec<String> = result.iter().map(ToString::to_string).collect();
     assert_eq!(lines, vec!["abc", "def", "ghi", "j"]);
-    let joined: String = result.iter().map(|l| l.to_string()).collect();
+    let joined: String = result.iter().map(ToString::to_string).collect();
     assert_eq!(joined, "abcdefghij");
 }
 
@@ -187,7 +189,7 @@ fn plain_text_lines_cjk_widths() {
     // Display width (not char count) drives wrapping: 4 CJK chars = 8
     // columns at width 4 → two lines of 2 chars each.
     let result = plain_text_lines("日本語文", 4);
-    let lines: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let lines: Vec<String> = result.iter().map(ToString::to_string).collect();
     assert_eq!(lines, vec!["日本", "語文"]);
 }
 
@@ -305,7 +307,7 @@ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n```";
     let result = markdown_lines(md, 80);
     let text = result
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // Side-by-side artifacts (width 80 ≥ MIN_SIDEBYSIDE_WIDTH 40).
@@ -324,7 +326,7 @@ fn markdown_lines_diff_fence_with_junk_falls_back_to_literal_fence() {
     let result = markdown_lines(md, 80);
     let text = result
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("```diff"), "literal fence expected: {text}");
@@ -342,6 +344,7 @@ fn markdown_lines_code_block_no_language() {
 // ── BlockQuote ──────────────────────────────────────────────────────
 
 #[test]
+#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn markdown_lines_blockquote_simple() {
     let md = "> hello world";
     let result = markdown_lines(md, 80);
@@ -355,7 +358,7 @@ fn markdown_lines_blockquote_within_budget() {
     let result = markdown_lines(md, 20);
     let text = result
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     for line in &result {
@@ -376,7 +379,7 @@ fn markdown_lines_unordered_list_simple() {
     let result = markdown_lines(md, 80);
     let text = result
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("• item one"), "first item should render");
@@ -389,7 +392,7 @@ fn markdown_lines_ordered_list_simple() {
     let result = markdown_lines(md, 80);
     let text = result
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("1. first"), "first ordered item");
@@ -407,8 +410,7 @@ fn leading_spaces(line: &str) -> usize {
 fn first_content_column(line: &str) -> usize {
     line.char_indices()
         .find(|(_, ch)| ch.is_alphabetic())
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
+        .map_or(0, |(idx, _)| idx)
 }
 
 #[test]
@@ -418,7 +420,7 @@ fn ordered_list_items_share_content_column() {
     // 4 columns) — not just the wrapped lines, but the first lines too.
     let md = "9. Thread Communication\n10. Inline Comments\n11. Pre-Commit Workflow";
     let result = markdown_lines(md, 80);
-    let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let text: Vec<String> = result.iter().map(ToString::to_string).collect();
     for line in &text {
         assert_eq!(
             first_content_column(line),
@@ -436,7 +438,7 @@ fn ordered_list_wrapped_lines_share_widest_marker_indent() {
     let long = "b".repeat(30);
     let md = format!("1. {long}\n2. x\n3. x\n4. x\n5. x\n6. x\n7. x\n8. x\n9. x\n10. {long}");
     let result = markdown_lines(&md, 20);
-    let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let text: Vec<String> = result.iter().map(ToString::to_string).collect();
     // Both wrapped items must continue under the widest marker, and their
     // first-line content must start at the same column as well.
     for marker in ["1. ", "10. "] {
@@ -490,7 +492,7 @@ fn ordered_list_three_digit_marker_indent() {
     let long = "c".repeat(30);
     let md = format!("98. {long}\n99. {long}\n100. {long}");
     let result = markdown_lines(&md, 20);
-    let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let text: Vec<String> = result.iter().map(ToString::to_string).collect();
     let idx = text
         .iter()
         .position(|l| l.starts_with("98. "))
@@ -520,7 +522,7 @@ fn unordered_list_continuation_indent_unchanged() {
     let long = "e".repeat(30);
     let md = format!("- {long}\n- short");
     let result = markdown_lines(&md, 20);
-    let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let text: Vec<String> = result.iter().map(ToString::to_string).collect();
     let idx = text
         .iter()
         .position(|l| l.starts_with("• "))
@@ -541,7 +543,7 @@ fn markdown_lines_list_within_budget() {
     let result = markdown_lines(md, 10);
     let text = result
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("•"), "bullet should be present");
@@ -549,6 +551,7 @@ fn markdown_lines_list_within_budget() {
 }
 
 #[test]
+#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn markdown_lines_list_continuation_preserves_spans() {
     let md = "- **bold** and `code`";
     let result = markdown_lines(md, 80);
@@ -611,7 +614,7 @@ fn hard_split_word_joins_directly() {
         joins.iter().skip(1).all(|&j| j == LineJoin::Join),
         "every continuation is a mid-word split: {joins:?}"
     );
-    let rejoin: String = lines.iter().map(|l| l.to_string()).collect();
+    let rejoin: String = lines.iter().map(ToString::to_string).collect();
     assert_eq!(rejoin, word, "direct concatenation reproduces the word");
 }
 
@@ -628,7 +631,7 @@ fn plain_text_wrap_joins_directly_and_preserves_whitespace() {
         joins.iter().skip(1).all(|&j| j == LineJoin::Join),
         "every continuation is a direct join: {joins:?}"
     );
-    let rejoin: String = lines.iter().map(|l| l.to_string()).collect();
+    let rejoin: String = lines.iter().map(ToString::to_string).collect();
     assert_eq!(rejoin, text, "direct concatenation reproduces the input");
 }
 
@@ -716,6 +719,7 @@ fn display_width_empty() {
 // ── render_turn_lines ────────────────────────────────────────────────
 
 #[test]
+#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn render_turn_lines_error_shows_red_header() {
     let turn = Turn {
         created_at: choreo_proto::TimestampMs::now(),
@@ -735,7 +739,7 @@ fn render_turn_lines_error_shows_red_header() {
     assert!(!lines.is_empty());
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("Error: something went wrong"));
@@ -777,7 +781,7 @@ fn render_turn_lines_error_wraps_long_message() {
     let joined: String = rendered
         .lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<String>();
     assert_eq!(joined, format!("Error: {long}"));
     assert!(joined.contains("invalid_request_error"));
@@ -803,7 +807,7 @@ fn render_turn_lines_error_shows_user_text_above() {
         reasoning_producer: None,
     };
     let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
-    let texts: Vec<String> = rendered.lines.iter().map(|l| l.to_string()).collect();
+    let texts: Vec<String> = rendered.lines.iter().map(ToString::to_string).collect();
     let user_idx = texts
         .iter()
         .position(|t| t.contains("hi"))
@@ -842,7 +846,7 @@ fn render_turn_lines_error_sanitizes_hostile_body() {
         reasoning_producer: None,
     };
     let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
-    let joined: String = rendered.lines.iter().map(|l| l.to_string()).collect();
+    let joined: String = rendered.lines.iter().map(ToString::to_string).collect();
     assert!(
         !joined.contains('\u{1b}'),
         "no live ESC may survive: {joined:?}"
@@ -873,7 +877,7 @@ fn render_turn_lines_user_text() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("hello world"), "user text should appear");
@@ -899,7 +903,7 @@ fn render_turn_lines_assistant_text() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // The collapsible header is always shown when reasoning exists.
@@ -946,7 +950,7 @@ fn render_turn_lines_reasoning_collapsed_with_response() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // Response present + reasoning collapsed: header shown, body hidden.
@@ -988,7 +992,7 @@ fn render_turn_lines_reasoning_expanded_with_response() {
     let lines = render_turn_lines(&turn, 80, 85, true, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("▼ Reasoning"), "header should point down");
@@ -1029,7 +1033,7 @@ fn render_turn_lines_reasoning_inline_code() {
     let lines = render_turn_lines(&turn, 80, 85, true, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -1177,7 +1181,7 @@ fn render_turn_lines_reasoning_whitespace_only() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // Whitespace-only reasoning is treated as absent: no header, and the
@@ -1216,7 +1220,7 @@ fn render_turn_lines_reasoning_code_block() {
     let lines = render_turn_lines(&turn, 80, 85, true, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("▼ Reasoning"), "header should appear");
@@ -1316,7 +1320,7 @@ fn render_turn_lines_tool_calls() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // The turn has only tool_calls (no text, no reasoning), so no
@@ -1355,7 +1359,7 @@ fn render_turn_lines_quiet_tool_collapsed_by_default_hides_content() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[true]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // Collapsed: triangle + description header only — no label row, no
@@ -1394,7 +1398,7 @@ fn render_turn_lines_quiet_tool_expanded_reveals_content() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[false]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("▼ Reading file src/main.rs."), "{text}");
@@ -1432,7 +1436,7 @@ fn render_turn_lines_collapsed_shows_full_invocation_description() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[true]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // Header row opens the description; the wrapped tail is still
@@ -1531,7 +1535,7 @@ fn render_turn_lines_tool_result_header_falls_back_to_label_without_description(
     let join = |lines: Vec<ratatui::text::Line<'static>>| {
         lines
             .iter()
-            .map(|l| l.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -1608,6 +1612,7 @@ fn render_turn_lines_tool_result_header_idxs_aligned_and_stable() {
 }
 
 #[test]
+#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn render_turn_lines_tool_result_header_idxs_empty_without_results() {
     let turn = Turn {
         created_at: choreo_proto::TimestampMs::now(),
@@ -1665,7 +1670,7 @@ content ---"
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // The untrusted header must survive as markdown text. Note the
@@ -1720,7 +1725,7 @@ a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // Side-by-side diff rendering (width 85 ≥ MIN_SIDEBYSIDE_WIDTH 40)
@@ -1771,7 +1776,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -1818,7 +1823,7 @@ yes\n\n```diff\ndiff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -1863,7 +1868,7 @@ fn render_turn_lines_unfenced_diff_is_plain_text() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // The raw text survives through the markdown path. Asserting on
@@ -1971,7 +1976,7 @@ fn render_turn_lines_git_show_message_fence_with_backticks_is_not_a_diff() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("hello"), "{text}");
@@ -2016,7 +2021,7 @@ fn render_turn_lines_fenced_diff_in_non_markdown_tool_is_plain() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -2060,7 +2065,7 @@ fn render_turn_lines_grep_bold_is_literal_plain_text() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -2121,7 +2126,7 @@ fn render_turn_lines_plain_text_result_wraps_to_content_width() {
     }
     let text: String = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // Wrapping actually happened: the long content spans several lines.
@@ -2171,7 +2176,7 @@ fn render_turn_lines_tab_indented_content_renders_as_spaces() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text: String = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -2223,7 +2228,7 @@ fn render_turn_lines_pdf_to_markdown_keeps_markdown_rendering() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     let has_bold = lines
@@ -2275,7 +2280,7 @@ fn render_turn_lines_write_file_fenced_content_renders_as_markdown() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // Summary line survives verbatim as a paragraph.
@@ -2323,7 +2328,7 @@ fn render_turn_lines_tool_results_error() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("tool error: run"));
@@ -2370,7 +2375,7 @@ fn render_turn_lines_user_with_assistant_renders_both_blocks() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("Hello"), "user block should appear");
@@ -2436,7 +2441,7 @@ fn user_text_timestamp_rendered_in_milliseconds() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -2508,7 +2513,7 @@ fn assistant_block_has_no_duplicate_timestamp() {
     let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
     let text = lines
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     let rendered_ts = format_timestamp(turn.created_at.as_millis());
@@ -2974,7 +2979,7 @@ fn markdown_styled_text_with_indent_does_not_overflow() {
     }
     let text = result
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -3029,7 +3034,7 @@ fn markdown_inline_code_wider_than_width_splits() {
         }
     }
     // Full content should appear across the lines.
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains(long_code),
         "all characters of the code must appear in the output"
@@ -3041,7 +3046,7 @@ fn markdown_inline_code_wider_than_width_splits() {
 #[test]
 fn markdown_link_renders_bold_content_with_underlined_url() {
     let result = markdown_lines("[click here](http://example.com)", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("click"), "word 'click' should appear");
     assert!(whole.contains("here"), "word 'here' should appear");
     assert!(whole.contains("http://example.com"), "URL should appear");
@@ -3065,7 +3070,7 @@ fn markdown_link_renders_bold_content_with_underlined_url() {
 #[test]
 fn markdown_link_empty_destination_no_url() {
     let result = markdown_lines("[text]()", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("text"), "link text should appear");
     assert!(
         !whole.contains("http"),
@@ -3082,7 +3087,7 @@ fn markdown_link_empty_destination_no_url() {
 #[test]
 fn markdown_link_inside_bold_applies_both() {
     let result = markdown_lines("[**bold link**](http://example.com)", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("bold"), "bold word should appear");
     assert!(whole.contains("link"), "link word should appear");
     assert!(
@@ -3106,7 +3111,7 @@ fn markdown_link_with_code_is_colored() {
         .flat_map(|l| l.spans.iter())
         .any(|s| s.style.fg == Some(Color::Cyan));
     assert!(has_cyan, "inline code should be Cyan inside a link");
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("code"), "code content should appear");
     assert!(
         !whole.contains('`'),
@@ -3135,7 +3140,7 @@ fn markdown_link_wrapping_does_not_overflow() {
         );
     }
     // The URL should appear somewhere.
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("http://example.com"), "URL should appear");
 }
 
@@ -3232,7 +3237,7 @@ fn ends_with_opening_punct_non_opening_chars() {
 fn bold_with_exclamation_no_extra_space() {
     // "**bold**!" should render as "bold!", not "bold !"
     let result = markdown_lines("hello **bold**!", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("bold!"),
         "expected 'bold!' without space, got: {whole:?}"
@@ -3250,7 +3255,7 @@ fn bold_with_exclamation_no_extra_space() {
 #[test]
 fn italic_with_period_no_extra_space() {
     let result = markdown_lines("I said *italic*.", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("italic."),
         "expected 'italic.' without space, got: {whole:?}"
@@ -3264,7 +3269,7 @@ fn italic_with_period_no_extra_space() {
 #[test]
 fn strong_and_link_with_comma_no_extra_space() {
     let result = markdown_lines("see **bold**, and [link](http://x.com).", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("bold,"), "expected 'bold,' without space");
     assert!(
         whole.contains("link - http://x.com."),
@@ -3279,7 +3284,7 @@ fn strong_and_link_with_comma_no_extra_space() {
 #[test]
 fn closing_punct_after_strikethrough() {
     let result = markdown_lines("done ~~strike~~!", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("strike!"),
         "expected 'strike!' without space"
@@ -3294,7 +3299,7 @@ fn closing_punct_after_strikethrough() {
 fn opening_bracket_keeps_space() {
     // Opening brackets should still get a space before them
     let result = markdown_lines("word (paren)", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("word ("),
         "expected space before opening paren"
@@ -3307,7 +3312,7 @@ fn opening_bracket_keeps_space() {
 fn bold_after_opening_paren_no_extra_space() {
     // "(**hi**)" should render as "(hi)", not "( hi)"
     let result = markdown_lines("(**hi**)", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("(hi)"),
         "expected '(hi)' without space, got: {whole:?}"
@@ -3325,7 +3330,7 @@ fn bold_after_opening_paren_no_extra_space() {
 #[test]
 fn styled_text_after_opening_paren_in_sentence() {
     let result = markdown_lines("a (**hi**) b", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("a (hi) b"),
         "expected 'a (hi) b', got: {whole:?}"
@@ -3335,7 +3340,7 @@ fn styled_text_after_opening_paren_in_sentence() {
 #[test]
 fn emphasis_after_opening_paren_no_extra_space() {
     let result = markdown_lines("(*hi*)", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("(hi)"),
         "expected '(hi)' without space, got: {whole:?}"
@@ -3345,7 +3350,7 @@ fn emphasis_after_opening_paren_no_extra_space() {
 #[test]
 fn code_after_opening_paren_no_extra_space() {
     let result = markdown_lines("(`hi`)", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("(hi)"),
         "expected '(hi)' without space, got: {whole:?}"
@@ -3357,7 +3362,7 @@ fn bold_after_opening_quote_no_extra_space() {
     // Smart punctuation turns "**hi**" into “**hi**”, which splits into
     // Text(“), Strong(hi), Text(”). The opening quote must not get a space.
     let result = markdown_lines("\"**hi**\"", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("\u{201c}hi\u{201d}"),
         "expected curly-quoted 'hi' without space, got: {whole:?}"
@@ -3371,7 +3376,7 @@ fn bold_after_opening_quote_no_extra_space() {
 #[test]
 fn multiple_styled_parentheses_no_extra_space() {
     let result = markdown_lines("(**hi**) and (**there**)", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("(hi) and (there)"),
         "expected '(hi) and (there)', got: {whole:?}"
@@ -3382,7 +3387,7 @@ fn multiple_styled_parentheses_no_extra_space() {
 fn spaced_brackets_keep_spaces() {
     // A literal space between bracket and styled text must be preserved.
     let result = markdown_lines("( **hi** )", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("( hi )"),
         "expected '( hi )' with spaces preserved, got: {whole:?}"
@@ -3393,7 +3398,7 @@ fn spaced_brackets_keep_spaces() {
 fn styled_paren_after_word_keeps_space_before_bracket() {
     // The space before the bracket is kept; only the space after it is removed.
     let result = markdown_lines("word (**hi**)", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         whole.contains("word (hi)"),
         "expected 'word (hi)', got: {whole:?}"
@@ -3422,7 +3427,7 @@ fn heading_has_bold_and_underlined_modifier() {
 #[test]
 fn heading_content_not_literal() {
     let result = markdown_lines("# **bold** heading", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(
         !whole.contains("**bold**"),
         "markdown syntax should not appear"
@@ -3498,7 +3503,7 @@ fn heading_prefix_by_level() {
 #[test]
 fn level_two_heading_renders_wedge_prefix() {
     let result = markdown_lines("# Title\n\n## Section", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("\u{e0b4} Section"), "got: {whole:?}");
     assert!(
         !whole.contains("## Section"),
@@ -3509,7 +3514,7 @@ fn level_two_heading_renders_wedge_prefix() {
 #[test]
 fn level_three_heading_renders_block_before_wedge() {
     let result = markdown_lines("# Title\n\n## Section\n\n### Sub", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("█\u{e0b4} Sub"), "got: {whole:?}");
 }
 
@@ -3519,7 +3524,7 @@ fn first_heading_normalized_from_double_hash() {
     // heading renders as level 1 (no prefix) and every later heading
     // shifts down by the same amount.
     let result = markdown_lines("## First\n\n### Sub", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("First"), "first heading text should render");
     assert!(
         whole.contains("\u{e0b4} Sub"),
@@ -3537,7 +3542,7 @@ fn first_heading_normalization_shifts_only_heading_levels() {
     // first heading at `##` (shift 1), a `#####` heading normalizes to
     // level 4 → two solid blocks before the wedge.
     let result = markdown_lines("## First\n\nplain paragraph\n\n##### Deep", 80);
-    let whole: String = result.iter().map(|l| l.to_string()).collect();
+    let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("plain paragraph"), "paragraph should render");
     assert!(
         whole.contains("██\u{e0b4} Deep"),
@@ -3603,7 +3608,7 @@ fn list_items_compact_when_single_line() {
     let result = markdown_lines("- alpha\n- beta\n- gamma", 80);
     let whole: String = result
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(whole.contains("• alpha"), "first item should render");
@@ -3650,7 +3655,7 @@ fn list_spaces_all_items_when_majority_wraps() {
     let result = markdown_lines(&md, 40);
     let whole: String = result
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     // Blank line before the short middle item.
@@ -3713,7 +3718,7 @@ fn list_has_blank_line_before_and_after() {
     // paragraphs by a blank line on each side.
     let md = "before\n- one\n- two\n- three\n\nafter";
     let result = markdown_lines(md, 80);
-    let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let text: Vec<String> = result.iter().map(ToString::to_string).collect();
     let one = text.iter().position(|l| l.contains("• one")).unwrap();
     let after = text.iter().position(|l| l.contains("after")).unwrap();
     // One blank line before the list, directly after the preceding paragraph.
@@ -3733,7 +3738,7 @@ fn nested_list_makes_own_spacing_decision() {
     let result = markdown_lines(md, 80);
     let whole: String = result
         .iter()
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(whole.contains("• outer a"), "first outer item");
@@ -3780,7 +3785,7 @@ fn nested_list_gets_blank_line_before_next_item() {
     // delimited by a collapsing margin after it, so the boundary after
     // the nested list is separated while single-line items stay tight.
     // Raw string so the bullet indentation survives into the parser.
-    let md = r#"1. What the model is (context for sizing)
+    let md = r"1. What the model is (context for sizing)
 2. The fundamental requirement: ~150-600 GB of memory depending on quantization
 3. Options table:
       - Budget/self-host small: 2× DGX Spark (~$8K one-time)
@@ -3791,9 +3796,9 @@ fn nested_list_gets_blank_line_before_next_item() {
 5. On-prem purchase costs
 6. Throughput expectations
 7. Business reality check
-8. Software stack: vLLM, FP8"#;
+8. Software stack: vLLM, FP8";
     let result = markdown_lines(md, 100);
-    let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let text: Vec<String> = result.iter().map(ToString::to_string).collect();
     let whole = text.join("\n");
     // Blank line before item 4 (the sibling after the nested-list item).
     let idx4 = text
@@ -3857,7 +3862,7 @@ fn spaced_list_nested_list_single_blank_between_items() {
     let md =
         format!("1. {long} Options:\n      - inner one\n      - inner two\n2. {long}\n3. short");
     let result = markdown_lines(&md, 40);
-    let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let text: Vec<String> = result.iter().map(ToString::to_string).collect();
     let whole = text.join("\n");
     let idx2 = text
         .iter()
@@ -3888,7 +3893,7 @@ fn list_ending_with_nested_list_has_no_trailing_blank() {
     // zero-width blank.
     let md = "1. first\n2. outer\n      - inner\n      - inner2";
     let result = markdown_lines(md, 80);
-    let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let text: Vec<String> = result.iter().map(ToString::to_string).collect();
     assert!(
         !text.last().is_some_and(|l| l.trim().is_empty()),
         "no trailing blank line\n{}",
@@ -3973,6 +3978,7 @@ fn code_block_wrap_trailing_whitespace_stripped() {
 }
 
 #[test]
+#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn code_block_no_wrap_when_fits() {
     let md = "```\nshort\n```";
     let result = markdown_lines(md, 80);
@@ -4036,7 +4042,7 @@ fn display_math_renders_centered_on_its_own_line() {
 #[test]
 fn display_math_breaks_out_of_flowing_text() {
     let result = markdown_lines("left $$a+b$$ right", 80);
-    let rendered: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let rendered: Vec<String> = result.iter().map(ToString::to_string).collect();
     assert_eq!(rendered[0], "left");
     assert_eq!(rendered[2], "right");
     assert_eq!(rendered[1].trim_start(), "a+b");
@@ -4045,7 +4051,7 @@ fn display_math_breaks_out_of_flowing_text() {
 #[test]
 fn display_math_wraps_when_too_wide() {
     let result = markdown_lines("$$\\frac{x+1}{x-1} = 2$$", 10);
-    let joined: String = result.iter().map(|l| l.to_string()).collect();
+    let joined: String = result.iter().map(ToString::to_string).collect();
     assert_eq!(joined, "(x+1)/(x-1)=2");
     assert!(result.len() >= 2, "expected the equation to wrap");
     for line in &result {
@@ -4056,7 +4062,7 @@ fn display_math_wraps_when_too_wide() {
 #[test]
 fn table_cells_pretty_print_math() {
     let result = markdown_lines("| A | B |\n|---|---|\n| $x_i$ | $\\alpha$ |", 80);
-    let rendered: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+    let rendered: Vec<String> = result.iter().map(ToString::to_string).collect();
     let rendered = rendered.join("\n");
     assert!(
         rendered.contains("xᵢ"),

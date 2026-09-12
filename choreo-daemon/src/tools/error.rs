@@ -57,15 +57,21 @@ impl From<ToolExecError> for ToolError {
     }
 }
 
-pub(crate) fn tool_ok(content: String) -> ToolOutput {
+// why: `impl Into<String>` keeps the single-argument call sites ergonomic and
+// avoids forcing callers to pre-build a `String` for literal contents.
+pub(crate) fn tool_ok(content: impl Into<String>) -> ToolOutput {
     ToolOutput {
-        content,
+        content: content.into(),
         is_error: false,
         invocation_description: String::new(),
         ..Default::default()
     }
 }
 
+// why: `impl ToString` keeps the many heterogeneous call sites (thiserror
+// types, `String`, literals) one-line clean; re-borrowing each caller here is
+// churn.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn tool_err(error: impl ToString) -> ToolOutput {
     ToolOutput {
         content: error.to_string(),
@@ -118,7 +124,7 @@ mod tests {
 
     #[test]
     fn tool_ok_returns_success_output() {
-        let output = tool_ok("success".into());
+        let output = tool_ok("success");
         assert!(!output.is_error);
         assert_eq!(output.content, "success");
     }

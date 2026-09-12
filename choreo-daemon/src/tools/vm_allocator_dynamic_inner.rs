@@ -85,21 +85,27 @@ impl HoleList {
     /// Returns `true` if the heap was successfully initialised, `false` if
     /// `size` is too small to hold a Hole struct (and the hole list is left
     /// empty so that all allocations will fail).
+    // why: the caller hands us a `*mut u8` that the allocator has already
+    // aligned for `Hole`; the u8→Hole cast is the whole point of this API.
+    #[allow(clippy::cast_ptr_alignment)]
     pub unsafe fn init(&mut self, addr: *mut u8, size: usize) -> bool {
         if size < Hole::min_size() {
             self.front = None;
             return false;
         }
         ptr::write(
-            addr as *mut Hole,
+            addr.cast::<Hole>(),
             Hole { next: None, size, prev: None },
         );
-        self.front = Some(NonNull::new_unchecked(addr as *mut Hole));
+        self.front = Some(NonNull::new_unchecked(addr.cast::<Hole>()));
         true
     }
 
     /// First-fit walk: return a pointer to `layout.size()` bytes (at least
     /// `Hole::min_size()`), aligned to `layout.align()`.
+    // why: tail-hole addresses come from our own align_up arithmetic and are
+    // already `Hole`-aligned; the u8→Hole cast is deliberate.
+    #[allow(clippy::cast_ptr_alignment)]
     pub unsafe fn allocate_first_fit(&mut self, layout: Layout) -> *mut u8 {
         // The allocation must be at least min_size and must maintain
         // Hole alignment so that any tail hole starts at a valid address.
@@ -152,7 +158,7 @@ impl HoleList {
             // into a new hole.
             let tail = hole_end_addr.wrapping_sub(alloc_end);
             if tail >= Hole::min_size() {
-                let tail_hole = aligned.add(size) as *mut Hole;
+                let tail_hole = aligned.add(size).cast::<Hole>();
                 ptr::write(
                     tail_hole,
                     Hole { next: None, size: tail, prev: None },
@@ -167,15 +173,18 @@ impl HoleList {
     }
 
     /// Return a block of memory back to the free list, merging adjacent holes.
+    // why: `ptr` was produced by our own allocator and is already `Hole`-
+    // aligned; the u8→Hole cast is deliberate.
+    #[allow(clippy::cast_ptr_alignment)]
     pub unsafe fn deallocate(&mut self, ptr: *mut u8, layout: Layout) {
         // Must use the same rounded size as allocate_first_fit so that
         // the freed block exactly matches the consumed region.
         let size = Hole::round_to_align(max(layout.size(), Hole::min_size()));
         ptr::write(
-            ptr as *mut Hole,
+            ptr.cast::<Hole>(),
             Hole { next: None, size, prev: None },
         );
-        self.insert(NonNull::new_unchecked(ptr as *mut Hole));
+        self.insert(NonNull::new_unchecked(ptr.cast::<Hole>()));
     }
 
     // ── list helpers ──────────────────────────────────────────────────

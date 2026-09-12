@@ -68,9 +68,9 @@ pub(crate) struct AssistantMessage {
 
 impl AssistantMessage {
     /// Extract reasoning content from whichever field the model populated
-    /// (reasoning_content, reasoning, or reasoning_text), consuming the field
-    /// with the non-streaming precedence reasoning_content > reasoning >
-    /// reasoning_text.
+    /// (`reasoning_content`, reasoning, or `reasoning_text`), consuming the field
+    /// with the non-streaming precedence `reasoning_content` > reasoning >
+    /// `reasoning_text`.
     ///
     /// Returns the display text alongside an opaque [`ReasoningArtifact`]
     /// capturing the same raw value as UTF-8 bytes. The artifact records
@@ -166,7 +166,7 @@ pub(crate) struct StreamToolCallFunctionDelta {
 /// Lenient, provider-portable chat-completions `finish_reason`.
 ///
 /// Covers z.ai's documented set (`stop`, `tool_calls`, `length`, `sensitive`,
-/// `model_context_window_exceeded`, `network_error`) plus OpenAI's aliases
+/// `model_context_window_exceeded`, `network_error`) plus `OpenAI`'s aliases
 /// (`content_filter` → [`FinishReason::Sensitive`], `function_call` →
 /// [`FinishReason::ToolCalls`]). Unknown values map to
 /// [`FinishReason::Other`] and NEVER fail the response parse — a provider
@@ -208,7 +208,7 @@ impl FinishReason {
     }
 
     /// Whether this reason is a *content-filter* denial (z.ai `sensitive`,
-    /// OpenAI `content_filter`): terminal and never retryable — resending
+    /// `OpenAI` `content_filter`): terminal and never retryable — resending
     /// the same prompt can never clear the policy filter.
     fn is_content_filtered(&self) -> bool {
         matches!(self, FinishReason::Sensitive)
@@ -338,10 +338,10 @@ pub(crate) fn chat_completions_request_with_tools(
 /// result. The raw reasoning value is captured into the round-trip artifact
 /// inside `AssistantMessage::take_reasoning`, before the field is consumed.
 /// Terminal finish reasons must surface as distinct errors, not turn
-/// results: a content-filter refusal (z.ai `sensitive` / OpenAI
+/// results: a content-filter refusal (z.ai `sensitive` / `OpenAI`
 /// `content_filter`) is never retryable, and a context-window overflow is a
 /// compaction-bug signal. `Length` deliberately maps to NO error here — it is
-/// a truncation notice carried on the FinalText result instead (and is normal
+/// a truncation notice carried on the `FinalText` result instead (and is normal
 /// flow when tool calls are present).
 fn finish_reason_terminal_error(reason: Option<&FinishReason>) -> Option<super::OpenAiError> {
     let reason = reason?;
@@ -623,8 +623,8 @@ struct ChatCompletionsStreamAccumulator {
     raw_tool_call_deltas: Vec<StreamToolCallDelta>,
     seen_tool_call_indices: [bool; MAX_TOOL_CALLS],
     distinct_tool_call_count: usize,
-    /// Usage from the final SSE chunk (OpenAI sends a usage chunk with
-    /// choices: [] when stream_options.include_usage is true).
+    /// Usage from the final SSE chunk (`OpenAI` sends a usage chunk with
+    /// choices: [] when `stream_options.include_usage` is true).
     last_usage: Option<TokenUsage>,
     /// Finish reason from the final SSE chunk (last non-None wins — the
     /// provider sends it exactly once, but tolerate repeats defensively).
@@ -684,7 +684,7 @@ impl ChatCompletionsStreamAccumulator {
         for choice in &payload.choices {
             // Capture the finish reason (arrives on the final chunk).
             if choice.finish_reason.is_some() {
-                self.finish_reason = choice.finish_reason.clone();
+                self.finish_reason.clone_from(&choice.finish_reason);
             }
             let Some(delta) = &choice.delta else {
                 continue;
@@ -733,7 +733,7 @@ impl ChatCompletionsStreamAccumulator {
             // and produce sorted ChatToolCall output after the stream ends.
             if let Some(ref tcs) = delta.tool_calls {
                 self.has_any_output = true;
-                for tc in tcs.iter() {
+                for tc in tcs {
                     if self.distinct_tool_call_count >= MAX_TOOL_CALLS {
                         return Err(super::OpenAiError::Io(io::Error::other(format!(
                             "too many tool calls (max {MAX_TOOL_CALLS})"
@@ -749,11 +749,11 @@ impl ChatCompletionsStreamAccumulator {
                     // The bounds check above guarantees `tc.index` is within
                     // the fixed-size array, so this lookup always succeeds;
                     // the None arm is unreachable.
-                    if let Some(seen) = self.seen_tool_call_indices.get_mut(tc.index as usize) {
-                        if !*seen {
-                            *seen = true;
-                            self.distinct_tool_call_count += 1;
-                        }
+                    if let Some(seen) = self.seen_tool_call_indices.get_mut(tc.index as usize)
+                        && !*seen
+                    {
+                        *seen = true;
+                        self.distinct_tool_call_count += 1;
                     }
                     self.raw_tool_call_deltas.push(tc.clone());
                 }
@@ -1168,7 +1168,7 @@ mod tests {
             },
         ];
         let discarded = crate::openai::validate_tool_call_arguments(&mut calls);
-        assert!(discarded.is_empty());
+        assert_eq!(discarded, [] as [choreo_proto::DiscardedToolCall; 0]);
         assert_eq!(calls.len(), 2);
     }
 
@@ -1222,15 +1222,15 @@ mod tests {
         assert_eq!(discarded[0].arguments_json, "bad");
         assert_eq!(discarded[1].name, "tool_b");
         assert_eq!(discarded[1].arguments_json, "also bad");
-        assert!(calls.is_empty());
+        assert_eq!(calls, [] as [ChatToolCall; 0]);
     }
 
     #[test]
     fn validate_empty_list_returns_empty() {
         let mut calls: Vec<ChatToolCall> = vec![];
         let discarded = crate::openai::validate_tool_call_arguments(&mut calls);
-        assert!(discarded.is_empty());
-        assert!(calls.is_empty());
+        assert_eq!(discarded, [] as [choreo_proto::DiscardedToolCall; 0]);
+        assert_eq!(calls, [] as [ChatToolCall; 0]);
     }
 
     // -- tool call accumulation tests ------------------------------------
@@ -1238,7 +1238,7 @@ mod tests {
     #[test]
     fn accumulate_no_deltas_returns_empty_vec() {
         let result = accumulate_tool_calls_from_deltas(vec![]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [ChatToolCall; 0]);
     }
 
     #[test]
@@ -1331,7 +1331,7 @@ mod tests {
             kind: None,
             function: Some(StreamToolCallFunctionDelta {
                 name: Some("get_weather".into()),
-                arguments: Some(r#"{}"#.into()),
+                arguments: Some("{}".into()),
             }),
         }];
         let result = accumulate_tool_calls_from_deltas(deltas);
@@ -1348,7 +1348,7 @@ mod tests {
             kind: None,
             function: Some(StreamToolCallFunctionDelta {
                 name: None,
-                arguments: Some(r#"{}"#.into()),
+                arguments: Some("{}".into()),
             }),
         }];
         let result = accumulate_tool_calls_from_deltas(deltas);

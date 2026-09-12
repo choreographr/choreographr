@@ -17,6 +17,14 @@ use std::path::Path;
 /// write + fsync, then rename over the target (atomic on POSIX). The temp
 /// file must live in the same directory as the target so the rename never
 /// crosses a filesystem boundary.
+/// Atomically replace `path` with `bytes` (temp file + rename in the same
+/// directory so a crash leaves either the old or the new file, never a
+/// truncated one).
+///
+/// # Errors
+///
+/// Returns `io::Error` if the temp file cannot be written, flushed, or
+/// renamed into place.
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // Bind the parent once: it is both the temp file's home (same dir, so
     // the rename never crosses a filesystem boundary) and the directory that

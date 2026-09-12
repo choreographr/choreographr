@@ -41,7 +41,7 @@ impl Tool for SpawnSubsession {
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Spawning subsession: {}.", args.prompt)];
         if let Some(ref title) = args.title {
-            parts.push(format!(" Title: {}.", title));
+            parts.push(format!(" Title: {title}."));
         }
         if let Some(ref cats) = args.categories {
             parts.push(format!(" Categories: {}.", cats.join(", ")));
@@ -76,7 +76,7 @@ impl Tool for SpawnSubsession {
         // Determine child working_dir: prefer tool-level parameter, fall back to session context
         let child_working_dir = working_dir
             .or(ctx.working_dir.as_deref())
-            .map(|p| p.to_path_buf());
+            .map(std::path::Path::to_path_buf);
 
         // Inherit or override tool groups
         let categories = args
@@ -245,7 +245,7 @@ mod tests {
     fn spawn_subsession_args_missing_prompt_fails() {
         let json = r#"{"title": "no prompt"}"#;
         let result: Result<SpawnSubsessionArgs, _> = serde_json::from_str(json);
-        assert!(result.is_err(), "missing prompt should fail: {result:?}",);
+        assert!(result.is_err(), "missing prompt should fail: {result:?}");
     }
 
     #[test]

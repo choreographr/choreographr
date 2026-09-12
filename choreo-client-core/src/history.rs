@@ -53,12 +53,12 @@ fn push_capped(content: &mut String, data: &str) {
 /// routing streaming chunks during an active agent loop.
 #[derive(Debug, Clone)]
 pub struct SessionView {
-    /// turn_id → Turn. Ordered by key (monotonically assigned by daemon).
+    /// `turn_id` → Turn. Ordered by key (monotonically assigned by daemon).
     pub turns: BTreeMap<u32, Turn>,
-    /// request_id → turn_id for streaming chunk routing.
+    /// `request_id` → `turn_id` for streaming chunk routing.
     /// Inserted on `Started`, removed on `Done`/`Failed`/`Cancelled`.
     pub request_to_turn: HashMap<u32, u32>,
-    /// call_id → invocation description for tool calls whose start event
+    /// `call_id` → invocation description for tool calls whose start event
     /// (`ToolCallStarted`) arrived before their first streaming chunk created
     /// a stub result.  The description rides on the start event (never on a
     /// chunk — chunks are droppable under load), so a stub created by a later
@@ -68,6 +68,7 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             turns: BTreeMap::new(),
@@ -103,6 +104,7 @@ impl SessionView {
         }
     }
 
+    #[must_use]
     pub fn get(&self, turn_id: u32) -> Option<&Turn> {
         self.turns.get(&turn_id)
     }
@@ -111,6 +113,7 @@ impl SessionView {
         self.turns.get_mut(&turn_id)
     }
 
+    #[must_use]
     pub fn request_turn(&self, request_id: u32) -> Option<&Turn> {
         let turn_id = self.request_to_turn.get(&request_id)?;
         self.turns.get(turn_id)
@@ -122,7 +125,7 @@ impl SessionView {
     }
 
     /// Route streaming output to the current turn for this request.
-    pub fn stream_chunk(&mut self, request_id: u32, stream: OutputStream, data: &str) {
+    pub fn stream_chunk(&mut self, request_id: u32, stream: &OutputStream, data: &str) {
         let Some(&turn_id) = self.request_to_turn.get(&request_id) else {
             tracing::warn!(%request_id, "stream_chunk: unknown request");
             return;
@@ -162,7 +165,7 @@ impl SessionView {
         call_id: String,
         name: String,
         args: String,
-        invocation_description: String,
+        invocation_description: &str,
     ) {
         let Some(&turn_id) = self.request_to_turn.get(&request_id) else {
             tracing::warn!(%request_id, "tool_call_started: unknown request");
@@ -179,7 +182,7 @@ impl SessionView {
         // on a chunk).
         if !invocation_description.is_empty() {
             self.tool_call_descriptions
-                .insert(call_id.clone(), invocation_description.clone());
+                .insert(call_id.clone(), invocation_description.to_string());
         }
         // Backfill the tool name AND description onto a stub tool result
         // created out of order (a chunk that arrived before this event).  The
@@ -190,10 +193,10 @@ impl SessionView {
         // a seeded placeholder or an earlier backfill already carries values.
         if let Some(result) = turn.tool_results.iter_mut().find(|r| r.call_id == call_id) {
             if result.name.is_empty() {
-                result.name = name.clone();
+                result.name.clone_from(&name);
             }
             if result.invocation_description.is_empty() {
-                result.invocation_description = invocation_description.clone();
+                result.invocation_description = invocation_description.to_string();
             }
         }
         // The seeded turn already carries this call in tool_calls (the daemon
@@ -208,8 +211,8 @@ impl SessionView {
         }
     }
 
-    /// Route a tool result chunk — appends to the matching ToolResultRecord.
-    /// Creates a stub record if the ToolCallStarted event hasn't arrived yet.
+    /// Route a tool result chunk — appends to the matching `ToolResultRecord`.
+    /// Creates a stub record if the `ToolCallStarted` event hasn't arrived yet.
     pub fn tool_result_chunk(&mut self, request_id: u32, call_id: &str, data: &str) {
         let Some(&turn_id) = self.request_to_turn.get(&request_id) else {
             tracing::warn!(%request_id, "tool_result_chunk: unknown request");
@@ -223,48 +226,45 @@ impl SessionView {
         // actually needs it: a placeholder/stub that already carries its
         // description (the common seeded case) skips the map read and the
         // String clone entirely on the per-chunk hot path.
-        match turn.tool_results.iter_mut().find(|r| r.call_id == call_id) {
-            Some(result) => {
-                // A record that predates the start event (e.g. the seeded
-                // placeholder when the ToolCallStarted broadcast was dropped)
-                // still gets its header from the first chunk onward.
-                if result.invocation_description.is_empty()
-                    && let Some(desc) = self.tool_call_descriptions.get(call_id)
-                {
-                    result.invocation_description = desc.clone();
-                }
-                push_capped(&mut result.content, data);
+        if let Some(result) = turn.tool_results.iter_mut().find(|r| r.call_id == call_id) {
+            // A record that predates the start event (e.g. the seeded
+            // placeholder when the ToolCallStarted broadcast was dropped)
+            // still gets its header from the first chunk onward.
+            if result.invocation_description.is_empty()
+                && let Some(desc) = self.tool_call_descriptions.get(call_id)
+            {
+                result.invocation_description.clone_from(desc);
             }
-            None => {
-                // Stub created out of order (chunk before ToolCallStarted).
-                // Resolve the tool name from the turn's tool_calls so the
-                // quiet/derived-default decision (which keys on the name)
-                // is correct from the first chunk instead of flipping when
-                // the real record lands.  Falls back to empty when the call
-                // is unknown, which is never quiet → default expanded.
-                let name = turn
-                    .tool_calls
-                    .iter()
-                    .find(|tc| tc.call_id == call_id)
-                    .map(|tc| tc.name.clone())
-                    .unwrap_or_default();
-                let mut content = String::new();
-                push_capped(&mut content, data);
-                turn.tool_results.push(ToolResultRecord {
-                    call_id: call_id.to_string(),
-                    name,
-                    content,
-                    is_error: false,
-                    // The stub branch runs once per call, so the lookup +
-                    // clone here is off the per-chunk hot path.
-                    invocation_description: self
-                        .tool_call_descriptions
-                        .get(call_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    image: None,
-                });
-            }
+            push_capped(&mut result.content, data);
+        } else {
+            // Stub created out of order (chunk before ToolCallStarted).
+            // Resolve the tool name from the turn's tool_calls so the
+            // quiet/derived-default decision (which keys on the name)
+            // is correct from the first chunk instead of flipping when
+            // the real record lands.  Falls back to empty when the call
+            // is unknown, which is never quiet → default expanded.
+            let name = turn
+                .tool_calls
+                .iter()
+                .find(|tc| tc.call_id == call_id)
+                .map(|tc| tc.name.clone())
+                .unwrap_or_default();
+            let mut content = String::new();
+            push_capped(&mut content, data);
+            turn.tool_results.push(ToolResultRecord {
+                call_id: call_id.to_string(),
+                name,
+                content,
+                is_error: false,
+                // The stub branch runs once per call, so the lookup +
+                // clone here is off the per-chunk hot path.
+                invocation_description: self
+                    .tool_call_descriptions
+                    .get(call_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                image: None,
+            });
         }
     }
 

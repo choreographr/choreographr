@@ -18,7 +18,7 @@ use std::time::Duration;
 mod common;
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn server_accepts_ping_and_shuts_down_on_signal() {
     let dir = tempfile::tempdir().expect("tempdir for socket");
     let socket_path = dir.path().join("test.sock");
@@ -32,7 +32,7 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
 
     // Run the server in a background thread.
     let handle = thread::spawn(move || {
-        run_server(&socket_str, state, None, None, transport_sk, acl).expect("run_server");
+        run_server(&socket_str, state, None, None, transport_sk, &acl).expect("run_server");
     });
 
     // Wait for the socket to appear (server is ready).

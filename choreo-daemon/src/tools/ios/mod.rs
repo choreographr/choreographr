@@ -79,11 +79,10 @@ pub(crate) fn run_bridge_tool<T: serde::Serialize>(
         ToolExecError(format!("failed to encode ios tool arguments: {e}"))
     })?;
 
-    tracing::debug!(
-        tool = tool_name,
-        timeout_ms = timeout.as_millis() as u64,
-        "dispatching ios tool"
-    );
+    // u128→u64: iOS tool timeouts are seconds-to-minutes; no truncation in practice.
+    #[allow(clippy::cast_possible_truncation)]
+    let timeout_ms = timeout.as_millis() as u64;
+    tracing::debug!(tool = tool_name, timeout_ms, "dispatching ios tool");
     let pending = bridge
         .dispatch(IosToolRequest {
             // Reassigned by the bridge; zero here is only the pre-assign value.
@@ -174,7 +173,7 @@ pub(crate) mod test_util {
     /// A test `ToolContext` whose DB backing file is DELETED immediately
     /// after the redb handle is created: the open handle stays valid (Unix
     /// unlink semantics; on Windows the remove may fail and is ignored —
-    /// the TempDir still cleans up on drop), and the TempDir is dropped
+    /// the `TempDir` still cleans up on drop), and the `TempDir` is dropped
     /// normally, so tests leave no accumulating files behind.
     pub(crate) fn test_ctx() -> ToolContext {
         let (tx, _rx) = std::sync::mpsc::channel();

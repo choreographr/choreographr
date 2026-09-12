@@ -30,7 +30,7 @@
 //! `pin()` rewrites the whole file from this process's in-memory view, so
 //! two processes that load the store concurrently and both pin serialize
 //! their writes but the SECOND write clobbers the FIRST's new entry
-//! (last-writer-wins). That is acceptable for a known_hosts analogue (the
+//! (last-writer-wins). That is acceptable for a `known_hosts` analogue (the
 //! store is small, per-user, and a vanished pin degrades to a re-confirmed
 //! first contact — never silent trust), but it is why this store carries
 //! only its two sanctioned mutable fields (the transport pin and the
@@ -89,6 +89,11 @@ pub struct KnownServers {
 /// (`~/.config/choreographr/known_servers.toml`), resolved through the
 /// keystore's config-dir helper so test overrides and platform paths agree
 /// with the rest of the config family.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Io`] if the keystore config dir cannot be
+/// resolved.
 pub fn known_servers_path() -> Result<PathBuf, ClientError> {
     choreo_keystore::paths::config_dir()
         .map(|dir| dir.join("known_servers.toml"))
@@ -118,6 +123,10 @@ impl KnownServers {
     ///
     /// A missing file is the normal first-run case: an empty store, not an
     /// error. See the module docs for the full failure policy.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Io`] if the store exists but cannot be read.
     pub fn load() -> Result<Self, ClientError> {
         let path = known_servers_path()?;
         Self::load_from(&path)
@@ -125,6 +134,10 @@ impl KnownServers {
 
     /// Load from an explicit path (the test seam — production callers use
     /// [`KnownServers::load`]).
+///
+/// # Errors
+///
+/// Returns [`ClientError::Io`] if the file exists but cannot be read.
     pub fn load_from(path: &Path) -> Result<Self, ClientError> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
@@ -169,6 +182,11 @@ impl KnownServers {
     /// unix-socket unlock-key carrier) also yields `Ok(None)`: TCP callers
     /// see that as "unpinned", which is exactly the first-contact
     /// semantics they already handle.
+///
+/// # Errors
+///
+/// Returns [`ClientError::CredentialParse`] if a stored pin is invalid
+/// base64 or not exactly 32 bytes.
     pub fn lookup(&self, addr: &str) -> Result<Option<[u8; 32]>, ClientError> {
         match self.entries.iter().find(|e| e.addr == addr) {
             None => Ok(None),
@@ -180,10 +198,15 @@ impl KnownServers {
     }
 
     /// The stored per-daemon unlock key for `addr`, if one exists.
-    /// Returns `Ok(None)` when the entry has no unlock_key (or no entry at
+    /// Returns `Ok(None)` when the entry has no `unlock_key` (or no entry at
     /// all) — callers fall back to the legacy local key or generate a fresh
-    /// one. Entries whose stored unlock_key does not decode to 32 bytes are
+    /// one. Entries whose stored `unlock_key` does not decode to 32 bytes are
     /// dropped at load time, so this never surfaces garbage.
+///
+/// # Errors
+///
+/// Returns [`ClientError::CredentialParse`] if a stored unlock key is
+/// invalid base64 or not exactly 32 bytes.
     pub fn unlock_key(&self, addr: &str) -> Result<Option<[u8; 32]>, ClientError> {
         match self
             .entries
@@ -203,6 +226,11 @@ impl KnownServers {
     /// TCP daemons already have a pinned entry by the time a credential
     /// flow runs, so the existing entry is updated in place, keeping its
     /// pin intact).
+///
+/// # Errors
+///
+/// Returns [`ClientError::Io`] if the store cannot be read back or
+/// written after the update.
     pub fn set_unlock_key(&mut self, addr: &str, key: &[u8; 32]) -> Result<(), ClientError> {
         let b64 = encode_key(key);
         match self.entries.iter_mut().find(|e| e.addr == addr) {
@@ -233,9 +261,13 @@ impl KnownServers {
     /// re-pin, and only then does IK succeed again. The per-daemon keystore
     /// unlock key is an INDEPENDENT field and must survive a re-pin — an
     /// entry that carries both a pin and an unlock key (a TCP daemon after
-    /// the first set_unlock_key) would otherwise silently lose the unlock
+    /// the first `set_unlock_key`) would otherwise silently lose the unlock
     /// key, locking the operator out of a now-misbound keystore. There is
     /// no in-code path that replaces a pin without this explicit call.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Io`] if the updated store cannot be persisted.
     pub fn pin(&mut self, addr: &str, pk: &[u8; 32]) -> Result<(), ClientError> {
         match self.entries.iter_mut().find(|e| e.addr == addr) {
             // Update the existing entry in place: swap the pin but leave
@@ -261,8 +293,12 @@ impl KnownServers {
     }
 
     /// Remove the pin for `addr` (the "server key changed, delete the
-    /// known_hosts entry to re-pair" path). Returns whether an entry was
+    /// `known_hosts` entry to re-pair" path). Returns whether an entry was
     /// removed; persists only when something changed.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Io`] if the updated store cannot be persisted.
     pub fn remove(&mut self, addr: &str) -> Result<bool, ClientError> {
         let before = self.entries.len();
         self.entries.retain(|e| e.addr != addr);
@@ -275,6 +311,11 @@ impl KnownServers {
     }
 
     /// All entries (read-only view — for UIs listing known daemons).
+    #[must_use]
+///
+/// # Errors
+///
+/// Returns [`ClientError::Io`] if the store cannot be read.
     pub fn entries(&self) -> &[KnownServerEntry] {
         &self.entries
     }
@@ -349,7 +390,7 @@ struct StoreFile {
 /// load-time tolerant policy); individual entries whose PRESENT pubkey
 /// does not decode to 32 bytes are dropped with a warning, while entries
 /// with NO pubkey are kept (unix-socket unlock-key carriers) and entries
-/// whose unlock_key is corrupt have just that field dropped — one bad
+/// whose `unlock_key` is corrupt have just that field dropped — one bad
 /// line must not unpin or unlock-wipe every server.
 fn parse_store(text: &str) -> Vec<KnownServerEntry> {
     let parsed: StoreFile = match toml::from_str(text) {
@@ -414,7 +455,7 @@ mod tests {
     /// every test here redirects it to its own tempdir. `TestConfigGuard`
     /// resets the override on drop — even on a panicking assert — so a
     /// failed test cannot leak the override into another test's thread; the
-    /// TempDir must be held for the test's whole body (it owns the store
+    /// `TempDir` must be held for the test's whole body (it owns the store
     /// directory) — callers bind BOTH returned guards.
     fn use_temp_config_root() -> (
         tempfile::TempDir,
@@ -557,7 +598,7 @@ mod tests {
         std::fs::write(&path, "not valid toml [[[").expect("write garbage");
 
         let mut store = KnownServers::load_from(&path).expect("corrupt store loads empty");
-        assert!(store.entries().is_empty());
+        assert_eq!(store.entries(), [] as [KnownServerEntry; 0]);
 
         let pk = [5u8; 32];
         store.pin("host:9443", &pk).expect("pin over garbage");
@@ -599,6 +640,6 @@ mod tests {
         )
         .expect("write short-key store");
         let store = KnownServers::load_from(&path).expect("load");
-        assert!(store.entries().is_empty());
+        assert_eq!(store.entries(), [] as [KnownServerEntry; 0]);
     }
 }

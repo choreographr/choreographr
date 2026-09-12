@@ -25,6 +25,13 @@ pub struct GitShowArgs {
     pub diff: Option<bool>,
 }
 
+/// Show the details of a Git object (commit, tree, blob, tag) or a file at
+/// a given revision.
+///
+/// # Errors
+///
+/// Returns Err if the repository cannot be opened, the revision cannot be
+/// resolved, or the object cannot be read or rendered.
 pub fn execute_git_show_tool(
     args: &GitShowArgs,
     working_dir: Option<&std::path::Path>,
@@ -68,7 +75,7 @@ fn git_show_impl(
     match object.kind {
         gix::object::Kind::Commit => show_commit(&repo, &object, args.diff.unwrap_or(false)),
         gix::object::Kind::Tree => show_tree(&object),
-        gix::object::Kind::Blob => show_blob(&object, None),
+        gix::object::Kind::Blob => Ok(show_blob(&object, None)),
         gix::object::Kind::Tag => show_tag(&repo, &object),
     }
 }
@@ -103,7 +110,7 @@ fn show_path(repo: &gix::Repository, revision: &str, path: &str) -> Result<Strin
         .map_err(|e| ToolError::Other(format!("failed to get object for '{path}': {e}")))?;
 
     match entry_object.kind {
-        gix::object::Kind::Blob => show_blob(&entry_object, Some(path)),
+        gix::object::Kind::Blob => Ok(show_blob(&entry_object, Some(path))),
         gix::object::Kind::Tree => show_tree(&entry_object),
         kind => Err(ToolError::Other(format!(
             "path '{path}' resolves to a {kind} object at revision '{revision}'"
@@ -172,13 +179,13 @@ fn show_commit(
         writeln!(out, "Date:     {}", format_date(&time)).ok();
     }
     if let Ok(tree_id) = commit.tree_id() {
-        writeln!(out, "Tree:     {}", tree_id).ok();
+        writeln!(out, "Tree:     {tree_id}").ok();
     }
     if parent_ids.is_empty() {
         writeln!(out, "Parent:   (root commit)").ok();
     } else {
         for pid in &parent_ids {
-            writeln!(out, "Parent:   {}", pid).ok();
+            writeln!(out, "Parent:   {pid}").ok();
         }
     }
     writeln!(out, "Head:     {head_desc}").ok();
@@ -216,6 +223,8 @@ fn generate_commit_diff(
     commit: &gix::Commit<'_>,
     parent_ids: &[gix::Id<'_>],
 ) -> Result<String, ToolError> {
+    use gix::object::tree::diff::ChangeDetached;
+
     let commit_tree = commit
         .tree()
         .map_err(|e| ToolError::Other(format!("failed to get commit tree: {e}")))?;
@@ -233,8 +242,6 @@ fn generate_commit_diff(
     } else {
         None
     };
-
-    use gix::object::tree::diff::ChangeDetached;
 
     let changes: Vec<ChangeDetached> = repo
         .diff_tree_to_tree(
@@ -413,7 +420,9 @@ fn show_tree(object: &gix::Object<'_>) -> Result<String, ToolError> {
 ///
 /// Safety: `object` must have been confirmed as `Kind::Blob` by the caller.
 /// `into_blob()` panics on kind mismatch.
-fn show_blob(object: &gix::Object<'_>, path_hint: Option<&str>) -> Result<String, ToolError> {
+fn show_blob(object: &gix::Object<'_>, path_hint: Option<&str>) -> String {
+    // Infallible by contract: the caller has confirmed `Kind::Blob` before
+    // calling, and rendering cannot fail, so the Result wrapper was transparent.
     let blob = object.clone().into_blob();
     let content = String::from_utf8_lossy(&blob.data);
 
@@ -432,7 +441,7 @@ fn show_blob(object: &gix::Object<'_>, path_hint: Option<&str>) -> Result<String
         out.push_str(&crate::tools::fs::fence_content(&content, lang));
     }
 
-    Ok(out.trim_end().to_string())
+    out.trim_end().to_string()
 }
 
 /// Show an annotated tag: metadata then the tagged object.
@@ -487,7 +496,7 @@ fn show_tag(repo: &gix::Repository, object: &gix::Object<'_>) -> Result<String, 
         let nested = match target_obj.kind {
             gix::object::Kind::Commit => show_commit(repo, &target_obj, false),
             gix::object::Kind::Tree => show_tree(&target_obj),
-            gix::object::Kind::Blob => show_blob(&target_obj, None),
+            gix::object::Kind::Blob => Ok(show_blob(&target_obj, None)),
             gix::object::Kind::Tag => show_tag(repo, &target_obj),
         }?;
         writeln!(out, "{nested}").ok();
@@ -541,7 +550,7 @@ mod tests {
     #[test]
     fn test_format_date_positive_offset() {
         let time = gix::date::Time {
-            seconds: 1700000000,
+            seconds: 1_700_000_000,
             offset: 28800,
         };
         let result = format_date(&time);
@@ -554,7 +563,7 @@ mod tests {
     #[test]
     fn test_format_date_negative_offset() {
         let time = gix::date::Time {
-            seconds: 1700000000,
+            seconds: 1_700_000_000,
             offset: -18000,
         };
         let result = format_date(&time);
@@ -567,7 +576,7 @@ mod tests {
     #[test]
     fn test_format_date_pre_epoch() {
         let time = gix::date::Time {
-            seconds: -12614400,
+            seconds: -12_614_400,
             offset: 0,
         };
         let result = format_date(&time);
@@ -661,26 +670,26 @@ mod tests {
     #[test]
     fn blob_changes_are_diffed() {
         // Regular file, executable file, and symlink additions.
-        assert!(is_blob_change(&addition(0o100644)));
-        assert!(is_blob_change(&addition(0o100755)));
-        assert!(is_blob_change(&addition(0o120000)));
+        assert!(is_blob_change(&addition(0o100_644)));
+        assert!(is_blob_change(&addition(0o100_755)));
+        assert!(is_blob_change(&addition(0o120_000)));
         // Deletions and modifications of files.
-        assert!(is_blob_change(&deletion(0o100644)));
-        assert!(is_blob_change(&modification(0o100644, 0o100644)));
-        assert!(is_blob_change(&modification(0o100644, 0o100755)));
+        assert!(is_blob_change(&deletion(0o100_644)));
+        assert!(is_blob_change(&modification(0o100_644, 0o100_644)));
+        assert!(is_blob_change(&modification(0o100_644, 0o100_755)));
     }
 
     #[test]
     fn directory_and_gitlink_changes_are_skipped() {
         // Directory additions/deletions are structural, not content.
-        assert!(!is_blob_change(&addition(0o040000)));
-        assert!(!is_blob_change(&deletion(0o040000)));
+        assert!(!is_blob_change(&addition(0o040_000)));
+        assert!(!is_blob_change(&deletion(0o040_000)));
         // Submodule (gitlink) entries carry no diffable content either.
-        assert!(!is_blob_change(&addition(0o160000)));
+        assert!(!is_blob_change(&addition(0o160_000)));
         // Directory → directory and file ↔ directory transitions.
-        assert!(!is_blob_change(&modification(0o040000, 0o040000)));
-        assert!(!is_blob_change(&modification(0o100644, 0o040000)));
-        assert!(!is_blob_change(&modification(0o040000, 0o100644)));
+        assert!(!is_blob_change(&modification(0o040_000, 0o040_000)));
+        assert!(!is_blob_change(&modification(0o100_644, 0o040_000)));
+        assert!(!is_blob_change(&modification(0o040_000, 0o100_644)));
     }
 
     #[test]

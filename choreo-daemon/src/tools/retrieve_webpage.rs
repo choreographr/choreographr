@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 /// What `retrieve_webpage` should produce from the rendered page.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebpageAction {
     /// Fully rendered HTML (outerHTML); restricted to `selector` when given.
@@ -27,7 +27,7 @@ pub enum WebpageAction {
 }
 
 impl WebpageAction {
-    fn as_str(&self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             WebpageAction::Content => "content",
             WebpageAction::Text => "text",
@@ -46,7 +46,7 @@ pub struct RetrieveWebpageArgs {
     action: Option<WebpageAction>,
     /// Milliseconds to wait after load before capturing (lets JS settle). 0 = none.
     wait_ms: Option<u64>,
-    /// Navigation / element-wait timeout in milliseconds. Default 30_000.
+    /// Navigation / element-wait timeout in milliseconds. Default `30_000`.
     timeout_ms: Option<u64>,
     /// Viewport width. Default 1280.
     width: Option<u32>,
@@ -160,8 +160,7 @@ fn is_executable(path: &std::path::Path) -> bool {
     {
         use std::os::unix::fs::PermissionsExt;
         path.metadata()
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+            .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {
@@ -266,7 +265,7 @@ fn element_document_box(
 /// Capture a screenshot of the whole visible viewport (or a single element, via
 /// `selector`). When `full_page`, this returns the entire scrollable page.
 ///
-/// headless_chrome's `Tab::capture_screenshot` maps its last boolean to the CDP
+/// `headless_chrome`'s `Tab::capture_screenshot` maps its last boolean to the CDP
 /// `fromSurface` flag — *not* "full page" — and hard-codes
 /// `captureBeyondViewport: None`, so it can only ever capture the current
 /// viewport. For a real full-page shot we issue `Page.captureScreenshot`
@@ -434,8 +433,7 @@ impl super::Tool for RetrieveWebpage {
         let action = args
             .action
             .as_ref()
-            .map(|a| a.as_str())
-            .unwrap_or(WebpageAction::Content.as_str());
+            .map_or(WebpageAction::Content.as_str(), |a| a.as_str());
         let mut parts = vec![format!(
             "Retrieving web page ({action}). URL: {}.",
             args.url
@@ -460,7 +458,7 @@ impl super::Tool for RetrieveWebpage {
         working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
-        let action = args.action.clone().unwrap_or(WebpageAction::Content);
+        let action = args.action.unwrap_or(WebpageAction::Content);
         let url = args.url.trim();
         let action_str = action.as_str();
         validate_url(url)?;
@@ -712,7 +710,7 @@ mod tests {
             "not a url",
         ] {
             let err = validate_url(u).unwrap_err();
-            assert!(!err.to_string().is_empty());
+            assert_ne!(err.to_string(), "");
         }
     }
 

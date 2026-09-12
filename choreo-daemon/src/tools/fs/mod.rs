@@ -60,10 +60,10 @@ fn write_text_file(path: &Path, content: &str, overwrite: bool) -> io::Result<()
 /// Wrap content in a fenced code block, choosing a fence wide enough that
 /// content containing backticks cannot close it early.
 ///
-/// Shared by write_file, git_show's commit/tag messages, and show_blob:
+/// Shared by `write_file`, `git_show`'s commit/tag messages, and `show_blob`:
 /// all of them emit untrusted data (file contents, commit/tag messages)
 /// verbatim inside a fence so a markdown-parsing client (the TUI'S
-/// MARKDOWN_TOOLS renderer) cannot re-interpret the enclosed bytes.
+/// `MARKDOWN_TOOLS` renderer) cannot re-interpret the enclosed bytes.
 pub(crate) fn fence_content(content: &str, lang: &str) -> String {
     // Strip trailing newlines so the closing fence sits directly after the
     // last line of content, avoiding a blank line before the fence.

@@ -2,7 +2,7 @@ use choreo_daemon::{FishArgs, execute_fish_tool};
 use std::path::Path;
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn echo_hello() {
     let result = execute_fish_tool(
         &FishArgs {
@@ -18,7 +18,7 @@ fn echo_hello() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn exit_nonzero() {
     let result = execute_fish_tool(
         &FishArgs {
@@ -33,7 +33,7 @@ fn exit_nonzero() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn working_directory() {
     // `pwd` prints the physical (symlink-resolved) directory, so on macOS the
     // expected path must be canonicalized (/var → /private/var).
@@ -51,7 +51,7 @@ fn working_directory() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn timeout_kills_command() {
     let result = execute_fish_tool(
         &FishArgs {
@@ -67,7 +67,7 @@ fn timeout_kills_command() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn output_truncation() {
     let result = execute_fish_tool(
         &FishArgs {
@@ -82,7 +82,7 @@ fn output_truncation() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn stderr_output_included() {
     let result = execute_fish_tool(
         &FishArgs {

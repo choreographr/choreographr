@@ -46,8 +46,8 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::{debug, warn};
-/// Broadcast a TurnAppended message to all session subscribers, if the
-/// given turn_id exists in the session's turn map.
+/// Broadcast a `TurnAppended` message to all session subscribers, if the
+/// given `turn_id` exists in the session's turn map.
 pub(crate) fn broadcast_turn_appended(
     cmd_tx: &mpsc::Sender<SessionCommand>,
     session: &SessionState,
@@ -103,7 +103,7 @@ pub(crate) fn emit_image(
 /// instead of at the next poll boundary.  The output arm is listed first and,
 /// when a kill is observed between chunks, the output already queued at that
 /// instant is drained — bounded by the queue length sampled at kill time —
-/// before the thread stops (output priority, matching the old recv_timeout
+/// before the thread stops (output priority, matching the old `recv_timeout`
 /// semantics; the biased select only makes the output arm *more likely* to
 /// win a simultaneous race, and a chunk is either forwarded or dropped
 /// whole, never partially recorded).  A continuously-streaming tool keeps the
@@ -209,7 +209,7 @@ pub(crate) fn is_cancelled_once(rx: &crossbeam_channel::Receiver<()>) -> bool {
 /// Accumulate per-turn token usage into the session-level counter and log it.
 pub(crate) fn accumulate_token_usage(
     session: &mut SessionState,
-    token_usage: &Option<TokenUsage>,
+    token_usage: Option<&TokenUsage>,
     turn: u32,
     ctx: &RequestContext,
 ) {
@@ -298,7 +298,7 @@ pub(crate) fn determine_tool_timeout(name: &str, arguments_json: &str) -> Option
     let requested = if matches!(name, "sh" | "nushell" | "fish" | "exec") {
         serde_json::from_str::<serde_json::Value>(arguments_json)
             .ok()
-            .and_then(|args| args.get("timeout").and_then(|t| t.as_u64()))
+            .and_then(|args| args.get("timeout").and_then(serde_json::Value::as_u64))
             .filter(|ms| *ms > 0)
             .map(Duration::from_millis)
     } else {
@@ -308,9 +308,12 @@ pub(crate) fn determine_tool_timeout(name: &str, arguments_json: &str) -> Option
         .map(|r| r + TOOL_TIMEOUT_GRACE)
         .map_or(base, |raised| raised.max(base));
     if effective > base {
+        // u128→u64: tool timeouts are seconds-to-minutes; no truncation in practice.
+        #[allow(clippy::cast_possible_truncation)]
+        let requested_ms = requested.map(|r| r.as_millis() as u64);
         debug!(
             tool = name,
-            requested_ms = requested.map(|r| r.as_millis() as u64),
+            requested_ms,
             effective_secs = effective.as_secs(),
             "outer tool deadline raised to cover the requested timeout"
         );
@@ -422,8 +425,10 @@ pub(crate) struct SpawnedToolExecution {
     image_rx: mpsc::Receiver<PreparedImage>,
     /// Forwarding-thread handle, kept alive for this frame then detached
     /// (never joined) so the thread can finish a busy stream in the
-    /// background after the caller stops waiting.
-    _forwarder: std::thread::JoinHandle<()>,
+    /// background after the caller stops waiting. Named without the
+    /// underscore prefix because keeping the handle alive IS its purpose —
+    /// it is intentionally never joined.
+    forwarder: std::thread::JoinHandle<()>,
 }
 
 /// Spawn the forwarding thread and the tool execution thread for one call,
@@ -471,7 +476,7 @@ pub(crate) fn spawn_tool_execution(
     // Forwards streaming output chunks to subscribers as they arrive.
     // Exits when the output channel is disconnected (tool finished) or
     // a kill signal is received (we stopped waiting).
-    let _forwarder = spawn_forwarding_thread(
+    let forwarder = spawn_forwarding_thread(
         cmd_tx,
         session_id,
         request_id,
@@ -499,7 +504,7 @@ pub(crate) fn spawn_tool_execution(
         exec_rx,
         kill_tx,
         image_rx,
-        _forwarder,
+        forwarder,
     }
 }
 
@@ -560,7 +565,9 @@ pub(crate) fn spawn_single_tool(args: SpawnToolArgs) -> crossbeam_channel::Sende
         exec_rx,
         kill_tx,
         image_rx,
-        _forwarder,
+        // Destructured by value to keep the handle alive for this frame, then
+        // detached (never joined) — see the field docs.
+        forwarder: _forwarder_handle,
     } = spawn_tool_execution(
         &tool_call,
         ToolOutputFormat::Text,
@@ -987,6 +994,16 @@ pub(crate) fn execute_tool_with_timeout(
     ctx: &RequestContext,
     invocation_description: &str,
 ) -> (ToolOutput, bool, Option<PreparedImage>) {
+    // Drop guard: when the main loop exits (for any reason), signal the
+    // forwarder to stop so it doesn't orphan waiting on output_rx.
+    // (Declared at the top of the block: items must precede statements.)
+    struct KillGuard(crossbeam_channel::Sender<()>);
+    impl Drop for KillGuard {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
     let format = match &tool_call.caller {
         Some(caller) if caller.kind == "program" => ToolOutputFormat::Json,
         _ => ToolOutputFormat::Text,
@@ -1007,7 +1024,7 @@ pub(crate) fn execute_tool_with_timeout(
         active_tool_groups: session.config.active_tool_groups.clone(),
         reasoning_effort: session.config.reasoning_effort.clone(),
         selected_model: session.config.selected_model.clone(),
-        working_dir: working_dir.map(|p| p.to_path_buf()),
+        working_dir: working_dir.map(std::path::Path::to_path_buf),
         cancelled: Arc::clone(&cancel_flag),
         account_name: session.config.account_name.clone(),
     };
@@ -1020,27 +1037,21 @@ pub(crate) fn execute_tool_with_timeout(
         exec_rx: result_rx,
         kill_tx,
         image_rx,
-        _forwarder,
+        // Destructured by value to keep the handle alive for this frame, then
+        // detached (never joined) — see the field docs.
+        forwarder: _forwarder_handle,
     } = spawn_tool_execution(
         tool_call,
         format,
         Arc::clone(&ctx.tool_registry),
         x_credentials.cloned(),
-        working_dir.map(|p| p.to_path_buf()),
+        working_dir.map(std::path::Path::to_path_buf),
         tool_ctx,
         ctx.cmd_tx.clone(),
         session_id,
         request_id,
     );
 
-    // Drop guard: when the main loop exits (for any reason), signal the
-    // forwarder to stop so it doesn't orphan waiting on output_rx.
-    struct KillGuard(crossbeam_channel::Sender<()>);
-    impl Drop for KillGuard {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
     let _kill_guard = KillGuard(kill_tx);
 
     // Event-driven wait: `select_biased!` waits on the cancellation channel,

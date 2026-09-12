@@ -6,7 +6,10 @@
     clippy::expect_used,
     clippy::panic,
     clippy::panic_in_result_fn,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    // Test helper mirrors the tools' `Option<String>` arg shape; the Option is
+    // the point, not a Result, so the wrap lint is silenced file-wide.
+    clippy::unnecessary_wraps
 )]
 use choreo_daemon::{
     GitAddArgs, GitCommitArgs, GitDiffArgs, GitLogArgs, GitPushArgs, GitRepoArgs, GitShowArgs,
@@ -40,7 +43,7 @@ fn git(repo: &Path, args: &[&str]) {
         .current_dir(repo)
         .status()
         .expect("run git");
-    assert!(status.success(), "git {:?} failed with {status}", args);
+    assert!(status.success(), "git {args:?} failed with {status}");
 }
 
 fn init_repo() -> std::path::PathBuf {
@@ -65,11 +68,12 @@ fn setup_remote(remote: &Path, repo: &Path) {
 }
 
 fn repo_path_arg(repo: &Path) -> Option<String> {
+    // No error path: the arg is always present in these tests.
     Some(repo.to_str().unwrap().to_string())
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn status_initial_repo() {
     let repo = init_repo();
     let worktree = execute_git_status_tool(
@@ -87,7 +91,7 @@ fn status_initial_repo() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn status_tracked_and_untracked_files() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "hello").unwrap();
@@ -109,7 +113,7 @@ fn status_tracked_and_untracked_files() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn diff_working_tree() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "original").unwrap();
@@ -135,7 +139,7 @@ fn diff_working_tree() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn diff_cached() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "original").unwrap();
@@ -162,7 +166,7 @@ fn diff_cached() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn log_recent() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "v1").unwrap();
@@ -184,7 +188,7 @@ fn log_recent() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn add_and_commit() {
     let repo = init_repo();
     let added = "new.txt";
@@ -205,8 +209,7 @@ fn add_and_commit() {
     assert_eq!(
         added_result.matches("repository:").count(),
         1,
-        "{}",
-        added_result
+        "{added_result}"
     );
 
     let result = execute_git_commit_tool(
@@ -222,7 +225,7 @@ fn add_and_commit() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn commit_empty_message_rejected() {
     let repo = init_repo();
     let result = execute_git_commit_tool(
@@ -239,7 +242,7 @@ fn commit_empty_message_rejected() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn commit_no_changes_fails() {
     let repo = init_repo();
     let result = execute_git_commit_tool(
@@ -256,7 +259,7 @@ fn commit_no_changes_fails() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn push_to_remote() {
     let remote = init_bare_remote();
     let repo = init_repo();
@@ -284,7 +287,7 @@ fn push_to_remote() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn push_dry_run() {
     let remote = init_bare_remote();
     let repo = init_repo();
@@ -310,7 +313,7 @@ fn push_dry_run() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn push_fails_without_remote() {
     let repo = init_repo();
     let result = execute_git_push_tool(
@@ -324,13 +327,13 @@ fn push_fails_without_remote() {
         },
         None,
     );
-    assert!(result.is_err(), "expected error: {:?}", result);
+    assert!(result.is_err(), "expected error: {result:?}");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("remote: origin"), "{}", err);
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn push_rejected_when_ahead() {
     let remote = init_bare_remote();
     let repo = init_repo();
@@ -359,7 +362,7 @@ fn push_rejected_when_ahead() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn show_commit_diff_skips_directory_entries() {
     // Regression test: gix's tree diff reports a change for every modified
     // *directory* entry in addition to the files inside it. The old code
@@ -400,7 +403,7 @@ fn show_commit_diff_skips_directory_entries() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn show_commit_message_is_fenced_and_verbatim() {
     // git_show results are markdown-parsed in the TUI (see the renderer's
     // MARKDOWN_TOOLS), so the commit message — untrusted repo data — must be

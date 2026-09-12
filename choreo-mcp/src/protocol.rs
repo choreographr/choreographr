@@ -128,6 +128,11 @@ pub enum McpContent {
 // ---------------------------------------------------------------------------
 
 /// Build an `initialize` request for the MCP handshake.
+///
+/// # Errors
+///
+/// Returns [`McpError::ProtocolError`] when the initialize params cannot be
+/// serialized to JSON (practically unreachable for these fixed fields).
 pub fn make_initialize_request(id: RequestId) -> Result<JsonRpcRequest, McpError> {
     Ok(JsonRpcRequest {
         jsonrpc: "2.0".into(),

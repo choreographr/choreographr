@@ -1,4 +1,4 @@
-//! Wire tests for the OpenAI image adapter, served by the shared
+//! Wire tests for the `OpenAI` image adapter, served by the shared
 //! scripted HTTP provider ([`MockProvider`]).
 //!
 //! These tests bind a local `TcpListener`, so they exercise the full
@@ -16,6 +16,7 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
+use base64::Engine as _;
 use choreo_ai_protocols::images::{
     Background, ImageGenerationRequest, ImageQuality, ImageSize, OutputFormat,
 };
@@ -52,7 +53,7 @@ fn success_body() -> String {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn success_maps_b64_and_revised_prompt() {
     let mock = MockProvider::start(vec![(200, "application/json", success_body())]);
     let result = client(&mock)
@@ -75,7 +76,7 @@ fn success_maps_b64_and_revised_prompt() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn wire_body_has_model_prompt_n1_and_no_response_format() {
     // gpt-image-1 rejects `response_format` (it always returns b64_json), so
     // the wire body must never carry it — pinned here so a future refactor
@@ -101,7 +102,7 @@ fn wire_body_has_model_prompt_n1_and_no_response_format() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn non_2xx_error_body_message_surfaces() {
     // The standard OpenAI error envelope's `error.message` must reach the
     // caller instead of the raw body dump.
@@ -124,7 +125,7 @@ fn non_2xx_error_body_message_surfaces() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn rate_limited_with_small_retry_after_is_retried_then_succeeds() {
     // Retry-After: 0 fits the backoff budget (wait = zero → no sleeping in
     // the test) and the frugal 2-attempt budget allows exactly one retry.
@@ -191,7 +192,7 @@ fn single_response_with_header(
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn rate_limited_with_oversized_retry_after_is_terminal() {
     // A 1-hour cooldown outlives the 30 s backoff ceiling → the request must
     // fail immediately instead of waiting (and the frugal budget would not
@@ -225,7 +226,7 @@ fn rate_limited_with_oversized_retry_after_is_terminal() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn empty_data_array_is_empty_response_error() {
     let mock = MockProvider::start(vec![(
         200,
@@ -242,7 +243,7 @@ fn empty_data_array_is_empty_response_error() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn malformed_json_response_errors() {
     let mock = MockProvider::start(vec![(
         200,
@@ -259,7 +260,7 @@ fn malformed_json_response_errors() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn data_item_without_b64_is_empty_response_error() {
     // A 200 envelope whose item lacks b64_json is "no image data", not a
     // deserialization crash.
@@ -275,7 +276,7 @@ fn data_item_without_b64_is_empty_response_error() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn non_auto_enums_serialize_as_wire_strings() {
     let mock = MockProvider::start(vec![(200, "application/json", success_body())]);
     let req = ImageGenerationRequest {
@@ -296,7 +297,7 @@ fn non_auto_enums_serialize_as_wire_strings() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn defaults_and_trait_accessors() {
     let mock = MockProvider::start(vec![]);
     let c = client(&mock);
@@ -351,7 +352,7 @@ fn zai_sample_request() -> ImageGenerationRequest {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_url_response_downloads_image_bytes() {
     let mock = MockProvider::start_scripted(|base| {
         vec![
@@ -375,7 +376,6 @@ fn zai_url_response_downloads_image_bytes() {
 
     // Byte fidelity: the downloaded bytes are re-encoded b64 and decode
     // back to the exact payload the mock served.
-    use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&result.image_b64)
         .expect("result b64 decodes");
@@ -396,7 +396,7 @@ fn zai_url_response_downloads_image_bytes() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_url_download_retries_the_not_yet_published_race() {
     // Production race (observed 2026-09): z.ai's object storage advertises
     // the generation's url BEFORE the object is published, so the first
@@ -438,7 +438,6 @@ fn zai_url_download_retries_the_not_yet_published_race() {
     .generate_image(&zai_sample_request(), None)
     .expect("second CDN fetch resolves the propagation race");
 
-    use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&result.image_b64)
         .expect("result b64 decodes");
@@ -451,7 +450,7 @@ fn zai_url_download_retries_the_not_yet_published_race() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_url_download_stays_terminal_after_the_retry_budget() {
     // The retry budget is bounded: if EVERY GET serves the racy non-image
     // body, the download fails for real instead of looping forever — the
@@ -497,7 +496,7 @@ fn zai_url_download_stays_terminal_after_the_retry_budget() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_b64_json_present_is_used_directly() {
     // b64_json is not part of glm-image's contract but is tolerated at the
     // parse level — when present (and non-empty) it must be preferred over
@@ -516,7 +515,7 @@ fn zai_b64_json_present_is_used_directly() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_wire_body_has_model_prompt_only_plus_mapped_knobs() {
     // glm-image's schema is {model, prompt} + optional {size, quality}.
     // n / response_format / background / output_format are NOT documented
@@ -551,7 +550,7 @@ fn zai_wire_body_has_model_prompt_only_plus_mapped_knobs() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_quality_map_low_medium_are_standard_high_is_hd_auto_omitted() {
     let mock = MockProvider::start(vec![
         (
@@ -598,7 +597,7 @@ fn zai_quality_map_low_medium_are_standard_high_is_hd_auto_omitted() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_flat_error_body_message_surfaces() {
     // z.ai errors are the FLAT {code, message} shape (not OpenAI's nested
     // error envelope) — the retry layer's `message` fallback must surface it.
@@ -621,7 +620,7 @@ fn zai_flat_error_body_message_surfaces() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_content_filter_blocks_with_clear_message_not_empty_response() {
     // Documented semantics: level 0 (most severe) ..= 3; any entry at level
     // 0..=2 marks the generation BLOCKED — a ContentFiltered error, NOT
@@ -656,7 +655,7 @@ fn zai_content_filter_blocks_with_clear_message_not_empty_response() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_content_filter_level_3_is_advisory_not_blocking() {
     // Level 3 is the least severe (docs: 0 most severe, 3 least) — a level-3
     // entry must NOT turn the generation into an error.
@@ -673,7 +672,7 @@ fn zai_content_filter_level_3_is_advisory_not_blocking() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_empty_data_is_empty_response_and_neither_field_is_nor() {
     // Empty data array → EmptyResponse (same convention as the OpenAI
     // adapter), not a deserialization failure.
@@ -700,7 +699,7 @@ fn zai_empty_data_is_empty_response_and_neither_field_is_nor() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn zai_defaults_and_trait_accessors() {
     let mock = MockProvider::start(vec![]);
     let c = zai_client(&mock);

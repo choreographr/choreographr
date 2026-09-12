@@ -21,12 +21,18 @@ async fn evm_nonce_impl(rpc_url: &str, address_str: &str) -> Result<String, Bloc
 
 /// Synchronous entry point: runs [`evm_nonce_impl`] on the sidecar runtime and
 /// caps the output at the shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`BlockchainError`] when the node is unreachable, the RPC call
+/// fails, or the capped sanitized output cannot be produced.
 pub fn execute_evm_nonce(args: &EvmNonceArgs) -> Result<String, BlockchainError> {
     log_execution("evm_nonce", &args.rpc_url);
     let output = block_on(rpc_call(evm_nonce_impl(&args.rpc_url, &args.address)))??;
     Ok(truncate_tool_output(&output))
 }
 
+#[must_use]
 pub fn describe_evm_nonce_invocation(args: &EvmNonceArgs) -> String {
     format!(
         "Querying transaction count (nonce) of {} on {}.",

@@ -13,7 +13,7 @@ pub(crate) mod tests {
     use choreo_proto::{SessionStatus, SessionSummary, TokenUsage};
     use std::sync::Arc;
 
-    /// Build a ToolContext with a mock daemon channel.
+    /// Build a `ToolContext` with a mock daemon channel.
     pub(crate) fn test_context() -> (ToolContext, std::sync::mpsc::Sender<DaemonCommand>) {
         let (daemon_tx, daemon_rx) = std::sync::mpsc::channel::<DaemonCommand>();
         let dir = tempfile::tempdir().unwrap();

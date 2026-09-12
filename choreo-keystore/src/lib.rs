@@ -71,6 +71,7 @@ pub struct XCredentialView<'a> {
 
 impl ServiceCredential {
     /// Returns a view of the X credential fields if this is the X variant.
+    #[must_use]
     pub fn as_x(&self) -> Option<XCredentialView<'_>> {
         match self {
             ServiceCredential::X {
@@ -92,6 +93,7 @@ impl ServiceCredential {
 
     /// Returns a view of the Substrate credential fields if this is the
     /// Substrate variant.
+    #[must_use]
     pub fn as_substrate(&self) -> Option<SubstrateCredentialView<'_>> {
         match self {
             ServiceCredential::Substrate {

@@ -1,7 +1,9 @@
 use choreo_proto::ClientMessage;
 use choreo_tui::{ShellCommand, parse_input_line};
 
-#[ignore]
+// Ignored by default: part of the #[ignore] integration suite, exercised via
+// `cargo test-integration` (it binds sockets and runs the full parser flow).
+#[ignore = "integration test; run explicitly via nextest --ignored"]
 #[test]
 fn shell_parser_handles_full_command_flow() {
     let mut next_request_id = 1;

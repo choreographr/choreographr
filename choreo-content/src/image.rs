@@ -26,7 +26,17 @@ const MIN_LEVEL_DIMENSION: u32 = 64;
 /// images never produce zero-sized encodes (reference arithmetic).
 fn level_dimensions(original: u32, level: u32) -> u32 {
     let scale = 2_u32.pow(level);
-    ((original as f32) / (scale as f32)).round().max(1.0) as u32
+    // The reference protocol performs this ratio in f32 (with its inherent
+    // precision loss and f32->u32 truncation); reproducing it exactly in
+    // integer math would change the produced dimensions, so keep the casts.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    {
+        ((original as f32) / (scale as f32)).round().max(1.0) as u32
+    }
 }
 
 /// The `(width, height)` of every level in the pyramid for a full-res
@@ -96,6 +106,14 @@ fn build_levels(
 /// path's own file name is used. The mixin's digest is the sha2-256 of the
 /// original file bytes (matching what `acuity-dioxus` hashes into
 /// `ipfs_hash`), while the mipmap levels reference the JPEG re-encodes.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Image`] when the file cannot be read, the bytes
+/// are not a decodable image, or a mipmap level fails JPEG encoding; with
+/// [`ContentError::Ipfs`] when an `ipfs::add` upload of a level fails; and
+/// with [`ContentError::Cid`] when the returned digest cannot be converted
+/// back to a CID.
 pub fn build_image_spec(
     path: &Path,
     filename_override: Option<&str>,
@@ -110,9 +128,7 @@ pub fn build_image_spec(
 
     // Each level is pinned to IPFS under its own CID; the digest returned by
     // `ipfs::add` is converted back to the CID form the spec stores.
-    let filename = filename_override
-        .map(str::to_owned)
-        .unwrap_or_else(|| fallback_filename(path));
+    let filename = filename_override.map_or_else(|| fallback_filename(path), str::to_owned);
     let upload = |jpeg_bytes: &[u8]| -> Result<String, ContentError> {
         let digest_hex = crate::ipfs::add(jpeg_bytes, &filename)?;
         crate::encode::digest_hex_to_cid(&digest_hex)
@@ -140,8 +156,7 @@ pub fn build_image_spec(
 /// rather than fail a publish that has perfectly good image bytes.
 fn fallback_filename(path: &Path) -> String {
     path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "image".to_string())
+        .map_or_else(|| "image".to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -154,6 +169,9 @@ mod tests {
     /// on the height, giving 3 levels).
     fn test_image() -> DynamicImage {
         DynamicImage::ImageRgba8(ImageBuffer::from_fn(300, 200, |x, y| {
+            // Pixel components wrap modulo 256 to stay deterministic across
+            // the coordinate range; u32->u8 truncation is intentional here.
+            #[allow(clippy::cast_possible_truncation)]
             Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255])
         }))
     }
@@ -205,7 +223,7 @@ mod tests {
         let mut calls = 0;
         let levels = build_levels(&image, |bytes| {
             calls += 1;
-            assert!(!bytes.is_empty());
+            assert_ne!(bytes, &[] as &[u8]);
             Ok(format!("QmFake{calls}"))
         })
         .unwrap();

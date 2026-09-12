@@ -71,8 +71,9 @@ pub struct AccountConfig {
 }
 
 impl AccountConfig {
-    /// Create an AccountConfig with just a name and provider; all other
+    /// Create an `AccountConfig` with just a name and provider; all other
     /// fields are `None` (meaning "use the provider default").
+    #[must_use]
     pub fn simple(name: &str, provider: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -116,6 +117,12 @@ impl AccountConfig {
     /// `RetryConfig::new` for callers that construct `ServiceConfig`
     /// directly; this is the UX layer that tells the daemon user exactly
     /// what to fix.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err when a configured retry knob violates its invariant:
+    /// `retry_initial_backoff_ms` or `retry_max_backoff_ms` exceeds the
+    /// maximum supported retry delay.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(initial) = self.retry_initial_backoff_ms
             && initial > MAX_BACKOFF_MS
@@ -147,10 +154,10 @@ impl AccountConfig {
         Ok(())
     }
 
-    /// Apply this account's config overrides to a ServiceConfig.
+    /// Apply this account's config overrides to a `ServiceConfig`.
     pub fn apply_overrides(&self, config: &mut choreo_ai_protocols::openai::ServiceConfig) {
         if let Some(base_url) = &self.base_url {
-            config.base_url = base_url.clone();
+            config.base_url.clone_from(base_url);
         }
         if let Some(streaming) = self.streaming {
             config.streaming = streaming;
@@ -174,13 +181,13 @@ impl AccountConfig {
             config.total_timeout_secs = total;
         }
         if let Some(path) = &self.model_list_path {
-            config.model_list_path = path.clone();
+            config.model_list_path.clone_from(path);
         }
         if let Some(path) = &self.responses_path {
-            config.responses_path = path.clone();
+            config.responses_path.clone_from(path);
         }
         if let Some(path) = &self.chat_completions_path {
-            config.chat_completions_path = path.clone();
+            config.chat_completions_path.clone_from(path);
         }
         if let Some(fmt) = self.default_request_format {
             config.default_request_format = fmt;
@@ -189,19 +196,19 @@ impl AccountConfig {
             config.chat_completions_max_tokens = Some(n);
         }
         if let Some(ref map) = self.model_max_tokens {
-            config.model_max_tokens = map.clone();
+            config.model_max_tokens.clone_from(map);
         }
         if let Some(field) = self.chat_completions_max_tokens_field {
             config.chat_completions_max_tokens_field = field;
         }
         if let Some(ref map) = self.model_max_tokens_fields {
-            config.model_max_tokens_fields = map.clone();
+            config.model_max_tokens_fields.clone_from(map);
         }
         if let Some(n) = self.responses_max_output_tokens {
             config.responses_max_output_tokens = Some(n);
         }
         if let Some(ref map) = self.model_responses_max_output_tokens {
-            config.model_responses_max_output_tokens = map.clone();
+            config.model_responses_max_output_tokens.clone_from(map);
         }
         if let Some(v) = self.programmatic_tool_calling {
             config.programmatic_tool_calling = v;
@@ -221,10 +228,12 @@ impl AccountConfig {
     /// used by the provider crates (`choreo-ai-protocols`).  OpenAI-specific
     /// fields are not represented — they are applied directly via
     /// [`apply_overrides`](Self::apply_overrides).
+    #[must_use]
     pub fn provider_overrides(&self) -> choreo_ai_protocols::ProviderOverrides {
         choreo_ai_protocols::ProviderOverrides::from(self)
     }
 
+    #[must_use]
     pub fn to_info(&self, has_credential: bool) -> AccountInfo {
         AccountInfo {
             name: self.name.clone(),
@@ -264,6 +273,10 @@ impl From<&AccountConfig> for choreo_ai_protocols::ProviderOverrides {
 pub const ACCOUNTS_TOML_NAME: &str = "accounts.toml";
 
 /// Resolve the accounts.toml path (e.g. ~/.config/choreographr/accounts.toml).
+///
+/// # Errors
+///
+/// Returns Err if the user's config directory cannot be determined.
 pub fn accounts_config_path() -> io::Result<PathBuf> {
     let config_dir = dirs::config_dir().ok_or_else(|| {
         io::Error::new(
@@ -291,7 +304,7 @@ pub fn spawn_accounts_watcher(
     let _ = std::thread::Builder::new()
         .name("accounts-config-watch".into())
         .spawn(move || {
-            for _first in accounts_rx.iter() {
+            for _first in &accounts_rx {
                 // Coalesce: an editor save (temp + rename) can fan out several
                 // Create/Modify/Remove events for one logical edit. Drain any
                 // already-queued changes so a burst becomes ONE AccountsReload —
@@ -319,6 +332,7 @@ pub struct AccountManager {
 impl AccountManager {
     /// Create an empty account manager with the default config path.
     /// Used as a fallback when the accounts file cannot be loaded.
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             config_path: PathBuf::new(),
@@ -328,7 +342,17 @@ impl AccountManager {
 
     /// Load accounts from a TOML file. If the file doesn't exist, returns an
     /// empty manager (no error).
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the file cannot be read, is not valid TOML, or one of
+    /// the accounts fails `validate` (invalid retry knobs).
     pub fn load(path: &Path) -> io::Result<Self> {
+        #[derive(Deserialize)]
+        struct AccountsFile {
+            #[serde(default)]
+            account: Vec<AccountConfig>,
+        }
         if !path.exists() {
             return Ok(Self {
                 config_path: path.to_path_buf(),
@@ -336,11 +360,6 @@ impl AccountManager {
             });
         }
         let raw = fs::read_to_string(path)?;
-        #[derive(Deserialize)]
-        struct AccountsFile {
-            #[serde(default)]
-            account: Vec<AccountConfig>,
-        }
         let file: AccountsFile =
             toml::from_str(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // Validate the retry knobs of every account at load time (not lazily
@@ -372,6 +391,11 @@ impl AccountManager {
     /// deterministic ordering makes the on-disk file stable and diff-friendly;
     /// the atomic write means the config-file watcher can never observe a torn
     /// file mid-write (the daemon and an editor can race on this file).
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if serialization fails or the atomic file write fails
+    /// (unwritable path, missing parent directory, I/O error).
     pub fn save(&self) -> io::Result<()> {
         #[derive(Serialize)]
         struct AccountsFile<'a> {
@@ -387,6 +411,11 @@ impl AccountManager {
     }
 
     /// Add an account. Errors if the name already exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the account config fails validation, the name already
+    /// exists, or the accounts file cannot be saved.
     pub fn add(&mut self, config: AccountConfig) -> Result<(), String> {
         // Reject invalid retry knobs before they are persisted (the CLI add
         // path surfaces the error to the user).
@@ -401,19 +430,26 @@ impl AccountManager {
     }
 
     /// Remove an account by name. Errors if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if no account with that name exists or the accounts file
+    /// cannot be saved.
     pub fn remove(&mut self, name: &str) -> Result<(), String> {
         if self.accounts.remove(name).is_none() {
-            return Err(format!("account '{}' not found", name));
+            return Err(format!("account '{name}' not found"));
         }
         self.save()
             .map_err(|e| format!("failed to save accounts: {e}"))?;
         Ok(())
     }
 
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&AccountConfig> {
         self.accounts.get(name)
     }
 
+    #[must_use]
     pub fn list(&self, credentialed: &std::collections::HashSet<String>) -> Vec<AccountInfo> {
         let mut configs: Vec<AccountInfo> = self
             .accounts
@@ -424,16 +460,19 @@ impl AccountManager {
         configs
     }
 
+    #[must_use]
     pub fn all_configs(&self) -> Vec<AccountConfig> {
         let mut configs: Vec<AccountConfig> = self.accounts.values().cloned().collect();
         configs.sort_by(|a, b| a.name.cmp(&b.name));
         configs
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
     }
 
+    #[must_use]
     pub fn contains(&self, name: &str) -> bool {
         self.accounts.contains_key(name)
     }
@@ -441,18 +480,21 @@ impl AccountManager {
     /// The on-disk path this manager loads from / saves to. Empty for an
     /// un-initialized manager (`AccountManager::empty`), which the daemon uses
     /// to gate the external-edit reload until unlock has loaded a real path.
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.config_path
     }
 
     /// The account names, sorted for deterministic iteration. Used by the
     /// external-edit reload to compute which accounts were removed.
+    #[must_use]
     pub fn names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.accounts.keys().cloned().collect();
         names.sort();
         names
     }
 
+    #[must_use]
     pub fn first(&self) -> Option<&AccountConfig> {
         let mut keys: Vec<&String> = self.accounts.keys().collect();
         keys.sort();
@@ -673,7 +715,10 @@ model = "claude-4"
         let mut mgr = manager(&path);
         // An un-initialized manager has an empty path and no names.
         assert!(AccountManager::empty().path().as_os_str().is_empty());
-        assert!(AccountManager::empty().names().is_empty());
+        assert_eq!(
+            AccountManager::empty().names(),
+            [] as [std::string::String; 0]
+        );
 
         assert_eq!(mgr.path(), path);
         mgr.add(AccountConfig::simple("z", "openai")).unwrap();

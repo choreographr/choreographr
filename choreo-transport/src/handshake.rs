@@ -15,7 +15,7 @@ use crate::noise::NoiseStream;
 /// handshake read is bounded by the time remaining until it (see
 /// [`read_handshake_exact`]), so a peer that dribbles bytes to keep resetting
 /// a per-recv timeout is still cut off at the deadline. It is cleared before
-/// the TransportState is handed over; the data plane has no timeout by design
+/// the `TransportState` is handed over; the data plane has no timeout by design
 /// — readers block until a message or EOF, and the daemon's shutdown path
 /// closes sockets to unblock them.
 ///
@@ -56,6 +56,16 @@ pub(crate) fn be_len16(len_buf: &[u8]) -> Result<u16, TransportError> {
 
 fn invalid_slice(what: &str) -> TransportError {
     TransportError::InvalidFragment(format!("internal buffer size invariant violated ({what})"))
+}
+
+/// Handshake frame bodies are snow messages (snow caps every message at
+/// 65535 bytes) but `n` is measured as `usize`, so the wire's 16-bit length
+/// prefix needs a cast. Truncation is impossible by the snow message-size
+/// limit, and keeping the plain cast (not `try_from`) preserves the exact
+/// byte behavior of the handshakes, which round-trip tests pin down.
+#[allow(clippy::cast_possible_truncation)]
+fn len16(n: usize) -> [u8; 2] {
+    (n as u16).to_be_bytes()
 }
 
 pub(crate) fn at<'a>(
@@ -216,6 +226,13 @@ fn write_handshake_all(
 /// budget, and the handshake that follows gets its own — the two are
 /// independent deadlines, which only widens the worst case by one budget and
 /// keeps the deadline plumbing in exactly one place.
+///
+/// # Errors
+///
+/// Returns [`TransportError::HandshakeTimeout`] if the peer does not send
+/// the preamble byte within the [`HANDSHAKE_TIMEOUT`] budget, or any
+/// propagated socket I/O error (EOF before the byte reads as
+/// `UnexpectedEof`).
 pub fn read_handshake_preamble(stream: &mut TcpStream) -> Result<u8, TransportError> {
     read_handshake_preamble_with_timeout(stream, HANDSHAKE_TIMEOUT)
 }
@@ -225,6 +242,11 @@ pub fn read_handshake_preamble(stream: &mut TcpStream) -> Result<u8, TransportEr
 /// byte-for-byte the handshake's: a silent peer is cut off with
 /// `HandshakeTimeout`, and a dribbling peer cannot stretch the read past the
 /// deadline by keeping per-read timers alive.
+///
+/// # Errors
+///
+/// Returns [`TransportError::HandshakeTimeout`] if the peer does not send
+/// the preamble byte within `timeout`, or any propagated socket I/O error.
 pub fn read_handshake_preamble_with_timeout(
     stream: &mut TcpStream,
     timeout: Duration,
@@ -234,7 +256,7 @@ pub fn read_handshake_preamble_with_timeout(
     // `read_handshake_exact` above returned exactly `len = 1` bytes, so the
     // index is in bounds by construction; the access is bounds-checked anyway
     // (see the slice helpers' comment) rather than panicking.
-    Ok(at(&byte, 0, "preamble byte").copied()?)
+    at(&byte, 0, "preamble byte").copied()
 }
 
 /// Perform the Noise IK handshake as the **initiator** (client side), using
@@ -245,6 +267,12 @@ pub fn read_handshake_preamble_with_timeout(
 /// * `server_pk` — the server's transport.pub (32-byte X25519 public key).
 ///
 /// On success returns a `NoiseStream` ready for encrypted message I/O.
+///
+/// # Errors
+///
+/// Returns [`TransportError::HandshakeTimeout`] if the exchange exceeds the
+/// [`HANDSHAKE_TIMEOUT`] budget, or the snow/`TransportError` I/O and
+/// protocol errors raised by the exchange itself.
 pub fn handshake_initiator(
     stream: TcpStream,
     static_sk: &[u8; 32],
@@ -257,6 +285,12 @@ pub fn handshake_initiator(
 /// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`] for why the budget is absolute,
 /// not per-read). Exposed so integration tests can exercise the timeout path
 /// in milliseconds instead of waiting out the 10 s default.
+///
+/// # Errors
+///
+/// Returns [`TransportError::HandshakeTimeout`] if the exchange exceeds
+/// `timeout`, or the snow/`TransportError` I/O and protocol errors raised
+/// by the exchange itself.
 pub fn handshake_initiator_with_timeout(
     mut stream: TcpStream,
     static_sk: &[u8; 32],
@@ -280,7 +314,7 @@ pub fn handshake_initiator_with_timeout(
     let mut buf = vec![0u8; 2 + 1024];
     let n = handshake.write_message(&[], slice_mut(&mut buf, 2.., "handshake frame body")?)?;
     // Use 2-byte length prefix for handshake messages (max size < 65535)
-    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&(n as u16).to_be_bytes());
+    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&len16(n));
     let frame = slice(&buf, ..2 + n, "handshake frame")?;
     write_handshake_all(&mut stream, deadline, frame)?;
 
@@ -316,6 +350,13 @@ pub fn handshake_initiator_with_timeout(
 ///
 /// On success returns a `NoiseStream` ready for encrypted message I/O.
 /// On authentication failure the connection is closed and `Err(AuthFailed)` is returned.
+///
+/// # Errors
+///
+/// Returns [`TransportError::AuthFailed`] if the client is not authorized
+/// or never sent its static key, [`TransportError::HandshakeTimeout`] if
+/// the exchange exceeds the [`HANDSHAKE_TIMEOUT`] budget, or the snow/
+/// `TransportError` I/O and protocol errors raised by the exchange itself.
 pub fn handshake_responder<F>(
     stream: TcpStream,
     static_sk: &[u8; 32],
@@ -331,6 +372,13 @@ where
 /// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`]). Exposed so integration tests
 /// can exercise the timeout path in milliseconds instead of waiting out the
 /// 10 s default.
+///
+/// # Errors
+///
+/// Returns [`TransportError::AuthFailed`] if the client is not authorized
+/// or never sent its static key, [`TransportError::HandshakeTimeout`] if
+/// the exchange exceeds `timeout`, or the snow/`TransportError` I/O and
+/// protocol errors raised by the exchange itself.
 pub fn handshake_responder_with_timeout<F>(
     mut stream: TcpStream,
     static_sk: &[u8; 32],
@@ -378,7 +426,7 @@ where
     // (see write_handshake_all).
     let mut buf = vec![0u8; 2 + 1024];
     let n = handshake.write_message(&[], slice_mut(&mut buf, 2.., "handshake frame body")?)?;
-    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&(n as u16).to_be_bytes());
+    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&len16(n));
     let frame = slice(&buf, ..2 + n, "handshake frame")?;
     write_handshake_all(&mut stream, deadline, frame)?;
 
@@ -410,6 +458,13 @@ where
 /// and the server's static public key learned from the handshake. Fails if
 /// the server never transmitted its static key (an XX protocol-contract
 /// violation, surfaced as `InvalidFragment`).
+///
+/// # Errors
+///
+/// Returns [`TransportError::HandshakeTimeout`] if the exchange exceeds the
+/// [`HANDSHAKE_TIMEOUT`] budget, [`TransportError::InvalidFragment`] if the
+/// server omits its static key, or the snow/`TransportError` errors raised
+/// by the exchange itself.
 pub fn handshake_initiator_xx(
     stream: TcpStream,
     static_sk: &[u8; 32],
@@ -424,6 +479,13 @@ pub fn handshake_initiator_xx(
 /// a silent or dribbling peer is cut off at the deadline with
 /// `HandshakeTimeout`, and both socket timeouts are cleared before the data
 /// plane.
+///
+/// # Errors
+///
+/// Returns [`TransportError::HandshakeTimeout`] if the exchange exceeds
+/// `timeout`, [`TransportError::InvalidFragment`] if the server omits its
+/// static key, or the snow/`TransportError` errors raised by the exchange
+/// itself.
 pub fn handshake_initiator_xx_with_timeout(
     mut stream: TcpStream,
     static_sk: &[u8; 32],
@@ -446,7 +508,7 @@ pub fn handshake_initiator_xx_with_timeout(
 
     // Message 1 (-> e): the client's ephemeral key only.
     let n = handshake.write_message(&[], slice_mut(&mut buf, 2.., "handshake frame body")?)?;
-    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&(n as u16).to_be_bytes());
+    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&len16(n));
     let frame = slice(&buf, ..2 + n, "handshake frame")?;
     write_handshake_all(&mut stream, deadline, frame)?;
 
@@ -461,7 +523,7 @@ pub fn handshake_initiator_xx_with_timeout(
     // Message 3 (-> s, es): the client's static key, authenticating us to
     // the server (the server's responder-side ACL check consumes it).
     let n = handshake.write_message(&[], slice_mut(&mut buf, 2.., "handshake frame body")?)?;
-    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&(n as u16).to_be_bytes());
+    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&len16(n));
     let frame = slice(&buf, ..2 + n, "handshake frame")?;
     write_handshake_all(&mut stream, deadline, frame)?;
 
@@ -501,6 +563,13 @@ pub fn handshake_initiator_xx_with_timeout(
 /// with message 3 (not message 1), so the `check_client` ACL closure runs
 /// AFTER the full key exchange — see the comment at the check below for why
 /// that is still safe.
+///
+/// # Errors
+///
+/// Returns [`TransportError::AuthFailed`] if the client is not authorized
+/// or never sent its static key, [`TransportError::HandshakeTimeout`] if
+/// the exchange exceeds the [`HANDSHAKE_TIMEOUT`] budget, or the snow/
+/// `TransportError` I/O and protocol errors raised by the exchange itself.
 pub fn handshake_responder_xx<F>(
     stream: TcpStream,
     static_sk: &[u8; 32],
@@ -516,6 +585,13 @@ where
 /// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`]). Same absolute-deadline
 /// plumbing as the IK responder — every read AND write is bounded by the
 /// time remaining until the deadline.
+///
+/// # Errors
+///
+/// Returns [`TransportError::AuthFailed`] if the client is not authorized
+/// or never sent its static key, [`TransportError::HandshakeTimeout`] if
+/// the exchange exceeds `timeout`, or the snow/`TransportError` I/O and
+/// protocol errors raised by the exchange itself.
 pub fn handshake_responder_xx_with_timeout<F>(
     mut stream: TcpStream,
     static_sk: &[u8; 32],
@@ -552,7 +628,7 @@ where
     // which point its own static is exposed to the ACL check.
     let mut buf = vec![0u8; 2 + 1024];
     let n = handshake.write_message(&[], slice_mut(&mut buf, 2.., "handshake frame body")?)?;
-    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&(n as u16).to_be_bytes());
+    slice_mut(&mut buf, ..2, "length prefix")?.copy_from_slice(&len16(n));
     let frame = slice(&buf, ..2 + n, "handshake frame")?;
     write_handshake_all(&mut stream, deadline, frame)?;
 

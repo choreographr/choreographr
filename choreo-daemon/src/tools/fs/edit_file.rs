@@ -27,6 +27,13 @@ pub struct TextEditArgs {
     pub replace_all: Option<bool>,
 }
 
+/// Apply exact text replacements to a UTF-8 file, with optional SHA-256
+/// pre-check and dry-run preview.
+///
+/// # Errors
+///
+/// Returns Err if the path is invalid, the file cannot be read/written,
+/// the SHA-256 pre-check fails, or no edit matches.
 pub fn execute_edit_file_tool(
     args: &EditFileArgs,
     working_dir: Option<&Path>,
@@ -129,9 +136,14 @@ fn apply_text_edits(
             content.replacen(&edit.old_text, &edit.new_text, 1)
         };
         replacement_count += replacements_for_edit;
-        char_delta += (edit.new_text.chars().count() as isize
-            - edit.old_text.chars().count() as isize)
-            * replacements_for_edit as isize;
+        // usize→isize char-count delta: the delta may legitimately be negative
+        // (shorter replacement), so the cast is the intended wrap, not a bug.
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            char_delta += (edit.new_text.chars().count() as isize
+                - edit.old_text.chars().count() as isize)
+                * replacements_for_edit as isize;
+        }
     }
 
     Ok(AppliedEditSummary {
@@ -178,7 +190,7 @@ pub fn describe_edit_file_invocation(args: &EditFileArgs) -> String {
         args.edits.len()
     )];
     if let Some(ref sha) = args.expected_sha256 {
-        parts.push(format!(" Expecting SHA-256: {}.", sha));
+        parts.push(format!(" Expecting SHA-256: {sha}."));
     }
     if args.dry_run.unwrap_or(false) {
         parts.push(" Dry run (no changes will be applied).".to_string());

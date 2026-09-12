@@ -62,6 +62,7 @@ pub const TRUNCATION_SUFFIX: &str = "\n...[truncated]";
 /// or visibility, and are required by scripts like Persian (ZWNJ) and
 /// Devanagari (ZWJ/ZWNJ conjuncts), so escaping them would mangle
 /// legitimate text for no safety gain.
+#[must_use]
 pub fn is_non_joiner_format_char(c: char) -> bool {
     get_general_category(c) == GeneralCategory::Format && !matches!(c, '\u{200c}' | '\u{200d}')
 }
@@ -76,6 +77,7 @@ pub fn is_non_joiner_format_char(c: char) -> bool {
 /// line-oriented sanitizers (`grep`/`find`/`read_file`/`http_request`),
 /// the TUI's terminal sink filter, and the blockchain tools' node-output
 /// sanitizer.
+#[must_use]
 pub fn is_unsafe_unicode(c: char) -> bool {
     matches!(c, '\u{2028}' | '\u{2029}') || is_non_joiner_format_char(c)
 }
@@ -84,6 +86,7 @@ pub fn is_unsafe_unicode(c: char) -> bool {
 /// is hit. Cuts on a char boundary so a multi-byte UTF-8 char is never split.
 /// Shared by [`truncate_tool_output`] and [`finish_tool_output`] (the latter
 /// caps at a smaller budget to leave room for its tail).
+#[must_use]
 fn truncate_tool_output_at(content: &str, cap: usize) -> String {
     if content.len() <= cap {
         return content.to_string();
@@ -100,6 +103,7 @@ fn truncate_tool_output_at(content: &str, cap: usize) -> String {
 /// Cap `content` at [`MAX_TOOL_OUTPUT_BYTES`], appending
 /// [`TRUNCATION_SUFFIX`] when the cap is hit. Cuts on a char boundary so a
 /// multi-byte UTF-8 char is never split.
+#[must_use]
 pub fn truncate_tool_output(content: &str) -> String {
     truncate_tool_output_at(content, MAX_TOOL_OUTPUT_BYTES)
 }
@@ -116,6 +120,7 @@ pub fn truncate_tool_output(content: &str) -> String {
 /// re-applies the byte cap after `sanitize_transcript` (escaping expands a
 /// Cf char into `\u{202e}`). A tail appended past the cap would be cut off
 /// there; a tail kept inside the budget passes through untouched.
+#[must_use]
 pub fn finish_tool_output(body: &str, marker: Option<String>) -> String {
     let Some(marker) = marker else {
         return truncate_tool_output(body);
@@ -147,6 +152,7 @@ pub struct ByteBudget {
 }
 
 impl ByteBudget {
+    #[must_use]
     pub fn new(limit: usize) -> Self {
         Self {
             limit,
@@ -160,6 +166,7 @@ impl ByteBudget {
     /// whole chunk when it fits under the remaining budget, a fitting prefix
     /// when it would cross the cap (marking the budget truncated), or `0`
     /// once the budget is exhausted.
+    #[must_use]
     pub fn fit(&mut self, len: usize) -> usize {
         if self.used >= self.limit {
             self.truncated = true;
@@ -185,6 +192,7 @@ impl ByteBudget {
     /// `is_truncated()`-style re-check would re-arm on every subsequent
     /// chunk. `take_marker` consumes the signal exactly once — the same
     /// one-shot contract the streaming paths rely on.
+    #[must_use]
     pub fn take_marker(&mut self) -> Option<&'static str> {
         if self.truncated && !self.marker_sent {
             self.marker_sent = true;

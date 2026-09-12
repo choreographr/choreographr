@@ -107,7 +107,10 @@ fn resolve_provider_rebuilds_lazily_after_client_drop() {
     // and cached on the session for reuse.
     assert_eq!(provider.provider_slug(), "openai");
     assert_eq!(
-        state.provider.as_ref().map(|p| p.provider_slug()),
+        state
+            .provider
+            .as_ref()
+            .map(super::super::providers::InferenceProvider::provider_slug),
         Some("openai")
     );
 
@@ -257,33 +260,25 @@ fn turn_for_client_strips_vision_image_keeps_displayed_images() {
         reasoning_producer: None,
     };
     // Guard the fixture: without stripping both images would be present.
-    assert!(
-        !authoritative.tool_results[0]
-            .image
-            .as_ref()
-            .unwrap()
-            .data
-            .is_empty()
+    assert_ne!(
+        authoritative.tool_results[0].image.as_ref().unwrap().data,
+        [] as [u8; 0]
     );
-    assert!(!authoritative.displayed_images[0].data.is_empty());
+    assert_ne!(authoritative.displayed_images[0].data, [] as [u8; 0]);
 
     let client = turn_for_client(&authoritative);
 
     // Vision image bytes are stripped (daemon/model-only)…
     assert_eq!(client.tool_results[0].image, None);
     // …while the display image the client renders survives untouched.
-    assert!(!client.displayed_images[0].data.is_empty());
+    assert_ne!(client.displayed_images[0].data, [] as [u8; 0]);
     assert_eq!(client.displayed_images[0].data, b"\x89PNG-display-bytes");
     assert_eq!(client.tool_results[0].name, "read_image");
 
     // The authoritative turn keeps the vision bytes for the request builder.
-    assert!(
-        !authoritative.tool_results[0]
-            .image
-            .as_ref()
-            .unwrap()
-            .data
-            .is_empty()
+    assert_ne!(
+        authoritative.tool_results[0].image.as_ref().unwrap().data,
+        [] as [u8; 0]
     );
 }
 
@@ -526,8 +521,8 @@ fn broadcast_with_no_subscribers_does_not_panic() {
 
 #[test]
 fn broadcast_handles_disconnected_subscriber_gracefully() {
-    let (tx, _rx) = test_sink();
-    drop(_rx);
+    let (tx, rx) = test_sink();
+    drop(rx);
     let (mut state, ctx) = broadcast_setup();
     state.subscribers.insert(99, tx);
 
@@ -618,7 +613,7 @@ fn set_working_dir_updates_config_and_broadcasts() {
             assert_eq!(session_id, ctx.session_id);
             assert_eq!(path.as_deref(), Some("/tmp/new-wd"));
         }
-        other => panic!("expected SessionWorkingDirSet, got {:?}", other),
+        other => panic!("expected SessionWorkingDirSet, got {other:?}"),
     }
     // The handler replies synchronously with the applied path.
     match reply_rx.recv() {
@@ -673,7 +668,7 @@ fn load_tools_skips_already_active_in_reply() {
 
     match reply_rx.recv() {
         Ok(Ok(msg)) => {
-            assert_eq!(msg, "All specified groups were already active.")
+            assert_eq!(msg, "All specified groups were already active.");
         }
         Ok(Err(e)) => panic!("expected success reply, got error: {e}"),
         Err(e) => panic!("expected reply, got {e:?}"),
@@ -750,7 +745,7 @@ fn load_tools_rejects_unknown_group() {
     assert!(!state.config.active_tool_groups.contains("not-a-real-group"));
     match reply_rx.recv() {
         Ok(Err(msg)) => {
-            assert!(msg.contains("Unknown tool group(s): not-a-real-group"))
+            assert!(msg.contains("Unknown tool group(s): not-a-real-group"));
         }
         Ok(Ok(msg)) => panic!("expected error reply, got success: {msg}"),
         Err(e) => panic!("expected reply, got {e:?}"),
@@ -778,7 +773,7 @@ fn unload_tools_rejects_unknown_group() {
     assert!(state.config.active_tool_groups.contains("git"));
     match reply_rx.recv() {
         Ok(Err(msg)) => {
-            assert!(msg.contains("Unknown tool group(s): not-a-real-group"))
+            assert!(msg.contains("Unknown tool group(s): not-a-real-group"));
         }
         Ok(Ok(msg)) => panic!("expected error reply, got success: {msg}"),
         Err(e) => panic!("expected reply, got {e:?}"),
@@ -1633,7 +1628,10 @@ fn update_tool_result_unknown_call_id_is_noop() {
             ..Default::default()
         },
     );
-    assert!(state.turns[&tid].tool_results.is_empty());
+    assert_eq!(
+        state.turns[&tid].tool_results,
+        [] as [choreo_proto::ToolResultRecord; 0]
+    );
 }
 
 #[test]
@@ -1649,7 +1647,7 @@ fn update_tool_result_sets_all_record_fields_from_output() {
         name: "read_image".into(),
         arguments_json: "{}".into(),
     }];
-    state.seed_tool_results(tid, &calls, &["".into()]);
+    state.seed_tool_results(tid, &calls, &[String::new()]);
 
     let output = ToolOutput {
         content: "pixel".into(),
@@ -1704,7 +1702,7 @@ fn mark_unexecuted_tool_results_marks_only_unexecuted() {
             arguments_json: "{}".into(),
         },
     ];
-    state.seed_tool_results(tid, &calls, &["".into(), "".into(), "".into()]);
+    state.seed_tool_results(tid, &calls, &[String::new(), String::new(), String::new()]);
     // Only a's result was recorded before the cancel.
     state.update_tool_result(
         tid,
@@ -1741,7 +1739,7 @@ fn mark_unexecuted_tool_results_preserves_recorded_error_results() {
         name: "sh".into(),
         arguments_json: "{}".into(),
     }];
-    state.seed_tool_results(tid, &calls, &["".into(), "".into(), "".into()]);
+    state.seed_tool_results(tid, &calls, &[String::new(), String::new(), String::new()]);
     state.update_tool_result(
         tid,
         "a",
@@ -1784,7 +1782,7 @@ fn redo_turns_restores_undone_turns() {
     let mut state = SessionState::empty();
     let _ = state.start_turn(Some("user".into()));
     let ids = state.undo_turns().expect("undo succeeds");
-    assert!(!ids.is_empty());
+    assert_ne!(ids, [] as [u32; 0]);
 
     let restored = state.redo_turns().expect("redo succeeds");
     assert_eq!(restored.len(), ids.len());

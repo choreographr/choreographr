@@ -45,21 +45,26 @@ pub mod api {
     pub type Event = runtime_types::acuity_runtime::RuntimeEvent;
     #[doc = r" The outer extrinsic enum."]
     pub type Call = runtime_types::acuity_runtime::RuntimeCall;
-    #[doc = r" The outer error enum represents the DispatchError's Module variant."]
+    #[doc = r" The outer error enum represents the `DispatchError`'s `Module` variant."]
     pub type Error = runtime_types::acuity_runtime::RuntimeError;
+    #[must_use]
     pub fn constants() -> ConstantsApi {
         ConstantsApi
     }
+    #[must_use]
     pub fn storage() -> StorageApi {
         StorageApi
     }
+    #[must_use]
     #[doc = r" This is an alias to [`Self::transactions()`]."]
     pub fn tx() -> TransactionApi {
         TransactionApi
     }
+    #[must_use]
     pub fn transactions() -> TransactionApi {
         TransactionApi
     }
+    #[must_use]
     pub fn runtime_apis() -> runtime_apis::RuntimeApi {
         runtime_apis::RuntimeApi
     }
@@ -69,40 +74,51 @@ pub mod api {
         use ::subxt::ext::codec::Encode;
         pub struct RuntimeApi;
         impl RuntimeApi {
+            #[must_use]
             pub fn core(&self) -> core::Core {
                 core::Core
             }
+            #[must_use]
             pub fn metadata(&self) -> metadata::Metadata {
                 metadata::Metadata
             }
+            #[must_use]
             pub fn block_builder(&self) -> block_builder::BlockBuilder {
                 block_builder::BlockBuilder
             }
+            #[must_use]
             pub fn tagged_transaction_queue(
                 &self,
             ) -> tagged_transaction_queue::TaggedTransactionQueue {
                 tagged_transaction_queue::TaggedTransactionQueue
             }
+            #[must_use]
             pub fn offchain_worker_api(&self) -> offchain_worker_api::OffchainWorkerApi {
                 offchain_worker_api::OffchainWorkerApi
             }
+            #[must_use]
             pub fn session_keys(&self) -> session_keys::SessionKeys {
                 session_keys::SessionKeys
             }
+            #[must_use]
             pub fn aura_api(&self) -> aura_api::AuraApi {
                 aura_api::AuraApi
             }
+            #[must_use]
             pub fn get_parachain_info(&self) -> get_parachain_info::GetParachainInfo {
                 get_parachain_info::GetParachainInfo
             }
+            #[must_use]
             pub fn account_nonce_api(&self) -> account_nonce_api::AccountNonceApi {
                 account_nonce_api::AccountNonceApi
             }
+            #[must_use]
             pub fn transaction_payment_api(
                 &self,
             ) -> transaction_payment_api::TransactionPaymentApi {
                 transaction_payment_api::TransactionPaymentApi
             }
+            #[must_use]
             pub fn genesis_builder(&self) -> genesis_builder::GenesisBuilder {
                 genesis_builder::GenesisBuilder
             }
@@ -113,6 +129,7 @@ pub mod api {
             #[doc = " The `Core` runtime api that every Substrate runtime needs to implement."]
             pub struct Core;
             impl Core {
+                #[must_use]
                 #[doc = " Returns the version of the runtime."]
                 pub fn version(
                     &self,
@@ -129,6 +146,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Execute the given block."]
                 pub fn execute_block(
                     &self,
@@ -148,6 +166,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Initialize a block with the given header and return the runtime executive mode."]
                 pub fn initialize_block(
                     &self,
@@ -202,6 +221,7 @@ pub mod api {
             #[doc = " The `Metadata` api trait that returns metadata for the runtime."]
             pub struct Metadata;
             impl Metadata {
+                #[must_use]
                 #[doc = " Returns the metadata of a runtime."]
                 pub fn metadata(
                     &self,
@@ -218,6 +238,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Returns the metadata at a given version."]
                 #[doc = ""]
                 #[doc = " If the given `version` isn't supported, this will return `None`."]
@@ -241,6 +262,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Returns the supported metadata versions."]
                 #[doc = ""]
                 #[doc = " This can be used to call `metadata_at_version`."]
@@ -294,6 +316,7 @@ pub mod api {
             #[doc = " The `BlockBuilder` api trait that provides the required functionality for building a block."]
             pub struct BlockBuilder;
             impl BlockBuilder {
+                #[must_use]
                 #[doc = " Apply the given extrinsic."]
                 #[doc = ""]
                 #[doc = " Returns an inclusion outcome which specifies if this extrinsic is included in"]
@@ -316,6 +339,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Finish the current block."]
                 pub fn finalize_block(
                     &self,
@@ -332,6 +356,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Generate inherent extrinsics. The inherent data will vary from chain to chain."]
                 pub fn inherent_extrinsics(
                     &self,
@@ -352,6 +377,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Check that the inherents are valid. The inherent data will vary from chain to chain."]
                 pub fn check_inherents(
                     &self,
@@ -421,6 +447,7 @@ pub mod api {
             #[doc = " The `TaggedTransactionQueue` api trait for interfering with the transaction queue."]
             pub struct TaggedTransactionQueue;
             impl TaggedTransactionQueue {
+                #[must_use]
                 #[doc = " Validate the transaction."]
                 #[doc = ""]
                 #[doc = " This method is invoked by the transaction pool to learn details about given transaction."]
@@ -478,6 +505,7 @@ pub mod api {
             #[doc = " The offchain worker api."]
             pub struct OffchainWorkerApi;
             impl OffchainWorkerApi {
+                #[must_use]
                 #[doc = " Starts the off-chain task for given block header."]
                 pub fn offchain_worker(
                     &self,
@@ -515,6 +543,7 @@ pub mod api {
             #[doc = " Session keys runtime api."]
             pub struct SessionKeys;
             impl SessionKeys {
+                #[must_use]
                 #[doc = " Generate a set of session keys with optionally using the given seed."]
                 #[doc = " The keys should be stored within the keystore exposed via runtime"]
                 #[doc = " externalities."]
@@ -542,6 +571,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Decode the given public session keys."]
                 #[doc = ""]
                 #[doc = " Returns the list of public raw public keys + key type."]
@@ -598,6 +628,7 @@ pub mod api {
             #[doc = " API necessary for block authorship with aura."]
             pub struct AuraApi;
             impl AuraApi {
+                #[must_use]
                 #[doc = " Returns the slot duration for Aura."]
                 #[doc = ""]
                 #[doc = " Currently, only the value provided by this type at genesis will be used."]
@@ -617,6 +648,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Return the current set of authorities."]
                 pub fn authorities(
                     &self,
@@ -659,6 +691,7 @@ pub mod api {
             #[doc = " Runtime api used to access general info about a parachain runtime."]
             pub struct GetParachainInfo;
             impl GetParachainInfo {
+                #[must_use]
                 #[doc = " Retrieve the parachain id used for runtime."]
                 pub fn parachain_id(
                     &self,
@@ -692,6 +725,7 @@ pub mod api {
             #[doc = " The API to query account nonce."]
             pub struct AccountNonceApi;
             impl AccountNonceApi {
+                #[must_use]
                 #[doc = " Get current account nonce of given `AccountId`."]
                 pub fn account_nonce(
                     &self,
@@ -728,6 +762,7 @@ pub mod api {
             use super::runtime_types;
             pub struct TransactionPaymentApi;
             impl TransactionPaymentApi {
+                #[must_use]
                 pub fn query_info(
                     &self,
                     uxt: query_info::Uxt,
@@ -747,6 +782,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 pub fn query_fee_details(
                     &self,
                     uxt: query_fee_details::Uxt,
@@ -767,6 +803,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 pub fn query_weight_to_fee(
                     &self,
                     weight: query_weight_to_fee::Weight,
@@ -786,6 +823,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 pub fn query_length_to_fee(
                     &self,
                     length: query_length_to_fee::Length,
@@ -856,6 +894,7 @@ pub mod api {
             #[doc = " API to interact with `RuntimeGenesisConfig` for the runtime"]
             pub struct GenesisBuilder;
             impl GenesisBuilder {
+                #[must_use]
                 #[doc = " Build `RuntimeGenesisConfig` from a JSON blob not using any defaults and store it in the"]
                 #[doc = " storage."]
                 #[doc = ""]
@@ -884,6 +923,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Returns a JSON blob representation of the built-in `RuntimeGenesisConfig` identified by"]
                 #[doc = " `id`."]
                 #[doc = ""]
@@ -917,6 +957,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Returns a list of identifiers for available builtin `RuntimeGenesisConfig` presets."]
                 #[doc = ""]
                 #[doc = " The presets from the list can be queried with [`GenesisBuilder::get_preset`] method. If"]
@@ -967,9 +1008,11 @@ pub mod api {
             }
         }
     }
+    #[must_use]
     pub fn view_functions() -> ViewFunctionsApi {
         ViewFunctionsApi
     }
+    #[must_use]
     pub fn custom_values() -> CustomValuesApi {
         CustomValuesApi
     }
@@ -977,93 +1020,120 @@ pub mod api {
     impl CustomValuesApi {}
     pub struct ConstantsApi;
     impl ConstantsApi {
+        #[must_use]
         pub fn system(&self) -> system::constants::ConstantsApi {
             system::constants::ConstantsApi
         }
+        #[must_use]
         pub fn timestamp(&self) -> timestamp::constants::ConstantsApi {
             timestamp::constants::ConstantsApi
         }
+        #[must_use]
         pub fn aura(&self) -> aura::constants::ConstantsApi {
             aura::constants::ConstantsApi
         }
+        #[must_use]
         pub fn balances(&self) -> balances::constants::ConstantsApi {
             balances::constants::ConstantsApi
         }
+        #[must_use]
         pub fn transaction_payment(&self) -> transaction_payment::constants::ConstantsApi {
             transaction_payment::constants::ConstantsApi
         }
+        #[must_use]
         pub fn utility(&self) -> utility::constants::ConstantsApi {
             utility::constants::ConstantsApi
         }
     }
     pub struct StorageApi;
     impl StorageApi {
+        #[must_use]
         pub fn system(&self) -> system::storage::StorageApi {
             system::storage::StorageApi
         }
+        #[must_use]
         pub fn timestamp(&self) -> timestamp::storage::StorageApi {
             timestamp::storage::StorageApi
         }
+        #[must_use]
         pub fn parachain_system(&self) -> parachain_system::storage::StorageApi {
             parachain_system::storage::StorageApi
         }
+        #[must_use]
         pub fn aura(&self) -> aura::storage::StorageApi {
             aura::storage::StorageApi
         }
+        #[must_use]
         pub fn balances(&self) -> balances::storage::StorageApi {
             balances::storage::StorageApi
         }
+        #[must_use]
         pub fn sudo(&self) -> sudo::storage::StorageApi {
             sudo::storage::StorageApi
         }
+        #[must_use]
         pub fn transaction_payment(&self) -> transaction_payment::storage::StorageApi {
             transaction_payment::storage::StorageApi
         }
+        #[must_use]
         pub fn content(&self) -> content::storage::StorageApi {
             content::storage::StorageApi
         }
+        #[must_use]
         pub fn account_content(&self) -> account_content::storage::StorageApi {
             account_content::storage::StorageApi
         }
+        #[must_use]
         pub fn account_profile(&self) -> account_profile::storage::StorageApi {
             account_profile::storage::StorageApi
         }
     }
     pub struct TransactionApi;
     impl TransactionApi {
+        #[must_use]
         pub fn system(&self) -> system::calls::api::TransactionApi {
             system::calls::api::TransactionApi
         }
+        #[must_use]
         pub fn timestamp(&self) -> timestamp::calls::api::TransactionApi {
             timestamp::calls::api::TransactionApi
         }
+        #[must_use]
         pub fn parachain_system(&self) -> parachain_system::calls::api::TransactionApi {
             parachain_system::calls::api::TransactionApi
         }
+        #[must_use]
         pub fn balances(&self) -> balances::calls::api::TransactionApi {
             balances::calls::api::TransactionApi
         }
+        #[must_use]
         pub fn sudo(&self) -> sudo::calls::api::TransactionApi {
             sudo::calls::api::TransactionApi
         }
+        #[must_use]
         pub fn content(&self) -> content::calls::api::TransactionApi {
             content::calls::api::TransactionApi
         }
+        #[must_use]
         pub fn account_content(&self) -> account_content::calls::api::TransactionApi {
             account_content::calls::api::TransactionApi
         }
+        #[must_use]
         pub fn account_profile(&self) -> account_profile::calls::api::TransactionApi {
             account_profile::calls::api::TransactionApi
         }
+        #[must_use]
         pub fn content_reactions(&self) -> content_reactions::calls::api::TransactionApi {
             content_reactions::calls::api::TransactionApi
         }
+        #[must_use]
         pub fn utility(&self) -> utility::calls::api::TransactionApi {
             utility::calls::api::TransactionApi
         }
     }
     pub struct ViewFunctionsApi;
     impl ViewFunctionsApi {}
+    #[must_use]
     #[doc = r" check whether the metadata provided is aligned with this statically generated code."]
     pub fn is_codegen_valid_for(metadata: &::subxt::Metadata) -> bool {
         let runtime_metadata_hash = metadata
@@ -1387,6 +1457,7 @@ pub mod api {
             pub mod api {
                 pub struct TransactionApi;
                 impl TransactionApi {
+                    #[must_use]
                     #[doc = "Make some on-chain remark."]
                     #[doc = ""]
                     #[doc = "Can be executed by every `origin`."]
@@ -1406,6 +1477,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Set the number of pages in the WebAssembly environment's heap."]
                     pub fn set_heap_pages(
                         &self,
@@ -1424,6 +1496,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Set the new runtime code."]
                     pub fn set_code(
                         &self,
@@ -1441,6 +1514,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Set the new runtime code without doing any checks of the given `code`."]
                     #[doc = ""]
                     #[doc = "Note that runtime upgrades will not run if this is called with a not-increasing spec"]
@@ -1462,6 +1536,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Set some items of storage."]
                     pub fn set_storage(
                         &self,
@@ -1480,6 +1555,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Kill some items from storage."]
                     pub fn kill_storage(
                         &self,
@@ -1498,6 +1574,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Kill all storage items with a key that starts with the given prefix."]
                     #[doc = ""]
                     #[doc = "**NOTE:** We rely on the Root origin to provide us the number of subkeys under"]
@@ -1520,6 +1597,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Make some on-chain remark and emit event."]
                     pub fn remark_with_event(
                         &self,
@@ -1538,6 +1616,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Authorize an upgrade to a given `code_hash` for the runtime. The runtime can be supplied"]
                     #[doc = "later."]
                     #[doc = ""]
@@ -1559,6 +1638,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Authorize an upgrade to a given `code_hash` for the runtime. The runtime can be supplied"]
                     #[doc = "later."]
                     #[doc = ""]
@@ -1584,6 +1664,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Provide the preimage (runtime binary) `code` for an upgrade that has been authorized."]
                     #[doc = ""]
                     #[doc = "If the authorization required a version check, this call will ensure the spec name"]
@@ -1823,6 +1904,7 @@ pub mod api {
             use super::runtime_types;
             pub struct StorageApi;
             impl StorageApi {
+                #[must_use]
                 #[doc = " The full account information for a particular account ID."]
                 pub fn account(
                     &self,
@@ -1841,6 +1923,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Total extrinsics count for the current block."]
                 pub fn extrinsic_count(
                     &self,
@@ -1857,6 +1940,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Whether all inherents have been applied."]
                 pub fn inherents_applied(
                     &self,
@@ -1875,6 +1959,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The current weight for the block."]
                 pub fn block_weight(
                     &self,
@@ -1890,6 +1975,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Total size (in bytes) of the current block."]
                 #[doc = ""]
                 #[doc = " Tracks the size of the header and all extrinsics."]
@@ -1908,6 +1994,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Map of block numbers to block hashes."]
                 pub fn block_hash(
                     &self,
@@ -1926,6 +2013,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Extrinsics data for the current block (maps an extrinsic's index to its data)."]
                 pub fn extrinsic_data(
                     &self,
@@ -1945,6 +2033,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The current block number being processed. Set by `execute_block`."]
                 pub fn number(
                     &self,
@@ -1960,6 +2049,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Hash of the previous block."]
                 pub fn parent_hash(
                     &self,
@@ -1975,6 +2065,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Digest of the current block, also part of the block header."]
                 pub fn digest(
                     &self,
@@ -1991,10 +2082,11 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Events deposited for the current block."]
                 #[doc = ""]
                 #[doc = " NOTE: The item is unbound and should therefore never be read on chain."]
-                #[doc = " It could otherwise inflate the PoV size of a block."]
+                #[doc = " It could otherwise inflate the `PoV` size of a block."]
                 #[doc = ""]
                 #[doc = " Events have a large in-memory size. Box the events to not go out-of-memory"]
                 #[doc = " just in case someone still reads them from within the runtime."]
@@ -2013,6 +2105,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The number of events in the `Events<T>` list."]
                 pub fn event_count(
                     &self,
@@ -2028,7 +2121,8 @@ pub mod api {
                         ],
                     )
                 }
-                #[doc = " Mapping between a topic (represented by T::Hash) and a vector of indexes"]
+                #[must_use]
+                #[doc = " Mapping between a topic (represented by `T::Hash`) and a vector of indexes"]
                 #[doc = " of events in the `<Events<T>>` list."]
                 #[doc = ""]
                 #[doc = " All topic vectors have deterministic storage locations depending on the topic. This"]
@@ -2055,6 +2149,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Stores the `spec_version` and `spec_name` of when the last runtime upgrade happened."]
                 pub fn last_runtime_upgrade(
                     &self,
@@ -2074,6 +2169,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Number of blocks till the pending code upgrade is applied."]
                 pub fn blocks_till_upgrade(
                     &self,
@@ -2092,6 +2188,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " True if we have upgraded so that `type RefCount` is `u32`. False (default) if not."]
                 pub fn upgraded_to_u32_ref_count(
                     &self,
@@ -2110,7 +2207,8 @@ pub mod api {
                         ],
                     )
                 }
-                #[doc = " True if we have upgraded so that AccountInfo contains three types of `RefCount`. False"]
+                #[must_use]
+                #[doc = " True if we have upgraded so that `AccountInfo` contains three types of `RefCount`. False"]
                 #[doc = " (default) if not."]
                 pub fn upgraded_to_triple_ref_count(
                     &self,
@@ -2129,6 +2227,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The execution phase of the block."]
                 pub fn execution_phase(
                     &self,
@@ -2144,6 +2243,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " `Some` if a code upgrade has been authorized."]
                 pub fn authorized_upgrade(
                     &self,
@@ -2162,6 +2262,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The weight reclaimed for the extrinsic."]
                 #[doc = ""]
                 #[doc = " This information is available until the end of the extrinsic execution."]
@@ -2368,6 +2469,7 @@ pub mod api {
             use super::runtime_types;
             pub struct ConstantsApi;
             impl ConstantsApi {
+                #[must_use]
                 #[doc = " Block & extrinsics weights: base values and limits."]
                 pub fn block_weights(
                     &self,
@@ -2384,6 +2486,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The maximum length of a block (in bytes)."]
                 pub fn block_length(
                     &self,
@@ -2401,6 +2504,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Maximum number of block number to block hash mappings to keep (oldest pruned first)."]
                 pub fn block_hash_count(
                     &self,
@@ -2416,6 +2520,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The weight of runtime database operations the runtime can invoke."]
                 pub fn db_weight(
                     &self,
@@ -2432,6 +2537,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Get the chain's in-code version."]
                 pub fn version(
                     &self,
@@ -2447,6 +2553,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The designated SS58 prefix of this chain."]
                 #[doc = ""]
                 #[doc = " This replaces the \"ss58Format\" property declared in the chain spec. Reason is"]
@@ -2522,6 +2629,7 @@ pub mod api {
             pub mod api {
                 pub struct TransactionApi;
                 impl TransactionApi {
+                    #[must_use]
                     #[doc = "Set the current time."]
                     #[doc = ""]
                     #[doc = "This call should be invoked exactly once per block. It will panic at the finalization"]
@@ -2565,6 +2673,7 @@ pub mod api {
             use super::runtime_types;
             pub struct StorageApi;
             impl StorageApi {
+                #[must_use]
                 #[doc = " The current time for the current block."]
                 pub fn now(
                     &self,
@@ -2580,6 +2689,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Whether the timestamp has been updated in this block."]
                 #[doc = ""]
                 #[doc = " This value is updated to `true` upon successful submission of a timestamp by a node."]
@@ -2621,6 +2731,7 @@ pub mod api {
             use super::runtime_types;
             pub struct ConstantsApi;
             impl ConstantsApi {
+                #[must_use]
                 #[doc = " The minimum period between blocks."]
                 #[doc = ""]
                 #[doc = " Be aware that this is different to the *expected* period that the block production"]
@@ -2662,6 +2773,7 @@ pub mod api {
             use super::runtime_types;
             pub struct StorageApi;
             impl StorageApi {
+                #[must_use]
                 pub fn parachain_id(
                     &self,
                 ) -> ::subxt::storage::StaticAddress<(), parachain_id::Output, ::subxt::utils::Yes>
@@ -2695,6 +2807,7 @@ pub mod api {
             use super::runtime_types;
             pub struct StorageApi;
             impl StorageApi {
+                #[must_use]
                 #[doc = " The current authority set."]
                 pub fn authorities(
                     &self,
@@ -2710,6 +2823,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The current slot of this block."]
                 #[doc = ""]
                 #[doc = " This will be set in `on_initialize`."]
@@ -2752,6 +2866,7 @@ pub mod api {
             use super::runtime_types;
             pub struct ConstantsApi;
             impl ConstantsApi {
+                #[must_use]
                 #[doc = " The slot duration Aura should run with, expressed in milliseconds."]
                 #[doc = ""]
                 #[doc = " The effective value of this type can be changed with a runtime upgrade."]
@@ -3074,6 +3189,7 @@ pub mod api {
             pub mod api {
                 pub struct TransactionApi;
                 impl TransactionApi {
+                    #[must_use]
                     #[doc = "Transfer some liquid free balance to another account."]
                     #[doc = ""]
                     #[doc = "`transfer_allow_death` will set the `FreeBalance` of the sender and receiver."]
@@ -3099,6 +3215,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Exactly as `transfer_allow_death`, except the origin must be root and the source account"]
                     #[doc = "may be specified."]
                     pub fn force_transfer(
@@ -3124,6 +3241,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Same as the [`transfer_allow_death`] call, but with a check that the transfer will not"]
                     #[doc = "kill the origin account."]
                     #[doc = ""]
@@ -3148,6 +3266,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Transfer the entire transferable balance from the caller account."]
                     #[doc = ""]
                     #[doc = "NOTE: This function only attempts to transfer _transferable_ balances. This means that"]
@@ -3181,6 +3300,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Unreserve some balance from a user by force."]
                     #[doc = ""]
                     #[doc = "Can only be called by ROOT."]
@@ -3202,6 +3322,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Upgrade a specified account."]
                     #[doc = ""]
                     #[doc = "- `origin`: Must be `Signed`."]
@@ -3227,6 +3348,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Set the regular balance of a given account."]
                     #[doc = ""]
                     #[doc = "The dispatch origin for this call is `root`."]
@@ -3248,6 +3370,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Adjust the total issuance in a saturating way."]
                     #[doc = ""]
                     #[doc = "Can only be called by root and always needs a positive `delta`."]
@@ -3271,6 +3394,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Burn the specified liquid free balance from the origin account."]
                     #[doc = ""]
                     #[doc = "If the origin's account ends up below the existential deposit as a result"]
@@ -3335,7 +3459,7 @@ pub mod api {
             )]
             #[decode_as_type(crate_path = ":: subxt :: ext :: scale_decode")]
             #[encode_as_type(crate_path = ":: subxt :: ext :: scale_encode")]
-            #[doc = "An account was removed whose balance was non-zero but below ExistentialDeposit,"]
+            #[doc = "An account was removed whose balance was non-zero but below `ExistentialDeposit`,"]
             #[doc = "resulting in an outright loss."]
             pub struct DustLost {
                 pub account: dust_lost::Account,
@@ -3604,7 +3728,7 @@ pub mod api {
             )]
             #[decode_as_type(crate_path = ":: subxt :: ext :: scale_decode")]
             #[encode_as_type(crate_path = ":: subxt :: ext :: scale_encode")]
-            #[doc = "Some credit was balanced and added to the TotalIssuance."]
+            #[doc = "Some credit was balanced and added to the `TotalIssuance`."]
             pub struct MintedCredit {
                 pub amount: minted_credit::Amount,
             }
@@ -4097,6 +4221,7 @@ pub mod api {
             use super::runtime_types;
             pub struct StorageApi;
             impl StorageApi {
+                #[must_use]
                 #[doc = " The total units issued in the system."]
                 pub fn total_issuance(
                     &self,
@@ -4112,6 +4237,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The total units of outstanding deactivated balance in the system."]
                 pub fn inactive_issuance(
                     &self,
@@ -4130,6 +4256,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The Balances pallet example of storing the balance of an account."]
                 #[doc = ""]
                 #[doc = " # Example"]
@@ -4172,6 +4299,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Any liquidity locks on some account balances."]
                 #[doc = " NOTE: Should only be accessed when setting, changing and freeing a lock."]
                 #[doc = ""]
@@ -4194,6 +4322,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Named reserves on some account balances."]
                 #[doc = ""]
                 #[doc = " Use of reserves is deprecated in favour of holds. See `https://github.com/paritytech/substrate/pull/12951/`"]
@@ -4215,6 +4344,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Holds on account balances."]
                 pub fn holds(
                     &self,
@@ -4233,6 +4363,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Freeze locks on account balances."]
                 pub fn freezes(
                     &self,
@@ -4335,10 +4466,11 @@ pub mod api {
             use super::runtime_types;
             pub struct ConstantsApi;
             impl ConstantsApi {
+                #[must_use]
                 #[doc = " The minimum amount required to keep an account open. MUST BE GREATER THAN ZERO!"]
                 #[doc = ""]
                 #[doc = " If you *really* need it to be zero, you can enable the feature `insecure_zero_ed` for"]
-                #[doc = " this pallet. However, you do so at your own risk: this will open up a major DoS vector."]
+                #[doc = " this pallet. However, you do so at your own risk: this will open up a major `DoS` vector."]
                 #[doc = " In case you have multiple sources of provider references, you may also get unexpected"]
                 #[doc = " behaviour if you set this to zero."]
                 #[doc = ""]
@@ -4356,6 +4488,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The maximum number of locks that should exist on an account."]
                 #[doc = " Not strictly enforced, but used for weight estimation."]
                 #[doc = ""]
@@ -4374,6 +4507,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The maximum number of named reserves that can exist on an account."]
                 #[doc = ""]
                 #[doc = " Use of reserves is deprecated in favour of holds. See `https://github.com/paritytech/substrate/pull/12951/`"]
@@ -4391,6 +4525,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The maximum number of individual freeze locks that can exist on an account at any time."]
                 pub fn max_freezes(
                     &self,
@@ -4480,7 +4615,7 @@ pub mod api {
             )]
             #[decode_as_type(crate_path = ":: subxt :: ext :: scale_decode")]
             #[encode_as_type(crate_path = ":: subxt :: ext :: scale_encode")]
-            #[doc = "Authenticates the current sudo key and sets the given AccountId (`new`) as the new sudo"]
+            #[doc = "Authenticates the current sudo key and sets the given `AccountId` (`new`) as the new sudo"]
             #[doc = "key."]
             pub struct SetKey {
                 pub new: set_key::New,
@@ -4550,6 +4685,7 @@ pub mod api {
             pub mod api {
                 pub struct TransactionApi;
                 impl TransactionApi {
+                    #[must_use]
                     #[doc = "Authenticates the sudo key and dispatches a function call with `Root` origin."]
                     pub fn sudo(
                         &self,
@@ -4569,6 +4705,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Authenticates the sudo key and dispatches a function call with `Root` origin."]
                     #[doc = "This function does not check the weight of the call, and instead allows the"]
                     #[doc = "Sudo user to specify the weight of the call."]
@@ -4595,7 +4732,8 @@ pub mod api {
                             ],
                         )
                     }
-                    #[doc = "Authenticates the current sudo key and sets the given AccountId (`new`) as the new sudo"]
+                    #[must_use]
+                    #[doc = "Authenticates the current sudo key and sets the given `AccountId` (`new`) as the new sudo"]
                     #[doc = "key."]
                     pub fn set_key(
                         &self,
@@ -4613,6 +4751,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Authenticates the sudo key and dispatches a function call with `Signed` origin from"]
                     #[doc = "a given account."]
                     #[doc = ""]
@@ -4637,6 +4776,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Permanently removes the sudo key."]
                     #[doc = ""]
                     #[doc = "**This cannot be un-done.**"]
@@ -4763,6 +4903,7 @@ pub mod api {
             use super::runtime_types;
             pub struct StorageApi;
             impl StorageApi {
+                #[must_use]
                 #[doc = " The `AccountId` of the sudo key."]
                 pub fn key(
                     &self,
@@ -4832,6 +4973,7 @@ pub mod api {
             use super::runtime_types;
             pub struct StorageApi;
             impl StorageApi {
+                #[must_use]
                 pub fn next_fee_multiplier(
                     &self,
                 ) -> ::subxt::storage::StaticAddress<
@@ -4849,6 +4991,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 pub fn storage_version(
                     &self,
                 ) -> ::subxt::storage::StaticAddress<(), storage_version::Output, ::subxt::utils::Yes>
@@ -4864,6 +5007,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " The `OnChargeTransaction` stores the withdrawn tx fee here."]
                 #[doc = ""]
                 #[doc = " Use `withdraw_txfee` and `remaining_txfee` to access from outside the crate."]
@@ -4918,6 +5062,7 @@ pub mod api {
             use super::runtime_types;
             pub struct ConstantsApi;
             impl ConstantsApi {
+                #[must_use]
                 #[doc = " A fee multiplier for `Operational` extrinsics to compute \"virtual tip\" to boost their"]
                 #[doc = " `priority`"]
                 #[doc = ""]
@@ -5126,6 +5271,7 @@ pub mod api {
             pub mod api {
                 pub struct TransactionApi;
                 impl TransactionApi {
+                    #[must_use]
                     #[doc = "Publishes a new item and its initial revision."]
                     #[doc = ""]
                     #[doc = "The item id is derived from the signer, the supplied [`Nonce`], and"]
@@ -5161,6 +5307,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Publishes a new revision for an existing item."]
                     #[doc = ""]
                     #[doc = "Only the current item owner can publish revisions, and only while the"]
@@ -5190,6 +5337,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Marks an item as retracted."]
                     #[doc = ""]
                     #[doc = "Only the owner can retract, and only while the item still has the"]
@@ -5211,6 +5359,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Permanently disables future revisions for an item."]
                     pub fn set_not_revisionable(
                         &self,
@@ -5229,6 +5378,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Permanently disables future retraction for an item."]
                     pub fn set_not_retractable(
                         &self,
@@ -5408,6 +5558,7 @@ pub mod api {
             use super::runtime_types;
             pub struct StorageApi;
             impl StorageApi {
+                #[must_use]
                 #[doc = " Canonical item metadata keyed by deterministic [`ItemId`]."]
                 pub fn item_state(
                     &self,
@@ -5507,6 +5658,7 @@ pub mod api {
             pub mod api {
                 pub struct TransactionApi;
                 impl TransactionApi {
+                    #[must_use]
                     #[doc = "Adds a content item to the caller's ordered list."]
                     #[doc = ""]
                     #[doc = "The referenced item must exist in `pallet-content`, must not be"]
@@ -5527,6 +5679,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Removes a content item from the caller's ordered list."]
                     #[doc = ""]
                     #[doc = "Removal uses swap-with-last semantics so membership checks and"]
@@ -5613,6 +5766,7 @@ pub mod api {
             use super::runtime_types;
             pub struct StorageApi;
             impl StorageApi {
+                #[must_use]
                 #[doc = " Ordered content item ids keyed by account."]
                 pub fn account_item_ids(
                     &self,
@@ -5631,6 +5785,7 @@ pub mod api {
                         ],
                     )
                 }
+                #[must_use]
                 #[doc = " Reverse lookup from `(account, item_id)` to `index + 1` in [`AccountItemIds`]."]
                 pub fn account_item_id_index(
                     &self,
@@ -5717,6 +5872,7 @@ pub mod api {
             pub mod api {
                 pub struct TransactionApi;
                 impl TransactionApi {
+                    #[must_use]
                     #[doc = "Sets or overwrites the caller's profile pointer."]
                     #[doc = ""]
                     #[doc = "The referenced item must exist in `pallet-content`, must not be"]
@@ -5776,6 +5932,7 @@ pub mod api {
             use super::runtime_types;
             pub struct StorageApi;
             impl StorageApi {
+                #[must_use]
                 #[doc = " Profile content item currently associated with each account."]
                 pub fn account_profile(
                     &self,
@@ -5854,6 +6011,7 @@ pub mod api {
             pub mod api {
                 pub struct TransactionApi;
                 impl TransactionApi {
+                    #[must_use]
                     #[doc = "Sets the caller's full reaction set for a specific item revision,"]
                     #[doc = "replacing any prior reactions."]
                     #[doc = ""]
@@ -6232,6 +6390,7 @@ pub mod api {
             pub mod api {
                 pub struct TransactionApi;
                 impl TransactionApi {
+                    #[must_use]
                     #[doc = "Send a batch of dispatch calls."]
                     #[doc = ""]
                     #[doc = "May be called from any origin except `None`."]
@@ -6266,6 +6425,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Send a call through an indexed pseudonym of the sender."]
                     #[doc = ""]
                     #[doc = "Filter from origin are passed along. The call will be dispatched with an origin which"]
@@ -6300,6 +6460,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Send a batch of dispatch calls and atomically execute them."]
                     #[doc = "The whole transaction will rollback and fail if any of the calls failed."]
                     #[doc = ""]
@@ -6329,6 +6490,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Dispatches a function call with a provided origin."]
                     #[doc = ""]
                     #[doc = "The dispatch origin for this call must be _Root_."]
@@ -6356,6 +6518,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Send a batch of dispatch calls."]
                     #[doc = "Unlike `batch`, it allows errors and won't interrupt."]
                     #[doc = ""]
@@ -6386,6 +6549,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Dispatch a function call with a specified weight."]
                     #[doc = ""]
                     #[doc = "This function does not check the weight of the call, and instead allows the"]
@@ -6413,6 +6577,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Dispatch a fallback call in the event the main call fails to execute."]
                     #[doc = "May be called from any origin except `None`."]
                     #[doc = ""]
@@ -6456,6 +6621,7 @@ pub mod api {
                             ],
                         )
                     }
+                    #[must_use]
                     #[doc = "Dispatches a function call with a provided origin."]
                     #[doc = ""]
                     #[doc = "Almost the same as [`Pallet::dispatch_as`] but forwards any error of the inner call."]
@@ -6666,6 +6832,7 @@ pub mod api {
             use super::runtime_types;
             pub struct ConstantsApi;
             impl ConstantsApi {
+                #[must_use]
                 #[doc = " The limit on the number of batched calls."]
                 pub fn batched_calls_limit(
                     &self,
@@ -7680,7 +7847,7 @@ pub mod api {
                         free_balance: ::core::primitive::u128,
                     },
                     #[codec(index = 1)]
-                    #[doc = "An account was removed whose balance was non-zero but below ExistentialDeposit,"]
+                    #[doc = "An account was removed whose balance was non-zero but below `ExistentialDeposit`,"]
                     #[doc = "resulting in an outright loss."]
                     DustLost {
                         account: ::subxt::utils::AccountId32,
@@ -7746,7 +7913,7 @@ pub mod api {
                         amount: ::core::primitive::u128,
                     },
                     #[codec(index = 11)]
-                    #[doc = "Some credit was balanced and added to the TotalIssuance."]
+                    #[doc = "Some credit was balanced and added to the `TotalIssuance`."]
                     MintedCredit { amount: ::core::primitive::u128 },
                     #[codec(index = 12)]
                     #[doc = "Some amount was burned from an account."]
@@ -8245,7 +8412,7 @@ pub mod api {
                         weight: runtime_types::sp_weights::weight_v2::Weight,
                     },
                     #[codec(index = 2)]
-                    #[doc = "Authenticates the current sudo key and sets the given AccountId (`new`) as the new sudo"]
+                    #[doc = "Authenticates the current sudo key and sets the given `AccountId` (`new`) as the new sudo"]
                     #[doc = "key."]
                     set_key {
                         new: ::subxt::utils::MultiAddress<::subxt::utils::AccountId32, ()>,

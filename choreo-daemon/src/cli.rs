@@ -122,15 +122,14 @@ fn acl_add_to(path: &std::path::Path, pubkey_b64: &str) -> anyhow::Result<usize>
 /// Print the fingerprint of a transport public key (see `Command::Fingerprint`).
 fn fingerprint_cli(path: Option<&str>) -> anyhow::Result<()> {
     use choreo_transport::key::{fingerprint, fingerprint_of_file, read_server_pk};
-    let fp = match path {
-        Some(p) => fingerprint_of_file(std::path::Path::new(p))
-            .with_context(|| format!("failed to fingerprint key file {p}"))?,
-        None => {
-            let pk = read_server_pk(None).context(
-                "failed to read this machine's transport public key (has the daemon ever run here?)",
-            )?;
-            fingerprint(&pk)
-        }
+    let fp = if let Some(p) = path {
+        fingerprint_of_file(std::path::Path::new(p))
+            .with_context(|| format!("failed to fingerprint key file {p}"))?
+    } else {
+        let pk = read_server_pk(None).context(
+            "failed to read this machine's transport public key (has the daemon ever run here?)",
+        )?;
+        fingerprint(&pk)
     };
     println!("{fp}");
     Ok(())
@@ -166,11 +165,22 @@ fn resolve_max_turns() -> anyhow::Result<u32> {
 
 /// Parse the `CHOREOGRAPHR_MAX_TURNS` value. Kept as a pure function so the
 /// parsing behavior is unit-testable without touching process-global env.
+///
+/// # Errors
+///
+/// Returns Err if the value is not a valid `u32`.
 fn parse_max_turns_env(val: &str) -> anyhow::Result<u32> {
     val.parse::<u32>()
         .map_err(|e| anyhow::anyhow!("CHOREOGRAPHR_MAX_TURNS={val:?} is not a valid u32: {e}"))
 }
 
+/// Daemon entry point: parse CLI args, initialize logging, and run the
+/// daemon.
+///
+/// # Errors
+///
+/// Returns Err if argument parsing, config loading, daemon startup, or the
+/// run loop fails; the error is reported to stderr before exit.
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -274,10 +284,10 @@ pub fn main() -> anyhow::Result<()> {
     crate::run_server(
         &socket_path,
         state,
-        cli.metrics_addr,
-        cli.tcp_addr,
+        cli.metrics_addr.as_ref(),
+        cli.tcp_addr.as_ref(),
         transport_sk,
-        acl,
+        &acl,
     )
     .context("failed to run server")
 }
@@ -329,11 +339,11 @@ mod tests {
 
     #[test]
     fn acl_add_to_rejects_bad_keys() {
+        use base64::Engine as _;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("authorized_clients.toml");
         assert!(acl_add_to(&path, "not-base64!!!").is_err());
         // Valid base64, wrong decoded length.
-        use base64::Engine as _;
         let short = base64::engine::general_purpose::STANDARD.encode([9u8; 16]);
         assert!(acl_add_to(&path, &short).is_err());
         // Nothing was written for the rejected keys.
@@ -367,16 +377,15 @@ mod tests {
 
     /// `--version` is handled by clap before any real arg parsing: it exits
     /// with a `DisplayVersion` error whose message is the version string.
-    /// Assert both so the flag stays wired to CARGO_PKG_VERSION (it breaks
+    /// Assert both so the flag stays wired to `CARGO_PKG_VERSION` (it breaks
     /// silently if the derive attribute loses the bare `version` marker).
     #[test]
     fn version_flag_displays_package_version() {
         // clap returns the version as a `DisplayVersion` error instead of a
         // value; match it out by hand (Cli doesn't derive Debug, so
         // `unwrap_err()`'s Debug bound doesn't apply).
-        let err = match Cli::try_parse_from(["choreographr", "--version"]) {
-            Err(e) => e,
-            Ok(_) => panic!("--version should short-circuit before arg validation"),
+        let Err(err) = Cli::try_parse_from(["choreographr", "--version"]) else {
+            panic!("--version should short-circuit before arg validation")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));

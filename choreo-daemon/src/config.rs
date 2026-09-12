@@ -15,6 +15,11 @@ pub struct DaemonConfig {
     pub context: ContextConfig,
 }
 
+/// Resolve the config.toml path (e.g. ~/.config/choreographr/config.toml).
+///
+/// # Errors
+///
+/// Returns Err if the user's standard config directory cannot be determined.
 pub fn config_path() -> io::Result<PathBuf> {
     let config_dir = dirs::config_dir().ok_or_else(|| {
         io::Error::new(
@@ -24,13 +29,17 @@ pub fn config_path() -> io::Result<PathBuf> {
     })?;
     Ok(config_dir.join("choreographr").join("config.toml"))
 }
-
 /// Load daemon-level configuration from config.toml.
 ///
 /// Only daemon-level fields are parsed (`max_turns`, `[context]`);
 /// provider-level fields are ignored (they belong in accounts.toml, see
 /// [`crate::accounts`]). Returns `DaemonConfig::default()` when the file
 /// does not exist.
+///
+/// # Errors
+///
+/// Returns Err if the config path cannot be resolved, the file cannot be
+/// read, or it is not valid TOML.
 pub fn load_daemon_config() -> io::Result<DaemonConfig> {
     let path = config_path()?;
     if !path.exists() {
@@ -57,6 +66,11 @@ pub fn load_daemon_config() -> io::Result<DaemonConfig> {
 ///
 /// Provider-level fields in config.toml are no longer read.  This function
 /// returns default provider settings; configure those in accounts.toml.
+///
+/// # Errors
+///
+/// Returns Err if the daemon config cannot be loaded while checking for
+/// deprecated fields (the warning is logged and the error propagated).
 #[deprecated(
     since = "0.1.0",
     note = "provider-level config has moved to accounts.toml; use load_daemon_config() for daemon settings"

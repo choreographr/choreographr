@@ -78,6 +78,7 @@ impl ConfigWatcher {
     /// A watcher over `dir`. The directory is created (log-only on failure)
     /// by the transport thread when it spawns, so it does not need to exist
     /// yet.
+    #[must_use]
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
@@ -104,14 +105,14 @@ impl ConfigWatcher {
     pub fn spawn(self) {
         let _ = std::thread::Builder::new()
             .name("config-watch".into())
-            .spawn(move || transport_loop(self.subscribers, self.dir));
+            .spawn(move || transport_loop(&self.subscribers, &self.dir));
     }
 }
 
 /// Map a raw `notify` event kind onto our coarse [`ChangeKind`]. Returns
-/// `None` for pure `Access`/`Other` noise (e.g. macOS FSEvents access
+/// `None` for pure `Access`/`Other` noise (e.g. macOS `FSEvents` access
 /// reports) that must never trigger a reload.
-fn classify(kind: &notify::EventKind) -> Option<ChangeKind> {
+fn classify(kind: notify::EventKind) -> Option<ChangeKind> {
     match kind {
         notify::EventKind::Create(_) => Some(ChangeKind::Create),
         notify::EventKind::Modify(_) => Some(ChangeKind::Modify),
@@ -129,7 +130,7 @@ fn route(
     subscribers: &HashMap<PathBuf, Vec<Sender<ConfigChange>>>,
     event: &notify::Event,
 ) -> Vec<(PathBuf, ChangeKind)> {
-    let Some(kind) = classify(&event.kind) else {
+    let Some(kind) = classify(event.kind) else {
         return Vec::new();
     };
     // The basenames named in this event (an event can carry several paths).
@@ -219,7 +220,7 @@ fn snapshot_content(dir: &Path, basename: &Path) -> Option<Vec<u8>> {
 ///   for that write already reached subscribers, or the change is pre-watch
 ///   baseline — replaying a no-op would be a spurious reload).
 ///
-/// Pure relative to (dir, last_known) — no sleeps, no kernel overflow needed —
+/// Pure relative to (dir, `last_known`) — no sleeps, no kernel overflow needed —
 /// so unit tests drive it directly with a temp dir.
 fn rescan_changes(
     dir: &Path,
@@ -270,8 +271,8 @@ fn note_routed_state(
 /// routes every raw event to the matching subscribers. Re-arms the watch on a
 /// fixed cadence while it is unarmed (a dir deleted at runtime, or a
 /// creation failure above that has since been fixed).
-fn transport_loop(subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir: PathBuf) {
-    ensure_config_dir(&dir);
+fn transport_loop(subscribers: &HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir: &Path) {
+    ensure_config_dir(dir);
 
     // Last-known content per registered basename, used only to decide what an
     // overflow rescan must replay (see `rescan_changes`). Owned exclusively by
@@ -303,7 +304,7 @@ fn transport_loop(subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir:
         // dir whose creation failed at spawn). Debug, not warn: this retries
         // on a fixed cadence until it succeeds, so a warn would spam the log.
         if !armed && let Some(w) = watcher.as_mut() {
-            match w.watch(&dir, RecursiveMode::NonRecursive) {
+            match w.watch(dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     armed = true;
                     info!(
@@ -327,12 +328,11 @@ fn transport_loop(subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir:
         // RecvTimeoutError), so they are handled in separate arms that both
         // fall through to the same routing below.
         let raw = if armed {
-            match raw_rx.recv() {
-                Ok(raw) => raw,
-                Err(_) => {
-                    info!("config watch raw channel closed; exiting");
-                    break;
-                }
+            if let Ok(raw) = raw_rx.recv() {
+                raw
+            } else {
+                info!("config watch raw channel closed; exiting");
+                break;
             }
         } else {
             match raw_rx.recv_timeout(REARM_INTERVAL) {
@@ -353,7 +353,7 @@ fn transport_loop(subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir:
                 // runtime), the inotify/kqueue watch is now dead — drop `armed`
                 // so the loop re-arms once the directory comes back, instead of
                 // sitting on a stale watch that never fires again.
-                if armed && dir_was_removed(&dir, &event) {
+                if armed && dir_was_removed(dir, &event) {
                     armed = false;
                     info!(
                         dir = %dir.display(),
@@ -372,10 +372,10 @@ fn transport_loop(subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir:
                         dir = %dir.display(),
                         "watcher queue overflow detected; rescanning the config dir",
                     );
-                    for (basename, kind) in rescan_changes(&dir, &subscribers, &mut last_known) {
+                    for (basename, kind) in rescan_changes(dir, subscribers, &mut last_known) {
                         debug!(basename = %basename.display(), ?kind,
                             "overflow rescan synthesized a change");
-                        deliver(&subscribers, &dir, &basename, kind);
+                        deliver(subscribers, dir, &basename, kind);
                     }
                     debug!(
                         dir = %dir.display(),
@@ -383,17 +383,17 @@ fn transport_loop(subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir:
                         "overflow rescan complete; last-known state refreshed",
                     );
                 } else {
-                    let routed = route(&subscribers, &event);
+                    let routed = route(subscribers, &event);
                     // Snapshot BEFORE delivery (single thread — either order
                     // is race-free); what matters is refreshing the view per
                     // real event, so a subsequent overflow rescan compares
                     // against the freshest on-disk content rather than a
                     // stale view and replays nothing subscribers already
                     // saw (or never saw, because nothing diverged).
-                    note_routed_state(&dir, &mut last_known, &routed);
+                    note_routed_state(dir, &mut last_known, &routed);
                     for (basename, kind) in routed {
                         trace!(basename = %basename.display(), ?kind, "delivering config change");
-                        deliver(&subscribers, &dir, &basename, kind);
+                        deliver(subscribers, dir, &basename, kind);
                     }
                 }
             }
@@ -405,10 +405,10 @@ fn transport_loop(subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir:
                 // nothing actually diverged.
                 warn!(error = %e, dir = %dir.display(),
                     "config watcher error; rescanning the config dir to replay any missed changes");
-                for (basename, kind) in rescan_changes(&dir, &subscribers, &mut last_known) {
+                for (basename, kind) in rescan_changes(dir, subscribers, &mut last_known) {
                     debug!(basename = %basename.display(), ?kind,
                         "error-path rescan synthesized a change");
-                    deliver(&subscribers, &dir, &basename, kind);
+                    deliver(subscribers, dir, &basename, kind);
                 }
             }
         }
@@ -431,23 +431,23 @@ mod tests {
     fn classify_strips_access_and_other_noise() {
         // Pure Access/Other events must never surface a reload.
         assert_eq!(
-            classify(&notify::EventKind::Access(notify::event::AccessKind::Read)),
+            classify(notify::EventKind::Access(notify::event::AccessKind::Read)),
             None
         );
-        assert_eq!(classify(&notify::EventKind::Other), None);
+        assert_eq!(classify(notify::EventKind::Other), None);
         // Create/Modify/Remove map onto the coarse kinds.
         assert_eq!(
-            classify(&notify::EventKind::Create(notify::event::CreateKind::File)),
+            classify(notify::EventKind::Create(notify::event::CreateKind::File)),
             Some(ChangeKind::Create)
         );
         assert_eq!(
-            classify(&notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            classify(notify::EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Any
             ))),
             Some(ChangeKind::Modify)
         );
         assert_eq!(
-            classify(&notify::EventKind::Remove(notify::event::RemoveKind::File)),
+            classify(notify::EventKind::Remove(notify::event::RemoveKind::File)),
             Some(ChangeKind::Remove)
         );
     }
@@ -502,10 +502,7 @@ mod tests {
             notify::EventKind::Remove(notify::event::RemoveKind::File),
         ] {
             let routed = route(&subs, &event(Path::new("/cfg/models-overlay.toml"), kind));
-            assert_eq!(
-                routed,
-                vec![(overlay.clone(), ChangeKind::from_kind(&kind))]
-            );
+            assert_eq!(routed, vec![(overlay.clone(), ChangeKind::from_kind(kind))]);
         }
 
         // A different file in the same directory does not route to overlay.
@@ -528,7 +525,7 @@ mod tests {
                 )),
             ),
         );
-        assert!(routed.is_empty());
+        assert_eq!(routed, [] as [(PathBuf, ChangeKind); 0]);
 
         // Pure access noise never routes, even for a registered basename.
         let routed = route(
@@ -538,7 +535,7 @@ mod tests {
                 notify::EventKind::Access(notify::event::AccessKind::Read),
             ),
         );
-        assert!(routed.is_empty());
+        assert_eq!(routed, [] as [(PathBuf, ChangeKind); 0]);
     }
 
     #[test]
@@ -584,7 +581,10 @@ mod tests {
             assert!(changes.contains(&pair), "missing replay of {pair:?}");
         }
         // Rescans are idempotent: no divergence, nothing replayed.
-        assert!(rescan_changes(d, &subs, &mut last_known).is_empty());
+        assert_eq!(
+            rescan_changes(d, &subs, &mut last_known),
+            [] as [(PathBuf, ChangeKind); 0]
+        );
 
         // Content change with no real event seen → Modify.
         std::fs::write(d.join("accounts.toml"), "a = 2\n").unwrap();
@@ -600,7 +600,10 @@ mod tests {
             rescan_changes(d, &subs, &mut last_known),
             vec![(PathBuf::from("accounts.toml"), ChangeKind::Remove)]
         );
-        assert!(rescan_changes(d, &subs, &mut last_known).is_empty());
+        assert_eq!(
+            rescan_changes(d, &subs, &mut last_known),
+            [] as [(PathBuf, ChangeKind); 0]
+        );
 
         // Recreation after a Remove replays as a Create again.
         std::fs::write(d.join("accounts.toml"), "a = 3\n").unwrap();
@@ -642,7 +645,10 @@ mod tests {
         let routed = vec![(PathBuf::from("accounts.toml"), ChangeKind::Create)];
         note_routed_state(d, &mut last_known, &routed);
         // An overflow right after must NOT replay it (subscribers already saw it).
-        assert!(rescan_changes(d, &subs, &mut last_known).is_empty());
+        assert_eq!(
+            rescan_changes(d, &subs, &mut last_known),
+            [] as [(PathBuf, ChangeKind); 0]
+        );
 
         // The file vanishing without a real Remove event still replays.
         std::fs::remove_file(d.join("accounts.toml")).unwrap();
@@ -654,7 +660,7 @@ mod tests {
 
     // Map a notify kind back to our coarse kind for the assertion helper.
     impl ChangeKind {
-        fn from_kind(kind: &notify::EventKind) -> ChangeKind {
+        fn from_kind(kind: notify::EventKind) -> ChangeKind {
             classify(kind).expect("event kind is classified")
         }
     }

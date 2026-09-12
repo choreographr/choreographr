@@ -11,7 +11,6 @@
 
 use crate::daemon::{DaemonCommand, DaemonState};
 use crate::sessions::SessionCommand;
-use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -56,14 +55,14 @@ pub(crate) struct DaemonCore {
     /// to every connection's writer thread that the command loop and session
     /// threads increment on enqueue.
     pub global_lag: Arc<AtomicUsize>,
-    /// Daemon-wide live-connection counter backing MAX_CONCURRENT_CONNECTIONS.
+    /// Daemon-wide live-connection counter backing `MAX_CONCURRENT_CONNECTIONS`.
     /// Created here (not in the adapters) because BOTH accept paths take a
     /// slot per accepted connection — the cap must be enforced atomically
     /// across the Unix main thread and the TCP accept thread, so the Arc must
     /// exist before either adapter is spawned. See ARCHITECTURE.md
     /// (exception #3) for the lock-free rationale.
     pub conn_count: Arc<AtomicUsize>,
-    /// JoinHandle of the command-loop thread; the shutdown drain joins it
+    /// `JoinHandle` of the command-loop thread; the shutdown drain joins it
     /// after sending `Shutdown` and dropping `daemon_tx`.
     pub cmd_handle: thread::JoinHandle<()>,
 }
@@ -83,7 +82,7 @@ fn spawn_power_event_forwarder(
     let _ = thread::Builder::new()
         .name("power-events".into())
         .spawn(move || {
-            for event in power_rx.iter() {
+            for event in &power_rx {
                 debug!(?event, "power event received; forwarding to command loop");
                 if daemon_tx.send(DaemonCommand::PowerEvent(event)).is_err() {
                     info!("daemon command loop gone; stopping power-event forwarder");
@@ -100,7 +99,10 @@ fn spawn_power_event_forwarder(
 /// Everything a transport adapter needs afterwards comes back in
 /// [`DaemonCore`]; no listener is created or touched here, so the Unix and
 /// (future) embedded daemon share this exact assembly.
-pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> io::Result<DaemonCore> {
+// The assembly cannot fail: every fallible step degrades gracefully (no ACL
+// dir → no hot-reload, no config dir → never-delivering receivers), so the
+// function returns `DaemonCore` directly instead of a transparent Ok wrapper.
+pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> DaemonCore {
     let mut state = state;
     let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
     state.daemon_tx = daemon_tx.clone();
@@ -276,11 +278,11 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> io::Re
         info!("command loop teardown: complete");
     });
 
-    Ok(DaemonCore {
+    DaemonCore {
         daemon_tx,
         shutdown,
         global_lag,
         conn_count,
         cmd_handle,
-    })
+    }
 }

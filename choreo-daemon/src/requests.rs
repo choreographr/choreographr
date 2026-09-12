@@ -73,7 +73,7 @@ fn resolve_reasoning_effort(
 }
 
 /// Estimate the number of prompt tokens for the current request using
-/// tiktoken.  Returns a (encoding, estimated_tokens) pair so the caller
+/// tiktoken.  Returns a (encoding, `estimated_tokens`) pair so the caller
 /// can reuse the encoding for output-token counting during streaming.
 ///
 /// The estimate counts the `messages` slice as-is, which is the FULL visible
@@ -94,73 +94,85 @@ fn estimate_prompt_tokens(
 ) -> (Option<&'static tiktoken::CoreBpe>, u32) {
     let encoding =
         tiktoken::encoding_for_model(model).or_else(|| tiktoken::get_encoding("cl100k_base"));
-    let estimated = match &encoding {
-        Some(enc) => {
-            // Reasoning artifacts are NOT excluded: since phase 4b the builder
-            // attaches them to assistant messages under echo policies
-            // (ToolLoop/AllTurns/Signature), and providers bill replayed
-            // reasoning as input tokens (the round-trip payload is part of the
-            // context on keep-all models). The legacy string fields
-            // (reasoning_content/reasoning/reasoning_text) are still never
-            // populated by the daemon, so only `reasoning_artifact` is counted.
-            let content_tokens: u32 = messages
-                .iter()
-                .filter_map(|m| m.content.as_deref())
-                .map(|text| enc.count(text) as u32)
-                .sum();
+    let estimated = if let Some(enc) = &encoding {
+        // Reasoning artifacts are NOT excluded: since phase 4b the builder
+        // attaches them to assistant messages under echo policies
+        // (ToolLoop/AllTurns/Signature), and providers bill replayed
+        // reasoning as input tokens (the round-trip payload is part of the
+        // context on keep-all models). The legacy string fields
+        // (reasoning_content/reasoning/reasoning_text) are still never
+        // populated by the daemon, so only `reasoning_artifact` is counted.
+        let content_tokens: u32 = messages
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            // u128→u32 token counts: real conversations are far below u32::MAX,
+            // and the estimate is informational (billing uses provider usage).
+            .map(|text| {
+                let n = enc.count(text);
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    n as u32
+                }
+            })
+            .sum();
 
-            // Vision images are billed by the provider as tokens based on their
-            // (resized) dimensions. We don't know the exact per-provider
-            // tokenizer for images, so use the fixed estimate the surveyed
-            // agents converge on (~1000 tokens/image): the estimate feeds the
-            // context-window display and compaction weighting, not billing.
-            let image_tokens: u32 = messages
-                .iter()
-                .map(|m| (m.images.len() as u32).saturating_mul(IMAGE_TOKEN_ESTIMATE))
-                .sum();
+        // Vision images are billed by the provider as tokens based on their
+        // (resized) dimensions. We don't know the exact per-provider
+        // tokenizer for images, so use the fixed estimate the surveyed
+        // agents converge on (~1000 tokens/image): the estimate feeds the
+        // context-window display and compaction weighting, not billing.
+        let image_tokens: u32 = messages
+            .iter()
+            .map(|m| {
+                #[allow(clippy::cast_possible_truncation)]
+                // usize→u32 image count: turns never carry 4 billion images
+                (m.images.len() as u32).saturating_mul(IMAGE_TOKEN_ESTIMATE)
+            })
+            .sum();
 
-            let tool_call_tokens: u32 = messages
-                .iter()
-                .filter_map(|m| m.tool_calls.as_ref())
-                .flat_map(|calls| calls.iter())
-                .map(|tc| {
-                    enc.count(&tc.id) as u32
-                        + enc.count(&tc.kind) as u32
-                        + enc.count(&tc.function.name) as u32
-                        + enc.count(&tc.function.arguments) as u32
-                })
-                .sum();
+        let tool_call_tokens: u32 = messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flat_map(|calls| calls.iter())
+            .map(|tc| {
+                #[allow(clippy::cast_possible_truncation)]
+                // u128→u32 token counts, informational only
+                let tc_tokens = (enc.count(&tc.id) + enc.count(&tc.kind)) as u32
+                    + (enc.count(&tc.function.name) + enc.count(&tc.function.arguments)) as u32;
+                tc_tokens
+            })
+            .sum();
 
-            let tool_def_tokens: u32 = tools
-                .iter()
-                .filter_map(|def| {
-                    match serde_json::to_string(def) {
-                        Ok(s) => Some(enc.count(&s) as u32),
-                        Err(e) => {
-                            warn!(error = %e, "failed to serialize tool definition for token estimation");
-                            None
-                        }
-                    }
-                })
-                .sum();
+        let tool_def_tokens: u32 = tools
+            .iter()
+            .filter_map(|def| match serde_json::to_string(def) {
+                Ok(s) => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    // u128→u32 token counts, informational only
+                    Some(enc.count(&s) as u32)
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to serialize tool definition for token estimation");
+                    None
+                }
+            })
+            .sum();
 
-            let artifact_tokens: u32 = messages
-                .iter()
-                .filter_map(|m| m.reasoning_artifact.as_ref())
-                .map(|artifact| reasoning_artifact_tokens(enc, artifact))
-                .sum();
+        let artifact_tokens: u32 = messages
+            .iter()
+            .filter_map(|m| m.reasoning_artifact.as_ref())
+            .map(|artifact| reasoning_artifact_tokens(enc, artifact))
+            .sum();
 
-            content_tokens + tool_call_tokens + tool_def_tokens + artifact_tokens + image_tokens
-        }
-        None => {
-            // Effectively unreachable — `get_encoding("cl100k_base")` above
-            // always succeeds — but kept as defense-in-depth: if the fallback
-            // encoding ever fails to load, report 0 rather than panic or reuse
-            // a stale estimate. The estimate is informational only (billing
-            // uses the provider-reported usage).
-            tracing::warn!("no tiktoken encoding available for {model}");
-            0
-        }
+        content_tokens + tool_call_tokens + tool_def_tokens + artifact_tokens + image_tokens
+    } else {
+        // Effectively unreachable — `get_encoding("cl100k_base")` above
+        // always succeeds — but kept as defense-in-depth: if the fallback
+        // encoding ever fails to load, report 0 rather than panic or reuse
+        // a stale estimate. The estimate is informational only (billing
+        // uses the provider-reported usage).
+        tracing::warn!("no tiktoken encoding available for {model}");
+        0
     };
     (encoding, estimated)
 }
@@ -171,7 +183,7 @@ fn estimate_prompt_tokens(
 /// so the accumulator fed to the provider on the next call is re-sorted to
 /// match the assistant message's `tool_calls` array: some providers match
 /// tool messages positionally, and the order should be deterministic. Items
-/// whose `call_id` has no matching tool_call (e.g. a streaming stub created
+/// whose `call_id` has no matching `tool_call` (e.g. a streaming stub created
 /// before the start event arrived) sink to the end, keeping their relative
 /// order (stable sort). The turn's own `tool_results` never need this — they
 /// are seeded in call order and updated in place by `call_id`, so their
@@ -196,7 +208,7 @@ fn sort_by_call_order<T>(
 /// applied to the worker's config copy in Phase 3.
 ///
 /// The authoritative mutation is applied by the session main loop (via
-/// DaemonCommand → SessionCommand routing); this worker copy must be updated
+/// `DaemonCommand` → `SessionCommand` routing); this worker copy must be updated
 /// as well so the NEXT agent-loop iteration observes the change when it
 /// rebuilds tool definitions, system content, and working-dir-relative file
 /// operations.
@@ -349,7 +361,7 @@ pub(crate) fn run_agent_loop(
     request_id: u32,
     cancel_rx: &crossbeam_channel::Receiver<()>,
     ctx: &RequestContext,
-    user_text: Option<String>,
+    user_text: Option<&str>,
 ) -> io::Result<bool> {
     let max_turns = ctx.max_turns;
     // `max_turns == 0` means *unlimited* — the loop runs until the model
@@ -415,7 +427,7 @@ pub(crate) fn run_agent_loop(
 
         // Start a new turn for this agent loop iteration.
         let turn_user_text = if turn_iter == 0 {
-            user_text.clone()
+            user_text.map(std::string::ToString::to_string)
         } else {
             None
         };
@@ -434,7 +446,7 @@ pub(crate) fn run_agent_loop(
             // mutable borrows that follow (start_turn, set_assistant_response, etc.).
             let skills: &[SkillMeta] = session.discovered_skills.as_deref().unwrap_or_default();
             build_system_content(
-                SystemContentParams {
+                &SystemContentParams {
                     working_dir: session.config.working_dir.as_deref(),
                     context_config: &session.config.context_config,
                     skills,
@@ -476,6 +488,8 @@ pub(crate) fn run_agent_loop(
                 let _ = cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Retrying {
                     attempt,
                     max_attempts,
+                    // u128→u64: retry delays are at most minutes; no truncation in practice.
+                    #[allow(clippy::cast_possible_truncation)]
                     delay_ms: delay.as_millis() as u64,
                 }));
             }
@@ -510,7 +524,12 @@ pub(crate) fn run_agent_loop(
                 match event {
                     StreamEvent::Answer(text) => {
                         if let Some(enc) = &encoding {
-                            output_token_count += enc.count(&text) as u32;
+                            // u128→u32 token counts, informational only.
+                            let n = enc.count(&text);
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                output_token_count += n as u32;
+                            }
                         }
                         let _ =
                             ctx.cmd_tx
@@ -536,7 +555,12 @@ pub(crate) fn run_agent_loop(
                     }
                     StreamEvent::Reasoning(text) => {
                         if let Some(enc) = &encoding {
-                            output_token_count += enc.count(&text) as u32;
+                            // u128→u32 token counts, informational only.
+                            let n = enc.count(&text);
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                output_token_count += n as u32;
+                            }
                         }
                         let _ =
                             ctx.cmd_tx
@@ -575,7 +599,7 @@ pub(crate) fn run_agent_loop(
                     "model returned final text",
                 );
                 let token_usage = final_text.usage;
-                accumulate_token_usage(session, &token_usage, turn_iter, ctx);
+                accumulate_token_usage(session, token_usage.as_ref(), turn_iter, ctx);
                 broadcast_token_usage(ctx, session);
                 // Cheap display hook for the finish-reason truncation flag:
                 // `length` on a final-text turn means the answer was cut off
@@ -621,7 +645,10 @@ pub(crate) fn run_agent_loop(
                 // invocation only when the same provider+model is still
                 // active — the id is service-bound and must not be replayed
                 // into a different provider).
-                session.config.last_response_id = final_text.response_id.clone();
+                session
+                    .config
+                    .last_response_id
+                    .clone_from(&final_text.response_id);
                 session.config.last_response_id_producer = Some(producer);
                 finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
                 tool_results.clear();
@@ -629,7 +656,7 @@ pub(crate) fn run_agent_loop(
             }
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 let token_usage = tool_use.usage;
-                accumulate_token_usage(session, &token_usage, turn_iter, ctx);
+                accumulate_token_usage(session, token_usage.as_ref(), turn_iter, ctx);
                 broadcast_token_usage(ctx, session);
                 // Build the call records once so the same ordered list seeds
                 // both the assistant message's tool_calls and the placeholder
@@ -704,8 +731,8 @@ pub(crate) fn run_agent_loop(
                 // config so ResponseId-policy providers can chain across user
                 // turns (restored at the top of the next loop invocation only
                 // when the same provider+model is still active).
-                prev_resp_id = tool_use.response_id.clone();
-                session.config.last_response_id = prev_resp_id.clone();
+                prev_resp_id.clone_from(&tool_use.response_id);
+                session.config.last_response_id.clone_from(&prev_resp_id);
                 session.config.last_response_id_producer = Some(producer);
                 tool_results.clear();
 
@@ -747,7 +774,7 @@ pub(crate) fn run_agent_loop(
                 let mut executed_tool_calls: HashSet<String> = HashSet::new();
 
                 // ── Phase 1: Session-config tools (serial) ────────
-                for tool_call in mutators.into_iter() {
+                for tool_call in mutators {
                     if is_cancelled_once(cancel_rx) {
                         cancelled = true;
                         break;
@@ -872,7 +899,7 @@ pub(crate) fn run_agent_loop(
 
                 // ── Phase 2: All remaining tools (concurrent) ───────
                 if !cancelled && !concurrent.is_empty() {
-                    for tc in concurrent.iter() {
+                    for tc in &concurrent {
                         // Carry the invocation description (computed once,
                         // above) on the start event so clients render the
                         // tool's context (e.g. "Running command: `…`.") from
@@ -945,7 +972,7 @@ pub(crate) fn run_agent_loop(
                     // (rare) fallback synthesis below: rebuilding the results
                     // of wait-loop threads that died before delivering.
                     let mut call_infos: Vec<CallInfo> = Vec::with_capacity(concurrent.len());
-                    for tool_call in concurrent.into_iter() {
+                    for tool_call in concurrent {
                         let timeout =
                             determine_tool_timeout(&tool_call.name, &tool_call.arguments_json);
                         let invocation_description = description_by_call
@@ -1118,54 +1145,48 @@ pub(crate) fn run_agent_loop(
                             // delivering — synthesize its result, matching the
                             // normal batch-end path below.
                             while delivered.len() < batch_size {
-                                match batch_rx.recv() {
-                                    Ok(handle) => {
-                                        delivered.insert(handle.tool_call.id.clone());
-                                        process_tool_handle(handle);
-                                    }
-                                    Err(_) => {
-                                        warn!(
-                                            session_id = ctx.session_id,
-                                            request_id,
-                                            delivered = delivered.len(),
-                                            expected = batch_size,
-                                            "concurrent tool batch ended early after cancel; synthesizing missing tool results",
-                                        );
-                                        for info in missing_calls(&call_infos, &delivered) {
-                                            process_tool_handle(panic_tool_handle(info));
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        if let Some(msg) = handle_msg {
-                            match msg {
-                                Ok(handle) => {
+                                if let Ok(handle) = batch_rx.recv() {
                                     delivered.insert(handle.tool_call.id.clone());
                                     process_tool_handle(handle);
-                                }
-                                Err(_) => {
-                                    // Every wait-loop thread has exited but fewer
-                                    // handles arrived than expected: some thread
-                                    // panicked before sending. Synthesize the same
-                                    // "tool thread panicked" output the old
-                                    // join-based path produced, for the missing
-                                    // slots only (by call_id), so the turn still
-                                    // records a result for every call.
+                                } else {
                                     warn!(
                                         session_id = ctx.session_id,
                                         request_id,
                                         delivered = delivered.len(),
                                         expected = batch_size,
-                                        "concurrent tool batch ended early; synthesizing missing tool results",
+                                        "concurrent tool batch ended early after cancel; synthesizing missing tool results",
                                     );
                                     for info in missing_calls(&call_infos, &delivered) {
                                         process_tool_handle(panic_tool_handle(info));
                                     }
                                     break;
                                 }
+                            }
+                            break;
+                        }
+                        if let Some(msg) = handle_msg {
+                            if let Ok(handle) = msg {
+                                delivered.insert(handle.tool_call.id.clone());
+                                process_tool_handle(handle);
+                            } else {
+                                // Every wait-loop thread has exited but fewer
+                                // handles arrived than expected: some thread
+                                // panicked before sending. Synthesize the same
+                                // "tool thread panicked" output the old
+                                // join-based path produced, for the missing
+                                // slots only (by call_id), so the turn still
+                                // records a result for every call.
+                                warn!(
+                                    session_id = ctx.session_id,
+                                    request_id,
+                                    delivered = delivered.len(),
+                                    expected = batch_size,
+                                    "concurrent tool batch ended early; synthesizing missing tool results",
+                                );
+                                for info in missing_calls(&call_infos, &delivered) {
+                                    process_tool_handle(panic_tool_handle(info));
+                                }
+                                break;
                             }
                         }
                     }
@@ -1294,7 +1315,7 @@ pub(crate) fn run_agent_loop(
 /// Fixed per-image token estimate for prompt-token accounting. Providers bill
 /// image input as tokens derived from (resized) dimensions, with no portable
 /// way to compute the exact count client-side; the surveyed agents converge on
-/// ~1000 tokens/image, which is a good middle estimate (DeepSeek caps at 384,
+/// ~1000 tokens/image, which is a good middle estimate (`DeepSeek` caps at 384,
 /// Anthropic/OpenAI high-detail run higher). This feeds the context-window
 /// display and compaction weighting, not billing (which uses provider usage).
 pub const IMAGE_TOKEN_ESTIMATE: u32 = 1000;

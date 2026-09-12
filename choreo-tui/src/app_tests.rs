@@ -721,6 +721,7 @@ mod unsent_draft_tests {
         assert_eq!(app.input.cursor, 4);
     }
 
+    #[allow(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
     #[test]
     fn editing_history_entry_becomes_the_draft_on_switch() {
         let (tx, _rx) = std::sync::mpsc::channel();

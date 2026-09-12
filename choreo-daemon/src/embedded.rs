@@ -73,11 +73,11 @@ pub struct EmbeddedDaemon {
     /// core so `connect()` hands the connection thread the SAME counter the
     /// command loop and session threads increment on enqueue.
     global_lag: Arc<AtomicUsize>,
-    /// Shared live-connection counter backing MAX_CONCURRENT_CONNECTIONS —
+    /// Shared live-connection counter backing `MAX_CONCURRENT_CONNECTIONS` —
     /// the SAME counter the Unix and TCP accept paths use, so the cap applies
     /// uniformly across all three transports.
     conn_count: Arc<AtomicUsize>,
-    /// Ferry for connection-thread JoinHandles (same pattern as the TCP
+    /// Ferry for connection-thread `JoinHandles` (same pattern as the TCP
     /// accept thread in `lifecycle.rs`): the accept path here is `connect()`
     /// itself, spawning on the CALLER's thread, so handles are sent over the
     /// channel and drained by `shutdown()`.
@@ -107,6 +107,11 @@ pub struct EmbeddedDaemon {
 /// accounts.toml / models-overlay auto-reload still work inside an app
 /// sandbox where the standard config dir resolves, and simply never fire
 /// where it does not.
+///
+/// # Errors
+///
+/// Returns Err if the daemon core (command loop, catalog maintenance,
+/// config watchers) cannot be started.
 pub fn spawn_embedded(state: DaemonState, _opts: EmbeddedOptions) -> io::Result<EmbeddedDaemon> {
     info!("spawning embedded daemon core");
     let core = start_daemon_core(
@@ -115,7 +120,7 @@ pub fn spawn_embedded(state: DaemonState, _opts: EmbeddedOptions) -> io::Result<
             acl: None,
             config_watchers: true,
         },
-    )?;
+    );
     let daemon_tx = core.daemon_tx.clone();
     let conn_count = Arc::clone(&core.conn_count);
     let global_lag = Arc::clone(&core.global_lag);
@@ -141,14 +146,14 @@ impl EmbeddedDaemon {
     /// Open a new embedded connection, mirroring the TCP accept arm in
     /// `run_server`:
     ///
-    /// 1. take a [`ConnectionSlot`] (MAX_CONCURRENT_CONNECTIONS applies to
+    /// 1. take a [`ConnectionSlot`] (`MAX_CONCURRENT_CONNECTIONS` applies to
     ///    embedded connections too — a wedged GUI is bounded like a wedged
     ///    socket client);
     /// 2. register the writer channel with the daemon BEFORE spawning the
     ///    connection thread (ordering invariant, see
     ///    `register_client_writer`: a concurrently-shutting-down client is
     ///    guaranteed to still receive `ShuttingDown`);
-    /// 3. spawn [`embedded_client_thread`], ferrying its JoinHandle over the
+    /// 3. spawn [`embedded_client_thread`], ferrying its `JoinHandle` over the
     ///    handle channel.
     ///
     /// `connect()` returns only after the connection thread is spawned, so
@@ -156,6 +161,12 @@ impl EmbeddedDaemon {
     /// simply QUEUE in the unbounded channel instead of racing a "socket not
     /// ready yet" window: there is no handshake, so there is nothing to be
     /// not-ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the daemon is already at the concurrent-connection
+    /// cap (the connection is refused, not queued) or the internal handle
+    /// channel is disconnected.
     pub fn connect(&self) -> io::Result<EmbeddedLink> {
         // Enforce the concurrent-connection cap exactly like both accept
         // paths: at the cap the connection is refused (not queued).
@@ -204,9 +215,7 @@ impl EmbeddedDaemon {
                 writer_rx,
                 global_lag,
             };
-            if let Err(e) = crate::server::connection::embedded_client_thread(args) {
-                error!(error = %e, "embedded client error");
-            }
+            crate::server::connection::embedded_client_thread(args);
         });
         // Ferry the handle for the shutdown drain (same pattern as the TCP
         // accept thread). A send to a live `handle_tx` cannot fail while the
@@ -227,7 +236,7 @@ impl EmbeddedDaemon {
     ///    channel, so the GUI observes the notification before the close;
     /// 2. `Shutdown` — the command loop drains sessions and MCP;
     /// 3. drop the command channel and join the command-loop thread;
-    /// 4. drain the JoinHandle ferry and bounded-join every connection
+    /// 4. drain the `JoinHandle` ferry and bounded-join every connection
     ///    thread against the shared [`CONNECTION_DRAIN_GRACE`] deadline.
     ///
     /// Consuming `self` is the point: no link can be opened after or during

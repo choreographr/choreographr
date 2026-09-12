@@ -4,6 +4,7 @@ use super::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::path::Path;
 use tracing::debug;
 
@@ -52,12 +53,13 @@ pub(crate) fn execute_read_file_tool(
         // returned content exactly (the marker text itself is appended past
         // the budget).
         let returned_bytes = budget.shown_bytes() + 1;
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "\n...[truncated: showing {returned_bytes} of {} bytes; file has {} line(s) — \
              use read_file_range for the rest]",
             stream.total_bytes(),
             stream.total_lines()
-        ));
+        );
     }
 
     debug!(

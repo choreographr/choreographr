@@ -1,11 +1,12 @@
 /// Generate a unified diff between two strings, formatted like `diff -u`.
 /// Uses gix-imara-diff for line-by-line comparison.
+#[must_use]
 pub fn generate_diff(old: &str, new: &str, old_path: &str, new_path: &str) -> String {
+    use gix_imara_diff::{Algorithm, BasicLineDiffPrinter, Diff, InternedInput, UnifiedDiffConfig};
+
     if old == new {
         return String::new();
     }
-
-    use gix_imara_diff::{Algorithm, BasicLineDiffPrinter, Diff, InternedInput, UnifiedDiffConfig};
 
     let input = InternedInput::new(old, new);
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
@@ -33,7 +34,7 @@ mod tests {
     #[test]
     fn generate_diff_returns_empty_when_no_change() {
         let result = generate_diff("same content", "same content", "f", "f");
-        assert!(result.is_empty());
+        assert_eq!(result, "");
     }
 
     #[test]

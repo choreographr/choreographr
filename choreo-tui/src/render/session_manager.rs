@@ -216,8 +216,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         Paragraph::new(Line::from(format!(" Delete \"{title}\"? (y/N)  ")))
     } else {
         Paragraph::new(Line::from(format!(
-            " <j/k nav>  <Enter switch>  <i details>  <n new>  <d delete>  <Esc back>  —  {} sessions",
-            total_items
+            " <j/k nav>  <Enter switch>  <i details>  <n new>  <d delete>  <Esc back>  —  {total_items} sessions"
         )))
     };
     frame.render_widget(status, status_area);
@@ -283,7 +282,7 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
             Line::from(match (detail.context_window, detail.last_prompt_tokens) {
                 (Some(limit), Some(current)) => {
                     let ratio = if limit > 0 {
-                        current as f64 / limit as f64
+                        f64::from(current) / f64::from(limit)
                     } else {
                         0.0
                     };

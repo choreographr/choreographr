@@ -15,7 +15,7 @@
 //! ACL) and the connection thread re-installs the override before
 //! `run_daemon_tcp_connection` loads it — see [`NoiseClient::connect`].
 //!
-//! These tests belong to the `#[ignore]` integration suite (run via
+//! These tests belong to the `#[ignore = "integration"]` integration suite (run via
 //! `cargo test-integration` / nextest `--run-ignored only`): they bind real
 //! sockets and spawn real threads, so they are excluded from the fast unit
 //! suite. The only time-based primitive used is the bounded `recv_timeout`
@@ -30,7 +30,10 @@
     clippy::expect_used,
     clippy::panic,
     clippy::panic_in_result_fn,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    // u8 key fixtures: `std::array::from_fn(|i| (i * K) as u8)` — truncation
+    // is the point (deterministic byte patterns), never a bug.
+    clippy::cast_possible_truncation
 )]
 use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_connection;
@@ -144,7 +147,7 @@ impl NoiseClient {
     }
 }
 
-/// The CreateSession request used throughout: every optional field unset, so
+/// The `CreateSession` request used throughout: every optional field unset, so
 /// the tests exercise the default session-creation path (mirrors the Unix
 /// test file's helper).
 fn create_session() -> ClientMessage {
@@ -177,7 +180,7 @@ fn test_keypair() -> (tempfile::TempDir, [u8; 32]) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_ping_pong_over_tcp() {
     let (key_dir, client_pk) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
@@ -202,7 +205,7 @@ fn noise_ping_pong_over_tcp() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_list_sessions_round_trip() {
     let (key_dir, client_pk) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
@@ -215,7 +218,9 @@ fn noise_list_sessions_round_trip() {
     // Fresh daemon: the session list starts empty.
     client.send(ClientMessage::ListSessions);
     match client.recv() {
-        DaemonMessage::Sessions { sessions } => assert!(sessions.is_empty()),
+        DaemonMessage::Sessions { sessions } => {
+            assert_eq!(sessions, [] as [choreo_proto::SessionSummary; 0]);
+        }
         other => panic!("expected empty Sessions, got {other:?}"),
     }
 
@@ -253,7 +258,7 @@ fn noise_list_sessions_round_trip() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_and_unix_share_daemon_state() {
     let (key_dir, client_pk) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
@@ -340,7 +345,7 @@ fn noise_and_unix_share_daemon_state() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_subscribe_receives_session_broadcasts() {
     // Two authorized Noise clients with independent keypairs: A opts into
     // session-summary broadcasts, B stays unsubscribed. This is the
@@ -374,7 +379,9 @@ fn noise_subscribe_receives_session_broadcasts() {
     // (zero subscribers at broadcast time) — flaking the test.
     client_a.send(ClientMessage::ListSessions);
     match client_a.recv() {
-        DaemonMessage::Sessions { sessions } => assert!(sessions.is_empty()),
+        DaemonMessage::Sessions { sessions } => {
+            assert_eq!(sessions, [] as [choreo_proto::SessionSummary; 0]);
+        }
         other => panic!("expected empty Sessions, got {other:?}"),
     }
 
@@ -468,7 +475,7 @@ fn noise_subscribe_receives_session_broadcasts() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_rejects_client_not_in_acl() {
     // Two independent keypairs: dir_a holds the key the daemon authorizes,
     // dir_b holds the key the connecting client actually presents. They
@@ -497,7 +504,7 @@ fn noise_rejects_client_not_in_acl() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_wrong_server_public_key_fails() {
     let (key_dir, client_pk) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
@@ -524,7 +531,7 @@ fn noise_wrong_server_public_key_fails() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_shutdown_notifies_client() {
     let (key_dir, client_pk) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
@@ -551,16 +558,16 @@ fn noise_shutdown_notifies_client() {
 }
 
 /// Test that a >64 KiB message survives the FULL daemon round trip. The
-/// client's 1 MiB AddCredential payload must fragment on the wire (snow's
+/// client's 1 MiB `AddCredential` payload must fragment on the wire (snow's
 /// single-fragment cap is 65518 plaintext bytes); the daemon's
 /// `tcp_client_thread` reassembles it via `recv_client_message`, the command
-/// loop stores the blob (`handle_add_credential_sync`), and the CredentialAdded
+/// loop stores the blob (`handle_add_credential_sync`), and the `CredentialAdded`
 /// reply travels back through the same encrypted channel. This proves the
 /// framing change is invisible above the transport: typed proto messages can
 /// now be as large as the codec's 32 MiB `MAX_FRAME_SIZE`, not just 65518
 /// bytes.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_large_message_through_daemon() {
     let (key_dir, client_pk) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
@@ -626,14 +633,18 @@ fn noise_large_message_through_daemon() {
 /// Test that a >64 KiB message travels daemon → client through the FULL
 /// daemon stack — the reverse direction of `noise_large_message_through_daemon`
 /// (which is client → daemon). The client creates sessions with multi-KiB
-/// titles, so the aggregate ListSessions reply exceeds snow's single-message
+/// titles, so the aggregate `ListSessions` reply exceeds snow's single-message
 /// cap and must fragment on the wire: the daemon's writer thread splits it
-/// (send_daemon_message → send_message) and the client's reader thread
-/// reassembles it (recv_daemon_message → recv_message). The reply must
+/// (`send_daemon_message` → `send_message`) and the client's reader thread
+/// reassembles it (`recv_daemon_message` → `recv_message`). The reply must
 /// arrive intact.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_large_message_daemon_to_client() {
+    // Titles large enough that the aggregate Sessions reply exceeds the
+    // 65518-byte single-fragment cap: 12 × 8 KiB of title bytes
+    // (~96 KiB) fragments into at least two wire fragments.
+    const SESSIONS: usize = 12;
     let (key_dir, client_pk) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
     let client = NoiseClient::connect(
@@ -642,10 +653,6 @@ fn noise_large_message_daemon_to_client() {
         key_dir.path().to_path_buf(),
     );
 
-    // Titles large enough that the aggregate Sessions reply exceeds the
-    // 65518-byte single-fragment cap: 12 × 8 KiB of title bytes
-    // (~96 KiB) fragments into at least two wire fragments.
-    const SESSIONS: usize = 12;
     let big_title = "x".repeat(8 * 1024);
     for i in 0..SESSIONS {
         client.send(ClientMessage::CreateSession {
@@ -662,7 +669,7 @@ fn noise_large_message_daemon_to_client() {
                 session_id: Some(session_id),
                 event: SessionEvent::SessionCreated { .. },
             } => {
-                assert_eq!(session_id, (i + 1) as u64)
+                assert_eq!(session_id, (i + 1) as u64);
             }
             other => panic!("expected SessionCreated, got {other:?}"),
         }
@@ -681,7 +688,7 @@ fn noise_large_message_daemon_to_client() {
             // Sanity: the reply really was large enough to fragment.
             let total: usize = sessions
                 .iter()
-                .map(|s| s.title.as_deref().map_or(0, |t| t.len()))
+                .map(|s| s.title.as_deref().map_or(0, str::len))
                 .sum();
             assert!(
                 total > 65518,
@@ -748,7 +755,7 @@ fn connect_xx(
 /// before any protocol traffic flows, confirms, and only then is the
 /// encrypted channel used (Ping -> Pong).
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_xx_first_contact_full_path() {
     let (key_dir, client_pk) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
@@ -786,7 +793,7 @@ fn noise_xx_first_contact_full_path() {
 /// rule — a first-contact MITM (or an unwanted server) must never be able
 /// to harvest an `Unlock` (the daemon's private key) by answering the dial.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_xx_first_contact_reject_closes_without_traffic() {
     let (key_dir, client_pk) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk]);
@@ -855,7 +862,7 @@ fn noise_xx_first_contact_reject_closes_without_traffic() {
 /// pre-authentication, so an invalid value must never produce a
 /// half-open connection — it is dropped, and nothing is ever read again.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_unknown_preamble_is_rejected() {
     let (key_dir, client_pk) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk]);

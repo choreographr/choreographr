@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-/// Shrink a raw TcpStream's kernel send/recv buffers (SO_SNDBUF/SO_RCVBUF)
+/// Shrink a raw `TcpStream`'s kernel send/recv buffers (`SO_SNDBUF/SO_RCVBUF`)
 /// before the handshake, so the socket's in-flight capacity stays far below
 /// the 1 MiB payloads and the writers are forced to block on a full peer
 /// receive buffer. `TcpStream` has no stable API for these options, so use
@@ -22,7 +22,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 /// fail the kernel keeps default-sized buffers, and even defaults (~64-256
 /// KiB) are far below 1 MiB, so the test still reproduces the deadlock.
 ///
-/// 64 KiB, not smaller: the kernel doubles SO_SNDBUF/SO_RCVBUF, and on the
+/// 64 KiB, not smaller: the kernel doubles `SO_SNDBUF/SO_RCVBUF`, and on the
 /// loopback interface the TCP MSS is 32768 bytes. A 4096-byte request (8 KiB
 /// effective) leaves the receive window smaller than one full segment, which
 /// on loopback stalls the transfer with window/retransmit collapses even with
@@ -64,7 +64,7 @@ fn noise_test_pair()
 
 /// Test full Noise IK handshake between client and server.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_ik_handshake_round_trip() {
     let (listener, server_sk, server_pk, client_sk, client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -96,7 +96,7 @@ fn noise_ik_handshake_round_trip() {
 
 /// Test that ACL rejection works.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_ik_handshake_rejects_unknown_client() {
     let (listener, server_sk, server_pk, client_sk, _client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -125,13 +125,14 @@ fn noise_ik_handshake_rejects_unknown_client() {
     );
 }
 
-/// Test the encrypted data plane: typed messages (ClientMessage /
-/// DaemonMessage) round-trip over the Noise transport after the handshake.
+/// Test the encrypted data plane: typed messages (`ClientMessage`
+/// /
+/// `DaemonMessage`) round-trip over the Noise transport after the handshake.
 /// A *second* round trip proves the transport is not a one-shot — each
 /// message consumes a nonce on both sides, so this exercises nonce
-/// advancement through the shared TransportState.
+/// advancement through the shared `TransportState`.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_encrypted_message_round_trip() {
     let (listener, server_sk, server_pk, client_sk, client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -216,7 +217,7 @@ fn noise_encrypted_message_round_trip() {
 /// format, while `noise_fragmented_message_round_trip` covers payloads past
 /// this cap (which the transport now splits and reassembles transparently).
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_large_message_round_trip() {
     let (listener, server_sk, server_pk, client_sk, client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -274,11 +275,11 @@ fn noise_large_message_round_trip() {
 /// 65518-byte single-fragment maximum, so it must split into two fragments;
 /// 1024 * 1024 bytes spans 17 fragments (16 full 65518-byte chunks plus a
 /// 288-byte remainder). The final small echo round trip proves the shared
-/// TransportState keeps working across fragment boundaries — send and recv
+/// `TransportState` keeps working across fragment boundaries — send and recv
 /// nonces stay in sync after a multi-fragment exchange, and the transport
 /// still carries ordinary single-frame messages afterwards.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_fragmented_message_round_trip() {
     let (listener, server_sk, server_pk, client_sk, client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -376,10 +377,10 @@ fn noise_fragmented_message_round_trip() {
 /// nothing) and the peer's `recv_message` blocked forever on the length
 /// prefix. Now the empty message round-trips as `Ok(vec![])` — proving a real
 /// frame was emitted — and a follow-up non-empty round trip proves the shared
-/// TransportState keeps working (send/recv nonces stay in sync across the
+/// `TransportState` keeps working (send/recv nonces stay in sync across the
 /// empty message).
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_empty_message_round_trip() {
     let (listener, server_sk, server_pk, client_sk, client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -445,7 +446,7 @@ fn noise_empty_message_round_trip() {
 /// and run cleanup instead of reporting an error. Pins the EOF classification
 /// in `noise::recv_message`.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_peer_close_surfaces_as_connection_closed() {
     let (listener, server_sk, server_pk, client_sk, client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -485,13 +486,13 @@ fn noise_peer_close_surfaces_as_connection_closed() {
 }
 
 /// Test that a peer sending garbage instead of a Noise handshake message 1
-/// cannot wedge the responder: handshake_responder must error out (not
+/// cannot wedge the responder: `handshake_responder` must error out (not
 /// hang), and that failure is relayed over mpsc. The client writes a
 /// plausible 2-byte big-endian length prefix followed by 5 bytes that are
 /// NOT a Noise IK message (X25519 + AESGCM message 1 is 96 bytes); the
-/// responder reads the prefix + body and snow's read_message fails.
+/// responder reads the prefix + body and snow's `read_message` fails.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_garbage_handshake_message_rejected() {
     let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
     let server_sk_bytes = server_sk.to_bytes();
@@ -541,7 +542,7 @@ fn noise_garbage_handshake_message_rejected() {
 /// `write_all` completes. This test pins that fix: it deadlocks (and times
 /// out) against the old code, passes against the new one.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_concurrent_bidirectional_large_messages() {
     let (listener, server_sk, server_pk, client_sk, client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -665,11 +666,13 @@ fn noise_concurrent_bidirectional_large_messages() {
     // returns, so the deadlocked threads do not leak into other tests.
     let server_result = match server_rx.recv_timeout(std::time::Duration::from_secs(30)) {
         Ok(result) => result.map_err(|e| format!("server side failed: {e}")),
-        Err(_) => panic!("timed out waiting for server side (deadlock?)"),
+        // Any `RecvTimeoutError` here is a timeout: the sender only sends
+        // once at completion, and a dead receiver would panic on send.
+        Err(e) => panic!("timed out waiting for server side ({e:?})"),
     };
     let client_result = match client_rx.recv_timeout(std::time::Duration::from_secs(30)) {
         Ok(result) => result.map_err(|e| format!("client side failed: {e}")),
-        Err(_) => panic!("timed out waiting for client side (deadlock?)"),
+        Err(e) => panic!("timed out waiting for client side ({e:?})"),
     };
     assert!(
         server_result.is_ok(),
@@ -686,15 +689,15 @@ fn noise_concurrent_bidirectional_large_messages() {
 /// Test that a hostile or corrupted length prefix cannot make the receiver
 /// allocate a huge buffer or hang: the 4-byte data-plane prefix is NOT
 /// authenticated (it precedes the GCM ciphertext), so a peer can send any
-/// value. recv_message must reject a fragment longer than snow's 65535-byte
+/// value. `recv_message` must reject a fragment longer than snow's 65535-byte
 /// ciphertext cap BEFORE allocating or reading that many bytes — without the
-/// validation the old code would `vec![0u8; ct_len]` for a 0x7FFF_FFFF
-/// prefix (~2 GiB) and block in read_exact waiting for the bytes.
+/// validation the old code would `vec![0u8; ct_len]` for a `0x7FFF_FFFF`
+/// prefix (~2 GiB) and block in `read_exact` waiting for the bytes.
 ///
 /// (The prefix no longer carries a continuation flag — that decision moved
 /// into the authenticated plaintext — so the raw value is just a huge length.)
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_rejects_oversized_fragment_prefix() {
     let (listener, server_sk, server_pk, client_sk, client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -778,11 +781,18 @@ fn raw_handshake_responder(
     let n = handshake
         .write_message(&[], &mut out_buf)
         .map_err(|e| format!("server write msg2 failed: {e:?}"))?;
+    // Handshake messages are tiny (few hundred bytes); the u16 length
+    // prefix cannot truncate.
+    let n = u16::try_from(n).map_err(|e| format!("handshake message length overflows u16: {e}"))?;
     stream
-        .write_all(&(n as u16).to_be_bytes())
+        .write_all(&n.to_be_bytes())
         .map_err(|e| format!("write msg2 len failed: {e}"))?;
     stream
-        .write_all(out_buf.get(..n).ok_or("out_buf slice out of bounds")?)
+        .write_all(
+            out_buf
+                .get(..usize::from(n))
+                .ok_or("out_buf slice out of bounds")?,
+        )
         .map_err(|e| format!("write msg2 failed: {e}"))?;
 
     let ts = handshake
@@ -815,11 +825,14 @@ fn raw_handshake_initiator(
     let n = handshake
         .write_message(&[], &mut buf)
         .map_err(|e| format!("client write msg1 failed: {e:?}"))?;
+    // Handshake messages are tiny (few hundred bytes); the u16 length
+    // prefix cannot truncate.
+    let n = u16::try_from(n).map_err(|e| format!("handshake message length overflows u16: {e}"))?;
     stream
-        .write_all(&(n as u16).to_be_bytes())
+        .write_all(&n.to_be_bytes())
         .map_err(|e| format!("write msg1 len failed: {e}"))?;
     stream
-        .write_all(buf.get(..n).ok_or("buf slice out of bounds")?)
+        .write_all(buf.get(..usize::from(n)).ok_or("buf slice out of bounds")?)
         .map_err(|e| format!("write msg1 failed: {e}"))?;
 
     let mut len_buf = [0u8; 2];
@@ -845,17 +858,17 @@ fn raw_handshake_initiator(
 /// loudly and can never silently truncate a reassembled message. The 4-byte
 /// prefix precedes the GCM ciphertext and is NOT authenticated, so the
 /// reassembly decision must come from the authenticated continuation byte
-/// INSIDE the plaintext: a flipped prefix bit changes ct_len, which either
+/// INSIDE the plaintext: a flipped prefix bit changes `ct_len`, which either
 /// trips the size cap or fails the GCM authentication on the wrong byte
 /// count — in no case may the receiver return a truncated prefix as a
 /// complete message.
 ///
-/// The test drives a manually-derived TransportState (mirroring the
+/// The test drives a manually-derived `TransportState` (mirroring the
 /// production handshake byte-for-byte) on both sides so it can encrypt raw
 /// fragments and then write a tampered prefix — something the public API
 /// cannot express, since `send_message` always writes an intact prefix.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_rejects_tampered_length_prefix() {
     let (listener, server_sk, server_pk, client_sk, client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -912,12 +925,14 @@ fn noise_rejects_tampered_length_prefix() {
         let chunks: Vec<&[u8]> = payload.chunks(65518).collect();
         for (i, chunk) in chunks.iter().enumerate() {
             let more = i + 1 < chunks.len();
-            frag[0] = if more { 0x01 } else { 0x00 };
-            frag[1..1 + chunk.len()].copy_from_slice(chunk);
+            frag[0] = u8::from(more);
+            frag[1..=chunk.len()].copy_from_slice(chunk);
             let n = ts
-                .write_message(&frag[..1 + chunk.len()], &mut ct)
+                .write_message(&frag[..=chunk.len()], &mut ct)
                 .expect("encrypt");
-            let mut len = n as u32;
+            // Snow ciphertexts are capped at 65535 bytes; the u32 prefix
+            // cannot truncate.
+            let mut len = u32::try_from(n).expect("snow ciphertext length fits u32");
             if tamper_second && i == 1 {
                 // Decrement (never increment): a larger prefix would make the
                 // receiver block waiting for bytes we never send, hanging the
@@ -925,7 +940,7 @@ fn noise_rejects_tampered_length_prefix() {
                 len -= 1;
             }
             stream.write_all(&len.to_be_bytes()).expect("write len");
-            stream.write_all(&ct[..n]).expect("write ct");
+            stream.write_all(&ct[..usize::from(n)]).expect("write ct");
         }
     };
 
@@ -952,7 +967,7 @@ fn noise_rejects_tampered_length_prefix() {
 /// timeout path runs in milliseconds instead of waiting out the 10 s
 /// production default.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_handshake_times_out_when_peer_silent() {
     let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
     let server_sk_bytes = server_sk.to_bytes();
@@ -997,7 +1012,7 @@ fn noise_handshake_times_out_when_peer_silent() {
 /// test fails against the old per-recv-timeout-only code, which accepted the
 /// dribbles past the test's wait window.)
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_handshake_times_out_against_dribbling_peer() {
     let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
     let server_sk_bytes = server_sk.to_bytes();
@@ -1054,7 +1069,7 @@ fn noise_handshake_times_out_against_dribbling_peer() {
 /// the derived transport must carry encrypted traffic (Ping -> Pong) exactly
 /// like the IK transport.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_xx_handshake_round_trip() {
     let (listener, server_sk, server_pk, client_sk, client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -1113,11 +1128,11 @@ fn noise_xx_handshake_round_trip() {
 /// static). So the CLIENT's handshake completes successfully and it learns
 /// the server's key; the rejection surfaces as the server closing the
 /// socket before any data-plane traffic flows, which the client's reader
-/// observes as a clean ConnectionClosed. This asymmetry is inherent to XX
+/// observes as a clean `ConnectionClosed`. This asymmetry is inherent to XX
 /// and is safe: the rejected client holds no channel — it never sends or
 /// receives a single data-plane byte.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_xx_handshake_rejects_unknown_client() {
     let (listener, server_sk, _server_pk, client_sk, _client_pk) =
         noise_test_pair().expect("noise test listener bind");
@@ -1163,7 +1178,7 @@ fn noise_xx_handshake_rejects_unknown_client() {
 /// pre-authentication, exactly like IK's, so the same resource-exhaustion
 /// argument applies to the first-contact path.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_xx_handshake_times_out_when_peer_silent() {
     let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
     let server_sk_bytes = server_sk.to_bytes();
@@ -1201,7 +1216,7 @@ fn noise_xx_handshake_times_out_when_peer_silent() {
 /// (32-byte ephemeral + 16-byte GCM tag), so the dribbler claims 48 and then
 /// paces single bytes — each within the read window, the total far past it.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn noise_xx_handshake_times_out_against_dribbling_peer() {
     let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
     let server_sk_bytes = server_sk.to_bytes();

@@ -13,8 +13,8 @@ use crate::shell::UnlockMethod;
 /// `addr`.
 ///
 /// For `UnlockMethod::Raw`, unlock with the key ALREADY associated with this
-/// daemon: the stored known_servers `unlock_key`, falling back to the legacy
-/// raw `identity.pk` file — which is then COPIED into known_servers.toml so
+/// daemon: the stored `known_servers` `unlock_key`, falling back to the legacy
+/// raw `identity.pk` file — which is then COPIED into `known_servers.toml` so
 /// the store becomes the single source of truth (the legacy file is never
 /// deleted, merely superseded). Errors with [`ClientError::NoUnlockKey`] when
 /// neither source has a key.
@@ -22,7 +22,14 @@ use crate::shell::UnlockMethod;
 /// For `UnlockMethod::Key(key)`, the argument IS the unlock key (base64 of
 /// the 32 raw bytes): it is decoded, validated, and returned — WRITE-FREE.
 /// The caller records it via [`record_unlock_key`] ONLY when the daemon
-/// confirms (`Unlocked` reply); nothing is written to known_servers on send.
+/// confirms (`Unlocked` reply); nothing is written to `known_servers` on send.
+///
+/// # Errors
+///
+/// Returns [`ClientError`] when the unlock key cannot be loaded
+/// (`PrivateKeyInvalid` for a bad stored length, `Io`/`CredentialParse`
+/// for store access), or when a `Key`-method key is not valid base64 of
+/// exactly 32 bytes.
 pub fn resolve_private_key(method: &UnlockMethod, addr: &str) -> Result<Vec<u8>, ClientError> {
     match method {
         UnlockMethod::Raw => {
@@ -69,7 +76,7 @@ fn read_raw_private_key() -> Result<Vec<u8>, ClientError> {
     Ok(data)
 }
 
-/// Read the stored per-daemon unlock key for `addr` from known_servers.
+/// Read the stored per-daemon unlock key for `addr` from `known_servers`.
 /// Internal helper: failures to LOAD the store or DECODE a stored key are
 /// non-fatal for the resolution chain (we just fall through to the legacy
 /// path), so they are swallowed with a warning here rather than propagated.
@@ -94,9 +101,9 @@ fn stored_unlock_key(addr: &str) -> Option<[u8; 32]> {
 }
 
 /// Resolve the unlock key ALREADY associated with `addr`: the stored
-/// known_servers `unlock_key`, falling back to the legacy raw `identity.pk`
+/// `known_servers` `unlock_key`, falling back to the legacy raw `identity.pk`
 /// file. A legacy hit is COPIED into the store (best-effort) so that
-/// known_servers.toml becomes the single source of truth — the legacy file
+/// `known_servers.toml` becomes the single source of truth — the legacy file
 /// is NEVER deleted, merely superseded. `Ok(None)` when neither source has
 /// a usable key (daemon stays locked; all session operations still work).
 fn stored_or_adopted_unlock_key(addr: &str) -> Result<Option<[u8; 32]>, ClientError> {
@@ -140,13 +147,13 @@ fn stored_or_adopted_unlock_key(addr: &str) -> Result<Option<[u8; 32]>, ClientEr
 /// daemon at `addr`.
 ///
 /// Resolution order (per-daemon keystore TOFU design):
-/// 1. The stored `unlock_key` from the known_servers entry for `addr`.
+/// 1. The stored `unlock_key` from the `known_servers` entry for `addr`.
 /// 2. LEGACY fallback: the raw `identity.pk` file, COPIED into
-///    known_servers.toml on first use (the legacy file is never deleted).
+///    `known_servers.toml` on first use (the legacy file is never deleted).
 ///
 /// Returns `None` if no key can be resolved, which is fine — the daemon
 /// starts locked but all session operations (create, browse, delete) work
-/// without unlocking.  Only inference (RunInput) requires credentials.
+/// without unlocking.  Only inference (`RunInput`) requires credentials.
 pub fn try_auto_unlock_key(addr: &str) -> Option<Vec<u8>> {
     match stored_or_adopted_unlock_key(addr) {
         Ok(Some(key)) => Some(key.to_vec()),
@@ -164,12 +171,17 @@ pub fn try_auto_unlock_key(addr: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Persist the per-daemon unlock key for `addr` into the known_servers
+/// Persist the per-daemon unlock key for `addr` into the `known_servers`
 /// store. Legacy files are NEVER touched: no comparison, no deletion —
-/// known_servers.toml simply supersedes them once it holds the key.
+/// `known_servers.toml` simply supersedes them once it holds the key.
 ///
 /// Callers MUST only invoke this after the daemon CONFIRMED the key (an
 /// `Unlocked` or `CredentialAdded` reply) — never on send.
+///
+/// # Errors
+///
+/// Returns [`ClientError::PrivateKeyInvalid`] if `key` is not exactly 32
+/// bytes, and [`ClientError::Io`] if the store cannot be read or written.
 pub fn record_unlock_key(addr: &str, key: &[u8]) -> Result<(), ClientError> {
     let key: [u8; 32] = key.try_into().map_err(|_| ClientError::PrivateKeyInvalid)?;
     KnownServers::load()?.set_unlock_key(addr, &key)?;
@@ -228,7 +240,7 @@ fn parse_credential(
 }
 
 /// Resolve the per-daemon keystore unlock key for `addr` — VERIFY-ONLY
-/// resolution: the stored known_servers key for `addr`, falling back to the
+/// resolution: the stored `known_servers` key for `addr`, falling back to the
 /// legacy raw `identity.pk` file (which `stored_or_adopted_unlock_key` copies
 /// into the store).
 ///
@@ -246,7 +258,7 @@ fn resolve_keystore_key(addr: &str) -> Result<[u8; 32], ClientError> {
 /// `KeystoreUnbound` reply to an auto-unlock attempt).
 ///
 /// A brand-new 32-byte CSPRNG key is minted with `rand` and recorded into
-/// known_servers for `addr` BEFORE the `BindKeystore` message is returned —
+/// `known_servers` for `addr` BEFORE the `BindKeystore` message is returned —
 /// pre-send recording is CORRECT for bind (unlike unlock/add): an unbound
 /// daemon adopts whatever key arrives first, so if the confirmation is lost
 /// the recorded key still matches the binding, and there is nothing to
@@ -259,6 +271,11 @@ fn resolve_keystore_key(addr: &str) -> Result<[u8; 32], ClientError> {
 /// always be fresh so a recorded key is provably the one the daemon adopted.
 /// If the key cannot be persisted pre-send the bind is REFUSED — sending an
 /// unrecorded bind key risks an unrecoverable orphaned binding.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Io`] if the fresh bind key cannot be recorded
+/// into the store pre-send (the bind is then REFUSED, per the doc above).
 pub fn bind_fresh_daemon(addr: &str) -> Result<([u8; 32], ClientMessage), ClientError> {
     // CSPRNG via rand's thread-local generator: the binding key is the root
     // of the daemon's credential confidentiality, so it must never be
@@ -282,6 +299,15 @@ pub fn bind_fresh_daemon(addr: &str) -> Result<([u8; 32], ClientMessage), Client
 /// [`build_add_credential_from_credential`] for the full key-resolution and
 /// encryption semantics). The caller-supplied field strings (which may hold a
 /// secret, e.g. the API key) are zeroized once parsing has consumed them.
+///
+/// # Errors
+///
+/// Returns [`ClientError::CredentialParse`] if the credential fields do
+/// not parse for `credential_type`, and store/keystore errors bubbled up
+/// by the shared builder.
+// needless_pass_by_value waived: pub API — TUI/GUI/IM callers pass owned
+// field strings (which get zeroized) and rely on this signature.
+#[allow(clippy::needless_pass_by_value)]
 pub fn build_add_credential_message(
     addr: &str,
     service: String,
@@ -336,11 +362,13 @@ impl Default for KeystoreAutoBind {
 
 impl KeystoreAutoBind {
     /// Fresh state for a new connection: no bind attempted yet.
+    #[must_use]
     pub fn new() -> Self {
         Self { attempted: false }
     }
 
     /// Test/diagnostic accessor: has a bind already been attempted?
+    #[must_use]
     pub fn attempted(&self) -> bool {
         self.attempted
     }
@@ -348,7 +376,7 @@ impl KeystoreAutoBind {
     /// Handle a `KeystoreUnbound` report from the daemon.
     ///
     /// - `Ok(Some((key, message)))` — FIRST report on this connection: a
-    ///   fresh key was minted and recorded into known_servers PRE-SEND (see
+    ///   fresh key was minted and recorded into `known_servers` PRE-SEND (see
     ///   [`bind_fresh_daemon`] for why pre-send recording is mandatory) and
     ///   the caller MUST send `message` and hold `key` pending for the
     ///   targeted `Bound` confirmation.
@@ -359,6 +387,11 @@ impl KeystoreAutoBind {
     ///   The latch stays set: a store that refused once is not going to
     ///   accept on the next report, and the caller's reconnect path retries
     ///   with fresh state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Io`] if the fresh bind key cannot be recorded
+    /// pre-send (the latch stays set; see the doc above).
     pub fn on_unbound(
         &mut self,
         addr: &str,
@@ -395,6 +428,14 @@ impl KeystoreAutoBind {
 /// Returns the message AND the unlock key used, so the caller can call
 /// [`record_unlock_key`] once the daemon CONFIRMS success (`CredentialAdded` /
 /// `Unlocked` reply) — never on send.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Io`] if the keystore unlock key cannot be
+/// resolved or the encrypted credential cannot be built.
+// needless_pass_by_value waived: pub API — callers move the parsed
+// credential in; taking a reference would complicate every call site.
+#[allow(clippy::needless_pass_by_value)]
 pub fn build_add_credential_from_credential(
     addr: &str,
     service: String,
@@ -625,7 +666,7 @@ mod tests {
     }
 
     /// `/unlock` (Raw) with neither a stored key nor a legacy file is a
-    /// clear NoUnlockKey error, not a silent failure.
+    /// clear `NoUnlockKey` error, not a silent failure.
     #[test]
     fn resolve_raw_without_any_key_is_a_clear_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -685,7 +726,7 @@ mod tests {
     }
 
     /// Verify-only resolution: with nothing stored and no legacy files, the
-    /// add FAILS with NoUnlockKey — no fresh key is minted on the add path
+    /// add FAILS with `NoUnlockKey` — no fresh key is minted on the add path
     /// (fresh keys are minted exclusively by `bind_fresh_daemon`).
     #[test]
     fn build_add_credential_without_any_key_is_a_clear_error() {
@@ -740,7 +781,7 @@ mod tests {
     }
 
     /// `bind_fresh_daemon`: mints a FRESH CSPRNG key (never the stored or
-    /// legacy key), records it into known_servers PRE-SEND (so a lost
+    /// legacy key), records it into `known_servers` PRE-SEND (so a lost
     /// confirmation cannot orphan the binding), and returns the
     /// `BindKeystore` message carrying exactly that key.
     #[test]
@@ -820,8 +861,8 @@ mod tests {
         assert!(entry.pubkey.is_none(), "carrier entry must have no pin");
     }
 
-    /// Legacy files are NEVER deleted by record_unlock_key (or anything
-    /// else): known_servers.toml supersedes them, but they stay on disk.
+    /// Legacy files are NEVER deleted by `record_unlock_key` (or anything
+    /// else): `known_servers.toml` supersedes them, but they stay on disk.
     #[test]
     fn record_unlock_key_never_touches_legacy_files() {
         let dir = tempfile::tempdir().unwrap();

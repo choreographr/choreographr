@@ -14,7 +14,7 @@ use choreo_proto::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, mpsc};
 use tracing::{debug, error, info, trace, warn};
@@ -29,7 +29,7 @@ pub(crate) const CANCEL_ALL: u32 = 0;
 /// display strings shown in session listings and the TUI sidebar, so
 /// multi-byte scripts and composed emoji (e.g. "👨‍👩‍👧‍👦" = 1 grapheme, 7
 /// `char` values) are treated fairly.  Defined here as the single source
-/// of truth; the tool-level validator in set_session_title.rs imports
+/// of truth; the tool-level validator in `set_session_title.rs` imports
 /// this constant to avoid duplication.
 pub(crate) const MAX_TITLE_CHARS: usize = 200;
 
@@ -80,7 +80,12 @@ where
     shutdown_join_poll(
         session_id,
         grace,
-        || handle.borrow().as_ref().is_some_and(|h| h.is_finished()),
+        || {
+            handle
+                .borrow()
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+        },
         || {
             if let Some(h) = handle.borrow_mut().take() {
                 let _ = h.join();
@@ -250,7 +255,7 @@ pub enum SessionCommand {
 /// reducing argument count and making the dependency flow explicit.
 #[derive(Clone)]
 pub struct RequestContext {
-    /// Channel to send SessionCommands back to the session main loop.
+    /// Channel to send `SessionCommands` back to the session main loop.
     pub cmd_tx: mpsc::Sender<SessionCommand>,
     /// The session ID scoping all operations.
     pub session_id: u64,
@@ -359,17 +364,23 @@ impl From<SessionMetadata> for SessionRecord {
 /// in-memory index or for sending through the command channel.
 ///
 /// Fields that don't exist in [`SessionMetadata`] (subscribers, active
-/// requests, turn contents, etc.) are dropped. The `PathBuf` working_dir is
+/// requests, turn contents, etc.) are dropped. The `PathBuf` `working_dir` is
 /// stringified.
 impl From<&SessionState> for SessionMetadata {
     fn from(state: &SessionState) -> Self {
         let mut meta = SessionMetadata::from(&state.config);
-        meta.turn_count = state.turns.len() as u32;
+        // usize→u32 turn count: a session with 4 billion turns is impossible
+        // in practice (each turn is a full provider round-trip).
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            meta.turn_count = state.turns.len() as u32;
+        }
         meta
     }
 }
 
 impl SessionMetadata {
+    #[must_use]
     pub fn to_summary(&self, session_id: u64) -> SessionSummary {
         SessionSummary {
             session_id,
@@ -413,7 +424,7 @@ pub struct SessionConfig {
     /// Last provider response id, persisted so ResponseId-policy models
     /// (OpenAI/xAI Responses) can chain `previous_response_id` across user
     /// turns (phase 4c). Meaningless for other policies; set after every model
-    /// call in the agent loop and restored only under the ResponseId policy.
+    /// call in the agent loop and restored only under the `ResponseId` policy.
     pub last_response_id: Option<String>,
     /// Which provider+model produced `last_response_id`. The builder restores
     /// the id only when the current provider+model matches (same provenance
@@ -449,7 +460,7 @@ impl Default for SessionConfig {
 impl SessionConfig {
     /// Apply fields from a worker snapshot, preserving any fields
     /// that may have been mutated mid-request through direct
-    /// `SessionCommand` calls (SetTitle, SetAccount, SetReasoningEffort)
+    /// `SessionCommand` calls (`SetTitle`, `SetAccount`, `SetReasoningEffort`)
     /// that the worker snapshot wouldn't know about.
     ///
     /// This is an allowlist — only fields the worker actually owns
@@ -464,8 +475,9 @@ impl SessionConfig {
         // The worker writes last_response_id (+ its producer) after each model
         // call; they must survive the request boundary so ResponseId-policy
         // chaining works across user turns (phase 4c).
-        self.last_response_id = snapshot.last_response_id.clone();
-        self.last_response_id_producer = snapshot.last_response_id_producer.clone();
+        self.last_response_id.clone_from(&snapshot.last_response_id);
+        self.last_response_id_producer
+            .clone_from(&snapshot.last_response_id_producer);
     }
 }
 
@@ -505,8 +517,12 @@ impl From<&SessionState> for SessionRecord {
         // last_response_id (+ producer) is worker-owned runtime state that must
         // survive the record round-trip: it chains ResponseId-policy models
         // across user turns AND daemon restarts (phase 4c).
-        record.last_response_id = state.config.last_response_id.clone();
-        record.last_response_id_producer = state.config.last_response_id_producer.clone();
+        record
+            .last_response_id
+            .clone_from(&state.config.last_response_id);
+        record
+            .last_response_id_producer
+            .clone_from(&state.config.last_response_id_producer);
         record
     }
 }
@@ -530,7 +546,7 @@ pub(crate) struct ActiveRequest {
     /// unreachable) disconnect as "proceed without cancellation" rather than
     /// aborting a retry loop.
     pub(crate) cancel_tx: crossbeam_channel::Sender<()>,
-    /// The turn_id associated with this request, so that late-joining
+    /// The `turn_id` associated with this request, so that late-joining
     /// subscribers can route streaming chunks to the correct turn.
     pub(crate) turn_id: u32,
 }
@@ -601,7 +617,7 @@ impl SessionState {
             broadcast(
                 &mut self.subscribers,
                 ctx,
-                DaemonMessage::Session {
+                &DaemonMessage::Session {
                     session_id: Some(ctx.session_id),
                     event: SessionEvent::ContextWindowResolved { context_window: cw },
                 },
@@ -620,6 +636,9 @@ impl SessionState {
     }
 
     fn from_snapshot(snapshot: SessionSnapshot, subscribers: HashMap<u64, SubscriberSink>) -> Self {
+        // usize→u32 turn count: a session with 4 billion turns is impossible
+        // in practice (each turn is a full provider round-trip).
+        #[allow(clippy::cast_possible_truncation)]
         let turn_count = snapshot.turns.len() as u32;
         Self {
             config: snapshot.config,
@@ -673,7 +692,7 @@ impl SessionState {
         }
     }
 
-    /// Start a new turn, returning its turn_id.
+    /// Start a new turn, returning its `turn_id`.
     /// If the turn has user text, the redo stack is cleared.
     pub fn start_turn(&mut self, user_text: Option<String>) -> (u32, Turn) {
         // New user input after an undo clears the redo opportunity.
@@ -757,7 +776,7 @@ impl SessionState {
     /// of when the tool actually finished. Requires the turn to have been
     /// seeded via [`Self::seed_tool_results`]; otherwise it is a no-op.
     ///
-    /// The five per-record fields (content, is_error, invocation_description,
+    /// The five per-record fields (content, `is_error`, `invocation_description`,
     /// image) are collapsed into the `output` value so the signature stays
     /// under clippy's `too_many_arguments` threshold; `name` stays explicit
     /// because `ToolOutput` does not carry it (it comes from the tool call).
@@ -772,10 +791,12 @@ impl SessionState {
             && let Some(record) = turn.tool_results.iter_mut().find(|r| r.call_id == call_id)
         {
             record.name = name;
-            record.content = output.content.clone();
+            record.content.clone_from(&output.content);
             record.is_error = output.is_error;
-            record.invocation_description = output.invocation_description.clone();
-            record.image = output.image_ref.clone();
+            record
+                .invocation_description
+                .clone_from(&output.invocation_description);
+            record.image.clone_from(&output.image_ref);
         }
     }
 
@@ -788,7 +809,7 @@ impl SessionState {
     /// dispatched but still running when the request stopped. Fill them with
     /// an explicit marker so the transcript shows what happened and the next
     /// provider request does not carry empty tool messages for calls whose
-    /// outcome is unknown. `executed` holds the call_ids whose results were
+    /// outcome is unknown. `executed` holds the `call_ids` whose results were
     /// actually recorded; every other placeholder is marked.
     pub fn mark_unexecuted_tool_results(&mut self, turn_id: u32, executed: &HashSet<String>) {
         if let Some(turn) = self.turns.get_mut(&turn_id) {
@@ -817,6 +838,11 @@ impl SessionState {
 
     /// Finalize a turn and persist it to the database.
     /// Returns an error if persistence fails after all retries.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the turn does not exist, the session write fails
+    /// after retries, or encoding/persisting any displayed image fails.
     pub fn finalize_turn(
         &mut self,
         db: &redb::Database,
@@ -832,7 +858,7 @@ impl SessionState {
 
     /// Undo the most recent user-initiated turns: find the most recent
     /// non-undone turn with `user_text: Some(...)`, mark it and all
-    /// higher-id turns as `undone = true`, store turn_ids for redo.
+    /// higher-id turns as `undone = true`, store `turn_ids` for redo.
     pub fn undo_turns(&mut self) -> Option<Vec<u32>> {
         let target = self
             .turns
@@ -865,6 +891,7 @@ impl SessionState {
     }
 
     /// Create an empty session state.
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             config: SessionConfig::default(),
@@ -976,7 +1003,7 @@ pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
     // Vision image bytes are daemon/model-only: the request builder consumes
     // them from the authoritative daemon-side turn, and the client renders
     // images via `displayed_images` (kept below), so drop the raw bytes here.
-    for record in clone.tool_results.iter_mut() {
+    for record in &mut clone.tool_results {
         record.image = None;
     }
     clone
@@ -985,7 +1012,7 @@ pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
 fn broadcast(
     subscribers: &mut HashMap<u64, SubscriberSink>,
     ctx: &RequestContext,
-    message: DaemonMessage,
+    message: &DaemonMessage,
 ) {
     // Forward to daemon-level activity subscribers so clients subscribed
     // to all session activity (e.g. the TUI after SubscribeAllActivity)
@@ -994,6 +1021,9 @@ fn broadcast(
     // origin is carried explicitly on the command for the daemon's
     // duplicate-suppression (it no longer re-derives the origin from the
     // message shape).
+    // `msg` is taken by reference so the (potentially large) payload can be
+    // reused by the caller after fanning it out — the daemon-level forward
+    // below clones it anyway.
     let _ = ctx.daemon_tx.send(DaemonCommand::BroadcastActivity {
         session_id: Some(ctx.session_id),
         msg: message.clone(),
@@ -1010,7 +1040,7 @@ fn broadcast(
     // daemon tears the connection down.
     let (evict_clients, evict_largest) = fan_out_evicting(
         subscribers,
-        &message,
+        message,
         &ctx.lag_limits,
         &ctx.global_lag,
         |_| false, // session subscribers are never duplicate-suppressed
@@ -1033,7 +1063,7 @@ fn fail_request(
     broadcast(
         subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(session_id),
             event: SessionEvent::Started {
                 request_id,
@@ -1045,7 +1075,7 @@ fn fail_request(
     broadcast(
         subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(session_id),
             event: SessionEvent::Failed {
                 request_id,
@@ -1058,7 +1088,7 @@ fn fail_request(
 
 /// Notify the daemon of updated metadata and persist the session record
 /// to the database.  Shared boilerplate used by session mutation handlers
-/// (SetTitle, SetAccount, SetModel, etc.) so that changes are reflected
+/// (`SetTitle`, `SetAccount`, `SetModel`, etc.) so that changes are reflected
 /// in session listings immediately and survive daemon restarts.
 fn persist_session_metadata(state: &mut SessionState, ctx: &RequestContext, label: &str) {
     // Any metadata mutation is a modification: bump the timestamp so the
@@ -1106,12 +1136,16 @@ fn default_active_tool_groups() -> HashSet<String> {
 }
 
 pub fn session_main(
-    rx: std::sync::mpsc::Receiver<SessionCommand>,
+    rx: &std::sync::mpsc::Receiver<SessionCommand>,
     initial_provider: Option<InferenceProvider>,
     registry: choreo_ai_protocols::SocketRegistry,
     account_name: Option<String>,
-    init_record: Option<SessionRecord>,
-    ctx: RequestContext,
+    // `init_record` is only read (title/model/effort/etc. are cloned out of
+    // it); the caller in daemon.rs still owns the record it built.
+    init_record: Option<&SessionRecord>,
+    // Borrowed only: the context is read throughout the loop (the session
+    // thread never outlives the caller's closure, which owns it).
+    ctx: &RequestContext,
 ) {
     let config = SessionConfig {
         title: init_record.as_ref().and_then(|r| r.title.clone()),
@@ -1125,12 +1159,10 @@ pub fn session_main(
             .and_then(|r| r.working_dir.as_ref().map(PathBuf::from)),
         created_at: init_record
             .as_ref()
-            .map(|r| r.created_at)
-            .unwrap_or_else(|| TimestampMs::now().as_millis()),
+            .map_or_else(|| TimestampMs::now().as_millis(), |r| r.created_at),
         last_modified: init_record
             .as_ref()
-            .map(|r| r.last_modified)
-            .unwrap_or_else(|| TimestampMs::now().as_millis()),
+            .map_or_else(|| TimestampMs::now().as_millis(), |r| r.last_modified),
         status: SessionStatus::Inactive,
         active_tool_groups: init_record
             .as_ref()
@@ -1165,7 +1197,7 @@ pub fn session_main(
     // Re-resolve context window from the catalog when loading an existing
     // session whose stored context_window is None (e.g. sessions created
     // before a model was added to the catalog).
-    state.resolve_context_window_if_missing(&ctx);
+    state.resolve_context_window_if_missing(ctx);
 
     match db::read_turns(&ctx.db, ctx.session_id) {
         Ok(turns) => {
@@ -1210,7 +1242,7 @@ pub fn session_main(
 
     let mut shutdown_requested = false;
     while let Ok(cmd) = rx.recv() {
-        if process_command(cmd, &mut state, &mut shutdown_requested, &ctx) {
+        if process_command(cmd, &mut state, &mut shutdown_requested, ctx) {
             break;
         }
     }
@@ -1227,40 +1259,49 @@ fn process_command(
 ) -> bool {
     match cmd {
         SessionCommand::RunInput { request_id, input } => {
-            handle_run_input(request_id, input, state, shutdown_requested, ctx)
+            handle_run_input(request_id, &input, state, shutdown_requested, ctx)
         }
         SessionCommand::RunChildInput {
             request_id,
             user_text,
             reply,
-        } => handle_run_child_input(request_id, user_text, reply, state, shutdown_requested, ctx),
+        } => handle_run_child_input(
+            request_id,
+            user_text.as_deref(),
+            reply,
+            state,
+            shutdown_requested,
+            ctx,
+        ),
         SessionCommand::Cancel { request_id } => handle_cancel(request_id, state, ctx),
         SessionCommand::SetModel { model } => handle_set_model(model, state, ctx),
         SessionCommand::StatusChanged(new_status) => handle_status_changed(new_status, state, ctx),
         SessionCommand::Attach { client_id, tx } => handle_attach(client_id, tx, state, ctx),
         SessionCommand::Detach { client_id } => {
-            handle_detach(client_id, state, shutdown_requested, ctx)
+            handle_detach(client_id, state, *shutdown_requested, ctx)
         }
         SessionCommand::RemoveSubscriber { client_id } => {
-            handle_remove_subscriber(client_id, state, shutdown_requested, ctx)
+            handle_remove_subscriber(client_id, state, *shutdown_requested, ctx)
         }
-        SessionCommand::GetSummary { reply } => handle_get_summary(reply, state, ctx),
+        SessionCommand::GetSummary { reply } => handle_get_summary(&reply, state, ctx),
         SessionCommand::RequestFinished {
             request_id,
             snapshot,
-        } => handle_request_finished(request_id, snapshot, state, shutdown_requested, ctx),
-        SessionCommand::Broadcast(message) => handle_broadcast(message, state, ctx),
+        } => handle_request_finished(request_id, snapshot, state, *shutdown_requested, ctx),
+        SessionCommand::Broadcast(message) => handle_broadcast(&message, state, ctx),
         SessionCommand::SyncAccumulatedUsage {
             token_usage,
             last_prompt_tokens,
         } => handle_sync_accumulated_usage(token_usage, last_prompt_tokens, state, ctx),
-        SessionCommand::SetTitle { title } => handle_set_title(title, state, ctx),
+        SessionCommand::SetTitle { title } => handle_set_title(&title, state, ctx),
         SessionCommand::SetWorkingDir { path, reply } => {
-            handle_set_working_dir(path, reply, state, ctx)
+            handle_set_working_dir(&path, &reply, state, ctx)
         }
-        SessionCommand::LoadTools { groups, reply } => handle_load_tools(groups, reply, state, ctx),
+        SessionCommand::LoadTools { groups, reply } => {
+            handle_load_tools(&groups, &reply, state, ctx)
+        }
         SessionCommand::UnloadTools { groups, reply } => {
-            handle_unload_tools(groups, reply, state, ctx)
+            handle_unload_tools(&groups, &reply, state, ctx)
         }
         SessionCommand::SetAccount { name } => handle_set_account(name, state, ctx),
         SessionCommand::DropProvider => {
@@ -1280,7 +1321,7 @@ fn process_command(
             handle_set_reasoning_effort(effort, state, ctx)
         }
         SessionCommand::GetReasoningEffort { reply } => {
-            handle_get_reasoning_effort(reply, state, ctx)
+            handle_get_reasoning_effort(&reply, state, ctx)
         }
         SessionCommand::Undo => handle_undo(state, ctx),
         SessionCommand::Redo => handle_redo(state, ctx),
@@ -1293,13 +1334,13 @@ fn process_command(
 /// Process a user input: validate, resolve provider, spawn a request worker.
 fn handle_run_input(
     request_id: u32,
-    input: Vec<u8>,
+    input: &[u8],
     state: &mut SessionState,
     shutdown_requested: &mut bool,
     ctx: &RequestContext,
 ) -> bool {
     debug!("session {}: RunInput id={}", ctx.session_id, request_id);
-    let text = String::from_utf8_lossy(&input).trim().to_string();
+    let text = String::from_utf8_lossy(input).trim().to_string();
     info!(
         session_id = ctx.session_id,
         input_len = text.len(),
@@ -1362,7 +1403,7 @@ fn handle_run_input(
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::Started {
                 request_id,
@@ -1387,15 +1428,15 @@ fn handle_run_input(
     let ctx = ctx.clone();
     let user_text = Some(text);
     std::thread::spawn(move || {
-        let _ = run_request_worker(
+        run_request_worker(
             request_id,
-            provider,
+            &provider,
             &mut worker_session,
-            model,
-            cancel_rx,
-            ctx,
+            &model,
+            &cancel_rx,
+            &ctx,
             None,
-            user_text,
+            user_text.as_deref(),
         );
     });
     false
@@ -1408,7 +1449,9 @@ fn handle_run_input(
 /// queued. The response is delivered through the `reply` channel.
 fn handle_run_child_input(
     request_id: u32,
-    user_text: Option<String>,
+    // Borrowed only: the text is cloned when injected into the worker's
+    // user turn; the command variant still owns it.
+    user_text: Option<&str>,
     reply: std::sync::mpsc::Sender<io::Result<ChildResult>>,
     state: &mut SessionState,
     shutdown_requested: &mut bool,
@@ -1417,14 +1460,14 @@ fn handle_run_child_input(
     // Lazy resolution (same path as RunInput): a session thread that has
     // never run a request may still be provider-less (keystore was locked at
     // attach). The old wording ("daemon locked") is preserved for failures.
-    let provider = match state.resolve_provider(ctx) {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = reply.send(Err(io::Error::other("daemon locked")));
-            return false;
-        }
+    let Ok(provider) = state.resolve_provider(ctx) else {
+        let _ = reply.send(Err(io::Error::other("daemon locked")));
+        return false;
     };
     let model = state.config.selected_model.clone().unwrap_or_default();
+    // Own the text before crossing the thread boundary — the borrowed
+    // `user_text` parameter cannot escape into the spawned worker.
+    let user_text_owned = user_text.map(str::to_owned);
     if *shutdown_requested {
         let _ = reply.send(Err(io::Error::other("session is shutting down")));
         return false;
@@ -1438,7 +1481,7 @@ fn handle_run_child_input(
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::Started {
                 request_id,
@@ -1459,17 +1502,16 @@ fn handle_run_child_input(
     let ctx = ctx.clone();
     let provider = provider.clone();
     std::thread::spawn(move || {
-        let result = run_request_worker(
+        run_request_worker(
             request_id,
-            provider,
+            &provider,
             &mut worker_session,
-            model,
-            cancel_rx,
-            ctx,
-            Some(reply),
-            user_text,
+            &model,
+            &cancel_rx,
+            &ctx,
+            Some(&reply),
+            user_text_owned.as_deref(),
         );
-        let _ = result;
     });
     false
 }
@@ -1496,7 +1538,7 @@ fn handle_cancel(request_id: u32, state: &mut SessionState, ctx: &RequestContext
             broadcast(
                 &mut state.subscribers,
                 ctx,
-                DaemonMessage::Session {
+                &DaemonMessage::Session {
                     session_id: Some(ctx.session_id),
                     event: SessionEvent::Cancelled { request_id: rid },
                 },
@@ -1521,7 +1563,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         broadcast(
             &mut state.subscribers,
             ctx,
-            DaemonMessage::Session {
+            &DaemonMessage::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::ModelSelectionFailed { model, error: msg },
             },
@@ -1543,7 +1585,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         broadcast(
             &mut state.subscribers,
             ctx,
-            DaemonMessage::Session {
+            &DaemonMessage::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::ContextWindowResolved { context_window: cw },
             },
@@ -1571,7 +1613,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         broadcast(
             &mut state.subscribers,
             ctx,
-            DaemonMessage::Session {
+            &DaemonMessage::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::ReasoningEffortSet {
                     effort: "off".to_string(),
@@ -1587,7 +1629,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::ModelSelected {
                 model: model.clone(),
@@ -1637,7 +1679,7 @@ fn validate_model_via_daemon(model: &str, ctx: &RequestContext) -> Result<(), St
 
 /// Update the session status and broadcast to subscribers and daemon.
 ///
-/// Status transitions (Inference, ToolCall, Retrying) are internal pipeline
+/// Status transitions (Inference, `ToolCall`, Retrying) are internal pipeline
 /// churn, NOT user-visible modifications — the status is refreshed everywhere
 /// but `last_modified` is deliberately left untouched so the sessions list
 /// does not re-sort on every tool call mid-request.  Only completed requests
@@ -1655,7 +1697,7 @@ fn handle_status_changed(
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::SessionStatusChanged {
                 status: new_status.clone(),
@@ -1743,7 +1785,7 @@ fn handle_attach(
 fn handle_detach(
     client_id: u64,
     state: &mut SessionState,
-    shutdown_requested: &bool,
+    shutdown_requested: bool,
     ctx: &RequestContext,
 ) -> bool {
     info!("session {}: client {} detached", ctx.session_id, client_id);
@@ -1757,7 +1799,7 @@ fn handle_detach(
             client_id,
             session_id: ctx.session_id,
         });
-    state.active_requests.is_empty() && (state.subscribers.is_empty() || *shutdown_requested)
+    state.active_requests.is_empty() && (state.subscribers.is_empty() || shutdown_requested)
 }
 
 /// Remove a subscriber at the daemon's request (client evicted for lag or
@@ -1770,7 +1812,7 @@ fn handle_detach(
 fn handle_remove_subscriber(
     client_id: u64,
     state: &mut SessionState,
-    shutdown_requested: &bool,
+    shutdown_requested: bool,
     ctx: &RequestContext,
 ) -> bool {
     debug!(
@@ -1778,12 +1820,12 @@ fn handle_remove_subscriber(
         ctx.session_id, client_id
     );
     state.subscribers.remove(&client_id);
-    state.active_requests.is_empty() && (state.subscribers.is_empty() || *shutdown_requested)
+    state.active_requests.is_empty() && (state.subscribers.is_empty() || shutdown_requested)
 }
 
-/// Return a SessionSummary for this session via the reply channel.
+/// Return a `SessionSummary` for this session via the reply channel.
 fn handle_get_summary(
-    reply: std::sync::mpsc::Sender<SessionSummary>,
+    reply: &std::sync::mpsc::Sender<SessionSummary>,
     state: &SessionState,
     ctx: &RequestContext,
 ) -> bool {
@@ -1800,6 +1842,9 @@ fn handle_get_summary(
             .map(|p| p.display().to_string()),
         created_at: state.config.created_at,
         last_modified: state.config.last_modified,
+        // usize→u32 turn count: a session with 4 billion turns is impossible
+        // in practice (each turn is a full provider round-trip).
+        #[allow(clippy::cast_possible_truncation)]
         turn_count: state.turns.len() as u32,
         status: state.config.status.clone(),
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
@@ -1816,7 +1861,7 @@ fn handle_request_finished(
     request_id: u32,
     mut snapshot: SessionSnapshot,
     state: &mut SessionState,
-    shutdown_requested: &bool,
+    shutdown_requested: bool,
     ctx: &RequestContext,
 ) -> bool {
     // An undo processed while the request worker was in flight leaves the
@@ -1914,7 +1959,7 @@ fn handle_request_finished(
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
@@ -1926,12 +1971,15 @@ fn handle_request_finished(
         session_id: ctx.session_id,
         status: SessionStatus::Inactive,
     });
-    state.active_requests.is_empty() && (state.subscribers.is_empty() || *shutdown_requested)
+    state.active_requests.is_empty() && (state.subscribers.is_empty() || shutdown_requested)
 }
 
 /// Broadcast a message through the live subscriber map.
 fn handle_broadcast(
-    message: DaemonMessage,
+    // Borrowed only: the message is forwarded by reference into
+    // `broadcast` (which clones it for the daemon-level activity fan-out);
+    // the command variant still owns the payload.
+    message: &DaemonMessage,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
@@ -1971,7 +2019,7 @@ fn handle_sync_accumulated_usage(
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::TokenUsageUpdate {
                 token_usage: state.config.accumulated_usage,
@@ -1992,7 +2040,7 @@ fn handle_sync_accumulated_usage(
 /// Set the session title, broadcasting the change to subscribers and
 /// notifying the daemon so session listings reflect the new title
 /// immediately.
-fn handle_set_title(title: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
+fn handle_set_title(title: &str, state: &mut SessionState, ctx: &RequestContext) -> bool {
     // Defense-in-depth: cap title length by grapheme clusters so
     // multi-byte scripts and composed emoji are treated as single
     // user-perceived characters.  The tool-level validation in
@@ -2015,17 +2063,17 @@ fn handle_set_title(title: String, state: &mut SessionState, ctx: &RequestContex
         new_title = %title,
         "session title changed",
     );
-    state.config.title = Some(title.clone());
+    state.config.title = Some(title.to_string());
 
     // Broadcast to session subscribers (e.g. TUI) so they reflect the
     // new title immediately, without waiting for the next persist cycle.
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::SessionTitleSet {
-                title: title.clone(),
+                title: title.to_owned(),
             },
         },
     );
@@ -2046,8 +2094,10 @@ fn handle_set_title(title: String, state: &mut SessionState, ctx: &RequestContex
 /// request end, silently reverting the change.)  Replies with the canonical
 /// path that was applied so the calling tool knows the round-trip succeeded.
 fn handle_set_working_dir(
-    path: PathBuf,
-    reply: mpsc::Sender<Result<String, String>>,
+    // Borrowed only: the path is cloned into `state.config.working_dir` and
+    // stringified for the reply below; the command variant still owns it.
+    path: &Path,
+    reply: &mpsc::Sender<Result<String, String>>,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
@@ -2057,7 +2107,7 @@ fn handle_set_working_dir(
         new_path = %path.display(),
         "session working directory changed",
     );
-    state.config.working_dir = Some(path.clone());
+    state.config.working_dir = Some(path.to_path_buf());
     // Skills are discovered relative to the working directory — invalidate
     // the cache so they are re-discovered from the new location on the next
     // agent-loop turn.  (The system-prompt context cache is fingerprint-keyed
@@ -2069,7 +2119,7 @@ fn handle_set_working_dir(
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::SessionWorkingDirSet {
                 path: Some(path.to_string_lossy().into_owned()),
@@ -2088,8 +2138,8 @@ fn handle_set_working_dir(
 /// updated group set, persist, and reply to the calling tool with a summary
 /// of what changed.
 fn handle_load_tools(
-    groups: Vec<String>,
-    reply: mpsc::Sender<Result<String, String>>,
+    groups: &[String],
+    reply: &mpsc::Sender<Result<String, String>>,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
@@ -2100,7 +2150,7 @@ fn handle_load_tools(
     // handler.  Re-validate here so a directly-sent command can never
     // persist a typo'd group into the authoritative active set.
     let known = ctx.tool_registry.known_group_names();
-    if let Some(unknown) = crate::tools::unknown_group_names(&groups, &known) {
+    if let Some(unknown) = crate::tools::unknown_group_names(groups, &known) {
         let _ = reply.send(Err(format!(
             "Unknown tool group(s): {}",
             unknown.join(", ")
@@ -2109,12 +2159,12 @@ fn handle_load_tools(
     }
 
     let result =
-        crate::tools::load_tools::apply_load_tools(&mut state.config.active_tool_groups, &groups);
+        crate::tools::load_tools::apply_load_tools(&mut state.config.active_tool_groups, groups);
 
     // Broadcast updated session state so the client (e.g. TUI status bar)
     // picks up the new active_tool_groups immediately.
     let session_state = state.session_state_message(ctx.session_id);
-    broadcast(&mut state.subscribers, ctx, session_state);
+    broadcast(&mut state.subscribers, ctx, &session_state);
     persist_session_metadata(state, ctx, "LoadTools");
     let _ = reply.send(Ok(result));
 
@@ -2125,8 +2175,8 @@ fn handle_load_tools(
 /// updated group set, persist, and reply to the calling tool with a summary
 /// of what changed.
 fn handle_unload_tools(
-    groups: Vec<String>,
-    reply: mpsc::Sender<Result<String, String>>,
+    groups: &[String],
+    reply: &mpsc::Sender<Result<String, String>>,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
@@ -2135,7 +2185,7 @@ fn handle_unload_tools(
     // Defense-in-depth: reject unknown group names (same rationale as
     // handle_load_tools).  "core" is known and handled below as protected.
     let known = ctx.tool_registry.known_group_names();
-    if let Some(unknown) = crate::tools::unknown_group_names(&groups, &known) {
+    if let Some(unknown) = crate::tools::unknown_group_names(groups, &known) {
         let _ = reply.send(Err(format!(
             "Unknown tool group(s): {}",
             unknown.join(", ")
@@ -2148,14 +2198,14 @@ fn handle_unload_tools(
     // the unload_tools tool and the request worker's mirror.
     let result = crate::tools::unload_tools::apply_unload_tools(
         &mut state.config.active_tool_groups,
-        &groups,
+        groups,
         ctx.tool_registry.protected_groups(),
     );
 
     // Broadcast updated session state so the client picks up the new
     // active_tool_groups immediately.
     let session_state = state.session_state_message(ctx.session_id);
-    broadcast(&mut state.subscribers, ctx, session_state);
+    broadcast(&mut state.subscribers, ctx, &session_state);
     persist_session_metadata(state, ctx, "UnloadTools");
     let _ = reply.send(Ok(result));
 
@@ -2197,7 +2247,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
                 broadcast(
                     &mut state.subscribers,
                     ctx,
-                    DaemonMessage::Session {
+                    &DaemonMessage::Session {
                         session_id: Some(ctx.session_id),
                         event: SessionEvent::ContextWindowResolved { context_window: cw },
                     },
@@ -2215,7 +2265,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::SessionAccountSet { account: name },
         },
@@ -2237,7 +2287,7 @@ fn handle_set_reasoning_effort(
         broadcast(
             &mut state.subscribers,
             ctx,
-            DaemonMessage::Session {
+            &DaemonMessage::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::ReasoningEffortSetFailed { effort, error: msg },
             },
@@ -2256,8 +2306,7 @@ fn handle_set_reasoning_effort(
     let valid = effort == "off"
         || capability
             .as_ref()
-            .map(|c| c.available_effort_levels.contains(&effort))
-            .unwrap_or(false)
+            .is_some_and(|c| c.available_effort_levels.contains(&effort))
         // No model selected yet: accept the preference optimistically (it
         // will be validated when inference actually runs in
         // resolve_reasoning_effort).
@@ -2274,31 +2323,30 @@ fn handle_set_reasoning_effort(
         broadcast(
             &mut state.subscribers,
             ctx,
-            DaemonMessage::Session {
+            &DaemonMessage::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::ReasoningEffortSet { effort },
             },
         );
         return false;
-    } else {
-        let model = state.config.selected_model.as_deref().unwrap_or("(none)");
-        let msg = format!("model '{model}' does not support reasoning effort '{effort}'");
-        warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
-        broadcast(
-            &mut state.subscribers,
-            ctx,
-            DaemonMessage::Session {
-                session_id: Some(ctx.session_id),
-                event: SessionEvent::ReasoningEffortSetFailed { effort, error: msg },
-            },
-        );
     }
+    let model = state.config.selected_model.as_deref().unwrap_or("(none)");
+    let msg = format!("model '{model}' does not support reasoning effort '{effort}'");
+    warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
+    broadcast(
+        &mut state.subscribers,
+        ctx,
+        &DaemonMessage::Session {
+            session_id: Some(ctx.session_id),
+            event: SessionEvent::ReasoningEffortSetFailed { effort, error: msg },
+        },
+    );
     false
 }
 
 /// Return the current reasoning effort via the reply channel.
 fn handle_get_reasoning_effort(
-    reply: mpsc::Sender<String>,
+    reply: &mpsc::Sender<String>,
     state: &SessionState,
     ctx: &RequestContext,
 ) -> bool {
@@ -2313,7 +2361,7 @@ fn handle_get_reasoning_effort(
 }
 
 /// Handle Undo: mark the most recent user turn's subtree as deleted.
-/// Uses a quick-reference HashMap to avoid an O(n) scan per ID.
+/// Uses a quick-reference `HashMap` to avoid an O(n) scan per ID.
 fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     let Some(turn_ids) = state.undo_turns() else {
         debug!(
@@ -2360,7 +2408,7 @@ fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::TurnsUndone { turn_ids },
         },
@@ -2391,7 +2439,7 @@ fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     broadcast(
         &mut state.subscribers,
         ctx,
-        DaemonMessage::Session {
+        &DaemonMessage::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::TurnsRedone {
                 turns: turns
@@ -2416,7 +2464,7 @@ fn handle_shutdown(
         broadcast(
             &mut state.subscribers,
             ctx,
-            DaemonMessage::Session {
+            &DaemonMessage::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::Cancelled { request_id },
             },
@@ -2428,19 +2476,25 @@ fn handle_shutdown(
 #[expect(clippy::too_many_arguments)]
 fn run_request_worker(
     request_id: u32,
-    client: InferenceProvider,
+    // Borrowed only: `run_agent_loop` also takes the client by reference;
+    // the worker thread outlives the call via its own clones of `ctx` and
+    // `model` at the spawn site.
+    client: &InferenceProvider,
     session: &mut SessionState,
-    model: String,
-    cancel_rx: crossbeam_channel::Receiver<()>,
-    ctx: RequestContext,
-    child_reply: Option<mpsc::Sender<io::Result<ChildResult>>>,
-    user_text: Option<String>,
-) -> io::Result<()> {
+    model: &str,
+    cancel_rx: &crossbeam_channel::Receiver<()>,
+    ctx: &RequestContext,
+    child_reply: Option<&mpsc::Sender<io::Result<ChildResult>>>,
+    user_text: Option<&str>,
+) {
+    // No error path: every failure mode is folded into a RequestOutcome and
+    // routed back through the command channel, so the function returns ()
+    // instead of a transparent Ok wrapper.
     let request_start = std::time::Instant::now();
     let initial_snapshot = session.snapshot();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_agent_loop(
-            &client, session, &model, request_id, &cancel_rx, &ctx, user_text,
+            client, session, model, request_id, cancel_rx, ctx, user_text,
         )
     }));
 
@@ -2536,7 +2590,6 @@ fn run_request_worker(
         request_id,
         snapshot,
     });
-    Ok(())
 }
 
 enum RequestOutcome {
