@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Eliminated the last clippy warnings across the workspace so
+  `cargo clippy --workspace --all-targets` is warning-free (the only
+  remaining notice is the `proc-macro-error2` dependency advisory): removed
+  a needless `Ok(.. ?)` in `choreo-transport`'s preamble reader, collapsed a
+  nested `if` in the OpenAI tool-call accumulator, factored the
+  `noise_integration` test helper's complex tuple return into a
+  `NoiseTestPair` alias, and silenced the unused-import/dead-code warnings in
+  the temporarily-disabled `choreo-content` platform round-trip test via
+  `#[cfg(any())]` gating (items preserved verbatim for restoration) instead
+  of leaving a doc comment dangling before its block comment.
+
+### Changed
+
+- Refactored the post-strict-lints bounds-checked slicing boilerplate: a
+  shared `read_slice` helper in `choreo-ai-protocols` replaces the four
+  duplicated `buf.get(..n).unwrap_or(&[])` read-contract sites (SSE readers,
+  image CDN download); `zai.rs` hoists its duplicated `as_object_mut` guard;
+  `choreo-daemon`'s `text_stream.rs` no longer uses silent-widening
+  `unwrap_or(full-buffer)` slicing fallbacks — out-of-bounds windows and a
+  violated `Utf8Error::valid_up_to()` invariant now produce loud errors
+  instead of quietly defeating the display cap.
+
 ### Added
 
 - Workspace-wide strict clippy lints, modeled on the "strict lints"

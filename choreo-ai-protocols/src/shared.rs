@@ -107,6 +107,18 @@ impl From<ProviderError> for io::Error {
     }
 }
 
+/// Slice `buf[..n]` for a `Read::read` result.
+///
+/// `Read::read` guarantees `Ok(n)` with `n <= buf.len()`, so this is
+/// infallible for any correctly-obtained `n`; the empty fallback exists only
+/// to keep the slicing family of lints satisfied and is unreachable unless a
+/// call site passes an `n` that did not come from a `read` on `buf`.
+/// Shared by the SSE readers and the image-CDN download loop so each site
+/// doesn't repeat the same `get(..n).unwrap_or(&[])` boilerplate.
+pub(crate) fn read_slice(buf: &[u8], n: usize) -> &[u8] {
+    buf.get(..n).unwrap_or(&[])
+}
+
 /// Map a ProviderError variant to a stable label string.
 ///
 /// Test-only helper. Delegates to [`InferenceError::metric_label`] so the

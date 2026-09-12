@@ -44,10 +44,8 @@ impl SseReader {
                     return self.finish_event();
                 }
                 n => {
-                    // `read` returns n <= buf.len() by contract, so the slice
-                    // always succeeds; the empty fallback is unreachable.
-                    let bytes = buf.get(..n).unwrap_or(&[]);
-                    self.pending.extend_from_slice(bytes);
+                    self.pending
+                        .extend_from_slice(crate::shared::read_slice(&buf, n));
                 }
             }
         }

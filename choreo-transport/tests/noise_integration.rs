@@ -44,10 +44,15 @@ fn shrink_socket_buffers(stream: &TcpStream) {
 #[cfg(not(unix))]
 fn shrink_socket_buffers(_stream: &TcpStream) {}
 
+/// Keypairs + listener bundle returned by [`noise_test_pair`]: the ephemeral
+/// listener plus the server and client static keys (secret, then public, in
+/// construction order), destructured flat by every test. Factored into a type
+/// alias to keep the shared test helper's signature readable.
+type NoiseTestPair = (TcpListener, [u8; 32], [u8; 32], [u8; 32], [u8; 32]);
+
 /// Fresh X25519 keypairs for both handshake sides plus an ephemeral
 /// listener, shared by every test (cuts the per-test keygen boilerplate).
-fn noise_test_pair()
--> std::result::Result<(TcpListener, [u8; 32], [u8; 32], [u8; 32], [u8; 32]), String> {
+fn noise_test_pair() -> std::result::Result<NoiseTestPair, String> {
     let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
     let server_pk = PublicKey::from(&server_sk);
     let client_sk = StaticSecret::random_from_rng(&mut rand::rng());

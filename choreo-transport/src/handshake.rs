@@ -234,7 +234,7 @@ pub fn read_handshake_preamble_with_timeout(
     // `read_handshake_exact` above returned exactly `len = 1` bytes, so the
     // index is in bounds by construction; the access is bounds-checked anyway
     // (see the slice helpers' comment) rather than panicking.
-    Ok(at(&byte, 0, "preamble byte").copied()?)
+    at(&byte, 0, "preamble byte").copied()
 }
 
 /// Perform the Noise IK handshake as the **initiator** (client side), using

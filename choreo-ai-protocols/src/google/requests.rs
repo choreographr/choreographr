@@ -469,10 +469,10 @@ impl GeminiSseReader {
                 }
                 Err(e) => return Err(e),
             };
-            // `read` returns n <= buf.len() by contract, so the slice always
-            // succeeds; the empty fallback is unreachable.
-            let bytes = buf.get(..n).unwrap_or(&[]);
-            self.pending.extend_from_slice(bytes);
+            // `read` returns n <= buf.len() by contract (enforced centrally
+            // by `read_slice`), so the fallback is unreachable.
+            self.pending
+                .extend_from_slice(crate::shared::read_slice(&buf, n));
         }
     }
 

@@ -249,13 +249,13 @@ impl ZaiImageClient {
         });
         // `Map::insert` (instead of `Value`'s IndexMut, which would panic on
         // a non-object body) is the correct API for setting top-level keys.
-        if let Some(size) = size_wire(req.size) {
-            if let Some(obj) = body.as_object_mut() {
+        // The json! macro above always produces an object, so the guard is a
+        // formality — hoisted out of the two optionals below.
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(size) = size_wire(req.size) {
                 obj.insert("size".into(), size.into());
             }
-        }
-        if let Some(quality) = quality_wire(req.quality) {
-            if let Some(obj) = body.as_object_mut() {
+            if let Some(quality) = quality_wire(req.quality) {
                 obj.insert("quality".into(), quality.into());
             }
         }
@@ -407,10 +407,7 @@ impl ZaiImageClient {
                     "generated image exceeds the adapter's download cap",
                 )));
             }
-            // `read` returns n <= chunk.len() by contract, so the slice always
-            // succeeds; the empty fallback is unreachable.
-            let fresh = chunk.get(..n).unwrap_or(&[]);
-            bytes.extend_from_slice(fresh);
+            bytes.extend_from_slice(crate::shared::read_slice(&chunk, n));
         }
         if bytes.is_empty() {
             // An empty body with an image content type is the same

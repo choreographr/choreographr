@@ -73,12 +73,16 @@ pub(crate) fn read_line_capped<R: BufRead>(
                 return Ok(false);
             }
             let take = available.len().min(remaining);
-            // `take <= available.len()`, so all ranges below are in bounds;
-            // the get() fallbacks are unreachable.
-            let window = available.get(..take).unwrap_or(available);
+            // `take <= available.len()`, so the window below is always valid.
+            // Unlike an `unwrap_or(available)` fallback — which would silently
+            // WIDEN the range and defeat the `take` cap if an invariant ever
+            // broke — the helper returns an error so the violation is loud.
+            let window = cap_slice(available, ..take)?;
             match window.iter().position(|&b| b == b'\n') {
                 Some(idx) => {
-                    buf.extend_from_slice(available.get(..=idx).unwrap_or(available));
+                    // `idx < take`, so the range is in bounds (and the
+                    // loud-error helper applies for the same reason as above).
+                    buf.extend_from_slice(cap_slice(available, ..=idx)?);
                     (idx + 1, true)
                 }
                 None => {
@@ -92,6 +96,22 @@ pub(crate) fn read_line_capped<R: BufRead>(
             return Ok(true);
         }
     }
+}
+
+/// Bounds-checked sub-slice of a `BufRead::fill_buf` window that returns a
+/// loud `io::Error` instead of silently widening (an `unwrap_or(full)`
+/// fallback here would quietly defeat the `take` display cap that bounds
+/// memory). Unreachable unless a slicing invariant above is broken.
+fn cap_slice(
+    available: &[u8],
+    range: impl std::slice::SliceIndex<[u8], Output = [u8]>,
+) -> io::Result<&[u8]> {
+    available.get(range).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "internal invariant violated: fill_buf window slice out of bounds",
+        )
+    })
 }
 
 /// Consume the remainder of an over-cap line (up to and including `\n`),
@@ -301,9 +321,15 @@ pub(crate) fn render_streamed_line(
         Err(e) if !line.complete && e.error_len().is_none() => {
             // The display cap split a multi-byte char mid-sequence; the
             // prefix before the split is valid and that is all we show.
-            // `valid_up_to()` is a valid boundary index; fallback preserves behavior.
-            std::str::from_utf8(line.content.get(..e.valid_up_to()).unwrap_or(&line.content))
-                .unwrap_or_default()
+            // `valid_up_to()` is a valid boundary index by the Utf8Error
+            // contract; a loud error (not a widened fallback) if that ever
+            // stops holding.
+            let prefix = line.content.get(..e.valid_up_to()).ok_or_else(|| {
+                ToolExecError(
+                    "internal invariant violated: Utf8Error::valid_up_to() out of bounds".into(),
+                )
+            })?;
+            std::str::from_utf8(prefix).unwrap_or_default()
         }
         Err(e) => {
             return Err(ToolExecError(format!(
