@@ -289,9 +289,29 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         let result = match &mode {
             ConnectionMode::UnixSocket(socket_path) => {
                 let ensure_path = socket_path.clone();
+                // A separate clone for the autostart hook: `handle_daemon_message`
+                // above borrows `connection_ui_tx` for the lifetime of the call,
+                // so the hook cannot move it (crossbeam senders are cheap clones).
+                let autostart_ui_tx = connection_ui_tx.clone();
                 let mut ensure_daemon = move || {
-                    crate::autostart::start_daemon(&ensure_path)
-                        .map_err(|error| ClientError::DaemonStart(format!("{error:#}")))
+                    // Simple status feedback while the daemon spawns and comes
+                    // up (sub-second in practice): the UI loop paints this on
+                    // the status line instead of the user staring at a silent
+                    // screen for the whole autostart wait. Nothing is printed
+                    // to the terminal directly — that would garble the
+                    // alternate screen.
+                    let _ = autostart_ui_tx.send(UiEvent::Status(
+                        "no daemon running — starting choreographr…".to_string(),
+                    ));
+                    let result = crate::autostart::start_daemon(&ensure_path)
+                        .map_err(|error| ClientError::DaemonStart(format!("{error:#}")));
+                    // On success, replace the starting message; the first real
+                    // daemon messages overwrite it in turn. On failure the
+                    // connection error becomes the TUI's quit message.
+                    if result.is_ok() {
+                        let _ = autostart_ui_tx.send(UiEvent::Status("daemon started".to_string()));
+                    }
+                    result
                 };
                 run_daemon_connection_with_autostart(
                     socket_path,
@@ -1128,6 +1148,15 @@ fn handle_ui_event(
             app.quit_message
                 .get_or_insert_with(|| "the connection to the daemon was closed".to_string());
             Ok(false)
+        }
+        UiEvent::Status(message) => {
+            // Connection-task feedback while the connection is still being
+            // established (currently: the daemon-autostart wait). The very
+            // first daemon messages overwrite it, and the connection task
+            // sends a final "daemon started" status when the autostart hook
+            // succeeds — so no explicit clearing is needed.
+            app.status = Some(message);
+            Ok(true)
         }
     }
 }
@@ -1993,6 +2022,31 @@ mod tests {
             Some("the connection to the daemon was closed"),
             "a bare EOF must report the dropped connection"
         );
+    }
+
+    #[test]
+    fn status_event_sets_the_status_line_and_requests_a_repaint() {
+        // The autostart wait's "no daemon running — starting choreographr…"
+        // feedback travels as a Status event: it must land on the status line
+        // (and count as a re-render trigger) but never touch the views or
+        // quit state.
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let dirty = handle_ui_event(
+            UiEvent::Status("no daemon running — starting choreographr…".to_string()),
+            &mut app,
+            &tx,
+        )
+        .expect("handle Status");
+
+        assert!(dirty, "a status change must trigger a repaint");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("no daemon running — starting choreographr…")
+        );
+        assert!(!app.should_quit, "a status event must never quit");
+        assert!(app.quit_message.is_none());
     }
 
     #[test]

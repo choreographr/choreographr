@@ -203,9 +203,20 @@ fn handle_accept_error(e: io::Error) {
 /// SUCCESSFUL connect means a live daemon is listening, so removing the file
 /// would orphan a working daemon — return an actionable error instead. A
 /// failed connect (ENOENT, ECONNREFUSED, or a regular file at the path) means
-/// nothing is listening: remove the leftover and proceed. The connect has no
-/// timeout by design — a connect to a local listener resolves immediately;
-/// there is no third state.
+/// nothing is listening: remove the leftover and proceed (the classification
+/// mirror of `choreo_proto::dial_error_means_no_listener`, which the CLIENT
+/// side uses for autostart — here ANY failed connect is stale, because this
+/// path's action on "stale" is cleanup, not a spawn). The connect has no
+/// timeout by design — a connect to a local listener resolves immediately.
+///
+/// Honest limitation: probe-then-remove-then-bind is three separate syscalls,
+/// not one atomic operation, so two daemons starting SIMULTANEOUSLY can both
+/// pass the probe (the socket file may even be recreated between the probe
+/// and the remove by the other starter). The guarantee is therefore
+/// best-effort ordering, not exclusivity: the loser of such a race always
+/// fails loudly at the bind (or at the removal error above), and the ordinary
+/// autostart flow — a client dialing an existing socket — is fully covered,
+/// since a live listener makes the probe connect succeed.
 pub(crate) fn remove_stale_socket(socket_path: &str) -> io::Result<()> {
     if !Path::new(socket_path).exists() {
         return Ok(());

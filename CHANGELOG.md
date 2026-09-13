@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Autostart feedback in the TUI: while the autostart hook spawns the daemon
+  and waits for its socket, the status line shows "no daemon running —
+  starting choreographr…" (then "daemon started") via a new
+  `UiEvent::Status` event from the connection task — no more silent screen
+  during the wait, and still nothing printed directly to the terminal (that
+  would garble the alternate screen).
+
+### Changed
+
+- The "nothing is listening" dial classification (`NotFound` /
+  `ConnectionRefused`) moved into a shared predicate,
+  `choreo_proto::dial_error_means_no_listener`, used by the TUI connection
+  path (`choreo-client-core`'s `run_daemon_connection_with_autostart`) and
+  documented as the mirror of the daemon-side stale-socket probe, so the
+  client and daemon classifications can never drift.
+- The TUI's cross-platform socket dial (std `UnixStream` on unix,
+  `uds_windows` on Windows) extracted into a single named helper,
+  `autostart::dial_socket`, used by both the wait-for-our-child loop and the
+  tests instead of three inlined `#[cfg]` copies.
+- Autostart/poll tests that wait on real time or bind real sockets moved out
+  of the `src/` unit-test modules into the crates' `tests/` integration
+  suites (`choreo-tui/tests/autostart_poll.rs`,
+  `choreo-client-core/tests/connection_autostart.rs`), per the test
+  discipline: unit tests are now timing-free.
+
 ### Fixed
+
+- The daemon's `--log-file` is now created with mode 0600 on unix: daemon
+  logs can carry sensitive content and the TUI autostart writes them into
+  the (potentially shared) temp dir — an unrestricted create leaked by
+  default. Windows keeps inherited ACLs.
 
 - `run_server` no longer steals a live daemon's socket: before removing an
   existing socket file it now probes it with a connect — a successful

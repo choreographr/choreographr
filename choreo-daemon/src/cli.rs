@@ -215,16 +215,26 @@ pub fn main() -> anyhow::Result<()> {
     // fail loudly with the path, not silently lose all diagnostics. ANSI is
     // always off for file output (escape codes are unreadable in a log file).
     if let Some(path) = &cli.log_file {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .with_context(|| {
-                format!(
-                    "failed to open --log-file {path} for writing; check that the \
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        // Unix only: create the log with 0600 so other users on a shared
+        // machine cannot read it. Daemon logs can carry sensitive content
+        // (paths, account names, provider request errors) and the temp-dir
+        // location the TUI autostart uses is shared — an unrestricted create
+        // would leak by default. Windows ACLs are inherited from the parent
+        // directory (the user's own temp dir), so no extra work is needed
+        // there; `mode` does not exist as a method outside unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path).with_context(|| {
+            format!(
+                "failed to open --log-file {path} for writing; check that the \
                      directory exists and is writable"
-                )
-            })?;
+            )
+        })?;
         // `Mutex<File>` is a `MakeWriter`: each tracing event locks the file
         // briefly, serializing writes without any extra plumbing.
         fmt()

@@ -172,6 +172,30 @@ fn read_payload_rejects_oversized_frame() {
 }
 
 #[test]
+fn dial_error_means_no_listener_covers_exactly_the_no_listener_kinds() {
+    use std::io::ErrorKind;
+    // The autostart contract: only these two kinds may trigger a spawn.
+    assert!(crate::dial_error_means_no_listener(ErrorKind::NotFound));
+    assert!(crate::dial_error_means_no_listener(
+        ErrorKind::ConnectionRefused
+    ));
+    // Everything else — permission problems, wedged listeners, anything
+    // unknown — must NOT read as "no daemon" (spawning a second daemon over
+    // a live one would be the failure mode).
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::TimedOut,
+        ErrorKind::ConnectionReset,
+        ErrorKind::Other,
+    ] {
+        assert!(
+            !crate::dial_error_means_no_listener(kind),
+            "{kind:?} must not classify as no-listener"
+        );
+    }
+}
+
+#[test]
 fn socket_path_uses_env_override() {
     assert_eq!(
         crate::io::socket_path_impl(|| Some("/tmp/custom-choreographr.sock".to_string())),

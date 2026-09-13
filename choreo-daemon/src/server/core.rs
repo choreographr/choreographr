@@ -260,6 +260,19 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> io::Re
                     // clients remain, or a spurious delivery — is a no-op.
                     // There is deliberately no idle timer: a daemon that has
                     // never had a client runs forever.
+                    //
+                    // Known benign race: the zero-check and a NEW client's
+                    // slot acquisition are not serialized (the counter is the
+                    // sanctioned lock-free bookkeeping exception, not a
+                    // mutex-guarded decision), so a client dialing in the
+                    // window between "count hits 0" and "this arm reads 0"
+                    // can have the daemon shut down underneath it — that
+                    // client sees a bare EOF (or the notify-before-EOF
+                    // `ShuttingDown`) and, for the TUI autostart flow,
+                    // simply retries. Closing that window would require the
+                    // accept path to take the decision mutex per connection,
+                    // which the message-passing rules forbid for a bookkeeping
+                    // counter; the tiny retry cost is the accepted trade-off.
                     if let Some(wake_path) = &auto_exit_wake_path
                         && auto_exit_conn_count.load(std::sync::atomic::Ordering::Relaxed) == 0
                     {

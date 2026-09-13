@@ -10,7 +10,7 @@
 //! anything: remote daemons are not launchable from here by definition.
 //!
 //! All helpers are factored as pure functions over injected parameters (paths,
-//! a probe closure) so they are unit-testable without real processes; only
+//! a dial closure) so they are unit-testable without real sockets; only
 //! [`start_daemon`] performs the actual spawn.
 
 use anyhow::Context;
@@ -21,12 +21,29 @@ use std::time::{Duration, Instant};
 /// Poll interval between socket dials while waiting for the spawned daemon to
 /// start listening. Short enough that startup feels instant, long enough not
 /// to spin.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Total budget for waiting for the daemon's socket to appear. Generous
 /// enough for a cold start on slow disks; past this the spawn is considered
 /// failed and the child is killed.
-const START_BUDGET: Duration = Duration::from_secs(5);
+pub const START_BUDGET: Duration = Duration::from_secs(5);
+
+/// The ONE cross-platform unix-socket dial primitive: std's `UnixStream` on
+/// unix, the `uds_windows` shim on Windows (std's Windows `UnixStream` is
+/// still unstable). Extracted as a named function so every socket probe in
+/// the TUI — the wait-for-our-child loop below and the integration tests —
+/// exercises the exact same dial shape `choreo-client-core`'s connection
+/// path uses, instead of re-inlining the `#[cfg]` split at each site.
+///
+/// Note this is a PROBE primitive only: it is never used for the connection
+/// itself (that dial lives in `choreo-client-core` and keeps its stream).
+pub fn dial_socket(path: &str) -> bool {
+    #[cfg(unix)]
+    let probe = std::os::unix::net::UnixStream::connect(path);
+    #[cfg(windows)]
+    let probe = uds_windows::UnixStream::connect(path);
+    probe.is_ok()
+}
 
 /// Path of the sibling `choreographr` daemon binary: same directory as the
 /// running TUI executable, `.exe`-suffixed on Windows. Factored over the exe
@@ -54,14 +71,16 @@ pub(crate) fn daemon_log_path() -> PathBuf {
 /// the injected probe reports a live listener or the budget expires. This is
 /// not a pre-flight probe of a foreign daemon — it is the unavoidable wait for
 /// our own child between the spawn and the connection retry. The probe is a
-/// parameter (not hardcoded) so tests can drive this without real sockets.
+/// parameter (not hardcoded [`dial_socket`]) so unit tests can drive this
+/// with scripted closures and never sleep; the real-dial timing behavior is
+/// exercised by `tests/autostart_poll.rs`.
 ///
 /// Returns `true` only when the probe reported a live listener within the
 /// budget. There is exactly one interval-sleep between probes (the first
 /// probe fires immediately — a fast-starting daemon should not pay for a
 /// sleep), and the budget is checked before each probe so the total wait is
 /// bounded by `budget` regardless of probe duration.
-pub(crate) fn poll_until_listening(
+pub fn poll_until_listening(
     path: &str,
     interval: Duration,
     budget: Duration,
@@ -114,9 +133,12 @@ fn spawn_daemon(binary: &Path, log_path: &Path) -> anyhow::Result<Child> {
 /// nothing listening — that decision lives in `choreo_client_core`).
 ///
 /// Runs on the TUI's connection thread while the alternate screen is active,
-/// so nothing is printed to the terminal — diagnostics go to the TUI log, and
-/// failure bails with actionable errors naming the binary location, the log
-/// path, or the manual-start hint (surfaced as the TUI's quit message).
+/// so nothing is printed to the terminal — the "starting the daemon" feedback
+/// reaches the user through a status event on the UI channel (sent by the
+/// connection task BEFORE this hook runs, so it is visible during the whole
+/// wait), diagnostics go to the TUI log, and failure bails with actionable
+/// errors naming the binary location, the log path, or the manual-start hint
+/// (surfaced as the TUI's quit message).
 pub(crate) fn start_daemon(socket_path: &str) -> anyhow::Result<()> {
     // Resolve the daemon binary next to THIS executable. The binary pair is
     // built into the same target dir / install prefix, so sibling lookup is
@@ -139,15 +161,7 @@ pub(crate) fn start_daemon(socket_path: &str) -> anyhow::Result<()> {
     tracing::info!(binary = %binary.display(), log = %log_path.display(), "spawning daemon");
     let mut child = spawn_daemon(&binary, &log_path)?;
 
-    if poll_until_listening(socket_path, POLL_INTERVAL, START_BUDGET, |path| {
-        // Same cross-platform dial the connection itself uses (std UnixStream
-        // on unix, the uds_windows shim on Windows — see choreo-client-core).
-        #[cfg(unix)]
-        let probe = std::os::unix::net::UnixStream::connect(path);
-        #[cfg(windows)]
-        let probe = uds_windows::UnixStream::connect(path);
-        probe.is_ok()
-    }) {
+    if poll_until_listening(socket_path, POLL_INTERVAL, START_BUDGET, dial_socket) {
         tracing::info!(path = socket_path, "daemon started and listening");
         return Ok(());
     }
@@ -203,7 +217,14 @@ mod tests {
         );
     }
 
-    // ── Poll helper (injected probe — no real sockets) ───────────
+    // ── Poll helper (injected probe — no sleeping, no real sockets) ──
+    //
+    // Everything here is timing-free: zero intervals/budgets make the loop
+    // terminate without ever reaching the sleep, so these stay valid UNIT
+    // tests. The cases that actually wait (a probe that stays dead, a probe
+    // that flips live mid-poll) and every real-socket case moved to
+    // tests/autostart_poll.rs per the no-time-based-waits rule for unit
+    // tests.
 
     #[test]
     fn poll_succeeds_when_the_probe_is_immediately_live() {
@@ -227,94 +248,5 @@ mod tests {
         });
         assert!(!ok, "a zero budget must never report success");
         assert_eq!(probes, 0, "the probe must not run past the budget");
-    }
-
-    #[test]
-    fn poll_returns_false_when_the_probe_never_succeeds() {
-        let mut probes = 0;
-        let ok = poll_until_listening(
-            "unused",
-            Duration::from_millis(1),
-            Duration::from_millis(20),
-            |_| {
-                probes += 1;
-                false
-            },
-        );
-        assert!(!ok, "a never-listening socket must time out");
-        assert!(probes > 0, "the probe must have run at least once");
-    }
-
-    #[test]
-    fn poll_returns_true_once_the_probe_flips_live() {
-        // Simulates the daemon coming up after a few failed probes (slow
-        // cold start) — the success path that motivates the whole poll loop.
-        let mut probes_left = 3;
-        let ok = poll_until_listening(
-            "unused",
-            Duration::from_millis(1),
-            Duration::from_secs(2),
-            |_| {
-                if probes_left == 0 {
-                    true
-                } else {
-                    probes_left -= 1;
-                    false
-                }
-            },
-        );
-        assert!(ok, "a probe that flips live within the budget must succeed");
-    }
-
-    // ── Poll helper against a REAL unix socket in a temp dir ─────
-
-    /// Real-socket test: drive `poll_until_listening` with a closure that
-    /// replicates the production dial (std UnixStream::connect) against a
-    /// bound-and-listening socket in a temp dir. Cheap (one listener, no
-    /// processes) and it exercises the exact dial shape the spawn flow relies
-    /// on.
-    #[cfg(unix)]
-    #[test]
-    fn poll_succeeds_against_a_real_listening_socket() {
-        // Same dial the production closure performs (inlined here because the
-        // production probe is a closure inside start_daemon, not a named fn).
-        let dial = |path: &str| std::os::unix::net::UnixStream::connect(path).is_ok();
-        let dir = std::env::temp_dir().join(format!(
-            "choreo-tui-autostart-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock is after the epoch")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir create");
-        let sock = dir.join("test.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
-        let path = sock.to_string_lossy().into_owned();
-
-        assert!(
-            poll_until_listening(
-                &path,
-                Duration::from_millis(1),
-                Duration::from_secs(2),
-                dial
-            ),
-            "a real listening socket must be detected by the dial closure"
-        );
-
-        // A never-listening path must also read as absent through the same
-        // probe (the negative half of the contract, against the real OS).
-        assert!(
-            !poll_until_listening(
-                &dir.join("absent.sock").to_string_lossy(),
-                Duration::from_millis(1),
-                Duration::from_millis(10),
-                dial
-            ),
-            "an absent socket must not be reported as live"
-        );
-
-        drop(listener);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

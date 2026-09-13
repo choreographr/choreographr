@@ -10,7 +10,7 @@ use choreo_transport::key::ensure_transport_keypair;
 // the link and stuffs the ends into `ConnectionMode::InProcess`.
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use std::fmt;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -84,10 +84,17 @@ pub fn run_daemon_connection(
 /// There is no pre-flight probe: the first `UnixStream::connect` IS the real
 /// connection attempt, and when the daemon is up it is used directly — the
 /// stream is never thrown away. Only a dial failure classified as "nothing is
-/// listening" (`NotFound` = no socket file, `ConnectionRefused` = stale socket
-/// file with no listener) invokes `ensure_daemon`, after which the connection
-/// is retried. Any other dial error is returned unchanged — autostart cannot
-/// fix a permission problem, for example.
+/// listening" (via [`choreo_proto::dial_error_means_no_listener`], shared
+/// with the daemon side so the classification can never drift) invokes
+/// `ensure_daemon`, after which the connection is retried. Any other dial
+/// error is returned unchanged — autostart cannot fix a permission problem,
+/// for example.
+///
+/// Race note: between the failed first dial and the post-autostart retry, a
+/// third party could bind the socket, or an auto-exit daemon could be racing
+/// its own shutdown. The retry dial therefore surfaces its errors verbatim —
+/// the caller sees exactly what the retry saw, never a synthetic "autostart
+/// failed".
 pub fn run_daemon_connection_with_autostart(
     socket_path: &str,
     ensure_daemon: &mut dyn FnMut() -> Result<(), ClientError>,
@@ -98,12 +105,7 @@ pub fn run_daemon_connection_with_autostart(
     info!("connecting to daemon at {socket_path}");
     let stream = match UnixStream::connect(socket_path) {
         Ok(stream) => stream,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
+        Err(error) if choreo_proto::dial_error_means_no_listener(error.kind()) => {
             info!(%error, "no daemon listening on the socket; requesting autostart");
             ensure_daemon()?;
             info!("autostart done; retrying connection to daemon at {socket_path}");
@@ -1038,7 +1040,9 @@ mod in_process_tests {
     /// listening (NotFound here: no socket file at all). The hook deliberately
     /// fails, so a successful run would be impossible — the pinned outcome is
     /// exactly one hook invocation and the hook's error surfacing as the
-    /// connection result.
+    /// connection result. (The live-listener half of this contract binds real
+    /// sockets, so it lives in tests/connection_autostart.rs — no filesystem
+    /// or IPC boundary in unit tests.)
     #[test]
     fn autostart_hook_invoked_when_nothing_listens() {
         let path = std::env::temp_dir().join(format!(
@@ -1069,51 +1073,5 @@ mod in_process_tests {
         assert!(matches!(error, ClientError::DaemonStart(_)));
         assert_eq!(hook_calls, 1, "the hook must run exactly once");
         let _ = std::fs::remove_file(&path);
-    }
-
-    /// A LIVE listener means the first dial IS the connection: the autostart
-    /// hook must never run (a pre-flight probe would have dial-then-dialled —
-    /// this pins the connect-directly contract), and the pump must observe
-    /// the clean EOF the listener's accept thread produces.
-    #[cfg(unix)]
-    #[test]
-    fn autostart_hook_skipped_when_daemon_listens() {
-        let dir = std::env::temp_dir().join(format!(
-            "choreo-core-autostart-live-{}-{}",
-            std::process::id(),
-            format!("{:?}", std::thread::current().id()).as_str()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("live.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        // Close every accepted stream immediately: EOF for the pump, so this
-        // test needs no real daemon messages.
-        let accepter = std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                drop(stream);
-            }
-        });
-        let path = sock.to_string_lossy().into_owned();
-
-        let mut hook_calls = 0;
-        let mut ensure_daemon = || {
-            hook_calls += 1;
-            Ok(())
-        };
-        let (from_ui_tx, from_ui_rx) = mpsc::channel::<ClientMessage>();
-        drop(from_ui_tx);
-
-        let result = run_daemon_connection_with_autostart(
-            &path,
-            &mut ensure_daemon,
-            |_| {},
-            from_ui_rx,
-            None,
-        );
-
-        assert!(result.is_ok(), "EOF from the closed accept is clean");
-        assert_eq!(hook_calls, 0, "a live daemon must never be autostarted");
-        drop(accepter);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

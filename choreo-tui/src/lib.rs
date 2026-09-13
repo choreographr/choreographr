@@ -1,4 +1,7 @@
-mod autostart;
+// `pub`: the poll/dial helpers are exercised from tests/autostart_poll.rs
+// (the integration suite — real waits and real sockets must not live in the
+// unit-test module per AGENTS.md), which needs cross-crate visibility.
+pub mod autostart;
 mod cache;
 mod clipboard;
 mod connection;

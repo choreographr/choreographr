@@ -447,6 +447,12 @@ pub(crate) struct HistoryScrollState {
 pub(crate) enum UiEvent {
     Daemon(Box<choreo_proto::DaemonMessage>),
     ReaderClosed,
+    /// A transient status-line message from the connection task, used while
+    /// the connection is not yet established (the daemon-autostart wait) —
+    /// the reader thread cannot paint the UI itself, so progress feedback
+    /// travels to the UI loop as an event. Unlike daemon messages this does
+    /// NOT scroll or mutate any view: it just sets the status line.
+    Status(String),
 }
 
 impl HistoryViewport {

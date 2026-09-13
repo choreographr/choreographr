@@ -903,7 +903,9 @@ and the indexer (`tungstenite`) are synchronous.
 
 Entry point: `choreo_daemon::main` — invoked from the root package's
 `src/bin/choreographr.rs` wrapper — initializes tracing (to stderr, or to a
-file with `--log-file <path>` — append mode, ANSI off, level control
+file with `--log-file <path>` — append mode, ANSI off, created with 0600 on
+unix so other users on a shared machine cannot read the daemon's diagnostics,
+level control
 unchanged; an unopenable log file is a fatal startup error), creates
 `DaemonState`, runs socket server. `--auto-exit` (see the
 `server/lifecycle.rs` and `server/core.rs` rows) shuts the daemon down
@@ -1437,7 +1439,10 @@ connects to the daemon socket DIRECTLY — there is no pre-flight probe. The
 dial lives in `choreo_client_core`'s `run_daemon_connection_with_autostart`,
 which keeps the stream of a successful first dial and invokes the TUI's
 autostart hook ONLY when the dial itself fails with `NotFound` or
-`ConnectionRefused` (nothing listening). The hook spawns the SIBLING
+`ConnectionRefused` (nothing listening — classified via
+`choreo_proto::dial_error_means_no_listener`, the same predicate the daemon's
+stale-socket probe mirrors, so the two sides can never disagree). The hook spawns
+the SIBLING
 `choreographr` binary (same directory as its own executable, via
 `current_exe` — so both must be installed side by side, which the
 .tarball/.deb/binstall layouts already guarantee) as a detached child with
@@ -1445,7 +1450,10 @@ autostart hook ONLY when the dial itself fails with `NotFound` or
 socket (100 ms interval, 5 s budget — waiting for OUR OWN spawned child, not
 probing a foreign daemon) and returns; the connection is then retried.
 Autostart runs on the connection thread after the alternate screen is up, so
-nothing is printed to the terminal — failures surface as the TUI quit message
+nothing is printed to the terminal — feedback travels as a
+`UiEvent::Status` message ("no daemon running — starting choreographr…",
+then "daemon started") painted on the UI's status line, and failures surface
+as the TUI quit message
 naming the daemon's log path. TCP mode (`--tcp-addr`) never spawns — a remote
 daemon is not launchable from the client machine, by definition.
 Once connected, a protocol-version mismatch (`ProtoError::UnsupportedVersion`)
