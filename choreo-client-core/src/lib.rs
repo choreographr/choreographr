@@ -16,9 +16,9 @@ pub mod test_support;
 pub use choreo_transport::key::{fingerprint, read_server_pk};
 pub use connection::{
     ConnectionMode, PreflightError, own_transport_pubkey, probe_server_key, run_daemon_connection,
-    run_daemon_connection_with_mode, run_daemon_reader, run_daemon_tcp_connection,
-    run_daemon_tcp_connection_pinned, run_daemon_tcp_connection_xx_first_contact,
-    verify_daemon_authorization,
+    run_daemon_connection_with_autostart, run_daemon_connection_with_mode, run_daemon_reader,
+    run_daemon_tcp_connection, run_daemon_tcp_connection_pinned,
+    run_daemon_tcp_connection_xx_first_contact, verify_daemon_authorization,
 };
 pub use credentials::{
     KeystoreAutoBind, bind_fresh_daemon, build_add_credential_from_credential,

@@ -48,17 +48,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Daemon autostart from the TUI (`choreo-tui`, new `autostart` module):**
-  in Unix-socket mode, if nothing is listening on the daemon socket at
-  startup, the TUI prints "No daemon running — starting choreographr…" and
-  spawns the sibling `choreographr` binary (same directory as its own
-  executable, resolved via `current_exe`) as a detached child with
-  `--auto-exit --log-file $TMPDIR/choreo-daemon-<tui-pid>.log`, then polls
-  the socket (100 ms interval, 5 s budget) before starting the UI. Spawn or
-  poll failure kills the child and exits with an error naming the daemon's
-  log path. TCP mode (`--tcp-addr`) never spawns — a remote daemon is not
-  launchable from the client machine. This runs in the same pre-alternate-
-  screen cooked-mode window as the fingerprint prompt, so the notice is
-  visible.
+  in Unix-socket mode the TUI connects DIRECTLY to the daemon socket — no
+  pre-flight probe. `choreo_client_core`'s new
+  `run_daemon_connection_with_autostart` keeps the stream of a successful
+  first dial and invokes the caller's autostart hook only when the dial
+  itself fails with `NotFound`/`ConnectionRefused`; the TUI's hook spawns the
+  sibling `choreographr` binary (same directory as its own executable,
+  resolved via `current_exe`) as a detached child with
+  `--auto-exit --log-file $TMPDIR/choreo-daemon-<tui-pid>.log`, waits for the
+  spawned daemon's socket (100 ms interval, 5 s budget), and the connection
+  is retried. Spawn failure kills the child and the TUI exits with an error
+  naming the daemon's log path. TCP mode (`--tcp-addr`) never spawns — a
+  remote daemon is not launchable from the client machine. This also fixes
+  the probe-as-client problem: a probe connection to a live `--auto-exit`
+  daemon would have looked like a connect-and-disconnect client and killed
+  the daemon.
 - `choreographr --log-file <path>`: write daemon logs to a file instead of
   stderr (ANSI disabled for file output; level control unchanged via
   `-v`/`-q`/`RUST_LOG`). The daemon refuses to start when the file cannot be

@@ -394,17 +394,12 @@ pub fn main() -> anyhow::Result<()> {
             cli.trust_fingerprint.as_deref(),
         )?
     } else {
-        // Unix-socket mode: probe for a live daemon BEFORE constructing the
-        // mode, and autostart one if absent. This runs before the alternate
-        // screen starts (the same cooked-mode window the fingerprint prompt
-        // uses), so the "No daemon running…" notice is visible. The TCP
-        // branch above never reaches this — a remote daemon is not
-        // launchable from the client machine, by definition.
-        let socket_path = choreo_proto::socket_path();
-        if !autostart::socket_accepting(&socket_path) {
-            autostart::start_daemon(&socket_path)?;
-        }
-        choreo_client_core::ConnectionMode::UnixSocket(socket_path)
+        // Unix-socket mode: NO pre-flight probe. The TUI connects directly;
+        // when the dial itself finds nothing listening, the connection task
+        // (connection::run_app) autostarts a daemon via autostart::start_daemon
+        // and retries. The TCP branch above never autostarts — a remote daemon
+        // is not launchable from the client machine, by definition.
+        choreo_client_core::ConnectionMode::UnixSocket(choreo_proto::socket_path())
     };
 
     let log_path = init_file_logging();

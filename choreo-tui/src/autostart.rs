@@ -1,49 +1,32 @@
 //! Daemon autostart for the TUI's default (unix-socket) connection mode.
 //!
-//! When the TUI starts and nothing is listening on the daemon's unix socket,
-//! it launches the `choreographr` daemon binary itself (sibling of the TUI
-//! executable) with `--auto-exit` (so the daemon cleans itself up when the
-//! TUI disconnects) and `--log-file` (so a failed start is diagnosable from
-//! the log path the TUI reports on failure). The TCP path (`--tcp-addr`)
-//! NEVER spawns anything: remote daemons are not launchable from here by
-//! definition.
+//! There is NO pre-flight probe: the TUI connects to the daemon's unix socket
+//! directly (the dial inside `choreo_client_core`), and only when that dial
+//! itself fails because nothing is listening does it launch the `choreographr`
+//! daemon binary (sibling of the TUI executable) with `--auto-exit` (so the
+//! daemon cleans itself up when the TUI disconnects) and `--log-file` (so a
+//! failed start is diagnosable from the log path the TUI reports on failure),
+//! then the connection is retried. The TCP path (`--tcp-addr`) NEVER spawns
+//! anything: remote daemons are not launchable from here by definition.
 //!
-//! All helpers are factored as pure functions over injected parameters
-//! (paths, a probe closure) so they are unit-testable without real
-//! processes; only [`start_daemon`] performs the actual spawn.
+//! All helpers are factored as pure functions over injected parameters (paths,
+//! a probe closure) so they are unit-testable without real processes; only
+//! [`start_daemon`] performs the actual spawn.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-// Same cross-platform unix-socket dialing mechanism the daemon-side
-// connection path uses (choreo-client-core/src/connection.rs): std's
-// UnixStream on unix, the uds_windows shim on Windows (std's Windows
-// UnixStream is still unstable).
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-#[cfg(windows)]
-use uds_windows::UnixStream;
-
-/// Poll interval between socket probes while waiting for the spawned daemon
-/// to start listening. Short enough that startup feels instant, long enough
-/// not to spin.
+/// Poll interval between socket dials while waiting for the spawned daemon to
+/// start listening. Short enough that startup feels instant, long enough not
+/// to spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Total budget for waiting for the daemon's socket to appear. Generous
 /// enough for a cold start on slow disks; past this the spawn is considered
 /// failed and the child is killed.
 const START_BUDGET: Duration = Duration::from_secs(5);
-
-/// Whether a daemon is currently accepting connections on the unix socket at
-/// `path`. A successful connect proves a live listener; every failure
-/// (missing file, stale socket, ECONNREFUSED) means "no daemon" for our
-/// purposes — the daemon itself removes stale socket files at startup, so
-/// the TUI never needs to distinguish stale from absent.
-pub(crate) fn socket_accepting(path: &str) -> bool {
-    UnixStream::connect(path).is_ok()
-}
 
 /// Path of the sibling `choreographr` daemon binary: same directory as the
 /// running TUI executable, `.exe`-suffixed on Windows. Factored over the exe
@@ -67,11 +50,11 @@ pub(crate) fn daemon_log_path() -> PathBuf {
     std::env::temp_dir().join(format!("choreo-daemon-{}.log", std::process::id()))
 }
 
-/// Poll the socket path until the injected probe reports a live listener or
-/// the budget expires. The probe is a parameter (not a hardcoded
-/// [`socket_accepting`]) so tests can drive this without real sockets, and
-/// so a caller could substitute a different liveness check if the wire
-/// protocol ever needs one.
+/// Wait for the daemon WE JUST SPAWNED to come up: poll the socket path until
+/// the injected probe reports a live listener or the budget expires. This is
+/// not a pre-flight probe of a foreign daemon — it is the unavoidable wait for
+/// our own child between the spawn and the connection retry. The probe is a
+/// parameter (not hardcoded) so tests can drive this without real sockets.
 ///
 /// Returns `true` only when the probe reported a live listener within the
 /// budget. There is exactly one interval-sleep between probes (the first
@@ -127,15 +110,14 @@ fn spawn_daemon(binary: &Path, log_path: &Path) -> anyhow::Result<Child> {
         })
 }
 
-/// Ensure a daemon is running on the unix socket at `path`; if not, spawn
-/// one and wait for its socket. This is the whole autostart flow.
+/// Start a daemon for the retrying connection attempt (the dial already found
+/// nothing listening — that decision lives in `choreo_client_core`).
 ///
-/// Failure bails with actionable errors naming the binary location, the log
-/// path, or the manual-start hint — everything a user needs to recover
-/// without reading the TUI source.
+/// Runs on the TUI's connection thread while the alternate screen is active,
+/// so nothing is printed to the terminal — diagnostics go to the TUI log, and
+/// failure bails with actionable errors naming the binary location, the log
+/// path, or the manual-start hint (surfaced as the TUI's quit message).
 pub(crate) fn start_daemon(socket_path: &str) -> anyhow::Result<()> {
-    println!("No daemon running — starting choreographr…");
-
     // Resolve the daemon binary next to THIS executable. The binary pair is
     // built into the same target dir / install prefix, so sibling lookup is
     // the only path that works for both `cargo run` and installed setups —
@@ -157,7 +139,15 @@ pub(crate) fn start_daemon(socket_path: &str) -> anyhow::Result<()> {
     tracing::info!(binary = %binary.display(), log = %log_path.display(), "spawning daemon");
     let mut child = spawn_daemon(&binary, &log_path)?;
 
-    if poll_until_listening(socket_path, POLL_INTERVAL, START_BUDGET, socket_accepting) {
+    if poll_until_listening(socket_path, POLL_INTERVAL, START_BUDGET, |path| {
+        // Same cross-platform dial the connection itself uses (std UnixStream
+        // on unix, the uds_windows shim on Windows — see choreo-client-core).
+        #[cfg(unix)]
+        let probe = std::os::unix::net::UnixStream::connect(path);
+        #[cfg(windows)]
+        let probe = uds_windows::UnixStream::connect(path);
+        probe.is_ok()
+    }) {
         tracing::info!(path = socket_path, "daemon started and listening");
         return Ok(());
     }
@@ -278,13 +268,17 @@ mod tests {
 
     // ── Poll helper against a REAL unix socket in a temp dir ─────
 
-    /// Real-socket test: drive `poll_until_listening` with the production
-    /// probe closure (`socket_accepting`) against a bound-and-listening
-    /// socket in a temp dir. Cheap (one listener, no processes) and it
-    /// exercises the exact probe the spawn flow relies on.
+    /// Real-socket test: drive `poll_until_listening` with a closure that
+    /// replicates the production dial (std UnixStream::connect) against a
+    /// bound-and-listening socket in a temp dir. Cheap (one listener, no
+    /// processes) and it exercises the exact dial shape the spawn flow relies
+    /// on.
     #[cfg(unix)]
     #[test]
     fn poll_succeeds_against_a_real_listening_socket() {
+        // Same dial the production closure performs (inlined here because the
+        // production probe is a closure inside start_daemon, not a named fn).
+        let dial = |path: &str| std::os::unix::net::UnixStream::connect(path).is_ok();
         let dir = std::env::temp_dir().join(format!(
             "choreo-tui-autostart-test-{}-{}",
             std::process::id(),
@@ -303,9 +297,9 @@ mod tests {
                 &path,
                 Duration::from_millis(1),
                 Duration::from_secs(2),
-                socket_accepting
+                dial
             ),
-            "a real listening socket must be detected by the production probe"
+            "a real listening socket must be detected by the dial closure"
         );
 
         // A never-listening path must also read as absent through the same
@@ -315,7 +309,7 @@ mod tests {
                 &dir.join("absent.sock").to_string_lossy(),
                 Duration::from_millis(1),
                 Duration::from_millis(10),
-                socket_accepting
+                dial
             ),
             "an absent socket must not be reported as live"
         );

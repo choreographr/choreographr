@@ -10,7 +10,7 @@ use choreo_transport::key::ensure_transport_keypair;
 // the link and stuffs the ends into `ConnectionMode::InProcess`.
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use std::fmt;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -75,6 +75,56 @@ pub fn run_daemon_connection(
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {socket_path}");
     let stream = UnixStream::connect(socket_path)?;
+    pump_connection(stream, handle_daemon_message, from_ui, shutdown_rx)
+}
+
+/// Connect to the daemon at `socket_path`, starting one via `ensure_daemon` if
+/// (and ONLY if) the initial dial itself finds nothing listening.
+///
+/// There is no pre-flight probe: the first `UnixStream::connect` IS the real
+/// connection attempt, and when the daemon is up it is used directly — the
+/// stream is never thrown away. Only a dial failure classified as "nothing is
+/// listening" (`NotFound` = no socket file, `ConnectionRefused` = stale socket
+/// file with no listener) invokes `ensure_daemon`, after which the connection
+/// is retried. Any other dial error is returned unchanged — autostart cannot
+/// fix a permission problem, for example.
+pub fn run_daemon_connection_with_autostart(
+    socket_path: &str,
+    ensure_daemon: &mut dyn FnMut() -> Result<(), ClientError>,
+    handle_daemon_message: impl FnMut(DaemonMessage),
+    from_ui: mpsc::Receiver<choreo_proto::ClientMessage>,
+    shutdown_rx: Option<mpsc::Receiver<()>>,
+) -> Result<(), ClientError> {
+    info!("connecting to daemon at {socket_path}");
+    let stream = match UnixStream::connect(socket_path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            info!(%error, "no daemon listening on the socket; requesting autostart");
+            ensure_daemon()?;
+            info!("autostart done; retrying connection to daemon at {socket_path}");
+            UnixStream::connect(socket_path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    pump_connection(stream, handle_daemon_message, from_ui, shutdown_rx)
+}
+
+/// Drive an ESTABLISHED daemon connection: spawn the writer thread, install
+/// the optional shutdown hook, and block in the reader loop until the daemon
+/// closes the stream. Split out of `run_daemon_connection` so the autostart
+/// variant can hand over a stream it already dialed (the successful first
+/// dial is never discarded).
+fn pump_connection(
+    stream: UnixStream,
+    handle_daemon_message: impl FnMut(DaemonMessage),
+    from_ui: mpsc::Receiver<choreo_proto::ClientMessage>,
+    shutdown_rx: Option<mpsc::Receiver<()>>,
+) -> Result<(), ClientError> {
     let reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
 
@@ -982,5 +1032,88 @@ mod in_process_tests {
         assert_eq!(format!("{mode:?}"), "InProcess(<embedded link>)");
         // The ends themselves are opaque and dropped with the mode.
         drop(daemon_tx);
+    }
+
+    /// The autostart hook must fire ONLY when the dial finds nothing
+    /// listening (NotFound here: no socket file at all). The hook deliberately
+    /// fails, so a successful run would be impossible — the pinned outcome is
+    /// exactly one hook invocation and the hook's error surfacing as the
+    /// connection result.
+    #[test]
+    fn autostart_hook_invoked_when_nothing_listens() {
+        let path = std::env::temp_dir().join(format!(
+            "choreo-core-autostart-absent-{}-{}",
+            std::process::id(),
+            format!("{:?}", std::thread::current().id()).as_str()
+        ));
+        let _ = std::fs::remove_file(&path); // absent by construction
+        let path = path.to_string_lossy().into_owned();
+
+        let mut hook_calls = 0;
+        let mut ensure_daemon = || {
+            hook_calls += 1;
+            Err(ClientError::DaemonStart("test: no daemon".to_string()))
+        };
+        let (from_ui_tx, from_ui_rx) = mpsc::channel::<ClientMessage>();
+        drop(from_ui_tx); // the pump's writer thread ends immediately
+
+        let error = run_daemon_connection_with_autostart(
+            &path,
+            &mut ensure_daemon,
+            |_| {},
+            from_ui_rx,
+            None,
+        )
+        .expect_err("the failing hook must fail the connection");
+
+        assert!(matches!(error, ClientError::DaemonStart(_)));
+        assert_eq!(hook_calls, 1, "the hook must run exactly once");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A LIVE listener means the first dial IS the connection: the autostart
+    /// hook must never run (a pre-flight probe would have dial-then-dialled —
+    /// this pins the connect-directly contract), and the pump must observe
+    /// the clean EOF the listener's accept thread produces.
+    #[cfg(unix)]
+    #[test]
+    fn autostart_hook_skipped_when_daemon_listens() {
+        let dir = std::env::temp_dir().join(format!(
+            "choreo-core-autostart-live-{}-{}",
+            std::process::id(),
+            format!("{:?}", std::thread::current().id()).as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("live.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Close every accepted stream immediately: EOF for the pump, so this
+        // test needs no real daemon messages.
+        let accepter = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let path = sock.to_string_lossy().into_owned();
+
+        let mut hook_calls = 0;
+        let mut ensure_daemon = || {
+            hook_calls += 1;
+            Ok(())
+        };
+        let (from_ui_tx, from_ui_rx) = mpsc::channel::<ClientMessage>();
+        drop(from_ui_tx);
+
+        let result = run_daemon_connection_with_autostart(
+            &path,
+            &mut ensure_daemon,
+            |_| {},
+            from_ui_rx,
+            None,
+        );
+
+        assert!(result.is_ok(), "EOF from the closed accept is clean");
+        assert_eq!(hook_calls, 0, "a live daemon must never be autostarted");
+        drop(accepter);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

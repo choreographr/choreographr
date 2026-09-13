@@ -29,6 +29,11 @@ pub enum ClientError {
     Postcard(String),
     #[error("encryption failed: {0}")]
     Encryption(String),
+    /// Daemon autostart (the caller-provided `ensure_daemon` hook of
+    /// `run_daemon_connection_with_autostart`) failed. The string carries the
+    /// full anyhow cause chain so the TUI can surface the daemon's log path.
+    #[error("failed to start the daemon: {0}")]
+    DaemonStart(String),
 }
 
 /// Convert an mpsc send error (or any displayable error) into a
@@ -52,7 +57,8 @@ impl From<ClientError> for io::Error {
             | ClientError::PublicKeyInvalid
             | ClientError::CredentialParse(_)
             | ClientError::Postcard(_)
-            | ClientError::Encryption(_) => io::Error::new(io::ErrorKind::InvalidData, error),
+            | ClientError::Encryption(_)
+            | ClientError::DaemonStart(_) => io::Error::new(io::ErrorKind::InvalidData, error),
         }
     }
 }

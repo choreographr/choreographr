@@ -3,7 +3,10 @@ use crate::image_worker::{ImageResult, ImageWorker};
 use crate::render::render;
 use crate::state::{AccountWizardStep, App, Page, UiEvent};
 use crate::terminal_progress;
-use choreo_client_core::{ClientError, ConnectionMode, run_daemon_connection_with_mode};
+use choreo_client_core::{
+    ClientError, ConnectionMode, run_daemon_connection_with_autostart,
+    run_daemon_connection_with_mode,
+};
 use choreo_proto::ClientMessage;
 use crossbeam::channel;
 use crossbeam::select;
@@ -238,47 +241,73 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         // half the high-water mark) so a wedged UI loop is observable without
         // spamming the log on every event while it is stalled.
         let mut queue_over_high_water_warned = false;
-        let result = run_daemon_connection_with_mode(
-            mode,
-            |message| {
-                // The UI-event channel is unbounded, so this send can never
-                // block the reader thread and can never fail on capacity: the
-                // only failure is a Disconnected receiver, which means the UI
-                // thread has already begun tearing down and there is no
-                // consumer left to process this event.
-                //
-                // An unbounded channel is deliberate: with a bounded one, a
-                // burst from another session (all activity is subscribed, and
-                // a background session streams its own chunks/updates) could
-                // fill the queue and DROP this session's streaming chunks —
-                // and a dropped chunk is *not* recoverable from the next one
-                // (chunks are deltas, appended by the client; only the final
-                // `TurnAppended` resyncs the complete content).
-                //
-                // The cost is that a stalled UI event loop (slow render,
-                // heavy paste, resize storm) lets this queue grow without a
-                // hard cap: the daemon's drop-on-full bounds only the
-                // daemon-side channel, which the reader drains immediately,
-                // so it does NOT bound the queue here.  Correctness wins over
-                // a hard cap (dropping the newest chunk is the exact bug this
-                // replaced), so a high-water warning keeps a wedged loop
-                // observable instead of silently accumulating memory.
-                let _ = connection_ui_tx.send(UiEvent::Daemon(Box::new(message)));
-                if connection_ui_tx.len() > UI_EVENT_QUEUE_HIGH_WATER_MARK
-                    && !queue_over_high_water_warned
-                {
-                    queue_over_high_water_warned = true;
-                    tracing::warn!(
-                        queued = connection_ui_tx.len(),
-                        "ui event queue above high-water mark: a stalled render is accumulating events"
-                    );
-                } else if connection_ui_tx.len() < UI_EVENT_QUEUE_HIGH_WATER_MARK / 2 {
-                    queue_over_high_water_warned = false;
-                }
-            },
-            client_rx,
-            Some(shutdown_rx),
-        );
+        // The per-message handler is hoisted into a binding so the unix-socket
+        // arm below (autostart variant) and the other transports can share it
+        // — only one arm ever runs, so the single move is fine.
+        let handle_daemon_message = |message| {
+            // The UI-event channel is unbounded, so this send can never
+            // block the reader thread and can never fail on capacity: the
+            // only failure is a Disconnected receiver, which means the UI
+            // thread has already begun tearing down and there is no
+            // consumer left to process this event.
+            //
+            // An unbounded channel is deliberate: with a bounded one, a
+            // burst from another session (all activity is subscribed, and
+            // a background session streams its own chunks/updates) could
+            // fill the queue and DROP this session's streaming chunks —
+            // and a dropped chunk is *not* recoverable from the next one
+            // (chunks are deltas, appended by the client; only the final
+            // `TurnAppended` resyncs the complete content).
+            //
+            // The cost is that a stalled UI event loop (slow render,
+            // heavy paste, resize storm) lets this queue grow without a
+            // hard cap: the daemon's drop-on-full bounds only the
+            // daemon-side channel, which the reader drains immediately,
+            // so it does NOT bound the queue here.  Correctness wins over
+            // a hard cap (dropping the newest chunk is the exact bug this
+            // replaced), so a high-water warning keeps a wedged loop
+            // observable instead of silently accumulating memory.
+            let _ = connection_ui_tx.send(UiEvent::Daemon(Box::new(message)));
+            if connection_ui_tx.len() > UI_EVENT_QUEUE_HIGH_WATER_MARK
+                && !queue_over_high_water_warned
+            {
+                queue_over_high_water_warned = true;
+                tracing::warn!(
+                    queued = connection_ui_tx.len(),
+                    "ui event queue above high-water mark: a stalled render is accumulating events"
+                );
+            } else if connection_ui_tx.len() < UI_EVENT_QUEUE_HIGH_WATER_MARK / 2 {
+                queue_over_high_water_warned = false;
+            }
+        };
+        // Unix-socket mode connects DIRECTLY; only when the dial itself finds
+        // nothing listening does client-core invoke the autostart hook (which
+        // spawns the sibling daemon and waits for its socket), then retries
+        // the connection. No probe, no pre-flight — the first dial is the real
+        // connection attempt and is kept when it succeeds. TCP/embedded modes
+        // connect through the plain dispatcher and never spawn anything.
+        let result = match &mode {
+            ConnectionMode::UnixSocket(socket_path) => {
+                let ensure_path = socket_path.clone();
+                let mut ensure_daemon = move || {
+                    crate::autostart::start_daemon(&ensure_path)
+                        .map_err(|error| ClientError::DaemonStart(format!("{error:#}")))
+                };
+                run_daemon_connection_with_autostart(
+                    socket_path,
+                    &mut ensure_daemon,
+                    handle_daemon_message,
+                    client_rx,
+                    Some(shutdown_rx),
+                )
+            }
+            _ => run_daemon_connection_with_mode(
+                mode,
+                handle_daemon_message,
+                client_rx,
+                Some(shutdown_rx),
+            ),
+        };
         if result.is_ok() {
             // ReaderClosed must always be delivered — blocking is safe here
             // because no more daemon messages are coming after this.

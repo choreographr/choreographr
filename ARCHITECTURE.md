@@ -1432,17 +1432,22 @@ All new fields use `#[serde(default)]` so old persisted sessions remain compatib
 
 Entry point: `src/main.rs`
 
-**Daemon autostart (`autostart.rs`).** In Unix-socket mode only,
-before entering the alternate screen the TUI probes the daemon socket: if
-nothing is accepting connections, it prints "No daemon running — starting
-choreographr…" and spawns the SIBLING `choreographr` binary (same directory
-as its own executable, via `current_exe` — so both must be installed
-side by side, which the tarball/.deb/binstall layouts already guarantee) as
-a detached child with `--auto-exit --log-file $TMPDIR/choreo-daemon-<tui-
-pid>.log`, then polls the socket (100 ms interval, 5 s budget) before
-starting the UI; spawn or poll failure kills the child and exits with an
-error naming the daemon's log path. TCP mode (`--tcp-addr`) never spawns —
-a remote daemon is not launchable from the client machine, by definition.
+**Daemon autostart (`autostart.rs`).** In Unix-socket mode only, the TUI
+connects to the daemon socket DIRECTLY — there is no pre-flight probe. The
+dial lives in `choreo_client_core`'s `run_daemon_connection_with_autostart`,
+which keeps the stream of a successful first dial and invokes the TUI's
+autostart hook ONLY when the dial itself fails with `NotFound` or
+`ConnectionRefused` (nothing listening). The hook spawns the SIBLING
+`choreographr` binary (same directory as its own executable, via
+`current_exe` — so both must be installed side by side, which the
+.tarball/.deb/binstall layouts already guarantee) as a detached child with
+`--auto-exit --log-file $TMPDIR/choreo-daemon-<tui-pid>.log`, polls the
+socket (100 ms interval, 5 s budget — waiting for OUR OWN spawned child, not
+probing a foreign daemon) and returns; the connection is then retried.
+Autostart runs on the connection thread after the alternate screen is up, so
+nothing is printed to the terminal — failures surface as the TUI quit message
+naming the daemon's log path. TCP mode (`--tcp-addr`) never spawns — a remote
+daemon is not launchable from the client machine, by definition.
 Once connected, a protocol-version mismatch (`ProtoError::UnsupportedVersion`)
 quits with the actionable "the daemon's protocol version is incompatible —
 restart the daemon (it may be an older build)" instead of a raw codec

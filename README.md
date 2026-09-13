@@ -359,11 +359,11 @@ and follow
 [First conversation](#first-conversation) below. The daemon listens on the
 Unix socket `/tmp/Choreographr.sock` and stores its data under
 `~/.local/share/choreographr/` (see [Configuration](#configuration)).
-You don't strictly need to start the daemon yourself: `choreo-tui`
-autostarts one when it finds nothing listening on the socket (a private
-daemon spawned with `--auto-exit`, which shuts down when the last client
-disconnects; daemon logs land in `$TMPDIR/choreo-daemon-<pid>.log`), and a
-second `choreographr` refuses to start while another daemon is already
+You don't strictly need to start the daemon yourself: when `choreo-tui`'s
+connection attempt finds nothing listening on the socket, it autostarts one
+(a private daemon spawned with `--auto-exit`, which shuts down when the last
+client disconnects; daemon logs land in `$TMPDIR/choreo-daemon-<pid>.log`),
+and a second `choreographr` refuses to start while another daemon is already
 listening.
 
 > **Zig?** Only source builds need it. Homebrew, the `.deb`/`.rpm`, the AUR
