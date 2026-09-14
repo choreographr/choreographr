@@ -60,14 +60,6 @@ mimalloc = { version = "0.1", optional = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "fs"] }
 
-# Unix-socket DIALING on Windows: std's Windows UnixStream is still unstable
-# (feature `windows_unix_domain_sockets`), so the socket probe in the daemon
-# autostart path uses uds_windows — the same mechanism choreo-client-core's
-# connection path already uses (see the workspace-level comment there).
-# Unix-only code never links it.
-[target.'cfg(windows)'.dependencies]
-uds_windows.workspace = true
-
 [features]
 # mimalloc — process-wide allocator for the `choreo-tui` BINARY, enabled ONLY
 # by the static musl tarball build in the release pipeline (musl's default

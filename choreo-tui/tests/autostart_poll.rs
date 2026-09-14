@@ -7,7 +7,8 @@
 //! and run via `cargo test-integration`. The timing-free budget-contract
 //! cases stay as unit tests in `src/autostart.rs`.
 
-use choreo_tui::autostart::{dial_socket, poll_until_listening};
+use choreo_proto::socket_listening;
+use choreo_tui::autostart::poll_until_listening;
 use std::time::Duration;
 
 /// A probe that NEVER succeeds must time out — and the probe must actually
@@ -52,7 +53,8 @@ fn poll_returns_true_once_the_probe_flips_live() {
     assert!(ok, "a probe that flips live within the budget must succeed");
 }
 
-/// Drive `poll_until_listening` with the PRODUCTION dial (`dial_socket`)
+/// Drive `poll_until_listening` with the PRODUCTION probe
+/// (`choreo_proto::socket_listening`, the same dial the connection path uses)
 /// against a bound-and-listening socket in a temp dir. Cheap (one listener,
 /// no processes) and it exercises the exact dial shape the spawn flow relies
 /// on — including the negative half: a never-listening path reads as absent
@@ -79,7 +81,7 @@ fn poll_succeeds_against_a_real_listening_socket() {
             &path,
             Duration::from_millis(1),
             Duration::from_secs(2),
-            dial_socket
+            socket_listening
         ),
         "a real listening socket must be detected by the production dial"
     );
@@ -91,7 +93,7 @@ fn poll_succeeds_against_a_real_listening_socket() {
             &dir.join("absent.sock").to_string_lossy(),
             Duration::from_millis(1),
             Duration::from_millis(10),
-            dial_socket
+            socket_listening
         ),
         "an absent socket must not be reported as live"
     );

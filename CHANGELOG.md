@@ -23,11 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `choreo_proto::dial_error_means_no_listener`, used by the TUI connection
   path (`choreo-client-core`'s `run_daemon_connection_with_autostart`) and
   documented as the mirror of the daemon-side stale-socket probe, so the
-  client and daemon classifications can never drift.
-- The TUI's cross-platform socket dial (std `UnixStream` on unix,
-  `uds_windows` on Windows) extracted into a single named helper,
-  `autostart::dial_socket`, used by both the wait-for-our-child loop and the
-  tests instead of three inlined `#[cfg]` copies.
+  client and daemon classifications can never drift. The predicate takes the
+  whole `&io::Error` (matching on `kind()` internally) rather than a bare
+  `io::ErrorKind`, so a caller cannot accidentally classify an unrelated
+  error.
+- The cross-platform unix-socket DIAL is now a single primitive in
+  `choreo-proto` (`connect_unix` for the stream-keeping dial, plus the
+  `socket_listening` boolean wrapper and the `UnixStream` re-export that
+  resolves std-vs-`uds_windows` per platform). Every dial site — the TUI
+  autostart wait, `choreo-client-core`'s connection path, the daemon's
+  stale-socket probe and its signal/auto-exit accept-loop wake-ups — now uses
+  it instead of four inlined `#[cfg]` copies, and the now-redundant direct
+  `uds_windows` dependencies were dropped from `choreo-client-core` and
+  `choreo-tui`.
 - Autostart/poll tests that wait on real time or bind real sockets moved out
   of the `src/` unit-test modules into the crates' `tests/` integration
   suites (`choreo-tui/tests/autostart_poll.rs`,
@@ -47,10 +55,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receiver and initial `armed` flag, and the re-arm cadence still covers a
   dir deleted at runtime or a spawn-time arm failure.
 
-- The daemon's `--log-file` is now created with mode 0600 on unix: daemon
-  logs can carry sensitive content and the TUI autostart writes them into
-  the (potentially shared) temp dir — an unrestricted create leaked by
-  default. Windows keeps inherited ACLs.
+- The daemon's `--log-file` is hardened for the shared temp dir the TUI
+  autostart writes into: on unix it is created 0600 AND opened `O_NOFOLLOW`
+  (a symlink planted at the predictable pid-keyed path fails the open
+  instead of redirecting the daemon's diagnostics), the opened file is
+  verified to be a regular file owned by the daemon's own euid (a
+  pre-created file owned by another user, or a FIFO/device, is refused), and
+  its mode is explicitly tightened to 0600 (the create mode only applies on
+  creation, so a file left by an earlier run could be group/world-readable).
+  Windows keeps inherited ACLs.
+- The TUI's autostart status message no longer lingers: a `UiEvent::Status`
+  is flagged transient (`App::status_is_transient`) and cleared by the first
+  real daemon message, so "daemon started" does not sit on the status line
+  once the connection is live and the first turn is quiet. Statuses written
+  by daemon handlers are never cleared by this rule.
+- `poll_until_listening` now clamps each inter-probe sleep to the time
+  remaining before its budget, so the total wait is genuinely bounded by the
+  budget instead of overshooting by up to one interval after the last failed
+  probe (matching the doc contract).
 
 - `run_server` no longer steals a live daemon's socket: before removing an
   existing socket file it now probes it with a connect — a successful

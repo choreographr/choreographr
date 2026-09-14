@@ -21,15 +21,6 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
-// The auto-exit decision (LastClientDisconnected arm below) wakes the accept
-// loop by connecting to the daemon's own socket — the same probe the signal
-// threads use. On Windows the Unix-socket API comes from `uds_windows`, so
-// mirror lifecycle.rs's cfg split.
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-#[cfg(windows)]
-use uds_windows::UnixStream;
-
 /// Assembly options for [`start_daemon_core`].
 pub(crate) struct CoreOptions {
     /// Shared ACL to install into [`DaemonState::acl`] and hot-reload-watch.
@@ -281,10 +272,11 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> io::Re
                         // Wake the blocking accept() with a self-connect so
                         // run_server observes the flag and runs its normal
                         // drain (BroadcastShuttingDown → Shutdown → unlink),
-                        // exactly as on SIGINT.
-                        if let Ok(stream) = UnixStream::connect(wake_path) {
-                            drop(stream);
-                        }
+                        // exactly as on SIGINT. The dial lives in choreo-proto
+                        // (the one cross-platform primitive); we only need it
+                        // to land in the accept backlog, so the stream is
+                        // dropped immediately.
+                        let _ = choreo_proto::connect_unix(wake_path);
                     }
                 }
                 Ok(DaemonCommand::Shutdown) => {

@@ -173,12 +173,14 @@ fn read_payload_rejects_oversized_frame() {
 
 #[test]
 fn dial_error_means_no_listener_covers_exactly_the_no_listener_kinds() {
-    use std::io::ErrorKind;
+    use std::io::{Error, ErrorKind};
     // The autostart contract: only these two kinds may trigger a spawn.
-    assert!(crate::dial_error_means_no_listener(ErrorKind::NotFound));
-    assert!(crate::dial_error_means_no_listener(
+    assert!(crate::dial_error_means_no_listener(&Error::from(
+        ErrorKind::NotFound
+    )));
+    assert!(crate::dial_error_means_no_listener(&Error::from(
         ErrorKind::ConnectionRefused
-    ));
+    )));
     // Everything else — permission problems, wedged listeners, anything
     // unknown — must NOT read as "no daemon" (spawning a second daemon over
     // a live one would be the failure mode).
@@ -189,7 +191,7 @@ fn dial_error_means_no_listener_covers_exactly_the_no_listener_kinds() {
         ErrorKind::Other,
     ] {
         assert!(
-            !crate::dial_error_means_no_listener(kind),
+            !crate::dial_error_means_no_listener(&Error::from(kind)),
             "{kind:?} must not classify as no-listener"
         );
     }

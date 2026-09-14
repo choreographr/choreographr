@@ -41,11 +41,6 @@ tempfile = { workspace = true, optional = true }
 x25519-dalek.workspace = true
 rand.workspace = true
 
-# Windows Unix domain sockets (std::os::windows::net::UnixStream is still
-# unstable); see the workspace-level comment. Unix-only builds never compile it.
-[target.'cfg(windows)'.dependencies]
-uds_windows.workspace = true
-
 [dev-dependencies]
 # Own tests also use tempfile directly; duplicated with the optional dep
 # because the optional one is for the feature-gated test_support module.

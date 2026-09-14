@@ -414,6 +414,14 @@ pub(crate) struct App {
     pub(crate) history_entry_text: Option<String>,
     pub(crate) fullscreen_image_target: Option<(u64, u32, usize)>,
     pub(crate) status: Option<String>,
+    /// Whether the current `status` came from a connection-task
+    /// [`UiEvent::Status`] (a transient progress message like
+    /// "daemon started") rather than from daemon traffic. A transient
+    /// status is CLEARED the moment the first real daemon message arrives, so
+    /// it cannot linger on the status line once the connection is live and
+    /// the first turn happens to be quiet. Daemon-derived statuses never set
+    /// this flag, so they are never cleared by the arrive-of-traffic rule.
+    pub(crate) status_is_transient: bool,
     pub(crate) error: Option<String>,
     pub(crate) session_displays: HashMap<u64, SessionDisplayState>,
     pub(crate) active_session_id: Option<u64>,
@@ -451,7 +459,10 @@ pub(crate) enum UiEvent {
     /// the connection is not yet established (the daemon-autostart wait) —
     /// the reader thread cannot paint the UI itself, so progress feedback
     /// travels to the UI loop as an event. Unlike daemon messages this does
-    /// NOT scroll or mutate any view: it just sets the status line.
+    /// NOT scroll or mutate any view: it just sets the status line. Marked
+    /// transient ([`App::status_is_transient`]) so the first real daemon
+    /// message clears it — the "daemon started" reassurance must not outlive
+    /// the connection it describes.
     Status(String),
 }
 
@@ -574,6 +585,7 @@ impl App {
             history_entry_text: None,
             fullscreen_image_target: None,
             status: None,
+            status_is_transient: false,
             error: None,
             last_terminal_size: None,
             terminal_resized: false,

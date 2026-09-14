@@ -1,6 +1,9 @@
 // `pub`: the poll/dial helpers are exercised from tests/autostart_poll.rs
 // (the integration suite — real waits and real sockets must not live in the
 // unit-test module per AGENTS.md), which needs cross-crate visibility.
+// `#[doc(hidden)]`: it is an implementation detail, not part of the public
+// API contract — the re-exports exist only for that test target.
+#[doc(hidden)]
 pub mod autostart;
 mod cache;
 mod clipboard;

@@ -384,6 +384,13 @@ is declared by the root package's `src/bin/choreographr.rs`.
 ### `choreo-proto` — Wire protocol
 
 Defines all shared message types and framing. No dependencies on other workspace crates.
+It also owns the two unix-socket-path helpers every side of the wire must agree
+on: `socket_path()` (the `CHOREOGRAPHR_SOCKET_PATH`-aware default) and the
+dial primitives `connect_unix` / `socket_listening` / `dial_error_means_no_listener`
+(with the platform-resolved `UnixStream` re-export: std on unix, `uds_windows`
+on Windows). Keeping the dial and its "nothing is listening" classification
+here means the client (autostart) and the daemon (stale-socket probe) cannot
+classify a socket path differently.
 
 **Key types:**
 
@@ -903,9 +910,13 @@ and the indexer (`tungstenite`) are synchronous.
 
 Entry point: `choreo_daemon::main` — invoked from the root package's
 `src/bin/choreographr.rs` wrapper — initializes tracing (to stderr, or to a
-file with `--log-file <path>` — append mode, ANSI off, created with 0600 on
-unix so other users on a shared machine cannot read the daemon's diagnostics,
-level control
+file with `--log-file <path>` — append mode, ANSI off, created 0600 on unix
+and opened `O_NOFOLLOW`, with the opened file verified to be a regular file
+owned by the daemon's own euid and its mode tightened to 0600 — the TUI
+autostart writes the log into the shared temp dir under a predictable
+pid-keyed name, so a planted symlink or a pre-created file owned by another
+user must not redirect or collect the daemon's (potentially sensitive)
+diagnostics; level control
 unchanged; an unopenable log file is a fatal startup error), creates
 `DaemonState`, runs socket server. `--auto-exit` (see the
 `server/lifecycle.rs` and `server/core.rs` rows) shuts the daemon down
@@ -1436,10 +1447,12 @@ Entry point: `src/main.rs`
 
 **Daemon autostart (`autostart.rs`).** In Unix-socket mode only, the TUI
 connects to the daemon socket DIRECTLY — there is no pre-flight probe. The
-dial lives in `choreo_client_core`'s `run_daemon_connection_with_autostart`,
-which keeps the stream of a successful first dial and invokes the TUI's
-autostart hook ONLY when the dial itself fails with `NotFound` or
-`ConnectionRefused` (nothing listening — classified via
+dial is `choreo_proto::connect_unix` (the ONE cross-platform unix-socket dial
+primitive: std's `UnixStream` on unix, the `uds_windows` shim on Windows),
+kept as a single helper by `choreo_client_core`'s
+`run_daemon_connection_with_autostart`, which keeps the stream of a successful
+first dial and invokes the TUI's autostart hook ONLY when the dial itself
+fails with `NotFound` or `ConnectionRefused` (nothing listening — classified via
 `choreo_proto::dial_error_means_no_listener`, the same predicate the daemon's
 stale-socket probe mirrors, so the two sides can never disagree). The hook spawns
 the SIBLING
@@ -1448,11 +1461,15 @@ the SIBLING
 .tarball/.deb/binstall layouts already guarantee) as a detached child with
 `--auto-exit --log-file $TMPDIR/choreo-daemon-<tui-pid>.log`, polls the
 socket (100 ms interval, 5 s budget — waiting for OUR OWN spawned child, not
-probing a foreign daemon) and returns; the connection is then retried.
+probing a foreign daemon) via `choreo_proto::socket_listening` and returns; the
+connection is then retried.
 Autostart runs on the connection thread after the alternate screen is up, so
 nothing is printed to the terminal — feedback travels as a
 `UiEvent::Status` message ("no daemon running — starting choreographr…",
-then "daemon started") painted on the UI's status line, and failures surface
+then "daemon started") painted on the UI's status line. A `Status` event is
+flagged transient (`App::status_is_transient`) so the first real daemon
+message clears it — the reassurance must not linger once the connection is
+live and the first turn is quiet. Failures surface
 as the TUI quit message
 naming the daemon's log path. TCP mode (`--tcp-addr`) never spawns — a remote
 daemon is not launchable from the client machine, by definition.

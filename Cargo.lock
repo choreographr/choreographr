@@ -2842,7 +2842,6 @@ dependencies = [
  "thiserror 2.0.20",
  "toml 1.1.5+spec-1.1.0",
  "tracing",
- "uds_windows",
  "x25519-dalek 3.0.0",
  "zeroize",
 ]
@@ -3069,6 +3068,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tracing",
+ "uds_windows",
 ]
 
 [[package]]
@@ -3142,7 +3142,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-prompts",
- "uds_windows",
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "zeroize",

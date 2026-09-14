@@ -1137,6 +1137,18 @@ fn handle_ui_event(
 ) -> Result<bool, ClientError> {
     match event {
         UiEvent::Daemon(message) => {
+            // Real daemon traffic means the connection is now established, so
+            // the autostart reassurance ("no daemon running — starting…" /
+            // "daemon started") has served its purpose. Clear it ONLY if it is
+            // still the transient status — a status the daemon itself set (a
+            // handler below) is left untouched, and `Status` arriving later
+            // would re-arm the flag. Without this the "daemon started" text
+            // lingers on the status line until the first daemon handler
+            // happens to write one.
+            if app.status_is_transient {
+                app.status = None;
+                app.status_is_transient = false;
+            }
             handle_daemon_message(*message, app, client_tx)?;
             Ok(true)
         }
@@ -1151,11 +1163,12 @@ fn handle_ui_event(
         }
         UiEvent::Status(message) => {
             // Connection-task feedback while the connection is still being
-            // established (currently: the daemon-autostart wait). The very
-            // first daemon messages overwrite it, and the connection task
-            // sends a final "daemon started" status when the autostart hook
-            // succeeds — so no explicit clearing is needed.
+            // established (currently: the daemon-autostart wait). Unlike a
+            // daemon message this never scrolls or mutates a view — it just
+            // sets the status line, flagged transient so the first real
+            // daemon message clears it (see the `Daemon` arm above).
             app.status = Some(message);
+            app.status_is_transient = true;
             Ok(true)
         }
     }
@@ -2045,8 +2058,62 @@ mod tests {
             app.status.as_deref(),
             Some("no daemon running — starting choreographr…")
         );
+        assert!(
+            app.status_is_transient,
+            "a connection-task status must be flagged transient"
+        );
         assert!(!app.should_quit, "a status event must never quit");
         assert!(app.quit_message.is_none());
+    }
+
+    #[test]
+    fn first_daemon_message_clears_a_transient_status() {
+        // The autostart reassurance must not linger once real daemon traffic
+        // arrives: the "daemon started" text is cleared on the first daemon
+        // message. `AccountListFailed` is used because it surfaces an ERROR
+        // and returns early without touching the status line, so the cleared
+        // (blank) status is observable rather than being overwritten by the
+        // handler itself.
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        handle_ui_event(UiEvent::Status("daemon started".to_string()), &mut app, &tx)
+            .expect("handle Status");
+        assert_eq!(app.status.as_deref(), Some("daemon started"));
+
+        handle_ui_event(
+            UiEvent::Daemon(Box::new(DaemonMessage::AccountListFailed {
+                error: "boom".to_string(),
+            })),
+            &mut app,
+            &tx,
+        )
+        .expect("handle Daemon");
+        assert!(
+            app.status.is_none(),
+            "the transient status must be cleared by the first daemon message"
+        );
+        assert!(!app.status_is_transient);
+        assert!(app.error.is_some(), "the daemon's error still lands");
+    }
+
+    #[test]
+    fn daemon_message_does_not_clear_a_daemon_status() {
+        // A status the daemon itself set must survive subsequent daemon
+        // traffic — only the transient connection-task flag is cleared.
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.status = Some("a daemon-set status".to_string());
+        app.status_is_transient = false;
+
+        handle_ui_event(
+            UiEvent::Daemon(Box::new(DaemonMessage::AccountListFailed {
+                error: "boom".to_string(),
+            })),
+            &mut app,
+            &tx,
+        )
+        .expect("handle Daemon");
+        assert_eq!(app.status.as_deref(), Some("a daemon-set status"));
     }
 
     #[test]

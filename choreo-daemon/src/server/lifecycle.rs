@@ -9,7 +9,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 #[cfg(windows)]
-use uds_windows::{UnixListener, UnixStream};
+use uds_windows::UnixListener;
 
 /// Grace period for joining connection threads during shutdown. After
 /// `BroadcastShuttingDown`, every healthy writer flushes the notification and
@@ -199,15 +199,15 @@ fn handle_accept_error(e: io::Error) {
 
 /// Refuse to delete a live daemon's socket; clean up a stale one.
 ///
-/// When the socket path exists, probe it with a `UnixStream::connect`: a
-/// SUCCESSFUL connect means a live daemon is listening, so removing the file
-/// would orphan a working daemon — return an actionable error instead. A
-/// failed connect (ENOENT, ECONNREFUSED, or a regular file at the path) means
-/// nothing is listening: remove the leftover and proceed (the classification
-/// mirror of `choreo_proto::dial_error_means_no_listener`, which the CLIENT
-/// side uses for autostart — here ANY failed connect is stale, because this
-/// path's action on "stale" is cleanup, not a spawn). The connect has no
-/// timeout by design — a connect to a local listener resolves immediately.
+/// When the socket path exists, probe it with [`choreo_proto::socket_listening`]
+/// (the shared cross-platform dial): a SUCCESSFUL connect means a live daemon
+/// is listening, so removing the file would orphan a working daemon — return
+/// an actionable error instead. A failed connect (ENOENT, ECONNREFUSED, or a
+/// regular file at the path) means nothing is listening: remove the leftover
+/// and proceed (the same dial the CLIENT side uses for autostart — here ANY
+/// failed connect is stale, because this path's action on "stale" is cleanup,
+/// not a spawn). The connect has no timeout by design — a connect to a local
+/// listener resolves immediately.
 ///
 /// Honest limitation: probe-then-remove-then-bind is three separate syscalls,
 /// not one atomic operation, so two daemons starting SIMULTANEOUSLY can both
@@ -223,7 +223,7 @@ pub(crate) fn remove_stale_socket(socket_path: &str) -> io::Result<()> {
     }
     // Probe before removing: the path may be a LIVE daemon's socket, not a
     // stale leftover from a crash.
-    if UnixStream::connect(socket_path).is_ok() {
+    if choreo_proto::socket_listening(socket_path) {
         return Err(io::Error::other(format!(
             "another daemon is already listening at {socket_path}; it must be \
              stopped before starting a new one"
@@ -318,9 +318,7 @@ pub fn run_server(
                 // Wake the accept loop by connecting to our own socket.
                 // The pending connection causes the next blocking accept()
                 // to return immediately so the shutdown flag is checked.
-                if let Ok(stream) = UnixStream::connect(&sig_path) {
-                    drop(stream);
-                }
+                let _ = choreo_proto::connect_unix(&sig_path);
             }
         });
     }
@@ -364,9 +362,7 @@ pub fn run_server(
             // never returns Err and the loop runs until the process exits.
             while sig_rx.recv().is_ok() {
                 sig_shutdown.store(true, Ordering::SeqCst);
-                if let Ok(stream) = UnixStream::connect(&sig_path) {
-                    drop(stream);
-                }
+                let _ = choreo_proto::connect_unix(&sig_path);
             }
         });
     }

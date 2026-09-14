@@ -10,7 +10,7 @@
 //! anything: remote daemons are not launchable from here by definition.
 //!
 //! All helpers are factored as pure functions over injected parameters (paths,
-//! a dial closure) so they are unit-testable without real sockets; only
+//! a probe closure) so they are unit-testable without real sockets; only
 //! [`start_daemon`] performs the actual spawn.
 
 use anyhow::Context;
@@ -27,23 +27,6 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// enough for a cold start on slow disks; past this the spawn is considered
 /// failed and the child is killed.
 pub const START_BUDGET: Duration = Duration::from_secs(5);
-
-/// The ONE cross-platform unix-socket dial primitive: std's `UnixStream` on
-/// unix, the `uds_windows` shim on Windows (std's Windows `UnixStream` is
-/// still unstable). Extracted as a named function so every socket probe in
-/// the TUI — the wait-for-our-child loop below and the integration tests —
-/// exercises the exact same dial shape `choreo-client-core`'s connection
-/// path uses, instead of re-inlining the `#[cfg]` split at each site.
-///
-/// Note this is a PROBE primitive only: it is never used for the connection
-/// itself (that dial lives in `choreo-client-core` and keeps its stream).
-pub fn dial_socket(path: &str) -> bool {
-    #[cfg(unix)]
-    let probe = std::os::unix::net::UnixStream::connect(path);
-    #[cfg(windows)]
-    let probe = uds_windows::UnixStream::connect(path);
-    probe.is_ok()
-}
 
 /// Path of the sibling `choreographr` daemon binary: same directory as the
 /// running TUI executable, `.exe`-suffixed on Windows. Factored over the exe
@@ -71,15 +54,16 @@ pub(crate) fn daemon_log_path() -> PathBuf {
 /// the injected probe reports a live listener or the budget expires. This is
 /// not a pre-flight probe of a foreign daemon — it is the unavoidable wait for
 /// our own child between the spawn and the connection retry. The probe is a
-/// parameter (not hardcoded [`dial_socket`]) so unit tests can drive this
-/// with scripted closures and never sleep; the real-dial timing behavior is
-/// exercised by `tests/autostart_poll.rs`.
+/// parameter (not hardcoded [`choreo_proto::socket_listening`]) so unit tests
+/// can drive this with scripted closures and never sleep; the real-dial timing
+/// behavior is exercised by `tests/autostart_poll.rs`.
 ///
 /// Returns `true` only when the probe reported a live listener within the
 /// budget. There is exactly one interval-sleep between probes (the first
 /// probe fires immediately — a fast-starting daemon should not pay for a
-/// sleep), and the budget is checked before each probe so the total wait is
-/// bounded by `budget` regardless of probe duration.
+/// sleep), and each sleep is clamped to the time remaining before the budget,
+/// so the TOTAL wait is bounded by `budget` regardless of probe duration or
+/// interval.
 pub fn poll_until_listening(
     path: &str,
     interval: Duration,
@@ -97,7 +81,13 @@ pub fn poll_until_listening(
         if probe(path) {
             return true;
         }
-        std::thread::sleep(interval);
+        // Clamp the sleep to the budget's remainder so the loop cannot
+        // overshoot `budget` by up to one full interval after the last failed
+        // probe (the bug the doc above promises is impossible). A zero-length
+        // sleep (budget exhausted right after a probe) is cheap and the
+        // budget check at the top of the next iteration exits.
+        let remaining = budget.saturating_sub(start.elapsed());
+        std::thread::sleep(interval.min(remaining));
     }
 }
 
@@ -161,7 +151,12 @@ pub(crate) fn start_daemon(socket_path: &str) -> anyhow::Result<()> {
     tracing::info!(binary = %binary.display(), log = %log_path.display(), "spawning daemon");
     let mut child = spawn_daemon(&binary, &log_path)?;
 
-    if poll_until_listening(socket_path, POLL_INTERVAL, START_BUDGET, dial_socket) {
+    if poll_until_listening(
+        socket_path,
+        POLL_INTERVAL,
+        START_BUDGET,
+        choreo_proto::socket_listening,
+    ) {
         tracing::info!(path = socket_path, "daemon started and listening");
         return Ok(());
     }

@@ -15,6 +15,12 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# Windows Unix domain sockets: std::os::windows::net::UnixStream is still
+# unstable, so the crate's `UnixStream` re-export / `connect_unix` dial uses
+# the uds_windows shim on Windows. Unix-only builds never compile it.
+[target.'cfg(windows)'.dependencies]
+uds_windows.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true
 

@@ -1,5 +1,7 @@
 use crate::error::ClientError;
-use choreo_proto::{ClientMessage, DaemonMessage, ProtoError, read_message, write_message};
+use choreo_proto::{
+    ClientMessage, DaemonMessage, ProtoError, UnixStream, connect_unix, read_message, write_message,
+};
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::{
     PREAMBLE_IK, PREAMBLE_XX, handshake_initiator, handshake_initiator_xx,
@@ -11,17 +13,10 @@ use choreo_transport::key::ensure_transport_keypair;
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use std::fmt;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
-// Windows: std::os::windows::net::UnixStream is unstable (E0658, feature
-// `windows_unix_domain_sockets`, rust-lang/rust#150487), so uds_windows provides
-// the same connect/try_clone/shutdown API over named pipes.
-#[cfg(windows)]
-use uds_windows::UnixStream;
 
 /// Read DaemonMessages from `reader` in a blocking loop, calling
 /// `handle_daemon_message` for each successfully decoded message.
@@ -74,14 +69,14 @@ pub fn run_daemon_connection(
     shutdown_rx: Option<mpsc::Receiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {socket_path}");
-    let stream = UnixStream::connect(socket_path)?;
+    let stream = connect_unix(socket_path)?;
     pump_connection(stream, handle_daemon_message, from_ui, shutdown_rx)
 }
 
 /// Connect to the daemon at `socket_path`, starting one via `ensure_daemon` if
 /// (and ONLY if) the initial dial itself finds nothing listening.
 ///
-/// There is no pre-flight probe: the first `UnixStream::connect` IS the real
+/// There is no pre-flight probe: the first [`connect_unix`] IS the real
 /// connection attempt, and when the daemon is up it is used directly — the
 /// stream is never thrown away. Only a dial failure classified as "nothing is
 /// listening" (via [`choreo_proto::dial_error_means_no_listener`], shared
@@ -103,13 +98,13 @@ pub fn run_daemon_connection_with_autostart(
     shutdown_rx: Option<mpsc::Receiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {socket_path}");
-    let stream = match UnixStream::connect(socket_path) {
+    let stream = match connect_unix(socket_path) {
         Ok(stream) => stream,
-        Err(error) if choreo_proto::dial_error_means_no_listener(error.kind()) => {
+        Err(error) if choreo_proto::dial_error_means_no_listener(&error) => {
             info!(%error, "no daemon listening on the socket; requesting autostart");
             ensure_daemon()?;
             info!("autostart done; retrying connection to daemon at {socket_path}");
-            UnixStream::connect(socket_path)?
+            connect_unix(socket_path)?
         }
         Err(error) => return Err(error.into()),
     };
