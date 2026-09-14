@@ -1571,19 +1571,29 @@ at inference time (the client-driven guard beats waiting for a transient
 misleading `X / ?` fill when the context window isn't loaded), and `/lock`
 (re-)latches the banner via a `Locked` broadcast.
 
-**Idle-guard (submit-time).** Submitting a plain prompt (`RunInput`) while the
-attached session is not idle is rejected CLIENT-SIDE with the status message
-"Session is not idle, please wait before prompting." — a `RunInput` can only
-begin a new turn from `Inactive`, so the guard beats sending a message the
-daemon cannot start. It reads `App::attached_status` (kept fresh from session
-summaries, `SessionStatusChanged` broadcasts, and `SessionAttached` replies)
-and, like the keystore-lock guard, is a client-side UX guard only — the daemon
-stays authoritative, and an unknown status (`None`, e.g. a fresh client) fails
-open. The check runs *before* the input buffer is cleared and the per-session
-draft forgotten, so a rejected prompt stays in the input bar to resubmit;
-slash-commands (e.g. `/cancel`) also stay available while a session is busy.
-A future change replaces this blunt guard with prompt queueing for async tool
-calls. See `connection/chat.rs`.
+**New-turn submit guard (client-side).** Every action that begins a new
+inference turn — a plain prompt (`RunInput`) and Alt+Enter
+(`ContinueGeneration`, which the daemon turns into a `RunInput`) — runs through
+the single `App::new_turn_rejection` helper. It returns the rejection message
+(`None` = allowed) for two conditions, in order: the attached session is not
+idle, or the daemon's keystore is locked. The idle branch reads
+`App::attached_status` (kept fresh from session summaries,
+`SessionStatusChanged` broadcasts, and `SessionAttached` replies) and uses
+`SessionStatus::is_idle` (exactly `Inactive`; `Sleeping` — the session-thread
+exit marker — is not idle): a `RunInput` can only begin a turn from `Inactive`,
+so the guard beats sending a message the daemon would answer with a transient
+`session already has an active request`. The locked branch mirrors the
+persistent lock banner. Like the keystore-lock guard was, this is a client-side
+UX guard only — the daemon stays authoritative, and an unknown status (`None`,
+e.g. a fresh client) fails open. For a plain prompt the guard runs *before* the
+input buffer is cleared and the per-session draft forgotten, so a rejected
+prompt stays in the input bar to resubmit; slash-commands (e.g. `/cancel`) skip
+the guard entirely so they stay available while a session is busy.
+`attached_status` (and `attached_tool_groups`) are cleared when the attached
+session is deleted (`handle_session_deleted`), so a later prompt with nothing
+attached fails open instead of being rejected against a dead session's stale
+status. A future change replaces this blunt guard with prompt queueing for
+async tool calls. See `connection/chat.rs` and `state::App::new_turn_rejection`.
 
 **Module breakdown:**
 

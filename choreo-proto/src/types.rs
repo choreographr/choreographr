@@ -408,6 +408,18 @@ impl SessionStatus {
             SessionStatus::Inference | SessionStatus::ToolCall(_) | SessionStatus::Retrying { .. }
         )
     }
+
+    /// Returns `true` when the session is idle and ready to begin a new turn —
+    /// i.e. exactly [`SessionStatus::Inactive`].  `Sleeping` is deliberately
+    /// NOT idle: it is the session-thread exit marker (only an `AttachSession`
+    /// reloads the session), so a prompt submitted to a sleeping session cannot
+    /// start a turn either.
+    ///
+    /// Note this is not the negation of [`Self::is_active`], which is `false`
+    /// for both `Inactive` and `Sleeping`.
+    pub fn is_idle(&self) -> bool {
+        matches!(self, SessionStatus::Inactive)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -922,6 +934,33 @@ pub enum DaemonMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_status_idle_and_active_partition_busy_states() {
+        // `is_idle` is exactly `Inactive`; `is_active` covers the three
+        // processing states.  `Sleeping` is neither — it is the exit marker of
+        // a session whose thread has terminated, so it cannot begin a turn
+        // (hence not idle) yet is not "actively processing" either (hence not
+        // active).  Both predicates must agree on this partition.
+        assert!(SessionStatus::Inactive.is_idle());
+        assert!(!SessionStatus::Inactive.is_active());
+
+        for busy in [
+            SessionStatus::Inference,
+            SessionStatus::ToolCall("shell".into()),
+            SessionStatus::Retrying {
+                attempt: 2,
+                max_attempts: 5,
+                delay_ms: 250,
+            },
+        ] {
+            assert!(busy.is_active(), "{busy:?} must be active");
+            assert!(!busy.is_idle(), "{busy:?} must not be idle");
+        }
+
+        assert!(!SessionStatus::Sleeping.is_idle());
+        assert!(!SessionStatus::Sleeping.is_active());
+    }
 
     /// All four artifact variants, with realistic payload bytes.
     fn all_artifacts() -> Vec<ReasoningArtifact> {

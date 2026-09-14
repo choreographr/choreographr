@@ -6,7 +6,7 @@ use crate::{ShellCommand, clipboard, parse_input_line, selection};
 use choreo_client_core::{
     ClientError, broken_pipe, build_add_credential_message, resolve_private_key, shell_command_echo,
 };
-use choreo_proto::{ClientMessage, SessionStatus};
+use choreo_proto::ClientMessage;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
@@ -36,6 +36,16 @@ pub(super) fn handle_chat_event(
                 // Alt+Enter → continue generation
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
                     if app.attached_session_id.is_some() {
+                        // Alt+Enter sends a `ContinueGeneration`, which the
+                        // daemon turns into a fresh `RunInput` turn — so the same
+                        // client-side submit guard that protects a plain prompt
+                        // applies here too.  See `App::new_turn_rejection`.
+                        if let Some(reason) = app.new_turn_rejection() {
+                            tracing::debug!(reason, "[choreo-tui] Alt+Enter rejected client-side");
+                            app.status = Some(reason.to_string());
+                            app.error = None;
+                            return Ok(());
+                        }
                         tracing::debug!("Alt+Enter continuing generation");
                         let request_id = app.next_request_id;
                         app.next_request_id = app.next_request_id.wrapping_add(1);
@@ -107,37 +117,30 @@ pub(super) fn handle_chat_event(
                 }
                 KeyCode::Enter => {
                     let line = app.input.text.trim().to_string();
-                    // Client-side UX guard: a plain prompt (RunInput) can only be
-                    // accepted while the attached session is idle (`Inactive`).
-                    // While the session is busy (inferring / tool call / retrying /
-                    // sleeping) the daemon cannot begin a new turn, so reject the
-                    // submission immediately with clear feedback.  This mirrors the
-                    // keystore-locked guard below and, crucially, runs *before* the
+                    // A plain prompt (any non-empty line not starting with `/`)
+                    // begins a new inference turn, so it goes through the shared
+                    // client-side submit guard (`App::new_turn_rejection`) — idle
+                    // and keystore checks in one place.  Running it *before* the
                     // input buffer is cleared and the per-session draft forgotten
-                    // (`clear_current_draft`) — otherwise a rejected prompt would
-                    // silently vanish and the user would have to retype it.
-                    // Slash-commands pass through untouched so the user can still
-                    // e.g. `/cancel` the in-flight request.
+                    // (`clear_current_draft`) is what keeps a rejected prompt in
+                    // the input bar to resubmit instead of silently vanishing.
+                    // Slash-commands bypass the guard so the user can still e.g.
+                    // `/cancel` the in-flight request.
                     //
-                    // A `None` status (fresh client, or the brief window before the
-                    // daemon reports one) fails open, exactly like the
-                    // reasoning-capability check below: the daemon stays the
-                    // authority and will reject a genuinely-busy submission.
+                    // A `None` status (fresh client, or the brief window before
+                    // the daemon reports one) fails open inside the guard: the
+                    // daemon stays the authority and will reject a genuinely-busy
+                    // submission.
                     //
                     // TODO: replace this blunt guard with prompt queueing, so a
                     // prompt submitted mid-turn is held and dispatched when the
                     // session returns to idle instead of being refused.
                     if !line.is_empty()
                         && !line.starts_with('/')
-                        && let Some(status) = app.attached_status.as_ref()
-                        && *status != SessionStatus::Inactive
+                        && let Some(reason) = app.new_turn_rejection()
                     {
-                        tracing::debug!(
-                            ?status,
-                            "[choreo-tui] prompt rejected client-side: session not idle"
-                        );
-                        app.status =
-                            Some("Session is not idle, please wait before prompting.".to_string());
+                        tracing::debug!(reason, "[choreo-tui] prompt rejected client-side");
+                        app.status = Some(reason.to_string());
                         app.error = None;
                         return Ok(());
                     }
@@ -154,31 +157,6 @@ pub(super) fn handle_chat_event(
                         }
                         ShellCommand::UnknownCommand(error) => app.status = Some(error),
                         ShellCommand::Send(message) => {
-                            // Client-side guard: submitting a prompt (RunInput)
-                            // to a locked daemon does nothing at inference time
-                            // (no credentials in memory), so reject it
-                            // immediately with clear feedback instead of sending
-                            // a message that silently fails — the daemon's
-                            // "no credential stored" `Failed` would only render
-                            // as a transient status a keypress clears, and the
-                            // persistent lock banner is the always-visible
-                            // guidance. When the daemon IS unlocked (or this
-                            // is a non-session command like /models) the
-                            // message is sent normally.
-                            if matches!(&message, ClientMessage::RunInput { .. })
-                                && app.keystore_locked
-                            {
-                                tracing::debug!(
-                                    "[choreo-tui] prompt rejected client-side: daemon keystore locked"
-                                );
-                                app.status = Some(
-                                    "daemon keystore is locked — unlock with /unlock, or /unlock \
-                                     <base64 unlock-key> (a fresh daemon binds automatically)"
-                                        .to_string(),
-                                );
-                                app.error = None;
-                                return Ok(());
-                            }
                             // Client-side validation: reject reasoning slugs that
                             // the attached model's capability set does not include.
                             // This provides faster feedback than waiting for the

@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The TUI's client-side submit guard is now a single `App::new_turn_rejection`
+  helper covering both the idle check and the keystore-locked check, and it is
+  applied to **every** action that begins a new turn — a plain prompt *and*
+  Alt+Enter (`ContinueGeneration`), which was previously unguarded. A new
+  `SessionStatus::is_idle` (exactly `Inactive`; `Sleeping` is not idle) makes
+  the idle test explicit and shared. Behaviour change: a locked-keystore
+  rejection now runs before the input buffer is cleared, so the rejected text
+  is preserved (matching the idle-guard behaviour) instead of being dropped.
 - The "nothing is listening" dial classification (`NotFound` /
   `ConnectionRefused`) moved into a shared predicate,
   `choreo_proto::dial_error_means_no_listener`, used by the TUI connection
@@ -52,6 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Deleting the attached TUI session now clears the cached attach-state
+  (`attached_status` / `attached_tool_groups`) along with the session id. These
+  describe the attachment that just went away; leaving them set rendered a
+  stale status bar and (with the new idle-guard) made a later plain prompt be
+  rejected as "session not idle" even though no session was attached at all.
 - The unified config watcher now arms its `notify` watch **synchronously** in
   `ConfigWatcher::spawn()` (on the caller's thread) instead of on the spawned
   transport thread: previously a config-file write landing between `spawn()`

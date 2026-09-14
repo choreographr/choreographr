@@ -295,6 +295,72 @@ fn empty_submission_while_busy_is_a_noop() {
     assert!(rx.try_recv().is_err());
 }
 
+/// Drive an Alt+Enter keypress through the full terminal-event pipeline.
+fn press_alt_enter(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>) {
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+        app,
+        tx,
+    )
+    .expect("handle alt+enter");
+}
+
+#[test]
+fn alt_enter_while_busy_is_rejected_by_the_same_guard() {
+    // Alt+Enter sends a `ContinueGeneration`, which the daemon turns into a
+    // fresh turn — so it must be refused while the session is not idle, exactly
+    // like a plain prompt.  Without the shared guard the daemon would answer
+    // with a transient "session already has an active request".
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    app.attached_status = Some(SessionStatus::ToolCall("shell".into()));
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_alt_enter(&mut app, &tx);
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("Session is not idle, please wait before prompting.")
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no ContinueGeneration may be sent while the session is busy"
+    );
+}
+
+#[test]
+fn alt_enter_while_locked_is_rejected_by_the_same_guard() {
+    // The locked half of the guard applies to ContinueGeneration too — it needs
+    // the same credentials a prompt does.
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    app.attached_status = Some(SessionStatus::Inactive);
+    app.keystore_locked = true;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_alt_enter(&mut app, &tx);
+
+    let status = app.status.as_deref().expect("lock feedback status");
+    assert!(status.contains("locked"), "got: {status}");
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn alt_enter_while_idle_is_sent() {
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    app.attached_status = Some(SessionStatus::Inactive);
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_alt_enter(&mut app, &tx);
+
+    assert!(matches!(
+        rx.recv().expect("sent message"),
+        ClientMessage::ContinueGeneration { .. }
+    ));
+    assert!(app.status.is_none(), "no status message on success");
+}
+
 #[test]
 fn terminal_event_esc_noop_on_chat() {
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -820,6 +886,26 @@ mod unsent_draft_tests {
         // The draft lives in the removed display, so nothing is left to
         // resurface on a later switch either.
         assert!(!app.session_displays.contains_key(&1));
+    }
+
+    #[test]
+    fn deleting_attached_session_clears_cached_status() {
+        // The cached status/tool-groups describe the attachment; once the
+        // attached session is deleted there is nothing left to describe, so
+        // they must be cleared.  Leaving `attached_status` set (e.g. Inference)
+        // would render a stale status bar AND make the submit-time idle-guard
+        // in `connection/chat.rs` reject a plain prompt as "session not idle"
+        // even though no session is attached at all.
+        let mut app = test_app();
+        app.attached_session_id = Some(1);
+        app.attached_status = Some(SessionStatus::Inference);
+        app.attached_tool_groups = vec!["core".to_string()];
+
+        app.handle_session_deleted(1);
+
+        assert_eq!(app.attached_session_id, None);
+        assert_eq!(app.attached_status, None);
+        assert!(app.attached_tool_groups.is_empty());
     }
 
     #[test]

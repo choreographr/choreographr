@@ -1264,6 +1264,45 @@ impl App {
         }
     }
 
+    /// Client-side submit-time guard shared by every action that begins a NEW
+    /// inference turn: a plain prompt (`RunInput`) and the `ContinueGeneration`
+    /// that the daemon turns into one.  The daemon is authoritative and would
+    /// reject such a submission while it is busy (`session already has an
+    /// active request`) or while the keystore is locked (no credentials in
+    /// memory), but doing so costs a round-trip and surfaces a transient
+    /// failure the user has to retype around — so the TUI pre-empts it here.
+    ///
+    /// Returns `Some(message)` with the status line to show — and the caller
+    /// must NOT send — when the new turn is refused locally, or `None` when it
+    /// may proceed.  A `None`/unknown `attached_status` fails open, so the
+    /// daemon stays the authority for a fresh client that has not heard a
+    /// status yet.
+    ///
+    /// The idle and locked cases are intentionally ordered idle-first: the
+    /// busy case is the one the user hits during normal use, and it is the more
+    /// actionable message.
+    pub(crate) fn new_turn_rejection(&self) -> Option<&'static str> {
+        // Idle guard: a new turn can only begin from an idle (`Inactive`)
+        // session.  See `SessionStatus::is_idle` for why `Sleeping` counts as
+        // busy too.  `None` (no status known yet) fails open.
+        if let Some(status) = self.attached_status.as_ref()
+            && !status.is_idle()
+        {
+            return Some("Session is not idle, please wait before prompting.");
+        }
+        // Locked guard: with no credentials decrypted in memory the daemon
+        // cannot run inference, so a sent message would only come back as a
+        // transient "no credential stored" failure that a keypress clears —
+        // the persistent lock banner is the always-visible guidance.
+        if self.keystore_locked {
+            return Some(
+                "daemon keystore is locked — unlock with /unlock, or /unlock \
+                 <base64 unlock-key> (a fresh daemon binds automatically)",
+            );
+        }
+        None
+    }
+
     pub(crate) fn ensure_input_cursor_visible(&mut self) {
         if let Some((term_w, _)) = self.last_terminal_size {
             // inner width must match the renderer's drawing width so the
@@ -1867,6 +1906,15 @@ impl App {
             self.attached_session_id = None;
             self.active_session_id = None;
             self.attached_account_slug = None;
+            // Drop the deleted session's cached status and tool groups too.
+            // They describe the attachment that just went away; leaving them
+            // set would both render a stale status bar (there is no attached
+            // session to describe anymore) and mislead the submit-time
+            // idle-guard in `connection/chat.rs`, which reads `attached_status`
+            // and would wrongly reject a prompt as "session not idle" when
+            // nothing is attached at all.
+            self.attached_status = None;
+            self.attached_tool_groups.clear();
             // The deleted session's unsent prompt dies with it — the display
             // (and its draft) are gone above, so drop the input bar too
             // rather than leak the orphaned text into whichever session gets
