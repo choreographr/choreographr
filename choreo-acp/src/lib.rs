@@ -39,13 +39,15 @@ fn clap_styles() -> clap::builder::Styles {
 }
 
 #[derive(Parser)]
-// Bare `version` makes `--version` print the crate version (CARGO_PKG_VERSION);
-// clap handles it before the app starts, so it works headless too.
+// `--version` prints the crate version (CARGO_PKG_VERSION) with the release
+// name appended via `choreo_proto::release_name` — e.g. `0.2.0 (Lindy)`, or the
+// bare version when the name file is empty. clap handles it before the app
+// starts, so it works headless too.
 // `color` is explicitly `Auto` (clap's default) to document the intent that
 // help/error output is colored only when stdout/stderr is a TTY.
 #[command(
     name = "choreo-acp",
-    version,
+    version = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION")),
     about = "ACP bridge for Choreographr",
     color = clap::ColorChoice::Auto,
     styles = clap_styles()
@@ -180,6 +182,9 @@ mod cli_tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+        // And the release name (from choreo-proto/release-name.txt) rides along.
+        let expected = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION"));
+        assert!(err.to_string().contains(&expected));
     }
 
     /// The default log file must live under the PLATFORM temp dir — never a

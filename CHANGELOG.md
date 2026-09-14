@@ -223,6 +223,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identifier). The CI release job lifts it into the GitHub release title
   (`choreographr 0.2.0 — Lindy`); AGENTS.md notes the heading form.
 
+- **Release names are baked into the binaries.** `choreo-proto/release-name.txt`
+  is now the single source of truth for a series' dance-style name: a new
+  `choreo_proto::release_name` module compiles it in with `include_str!` (no
+  `build.rs`; an empty file means unnamed), so all four clap binaries
+  (`choreographr`, `choreo-tui`, `choreo-im`, `choreo-acp`) print
+  `0.2.0 (Lindy)` from `--version`, and the daemon and TUI also log the version
+  string at startup. The name is a per-minor-series attribute — major/minor sets
+  a new name, a patch keeps the current one. The CI release job reads the same
+  file for the GitHub release title (parentheses, matching `--version`), and a
+  new `scripts/check-release-name.sh` drift guard — wired into `just pre-commit`,
+  `just ci`, and the release workflow — keeps the file and the CHANGELOG heading
+  in sync.
+
 - **CHANGELOG.md reformatted to satisfy Keep a Changelog**: the `[Unreleased]`
   section, which had accumulated **seven** `### Fixed`, **seven** `### Changed`,
   and five `### Added` blocks, is consolidated to **one heading per category**

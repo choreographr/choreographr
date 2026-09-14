@@ -351,6 +351,10 @@ launchctl load ~/Library/LaunchAgents/com.choreographr.daemon.plist   # macOS: n
 choreographr                                     # ...or just run it in a terminal
 ```
 
+`--version` (on all four binaries) prints the version with the series' release
+name — e.g. `choreographr 0.2.0 (Lindy)`, or the bare version for an unnamed
+series.
+
 The non-Homebrew launchd plist expects `/opt/homebrew/bin/choreographr` —
 edit its `ProgramArguments` if your binaries live elsewhere. Once the daemon
 is up, attach a client (`choreo-tui`; the bridges via `cargo run -p choreo-im`

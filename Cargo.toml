@@ -427,7 +427,10 @@ arc-swap = "1.9.2"
 # credential channels (see ARCHITECTURE.md).
 rmp-serde = "1.3"
 tempfile = "3"
-clap = { version = "4.6", features = ["derive"] }
+# `string` lets `#[command(version = <expr>)]` accept a runtime-built `String`
+# (clap's `Str: From<String>` is behind this feature) — used by every shipped
+# binary to append the release name from `choreo_proto::release_name`.
+clap = { version = "4.6", features = ["derive", "string"] }
 # Multi-producer/single-consumer channels with `select!` — the event-driven
 # replacement for `recv_timeout` polling when a thread must wait on several
 # channels at once (cancellation alongside tool results / SSE events).

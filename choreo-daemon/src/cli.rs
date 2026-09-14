@@ -28,13 +28,15 @@ fn clap_styles() -> clap::builder::Styles {
 }
 
 #[derive(Parser)]
-// Bare `version` wires `--version`/`-V` to CARGO_PKG_VERSION (the crate
-// version), which the Homebrew formula test, installer, and smoke tests rely on.
+// `--version`/`-V` reports this crate's CARGO_PKG_VERSION (which the Homebrew
+// formula test, installer, and smoke tests rely on) with the release name
+// appended via `choreo_proto::release_name` — e.g. `0.2.0 (Lindy)`, or the
+// bare version when the name file is empty. See `choreo-proto/release-name.txt`.
 // `color` is explicitly `Auto` (clap's default) to document the intent that
 // help/error output is colored only when stdout/stderr is a TTY.
 #[command(
     name = "choreographr",
-    version,
+    version = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION")),
     about = "Choreographr AI daemon",
     color = clap::ColorChoice::Auto,
     styles = clap_styles()
@@ -343,7 +345,12 @@ pub fn main() -> anyhow::Result<()> {
     // policy, so its behavior is unchanged.
     let max_turns = resolve_max_turns().context("failed to resolve tool-loop iteration limit")?;
     info!(max_turns, "tool loop iteration limit");
-    info!("choreographr starting (locked)");
+    // The release name (choreo-proto/release-name.txt) is part of the startup
+    // banner alongside the crate version, so logs identify the exact series.
+    info!(
+        version = %choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION")),
+        "choreographr starting (locked)"
+    );
 
     let state = DaemonState::open(crate::daemon::OpenOptions {
         db_path: crate::db::db_path().context("failed to resolve database path")?,
@@ -528,5 +535,8 @@ mod tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+        // And the release name (from choreo-proto/release-name.txt) rides along.
+        let expected = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION"));
+        assert!(err.to_string().contains(&expected));
     }
 }

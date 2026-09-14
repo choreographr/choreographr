@@ -404,6 +404,20 @@ on Windows). Keeping the dial and its "nothing is listening" classification
 here means the client (autostart) and the daemon (stale-socket probe) cannot
 classify a socket path differently.
 
+It also hosts the **`release_name` module** — the build-info source of truth
+for the suite's dance-style release name. The raw name lives in one file,
+`choreo-proto/release-name.txt`, pulled in with `include_str!` (compile-time
+inclusion, no `build.rs`) so it is baked into every binary; the file sits inside
+the crate directory so it also ships in the published `.crate`. `release_name()`
+returns `Option<&str>` (`None` when the file is empty — the unnamed 0.1.0
+series) and `version_string(base)` renders `"0.2.0 (Lindy)"` for a binary's own
+`CARGO_PKG_VERSION`, or `base` unchanged when unnamed. The four clap binaries
+(`choreographr`, `choreo-tui`, `choreo-im`, `choreo-acp`) pass it to
+`#[command(version = …)]` so `--version` reports it, and the daemon and TUI also
+log it at startup. The CI release job reads the same file for the GitHub release
+title, and `scripts/check-release-name.sh` (the `just check-release-name` guard)
+fails on drift between it and the CHANGELOG heading.
+
 **Key types:**
 
 | Type | Purpose |

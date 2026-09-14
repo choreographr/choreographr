@@ -67,8 +67,12 @@ The `release` job (tag pushes only) downloads all build-job artifacts,
 generates one combined `SHA256SUMS` over everything, guards that the pushed
 tag matches the manifest version, extracts the version's section from
 `CHANGELOG.md` (the Keep a Changelog promotion from Phase 1 makes it the
-release body — a missing section fails the job), and creates the release
-with `gh release create vX.Y.Z dist/* --notes-file … --generate-notes`. A
+release body — a missing section fails the job), runs the `check-release-name`
+guard, and creates the release with
+`gh release create vX.Y.Z dist/* --notes-file … --generate-notes`. The
+release **title** is read from `choreo-proto/release-name.txt` — the same file
+compiled into the binaries, so the title and `--version` cannot drift (an empty
+file yields the bare `choreographr X.Y.Z`). A
 re-run after the release already exists fails on create — assets are
 immutable once uploaded; delete and re-create per the
 [Hotfix / rollback](#hotfix--rollback) section rather than editing the job.
@@ -98,13 +102,17 @@ channel updates in Phase 4 as before.
   `cargo release` do it (Phase 1).
 - **Tag format:** `vX.Y.Z` (e.g. `v0.1.1`). Release notes are generated from
   the tag diff (`gh release create --generate-notes`).
-- **Release names:** a **major or minor** release gets a fun name — a dance
+- **Release names:** a **major or minor** release sets a fun name — a dance
   style, e.g. *Lindy* — chosen by the conductor at release time (there is no
-  pre-assigned list; pick whatever fits). **Patch releases have no name.** The
-  name is release *metadata*: it lives in the CHANGELOG section heading
-  (`## [X.Y.Z] - YYYY-MM-DD (Lindy)`) and nowhere else — never in the git tag,
-  the crate versions, or any install identifier. The CI release job lifts it
-  into the GitHub release title (`choreographr 0.2.0 — Lindy`).
+  pre-assigned list; pick whatever fits). **Patch releases keep the current
+  name.** The name is a *per-minor-series* attribute stored in ONE file,
+  `choreo-proto/release-name.txt` — the single source of truth. The file is
+  compiled into the binaries (so `choreographr --version` prints
+  `choreographr 0.2.0 (Lindy)`) and read by the CI release job for the GitHub
+  release title. It also appears in the CHANGELOG section heading
+  (`## [X.Y.Z] - YYYY-MM-DD (Lindy)`); the `check-release-name` guard keeps the
+  file and the heading in sync. The name is release *metadata*: it is never in
+  the git tag, the crate versions, or any install identifier.
 
 ### Preflight (before Phase 1)
 
@@ -147,10 +155,11 @@ just preflight               # checks cargo + zig, notes nextest
    rewriting manifests on ordinary releases and only fires on a major. Update
    this table's examples when 1.0.0 ships (Phase 5 commits doc drift).
 
-   For a **major or minor** release (not a patch), also choose the release's
-   **name** here — a dance style such as *Lindy*; there is no pre-assigned
-   list, pick whatever fits (see [Release names](#versioning--gates)). It is
-   recorded in the changelog heading in step 2.
+   For a **major or minor** release (not a patch), also choose a **new name**
+   here — a dance style such as *Lindy*; there is no pre-assigned list, pick
+   whatever fits (see [Release names](#versioning--gates)). A **patch** release
+   keeps the current name: leave `choreo-proto/release-name.txt` and the
+   CHANGELOG heading as they are (step 2).
 
 2. **Enact the decision** — the command that carries it out is
    `cargo release version <level>`, where `<level>` is replaced with the
@@ -168,16 +177,25 @@ just preflight               # checks cargo + zig, notes nextest
    ```
 
    `cargo release version` only edits the manifests — it does **not** commit
-   or tag. Before committing: promote the changelog section — rename
-   `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md` (append
-   ` (Dance)` for a major/minor release, e.g. `## [0.2.0] - 2026-09-14 (Lindy)`
-   — see [Release names](#versioning--gates)) and start a fresh empty
-   `[Unreleased]` above it, moving the compare link — plus update any
-   user-facing docs that state a version or install command (README install
-   section):
+   or tag. Run it **first**: it refuses to run on a dirty tree, so the bump
+   must land before the accompanying edits below. Then, before committing:
+
+   1. `cargo release version <level> -x` — applies the manifest bump (clean
+      tree required; see above).
+   2. Set the release name (**major/minor only**) — write one line to
+      `choreo-proto/release-name.txt`; a patch release leaves it untouched.
+   3. Promote the changelog section — rename `## [Unreleased]` to
+      `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md`, keeping the series name in
+      parentheses so it matches the file (`## [0.2.1] - 2026-10-01 (Lindy)` for
+      a patch in the Lindy series; `## [0.2.0] - 2026-09-14 (Lindy)` for the
+      major/minor that introduced it — see
+      [Release names](#versioning--gates)) — and start a fresh empty
+      `[Unreleased]` above it, moving the compare link.
+   4. Update any user-facing docs that state a version or install command
+      (README install section).
 
    ```bash
-   git add Cargo.toml Cargo.lock README.md CHANGELOG.md   # + any other docs touched
+   git add Cargo.toml Cargo.lock choreo-proto/release-name.txt CHANGELOG.md README.md  # + any other docs touched
    git commit -m "release: bump to X.Y.Z"
    ```
 
@@ -192,8 +210,9 @@ just preflight               # checks cargo + zig, notes nextest
    > job extracts the `## [X.Y.Z]` section from `CHANGELOG.md` for the release
    > body and fails the job if it is absent — the curated notes are the
    > release notes, not an afterthought. The heading may carry an optional
-   > `- YYYY-MM-DD` date and ` (Name)`, and the job lifts the name into the
-   > release title.
+   > `- YYYY-MM-DD` date and ` (Name)`. The release **title** now comes from
+   > `choreo-proto/release-name.txt` (not the heading) — but the job first runs
+   > the `check-release-name` guard, so the heading and the file must agree.
 
 4. **Tag the bump commit** (cargo-release reads the version back from
    `Cargo.toml`): `cargo release tag -x` → creates `vX.Y.Z` at HEAD. The tag
@@ -500,7 +519,8 @@ Finally, commit any post-release doc/version drift in this repo and push.
 
 - [ ] `just ci` green; tree clean; master pulled
 - [ ] MSRV sync: `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'` → update `rust-version` in `[workspace.package]` (with `Cargo.lock`) if changed
-- [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD` section — append ` (Dance)` for a major/minor release (name picked at release time) — with a fresh empty `[Unreleased]` + compare link above it
+- [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD (Name)` section — ` (Name)` for a major/minor release (name picked at release time), or the current series name kept for a patch — with a fresh empty `[Unreleased]` + compare link above it
+- [ ] `choreo-proto/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch; must match the ` (Name)` on the CHANGELOG heading (enforced by `just check-release-name`)
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
 - [ ] `./scripts/publish-stable.sh publish --workspace` → 18 crates on crates.io; `cargo install --locked` verified
 - [ ] Next release only: the six new crates exceed the burst of 5 — use the burst override or the two batches in Phase 2 (`choreo-blockchain`, `choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content`)
@@ -595,18 +615,24 @@ glob **after** the `.deb`/`.rpm` step and assembles the upload list from every
 tarball present in `dist/` — so staging the macOS tarball first is what makes
 the uploaded checksum file complete and the macOS asset appear in the release.
 
-Equivalent manual form (what `--upload` assembles) — for a major/minor release,
-append the name to the title (`--title "choreographr X.Y.Z — Lindy"`); a patch
-release uses the bare `--title "choreographr X.Y.Z"`:
+Equivalent manual form (what `--upload` assembles) — the title comes from the
+source-of-truth file, so it matches the CI-produced title exactly (an empty
+`release-name.txt`, the unnamed series, yields the bare `choreographr X.Y.Z`):
 
 ```bash
+# Title from the source-of-truth file, matching the CI job: named series get a
+# trailing " (Name)", the unnamed series stays bare.
+TITLE="choreographr X.Y.Z"
+NAME="$(head -n1 choreo-proto/release-name.txt | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+[ -n "$NAME" ] && TITLE="${TITLE} (${NAME})"
+
 gh release create vX.Y.Z \
   dist/choreographr-X.Y.Z-x86_64-unknown-linux-musl.tar.gz \
   dist/choreographr-X.Y.Z-aarch64-apple-darwin.tar.gz \
   dist/choreographr-X.Y.Z-x86_64.deb \
   dist/choreographr-X.Y.Z-x86_64.rpm \
   dist/SHA256SUMS \
-  --title "choreographr X.Y.Z" \
+  --title "$TITLE" \
   --notes-file <(awk -v ver="X.Y.Z" 'index($0, "## [" ver "]") == 1 {f=1; next} f && /^## /{exit} f{print}' CHANGELOG.md) \
   --generate-notes
 ```

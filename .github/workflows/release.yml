@@ -688,6 +688,12 @@ jobs:
           fi
           cat /tmp/release-notes.md
 
+      - name: Check the release name is in sync
+        # The release TITLE below is read from choreo-proto/release-name.txt,
+        # while the CHANGELOG heading records the same name for humans. Fail
+        # the release on drift so a mislabelled title can never ship.
+        run: ./scripts/check-release-name.sh
+
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -705,18 +711,16 @@ jobs:
           # re-create per the SOP rather than "fixing" this job.
           # The body comes from CHANGELOG.md (extracted above); the
           # auto-generated notes are appended after it.
-          # Release name: a major/minor release is named after a dance style,
-          # recorded as "(Name)" on the CHANGELOG heading — patch releases
-          # carry no name. Lift it into the title (the heading itself is
-          # stripped from the body above). ASCII-only matching so mawk is fine.
-          CODENAME="$(awk -v ver="$VERSION" '
-            index($0, "## [" ver "]") == 1 {
-              if (match($0, /\([^)]*\)/)) print substr($0, RSTART + 1, RLENGTH - 2)
-              exit
-            }' CHANGELOG.md)"
+          # Release name: read from the source-of-truth file that is ALSO
+          # compiled into the binaries (choreo-proto/release-name.txt) — the
+          # same file the check-release-name guard validated against the
+          # CHANGELOG heading in the previous step. Patch releases have an
+          # empty file and get a bare title. Parentheses match the binaries'
+          # `--version` output (e.g. `choreographr 0.2.0 (Lindy)`).
+          CODENAME="$(head -n1 choreo-proto/release-name.txt 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
           TITLE="choreographr ${VERSION}"
           if [ -n "$CODENAME" ]; then
-              TITLE="${TITLE} — ${CODENAME}"
+              TITLE="${TITLE} (${CODENAME})"
           fi
           gh release create "v${VERSION}" dist/* \
               --title "$TITLE" \

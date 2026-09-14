@@ -313,6 +313,13 @@ clippy-strict: _require-zig
 check-supply-chain:
     ./scripts/check-supply-chain.sh
 
+# Release-name drift guard: `choreo-proto/release-name.txt` (the machine source
+# of truth baked into the binaries and read by CI for the release title) must
+# match the `(Name)` on the current version's CHANGELOG heading. See
+# scripts/check-release-name.sh.
+check-release-name:
+    ./scripts/check-release-name.sh
+
 # Install the dependency-policy tool cargo-deny (the authoritative layer of
 # check-supply-chain). Without it the script falls back to cargo-audit + a
 # literal lockfile scan, which covers advisories but not hard version bans.
@@ -322,10 +329,10 @@ install-cargo-deny:
 # Run this before `git commit` — it must pass green.
 # The pre-commit gate from AGENTS.md: formatting, lints, the full suite, and
 # the supply-chain checks (deny.toml bans + RustSec advisories + cache scan).
-pre-commit: fmt-check clippy test-all check-supply-chain
+pre-commit: fmt-check clippy test-all check-supply-chain check-release-name
 
 # CI gate: format check + warnings-denied lints + full suite + supply chain
-ci: fmt-check clippy-strict test-all check-supply-chain
+ci: fmt-check clippy-strict test-all check-supply-chain check-release-name
 
 # ── running ───────────────────────────────────────────────────────────────────
 

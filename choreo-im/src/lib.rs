@@ -38,12 +38,13 @@ fn clap_styles() -> clap::builder::Styles {
 }
 
 #[derive(Parser)]
-// Bare `version` wires `--version`/`-V` to CARGO_PKG_VERSION, matching the
-// rest of the suite. ColorChoice is explicitly Auto (clap's default): color
-// only on a TTY, never forced into pipes.
+// `--version`/`-V` reports CARGO_PKG_VERSION with the release name appended via
+// `choreo_proto::release_name`, matching the rest of the suite. ColorChoice is
+// explicitly Auto (clap's default): color only on a TTY, never forced into
+// pipes.
 #[command(
     name = "choreo-im",
-    version,
+    version = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION")),
     about = "IM platform bridge for Choreographr",
     color = clap::ColorChoice::Auto,
     styles = clap_styles()
@@ -293,6 +294,9 @@ mod tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+        // And the release name (from choreo-proto/release-name.txt) rides along.
+        let expected = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION"));
+        assert!(err.to_string().contains(&expected));
     }
 
     /// The platform is a required positional; a normal invocation parses it.
