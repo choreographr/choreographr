@@ -1784,3 +1784,33 @@ fn handle_sessions_auto_attach_falls_back_to_child_when_no_top_level() {
     let msg = rx.recv().expect("auto-attach message");
     assert_eq!(msg, ClientMessage::AttachSession { session_id: 7 });
 }
+
+#[test]
+fn handle_sessions_empty_creates_default_session_with_cwd() {
+    let mut app = App::new();
+    app.image_job_tx = None;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // The daemon reports no sessions, so the bootstrap auto-creates a
+    // "default" session seeded from the TUI's current working directory
+    // (so it gets project context and project-local skills) rather than
+    // from no working directory at all.
+    app.handle_sessions(&[], &tx)
+        .expect("handle_sessions should succeed");
+
+    let msg = rx.recv().expect("CreateSession message");
+    assert_eq!(
+        msg,
+        ClientMessage::CreateSession {
+            title: Some("default".into()),
+            parent_session_id: None,
+            working_dir: std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string()),
+            context_config: None,
+            account_name: app.ai_providers.accounts.first().map(|a| a.name.clone()),
+            selected_model: None,
+            reasoning_effort: None,
+        }
+    );
+}

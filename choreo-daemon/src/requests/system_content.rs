@@ -27,41 +27,41 @@ pub(crate) struct SystemContentParams<'a> {
 pub(crate) fn build_system_content(
     params: SystemContentParams,
     context_cache: &mut Option<(u64, Arc<String>)>,
-) -> Option<String> {
-    let working_dir = match params.working_dir {
-        Some(wd) => wd,
-        None => {
-            warn!("cannot build system content: no working directory on session");
-            return None;
-        }
-    };
+) -> String {
     let groups = params.tool_registry.groups();
-    let base_prompt =
+    let mut content =
         context::build_base_prompt(params.skills, &groups, params.loaded_skill_bodies);
-    let mut content = base_prompt;
 
-    // Context files with fingerprint caching
-    if let Ok(bundle) = context::discover_context(working_dir, params.context_config) {
-        let context_str = match context_cache {
-            Some((fp, cached)) if *fp == bundle.fingerprint => {
-                debug!("context cache HIT (fp={})", fp);
-                cached.as_str().to_string()
+    // Context-file discovery is the ONLY part that genuinely depends on a
+    // working directory: a dir-less session still receives the full base
+    // prompt (identity, tool groups, skills, title) but has no project scope
+    // to walk. The fingerprint cache is closed over this block.
+    if let Some(working_dir) = params.working_dir {
+        // Context files with fingerprint caching
+        if let Ok(bundle) = context::discover_context(working_dir, params.context_config) {
+            let context_str = match context_cache {
+                Some((fp, cached)) if *fp == bundle.fingerprint => {
+                    debug!("context cache HIT (fp={})", fp);
+                    cached.as_str().to_string()
+                }
+                _ => {
+                    let s = context::assemble_context(&bundle);
+                    debug!(
+                        "context cache MISS — rebuilt context ({} bytes from {} file(s))",
+                        s.len(),
+                        bundle.files.len()
+                    );
+                    *context_cache = Some((bundle.fingerprint, Arc::new(s.clone())));
+                    s
+                }
+            };
+            if !context_str.is_empty() {
+                content.push_str("\n\n");
+                content.push_str(&context_str);
             }
-            _ => {
-                let s = context::assemble_context(&bundle);
-                debug!(
-                    "context cache MISS — rebuilt context ({} bytes from {} file(s))",
-                    s.len(),
-                    bundle.files.len()
-                );
-                *context_cache = Some((bundle.fingerprint, Arc::new(s.clone())));
-                s
-            }
-        };
-        if !context_str.is_empty() {
-            content.push_str("\n\n");
-            content.push_str(&context_str);
         }
+    } else {
+        debug!("session has no working directory; skipping project context files");
     }
 
     // Inject the current session title so the LLM can see the agreed-upon
@@ -83,7 +83,7 @@ pub(crate) fn build_system_content(
         }
     }
 
-    Some(content)
+    content
 }
 
 /// Detect a `load_skill` tool call and persist the loaded skill body into
@@ -105,11 +105,10 @@ pub(crate) fn persist_loaded_skill(
         debug!("skill '{}' already loaded, skipping", name);
         return;
     }
-    let Some(ref working_dir) = session.config.working_dir else {
-        warn!("cannot load skill '{}': no working directory", name);
-        return;
-    };
-    if let Some(body) = context::load_skill_body(&name, working_dir) {
+    // Skills come from the always-scanned global `~/.agents/skills` plus,
+    // when the session has one, the project-local scope under the working
+    // directory — so a dir-less session can still load a global skill.
+    if let Some(body) = context::load_skill_body(&name, session.config.working_dir.as_deref()) {
         info!("loaded skill body: '{}' ({} bytes)", name, body.len());
         session.loaded_skill_bodies.push(LoadedSkill { name, body });
     } else {

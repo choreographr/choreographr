@@ -18,8 +18,7 @@ fn execute_load_skill(
     args: &LoadSkillArgs,
     working_dir: Option<&Path>,
 ) -> Result<String, ToolExecError> {
-    let effective_working_dir = working_dir.unwrap_or_else(|| Path::new("."));
-    let body = context::load_skill_body(&args.name, effective_working_dir)
+    let body = context::load_skill_body(&args.name, working_dir)
         .ok_or_else(|| ToolExecError(format!("skill not found: {}", args.name)))?;
     let skill_message = format!(
         "The following skill instructions are now active:\n\n<skill name=\"{name}\">\n{body}\n</skill>",
@@ -61,6 +60,21 @@ mod tests {
                 name: "nonexistent".into(),
             },
             Some(dir.path()),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("skill not found"));
+    }
+
+    #[test]
+    fn execute_load_skill_none_working_dir_not_found() {
+        // A dir-less session can still load global skills, but an obviously
+        // absent name must error rather than panic. The test does NOT rely on
+        // ambient global skills — the name is chosen to be absent everywhere.
+        let result = execute_load_skill(
+            &LoadSkillArgs {
+                name: "definitely-no-such-skill-xyz".into(),
+            },
+            None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("skill not found"));

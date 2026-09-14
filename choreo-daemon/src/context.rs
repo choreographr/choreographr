@@ -235,23 +235,30 @@ fn default_system_prompt() -> String {
     include_str!("../system.md").to_string()
 }
 
-pub fn discover_skills(working_dir: &Path) -> Vec<SkillMeta> {
+pub fn discover_skills(working_dir: Option<&Path>) -> Vec<SkillMeta> {
     let mut skills = Vec::new();
     let mut seen = HashSet::new();
 
+    // Global skills are independent of the session working directory, so a
+    // dir-less session still gets them; only the project-local walk below
+    // needs a directory to scope it.
     if let Some(home) = dirs::home_dir() {
         scan_skills_dir(&home.join(".agents").join("skills"), &mut skills, &mut seen);
     }
 
-    let git_root = find_git_root(working_dir);
-    let boundary = git_root.as_deref().unwrap_or_else(|| Path::new("/"));
-    let mut current = Some(working_dir.to_path_buf());
-    while let Some(dir) = current {
-        scan_skills_dir(&dir.join(".agents").join("skills"), &mut skills, &mut seen);
-        if dir == boundary {
-            break;
+    // Project-local skills need a working directory to scope the walk up to
+    // the git-root (or filesystem) boundary.
+    if let Some(working_dir) = working_dir {
+        let git_root = find_git_root(working_dir);
+        let boundary = git_root.as_deref().unwrap_or_else(|| Path::new("/"));
+        let mut current = Some(working_dir.to_path_buf());
+        while let Some(dir) = current {
+            scan_skills_dir(&dir.join(".agents").join("skills"), &mut skills, &mut seen);
+            if dir == boundary {
+                break;
+            }
+            current = dir.parent().map(|p| p.to_path_buf());
         }
-        current = dir.parent().map(|p| p.to_path_buf());
     }
 
     skills
@@ -302,7 +309,7 @@ fn extract_yaml_frontmatter(content: &str) -> Option<String> {
     Some(rest.get(..end).unwrap_or("").trim().to_string())
 }
 
-pub fn load_skill_body(name: &str, working_dir: &Path) -> Option<String> {
+pub fn load_skill_body(name: &str, working_dir: Option<&Path>) -> Option<String> {
     let skills = discover_skills(working_dir);
     let meta = skills.into_iter().find(|s| s.name == name)?;
     let content = fs::read_to_string(&meta.path).ok()?;
@@ -616,13 +623,21 @@ mod tests {
             "---\nname: test-skill\ndescription: A test skill for testing\n---\n\n# Instructions",
         );
 
-        let skills = discover_skills(tmp.path());
+        let skills = discover_skills(Some(tmp.path()));
         assert!(skills.iter().any(|s| s.name == "test-skill"));
         assert!(
             skills
                 .iter()
                 .any(|s| s.description == "A test skill for testing")
         );
+    }
+
+    #[test]
+    fn discover_skills_none_is_ok() {
+        // A dir-less session still discovers global skills; only assert that
+        // the call returns (the ambient ~/.agents/skills may be empty).
+        let skills = discover_skills(None);
+        let _ = skills;
     }
 
     #[test]
@@ -664,7 +679,7 @@ mod tests {
             "---\nname: test-skill\ndescription: A test skill\n---\n\nThis is the skill body content.",
         );
 
-        let body = load_skill_body("test-skill", tmp.path()).unwrap();
+        let body = load_skill_body("test-skill", Some(tmp.path())).unwrap();
         assert!(body.contains("skill body content"));
     }
 }

@@ -3448,20 +3448,28 @@ before every model call (every turn of the tool-call loop).
 
 ### System prompt construction
 
-Each turn in the agent loop calls `build_system_content()` which constructs the
-system prompt from four sources:
+Each turn in the agent loop calls `build_system_content()`, which **always**
+returns a full system prompt (a `String`, not an `Option<String>`), assembled
+from four sources:
 
-1. **Base prompt** — identity, tool group listing, available skill metadata, and
-   any loaded skill bodies (accumulated via `load_skill` calls).
+1. **Base prompt** — identity, tool group listing, available skill metadata, any
+   loaded skill bodies (accumulated via `load_skill` calls), and the session
+   title. These are built unconditionally, so a session with **no** working
+   directory still receives a full system prompt.
 2. **Project context files** (`AGENTS.md`, `CLAUDE.md`, etc.) — discovered by
-   `discover_context()` and assembled by `assemble_context()`. Results are cached
+   `discover_context()` and assembled by `assemble_context()`. This source
+   requires a working directory and contributes nothing when the session has
+   none. Results are cached
    on `SessionState::context_cache` (fingerprint + assembled text) and reused
    when the fingerprint is unchanged.
 3. **Subdirectory hints** — hints accumulated from filesystem tool calls in the
    previous turn, appended under "## New context from project subdirectories".
+   Requires a working directory.
 4. **Loaded skills** — `<skill name="...">...</skill>` blocks injected after the
    "Available skills" listing.
 
+Global skills (`~/.agents/skills`) are always scanned; only the project-local
+skills walk (`.agents/skills/` under the working directory) needs a directory.
 The system prompt is rebuilt every turn so that newly loaded skills and newly
 discovered subdirectory hints are visible to the model immediately.
 
@@ -3488,8 +3496,8 @@ the main context. Any found hint content is appended to the tool result message
 ### Skills (Agent Skills standard)
 
 Skills are discovered from:
-- `~/.agents/skills/<name>/SKILL.md` (global)
-- `.agents/skills/<name>/SKILL.md` (project, relative to session working directory)
+- `~/.agents/skills/<name>/SKILL.md` (global — always scanned)
+- `.agents/skills/<name>/SKILL.md` (project, relative to session working directory — scanned only when the session has a working directory)
 
 Each `SKILL.md` must have YAML frontmatter with `name` and `description`.
 
@@ -3530,12 +3538,12 @@ Implementation lives in `choreo-daemon/src/context.rs`. Key entry points:
 | Function | Purpose |
 |---|---|
 | `discover_context(working_dir, config)` | Walk filesystem, return `ContextBundle` with all discovered files |
-| `discover_skills(working_dir)` | Scan Agent Skills directories, return `Vec<SkillMeta>` |
+| `discover_skills(working_dir: Option<&Path>)` | Scan Agent Skills directories — always the global `~/.agents/skills`, plus the project-local walk under `working_dir` only when a directory is present — return `Vec<SkillMeta>` |
 | `assemble_context(bundle)` | Render discovered files into an XML-like format for injection |
 | `build_base_prompt(skills, groups, loaded_skills)` | Build the stable system prompt (identity + tool groups + skill metadata + loaded skill bodies) |
 | `recheck_context(working_dir, config, old_fp)` | Re-discover and compare fingerprints |
 | `subdirectory_hints(tool_name, args, working_dir, known)` | Return `Option<(String, Vec<PathBuf>)>` — subdirectory hint text and newly discovered paths |
-| `load_skill_body(name, working_dir)` | Load the full body of a SKILL.md, stripping YAML frontmatter |
+| `load_skill_body(name, working_dir: Option<&Path>)` | Load the full body of a SKILL.md, stripping YAML frontmatter; forwards `working_dir` into `discover_skills` |
 
 ### Tool: `load_skill`
 

@@ -215,6 +215,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The TUI's auto-created "default" session is seeded with the TUI's current
+  working directory** instead of no working directory, so the bootstrap session
+  gets project context files and can scope project-local skills (falling back to
+  no working directory only if the current directory cannot be read).
+
 - **Releases may carry a dance-style name** (major/minor only): `RELEASE.md`
   documents that the conductor picks a name at release time — a dance style
   such as *Lindy*, with no pre-assigned list — and records it in the CHANGELOG
@@ -966,6 +971,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Also hoisted the Zhipu slug allowlist out of the daemon into
   `images::is_zhipu_image_provider_slug` (the client crate owns provider-family knowledge), and
   added pure unit tests for the SSRF guard and the `/coding/paas` → `/paas` base rewrite.
+
+- A session with no working directory now still receives a full system
+  prompt: `build_system_content` always builds the base identity prompt,
+  tool-groups listing, skills metadata (global `~/.agents/skills` plus any
+  optional project scope), loaded-skill bodies, and session title. Only the
+  project context files (`AGENTS.md`/`CLAUDE.md`) and subdirectory hints
+  genuinely depend on a working directory, so they are now gated on
+  `Option<&Path>` and the function returns `String` instead of `Option<String>`.
+  This also demotes the per-agent-loop-iteration `warn!` for dir-less
+  sessions to a single `debug!`.
 
 ### Security
 

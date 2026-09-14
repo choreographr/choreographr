@@ -1881,11 +1881,17 @@ impl App {
                     // account selection that was already configured.
                     let default_account =
                         self.ai_providers.accounts.first().map(|a| a.name.clone());
+                    // Seed the auto-created default session from the TUI's
+                    // launch directory so it gets project context and
+                    // project-local skills; fall back to None only when the
+                    // current directory cannot be read.
                     client_tx
                         .send(ClientMessage::CreateSession {
                             title: Some("default".to_string()),
                             parent_session_id: None,
-                            working_dir: None,
+                            working_dir: std::env::current_dir()
+                                .ok()
+                                .map(|p| p.display().to_string()),
                             context_config: None,
                             account_name: default_account,
                             selected_model: None,

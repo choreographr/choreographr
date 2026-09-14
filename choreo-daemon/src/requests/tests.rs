@@ -2880,9 +2880,17 @@ fn persist_loaded_skill_skips_missing_name() {
 }
 
 #[test]
-fn persist_loaded_skill_skips_without_working_dir() {
+fn persist_loaded_skill_without_working_dir_unknown_skill_not_added() {
+    // A dir-less session has no project scope, but the load path must not
+    // panic; an obviously absent skill name (not present in any global or
+    // project scope) leaves the accumulator empty. The test does NOT rely on
+    // ambient global skills.
     let mut session = SessionState::empty();
-    persist_loaded_skill(&mut session, "load_skill", r#"{"name": "test-skill"}"#);
+    persist_loaded_skill(
+        &mut session,
+        "load_skill",
+        r#"{"name": "definitely-no-such-skill-xyz"}"#,
+    );
     assert!(session.loaded_skill_bodies.is_empty());
 }
 
@@ -2907,7 +2915,7 @@ fn test_build_content(
     session: &mut SessionState,
     registry: &ToolRegistry,
     pending_hints: &[String],
-) -> Option<String> {
+) -> String {
     build_system_content(
         SystemContentParams {
             working_dir: session.config.working_dir.as_deref(),
@@ -2926,8 +2934,6 @@ fn test_build_content(
 fn build_system_content_with_working_dir() {
     let (mut session, registry, _dir) = setup_build_system_content_session();
     let content = test_build_content(&mut session, &registry, &[]);
-    assert!(content.is_some());
-    let content = content.unwrap();
     assert!(content.contains("Tool groups"));
     assert!(content.contains("core"));
     assert!(content.contains("Project rules"));
@@ -2935,10 +2941,13 @@ fn build_system_content_with_working_dir() {
 
 #[test]
 fn build_system_content_without_working_dir() {
+    // A dir-less session still receives the full base prompt (identity, tool
+    // groups, skills, title); only project context files are absent.
     let mut session = SessionState::empty();
     let registry = ToolRegistry::new().build();
     let content = test_build_content(&mut session, &registry, &[]);
-    assert!(content.is_none());
+    assert!(content.contains("Tool groups"));
+    assert!(!content.contains("AGENTS.md"));
 }
 
 #[test]
@@ -2949,8 +2958,6 @@ fn build_system_content_includes_loaded_skills() {
         body: "Loaded body text.".to_string(),
     });
     let content = test_build_content(&mut session, &registry, &[]);
-    assert!(content.is_some());
-    let content = content.unwrap();
     assert!(content.contains("Loaded skills"));
     assert!(content.contains("loaded-test"));
     assert!(content.contains("Loaded body text."));
@@ -2975,8 +2982,6 @@ fn build_system_content_includes_pending_hints() {
     let (mut session, registry, _dir) = setup_build_system_content_session();
     let pending_hints = vec!["Hint about subdirectory config.".to_string()];
     let content = test_build_content(&mut session, &registry, &pending_hints);
-    assert!(content.is_some());
-    let content = content.unwrap();
     assert!(content.contains("New context from project subdirectories"));
     assert!(content.contains("Hint about subdirectory config."));
 }
@@ -2986,8 +2991,6 @@ fn build_system_content_includes_session_title() {
     let (mut session, registry, _dir) = setup_build_system_content_session();
     session.config.title = Some("Refactoring the database layer".into());
     let content = test_build_content(&mut session, &registry, &[]);
-    assert!(content.is_some());
-    let content = content.unwrap();
     assert!(content.contains("## Current Session Title"));
     assert!(content.contains("Refactoring the database layer"));
 }
@@ -2997,14 +3000,10 @@ fn build_system_content_omits_empty_title() {
     let (mut session, registry, _dir) = setup_build_system_content_session();
     // Title is None by default — no "Current Session Title" section.
     let content = test_build_content(&mut session, &registry, &[]);
-    assert!(content.is_some());
-    let content = content.unwrap();
     assert!(!content.contains("## Current Session Title"));
 
     // Also omit when the title is an empty string.
     session.config.title = Some("".into());
     let content2 = test_build_content(&mut session, &registry, &[]);
-    assert!(content2.is_some());
-    let content2 = content2.unwrap();
     assert!(!content2.contains("## Current Session Title"));
 }

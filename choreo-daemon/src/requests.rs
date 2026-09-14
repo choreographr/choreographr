@@ -380,11 +380,13 @@ pub(crate) fn run_agent_loop(
     // diagnosable warning.
     warn_on_missing_reasoning_artifacts(session, ctx.session_id, provider_slug, model);
 
-    // Lazily cache discovered skills — they don't change during a session
-    if session.discovered_skills.is_none()
-        && let Some(ref wd) = session.config.working_dir
-    {
-        session.discovered_skills = Some(context::discover_skills(wd));
+    // Lazily cache discovered skills — they don't change during a session.
+    // Global skills are always discoverable; discovery handles the optional
+    // project scope internally, so a dir-less session still gets them.
+    if session.discovered_skills.is_none() {
+        session.discovered_skills = Some(context::discover_skills(
+            session.config.working_dir.as_deref(),
+        ));
     }
 
     let mut turn_iter: u32 = 0;
@@ -448,7 +450,7 @@ pub(crate) fn run_agent_loop(
         };
         pending_hints.clear();
         let messages =
-            build_chat_request_messages(session, system_content.as_deref(), provider_slug, model);
+            build_chat_request_messages(session, Some(&system_content), provider_slug, model);
 
         // The estimate counts `messages` as-is — the FULL conversation, not
         // the chained tail the adapter puts on the wire. That is intentional:
