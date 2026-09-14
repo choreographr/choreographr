@@ -76,8 +76,7 @@ pub struct ConfigWatcher {
 
 impl ConfigWatcher {
     /// A watcher over `dir`. The directory is created (log-only on failure)
-    /// by the transport thread when it spawns, so it does not need to exist
-    /// yet.
+    /// by `spawn()` when it arms the watch, so it does not need to exist yet.
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
@@ -101,10 +100,53 @@ impl ConfigWatcher {
     /// lives until the process exits, exactly like the catalog-maintenance
     /// thread) and owns the `notify` watcher; dropping the handle does not
     /// stop it.
+    ///
+    /// The config dir is created and the initial watch is armed *here*, on
+    /// the caller's thread, before the transport thread starts. Arming
+    /// synchronously guarantees that once `spawn()` returns, every subsequent
+    /// filesystem event is captured — without it there is a startup race
+    /// (caller writes a config file between `spawn()` and the thread's first
+    /// watch call, and the event is silently lost). Failed arm/creation is
+    /// not fatal: the transport thread's re-arm cadence retries as before.
     pub fn spawn(self) {
+        // Both startup steps happen before the thread exists, so there is no
+        // window in which events can slip past an unarmed watch.
+        ensure_config_dir(&self.dir);
+        let (raw_tx, raw_rx) =
+            crossbeam_channel::unbounded::<Result<notify::Event, notify::Error>>();
+        let mut watcher: Option<notify::RecommendedWatcher> =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                let _ = raw_tx.send(res);
+            }) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "failed to create the filesystem watcher; config-file changes \
+                         will not reload automatically",
+                    );
+                    None
+                }
+            };
+        // Arm the initial watch synchronously; the result seeds the thread's
+        // `armed` state (false means the re-arm loop keeps retrying).
+        let armed = match watcher.as_mut() {
+            Some(w) => match w.watch(&self.dir, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    info!(dir = %self.dir.display(), "config directory watch armed");
+                    true
+                }
+                Err(e) => {
+                    warn!(dir = %self.dir.display(), error = %e,
+                        "initial config dir watch failed; will retry on the re-arm cadence");
+                    false
+                }
+            },
+            None => false,
+        };
         let _ = std::thread::Builder::new()
             .name("config-watch".into())
-            .spawn(move || transport_loop(self.subscribers, self.dir));
+            .spawn(move || transport_loop(self.subscribers, self.dir, watcher, raw_rx, armed));
     }
 }
 
@@ -266,38 +308,28 @@ fn note_routed_state(
     }
 }
 
-/// The transport thread: owns the `notify` watcher, ensures the dir, and
-/// routes every raw event to the matching subscribers. Re-arms the watch on a
+/// The transport thread: owns the `notify` watcher (created and initially
+/// armed by `spawn()` on the caller's thread — see there for why) and routes
+/// every raw event to the matching subscribers. Re-arms the watch on a
 /// fixed cadence while it is unarmed (a dir deleted at runtime, or a
-/// creation failure above that has since been fixed).
-fn transport_loop(subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>, dir: PathBuf) {
-    ensure_config_dir(&dir);
-
+/// spawn-time arm failure). The initial `armed` flag and the raw-event
+/// receiver come in from `spawn()`.
+fn transport_loop(
+    subscribers: HashMap<PathBuf, Vec<Sender<ConfigChange>>>,
+    dir: PathBuf,
+    mut watcher: Option<notify::RecommendedWatcher>,
+    raw_rx: crossbeam_channel::Receiver<Result<notify::Event, notify::Error>>,
+    mut armed: bool,
+) {
     // Last-known content per registered basename, used only to decide what an
     // overflow rescan must replay (see `rescan_changes`). Owned exclusively by
     // this single thread — no shared state, it just shadows the FS state.
     let mut last_known: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
 
-    // The notify callback forwards raw events to a channel — all routing
-    // policy lives on this thread, keeping the notify-owned callback thread
-    // trivially small (mirrors the catalog maintenance thread's discipline).
-    let (raw_tx, raw_rx) = crossbeam_channel::unbounded::<Result<notify::Event, notify::Error>>();
-    let mut watcher: Option<notify::RecommendedWatcher> =
-        match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            let _ = raw_tx.send(res);
-        }) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "failed to create the filesystem watcher; config-file changes \
-                     will not reload automatically",
-                );
-                None
-            }
-        };
+    // The notify callback forwards raw events to a channel and all routing
+    // policy lives on this thread — see `spawn()` for where that channel and
+    // the watcher (already created and initially armed) are set up.
 
-    let mut armed = false;
     loop {
         // Last-resort re-arm while unarmed (a dir deleted at runtime, or a
         // dir whose creation failed at spawn). Debug, not warn: this retries

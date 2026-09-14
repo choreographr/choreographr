@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The unified config watcher now arms its `notify` watch **synchronously** in
+  `ConfigWatcher::spawn()` (on the caller's thread) instead of on the spawned
+  transport thread: previously a config-file write landing between `spawn()`
+  returning and the thread's first `watch()` call was silently lost, which
+  made `config_watcher_delivers_only_registered_basenames` (and its sibling)
+  flaky under full-suite parallel load. `spawn()` now also creates the config
+  dir itself, so both startup steps complete before the thread exists; the
+  thread receives the already-created, already-armed watcher plus the raw-event
+  receiver and initial `armed` flag, and the re-arm cadence still covers a
+  dir deleted at runtime or a spawn-time arm failure.
+
 - The daemon's `--log-file` is now created with mode 0600 on unix: daemon
   logs can carry sensitive content and the TUI autostart writes them into
   the (potentially shared) temp dir — an unrestricted create leaked by
