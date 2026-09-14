@@ -673,11 +673,12 @@ jobs:
         # would ship releases whose curated notes silently rot.
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          # Everything from the "## [X.Y.Z]" heading up to (not including) the
-          # next "## " heading, heading stripped. The changelog is repo-root
-          # CHANGELOG.md (Keep a Changelog 1.1).
+          # Everything from the "## [X.Y.Z]" heading — optionally dated
+          # ("## [X.Y.Z] - YYYY-MM-DD", the Keep a Changelog 1.1 form) — up to
+          # (not including) the next "## " heading, heading stripped. The
+          # changelog is repo-root CHANGELOG.md.
           awk -v ver="$VERSION" '
-            $0 == "## [" ver "]" { found=1; next }
+            index($0, "## [" ver "]") == 1 { found=1; next }
             found && /^## /   { exit }
             found             { print }
           ' CHANGELOG.md > /tmp/release-notes.md

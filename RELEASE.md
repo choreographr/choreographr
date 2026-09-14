@@ -175,7 +175,8 @@ just preflight               # checks cargo + zig, notes nextest
    `git ls-remote --tags origin | grep vX.Y.Z`.
 
    > **Why the changelog section must exist at the tag:** the CI `release`
-   > job extracts the `## [X.Y.Z]` section from `CHANGELOG.md` for the
+   > job extracts the `## [X.Y.Z]` (optionally `- YYYY-MM-DD`) section from
+   > `CHANGELOG.md` for the
    > release body and fails the job if it is absent — the curated notes are
    > the release notes, not an afterthought.
 
@@ -589,7 +590,7 @@ gh release create vX.Y.Z \
   dist/choreographr-X.Y.Z-x86_64.rpm \
   dist/SHA256SUMS \
   --title "choreographr X.Y.Z" \
-  --notes-file <(awk -v ver="X.Y.Z" '$0 == "## [" ver "]" {f=1; next} f && /^## /{exit} f{print}' CHANGELOG.md) \
+  --notes-file <(awk -v ver="X.Y.Z" 'index($0, "## [" ver "]") == 1 {f=1; next} f && /^## /{exit} f{print}' CHANGELOG.md) \
   --generate-notes
 ```
 

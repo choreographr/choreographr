@@ -32,7 +32,13 @@ Always try to refactor when implementing new features. Look for opportunities to
 
 When making changes, ensure [ARCHITECTURE.md](./ARCHITECTURE.md) and [README.md](./README.md) are kept up to date. If a change affects the architectural decisions, module structure, data flow, or any other documented aspect, update the files accordingly.
 
-Every non-trivial change (new features, fixes, refactors, dependency updates, behavior changes — anything a reviewer would mention in a commit summary) must also get an entry in [CHANGELOG.md](./CHANGELOG.md) under the `## [Unreleased]` section, using the Keep a Changelog categories (`Added` / `Changed` / `Fixed` / etc.). Only trivial changes (typo fixes, comment-only edits, test-only tweaks) may skip it. Release tooling promotes that section at tag time — see [RELEASE.md](./RELEASE.md).
+Every non-trivial change (new features, fixes, refactors, dependency updates, behavior changes — anything a reviewer would mention in a commit summary) must also get an entry in [CHANGELOG.md](./CHANGELOG.md) under the `## [Unreleased]` section. Only trivial changes (typo fixes, comment-only edits, test-only tweaks) may skip it.
+
+### CHANGELOG.md
+
+- **One heading per category, at most.** `[Unreleased]` is organized with the Keep a Changelog category headings — `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security` — each appearing **once at most**. Append a new bullet under the matching existing heading; never open a second `### Changed` (or any other) block. Include only the categories that apply — do not add an empty one. A section that repeats a category heading is malformed, not just untidy.
+- **Write it for the release page.** At tag time the CI `release` job copies the entire `## [X.Y.Z]` section (heading stripped) verbatim into the GitHub release body, followed by the auto-generated commit notes (see [RELEASE.md](./RELEASE.md) Phase 1). The file is user-facing prose, not a scratchpad: no TODOs, no internal scaffolding, no "see commit …".
+- **Promotion at release.** Phase 1 renames `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and starts a fresh, empty `[Unreleased]` above it (moving the compare link so `[Unreleased]` points at `HEAD` again). The extraction step accepts both the dated and the undated heading forms.
 
 ## Test Discipline
 

@@ -7,37 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **`choreo-sockreg`, `choreo-power-events`, and `choreo-content` are now
-  published** (release-blocking): each was `publish = false`, but each is a
-  dependency of a PUBLISHED crate (`choreo-ai-protocols` → `choreo-sockreg`;
-  `choreo-daemon` → `choreo-power-events`; and `choreo-daemon`'s optional
-  `content` feature → `choreo-content`), and cargo refuses to package a crate
-  whose dependency is not on crates.io — even an OPTIONAL one (verified: `cargo
-  package -p choreo-ai-protocols` fails with "no matching package named
-  `choreo-sockreg`", and `cargo package -p choreo-daemon` fails on the optional
-  `choreo-blockchain` dep). `choreo-gui` stays private (a leaf client nothing
-  depends on). Without this the next release could not be published at all.
-  `scripts/publish-stable.sh` now derives an `--exclude` for every remaining
-  `publish = false` member (currently just `choreo-gui`) from the manifests,
-  since cargo-release 1.1.5 ignores the flag in `--workspace` selection.
-
-### Changed
-
-- **Release documentation reconciled with the current workspace**
-  (`RELEASE.md`, `ARCHITECTURE.md`, `README.md`): the crates.io publish set is
-  **18** crates (every member except `choreo-gui`, the one private member); the
-  next release adds **six** new crates (`choreo-blockchain`, `choreo-sanitize`,
-  `choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content`) —
-  which EXCEEDS the new-crate burst of 5, so RELEASE.md Phase 2 now documents
-  the concrete two-batch staging plan (4 new + 2 new, ≥10 min apart) as well as
-  the burst-override option; the Windows `.zip` is documented as built-but-not-released (the CI
-  release job's `needs` omits `windows-msvc`); the crates.io /`binstall` install
-  routes name `choreo-tui` alongside `choreographr` (the TUI binary moved to its
-  own package); the workspace is nineteen crates (root + eighteen members); and
-  the batch-staging example now describes 0.1.0's actual 12-crate set.
-
 ### Added
 
 - The TUI now rejects a prompt submitted while the attached session is not
@@ -55,122 +24,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UiEvent::Status` event from the connection task — no more silent screen
   during the wait, and still nothing printed directly to the terminal (that
   would garble the alternate screen).
-
-### Changed
-
-- The TUI's client-side submit guard is now a single `App::new_turn_rejection`
-  helper covering both the idle check and the keystore-locked check, and it is
-  applied to **every** action that begins a new turn — a plain prompt, Alt+Enter,
-  and the `/continue` command (all of which end up as `RunInput` /
-  `ContinueGeneration`) — so the `/continue` path that was previously unguarded
-  is now covered too. A new
-  `SessionStatus::is_idle` (exactly `Inactive`; `Sleeping` is not idle) makes
-  the idle test explicit and shared. Behaviour change: a locked-keystore
-  rejection now runs before the input buffer is cleared, so the rejected text
-  is preserved (matching the idle-guard behaviour) instead of being dropped.
-- The two `ContinueGeneration` senders (Alt+Enter and `/continue`) collapsed
-  into a single `connection::chat::send_continue_generation` helper that owns
-  the guard, request-id allocation, in-flight tracking and send, so the two
-  triggers can no longer drift. The only intended difference is the shell echo:
-  `/continue` shows `> continue`, Alt+Enter does not.
-- The "nothing is listening" dial classification (`NotFound` /
-  `ConnectionRefused`) moved into a shared predicate,
-  `choreo_proto::dial_error_means_no_listener`, used by the TUI connection
-  path (`choreo-client-core`'s `run_daemon_connection_with_autostart`) and
-  documented as the mirror of the daemon-side stale-socket probe, so the
-  client and daemon classifications can never drift. The predicate takes the
-  whole `&io::Error` (matching on `kind()` internally) rather than a bare
-  `io::ErrorKind`, so a caller cannot accidentally classify an unrelated
-  error.
-- The cross-platform unix-socket DIAL is now a single primitive in
-  `choreo-proto` (`connect_unix` for the stream-keeping dial, plus the
-  `socket_listening` boolean wrapper and the `UnixStream` re-export that
-  resolves std-vs-`uds_windows` per platform). Every dial site — the TUI
-  autostart wait, `choreo-client-core`'s connection path, the daemon's
-  stale-socket probe and its signal/auto-exit accept-loop wake-ups — now uses
-  it instead of four inlined `#[cfg]` copies, and the now-redundant direct
-  `uds_windows` dependencies were dropped from `choreo-client-core` and
-  `choreo-tui`.
-- Autostart/poll tests that wait on real time or bind real sockets moved out
-  of the `src/` unit-test modules into the crates' `tests/` integration
-  suites (`choreo-tui/tests/autostart_poll.rs`,
-  `choreo-client-core/tests/connection_autostart.rs`), per the test
-  discipline: unit tests are now timing-free.
-
-### Fixed
-
-- Deleting the attached TUI session now clears the cached attach-state
-  (`attached_status` / `attached_tool_groups`) along with the session id. These
-  describe the attachment that just went away; leaving them set rendered a
-  stale status bar and (with the new idle-guard) made a later plain prompt be
-  rejected as "session not idle" even though no session was attached at all.
-- The unified config watcher now arms its `notify` watch **synchronously** in
-  `ConfigWatcher::spawn()` (on the caller's thread) instead of on the spawned
-  transport thread: previously a config-file write landing between `spawn()`
-  returning and the thread's first `watch()` call was silently lost, which
-  made `config_watcher_delivers_only_registered_basenames` (and its sibling)
-  flaky under full-suite parallel load. `spawn()` now also creates the config
-  dir itself, so both startup steps complete before the thread exists; the
-  thread receives the already-created, already-armed watcher plus the raw-event
-  receiver and initial `armed` flag, and the re-arm cadence still covers a
-  dir deleted at runtime or a spawn-time arm failure.
-
-- The daemon's `--log-file` is hardened for the shared temp dir the TUI
-  autostart writes into: on unix it is created 0600 AND opened `O_NOFOLLOW`
-  (a symlink planted at the predictable pid-keyed path fails the open
-  instead of redirecting the daemon's diagnostics), the opened file is
-  verified to be a regular file owned by the daemon's own euid (a
-  pre-created file owned by another user, or a FIFO/device, is refused), and
-  its mode is explicitly tightened to 0600 (the create mode only applies on
-  creation, so a file left by an earlier run could be group/world-readable).
-  Windows keeps inherited ACLs.
-- The TUI's autostart status message no longer lingers: a `UiEvent::Status`
-  is flagged transient (`App::status_is_transient`) and cleared by the first
-  real daemon message, so "daemon started" does not sit on the status line
-  once the connection is live and the first turn is quiet. Statuses written
-  by daemon handlers are never cleared by this rule.
-- `poll_until_listening` now clamps each inter-probe sleep to the time
-  remaining before its budget, so the total wait is genuinely bounded by the
-  budget instead of overshooting by up to one interval after the last failed
-  probe (matching the doc contract).
-
-- `run_server` no longer steals a live daemon's socket: before removing an
-  existing socket file it now probes it with a connect — a successful
-  connect means another daemon is still listening, so startup fails with
-  "another daemon is already listening at …" instead of orphaning the
-  working daemon (the two-daemon race that TUI autostart widens); any
-  failed connect (ENOENT, ECONNREFUSED, a regular file at the path) means
-  stale, and the leftover is removed as before — with the socket path now
-  carried in the removal error so a bare "Permission denied" (the Termux
-  /tmp failure mode) is diagnosable.
-- A daemon protocol-version mismatch surfaces an actionable TUI quit
-  message — "the daemon's protocol version is incompatible — restart the
-  daemon (it may be an older build)" — instead of a raw codec error the
-  user cannot act on; all other connection errors keep the historical
-  wording.
-- Eliminated the last clippy warnings across the workspace so
-  `cargo clippy --workspace --all-targets` is warning-free (the only
-  remaining notice is the `proc-macro-error2` dependency advisory): removed
-  a needless `Ok(.. ?)` in `choreo-transport`'s preamble reader, collapsed a
-  nested `if` in the OpenAI tool-call accumulator, factored the
-  `noise_integration` test helper's complex tuple return into a
-  `NoiseTestPair` alias, and silenced the unused-import/dead-code warnings in
-  the temporarily-disabled `choreo-content` platform round-trip test via
-  `#[cfg(any())]` gating (items preserved verbatim for restoration) instead
-  of leaving a doc comment dangling before its block comment.
-
-### Changed
-
-- Refactored the post-strict-lints bounds-checked slicing boilerplate: a
-  shared `read_slice` helper in `choreo-ai-protocols` replaces the four
-  duplicated `buf.get(..n).unwrap_or(&[])` read-contract sites (SSE readers,
-  image CDN download); `zai.rs` hoists its duplicated `as_object_mut` guard;
-  `choreo-daemon`'s `text_stream.rs` no longer uses silent-widening
-  `unwrap_or(full-buffer)` slicing fallbacks — out-of-bounds windows and a
-  violated `Utf8Error::valid_up_to()` invariant now produce loud errors
-  instead of quietly defeating the display cap.
-
-### Added
 
 - **Daemon autostart from the TUI (`choreo-tui`, new `autostart` module):**
   in Unix-socket mode the TUI connects DIRECTLY to the daemon socket — no
@@ -268,89 +121,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SSE provider + real daemon: mid-stream cancel finishes promptly via the
   registry force-close).
 
-### Fixed
-
-- Request cancellation no longer force-closes provider sockets belonging to
-  unrelated concurrent sessions: each session owns a private
-  `SocketRegistry` (plus one daemon-level registry for prefetch/catalog
-  fetches), so `shutdown_all` from a cancel is scoped to exactly the
-  cancelled session and its children.
-
-- **Windows `SocketRegistry` handle leak**: the Windows `close_logged`
-  variant called `into_raw_socket()`, transferring the `SOCKET` OUT of the
-  `OwnedSocket` without ever calling `closesocket` — every RAII unregister /
-  `shutdown_all` / prune on Windows leaked a socket handle. It now logs the
-  handle from a borrow (`as_raw_socket`) and lets `OwnedSocket`'s `Drop`
-  close it exactly once (verified with a `cargo check
-  --target x86_64-pc-windows-msvc`).
-- **`AccountsReload` over-invalidation**: the external-edit handler sent
-  `SessionCommand::DropProvider` to EVERY live session, forcing sessions
-  bound to untouched accounts to tear down their cached clients and HTTP
-  connection pools and rebuild on the next request. It now invalidates only
-  sessions bound to REMOVED or CHANGED accounts (the diff it already
-  computes), leaving untouched accounts' sessions warm — pinned by a
-  test asserting the untouched session's command channel stays empty.
-- The lazy provider-resolution reply (`ResolveAccountCmd`) crosses threads
-  via a `crossbeam_channel::Sender` (per the AGENTS.md channel rule for all
-  new code) and carries the decrypted API key wrapped in `Zeroizing<String>`,
-  so an unconsumed reply (session dropped mid-request) is wiped from the
-  channel queue on drop instead of lingering as an ordinary `String`.
-- Comment-only/test-only polish: de-duplicated the Wake-arm comment in
-  `handle_suspend_event`; the `make_daemon_state` test helper leaks its
-  config dir via the explicit `Box::leak` idiom instead of `mem::forget`.
-
-### Changed
-
-- **AGENTS.md channel rule is now workspace-wide**: thread-to-thread
-  messaging must use `crossbeam_channel` in ALL crates, not only those that
-  already depend on it — a crate gains the dependency in the same change
-  that introduces its first cross-thread channel (leaf-crate std-`mpsc`
-  tolerance removed).
-- `SocketRegistry::register` now returns a `SocketId` and
-  `RegisteredTcpTransport` unregisters + closes its registry fd on `Drop`,
-  so the registry tracks only live connections (no more growth bounded
-  only by the 256-entry prune). Unregistering an entry that `shutdown_all`/`prune`
-  already removed is a documented no-op: entry removal is the single
-  close-ownership-transfer signal, so the RAII guard cannot double-close an
-  fd the registry closed first.
-- Provider HTTP clients (`choreo-ai-protocols`) now build their ureq agents
-  through a registry-registered connector chain: `build_agent` replaces
-  ureq's plain TCP stage with choreo-sockreg's `RegisteringTcpConnector`
-  (chain: `ConnectProxyConnector` → `RegisteringTcpConnector` →
-  `RustlsConnector`, mirroring ureq 3.4's `DefaultConnector` for our feature
-  set), so every provider HTTP connection is keepalive-tuned and tracked in a
-  `SocketRegistry` for force-closing hung connections. All client
-  constructors (`OpenAiClient`, `AnthropicClient`, `GoogleClient`,
-  `OpenAiImageClient`, `ZaiImageClient`) now take the registry explicitly.
-- **Per-session socket registries and lazy clients**: neither the daemon nor
-  a session shares a provider client. Each session owns a private
-  `SocketRegistry` plus a lazily-built provider client (sessions can be
-  created while the keystore is locked, so no client can exist at creation
-  time — it is built on the session thread at the first request, against
-  that session's registry). The daemon command loop holds a clone of each
-  session's registry so `handle_cancel_request` can force-close a wedged
-  session's sockets from the one thread that DECIDED the cancel; a
-  registry-clone map lives in `DaemonState`, entered at session spawn and
-  dropped at session exit. Cancellation granularity is exactly the session
-  (sub-sessions own their own registries; a parent cancel closes the whole
-  subtree). Future async tool calls will reuse the session's
-  agent+pool+registry triple. The old per-account provider cache
-  (`DaemonState.providers`) is gone: `/lock`, `RemoveCredential`, and
-  `AccountsReload` invalidate affected sessions' clients via a new
-  `SessionCommand::DropProvider`, and each session rebuilds lazily on its
-  next request. Only non-session-scoped work (model prefetch, catalog
-  maintenance fetch — never individually cancelled) uses a
-  command-loop-owned `daemon_registry`.
-- Repinned the `zai` provider to z.ai's documented standard PaaS gateway
-  (`https://api.z.ai/api/paas/v4`, per docs.z.ai) instead of the Coding-Plan
-  gateway (`/api/coding/paas/v4`); z.ai's single API key type works on both,
-  and Coding-Plan subscribers can still reach the coding gateway via the
-  per-account `base_url` override. The image adapter's coding-gateway
-  rewrite is unchanged but is now a no-op passthrough for the default base;
-  doc comments/doc rows updated to say so.
-
-### Added
-
 - **Chat-completions `finish_reason` parsing and truncation notice (`choreo-ai-protocols`, `choreo-proto`, `choreo-daemon`):**
   the OpenAI-compatible chat-completions adapter now deserializes the per-choice `finish_reason`
   (non-streaming `Choice` and the streaming `StreamChoice`, threaded through the SSE accumulator)
@@ -362,155 +132,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other providers and for tool-call turns, where `length` is normal tool-loop flow); the daemon
   appends a visible "⚠ response truncated (length limit)" line to such answers and logs a
   warning, so an output-limited cut-off no longer looks like a complete reply.
-
-### Fixed
-
-- **Silent failure modes for content-filter refusals and context-window overflow:** z.ai's
-  `sensitive` finish reason (and OpenAI's `content_filter`) previously surfaced as an empty or
-  blank response indistinguishable from a glitch — and potentially retryable. It now maps to the
-  terminal, non-retryable `ContentFiltered` error (following the images-adapter precedent: no
-  fabricated HTTP status, the retry layer never retries it). A
-  `model_context_window_exceeded` finish now maps to a new distinct terminal
-  `ContextWindowExceeded` error variant on both `ProviderError` and `InferenceError` (metrics
-  label `context_window_exceeded`) with a clear "prompt exceeded the model's context window"
-  message, turning a previously invisible compaction-bug signal into a diagnosable failure.
-  `stop` / `tool_calls` / `network_error` / unknown values leave behavior unchanged.
-
-- **Cached prompt-token reporting (`choreo-proto`, `choreo-ai-protocols`, `choreo-tui`):**
-  `TokenUsage` gains a `cached_tokens: u32` field (`#[serde(default)]`, 0 when unreported, so
-  old wire payloads and providers that omit the details object keep deserializing) and
-  `merge_max` now folds it per-field. The OpenAI-compatible client parses z.ai's
-  `usage.prompt_tokens_details.cached_tokens` (an optional nested `prompt_tokens_details`
-  struct on `Usage`) in both the non-streaming and streaming chat-completions paths, maps it
-  into `TokenUsage` with a `debug!` trace on nonzero counts, and the TUI session-detail
-  "Tokens:" line annotates `(<N> cached)` when the provider reported a cached count. DeepSeek's
-  differently-shaped flat `prompt_cache_hit_tokens` and the Responses API's
-  `input_tokens_details.cached_tokens` are noted in-code as possible follow-ups.
-
-- **`max_tokens` field pinned for the Zhipu slugs (`choreo-ai-protocols` catalog/models-overlay.toml):**
-  z.ai's chat-completions API documents only `max_tokens` (no `max_completion_tokens`), but the
-  models.dev derivation defaults every OpenAI-protocol provider to `max_completion_tokens` —
-  z.ai would ignore or reject the output cap sent under that name. The bundled overlay now pins
-  `max_tokens_field = "max_tokens"` on both `zai` and `zhipuai` (same GLM PaaS-v4 contract shape);
-  pinned end-to-end by the new bundled-catalog regression test
-  `bundled_overlay_pins_max_tokens_field_for_the_zhipu_slugs`.
-
-- **`ZaiImageClient` — the z.ai (Zhipu GLM) Images adapter (`choreo-ai-protocols` src/images/zai.rs):**
-  a second adapter behind `ImageGenerationClient` for the `/paas/v4/images/generations` endpoint
-  (glm-image): request body is `{model, prompt}` + optional `size` (OpenAI wire strings verbatim;
-  Auto omitted — z.ai documents no auto sentinel) and `quality` (`Low`/`Medium` → `standard`,
-  `High` → `hd`, `Auto` omitted); `n`/`response_format`/`background`/`output_format` are never
-  sent (z.ai documents none of them; an explicitly-set background is silently ignored — a
-  documented best-effort-knobs decision, not an error). Responses are URL-returning (a temporary
-  CDN link that expires after 30 days), so the adapter downloads the URL with the shared agent
-  (no Authorization header — the pre-signed URL must not leak the API key to the CDN), an 8 MiB
-  streaming cap, a loose `image/*` content-type guard, and the same 180 s per-attempt deadline;
-  a `b64_json` field is tolerated (parse-level) and preferred when present. `content_filter`
-  entries at level 0..=2 (0 = most severe, 3 = least) surface a clear "provider content filter
-  blocked the generation (level N)" ClientError instead of EmptyResponse — blocked means no
-  retry. Flat `{code, message}` error bodies surface their message via the existing retry-layer
-  envelope extraction. Dispatch: the daemon's `from_account_config` routes the `zai` and
-  `zhipuai` provider slugs to this adapter (all other OpenAI-protocol providers keep the default
-  `OpenAiImageClient`); the catalog overlay pins `glm-image` as `supports_image_output` under
-  both slugs (picked as the sole priority-fallback image candidate — no `pick_image_model`
-  change needed).
-- **Image-generation capability on the provider facade + `GetImageGenerationProvider` command:**
-  `InferenceProvider` now carries an optional `image_client`
-  (`Option<Arc<dyn ImageGenerationClient>>`, populated with an
-  `OpenAiImageClient` built from the same `AccountConfig`/key as the chat
-  client for OpenAI-protocol accounts; `None` for Anthropic/Gemini, whose
-  image backends are deferred in v1), exposed via an `image_client()`
-  accessor. The daemon gains a new `GetImageGenerationProvider` command that
-  hands a tool thread an opaque `ImageProviderHandle { slug, client }` over a
-  crossbeam reply channel — explicit account name, else the deterministic
-  first image-capable provider in sorted-key order — with precise errors for
-  a locked keystore, a named account that does not support image generation,
-  and no matching account. `/lock` revocation falls out of the existing
-  `providers.clear()`: no new handle can be resolved once locked.
-- **`ImageGenerationClient` trait + OpenAI Images adapter (`choreo-ai-protocols
-  src/images/`):** a provider-agnostic image-generation trait with typed
-  wire enums (`ImageSize`/`ImageQuality`/`OutputFormat`/`Background`,
-  `JsonSchema`+`Deserialize` so the daemon's tool args reuse them directly)
-  and the sole `OpenAiImageClient` adapter — 180 s per-attempt wall-clock
-  deadline, a deliberately frugal 2-attempt retry budget (a generation costs
-  the provider money, so only clearly-transient 429/5xx get a second shot),
-  and no `response_format` field (modern gpt-image models ignore it and
-  older proxies 400 on it; the requested `output_format` carries the intent
-  and the returned bytes are decoded with that MIME). Errors reuse
-  `InferenceError`, so chat and image share one error taxonomy and metrics
-  label mapping.
-- **Image-output modality in the provider catalog:** `ModelEntry` gained
-  `supports_image_output`, ingested from models.dev's `modalities.output`
-  array and overridable via the same per-model overlay key used for the
-  other model facts; new lookup helpers `model_supports_image_output` and
-  `image_models_for_provider` (the provider's image-capable model ids) back
-  the tool's model selection; `catalog/catalog.bin` regenerated.
-- **`GenerateImage` tool (new `image` tool group):** the model generates an
-  image from a text prompt; provider resolution runs through
-  `GetImageGenerationProvider` in the daemon command loop (the credential
-  never reaches a tool thread), model selection is catalog-driven (explicit
-  `model` arg wins; otherwise a priority pick gpt-image > imagen >
-  gemini-image > flux > dall-e over ONLY catalog-verified candidates, never
-  a guess), and the returned bytes re-enter the exact `prepare_image_from_bytes`
-  + `DisplayImageReturn` pipeline `display_image` uses — zero proto/client
-  changes — so display, durable persistence, and the vision-feedback loop
-  (the model sees its own generation and can refine it) are free. Covered by
-  the `#[ignore]` integration test `choreo-daemon/tests/image_gen_integration.rs`.
-
-### Changed
-
-- **GLM `reasoning_effort` mapping in the OpenAI chat adapter**: z.ai's chat-completions API does not accept the full OpenAI effort set, and the accepted values differ by GLM generation. For the `zai`/`zhipuai` slugs, chat requests now map our effort slugs through the documented z.ai values — GLM-5.3/-flash accept only `low`/`high`/`max` (`minimal`→`low`, `medium`/`high`→`high`, `xhigh`→`max`; `off` omits the field with a warning since 5.3 cannot disable thinking and falls back to its `max` default), while GLM-5.2-and-below follow the documented family mappings (`minimal` passes through as skip-thinking, `low`/`medium`→`high`, `xhigh`→`max`). Other providers keep the previous pass-through behavior. The bundled overlay also pins `reasoning_levels = ["off", "low", "high", "max"]` on the `opencode-go` `glm-5.3-flash` wholesale entry so the UI never advertises slugs the API rejects.
-
-- **Image-generation provider resolution extracted into `daemon/image_provider.rs` (`choreo-daemon`)**: the `GetImageGenerationProvider` handler and its pure `resolve_image_generation_provider` logic moved out of `daemon.rs` into a dedicated `pub(super)` child module (same pattern as `daemon/subscriber_handlers.rs`); its tests moved from `daemon/tests.rs` into the module's `#[cfg(test)]` block. The reply channel no longer carries `Result<_, String>`: a structured `ImageProviderError` (thiserror; `Locked` / `AccountNotConfigured` / `NoImageBackend` / `NoImageCapableAccount`, re-exported next to `DaemonCommand`) replaces it, preserving the precise guidance wording — the `generate_image` tool maps the error's `Display` text into its `ToolExecError` so the model still sees "keystore is locked — unlock first", the named-account guidance, and the "does not support image generation" slug. `ImageProviderHandle` stays in `providers/mod.rs`, next to the `InferenceProvider` facade it is protocol-erased alongside. No behavior change.
-
-- Image-generation wire-body minimization: `ImageGenerationRequest` now `skip_serializing_if`-omits knobs left at their defaults
-  (`auto` size/quality/background, `png` format), so an all-defaults request serializes to just `{model, prompt, n}` —
-  image models reached through OpenAI-compatible proxies (imagen, flux, gemini-image) often reject parameters they do not
-  implement even as explicit defaults. `Display` impls on the knob enums mirror the serde wire strings exactly, so the
-  `generate_image` invocation line shows what the API receives (`1024x1024`, `high`, …) instead of Rust variant names.
-- The OpenAI image adapter's wire tests moved from `src/images/tests.rs` (unit) to `tests/images_wire.rs` (integration,
-  `#[ignore]`) per the Test Discipline rule — socket-based tests no longer run under `cargo test-fast`.
-- `default_image_model` removed from `ImageGenerationClient` (and the hardcoded `gpt-image-1` default from `OpenAiImageClient`):
-  with no catalog image-output candidates the tool now fails with guidance (pass `model` explicitly, or add a
-  `supports_image_output` overlay entry + /refresh-models) instead of silently sending a guessed model the provider likely
-  does not route (e.g. `gpt-image-1` against an opencode gateway); `args.prompt` is moved into the request instead of cloned.
-- `prepare_image_from_bytes` (normalization + alt-text return shape) was
-  extracted from `tools/image.rs`'s `display_image` so the new
-  `generate_image` tool can share the same pipeline; behavior-neutral
-  refactor, `display_image` output unchanged.
-
-- **Bin-to-crate relocation (part 1):** the thin binary wrappers moved out of
-  the root `choreographr` package into their own crates — `choreo-tui`,
-  `choreo-im`, and `choreo-acp` now each declare their `[[bin]]`
-  (`src/main.rs`, a thin wrapper calling the library's `main()`) plus their
-  own `mimalloc` feature/optional dependency (mimalloc cannot live in
-  `[workspace.dependencies]` because cargo rejects `optional` there — each
-  crate declares it inline). The root package declares ONLY the daemon
-  binary: the `im`/`acp` features, the optional bridge dependencies, and the
-  root `avif` → `choreo-tui/avif` forwarding were removed (the TUI's `avif`
-  feature stays on the `choreo-tui` package). Source builds of the bridges
-  are now `cargo build -p choreo-im` / `cargo build -p choreo-acp`, and the
-  full crates.io source install is `cargo install choreographr choreo-tui
-  choreo-im choreo-acp`. `just tui/im/acp` recipes updated accordingly
-  (`just im`/`just acp` also dropped `_require-zig` — those crates never
-  touch zlob).
-- Workspace `default-members = [".", "choreo-tui"]` added: a bare `cargo
-  build` at the root keeps producing the daemon + TUI exactly as before the
-  split, while choreo-gui (Blitz/wgpu-heavy) stays out of default builds.
-- **Release pipeline for the split binaries (part 2):** the release build
-  now selects BOTH owning packages (`-p choreographr -p choreo-tui`) with
-  package-scoped feature syntax (`--features
-  choreographr/metrics,choreographr/blockchain[,choreographr/mimalloc,choreo-tui/mimalloc]`),
-  in `scripts/release.sh`, the CI `windows-msvc` job, and
-  `scripts/build-android.sh` (whose `--features` list is prefixed per-item
-  with `choreographr/` for two-package unambiguity). Both bins still land in
-  the shared `target/<triple>/dist` profile dir, so tarball/.deb/.rpm/Termux
-  staging, smoke tests, and `install.sh` are unchanged. `choreo-tui` gained
-  an identical `[package.metadata.binstall]` block so `cargo binstall
-  choreo-tui` resolves the same single tarball asset and extracts just its
-  own binary.
-
-### Added
 
 - iOS-native-tool C-ABI bridge skeleton (Subsession 1 of the iOS tools
   plan; Subsession 2 added tool registration): `choreo_daemon::tools::ios_bridge` defines
@@ -578,55 +199,194 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of the console code page (and `$ProgressPreference` silenced).
   Registered only on Windows, and only when a PowerShell binary is on PATH.
 
-### Fixed
-
-- `generate_image` tool timeout raised from the generic 60 s default to a dedicated floor derived from the image adapters' shared
-  retry/deadline constants (`IMAGE_MAX_ATTEMPTS`/`IMAGE_DOWNLOAD_ATTEMPTS`/`IMAGE_TOTAL_TIMEOUT_SECS`, now `pub` in
-  choreo-ai-protocols) plus a 60 s inter-attempt backoff headroom — currently 960 s: the previous default fired
-  *while a paid generation was still rendering* (glm-image `hd` is documented at ~20 s but the adapters' bounded worst case —
-  2 POST attempts × the 180 s per-attempt deadline plus the z.ai URL download's 3-fetch retry budget — exceeds 60 s), causing
-  the outer wait-loop to kill a generation that was working correctly. Because the floor is computed from the adapter constants,
-  an adapter retry-policy change automatically keeps the outer deadline in sync; the adapters' internal deadlines keep the
-  ceiling bounded.
-
-- z.ai image download resilience: z.ai's object storage advertises the generated image URL *before* the object is published
-  (observed in production — the identical URL served a non-image error page on the first GET and a clean PNG seconds later, with
-  the CDN's `X-Ufile-Create-Time` confirming lazy materialization), which turned the single-shot URL fetch into a hard
-  `generate_image` failure right after a successful paid generation. The z.ai adapter's URL download now has its own bounded
-  3-attempt retry budget over the account's short initial backoff (scheme violations, cap overflows, transport errors, and the
-  exhausted budget stay terminal), with the cancel flag honored during the retry wait.
-
-- ConfigWatcher resends directory state after an inotify queue overflow, so
-  subscribers no longer miss changes dropped by the kernel under load (fixes
-  the flaky config_watch integration tests): `notify` surfaces `IN_Q_OVERFLOW`
-  as an event carrying `Flag::Rescan`, and on that signal (and on watch
-  read-errors, which can equally mean missed events) the transport thread now
-  rescans the watched directory and replays divergences from a per-basename
-  last-known-content view as synthesized Create/Modify/Remove through the
-  same subscriber routing as real events.
-
-- `binary_exists` (the registration-time PATH probe behind conditional tool
-  registration) now resolves Windows executables through PATHEXT: a bare
-  `nu`/`pwsh` is really `nu.exe`/`pwsh.exe`, so the old exact-name probe
-  missed every installed binary on Windows. Unix behavior is unchanged.
-- `IosToolPending::wait`'s `Duration`-overflow fallback no longer converts an
-  intended-indefinite deadline into an instant `Timeout` (the old
-  `unwrap_or_else(Instant::now)` produced an already-elapsed deadline); the
-  overflowed case now means "wait until the reply or a cancel", which matches
-  the intent of an unbounded wait.
-- The `cancel_wins_over_arrived_reply` bridge test genuinely exercises the
-  POST-reply cancel re-check now: the old version flipped the flag BEFORE
-  `wait` with a `Duration::ZERO` deadline, so it only pinned the pre-wait
-  check and never reached the reply arm it claimed to cover. The predicate
-  now flips the flag on its second invocation (the post-reply re-check), and
-  the per-tool cancel-race tests share one deterministic
-  `cancel_race_fixture`.
-- `toggle_on_device_tools` (choreo-gui) now LOAD-modifies-persists the
-  settings file instead of rewriting it from a fresh struct — a whole-file
-  rewrite from scratch would have silently reset every OTHER preference to
-  its default the moment a second field exists.
+- Review follow-ups for the embedded-daemon series: (1) the CI `ios aarch64`
+  release job now installs zig like the other jobs (zlob, via choreo-daemon,
+  compiles its Zig source with `zig cc` in build.rs on every host — the job
+  previously only claimed to, commit 40fada9 changed a comment); (2) the
+  cc/cxx shim generators duplicated byte-identically in `build-ios.sh` and
+  `check-ios.sh` are extracted to the shared `scripts/lib/ios-cc-shims.sh`
+  (one generator so they cannot drift; generated files are stamped with the
+  current generator's name), with the CLI executor line emitted via `printf`
+  so the runtime arg-forwarding expression cannot be corrupted by heredoc
+  escaping (the generated shims are byte-identical to the previous output);
+  (3) a consumer notice on the workspace `choreo-daemon` dependency:
+  `default-features = false` lives there, so a NEW consumer must re-enable
+  `features = ["pdf"]` or it silently gets a PDF-less daemon.
 
 ### Changed
+
+- **CHANGELOG.md reformatted to satisfy Keep a Changelog**: the `[Unreleased]`
+  section, which had accumulated **seven** `### Fixed`, **seven** `### Changed`,
+  and five `### Added` blocks, is consolidated to **one heading per category**
+  (Added / Changed / Removed / Fixed / Security) with every entry preserved
+  verbatim. AGENTS.md gains a "CHANGELOG.md" subsection spelling out the
+  convention (one heading per category, at most; write it for the release page;
+  promoted to a dated `## [X.Y.Z] - YYYY-MM-DD` at tag time). The release-notes
+  extraction in `.github/workflows/release.yml` (and RELEASE.md's manual
+  appendix) now matches the version heading with an optional date
+  (`index($0, "## [X.Y.Z]") == 1` instead of an exact-line `==`), so the dated
+  Keep-a-Changelog heading no longer fails the release job. Also corrected the
+  0.1.0 entry's crate count (14 → 12: the initial release published 12 crates).
+
+- **Release documentation reconciled with the current workspace**
+  (`RELEASE.md`, `ARCHITECTURE.md`, `README.md`): the crates.io publish set is
+  **18** crates (every member except `choreo-gui`, the one private member); the
+  next release adds **six** new crates (`choreo-blockchain`, `choreo-sanitize`,
+  `choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content`) —
+  which EXCEEDS the new-crate burst of 5, so RELEASE.md Phase 2 now documents
+  the concrete two-batch staging plan (4 new + 2 new, ≥10 min apart) as well as
+  the burst-override option; the Windows `.zip` is documented as built-but-not-released (the CI
+  release job's `needs` omits `windows-msvc`); the crates.io /`binstall` install
+  routes name `choreo-tui` alongside `choreographr` (the TUI binary moved to its
+  own package); the workspace is nineteen crates (root + eighteen members); and
+  the batch-staging example now describes 0.1.0's actual 12-crate set.
+
+- The TUI's client-side submit guard is now a single `App::new_turn_rejection`
+  helper covering both the idle check and the keystore-locked check, and it is
+  applied to **every** action that begins a new turn — a plain prompt, Alt+Enter,
+  and the `/continue` command (all of which end up as `RunInput` /
+  `ContinueGeneration`) — so the `/continue` path that was previously unguarded
+  is now covered too. A new
+  `SessionStatus::is_idle` (exactly `Inactive`; `Sleeping` is not idle) makes
+  the idle test explicit and shared. Behaviour change: a locked-keystore
+  rejection now runs before the input buffer is cleared, so the rejected text
+  is preserved (matching the idle-guard behaviour) instead of being dropped.
+- The two `ContinueGeneration` senders (Alt+Enter and `/continue`) collapsed
+  into a single `connection::chat::send_continue_generation` helper that owns
+  the guard, request-id allocation, in-flight tracking and send, so the two
+  triggers can no longer drift. The only intended difference is the shell echo:
+  `/continue` shows `> continue`, Alt+Enter does not.
+- The "nothing is listening" dial classification (`NotFound` /
+  `ConnectionRefused`) moved into a shared predicate,
+  `choreo_proto::dial_error_means_no_listener`, used by the TUI connection
+  path (`choreo-client-core`'s `run_daemon_connection_with_autostart`) and
+  documented as the mirror of the daemon-side stale-socket probe, so the
+  client and daemon classifications can never drift. The predicate takes the
+  whole `&io::Error` (matching on `kind()` internally) rather than a bare
+  `io::ErrorKind`, so a caller cannot accidentally classify an unrelated
+  error.
+- The cross-platform unix-socket DIAL is now a single primitive in
+  `choreo-proto` (`connect_unix` for the stream-keeping dial, plus the
+  `socket_listening` boolean wrapper and the `UnixStream` re-export that
+  resolves std-vs-`uds_windows` per platform). Every dial site — the TUI
+  autostart wait, `choreo-client-core`'s connection path, the daemon's
+  stale-socket probe and its signal/auto-exit accept-loop wake-ups — now uses
+  it instead of four inlined `#[cfg]` copies, and the now-redundant direct
+  `uds_windows` dependencies were dropped from `choreo-client-core` and
+  `choreo-tui`.
+- Autostart/poll tests that wait on real time or bind real sockets moved out
+  of the `src/` unit-test modules into the crates' `tests/` integration
+  suites (`choreo-tui/tests/autostart_poll.rs`,
+  `choreo-client-core/tests/connection_autostart.rs`), per the test
+  discipline: unit tests are now timing-free.
+
+- Refactored the post-strict-lints bounds-checked slicing boilerplate: a
+  shared `read_slice` helper in `choreo-ai-protocols` replaces the four
+  duplicated `buf.get(..n).unwrap_or(&[])` read-contract sites (SSE readers,
+  image CDN download); `zai.rs` hoists its duplicated `as_object_mut` guard;
+  `choreo-daemon`'s `text_stream.rs` no longer uses silent-widening
+  `unwrap_or(full-buffer)` slicing fallbacks — out-of-bounds windows and a
+  violated `Utf8Error::valid_up_to()` invariant now produce loud errors
+  instead of quietly defeating the display cap.
+
+- **AGENTS.md channel rule is now workspace-wide**: thread-to-thread
+  messaging must use `crossbeam_channel` in ALL crates, not only those that
+  already depend on it — a crate gains the dependency in the same change
+  that introduces its first cross-thread channel (leaf-crate std-`mpsc`
+  tolerance removed).
+- `SocketRegistry::register` now returns a `SocketId` and
+  `RegisteredTcpTransport` unregisters + closes its registry fd on `Drop`,
+  so the registry tracks only live connections (no more growth bounded
+  only by the 256-entry prune). Unregistering an entry that `shutdown_all`/`prune`
+  already removed is a documented no-op: entry removal is the single
+  close-ownership-transfer signal, so the RAII guard cannot double-close an
+  fd the registry closed first.
+- Provider HTTP clients (`choreo-ai-protocols`) now build their ureq agents
+  through a registry-registered connector chain: `build_agent` replaces
+  ureq's plain TCP stage with choreo-sockreg's `RegisteringTcpConnector`
+  (chain: `ConnectProxyConnector` → `RegisteringTcpConnector` →
+  `RustlsConnector`, mirroring ureq 3.4's `DefaultConnector` for our feature
+  set), so every provider HTTP connection is keepalive-tuned and tracked in a
+  `SocketRegistry` for force-closing hung connections. All client
+  constructors (`OpenAiClient`, `AnthropicClient`, `GoogleClient`,
+  `OpenAiImageClient`, `ZaiImageClient`) now take the registry explicitly.
+- **Per-session socket registries and lazy clients**: neither the daemon nor
+  a session shares a provider client. Each session owns a private
+  `SocketRegistry` plus a lazily-built provider client (sessions can be
+  created while the keystore is locked, so no client can exist at creation
+  time — it is built on the session thread at the first request, against
+  that session's registry). The daemon command loop holds a clone of each
+  session's registry so `handle_cancel_request` can force-close a wedged
+  session's sockets from the one thread that DECIDED the cancel; a
+  registry-clone map lives in `DaemonState`, entered at session spawn and
+  dropped at session exit. Cancellation granularity is exactly the session
+  (sub-sessions own their own registries; a parent cancel closes the whole
+  subtree). Future async tool calls will reuse the session's
+  agent+pool+registry triple. The old per-account provider cache
+  (`DaemonState.providers`) is gone: `/lock`, `RemoveCredential`, and
+  `AccountsReload` invalidate affected sessions' clients via a new
+  `SessionCommand::DropProvider`, and each session rebuilds lazily on its
+  next request. Only non-session-scoped work (model prefetch, catalog
+  maintenance fetch — never individually cancelled) uses a
+  command-loop-owned `daemon_registry`.
+- Repinned the `zai` provider to z.ai's documented standard PaaS gateway
+  (`https://api.z.ai/api/paas/v4`, per docs.z.ai) instead of the Coding-Plan
+  gateway (`/api/coding/paas/v4`); z.ai's single API key type works on both,
+  and Coding-Plan subscribers can still reach the coding gateway via the
+  per-account `base_url` override. The image adapter's coding-gateway
+  rewrite is unchanged but is now a no-op passthrough for the default base;
+  doc comments/doc rows updated to say so.
+
+- **GLM `reasoning_effort` mapping in the OpenAI chat adapter**: z.ai's chat-completions API does not accept the full OpenAI effort set, and the accepted values differ by GLM generation. For the `zai`/`zhipuai` slugs, chat requests now map our effort slugs through the documented z.ai values — GLM-5.3/-flash accept only `low`/`high`/`max` (`minimal`→`low`, `medium`/`high`→`high`, `xhigh`→`max`; `off` omits the field with a warning since 5.3 cannot disable thinking and falls back to its `max` default), while GLM-5.2-and-below follow the documented family mappings (`minimal` passes through as skip-thinking, `low`/`medium`→`high`, `xhigh`→`max`). Other providers keep the previous pass-through behavior. The bundled overlay also pins `reasoning_levels = ["off", "low", "high", "max"]` on the `opencode-go` `glm-5.3-flash` wholesale entry so the UI never advertises slugs the API rejects.
+
+- **Image-generation provider resolution extracted into `daemon/image_provider.rs` (`choreo-daemon`)**: the `GetImageGenerationProvider` handler and its pure `resolve_image_generation_provider` logic moved out of `daemon.rs` into a dedicated `pub(super)` child module (same pattern as `daemon/subscriber_handlers.rs`); its tests moved from `daemon/tests.rs` into the module's `#[cfg(test)]` block. The reply channel no longer carries `Result<_, String>`: a structured `ImageProviderError` (thiserror; `Locked` / `AccountNotConfigured` / `NoImageBackend` / `NoImageCapableAccount`, re-exported next to `DaemonCommand`) replaces it, preserving the precise guidance wording — the `generate_image` tool maps the error's `Display` text into its `ToolExecError` so the model still sees "keystore is locked — unlock first", the named-account guidance, and the "does not support image generation" slug. `ImageProviderHandle` stays in `providers/mod.rs`, next to the `InferenceProvider` facade it is protocol-erased alongside. No behavior change.
+
+- Image-generation wire-body minimization: `ImageGenerationRequest` now `skip_serializing_if`-omits knobs left at their defaults
+  (`auto` size/quality/background, `png` format), so an all-defaults request serializes to just `{model, prompt, n}` —
+  image models reached through OpenAI-compatible proxies (imagen, flux, gemini-image) often reject parameters they do not
+  implement even as explicit defaults. `Display` impls on the knob enums mirror the serde wire strings exactly, so the
+  `generate_image` invocation line shows what the API receives (`1024x1024`, `high`, …) instead of Rust variant names.
+- The OpenAI image adapter's wire tests moved from `src/images/tests.rs` (unit) to `tests/images_wire.rs` (integration,
+  `#[ignore]`) per the Test Discipline rule — socket-based tests no longer run under `cargo test-fast`.
+- `default_image_model` removed from `ImageGenerationClient` (and the hardcoded `gpt-image-1` default from `OpenAiImageClient`):
+  with no catalog image-output candidates the tool now fails with guidance (pass `model` explicitly, or add a
+  `supports_image_output` overlay entry + /refresh-models) instead of silently sending a guessed model the provider likely
+  does not route (e.g. `gpt-image-1` against an opencode gateway); `args.prompt` is moved into the request instead of cloned.
+- `prepare_image_from_bytes` (normalization + alt-text return shape) was
+  extracted from `tools/image.rs`'s `display_image` so the new
+  `generate_image` tool can share the same pipeline; behavior-neutral
+  refactor, `display_image` output unchanged.
+
+- **Bin-to-crate relocation (part 1):** the thin binary wrappers moved out of
+  the root `choreographr` package into their own crates — `choreo-tui`,
+  `choreo-im`, and `choreo-acp` now each declare their `[[bin]]`
+  (`src/main.rs`, a thin wrapper calling the library's `main()`) plus their
+  own `mimalloc` feature/optional dependency (mimalloc cannot live in
+  `[workspace.dependencies]` because cargo rejects `optional` there — each
+  crate declares it inline). The root package declares ONLY the daemon
+  binary: the `im`/`acp` features, the optional bridge dependencies, and the
+  root `avif` → `choreo-tui/avif` forwarding were removed (the TUI's `avif`
+  feature stays on the `choreo-tui` package). Source builds of the bridges
+  are now `cargo build -p choreo-im` / `cargo build -p choreo-acp`, and the
+  full crates.io source install is `cargo install choreographr choreo-tui
+  choreo-im choreo-acp`. `just tui/im/acp` recipes updated accordingly
+  (`just im`/`just acp` also dropped `_require-zig` — those crates never
+  touch zlob).
+- Workspace `default-members = [".", "choreo-tui"]` added: a bare `cargo
+  build` at the root keeps producing the daemon + TUI exactly as before the
+  split, while choreo-gui (Blitz/wgpu-heavy) stays out of default builds.
+- **Release pipeline for the split binaries (part 2):** the release build
+  now selects BOTH owning packages (`-p choreographr -p choreo-tui`) with
+  package-scoped feature syntax (`--features
+  choreographr/metrics,choreographr/blockchain[,choreographr/mimalloc,choreo-tui/mimalloc]`),
+  in `scripts/release.sh`, the CI `windows-msvc` job, and
+  `scripts/build-android.sh` (whose `--features` list is prefixed per-item
+  with `choreographr/` for two-package unambiguity). Both bins still land in
+  the shared `target/<triple>/dist` profile dir, so tarball/.deb/.rpm/Termux
+  staging, smoke tests, and `install.sh` are unchanged. `choreo-tui` gained
+  an identical `[package.metadata.binstall]` block so `cargo binstall
+  choreo-tui` resolves the same single tarball asset and extracts just its
+  own binary.
 
 - iOS platform tools hardening/streamlining: `open_url`'s executor-side
   validation now parses the URL with the `url` crate (scheme allow-list over
@@ -796,8 +556,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[profile.dist]` shipped-artifact profile with per-target CPU floors;
   `choreo-im`, `choreo-acp`, and `choreo-mcp` feature-gated off by default.
 
-### Changed
-
 - Connection keying for the in-process mode: `choreo-gui`'s
   `connection_addr()` keys an embedded daemon's keystore binding under the
   distinct stable string `"embedded"` instead of the unix socket path — a
@@ -863,23 +621,248 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`/unlock` uses it; `/unlock <key>` records it); rejected-unlock-key
   revert semantics replaced by survivor semantics.
 
-### Added
-
-- Review follow-ups for the embedded-daemon series: (1) the CI `ios aarch64`
-  release job now installs zig like the other jobs (zlob, via choreo-daemon,
-  compiles its Zig source with `zig cc` in build.rs on every host — the job
-  previously only claimed to, commit 40fada9 changed a comment); (2) the
-  cc/cxx shim generators duplicated byte-identically in `build-ios.sh` and
-  `check-ios.sh` are extracted to the shared `scripts/lib/ios-cc-shims.sh`
-  (one generator so they cannot drift; generated files are stamped with the
-  current generator's name), with the CLI executor line emitted via `printf`
-  so the runtime arg-forwarding expression cannot be corrupted by heredoc
-  escaping (the generated shims are byte-identical to the previous output);
-  (3) a consumer notice on the workspace `choreo-daemon` dependency:
-  `default-features = false` lives there, so a NEW consumer must re-enable
-  `features = ["pdf"]` or it silently gets a PDF-less daemon.
-
 ### Fixed
+
+- **`choreo-sockreg`, `choreo-power-events`, and `choreo-content` are now
+  published** (release-blocking): each was `publish = false`, but each is a
+  dependency of a PUBLISHED crate (`choreo-ai-protocols` → `choreo-sockreg`;
+  `choreo-daemon` → `choreo-power-events`; and `choreo-daemon`'s optional
+  `content` feature → `choreo-content`), and cargo refuses to package a crate
+  whose dependency is not on crates.io — even an OPTIONAL one (verified: `cargo
+  package -p choreo-ai-protocols` fails with "no matching package named
+  `choreo-sockreg`", and `cargo package -p choreo-daemon` fails on the optional
+  `choreo-blockchain` dep). `choreo-gui` stays private (a leaf client nothing
+  depends on). Without this the next release could not be published at all.
+  `scripts/publish-stable.sh` now derives an `--exclude` for every remaining
+  `publish = false` member (currently just `choreo-gui`) from the manifests,
+  since cargo-release 1.1.5 ignores the flag in `--workspace` selection.
+
+- Deleting the attached TUI session now clears the cached attach-state
+  (`attached_status` / `attached_tool_groups`) along with the session id. These
+  describe the attachment that just went away; leaving them set rendered a
+  stale status bar and (with the new idle-guard) made a later plain prompt be
+  rejected as "session not idle" even though no session was attached at all.
+- The unified config watcher now arms its `notify` watch **synchronously** in
+  `ConfigWatcher::spawn()` (on the caller's thread) instead of on the spawned
+  transport thread: previously a config-file write landing between `spawn()`
+  returning and the thread's first `watch()` call was silently lost, which
+  made `config_watcher_delivers_only_registered_basenames` (and its sibling)
+  flaky under full-suite parallel load. `spawn()` now also creates the config
+  dir itself, so both startup steps complete before the thread exists; the
+  thread receives the already-created, already-armed watcher plus the raw-event
+  receiver and initial `armed` flag, and the re-arm cadence still covers a
+  dir deleted at runtime or a spawn-time arm failure.
+
+- The daemon's `--log-file` is hardened for the shared temp dir the TUI
+  autostart writes into: on unix it is created 0600 AND opened `O_NOFOLLOW`
+  (a symlink planted at the predictable pid-keyed path fails the open
+  instead of redirecting the daemon's diagnostics), the opened file is
+  verified to be a regular file owned by the daemon's own euid (a
+  pre-created file owned by another user, or a FIFO/device, is refused), and
+  its mode is explicitly tightened to 0600 (the create mode only applies on
+  creation, so a file left by an earlier run could be group/world-readable).
+  Windows keeps inherited ACLs.
+- The TUI's autostart status message no longer lingers: a `UiEvent::Status`
+  is flagged transient (`App::status_is_transient`) and cleared by the first
+  real daemon message, so "daemon started" does not sit on the status line
+  once the connection is live and the first turn is quiet. Statuses written
+  by daemon handlers are never cleared by this rule.
+- `poll_until_listening` now clamps each inter-probe sleep to the time
+  remaining before its budget, so the total wait is genuinely bounded by the
+  budget instead of overshooting by up to one interval after the last failed
+  probe (matching the doc contract).
+
+- `run_server` no longer steals a live daemon's socket: before removing an
+  existing socket file it now probes it with a connect — a successful
+  connect means another daemon is still listening, so startup fails with
+  "another daemon is already listening at …" instead of orphaning the
+  working daemon (the two-daemon race that TUI autostart widens); any
+  failed connect (ENOENT, ECONNREFUSED, a regular file at the path) means
+  stale, and the leftover is removed as before — with the socket path now
+  carried in the removal error so a bare "Permission denied" (the Termux
+  /tmp failure mode) is diagnosable.
+- A daemon protocol-version mismatch surfaces an actionable TUI quit
+  message — "the daemon's protocol version is incompatible — restart the
+  daemon (it may be an older build)" — instead of a raw codec error the
+  user cannot act on; all other connection errors keep the historical
+  wording.
+- Eliminated the last clippy warnings across the workspace so
+  `cargo clippy --workspace --all-targets` is warning-free (the only
+  remaining notice is the `proc-macro-error2` dependency advisory): removed
+  a needless `Ok(.. ?)` in `choreo-transport`'s preamble reader, collapsed a
+  nested `if` in the OpenAI tool-call accumulator, factored the
+  `noise_integration` test helper's complex tuple return into a
+  `NoiseTestPair` alias, and silenced the unused-import/dead-code warnings in
+  the temporarily-disabled `choreo-content` platform round-trip test via
+  `#[cfg(any())]` gating (items preserved verbatim for restoration) instead
+  of leaving a doc comment dangling before its block comment.
+
+- Request cancellation no longer force-closes provider sockets belonging to
+  unrelated concurrent sessions: each session owns a private
+  `SocketRegistry` (plus one daemon-level registry for prefetch/catalog
+  fetches), so `shutdown_all` from a cancel is scoped to exactly the
+  cancelled session and its children.
+
+- **Windows `SocketRegistry` handle leak**: the Windows `close_logged`
+  variant called `into_raw_socket()`, transferring the `SOCKET` OUT of the
+  `OwnedSocket` without ever calling `closesocket` — every RAII unregister /
+  `shutdown_all` / prune on Windows leaked a socket handle. It now logs the
+  handle from a borrow (`as_raw_socket`) and lets `OwnedSocket`'s `Drop`
+  close it exactly once (verified with a `cargo check
+  --target x86_64-pc-windows-msvc`).
+- **`AccountsReload` over-invalidation**: the external-edit handler sent
+  `SessionCommand::DropProvider` to EVERY live session, forcing sessions
+  bound to untouched accounts to tear down their cached clients and HTTP
+  connection pools and rebuild on the next request. It now invalidates only
+  sessions bound to REMOVED or CHANGED accounts (the diff it already
+  computes), leaving untouched accounts' sessions warm — pinned by a
+  test asserting the untouched session's command channel stays empty.
+- The lazy provider-resolution reply (`ResolveAccountCmd`) crosses threads
+  via a `crossbeam_channel::Sender` (per the AGENTS.md channel rule for all
+  new code) and carries the decrypted API key wrapped in `Zeroizing<String>`,
+  so an unconsumed reply (session dropped mid-request) is wiped from the
+  channel queue on drop instead of lingering as an ordinary `String`.
+- Comment-only/test-only polish: de-duplicated the Wake-arm comment in
+  `handle_suspend_event`; the `make_daemon_state` test helper leaks its
+  config dir via the explicit `Box::leak` idiom instead of `mem::forget`.
+
+- **Silent failure modes for content-filter refusals and context-window overflow:** z.ai's
+  `sensitive` finish reason (and OpenAI's `content_filter`) previously surfaced as an empty or
+  blank response indistinguishable from a glitch — and potentially retryable. It now maps to the
+  terminal, non-retryable `ContentFiltered` error (following the images-adapter precedent: no
+  fabricated HTTP status, the retry layer never retries it). A
+  `model_context_window_exceeded` finish now maps to a new distinct terminal
+  `ContextWindowExceeded` error variant on both `ProviderError` and `InferenceError` (metrics
+  label `context_window_exceeded`) with a clear "prompt exceeded the model's context window"
+  message, turning a previously invisible compaction-bug signal into a diagnosable failure.
+  `stop` / `tool_calls` / `network_error` / unknown values leave behavior unchanged.
+
+- **Cached prompt-token reporting (`choreo-proto`, `choreo-ai-protocols`, `choreo-tui`):**
+  `TokenUsage` gains a `cached_tokens: u32` field (`#[serde(default)]`, 0 when unreported, so
+  old wire payloads and providers that omit the details object keep deserializing) and
+  `merge_max` now folds it per-field. The OpenAI-compatible client parses z.ai's
+  `usage.prompt_tokens_details.cached_tokens` (an optional nested `prompt_tokens_details`
+  struct on `Usage`) in both the non-streaming and streaming chat-completions paths, maps it
+  into `TokenUsage` with a `debug!` trace on nonzero counts, and the TUI session-detail
+  "Tokens:" line annotates `(<N> cached)` when the provider reported a cached count. DeepSeek's
+  differently-shaped flat `prompt_cache_hit_tokens` and the Responses API's
+  `input_tokens_details.cached_tokens` are noted in-code as possible follow-ups.
+
+- **`max_tokens` field pinned for the Zhipu slugs (`choreo-ai-protocols` catalog/models-overlay.toml):**
+  z.ai's chat-completions API documents only `max_tokens` (no `max_completion_tokens`), but the
+  models.dev derivation defaults every OpenAI-protocol provider to `max_completion_tokens` —
+  z.ai would ignore or reject the output cap sent under that name. The bundled overlay now pins
+  `max_tokens_field = "max_tokens"` on both `zai` and `zhipuai` (same GLM PaaS-v4 contract shape);
+  pinned end-to-end by the new bundled-catalog regression test
+  `bundled_overlay_pins_max_tokens_field_for_the_zhipu_slugs`.
+
+- **`ZaiImageClient` — the z.ai (Zhipu GLM) Images adapter (`choreo-ai-protocols` src/images/zai.rs):**
+  a second adapter behind `ImageGenerationClient` for the `/paas/v4/images/generations` endpoint
+  (glm-image): request body is `{model, prompt}` + optional `size` (OpenAI wire strings verbatim;
+  Auto omitted — z.ai documents no auto sentinel) and `quality` (`Low`/`Medium` → `standard`,
+  `High` → `hd`, `Auto` omitted); `n`/`response_format`/`background`/`output_format` are never
+  sent (z.ai documents none of them; an explicitly-set background is silently ignored — a
+  documented best-effort-knobs decision, not an error). Responses are URL-returning (a temporary
+  CDN link that expires after 30 days), so the adapter downloads the URL with the shared agent
+  (no Authorization header — the pre-signed URL must not leak the API key to the CDN), an 8 MiB
+  streaming cap, a loose `image/*` content-type guard, and the same 180 s per-attempt deadline;
+  a `b64_json` field is tolerated (parse-level) and preferred when present. `content_filter`
+  entries at level 0..=2 (0 = most severe, 3 = least) surface a clear "provider content filter
+  blocked the generation (level N)" ClientError instead of EmptyResponse — blocked means no
+  retry. Flat `{code, message}` error bodies surface their message via the existing retry-layer
+  envelope extraction. Dispatch: the daemon's `from_account_config` routes the `zai` and
+  `zhipuai` provider slugs to this adapter (all other OpenAI-protocol providers keep the default
+  `OpenAiImageClient`); the catalog overlay pins `glm-image` as `supports_image_output` under
+  both slugs (picked as the sole priority-fallback image candidate — no `pick_image_model`
+  change needed).
+- **Image-generation capability on the provider facade + `GetImageGenerationProvider` command:**
+  `InferenceProvider` now carries an optional `image_client`
+  (`Option<Arc<dyn ImageGenerationClient>>`, populated with an
+  `OpenAiImageClient` built from the same `AccountConfig`/key as the chat
+  client for OpenAI-protocol accounts; `None` for Anthropic/Gemini, whose
+  image backends are deferred in v1), exposed via an `image_client()`
+  accessor. The daemon gains a new `GetImageGenerationProvider` command that
+  hands a tool thread an opaque `ImageProviderHandle { slug, client }` over a
+  crossbeam reply channel — explicit account name, else the deterministic
+  first image-capable provider in sorted-key order — with precise errors for
+  a locked keystore, a named account that does not support image generation,
+  and no matching account. `/lock` revocation falls out of the existing
+  `providers.clear()`: no new handle can be resolved once locked.
+- **`ImageGenerationClient` trait + OpenAI Images adapter (`choreo-ai-protocols
+  src/images/`):** a provider-agnostic image-generation trait with typed
+  wire enums (`ImageSize`/`ImageQuality`/`OutputFormat`/`Background`,
+  `JsonSchema`+`Deserialize` so the daemon's tool args reuse them directly)
+  and the sole `OpenAiImageClient` adapter — 180 s per-attempt wall-clock
+  deadline, a deliberately frugal 2-attempt retry budget (a generation costs
+  the provider money, so only clearly-transient 429/5xx get a second shot),
+  and no `response_format` field (modern gpt-image models ignore it and
+  older proxies 400 on it; the requested `output_format` carries the intent
+  and the returned bytes are decoded with that MIME). Errors reuse
+  `InferenceError`, so chat and image share one error taxonomy and metrics
+  label mapping.
+- **Image-output modality in the provider catalog:** `ModelEntry` gained
+  `supports_image_output`, ingested from models.dev's `modalities.output`
+  array and overridable via the same per-model overlay key used for the
+  other model facts; new lookup helpers `model_supports_image_output` and
+  `image_models_for_provider` (the provider's image-capable model ids) back
+  the tool's model selection; `catalog/catalog.bin` regenerated.
+- **`GenerateImage` tool (new `image` tool group):** the model generates an
+  image from a text prompt; provider resolution runs through
+  `GetImageGenerationProvider` in the daemon command loop (the credential
+  never reaches a tool thread), model selection is catalog-driven (explicit
+  `model` arg wins; otherwise a priority pick gpt-image > imagen >
+  gemini-image > flux > dall-e over ONLY catalog-verified candidates, never
+  a guess), and the returned bytes re-enter the exact `prepare_image_from_bytes`
+  + `DisplayImageReturn` pipeline `display_image` uses — zero proto/client
+  changes — so display, durable persistence, and the vision-feedback loop
+  (the model sees its own generation and can refine it) are free. Covered by
+  the `#[ignore]` integration test `choreo-daemon/tests/image_gen_integration.rs`.
+
+- `generate_image` tool timeout raised from the generic 60 s default to a dedicated floor derived from the image adapters' shared
+  retry/deadline constants (`IMAGE_MAX_ATTEMPTS`/`IMAGE_DOWNLOAD_ATTEMPTS`/`IMAGE_TOTAL_TIMEOUT_SECS`, now `pub` in
+  choreo-ai-protocols) plus a 60 s inter-attempt backoff headroom — currently 960 s: the previous default fired
+  *while a paid generation was still rendering* (glm-image `hd` is documented at ~20 s but the adapters' bounded worst case —
+  2 POST attempts × the 180 s per-attempt deadline plus the z.ai URL download's 3-fetch retry budget — exceeds 60 s), causing
+  the outer wait-loop to kill a generation that was working correctly. Because the floor is computed from the adapter constants,
+  an adapter retry-policy change automatically keeps the outer deadline in sync; the adapters' internal deadlines keep the
+  ceiling bounded.
+
+- z.ai image download resilience: z.ai's object storage advertises the generated image URL *before* the object is published
+  (observed in production — the identical URL served a non-image error page on the first GET and a clean PNG seconds later, with
+  the CDN's `X-Ufile-Create-Time` confirming lazy materialization), which turned the single-shot URL fetch into a hard
+  `generate_image` failure right after a successful paid generation. The z.ai adapter's URL download now has its own bounded
+  3-attempt retry budget over the account's short initial backoff (scheme violations, cap overflows, transport errors, and the
+  exhausted budget stay terminal), with the cancel flag honored during the retry wait.
+
+- ConfigWatcher resends directory state after an inotify queue overflow, so
+  subscribers no longer miss changes dropped by the kernel under load (fixes
+  the flaky config_watch integration tests): `notify` surfaces `IN_Q_OVERFLOW`
+  as an event carrying `Flag::Rescan`, and on that signal (and on watch
+  read-errors, which can equally mean missed events) the transport thread now
+  rescans the watched directory and replays divergences from a per-basename
+  last-known-content view as synthesized Create/Modify/Remove through the
+  same subscriber routing as real events.
+
+- `binary_exists` (the registration-time PATH probe behind conditional tool
+  registration) now resolves Windows executables through PATHEXT: a bare
+  `nu`/`pwsh` is really `nu.exe`/`pwsh.exe`, so the old exact-name probe
+  missed every installed binary on Windows. Unix behavior is unchanged.
+- `IosToolPending::wait`'s `Duration`-overflow fallback no longer converts an
+  intended-indefinite deadline into an instant `Timeout` (the old
+  `unwrap_or_else(Instant::now)` produced an already-elapsed deadline); the
+  overflowed case now means "wait until the reply or a cancel", which matches
+  the intent of an unbounded wait.
+- The `cancel_wins_over_arrived_reply` bridge test genuinely exercises the
+  POST-reply cancel re-check now: the old version flipped the flag BEFORE
+  `wait` with a `Duration::ZERO` deadline, so it only pinned the pre-wait
+  check and never reached the reply arm it claimed to cover. The predicate
+  now flips the flag on its second invocation (the post-reply re-check), and
+  the per-tool cancel-race tests share one deterministic
+  `cancel_race_fixture`.
+- `toggle_on_device_tools` (choreo-gui) now LOAD-modifies-persists the
+  settings file instead of rewriting it from a fresh struct — a whole-file
+  rewrite from scratch would have silently reset every OTHER preference to
+  its default the moment a second field exists.
 
 - Embedded daemon teardown leaks on the embedder side: the GUI's
   `EMBEDDED_DAEMON` static is now `Mutex<Option<EmbeddedDaemon>>` instead of
@@ -938,21 +921,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bionic TLS-alignment abort on Android fixed (.tdata/.tbss aligned to 64
   at link); BSD sed compatibility in `build-stable.sh`.
 
-### Security
-
-- Dependency supply chain hardened against the arrayref attack.
-- Tool-output safety: six output-sanitization gaps closed across the tool
-  suite; shell-tool spawning hardened; streaming bounded across all tools.
-- Keystore: secrets zeroized; credential modal, keystore auto-bind, and
-  daemon lock-state handling hardened.
-- Transport: fragment reassembly capped and continuation authenticated;
-  handshake hardened to an absolute deadline; concurrent connections
-  capped; writer-loop joins bounded.
-- Trust: client fingerprint comparison tightened with pinned-mode failure
-  UX; enrollment & transport trust model documented in ARCHITECTURE.md.
-
-### Fixed
-
 - `generate_image` post-generation cancellation: `ToolContext.cancelled` is now re-checked the moment the provider
   round-trip returns, so a cancel issued while a (up to 180 s) generation was in flight discards the result before any
   decode/validation/persistence/display work instead of surfacing an image the user already cancelled.
@@ -978,10 +946,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `images::is_zhipu_image_provider_slug` (the client crate owns provider-family knowledge), and
   added pure unit tests for the SSRF guard and the `/coding/paas` → `/paas` base rewrite.
 
+### Security
+
+- Dependency supply chain hardened against the arrayref attack.
+- Tool-output safety: six output-sanitization gaps closed across the tool
+  suite; shell-tool spawning hardened; streaming bounded across all tools.
+- Keystore: secrets zeroized; credential modal, keystore auto-bind, and
+  daemon lock-state handling hardened.
+- Transport: fragment reassembly capped and continuation authenticated;
+  handshake hardened to an absolute deadline; concurrent connections
+  capped; writer-loop joins bounded.
+- Trust: client fingerprint comparison tightened with pinned-mode failure
+  UX; enrollment & transport trust model documented in ARCHITECTURE.md.
+
 ## [0.1.0]
 
 Initial release: daemon, TUI, protocol, Noise transport, provider catalog,
-markdown rendering, PDF tooling, and the 14-crate crates.io suite.
+markdown rendering, PDF tooling, and the 12-crate crates.io suite.
 
 [Unreleased]: https://github.com/choreographr/choreographr/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/choreographr/choreographr/releases/tag/v0.1.0
