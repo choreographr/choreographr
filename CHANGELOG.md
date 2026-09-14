@@ -220,6 +220,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gets project context files and can scope project-local skills (falling back to
   no working directory only if the current directory cannot be read).
 
+- **Project-local skills now shadow global skills of the same name.** Skill
+  discovery deduplicates by frontmatter `name` and scans the project walk
+  before the global `~/.agents/skills` scope, so a project skill wins over a
+  same-named global one (previously both were listed and `load_skill` resolved
+  whichever came first). Discovery is now injectable
+  (`discover_skills(global_home, working_dir)`) so global discovery is
+  unit-testable, and persisting a loaded skill reuses the session's cached
+  skill set instead of re-walking the filesystem.
+
 - **Releases may carry a dance-style name** (major/minor only): `RELEASE.md`
   documents that the conductor picks a name at release time — a dance style
   such as *Lindy*, with no pre-assigned list — and records it in the CHANGELOG
@@ -980,7 +989,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   genuinely depend on a working directory, so they are now gated on
   `Option<&Path>` and the function returns `String` instead of `Option<String>`.
   This also demotes the per-agent-loop-iteration `warn!` for dir-less
-  sessions to a single `debug!`.
+  sessions to a `debug!`.
 
 ### Security
 

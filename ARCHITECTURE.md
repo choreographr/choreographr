@@ -3470,8 +3470,10 @@ from four sources:
 
 Global skills (`~/.agents/skills`) are always scanned; only the project-local
 skills walk (`.agents/skills/` under the working directory) needs a directory.
-The system prompt is rebuilt every turn so that newly loaded skills and newly
-discovered subdirectory hints are visible to the model immediately.
+Skills are deduplicated by frontmatter `name`, and the project walk is scanned
+before the global scope, so a project-local skill **shadows** a same-named
+global one. The system prompt is rebuilt every turn so that newly loaded skills
+and newly discovered subdirectory hints are visible to the model immediately.
 
 ### Discovery algorithm
 
@@ -3498,6 +3500,11 @@ the main context. Any found hint content is appended to the tool result message
 Skills are discovered from:
 - `~/.agents/skills/<name>/SKILL.md` (global — always scanned)
 - `.agents/skills/<name>/SKILL.md` (project, relative to session working directory — scanned only when the session has a working directory)
+
+The project scope is scanned before the global scope and results are
+deduplicated by frontmatter `name`, so a project-local skill shadows a
+same-named global one (and, within the project walk, a more-local skill shadows
+one higher up the tree).
 
 Each `SKILL.md` must have YAML frontmatter with `name` and `description`.
 
@@ -3538,12 +3545,14 @@ Implementation lives in `choreo-daemon/src/context.rs`. Key entry points:
 | Function | Purpose |
 |---|---|
 | `discover_context(working_dir, config)` | Walk filesystem, return `ContextBundle` with all discovered files |
-| `discover_skills(working_dir: Option<&Path>)` | Scan Agent Skills directories — always the global `~/.agents/skills`, plus the project-local walk under `working_dir` only when a directory is present — return `Vec<SkillMeta>` |
+| `discover_skills(global_home: Option<&Path>, working_dir: Option<&Path>)` | Scan Agent Skills directories — the project-local walk under `working_dir` (only when a directory is present) first, then the global `<global_home>/.agents/skills` — deduplicated by frontmatter `name` so project skills shadow global ones; return `Vec<SkillMeta>`. `global_home` is injected so tests can supply a temp home. |
+| `discover_skills_ambient(working_dir: Option<&Path>)` | `discover_skills` with `dirs::home_dir()` as the global scope — the production entry point |
 | `assemble_context(bundle)` | Render discovered files into an XML-like format for injection |
 | `build_base_prompt(skills, groups, loaded_skills)` | Build the stable system prompt (identity + tool groups + skill metadata + loaded skill bodies) |
 | `recheck_context(working_dir, config, old_fp)` | Re-discover and compare fingerprints |
 | `subdirectory_hints(tool_name, args, working_dir, known)` | Return `Option<(String, Vec<PathBuf>)>` — subdirectory hint text and newly discovered paths |
-| `load_skill_body(name, working_dir: Option<&Path>)` | Load the full body of a SKILL.md, stripping YAML frontmatter; forwards `working_dir` into `discover_skills` |
+| `load_skill_body_from(skills: &[SkillMeta], name)` | Read a skill's body from an already-resolved (e.g. cached `SessionState::discovered_skills`) skill list, stripping YAML frontmatter |
+| `load_skill_body(name, working_dir: Option<&Path>)` | Discover then read a skill's body; convenience for callers without a cached skill set (the `load_skill` tool) |
 
 ### Tool: `load_skill`
 

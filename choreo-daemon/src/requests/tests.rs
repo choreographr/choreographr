@@ -2894,6 +2894,39 @@ fn persist_loaded_skill_without_working_dir_unknown_skill_not_added() {
     assert!(session.loaded_skill_bodies.is_empty());
 }
 
+#[test]
+fn persist_loaded_skill_reads_body_from_cached_skills() {
+    // The persistence path must reuse the session's discovered-skill cache
+    // rather than re-walking the filesystem: populate the cache with a meta
+    // whose SKILL.md lives in a temp dir and confirm its body is read.
+    let dir = tempfile::tempdir().unwrap();
+    let skill_md = dir.path().join("SKILL.md");
+    std::fs::write(
+        &skill_md,
+        "---\nname: cached-skill\ndescription: cached\n---\n\ncached body text\n---\n",
+    )
+    .unwrap();
+
+    let mut session = SessionState::empty();
+    session.discovered_skills = Some(vec![crate::context::SkillMeta {
+        name: "cached-skill".into(),
+        description: "cached".into(),
+        path: skill_md,
+    }]);
+
+    persist_loaded_skill(&mut session, "load_skill", r#"{"name": "cached-skill"}"#);
+
+    assert_eq!(session.loaded_skill_bodies.len(), 1);
+    assert_eq!(session.loaded_skill_bodies[0].name, "cached-skill");
+    assert!(
+        session.loaded_skill_bodies[0]
+            .body
+            .contains("cached body text"),
+        "body: {}",
+        session.loaded_skill_bodies[0].body
+    );
+}
+
 // -- build_system_content tests -----------------------------------------
 
 fn setup_build_system_content_session() -> (SessionState, Arc<ToolRegistry>, tempfile::TempDir) {
@@ -2947,7 +2980,10 @@ fn build_system_content_without_working_dir() {
     let registry = ToolRegistry::new().build();
     let content = test_build_content(&mut session, &registry, &[]);
     assert!(content.contains("Tool groups"));
-    assert!(!content.contains("AGENTS.md"));
+    // The structural marker for injected project-context files is absent —
+    // a stronger, more durable check than grepping for a filename that the
+    // base prompt could legitimately mention someday.
+    assert!(!content.contains("<agent_instructions"));
 }
 
 #[test]

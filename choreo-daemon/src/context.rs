@@ -235,25 +235,42 @@ fn default_system_prompt() -> String {
     include_str!("../system.md").to_string()
 }
 
-pub fn discover_skills(working_dir: Option<&Path>) -> Vec<SkillMeta> {
+/// Discover skills from the global scope and an optional project scope.
+///
+/// `global_home` is the base of the always-on global scope —
+/// `<global_home>/.agents/skills` is scanned unconditionally. Production
+/// passes `dirs::home_dir()` (see [`discover_skills_ambient`]); it is a
+/// parameter so tests can inject a temp directory instead of reading the
+/// developer's real home, which makes global discovery deterministic.
+///
+/// `working_dir` scopes the project-local walk; when `None` only the global
+/// scope is read (a dir-less session still gets global skills).
+///
+/// Precedence: the PROJECT walk is scanned first and the global scope LAST, so
+/// a project-local skill **shadows** a same-named global skill (dedup is by
+/// frontmatter `name`, the identity `load_skill` resolves by). Within the
+/// project walk the most-local directory is scanned first, so a skill beats a
+/// same-named one higher up the tree.
+pub fn discover_skills(global_home: Option<&Path>, working_dir: Option<&Path>) -> Vec<SkillMeta> {
     let mut skills = Vec::new();
-    let mut seen = HashSet::new();
+    // Dedup by frontmatter name: the first occurrence wins. Because the
+    // project walk below runs before the global scope, this gives project
+    // skills precedence over global ones of the same name.
+    let mut seen_names = HashSet::new();
 
-    // Global skills are independent of the session working directory, so a
-    // dir-less session still gets them; only the project-local walk below
-    // needs a directory to scope it.
-    if let Some(home) = dirs::home_dir() {
-        scan_skills_dir(&home.join(".agents").join("skills"), &mut skills, &mut seen);
-    }
-
-    // Project-local skills need a working directory to scope the walk up to
-    // the git-root (or filesystem) boundary.
+    // Project-local skills first (most-local wins), scoped up to the git-root
+    // (or filesystem) boundary. Needs a working directory; a dir-less session
+    // simply has no project scope.
     if let Some(working_dir) = working_dir {
         let git_root = find_git_root(working_dir);
         let boundary = git_root.as_deref().unwrap_or_else(|| Path::new("/"));
         let mut current = Some(working_dir.to_path_buf());
         while let Some(dir) = current {
-            scan_skills_dir(&dir.join(".agents").join("skills"), &mut skills, &mut seen);
+            scan_skills_dir(
+                &dir.join(".agents").join("skills"),
+                &mut skills,
+                &mut seen_names,
+            );
             if dir == boundary {
                 break;
             }
@@ -261,10 +278,28 @@ pub fn discover_skills(working_dir: Option<&Path>) -> Vec<SkillMeta> {
         }
     }
 
+    // Global scope LAST: the lowest-precedence fallback, so a global skill only
+    // lands here when no project skill shares its name. Independent of the
+    // working directory, so a dir-less session still discovers global skills.
+    if let Some(global_home) = global_home {
+        scan_skills_dir(
+            &global_home.join(".agents").join("skills"),
+            &mut skills,
+            &mut seen_names,
+        );
+    }
+
     skills
 }
 
-fn scan_skills_dir(dir: &Path, skills: &mut Vec<SkillMeta>, seen: &mut HashSet<PathBuf>) {
+/// [`discover_skills`] with the real home directory (`dirs::home_dir()`) as the
+/// global scope. Production call sites use this; tests call [`discover_skills`]
+/// directly to inject a temp home so global discovery is deterministic.
+pub fn discover_skills_ambient(working_dir: Option<&Path>) -> Vec<SkillMeta> {
+    discover_skills(dirs::home_dir().as_deref(), working_dir)
+}
+
+fn scan_skills_dir(dir: &Path, skills: &mut Vec<SkillMeta>, seen_names: &mut HashSet<String>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -276,8 +311,10 @@ fn scan_skills_dir(dir: &Path, skills: &mut Vec<SkillMeta>, seen: &mut HashSet<P
             continue;
         }
         let skill_md = path.join("SKILL.md");
+        // Dedup on the frontmatter name: a project skill shadows a same-named
+        // global skill because the project walk runs first.
         if let Some(meta) = parse_skill_metadata(&skill_md)
-            && seen.insert(skill_md.clone())
+            && seen_names.insert(meta.name.clone())
         {
             skills.push(meta);
         }
@@ -309,12 +346,23 @@ fn extract_yaml_frontmatter(content: &str) -> Option<String> {
     Some(rest.get(..end).unwrap_or("").trim().to_string())
 }
 
-pub fn load_skill_body(name: &str, working_dir: Option<&Path>) -> Option<String> {
-    let skills = discover_skills(working_dir);
-    let meta = skills.into_iter().find(|s| s.name == name)?;
+/// Read a skill's body from an already-resolved [`SkillMeta`] list.
+///
+/// Callers that hold a discovered/cached skill set — notably
+/// `persist_loaded_skill` reusing `SessionState::discovered_skills` — use this
+/// to avoid re-walking the filesystem.
+pub fn load_skill_body_from(skills: &[SkillMeta], name: &str) -> Option<String> {
+    let meta = skills.iter().find(|s| s.name == name)?;
     let content = fs::read_to_string(&meta.path).ok()?;
-    let body = extract_skill_body(&content)?;
-    Some(body)
+    extract_skill_body(&content)
+}
+
+/// Discover then read a skill's body. Convenience for callers without a cached
+/// skill set (the `load_skill` tool); the persistence path uses
+/// [`load_skill_body_from`] with the session's cached skills instead.
+pub fn load_skill_body(name: &str, working_dir: Option<&Path>) -> Option<String> {
+    let skills = discover_skills_ambient(working_dir);
+    load_skill_body_from(&skills, name)
 }
 
 fn extract_skill_body(content: &str) -> Option<String> {
@@ -623,7 +671,7 @@ mod tests {
             "---\nname: test-skill\ndescription: A test skill for testing\n---\n\n# Instructions",
         );
 
-        let skills = discover_skills(Some(tmp.path()));
+        let skills = discover_skills(None, Some(tmp.path()));
         assert!(skills.iter().any(|s| s.name == "test-skill"));
         assert!(
             skills
@@ -633,11 +681,57 @@ mod tests {
     }
 
     #[test]
-    fn discover_skills_none_is_ok() {
-        // A dir-less session still discovers global skills; only assert that
-        // the call returns (the ambient ~/.agents/skills may be empty).
-        let skills = discover_skills(None);
-        let _ = skills;
+    fn discover_skills_global_only_without_working_dir() {
+        // A dir-less session has no project scope but still discovers the
+        // global scope. Injecting a temp home makes this deterministic — no
+        // dependence on the developer's ambient ~/.agents/skills.
+        let home = TempDir::new().unwrap();
+        let skill_dir = home
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("global-skill");
+        write_file(
+            &skill_dir,
+            "SKILL.md",
+            "---\nname: global-skill\ndescription: A global skill\n---\n\n# Body",
+        );
+
+        let skills = discover_skills(Some(home.path()), None);
+        assert!(
+            skills.iter().any(|s| s.name == "global-skill"),
+            "a dir-less session must still discover global skills"
+        );
+    }
+
+    #[test]
+    fn discover_skills_project_shadows_global_same_name() {
+        // A project-local skill must win over a same-named global skill AND the
+        // duplicate must be deduped (one entry, not two).
+        let home = TempDir::new().unwrap();
+        let global_dir = home.path().join(".agents").join("skills").join("shared");
+        write_file(
+            &global_dir,
+            "SKILL.md",
+            "---\nname: shared\ndescription: global description\n---\n\n# global body",
+        );
+
+        let project = TempDir::new().unwrap();
+        let project_dir = project.path().join(".agents").join("skills").join("shared");
+        write_file(
+            &project_dir,
+            "SKILL.md",
+            "---\nname: shared\ndescription: project description\n---\n\n# project body",
+        );
+
+        let skills = discover_skills(Some(home.path()), Some(project.path()));
+        let shared: Vec<_> = skills.iter().filter(|s| s.name == "shared").collect();
+        assert_eq!(shared.len(), 1, "same-named skills must be deduped by name");
+        assert_eq!(
+            shared[0].description, "project description",
+            "the project-local skill must shadow the global one"
+        );
+        assert!(shared[0].path.starts_with(project.path()));
     }
 
     #[test]
@@ -681,5 +775,23 @@ mod tests {
 
         let body = load_skill_body("test-skill", Some(tmp.path())).unwrap();
         assert!(body.contains("skill body content"));
+    }
+
+    #[test]
+    fn load_skill_body_from_reads_a_resolved_meta() {
+        // The cached-skill path used by `persist_loaded_skill`: resolve once,
+        // then read the body without re-walking the filesystem.
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join(".agents").join("skills").join("test-skill");
+        write_file(
+            &skills_dir,
+            "SKILL.md",
+            "---\nname: test-skill\ndescription: A test skill\n---\n\nThis is the skill body content.",
+        );
+
+        let skills = discover_skills(None, Some(tmp.path()));
+        let body = load_skill_body_from(&skills, "test-skill").unwrap();
+        assert!(body.contains("skill body content"));
+        assert!(load_skill_body_from(&skills, "absent").is_none());
     }
 }

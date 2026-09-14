@@ -105,10 +105,29 @@ pub(crate) fn persist_loaded_skill(
         debug!("skill '{}' already loaded, skipping", name);
         return;
     }
-    // Skills come from the always-scanned global `~/.agents/skills` plus,
-    // when the session has one, the project-local scope under the working
-    // directory — so a dir-less session can still load a global skill.
-    if let Some(body) = context::load_skill_body(&name, session.config.working_dir.as_deref()) {
+    // Reuse the session's discovered-skill cache so persisting a loaded skill
+    // does not re-walk the filesystem: the agent loop populates
+    // `discovered_skills` before any tool runs and it is invalidated on a
+    // working-dir change. Fall back to a fresh ambient discovery only if the
+    // cache is unset (e.g. a direct call in a test), preserving behavior. The
+    // scope is the always-scanned global `~/.agents/skills` plus, when the
+    // session has one, the project-local scope under the working directory —
+    // so a dir-less session can still load a global skill. The borrow of the
+    // cache is confined to this block so the push below can take `session`
+    // mutably.
+    let body = {
+        let discovered;
+        let skills: &[context::SkillMeta] = match session.discovered_skills.as_deref() {
+            Some(skills) => skills,
+            None => {
+                discovered =
+                    context::discover_skills_ambient(session.config.working_dir.as_deref());
+                &discovered
+            }
+        };
+        context::load_skill_body_from(skills, &name)
+    };
+    if let Some(body) = body {
         info!("loaded skill body: '{}' ({} bytes)", name, body.len());
         session.loaded_skill_bodies.push(LoadedSkill { name, body });
     } else {

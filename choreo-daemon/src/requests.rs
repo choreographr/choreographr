@@ -384,7 +384,7 @@ pub(crate) fn run_agent_loop(
     // Global skills are always discoverable; discovery handles the optional
     // project scope internally, so a dir-less session still gets them.
     if session.discovered_skills.is_none() {
-        session.discovered_skills = Some(context::discover_skills(
+        session.discovered_skills = Some(context::discover_skills_ambient(
             session.config.working_dir.as_deref(),
         ));
     }
