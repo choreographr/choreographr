@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompting.", instead of sending a `RunInput` the daemon cannot start. The
   guard is client-side only (the daemon remains authoritative) and fails open
   when no session status is known yet. Rejected text stays in the input bar and
-  the per-session draft is preserved; slash-commands (e.g. `/cancel`) still
-  pass through. A future change will replace this with prompt queueing for
-  async tool calls.
+  the per-session draft is preserved. Slash-commands bypass the guard so they
+  stay usable mid-turn (e.g. `/cancel`), with the one deliberate exception of
+  `/continue`, itself a new-turn trigger and hence guarded too. A future change
+  will replace this with prompt queueing for async tool calls.
 - Autostart feedback in the TUI: while the autostart hook spawns the daemon
   and waits for its socket, the status line shows "no daemon running —
   starting choreographr…" (then "daemon started") via a new
@@ -36,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the idle test explicit and shared. Behaviour change: a locked-keystore
   rejection now runs before the input buffer is cleared, so the rejected text
   is preserved (matching the idle-guard behaviour) instead of being dropped.
+- The two `ContinueGeneration` senders (Alt+Enter and `/continue`) collapsed
+  into a single `connection::chat::send_continue_generation` helper that owns
+  the guard, request-id allocation, in-flight tracking and send, so the two
+  triggers can no longer drift. The only intended difference is the shell echo:
+  `/continue` shows `> continue`, Alt+Enter does not.
 - The "nothing is listening" dial classification (`NotFound` /
   `ConnectionRefused`) moved into a shared predicate,
   `choreo_proto::dial_error_means_no_listener`, used by the TUI connection

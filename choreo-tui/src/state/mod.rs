@@ -1913,6 +1913,14 @@ impl App {
             // idle-guard in `connection/chat.rs`, which reads `attached_status`
             // and would wrongly reject a prompt as "session not idle" when
             // nothing is attached at all.
+            //
+            // This restores the invariant `attached_session_id == None`
+            // implies `attached_status == None`, which the auto-attach path in
+            // `handle_sessions` relies on: it re-binds `attached_session_id`
+            // (and only that) before the daemon's `SessionAttached` reply
+            // refreshes the status, so a stale `attached_status` would leak
+            // across the switch.  Every path that clears `attached_session_id`
+            // must clear these two alongside it.
             self.attached_status = None;
             self.attached_tool_groups.clear();
             // The deleted session's unsent prompt dies with it — the display

@@ -1589,7 +1589,13 @@ UX guard only — the daemon stays authoritative, and an unknown status (`None`,
 e.g. a fresh client) fails open. For a plain prompt the guard runs *before* the
 input buffer is cleared and the per-session draft forgotten, so a rejected
 prompt stays in the input bar to resubmit; slash-commands (e.g. `/cancel`) skip
-the guard entirely so they stay available while a session is busy.
+the guard entirely so they stay available while a session is busy — the lone
+exception being `/continue`, which is itself a new-turn trigger and so is
+guarded too. The two `ContinueGeneration` senders (Alt+Enter and `/continue`)
+share a single `connection::chat::send_continue_generation` helper that owns
+the guard, the request-id allocation, the in-flight tracking and the send, so
+the triggers cannot drift; they differ only in whether they echo `> continue`
+(the typed command does, the bare keypress does not).
 `attached_status` (and `attached_tool_groups`) are cleared when the attached
 session is deleted (`handle_session_deleted`), so a later prompt with nothing
 attached fails open instead of being rejected against a dead session's stale

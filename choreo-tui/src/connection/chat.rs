@@ -11,6 +11,58 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 
+/// Send a `ContinueGeneration` for the attached session — the shared body of
+/// the two new-turn triggers that map to it, Alt+Enter and `/continue`.
+///
+/// Runs the shared client-side submit guard ([`App::new_turn_rejection`])
+/// first: a not-idle session or a locked keystore is refused locally with the
+/// guard's status message instead of a round-trip the daemon would only answer
+/// with a transient failure.  On success it allocates the request id, records
+/// the in-flight request on the active display (when one exists), ships the
+/// message, and scrolls to the newest turn.  `echo` shows the `> continue`
+/// shell echo — set for `/continue` (a typed command) but not for Alt+Enter
+/// (a bare keypress is its own feedback).
+///
+/// With no session attached it reports "no session attached" and sends
+/// nothing.  Returns `Ok(())` whether the turn was sent or refused; only a
+/// broken client channel is an error, so callers can `?` this directly.
+fn send_continue_generation(
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    echo: bool,
+) -> Result<(), ClientError> {
+    if app.attached_session_id.is_none() {
+        tracing::debug!("continue ignored — no session attached");
+        app.status = Some("no session attached".to_string());
+        return Ok(());
+    }
+    // Shared guard with the plain-prompt path: a `ContinueGeneration` becomes a
+    // fresh `RunInput` turn, so it cannot begin while the session is busy or the
+    // keystore is locked.  See `App::new_turn_rejection`.
+    if let Some(reason) = app.new_turn_rejection() {
+        tracing::debug!(reason, "[choreo-tui] continue rejected client-side");
+        app.status = Some(reason.to_string());
+        app.error = None;
+        return Ok(());
+    }
+    if echo && let Some(text) = shell_command_echo(&ShellCommand::Continue) {
+        app.status = Some(text);
+    }
+    let request_id = app.next_request_id;
+    app.next_request_id = app.next_request_id.wrapping_add(1);
+    // The guard above already checked `attached_session_id`, but the display
+    // entry may not exist yet — track the in-flight request only when there is
+    // a display to hold it, never panic on a missing one.
+    if let Some(display) = app.active_display() {
+        display.active.insert(request_id);
+    }
+    client_tx
+        .send(ClientMessage::ContinueGeneration { request_id })
+        .map_err(broken_pipe)?;
+    app.scroll_to(0);
+    Ok(())
+}
+
 pub(super) fn handle_chat_event(
     event: Event,
     app: &mut App,
@@ -33,37 +85,12 @@ pub(super) fn handle_chat_event(
                 _ if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     handle_chat_ctrl_key(key, app, client_tx)?;
                 }
-                // Alt+Enter → continue generation
+                // Alt+Enter → continue generation.  Shares the new-turn guard
+                // and the `ContinueGeneration` send with the `/continue`
+                // command; Alt+Enter is a bare keypress, so it shows no
+                // `> continue` echo (`echo = false`).
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                    if app.attached_session_id.is_some() {
-                        // Alt+Enter sends a `ContinueGeneration`, which the
-                        // daemon turns into a fresh `RunInput` turn — so the same
-                        // client-side submit guard that protects a plain prompt
-                        // applies here too.  See `App::new_turn_rejection`.
-                        if let Some(reason) = app.new_turn_rejection() {
-                            tracing::debug!(reason, "[choreo-tui] Alt+Enter rejected client-side");
-                            app.status = Some(reason.to_string());
-                            app.error = None;
-                            return Ok(());
-                        }
-                        tracing::debug!("Alt+Enter continuing generation");
-                        let request_id = app.next_request_id;
-                        app.next_request_id = app.next_request_id.wrapping_add(1);
-                        // The guard above already checked attached_session_id,
-                        // but the display entry may not exist yet — track the
-                        // in-flight request only when there is a display to
-                        // record it in, never panic on a missing one.
-                        if let Some(display) = app.active_display() {
-                            display.active.insert(request_id);
-                        }
-                        client_tx
-                            .send(ClientMessage::ContinueGeneration { request_id })
-                            .map_err(broken_pipe)?;
-                        app.scroll_to(0);
-                    } else {
-                        tracing::debug!("Alt+Enter ignored — no session attached");
-                        app.status = Some("no session attached".to_string());
-                    }
+                    send_continue_generation(app, client_tx, false)?;
                 }
                 KeyCode::Esc => {
                     if app.attached_session_id.is_some() {
@@ -313,38 +340,10 @@ pub(super) fn handle_chat_event(
                             let _ = client_tx.send(ClientMessage::Redo);
                         }
                         ShellCommand::Continue => {
-                            if app.attached_session_id.is_some() {
-                                // `/continue` sends the same `ContinueGeneration`
-                                // that Alt+Enter does, so it goes through the same
-                                // client-side submit guard — a new turn cannot
-                                // start while the session is busy or the keystore
-                                // is locked.  See `App::new_turn_rejection`.
-                                if let Some(reason) = app.new_turn_rejection() {
-                                    tracing::debug!(
-                                        reason,
-                                        "[choreo-tui] /continue rejected client-side"
-                                    );
-                                    app.status = Some(reason.to_string());
-                                    return Ok(());
-                                }
-                                if let Some(echo) = shell_command_echo(&ShellCommand::Continue) {
-                                    app.status = Some(echo);
-                                }
-                                let request_id = app.next_request_id;
-                                app.next_request_id = app.next_request_id.wrapping_add(1);
-                                // The guard above already checked attached_session_id,
-                                // but the display entry may not exist yet — only
-                                // track the request when there is a display to hold it.
-                                if let Some(display) = app.active_display() {
-                                    display.active.insert(request_id);
-                                }
-                                client_tx
-                                    .send(ClientMessage::ContinueGeneration { request_id })
-                                    .map_err(broken_pipe)?;
-                                app.scroll_to(0);
-                            } else {
-                                app.status = Some("no session attached".to_string());
-                            }
+                            // `/continue` is the shell-command spelling of
+                            // Alt+Enter — same guard, same `ContinueGeneration`
+                            // — but it echoes `> continue` (`echo = true`).
+                            send_continue_generation(app, client_tx, true)?;
                         }
                         ShellCommand::Stop => {
                             if let Some(echo) = shell_command_echo(&ShellCommand::Stop) {
