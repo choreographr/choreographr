@@ -362,6 +362,44 @@ fn alt_enter_while_idle_is_sent() {
 }
 
 #[test]
+fn continue_command_while_busy_is_rejected_by_the_same_guard() {
+    // `/continue` is the shell-command spelling of Alt+Enter, so it must trip
+    // the same new-turn guard while the session is not idle.
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    app.attached_status = Some(SessionStatus::Inference);
+    app.input.text = "/continue".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_enter(&mut app, &tx);
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("Session is not idle, please wait before prompting.")
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no ContinueGeneration may be sent while the session is busy"
+    );
+}
+
+#[test]
+fn continue_command_while_locked_is_rejected_by_the_same_guard() {
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    app.attached_status = Some(SessionStatus::Inactive);
+    app.keystore_locked = true;
+    app.input.text = "/continue".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_enter(&mut app, &tx);
+
+    let status = app.status.as_deref().expect("lock feedback status");
+    assert!(status.contains("locked"), "got: {status}");
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn terminal_event_esc_noop_on_chat() {
     let (tx, _rx) = std::sync::mpsc::channel();
 

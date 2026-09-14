@@ -1572,8 +1572,9 @@ misleading `X / ?` fill when the context window isn't loaded), and `/lock`
 (re-)latches the banner via a `Locked` broadcast.
 
 **New-turn submit guard (client-side).** Every action that begins a new
-inference turn — a plain prompt (`RunInput`) and Alt+Enter
-(`ContinueGeneration`, which the daemon turns into a `RunInput`) — runs through
+inference turn — a plain prompt (`RunInput`), Alt+Enter, and the `/continue`
+command (the latter two both becoming a `ContinueGeneration`, which the daemon
+turns into a `RunInput`) — runs through
 the single `App::new_turn_rejection` helper. It returns the rejection message
 (`None` = allowed) for two conditions, in order: the attached session is not
 idle, or the daemon's keystore is locked. The idle branch reads

@@ -313,10 +313,23 @@ pub(super) fn handle_chat_event(
                             let _ = client_tx.send(ClientMessage::Redo);
                         }
                         ShellCommand::Continue => {
-                            if let Some(echo) = shell_command_echo(&ShellCommand::Continue) {
-                                app.status = Some(echo);
-                            }
                             if app.attached_session_id.is_some() {
+                                // `/continue` sends the same `ContinueGeneration`
+                                // that Alt+Enter does, so it goes through the same
+                                // client-side submit guard — a new turn cannot
+                                // start while the session is busy or the keystore
+                                // is locked.  See `App::new_turn_rejection`.
+                                if let Some(reason) = app.new_turn_rejection() {
+                                    tracing::debug!(
+                                        reason,
+                                        "[choreo-tui] /continue rejected client-side"
+                                    );
+                                    app.status = Some(reason.to_string());
+                                    return Ok(());
+                                }
+                                if let Some(echo) = shell_command_echo(&ShellCommand::Continue) {
+                                    app.status = Some(echo);
+                                }
                                 let request_id = app.next_request_id;
                                 app.next_request_id = app.next_request_id.wrapping_add(1);
                                 // The guard above already checked attached_session_id,

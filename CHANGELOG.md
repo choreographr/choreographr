@@ -28,8 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The TUI's client-side submit guard is now a single `App::new_turn_rejection`
   helper covering both the idle check and the keystore-locked check, and it is
-  applied to **every** action that begins a new turn — a plain prompt *and*
-  Alt+Enter (`ContinueGeneration`), which was previously unguarded. A new
+  applied to **every** action that begins a new turn — a plain prompt, Alt+Enter,
+  and the `/continue` command (all of which end up as `RunInput` /
+  `ContinueGeneration`) — so the `/continue` path that was previously unguarded
+  is now covered too. A new
   `SessionStatus::is_idle` (exactly `Inactive`; `Sleeping` is not idle) makes
   the idle test explicit and shared. Behaviour change: a locked-keystore
   rejection now runs before the input buffer is cleared, so the rejected text
