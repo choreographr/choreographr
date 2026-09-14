@@ -1571,6 +1571,20 @@ at inference time (the client-driven guard beats waiting for a transient
 misleading `X / ?` fill when the context window isn't loaded), and `/lock`
 (re-)latches the banner via a `Locked` broadcast.
 
+**Idle-guard (submit-time).** Submitting a plain prompt (`RunInput`) while the
+attached session is not idle is rejected CLIENT-SIDE with the status message
+"Session is not idle, please wait before prompting." — a `RunInput` can only
+begin a new turn from `Inactive`, so the guard beats sending a message the
+daemon cannot start. It reads `App::attached_status` (kept fresh from session
+summaries, `SessionStatusChanged` broadcasts, and `SessionAttached` replies)
+and, like the keystore-lock guard, is a client-side UX guard only — the daemon
+stays authoritative, and an unknown status (`None`, e.g. a fresh client) fails
+open. The check runs *before* the input buffer is cleared and the per-session
+draft forgotten, so a rejected prompt stays in the input bar to resubmit;
+slash-commands (e.g. `/cancel`) also stay available while a session is busy.
+A future change replaces this blunt guard with prompt queueing for async tool
+calls. See `connection/chat.rs`.
+
 **Module breakdown:**
 
 | Module | Purpose |

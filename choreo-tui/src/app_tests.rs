@@ -3,7 +3,7 @@ use crate::markdown_render::*;
 use crate::state::*;
 use crate::test_util::{make_session, test_app};
 use choreo_proto::{
-    AccountInfo, CatalogProvider, ClientMessage, DaemonMessage, RefreshStatus, Turn,
+    AccountInfo, CatalogProvider, ClientMessage, DaemonMessage, RefreshStatus, SessionStatus, Turn,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
@@ -156,6 +156,143 @@ fn submitting_prompt_while_locked_is_rejected_with_feedback() {
         "no RunInput may be sent to a locked daemon"
     );
     assert!(app.keystore_locked, "the lock flag stays latched");
+}
+
+// ── Prompts are only accepted while the session is idle ──
+//
+// A plain prompt (RunInput) begins a new inference turn, which the daemon can
+// only start when the session is idle.  Submitting one while the session is
+// busy must be rejected client-side with a clear status message — and, just as
+// importantly, must NOT clear the input buffer or forget the per-session draft
+// (otherwise the user's text would be silently lost).  Slash-commands stay
+// available so the user can still e.g. `/cancel`.
+
+/// Drive a bare Enter keypress through the full terminal-event pipeline.
+fn press_enter(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>) {
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        app,
+        tx,
+    )
+    .expect("handle enter");
+}
+
+#[test]
+fn submitting_prompt_while_busy_is_rejected_and_preserves_input() {
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    // The attached session is mid-inference.
+    app.attached_status = Some(SessionStatus::Inference);
+    app.input.text = "hello".to_string();
+    app.input.cursor = 5;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_enter(&mut app, &tx);
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("Session is not idle, please wait before prompting.")
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no RunInput may be sent while the session is busy"
+    );
+    // The user's text must survive the rejection — a rejected prompt is still
+    // an unsent prompt, so it stays in the input bar ready to resubmit.
+    assert_eq!(app.input.text, "hello", "input buffer must be preserved");
+    assert_eq!(app.input.cursor, 5, "cursor position must be preserved");
+}
+
+#[test]
+fn submitting_prompt_while_sleeping_is_rejected() {
+    // Only `Inactive` is idle: a `Sleeping` session cannot accept a prompt
+    // either, so it is rejected the same way.
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    app.attached_status = Some(SessionStatus::Sleeping);
+    app.input.text = "hello".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_enter(&mut app, &tx);
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("Session is not idle, please wait before prompting.")
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn submitting_prompt_while_idle_is_sent() {
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    app.attached_status = Some(SessionStatus::Inactive);
+    app.input.text = "hello".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_enter(&mut app, &tx);
+
+    assert!(app.input.is_empty());
+    assert_eq!(
+        rx.recv().expect("sent message"),
+        ClientMessage::RunInput {
+            request_id: 1,
+            input: b"hello".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn submitting_prompt_with_unknown_status_fails_open() {
+    // No status known yet (fresh client / pre-report window): the daemon stays
+    // the authority, so the prompt is sent rather than blocked.
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    app.attached_status = None;
+    app.input.text = "hello".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_enter(&mut app, &tx);
+
+    assert!(
+        rx.try_recv().is_ok(),
+        "unknown status must fail open and send the prompt"
+    );
+}
+
+#[test]
+fn slash_command_is_accepted_while_busy() {
+    // The guard only applies to plain prompts: a shell command such as
+    // `/cancel` must still reach the daemon while the session is busy.
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    app.attached_status = Some(SessionStatus::Inference);
+    app.input.text = "/models".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_enter(&mut app, &tx);
+
+    assert_eq!(
+        rx.recv().expect("sent message"),
+        ClientMessage::ListModels,
+        "slash-commands must bypass the idle guard"
+    );
+}
+
+#[test]
+fn empty_submission_while_busy_is_a_noop() {
+    // An empty line is `ShellCommand::Empty`, not a prompt — it must not trip
+    // the guard and must not set an error status.
+    let mut app = test_app();
+    app.attached_session_id = Some(42);
+    app.attached_status = Some(SessionStatus::Inference);
+    app.input.text = "".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    press_enter(&mut app, &tx);
+
+    assert_eq!(app.status, None);
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]

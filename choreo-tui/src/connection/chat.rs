@@ -6,7 +6,7 @@ use crate::{ShellCommand, clipboard, parse_input_line, selection};
 use choreo_client_core::{
     ClientError, broken_pipe, build_add_credential_message, resolve_private_key, shell_command_echo,
 };
-use choreo_proto::ClientMessage;
+use choreo_proto::{ClientMessage, SessionStatus};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
@@ -107,6 +107,40 @@ pub(super) fn handle_chat_event(
                 }
                 KeyCode::Enter => {
                     let line = app.input.text.trim().to_string();
+                    // Client-side UX guard: a plain prompt (RunInput) can only be
+                    // accepted while the attached session is idle (`Inactive`).
+                    // While the session is busy (inferring / tool call / retrying /
+                    // sleeping) the daemon cannot begin a new turn, so reject the
+                    // submission immediately with clear feedback.  This mirrors the
+                    // keystore-locked guard below and, crucially, runs *before* the
+                    // input buffer is cleared and the per-session draft forgotten
+                    // (`clear_current_draft`) — otherwise a rejected prompt would
+                    // silently vanish and the user would have to retype it.
+                    // Slash-commands pass through untouched so the user can still
+                    // e.g. `/cancel` the in-flight request.
+                    //
+                    // A `None` status (fresh client, or the brief window before the
+                    // daemon reports one) fails open, exactly like the
+                    // reasoning-capability check below: the daemon stays the
+                    // authority and will reject a genuinely-busy submission.
+                    //
+                    // TODO: replace this blunt guard with prompt queueing, so a
+                    // prompt submitted mid-turn is held and dispatched when the
+                    // session returns to idle instead of being refused.
+                    if !line.is_empty()
+                        && !line.starts_with('/')
+                        && let Some(status) = app.attached_status.as_ref()
+                        && *status != SessionStatus::Inactive
+                    {
+                        tracing::debug!(
+                            ?status,
+                            "[choreo-tui] prompt rejected client-side: session not idle"
+                        );
+                        app.status =
+                            Some("Session is not idle, please wait before prompting.".to_string());
+                        app.error = None;
+                        return Ok(());
+                    }
                     app.input.clear();
                     // The prompt was sent — forget the per-session draft so it
                     // doesn't resurface when the user returns to this session.

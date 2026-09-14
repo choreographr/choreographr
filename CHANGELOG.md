@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The TUI now rejects a prompt submitted while the attached session is not
+  idle with the status message "Session is not idle, please wait before
+  prompting.", instead of sending a `RunInput` the daemon cannot start. The
+  guard is client-side only (the daemon remains authoritative) and fails open
+  when no session status is known yet. Rejected text stays in the input bar and
+  the per-session draft is preserved; slash-commands (e.g. `/cancel`) still
+  pass through. A future change will replace this with prompt queueing for
+  async tool calls.
 - Autostart feedback in the TUI: while the autostart hook spawns the daemon
   and waits for its socket, the status line shows "no daemon running —
   starting choreographr…" (then "daemon started") via a new
