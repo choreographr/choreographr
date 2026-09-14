@@ -28,8 +28,8 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 
 ## Workspace topology
 
-Sixteen crates in a single Cargo workspace (resolver = "3") — the root
-package plus fifteen members:
+Nineteen crates in a single Cargo workspace (resolver = "3") — the root
+package plus eighteen members:
 
 ```
 Choreographr (workspace)
@@ -67,6 +67,10 @@ Choreographr (workspace)
 ├── choreo-daemon          Unix socket server — the core engine (library; the
 │                       daemon binary `choreographr` is declared by the root
 │                       package)
+├── choreo-blockchain      Blockchain tools — EVM (alloy) and Substrate/Polkadot
+│                       (subxt) read-only queries + the tokio sidecar runtime they
+│                       need (linked only via the daemon's `blockchain` feature,
+│                       off by default)
 ├── choreo-acp             ACP bridge — translates the Agent Communication Protocol
 │                       (JSON-RPC over stdin/stdout) into choreo-proto messages over the
 │                       daemon's Unix socket, enabling ACP-compatible editors (Claude
@@ -198,7 +202,7 @@ it to `x86_64-unknown-linux-musl` with `--features mimalloc`, so one artifact
 runs on any Linux kernel regardless of the host's glibc version (this also
 replaces the old "build inside an old-glibc container" compatibility dance).
 The `.deb`/`.rpm` remain native glibc host-target builds without the
-`mimalloc` feature — see `scripts/release.sh`. The tarball holds the four
+`mimalloc` feature — see `scripts/release.sh`. The tarball holds the two
 binaries at the **top level** (no `bin/` prefix)
 plus both service files, exec bits preserved — `install.sh` and the Homebrew
 formula reference them directly.
@@ -306,7 +310,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 | `build-deb-termux.sh` | Build the **Termux-native** `.deb` from the already-cross-built `target/android/arm64-v8a/` binaries (NO rebuild) — package `choreographr`, `Architecture: aarch64` (Termux's tag, not Debian's `arm64`), files at `./data/data/com.termux/files/usr/bin/<name>` — Termux's dpkg installs against `/` with no chroot, so the package must carry the real on-device path of the fixed `$PREFIX` (as upstream Termux packages do; the earlier `./bin/` convention made dpkg try to write `/bin` at the read-only device root), no maintainer scripts / conffiles (Termux dpkg runs as the app uid, no root). Built with `dpkg-deb --build --root-owner-group -Zxz` — xz is forced because dpkg ≥ 1.22 on the ubuntu runners defaults to zstd and Termux's dpkg has no zstd support (it only finds `control.tar{xz,lzma,}` members; the on-device failure this caused is what the in-script member assertion guards against); validates control fields, archive members, contents, and exec bits in-script — structural only, since there is no Termux on the build host. Output: `dist/choreographr-termux_<ver>_aarch64.deb` (the `-termux-` infix disambiguates it from the desktop `.deb` on the release page). Wired into the release workflow's android job only — deliberately NOT into `release.sh` |
 | `smoke-test.sh` | Dispatches on the artifact suffix: a release tarball is extracted, the shipped binaries' presence/exec bits/`--version`/`--help` are checked; a `.deb` (the Termux package) is validated structurally via `dpkg-deb` — control fields, no `Depends:`/maintainer scripts, the shipped binaries at Termux's `$PREFIX` path (`./data/data/com.termux/files/usr/bin/`) with 0755 modes — the structural ceiling since no Termux exists on the host |
 | `release.sh` | The release orchestrator — local builds (its CI counterpart is `.github/workflows/release.yml`, which runs it on the Linux/macOS runners); dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard (CI passes it: a checkout IS the pushed commit, so the uncommitted-edits threat model cannot apply) |
-| `publish-stable.sh` | The crates.io publish wrapper (RELEASE.md Phase 2) — strips the nightly-only per-profile `rustflags` and the `[unstable]` config opt-in for the duration of `cargo release publish` (masking the two edited files from cargo-release's clean-tree gate via `git update-index --skip-worktree`, and always passing `--exclude choreo-gui`, which cargo-release 1.1.5 won't drop on its own via `publish = false`), so published manifests stay buildable by stable `cargo install`, then restores both files and clears the masks |
+| `publish-stable.sh` | The crates.io publish wrapper (RELEASE.md Phase 2) — strips the nightly-only per-profile `rustflags` and the `[unstable]` config opt-in for the duration of `cargo release publish` (masking the two edited files from cargo-release's clean-tree gate via `git update-index --skip-worktree`, and passing an `--exclude` for every `publish = false` member derived from the manifests — cargo-release 1.1.5 won't drop them on its own via `publish = false`), so published manifests stay buildable by stable `cargo install`, then restores both files and clears the masks |
 | `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine (the CI release workflow ships the tarballs but does not touch the tap) |
 | `check-supply-chain.sh` | The dependency supply-chain gate — runs `cargo deny check advisories bans sources` against `deny.toml` (falling back to `cargo-audit` + a literal lockfile scan when cargo-deny is absent), after scanning the local `~/.cargo/registry` cache for the `.crate` files deleted during the 2026-08-20 `arrayref` attack (RUSTSEC-2026-0260). Wired into `just pre-commit` / `just ci`; see the **Dependency supply chain** subsection under **Security model** |
 | `build-android.sh` | Cross-builds the shipped suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run) under `--profile dist` (the shipped-artifact profile — matches the desktop release pipeline), stages them in `target/android/<abi>/` (cargo's target/ tree — `dist/` is reserved for final publishable artifacts), and prints the `adb push` guidance for Termux `$PREFIX/bin`. Its output is the input for the Termux packaging step (`scripts/build-deb-termux.sh`, CI android job): packaging never rebuilds. Links both shipped binaries with a linker-script fragment that re-aligns the TLS output sections to 64 bytes — bionic's loader rejects arm64 executables whose `PT_TLS` has `p_align < 64` (rust/LLVM emit 8, and the emutls-for-Android rust PR was never merged), which aborted every Rust binary with thread-locals at startup on Android 10+; a post-build `readelf` gate fails the build rather than shipping a binary that dies on-device. Strips the per-profile `rustflags` from the manifest for the duration (persistent backups under `target/` + EXIT-trap restore, plus a next-run self-heal that recovers a tree left stripped by a hard-killed predecessor — the trap-reliant restore alone was not kill-safe; see `build-stable.sh`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
@@ -325,31 +329,39 @@ with `systemctl --user enable --now choreographr` (Linux) or
 The workspace inherits crates.io-required fields from `[workspace.package]`
 in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
 `readme`, `description`), and members opt into publishing by *not* setting
-`publish = false`. The **publish set** is therefore fifteen of the sixteen
-workspace members — everything except `choreo-gui` (not shipped).
-`choreo-sanitize` is published too (previously private): the members that
-depend on it must resolve it from crates.io after a release, and
-cargo-release's publish verification rejects unpublished workspace deps:
+`publish = false`. The **publish set** is therefore eighteen of the nineteen
+workspace packages (the root package plus all eighteen members except
+`choreo-gui`) — everything except `choreo-gui`, the one private member (a leaf
+client nothing depends on).
+`choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`, and
+`choreo-content` are published too (all added since 0.1.0): the members that
+depend on them must resolve them from crates.io after a release, and
+cargo-release's publish verification rejects unpublished workspace deps (cargo
+will not even package a crate whose dependency is unpublished — optional deps
+included):
 
 `choreographr` (root), `choreo-daemon`, `choreo-blockchain`, `choreo-tui`,
 `choreo-im`, `choreo-acp`, `choreo-proto`, `choreo-keystore`, `choreo-transport`,
 `choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`, `choreo-sanitize`,
-`choreo-markdown`, `choreo-image`
+`choreo-markdown`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`,
+`choreo-content`
 
 `choreo-gui` sets `publish = false`: it drags in the Dioxus Native (Blitz/wgpu)
 renderer tree and is not part of the shipped suite, so
 it is neither published to crates.io (`cargo install choreo-gui` does not
 exist) nor included in the prebuilt release artifacts (tarball/.deb/.rpm/
-Homebrew/AUR), which carry the daemon, TUI, and bridges only. The GUI is kept
-out of the publish selection explicitly — `scripts/publish-stable.sh` always
-passes `--exclude choreo-gui` because cargo-release 1.1.5 does not honor
+Homebrew/AUR), which carry the daemon and TUI only. `choreo-gui` is kept
+out of the publish selection explicitly — `scripts/publish-stable.sh` derives
+an `--exclude` for every `publish = false` member from the manifests, because
+cargo-release 1.1.5 does not honor
 `publish = false` in `--workspace` selection (verified: its plan lists the
-GUI crate, and a real publish would then fail on cargo's own refusal). The
-root `choreographr` package transitively depends on the other 14 publish-set
-members, so releasing the suite publishes 15 crates in dependency order.
+private crate, and a real publish would then fail on cargo's own
+refusal). The
+root `choreographr` package transitively depends on the other 17 publish-set
+members, so releasing the suite publishes 18 crates in dependency order.
 
 Releases are driven by **cargo-release** (`[workspace.metadata.release]` in
-the root `Cargo.toml`): it bumps versions, tags, and publishes the 15 crates
+the root `Cargo.toml`): it bumps versions, tags, and publishes the 18 crates
 to crates.io topologically. With `dependent-version = "fix"`, published
 manifest requirements (e.g. `choreo-tui = "0.1"`) stay in lockstep across
 minor/major bumps. The crates.io publish runs through `scripts/publish-stable.sh`

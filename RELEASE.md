@@ -5,12 +5,15 @@ phases in order; each phase has a **gate** that must pass before moving on.
 
 A release ships three things:
 
-1. **14 crates to crates.io** (everything except `choreo-gui`, in dependency
-   order) — enables `cargo install choreographr` / `cargo binstall`.
+1. **18 crates to crates.io** (every workspace member except `choreo-gui`, in
+   dependency order) — enables
+   `cargo install choreographr choreo-tui` / `cargo binstall`.
 2. **GitHub release `vX.Y.Z`** on `choreographr/choreographr` with prebuilt
-   artifacts (musl/macOS/Android tarballs, Windows `.zip`, desktop `.deb` +
-   `.rpm`, Termux-native `.deb`, combined `SHA256SUMS`) — enables Homebrew,
-   AUR, `cargo binstall`, and the `choreographr.com` installer.
+   artifacts (musl/macOS/Android tarballs, desktop `.deb` + `.rpm`,
+   Termux-native `.deb`, combined `SHA256SUMS`) — enables Homebrew,
+   AUR, `cargo binstall`, and the `choreographr.com` installer. (The Windows
+   `.zip` is built and smoke-tested on every tag but is not attached to the
+   release yet — see [CI builds](#ci-builds-github-actions).)
 3. **Channel updates** — Homebrew tap, AUR, choreographr.com.
 
 One release conductor drives all three. The binary artifacts for all shipped
@@ -49,7 +52,7 @@ built nowhere.
 |---|---|---|
 | `linux-musl` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` + `.rpm` (via `scripts/release.sh`; `rpmbuild` is apt-installed in the job, since it is not preinstalled) |
 | `macos-arm64` | macos-latest | native `aarch64-apple-darwin` tarball (via `scripts/release.sh`) |
-| `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the shipped `.exe` files |
+| `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the shipped `.exe` files — **built and smoke-tested on every tag, but currently NOT part of the published release** (the `release` job's `needs` omits this job until the Windows runtime is ready to ship) |
 | `android-termux` | ubuntu-latest + NDK | `aarch64-linux-android` Termux tarball (via `scripts/build-android.sh --features metrics,blockchain`) + the Termux-native `.deb` (via `scripts/build-deb-termux.sh`, structural smoke-test on the runner; the packaged binaries are then extracted with Termux's own dpkg-deb under qemu-user and executed against an unpacked Termux aarch64 rootfs — see the workflow's qemu step) |
 | `ios-build` | macos-latest | **none** — `choreo-gui` (the only crate that ships to iOS) compile check for both iOS targets, the real Xcode app link via the `ios/` scaffold, and a non-blocking simulator boot smoke (`continue-on-error` until the plumbing has proven stable). Deliberately not part of the release; a failing link is diagnosed from the log |
 
@@ -71,11 +74,14 @@ immutable once uploaded; delete and re-create per the
 [Hotfix / rollback](#hotfix--rollback) section rather than editing the job.
 
 Every job builds the same shipped binaries (`choreographr choreo-tui` — the
-`choreo-im`/`choreo-acp` bridges are feature-gated and excluded from release
-artifacts) with `--features metrics,blockchain` on the **stable** toolchain,
-smoke-tests its artifact, and uploads it; the `release` job only runs for tag
-pushes. Windows/Termux artifacts ship **in addition to** the Homebrew/AUR
-channels — those package the same tarballs CI produces.
+`choreo-im`/`choreo-acp` bridges live in their own packages and are not built
+for release) with the package-scoped
+`--features choreographr/metrics,choreographr/blockchain` on the **stable**
+toolchain, smoke-tests its artifact, and uploads it; the `release` job only
+runs for tag pushes. The Termux artifacts ship **in addition to** the
+Homebrew/AUR channels — those package the same tarballs CI produces. (The
+Windows `.zip` is built and uploaded to the workflow run, but as noted above
+it is not yet attached to the release.)
 
 How this slots into the SOP: push the `vX.Y.Z` tag (Phase 3) **after** the
 crates.io publish (Phase 2) — the tag push both publishes binaries and is the
@@ -220,10 +226,15 @@ verifies in Phase 5. The wrapper strips exactly those keys (plus the
 exit, so the published source builds at the target's default CPU on stable,
 exactly like the dist binaries.
 
-The wrapper always appends `--exclude choreo-gui`: cargo-release 1.1.5 does
-not honor the GUI crate's `publish = false` when selecting with
-`--workspace` (verified: its plan includes `choreo-gui`, and a real publish
-would then fail on cargo's own refusal for a publish=false crate). The wrapper
+The wrapper always appends an `--exclude <name>` for every `publish = false`
+workspace member, derived from the manifests: cargo-release 1.1.5 does not
+honor `publish = false` when selecting with `--workspace` (verified: its plan
+includes the private crate and a real publish would then fail on cargo's own
+refusal for a publish=false crate). `choreo-gui` is the only such member today
+— a leaf client nothing depends on, so it can stay unpublished. INVARIANT: any
+member a published crate depends on MUST be published (cargo refuses to package
+a crate whose dependency is unpublished — optional deps included), so
+`publish = false` is not an option for those. The wrapper
 also owns the dirty-tree gate for the publish: it refuses to
 start on an uncommitted tree by default — the `.crate` is built from the
 working tree (cargo package), so unreviewed uncommitted code must never ship.
@@ -245,11 +256,13 @@ package by default: a bare `cargo release publish` plans just `choreographr`,
 marks every workspace member as `disabled by user, skipping`, and then dies
 with `error: choreographr 0.1.0 depends on unpublished workspace package
 choreo-*` — the root's deps are neither in the publish set nor on crates.io
-yet. `--workspace` puts all 14 publish-set members in the set; cargo-release
+yet. `--workspace` puts all 18 publish-set members in the set; cargo-release
 hands them to a single `cargo publish` call and cargo uploads them in
-dependency order. `choreo-gui` is kept out by the wrapper's explicit
-`--exclude choreo-gui` — cargo-release 1.1.5 does *not* honor `publish = false`
-in `--workspace` selection, despite the GUI crate's manifest flag.
+dependency order. `choreo-gui` is the one private member kept out by the
+wrapper's derived `--exclude` flag — cargo-release 1.1.5 does *not* honor
+`publish = false` in `--workspace` selection, despite the crate's manifest flag
+(without the exclude its plan lists `choreo-gui`, and a real publish would then
+fail on cargo's own refusal).
 
 - `[workspace.metadata.release]` sets `dependent-version = "fix"`, so
   cross-crate requirements (`choreo-tui = "0.1"`, …) stay in lockstep across
@@ -264,53 +277,70 @@ in `--workspace` selection, despite the GUI crate's manifest flag.
 
 ```bash
 export CARGO_HOME=$(mktemp -d)
-cargo install choreographr --locked
+cargo install choreographr choreo-tui --locked
 ~/.cargo/bin/choreographr --version    # must print X.Y.Z
+~/.cargo/bin/choreo-tui --version      # the TUI is its own package now
 ```
 
 #### New-crate rate limit
 
 crates.io throttles **new-crate creation** per account to a burst of **5** with
 refill of **1 every 10 minutes** (a token bucket; updates to existing crates
-get burst 30/minute). cargo-release mirrors this via
-`rate-limit-new-packages` in `[workspace.metadata.release]` (default 5) and
-refuses upfront when a plan would publish more new crates than the burst:
+get burst 30/minute). cargo-release mirrors this via its
+`rate-limit-new-packages` setting (default 5, which the workspace does not
+override) and refuses upfront when a plan would publish more new crates than
+the burst:
 
 ```
 error: attempting to publish N new crates which is above the rate limit: 5
 error: dry-run failed, resolve the above errors and try again.
 ```
 
-The 0.1.0 first release had **12 new crates** (see the batched staging plan
-below for how that was done). The next release publishes **12 updates plus two
-new crates — `choreo-blockchain`** (the blockchain-tools crate added since
-0.1.0, referenced by `choreo-daemon`'s optional `blockchain` feature) **and
-`choreo-sanitize`** (the shared string-safety leaf, previously unpublished —
-it must ship because `choreo-blockchain` and the other members depend on it,
-and cargo-release's verification rejects unpublished workspace deps). Two
-new crates fit easily in the burst, so no batching is needed; if a future
-release ever introduces several new crates at once, stage them in
-≤ 5-crate batches:
+The 0.1.0 first release had **12 new crates**, staged in dependency-closed
+batches the same way described below. The next release publishes **12 updates
+plus six new crates** — `choreo-blockchain`, `choreo-sanitize`,
+`choreo-image`, `choreo-sockreg`, `choreo-power-events`, and `choreo-content`
+— every one of which must ship because a published crate depends on it (cargo
+refuses to publish a crate whose dependency — optional deps included — is not
+on crates.io). **Six new crates exceed the burst of 5**, so the next release
+must do one of:
 
 1. **Ask crates.io for a burst override** on the publishing account (the
    crates.io team raises the per-user burst in `publish_rate_overrides`). Then
    set `rate-limit-new-packages` to match and publish in one shot:
-   `cargo release publish --workspace -x`.
-2. **Stage the first release in dependency-closed batches of ≤ 5 new crates**
-   using `-p` selection, waiting ~10 minutes (one token refill) between
-   batches. Every workspace dependency of a batched crate is either in the
-   batch or already published:
-   - Batch 1: `./scripts/publish-stable.sh publish -p choreo-proto -p choreo-keystore -p choreo-markdown -p choreo-mcp -p choreo-transport -x`
-   - Batch 2: `./scripts/publish-stable.sh publish -p choreo-blockchain -p choreo-acp -p choreo-ai-protocols -p choreo-client-core -x`
-   - Batch 3: `./scripts/publish-stable.sh publish -p choreo-daemon -p choreo-im -p choreo-tui -x`
-   - Batch 4: `./scripts/publish-stable.sh publish -p choreographr -x`
+   `./scripts/publish-stable.sh publish --workspace -x`.
+
+2. **Stage it in two dependency-closed batches, ≥ 10 minutes apart.** Batch 1
+   holds every crate that depends on no other workspace member; batch 2 holds
+   the rest, which cargo-release publishes in dependency order. The split is
+   4 new + 2 new, and the token bucket (burst 5, +1 per 10 min) covers batch 2
+   after a single refill (4 spent → 1 left → +1 = 2 ≥ 2):
+
+   - **Batch 1** — the eight dependency leaves (4 new: `choreo-sanitize`,
+     `choreo-image`, `choreo-sockreg`, `choreo-power-events`):
+     ```bash
+     ./scripts/publish-stable.sh publish -p choreo-proto -p choreo-keystore \
+       -p choreo-markdown -p choreo-mcp -p choreo-sanitize -p choreo-image \
+       -p choreo-sockreg -p choreo-power-events -x
+     ```
+   - *(wait ≥ 10 minutes so the token bucket refills)*
+   - **Batch 2** — everything else (2 new: `choreo-blockchain`,
+     `choreo-content`); cargo-release orders these by dependency:
+     ```bash
+     ./scripts/publish-stable.sh publish -p choreo-transport \
+       -p choreo-ai-protocols -p choreo-acp -p choreo-blockchain \
+       -p choreo-content -p choreo-client-core -p choreo-im -p choreo-tui \
+       -p choreo-daemon -p choreographr -x
+     ```
 
    Dry-run each batch first (omit `-x`) and confirm it plans only that
-   batch's crates. Once all 14 exist on crates.io, later releases are
+   batch's crates. Every workspace dependency of a batched crate is either in
+   the same batch (published first — cargo-release orders by dependency) or in
+   an earlier batch. Once all 18 exist on crates.io, later releases are
    *updates* and go in a single `./scripts/publish-stable.sh publish --workspace -x`.
 
-**Gate:** 14 crates published, `cargo install choreographr --locked` works in
-a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
+**Gate:** 18 crates published, `cargo install choreographr choreo-tui --locked`
+works in a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
 
 ---
 
@@ -323,16 +353,19 @@ details in [CI builds](#ci-builds-github-actions)).
 
 Conductor duties while the workflow runs:
 
-1. **Watch the run** (`gh run watch` on the `release` workflow) — the four
-   build jobs must all go green. The `ios-build` job may report its
-   (non-blocking) smoke result; investigate a failure in the log, but it
-   does not hold the release.
+1. **Watch the run** (`gh run watch` on the `release` workflow) — the three
+   jobs the release waits on (`linux-musl`, `macos-arm64`, `android-termux`)
+   must go green. The `windows-msvc` job runs and smoke-tests its artifact but
+   does NOT gate the release (it is not in the release job's `needs`), and the
+   `ios-build` job may report its (non-blocking) smoke result; investigate a
+   failure in either log, but neither holds the release.
 2. **Verify the release page** once the `release` job completes:
    - the tag on the release matches `vX.Y.Z` and the manifest version
      (the job guards this too — a guard failure means a Phase 1/2 mistake);
    - all assets are present: three tarballs (musl, macOS, Android Termux),
-     the Windows `.zip`, the desktop `.deb` and `.rpm`, the Termux-native
-     `.deb`, and the combined `SHA256SUMS`;
+     the desktop `.deb` and `.rpm`, the Termux-native `.deb`, and the
+     combined `SHA256SUMS` (the Windows `.zip` is built but intentionally not
+     attached — see [CI builds](#ci-builds-github-actions));
    - each asset downloads.
 
 **Gate:** workflow green, release page lists all assets + `SHA256SUMS`,
@@ -400,8 +433,8 @@ Edit `packaging/aur/PKGBUILD`:
 1. Publish `scripts/install.sh` (or a per-version
    `install/vX.Y.Z.sh` and repoint `install.sh` — keep the versioned URL
    scheme from day one).
-2. Add `/download/vX.Y.Z/…` 302 redirects for each asset (tarballs, Windows
-   `.zip`, `.deb`, `.rpm`, Termux `.deb`) → the GitHub release URLs.
+2. Add `/download/vX.Y.Z/…` 302 redirects for each asset (tarballs, `.deb`,
+   `.rpm`, Termux `.deb`) → the GitHub release URLs.
 3. Publish `/releases/SHA256SUMS` (the combined file).
 
 **Gate:** every channel's `--version` reports `X.Y.Z`.
@@ -414,8 +447,8 @@ Exercise every install route from a clean environment:
 
 | Route | Command | Expect |
 |---|---|---|
-| crates.io (source) | `cargo install choreographr --locked` (with zig) | builds, `--version` = X.Y.Z |
-| binstall (prebuilt) | `cargo binstall choreographr` | fetches tarball, no toolchain |
+| crates.io (source) | `cargo install choreographr choreo-tui --locked` (with zig) | builds, `--version` = X.Y.Z |
+| binstall (prebuilt) | `cargo binstall choreographr choreo-tui` | fetches tarball, no toolchain |
 | Homebrew | `brew tap choreographr/choreographr && brew install choreographr` | no quarantine friction |
 | AUR | `choreographr-bin` | installs, `choreographr --version` |
 | curl installer | `curl -fsSL https://choreographr.com/install.sh \| sh` | sha256-verified extract |
@@ -453,8 +486,8 @@ Finally, commit any post-release doc/version drift in this repo and push.
 - [ ] MSRV sync: `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'` → update `rust-version` in `[workspace.package]` (with `Cargo.lock`) if changed
 - [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD` section (fresh empty `[Unreleased]` + compare link above it)
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
-- [ ] `./scripts/publish-stable.sh publish --workspace` → 14 crates on crates.io; `cargo install --locked` verified
-- [ ] First release only: 12 new crates staged in ≤5-crate batches (or crates.io burst override) — see Phase 2; the next release adds `choreo-blockchain` and `choreo-sanitize` as new crates
+- [ ] `./scripts/publish-stable.sh publish --workspace` → 18 crates on crates.io; `cargo install --locked` verified
+- [ ] Next release only: the six new crates exceed the burst of 5 — use the burst override or the two batches in Phase 2 (`choreo-blockchain`, `choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content`)
 - [ ] Push the bump commit + `vX.Y.Z` tag → CI builds all platforms and creates the GitHub release; verify the release page lists every asset + `SHA256SUMS` and they download
 - [ ] `gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/`, then `scripts/update-homebrew-tap.sh --push`; `brew install` verified on a Mac
 - [ ] AUR `pkgver`/`sha256sums` bumped, `.SRCINFO` regenerated, pushed
@@ -486,7 +519,8 @@ desktop machines run `scripts/release.sh`, which:
   CPU can never leak into a shipped artifact,
 - reads the version from `Cargo.toml`,
 - guards against a dirty tree,
-- builds with `--features metrics,blockchain`,
+- builds with the package-scoped
+  `--features choreographr/metrics,choreographr/blockchain`,
 - writes the tarball + `SHA256SUMS` (covering everything already in `dist/`
   for this version) into `dist/`,
 - builds `.deb`/`.rpm` best-effort (Linux only, host glibc, no mimalloc),
@@ -505,7 +539,7 @@ it).
 
 ```bash
 just release            # dry-run: musl tarball + SHA256SUMS + .deb + .rpm
-just smoke-test         # extract tarball; verify 4 binaries, --version, --help
+just smoke-test         # extract tarball; verify 2 binaries, --version, --help
 ```
 
 Confirm `dist/` contains the musl tarball, `.deb`, `.rpm`, and `SHA256SUMS`.
@@ -521,7 +555,8 @@ Then the **manual daemon smoke test** (the tarball smoke test only checks
 `--version`/`--help`; CI's `scripts/daemon-smoke.sh` covers this normally):
 
 1. Extract the tarball, run `./choreographr` — confirm the socket
-   (`/tmp/Choreographr.sock`) and keystore initialize.
+   (`choreographr.sock` under the platform temp dir, i.e.
+   `/tmp/choreographr.sock` on Linux) and keystore initialize.
 2. Load the bundled `com.choreographr.daemon.plist` in a throwaway launch
    agents dir; confirm the daemon starts and logs to `/tmp/choreographr.log`.
 3. Run `./choreo-tui` and complete one round-trip with a configured account.

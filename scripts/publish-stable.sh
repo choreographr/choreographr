@@ -61,11 +61,21 @@
 # multi-step `cargo release` (version+commit+tag) through it — the masks would
 # confuse cargo-release's own commit step.
 #
-# choreo-gui is always excluded from the publish selection (the wrapper
-# appends `--exclude choreo-gui`): cargo-release 1.1.5 does NOT honor
-# `publish = false` in `--workspace` selection (its plan lists the GUI crate
-# and a real publish would then hit cargo's own refusal for a publish=false
-# crate), and the GUI stub must never be published. Verified against 1.1.5.
+# Every `publish = false` workspace member is excluded from the publish
+# selection (the wrapper appends `--exclude <name>` for each): cargo-release
+# 1.1.5 does NOT honor `publish = false` in `--workspace` selection (verified:
+# its plan lists the private crate and a real publish would then hit cargo's
+# own refusal for a publish=false crate). The exclude set is DERIVED from the
+# manifests below rather than hardcoded, so a newly-private crate is excluded
+# automatically.
+#
+# INVARIANT: `publish = false` is only valid for a member that NO published
+# crate depends on — cargo REFUSES to publish a crate whose dependency is not
+# on crates.io (verified: `cargo package -p choreo-ai-protocols` fails with
+# "no matching package named `choreo-sockreg`", and the check covers OPTIONAL
+# deps too). `choreo-gui` (a leaf client nothing depends on) is the only
+# publish=false member today; marking a depended-on crate publish=false breaks
+# the whole release.
 #
 # Single-authored only (not safe under concurrent runs).
 set -euo pipefail
@@ -180,4 +190,28 @@ sed -i '/^rustflags = \[/d' "$MANIFEST"
 # publish-time cargo build needs no nightly feature opt-in on any toolchain.
 sed -i '/^\[unstable\]$/d; /^profile-rustflags = true$/d' "$CONFIG"
 
-cargo release "${ARGS[@]}" --exclude choreo-gui
+# Collect an `--exclude <name>` for every `publish = false` workspace member.
+# The workspace convention keeps every member in a top-level `choreo-*`
+# directory, so globbing the manifests is sufficient (the root package is
+# always published and lives in the root Cargo.toml). cargo-release 1.1.5
+# ignores `publish = false` in `--workspace` selection (see the header), so
+# these excludes are what keeps the private crates out of a real publish.
+EXCLUDE_ARGS=()
+for manifest in choreo-*/Cargo.toml; do
+    if grep -qE '^publish = false' "$manifest"; then
+        # The package `name` is the first `name = "…"` in the manifest.
+        name="$(sed -n 's/^name = "\(.*\)"/\1/p' "$manifest" | head -n1)"
+        if [ -n "$name" ]; then
+            EXCLUDE_ARGS+=(--exclude "$name")
+        fi
+    fi
+done
+# Sanity backstop: the glob is expected to find at least the known private
+# crates (choreo-gui among them). An empty set would mean the glob/parse broke
+# and we would publish private crates by accident — fail loudly instead.
+if [ "${#EXCLUDE_ARGS[@]}" -eq 0 ]; then
+    echo "error: found no 'publish = false' members to exclude — the manifest scan is broken" >&2
+    exit 1
+fi
+
+cargo release "${ARGS[@]}" "${EXCLUDE_ARGS[@]}"

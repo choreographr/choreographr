@@ -442,7 +442,7 @@ cargo run --release -p choreo-acp      # ACP bridge for editors
 
 ## Crates
 
-A Rust workspace of sixteen crates (resolver = "3"):
+A Rust workspace of nineteen crates (resolver = "3"):
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the daemon's
 internals — threading model, provider architecture, tool system, and session
@@ -456,6 +456,7 @@ data model.
 | `choreo-sockreg` | Leaf crate — live provider-socket registry (force-close + RAII deregistration: transports unregister on drop, so only live connections are listed; opportunistic prune stays as a backstop) and TCP keepalive tuning; every provider HTTP connection registers here so cancels/suspends can un-block wedged readers |
 | `choreo-power-events` | Leaf crate — platform suspend/wake notifications as crossbeam events (logind on Linux, IOKit on macOS, inert fallback elsewhere); best-effort over sockreg's kernel keepalives |
 | `choreo-blockchain` | Blockchain tools — EVM (alloy) and Substrate/Polkadot (subxt) read-only queries plus the tokio sidecar runtime they run on; pulled in by the daemon's `blockchain` feature (off by default) |
+| `choreo-content` | Choreographr Coordination Platform client — publish/retract items, revisions, profiles, and account pins against a Substrate content registry (content on IPFS, revisions via an event indexer, signed writes on a subxt tokio sidecar); pulled in by the daemon's `content` feature (off by default) |
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
 | `choreo-sanitize` | Internal leaf crate — the single source of truth for the Unicode "spoofing" predicates (bidi/ZWSP escaping) and the shared tool-output byte budget + `...[truncated]` marker, used by the daemon, TUI, blockchain tools, and client |
 | `choreo-image` | Leaf crate — the single raster decode path (EXIF orientation baked in) and HEIC/HEIF decode (with a pre-decode allocation guard), shared by the daemon and the TUI so the model and UI paths cannot drift |

@@ -8,7 +8,10 @@ homepage.workspace = true
 readme.workspace = true
 edition = "2024"
 rust-version.workspace = true
-publish = false
+# Published despite being an internal leaf crate: choreo-daemon depends on it
+# (optional, behind the `content` feature — but cargo requires OPTIONAL deps to
+# be published too), so keeping this `publish = false` blocks the release.
+publish = true
 
 [lib]
 name = "choreo_content"

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`choreo-sockreg`, `choreo-power-events`, and `choreo-content` are now
+  published** (release-blocking): each was `publish = false`, but each is a
+  dependency of a PUBLISHED crate (`choreo-ai-protocols` → `choreo-sockreg`;
+  `choreo-daemon` → `choreo-power-events`; and `choreo-daemon`'s optional
+  `content` feature → `choreo-content`), and cargo refuses to package a crate
+  whose dependency is not on crates.io — even an OPTIONAL one (verified: `cargo
+  package -p choreo-ai-protocols` fails with "no matching package named
+  `choreo-sockreg`", and `cargo package -p choreo-daemon` fails on the optional
+  `choreo-blockchain` dep). `choreo-gui` stays private (a leaf client nothing
+  depends on). Without this the next release could not be published at all.
+  `scripts/publish-stable.sh` now derives an `--exclude` for every remaining
+  `publish = false` member (currently just `choreo-gui`) from the manifests,
+  since cargo-release 1.1.5 ignores the flag in `--workspace` selection.
+
+### Changed
+
+- **Release documentation reconciled with the current workspace**
+  (`RELEASE.md`, `ARCHITECTURE.md`, `README.md`): the crates.io publish set is
+  **18** crates (every member except `choreo-gui`, the one private member); the
+  next release adds **six** new crates (`choreo-blockchain`, `choreo-sanitize`,
+  `choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content`) —
+  which EXCEEDS the new-crate burst of 5, so RELEASE.md Phase 2 now documents
+  the concrete two-batch staging plan (4 new + 2 new, ≥10 min apart) as well as
+  the burst-override option; the Windows `.zip` is documented as built-but-not-released (the CI
+  release job's `needs` omits `windows-msvc`); the crates.io /`binstall` install
+  routes name `choreo-tui` alongside `choreographr` (the TUI binary moved to its
+  own package); the workspace is nineteen crates (root + eighteen members); and
+  the batch-staging example now describes 0.1.0's actual 12-crate set.
+
 ### Added
 
 - The TUI now rejects a prompt submitted while the attached session is not

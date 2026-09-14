@@ -8,7 +8,10 @@ homepage.workspace = true
 readme.workspace = true
 edition = "2024"
 rust-version.workspace = true
-publish = false
+# Published despite being an internal leaf crate: choreo-ai-protocols depends
+# on it, and cargo refuses to publish a crate whose dependencies are not on
+# crates.io — keeping this `publish = false` blocks the whole release.
+publish = true
 
 [features]
 default = []
