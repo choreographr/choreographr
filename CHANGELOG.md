@@ -215,6 +215,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Releases may carry a dance-style name** (major/minor only): `RELEASE.md`
+  documents that the conductor picks a name at release time — a dance style
+  such as *Lindy*, with no pre-assigned list — and records it in the CHANGELOG
+  section heading as `## [X.Y.Z] - YYYY-MM-DD (Lindy)`; patch releases stay
+  nameless. The name is release metadata only (not in the tag or any install
+  identifier). The CI release job lifts it into the GitHub release title
+  (`choreographr 0.2.0 — Lindy`); AGENTS.md notes the heading form.
+
 - **CHANGELOG.md reformatted to satisfy Keep a Changelog**: the `[Unreleased]`
   section, which had accumulated **seven** `### Fixed`, **seven** `### Changed`,
   and five `### Added` blocks, is consolidated to **one heading per category**

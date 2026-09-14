@@ -98,6 +98,13 @@ channel updates in Phase 4 as before.
   `cargo release` do it (Phase 1).
 - **Tag format:** `vX.Y.Z` (e.g. `v0.1.1`). Release notes are generated from
   the tag diff (`gh release create --generate-notes`).
+- **Release names:** a **major or minor** release gets a fun name — a dance
+  style, e.g. *Lindy* — chosen by the conductor at release time (there is no
+  pre-assigned list; pick whatever fits). **Patch releases have no name.** The
+  name is release *metadata*: it lives in the CHANGELOG section heading
+  (`## [X.Y.Z] - YYYY-MM-DD (Lindy)`) and nowhere else — never in the git tag,
+  the crate versions, or any install identifier. The CI release job lifts it
+  into the GitHub release title (`choreographr 0.2.0 — Lindy`).
 
 ### Preflight (before Phase 1)
 
@@ -140,6 +147,11 @@ just preflight               # checks cargo + zig, notes nextest
    rewriting manifests on ordinary releases and only fires on a major. Update
    this table's examples when 1.0.0 ships (Phase 5 commits doc drift).
 
+   For a **major or minor** release (not a patch), also choose the release's
+   **name** here — a dance style such as *Lindy*; there is no pre-assigned
+   list, pick whatever fits (see [Release names](#versioning--gates)). It is
+   recorded in the changelog heading in step 2.
+
 2. **Enact the decision** — the command that carries it out is
    `cargo release version <level>`, where `<level>` is replaced with the
    level you decided in step 1 (`patch` / `minor` / `major`). Nothing else
@@ -157,10 +169,12 @@ just preflight               # checks cargo + zig, notes nextest
 
    `cargo release version` only edits the manifests — it does **not** commit
    or tag. Before committing: promote the changelog section — rename
-   `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md` (and
-   start a fresh empty `[Unreleased]` above it, moving the compare link),
-   plus update any user-facing docs that state a version or install command
-   (README install section):
+   `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md` (append
+   ` (Dance)` for a major/minor release, e.g. `## [0.2.0] - 2026-09-14 (Lindy)`
+   — see [Release names](#versioning--gates)) and start a fresh empty
+   `[Unreleased]` above it, moving the compare link — plus update any
+   user-facing docs that state a version or install command (README install
+   section):
 
    ```bash
    git add Cargo.toml Cargo.lock README.md CHANGELOG.md   # + any other docs touched
@@ -175,10 +189,11 @@ just preflight               # checks cargo + zig, notes nextest
    `git ls-remote --tags origin | grep vX.Y.Z`.
 
    > **Why the changelog section must exist at the tag:** the CI `release`
-   > job extracts the `## [X.Y.Z]` (optionally `- YYYY-MM-DD`) section from
-   > `CHANGELOG.md` for the
-   > release body and fails the job if it is absent — the curated notes are
-   > the release notes, not an afterthought.
+   > job extracts the `## [X.Y.Z]` section from `CHANGELOG.md` for the release
+   > body and fails the job if it is absent — the curated notes are the
+   > release notes, not an afterthought. The heading may carry an optional
+   > `- YYYY-MM-DD` date and ` (Name)`, and the job lifts the name into the
+   > release title.
 
 4. **Tag the bump commit** (cargo-release reads the version back from
    `Cargo.toml`): `cargo release tag -x` → creates `vX.Y.Z` at HEAD. The tag
@@ -485,7 +500,7 @@ Finally, commit any post-release doc/version drift in this repo and push.
 
 - [ ] `just ci` green; tree clean; master pulled
 - [ ] MSRV sync: `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'` → update `rust-version` in `[workspace.package]` (with `Cargo.lock`) if changed
-- [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD` section (fresh empty `[Unreleased]` + compare link above it)
+- [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD` section — append ` (Dance)` for a major/minor release (name picked at release time) — with a fresh empty `[Unreleased]` + compare link above it
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
 - [ ] `./scripts/publish-stable.sh publish --workspace` → 18 crates on crates.io; `cargo install --locked` verified
 - [ ] Next release only: the six new crates exceed the burst of 5 — use the burst override or the two batches in Phase 2 (`choreo-blockchain`, `choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content`)
@@ -580,7 +595,9 @@ glob **after** the `.deb`/`.rpm` step and assembles the upload list from every
 tarball present in `dist/` — so staging the macOS tarball first is what makes
 the uploaded checksum file complete and the macOS asset appear in the release.
 
-Equivalent manual form (what `--upload` assembles):
+Equivalent manual form (what `--upload` assembles) — for a major/minor release,
+append the name to the title (`--title "choreographr X.Y.Z — Lindy"`); a patch
+release uses the bare `--title "choreographr X.Y.Z"`:
 
 ```bash
 gh release create vX.Y.Z \

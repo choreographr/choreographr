@@ -705,7 +705,20 @@ jobs:
           # re-create per the SOP rather than "fixing" this job.
           # The body comes from CHANGELOG.md (extracted above); the
           # auto-generated notes are appended after it.
+          # Release name: a major/minor release is named after a dance style,
+          # recorded as "(Name)" on the CHANGELOG heading — patch releases
+          # carry no name. Lift it into the title (the heading itself is
+          # stripped from the body above). ASCII-only matching so mawk is fine.
+          CODENAME="$(awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 {
+              if (match($0, /\([^)]*\)/)) print substr($0, RSTART + 1, RLENGTH - 2)
+              exit
+            }' CHANGELOG.md)"
+          TITLE="choreographr ${VERSION}"
+          if [ -n "$CODENAME" ]; then
+              TITLE="${TITLE} — ${CODENAME}"
+          fi
           gh release create "v${VERSION}" dist/* \
-              --title "choreographr ${VERSION}" \
+              --title "$TITLE" \
               --notes-file /tmp/release-notes.md \
               --generate-notes

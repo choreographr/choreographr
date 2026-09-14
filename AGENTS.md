@@ -38,7 +38,7 @@ Every non-trivial change (new features, fixes, refactors, dependency updates, be
 
 - **One heading per category, at most.** `[Unreleased]` is organized with the Keep a Changelog category headings — `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security` — each appearing **once at most**. Append a new bullet under the matching existing heading; never open a second `### Changed` (or any other) block. Include only the categories that apply — do not add an empty one. A section that repeats a category heading is malformed, not just untidy.
 - **Write it for the release page.** At tag time the CI `release` job copies the entire `## [X.Y.Z]` section (heading stripped) verbatim into the GitHub release body, followed by the auto-generated commit notes (see [RELEASE.md](./RELEASE.md) Phase 1). The file is user-facing prose, not a scratchpad: no TODOs, no internal scaffolding, no "see commit …".
-- **Promotion at release.** Phase 1 renames `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and starts a fresh, empty `[Unreleased]` above it (moving the compare link so `[Unreleased]` points at `HEAD` again). The extraction step accepts both the dated and the undated heading forms.
+- **Promotion at release.** Phase 1 renames `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` (appending ` (Name)` for a **major/minor** release — a dance-style name chosen at release time; patch releases are nameless) and starts a fresh, empty `[Unreleased]` above it (moving the compare link so `[Unreleased]` points at `HEAD` again). The extraction accepts the dated, undated, and named heading forms; the CI release job lifts the name into the release title.
 
 ## Test Discipline
 
