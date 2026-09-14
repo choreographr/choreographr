@@ -1010,6 +1010,11 @@ pub(crate) fn execute_tool_with_timeout(
         working_dir: working_dir.map(|p| p.to_path_buf()),
         cancelled: Arc::clone(&cancel_flag),
         account_name: session.config.account_name.clone(),
+        // Share the session's discovered-skill snapshot with the tool so
+        // `load_skill` resolves against the SAME list the system-prompt listing
+        // used (one resolution, no divergence between the returned and
+        // persisted body).
+        discovered_skills: session.discovered_skills.clone().map(std::sync::Arc::new),
     };
 
     // Shared channel wiring: forwarding thread + execution thread + the

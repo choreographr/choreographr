@@ -40,6 +40,13 @@ pub struct ToolContext {
     /// Account name used by the parent session (inherited by sub-sessions so
     /// they can resolve the provider for model inference).
     pub account_name: Option<String>,
+    /// The session's discovered skills, computed once at the start of the agent
+    /// loop and shared with tools so a `load_skill` call resolves against the SAME
+    /// snapshot the system-prompt listing used — no second filesystem walk and no
+    /// divergence between the body returned to the model and the body persisted
+    /// into the system prompt. `None` = not provided (e.g. a direct unit-test call);
+    /// `load_skill` then falls back to a fresh ambient walk.
+    pub discovered_skills: Option<std::sync::Arc<Vec<crate::context::SkillMeta>>>,
 }
 
 impl ToolContext {
@@ -62,6 +69,7 @@ impl ToolContext {
             working_dir: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             account_name: None,
+            discovered_skills: None,
         }
     }
 }

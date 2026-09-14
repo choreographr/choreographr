@@ -1881,17 +1881,17 @@ impl App {
                     // account selection that was already configured.
                     let default_account =
                         self.ai_providers.accounts.first().map(|a| a.name.clone());
-                    // Seed the auto-created default session from the TUI's
-                    // launch directory so it gets project context and
-                    // project-local skills; fall back to None only when the
-                    // current directory cannot be read.
+                    // Deliberately no working directory: the daemon may serve a
+                    // remote client over TCP, so the TUI process's own cwd is
+                    // meaningless on the daemon host and could set a nonexistent
+                    // session working directory. The working directory is chosen
+                    // later (e.g. via `set_working_dir` or when attaching a
+                    // session that already has one).
                     client_tx
                         .send(ClientMessage::CreateSession {
                             title: Some("default".to_string()),
                             parent_session_id: None,
-                            working_dir: std::env::current_dir()
-                                .ok()
-                                .map(|p| p.display().to_string()),
+                            working_dir: None,
                             context_config: None,
                             account_name: default_account,
                             selected_model: None,

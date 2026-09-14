@@ -978,7 +978,7 @@ alloy/subxt clients, and the daemon calls their synchronous `execute_*` entry po
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. Compiled only when the `metrics` cargo feature is enabled (off by default; release binaries opt in via `scripts/release.sh`); disabled builds get no-op stubs so the instrumentation call sites compile unchanged. |
 | `tools/` | `Tool` trait (with `output_schema` for programmatic tool calling, `allowed_callers` for caller-level gating), `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 30+ registered tools (including `list_sessions`, `get_session`, `load_skill` via `admin/`). |
-| `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, selected model, working directory) passed to tools that need DB or daemon access or parent config for sub-sessions. |
+| `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, selected model, working directory, and the session's discovered-skill snapshot) passed to tools that need DB or daemon access or parent config for sub-sessions. |
 | `tools/db/` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`), one file per tool (`set.rs`, `get.rs`, `delete.rs`, `delete_range.rs`, `get_range.rs`, `list.rs`, `count.rs`) with shared `DbError`/`DbValue` in `db/mod.rs`. |
 | `tools/fs/` | Core filesystem tools (`list_files`, `line_count`, `write_file`, `edit_file`, `delete_files`), one file per tool with shared write helpers in `fs/mod.rs`. |
 | `tools/x/` | X/Twitter API tools (`x_post`, `x_search_recent`, `x_user_lookup`), one file per tool with shared OAuth1/HTTP plumbing in `x/mod.rs`. |
@@ -2027,7 +2027,8 @@ model's tool calls are recorded, so clients render the tool's context (e.g. "Run
 the moment the seeded turn is broadcast — before any output streams. It is explicitly excluded from LLM
 message construction — the model never sees it.
 
-Tools that need session context (`ToolContext` — used by `list_sessions`, `get_session`)
+Tools that need session context (`ToolContext` — used by `list_sessions`, `get_session`,
+`load_skill`)
 receive it in the `ctx` parameter. Tools that return structured data override
 `output_schema()` to describe their return JSON shape, enabling the model to call
 them programmatically (see [Programmatic Tool Calling](#114-programmatic-tool-calling-responses-api-gpt-56)).
@@ -3504,7 +3505,10 @@ Skills are discovered from:
 The project scope is scanned before the global scope and results are
 deduplicated by frontmatter `name`, so a project-local skill shadows a
 same-named global one (and, within the project walk, a more-local skill shadows
-one higher up the tree).
+one higher up the tree). Within a single scope the candidate directories are
+visited in sorted order, so if two directories declare the same `name` the
+lexicographically-first path wins deterministically (rather than depending on
+the unspecified `read_dir` order).
 
 Each `SKILL.md` must have YAML frontmatter with `name` and `description`.
 
@@ -3545,23 +3549,31 @@ Implementation lives in `choreo-daemon/src/context.rs`. Key entry points:
 | Function | Purpose |
 |---|---|
 | `discover_context(working_dir, config)` | Walk filesystem, return `ContextBundle` with all discovered files |
-| `discover_skills(global_home: Option<&Path>, working_dir: Option<&Path>)` | Scan Agent Skills directories — the project-local walk under `working_dir` (only when a directory is present) first, then the global `<global_home>/.agents/skills` — deduplicated by frontmatter `name` so project skills shadow global ones; return `Vec<SkillMeta>`. `global_home` is injected so tests can supply a temp home. |
+| `SkillScopes { global_home, working_dir }` | The two skill-discovery scopes as a named struct — a project walk scoped to the session working directory, plus the always-on global `<global_home>/.agents/skills`. Named (not two positional `Option<&Path>`s) so the two same-typed scopes cannot be swapped by mistake. |
+| `discover_skills(SkillScopes)` | Scan Agent Skills directories — the project-local walk under `scopes.working_dir` (only when a directory is present) first, then the global `<scopes.global_home>/.agents/skills` — deduplicated by frontmatter `name` so project skills shadow global ones; return `Vec<SkillMeta>`. `global_home` is injected so tests can supply a temp home. |
 | `discover_skills_ambient(working_dir: Option<&Path>)` | `discover_skills` with `dirs::home_dir()` as the global scope — the production entry point |
 | `assemble_context(bundle)` | Render discovered files into an XML-like format for injection |
 | `build_base_prompt(skills, groups, loaded_skills)` | Build the stable system prompt (identity + tool groups + skill metadata + loaded skill bodies) |
 | `recheck_context(working_dir, config, old_fp)` | Re-discover and compare fingerprints |
 | `subdirectory_hints(tool_name, args, working_dir, known)` | Return `Option<(String, Vec<PathBuf>)>` — subdirectory hint text and newly discovered paths |
-| `load_skill_body_from(skills: &[SkillMeta], name)` | Read a skill's body from an already-resolved (e.g. cached `SessionState::discovered_skills`) skill list, stripping YAML frontmatter |
-| `load_skill_body(name, working_dir: Option<&Path>)` | Discover then read a skill's body; convenience for callers without a cached skill set (the `load_skill` tool) |
+| `load_skill_body_from(skills: &[SkillMeta], name)` | Read a skill's body from an already-resolved skill list, stripping YAML frontmatter. Both the `load_skill` tool (via `ToolContext::discovered_skills`) and `persist_loaded_skill` resolve against the SAME `SessionState::discovered_skills` snapshot |
+| `load_skill_body(name, working_dir: Option<&Path>)` | Discover then read a skill's body (a fresh ambient walk); the `load_skill` tool falls back to this only when it has no session snapshot to resolve against |
 
 ### Tool: `load_skill`
 
 Registered alongside other tools in the tool loop (core group). When the model calls
 `load_skill(name)`, the daemon:
 
-1. Finds the matching `SKILL.md` from `~/.agents/skills/` or `.agents/skills/`
+1. Finds the matching skill in the session's `discovered_skills` snapshot, which the
+   agent loop computes once per request and shares with tools via
+   `ToolContext::discovered_skills` (falling back to a fresh ambient walk only when no
+   snapshot is available, e.g. a direct unit-test call)
 2. Strips the YAML frontmatter
 3. Returns `"Loaded skill: <name>"` as the tool result
+
+Resolving against the shared snapshot means the tool needs no second filesystem walk and
+the body it returns can never diverge from the body `persist_loaded_skill` records into
+the system prompt — both read the same list.
 
 **Persistence:** After the tool result is collected, `run_agent_loop` detects the
 `load_skill` call and pushes a `LoadedSkill { name, body }` into

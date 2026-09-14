@@ -99,6 +99,7 @@ fn spawn_subsession_happy_path() {
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
         account_name: None,
+        discovered_skills: None,
     };
 
     // ── Execute the tool ─────────────────────────────────────────────
@@ -157,6 +158,7 @@ fn spawn_subsession_daemon_rejects_creation() {
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
         account_name: None,
+        discovered_skills: None,
     };
 
     let result = SpawnSubsession.execute(
@@ -203,6 +205,7 @@ fn spawn_subsession_daemon_disconnected() {
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
         account_name: None,
+        discovered_skills: None,
     };
 
     let result = SpawnSubsession.execute(
@@ -309,6 +312,7 @@ fn spawn_subsession_inherits_categories() {
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
         account_name: None,
+        discovered_skills: None,
     };
 
     let result = SpawnSubsession.execute(
@@ -377,6 +381,7 @@ fn spawn_subsession_overrides_categories() {
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
         account_name: None,
+        discovered_skills: None,
     };
 
     let result = SpawnSubsession.execute(
@@ -445,6 +450,7 @@ fn spawn_subsession_inherits_selected_model() {
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
         account_name: None,
+        discovered_skills: None,
     };
 
     let result = SpawnSubsession.execute(

@@ -930,6 +930,14 @@ pub(crate) fn run_agent_loop(
                         working_dir: session.config.working_dir.clone(),
                         cancelled: Arc::clone(&cancel_flag),
                         account_name: session.config.account_name.clone(),
+                        // Share the session's discovered-skill snapshot with the
+                        // tool so `load_skill` resolves against the SAME list the
+                        // system-prompt listing used (one resolution, no
+                        // divergence between the returned and persisted body).
+                        discovered_skills: session
+                            .discovered_skills
+                            .clone()
+                            .map(std::sync::Arc::new),
                     };
 
                     let cmd_tx = ctx.cmd_tx.clone();

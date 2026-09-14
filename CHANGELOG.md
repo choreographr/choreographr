@@ -215,19 +215,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The TUI's auto-created "default" session is seeded with the TUI's current
-  working directory** instead of no working directory, so the bootstrap session
-  gets project context files and can scope project-local skills (falling back to
-  no working directory only if the current directory cannot be read).
-
-- **Project-local skills now shadow global skills of the same name.** Skill
-  discovery deduplicates by frontmatter `name` and scans the project walk
-  before the global `~/.agents/skills` scope, so a project skill wins over a
-  same-named global one (previously both were listed and `load_skill` resolved
-  whichever came first). Discovery is now injectable
-  (`discover_skills(global_home, working_dir)`) so global discovery is
-  unit-testable, and persisting a loaded skill reuses the session's cached
-  skill set instead of re-walking the filesystem.
+- **Project-local skills now shadow global skills of the same name, and skill
+  discovery is shared between the `load_skill` tool and skill persistence.**
+  Discovery deduplicates by frontmatter `name` and scans the project walk before
+  the global `~/.agents/skills` scope, so a project skill wins over a same-named
+  global one (previously both were listed and `load_skill` resolved whichever
+  came first); within a single scope the candidate directories are visited in
+  sorted order, so a tie is deterministic. The two scopes are passed as a named
+  `SkillScopes { global_home, working_dir }` (injectable, so global discovery is
+  unit-testable). The agent loop computes the session's skill set once and shares
+  it with tools via `ToolContext::discovered_skills`, so `load_skill` resolves
+  against the SAME snapshot the system prompt lists — the body returned to the
+  model can never diverge from the body persisted into the prompt, and no second
+  filesystem walk is needed.
 
 - **Releases may carry a dance-style name** (major/minor only): `RELEASE.md`
   documents that the conductor picks a name at release time — a dance style

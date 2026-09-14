@@ -547,9 +547,12 @@ RISC-V VM always has access to all tools.
 
 **Skill.** A filesystem-based extension following the Agent Skills standard — a
 `SKILL.md` file with YAML frontmatter (`name`, `description`) placed under
-`.agents/skills/<name>/`. At session creation, skill names and descriptions are
-listed in the system prompt. When the model calls `load_skill`, the full
-instruction body is injected into the conversation (progressive disclosure).
+`.agents/skills/<name>/`. Skills are discovered from the global `~/.agents/skills/`
+and, when the session has a working directory, the project-local `.agents/skills/`
+walk; a project-local skill shadows a same-named global one. At session creation,
+skill names and descriptions are listed in the system prompt. When the model calls
+`load_skill`, the full instruction body is injected into the conversation
+(progressive disclosure).
 
 **Reasoning round-trip.** Reasoning text is both *displayed* in the TUI
 (collapsible per-turn "Reasoning" section) and, for several providers, *sent

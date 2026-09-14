@@ -2437,6 +2437,7 @@ fn spawn_test_ctx() -> (ToolContext, mpsc::Sender<SessionCommand>) {
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
         account_name: None,
+        discovered_skills: None,
     };
     (ctx, cmd_tx)
 }
@@ -2882,10 +2883,13 @@ fn persist_loaded_skill_skips_missing_name() {
 #[test]
 fn persist_loaded_skill_without_working_dir_unknown_skill_not_added() {
     // A dir-less session has no project scope, but the load path must not
-    // panic; an obviously absent skill name (not present in any global or
-    // project scope) leaves the accumulator empty. The test does NOT rely on
-    // ambient global skills.
+    // panic; an obviously absent skill name leaves the accumulator empty. The
+    // discovered-skill cache is seeded EMPTY so the persistence path resolves
+    // against the cached (production) snapshot instead of falling back to
+    // ambient discovery — the test is deterministic and never touches the
+    // developer's real ~/.agents/skills.
     let mut session = SessionState::empty();
+    session.discovered_skills = Some(Vec::new());
     persist_loaded_skill(
         &mut session,
         "load_skill",
