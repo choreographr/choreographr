@@ -649,6 +649,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   past the Node.js 20 deprecation; Android Termux `.deb` xz-compressed for
   Termux's dpkg and installed at the real `$PREFIX`; desktop `.deb` forced
   to xz as well.
+- Routine dependency refresh (`cargo update`): the tree re-resolved to current
+  upstream releases (83 packages), including `ureq` 3.4.2 / `ureq-proto` 0.6.3,
+  `alloy` 2.4.2, `reqwest` 0.13.5, `serde_with` 3.23, `crossbeam` 0.8.5, and the
+  PDF stack (`pdf-inspector` 1.19, `lopdf` 0.44, `md-5` 0.11). `Cargo.lock` only;
+  no source changes.
 
 ### Removed
 
@@ -1003,6 +1008,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capped; writer-loop joins bounded.
 - Trust: client fingerprint comparison tightened with pinned-mode failure
   UX; enrollment & transport trust model documented in ARCHITECTURE.md.
+- `rustls` bumped 0.23.43 → 0.23.45 to fix RUSTSEC-2026-0285
+  (GHSA-2mjx-qc3c-rqvc, CVE-2025-61730): rustls accepted TLS 1.3 handshake
+  messages sent at the wrong encryption level. rustls reaches the tree only as
+  a transitive dependency (via `ureq`), so this is a lockfile-only update with
+  no source change. Verified with `cargo test-all` (3273 passing) and the
+  supply-chain gate (`cargo deny` advisories).
 
 ## [0.1.0]
 
