@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # update-homebrew-tap.sh — bump the choreographr/homebrew-choreographr tap
 # formula to the release version in the workspace Cargo.toml, recompute the
-# macOS tarball digests from dist/, and (only with --push) commit + push to
-# the tap repo. Dry-run by default: clones the tap, rewrites the formula,
-# validates it, and prints the diff — the remote is never touched.
+# macOS tarball digests from dist/, reconcile its bin.install list with the
+# in-repo mirrored formula, and (only with --push) commit + push to the tap
+# repo. Dry-run by default: clones the tap, rewrites the formula, validates it,
+# and prints the diff — the remote is never touched.
 #
-# Why a script instead of GitHub Actions: this repo has no CI by design
-# (RELEASE.md — every release step runs on owned machines; GitHub is only
-# artifact hosting). The tap bump is therefore a release-script step on the
-# Linux box, reusing the tarballs already staged in dist/ by Phase 4. The
-# digests are computed locally from the exact artifacts that were uploaded —
-# no re-download, no trust in a third-party service.
+# Why a script rather than a workflow: the bump reuses the macOS tarballs
+# already staged in dist/ by Phase 4 and computes the digests locally from the
+# exact artifacts that were uploaded — no re-download, no trust in a
+# third-party service. (CI verifies the RESULT: the `homebrew-verify` workflow
+# installs from the tap on a macOS arm64 runner and asserts `--version`.)
 #
 # Usage:
 #   scripts/update-homebrew-tap.sh              # dry-run: diff, no push
@@ -171,6 +171,19 @@ OLD_X86_64_SHA="$(sed -n '/^  else/,/^  end/ s/^    sha256 "\([^"]*\)"/\1/p' "$F
 [ -n "$OLD_ARM64_SHA" ] || { echo "error: could not read arm64 sha256 from $FORMULA" >&2; exit 1; }
 [ -n "$OLD_X86_64_SHA" ] || { echo "error: could not read x86_64 sha256 from $FORMULA" >&2; exit 1; }
 
+# The shipped binary set is structural, not release-specific, but the release
+# build's binary layout CAN change (the 0.1.0 → 0.2.0 split moved choreo-im and
+# choreo-acp out of the release). The tap formula's `bin.install` list must name
+# exactly the tarball's binaries or `brew install` fails with ENOENT on one the
+# tarball no longer ships — so reconcile it against the in-repo mirrored
+# formula, which is the source of truth for it.
+MIRROR_FORMULA="packaging/homebrew/choreographr.rb"
+[ -f "$MIRROR_FORMULA" ] || { echo "error: $MIRROR_FORMULA not found (repo layout changed?)" >&2; exit 1; }
+OLD_INSTALL="$(grep -m1 '^    bin\.install ' "$FORMULA" || true)"
+NEW_INSTALL="$(grep -m1 '^    bin\.install ' "$MIRROR_FORMULA" || true)"
+[ -n "$OLD_INSTALL" ] || { echo "error: no bin.install line found in $FORMULA" >&2; exit 1; }
+[ -n "$NEW_INSTALL" ] || { echo "error: no bin.install line found in $MIRROR_FORMULA" >&2; exit 1; }
+
 # Decide which fields need updating. The version/url fields change only when
 # the version differs; the digests can differ at the SAME version too — e.g.
 # the scaffolded formula was pushed with placeholder digests, or a tarball
@@ -178,6 +191,7 @@ OLD_X86_64_SHA="$(sed -n '/^  else/,/^  end/ s/^    sha256 "\([^"]*\)"/\1/p' "$F
 # version AND every shippable digest to match, not just the version line.
 NEEDS_REWRITE=0
 NEEDS_DIGEST=0
+NEEDS_INSTALL=0
 if [ "$OLD_VERSION" != "$VERSION" ]; then
     NEEDS_REWRITE=1
     NEEDS_DIGEST=1
@@ -186,16 +200,20 @@ elif [ "$OLD_ARM64_SHA" != "$ARM64_SHA" ]; then
 elif [ -n "$X86_64_SHA" ] && [ "$OLD_X86_64_SHA" != "$X86_64_SHA" ]; then
     NEEDS_DIGEST=1
 fi
+[ "$OLD_INSTALL" = "$NEW_INSTALL" ] || NEEDS_INSTALL=1
 
-if [ "$NEEDS_REWRITE" -eq 0 ] && [ "$NEEDS_DIGEST" -eq 0 ]; then
-    echo "==> tap formula already at v${VERSION} with matching digests — nothing to do"
+if [ "$NEEDS_REWRITE" -eq 0 ] && [ "$NEEDS_DIGEST" -eq 0 ] && [ "$NEEDS_INSTALL" -eq 0 ]; then
+    echo "==> tap formula already at v${VERSION} with matching digests + bin.install — nothing to do"
     exit 0
 fi
 
 if [ "$NEEDS_REWRITE" -eq 1 ]; then
     echo "==> tap formula at v${OLD_VERSION} — bumping version + urls to v${VERSION}"
 else
-    echo "==> tap formula already at v${VERSION} — updating digests"
+    echo "==> tap formula already at v${VERSION} — updating changed fields"
+fi
+if [ "$NEEDS_INSTALL" -eq 1 ]; then
+    echo "==> tap bin.install differs from ${MIRROR_FORMULA} — reconciling"
 fi
 
 # ── rewrite ──────────────────────────────────────────────────────────────────
@@ -242,6 +260,11 @@ if [ "$NEEDS_DIGEST" -eq 1 ]; then
         replace_literal "sha256 \"$OLD_X86_64_SHA\"" "sha256 \"$X86_64_SHA\"" 1 "x86_64 digest"
     fi
 fi
+# 3. The bin.install list — whenever it differs from the mirrored formula (e.g.
+#    the shipped binary set changed since the tap was scaffolded).
+if [ "$NEEDS_INSTALL" -eq 1 ]; then
+    replace_literal "$OLD_INSTALL" "$NEW_INSTALL" 1 "bin.install line"
+fi
 
 # ── post-verification: every field must now be exactly what we expect ────────
 echo "==> verifying rewritten formula"
@@ -271,6 +294,8 @@ else
 fi
 # Exactly two sha256 fields must remain (arm64 + x86_64 branches).
 verify_count 'sha256 "' 2 "sha256 fields"
+# The bin.install list must NOW match the mirrored formula exactly.
+verify_count "$NEW_INSTALL" 1 "bin.install line"
 # Stale-version checks apply only when the version/urls were rewritten: at the
 # same version the URL lines legitimately still contain v$VERSION/.
 if [ "$NEEDS_REWRITE" -eq 1 ]; then
@@ -311,9 +336,10 @@ fi
 
 cat <<EOF
 
-==> remaining manual step (MacBook, needs real Homebrew):
-    brew install ./choreographr.rb && choreographr --version
+==> verify the channel — no Mac needed: the homebrew-verify workflow
+    gh workflow run homebrew-verify.yml -f version=${VERSION}
+    (or, on a Mac: brew install ./choreographr.rb && choreographr --version)
 
 ==> remember to sync the mirrored formula in this repo:
-    packaging/homebrew/choreographr.rb  (commit the drift — RELEASE.md Phase 6)
+    packaging/homebrew/choreographr.rb  (commit the drift — RELEASE.md Phase 5)
 EOF

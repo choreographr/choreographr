@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Homebrew tap formula installed the 0.1.0 binary set (`choreo-im`,
+  `choreo-acp`), which the 0.2.0 release build no longer ships, so
+  `brew install choreographr` failed with `ENOENT` on `choreo-im`. The formula
+  now lists only the shipped binaries (`choreographr`, `choreo-tui`), and
+  `scripts/update-homebrew-tap.sh` reconciles the `bin.install` line against the
+  in-repo mirrored formula so the two cannot drift apart again.
 - The release workflow no longer attaches the not-yet-shippable Windows
   `.zip` to GitHub releases. The `release` job downloaded every artifact in
   the run (`pattern: "*"`), so the zip landed on a release whenever the
