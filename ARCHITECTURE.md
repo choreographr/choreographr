@@ -321,7 +321,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 - **Homebrew tap** — `brew tap choreographr/choreographr && brew install choreographr` (prebuilt formula)
 - **GitHub Releases** — the tarball, `SHA256SUMS`, the desktop `.deb`/`.rpm`, and the Termux `.deb` at `https://github.com/choreographr/choreographr/releases`
 - **choreographr.com** — `https://choreographr.com/download/<version>/` mirrors the tarball and `SHA256SUMS` (this is what `install.sh` fetches); `https://choreographr.com/install.sh` serves the installer, and per-version download redirects are added at release time
-- **AUR** — `choreographr-bin`
+- **AUR** — `choreographr-bin` (prepared in `packaging/aur/`, **not yet published**: no maintainer account and AUR registration is closed)
 - **crates.io** — `cargo install choreographr choreo-tui` (source build, needs Zig) and `cargo binstall choreographr choreo-tui` (prebuilt; asset naming resolved via `[package.metadata.binstall]` in each package, below)
 
 ### crates.io metadata
