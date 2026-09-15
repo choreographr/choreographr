@@ -14,7 +14,7 @@ A release ships three things:
    AUR, `cargo binstall`, and the `choreographr.com` installer. (The Windows
    `.zip` is built and smoke-tested on every tag but is not attached to the
    release yet — see [CI builds](#ci-builds-github-actions).)
-3. **Channel updates** — Homebrew tap, AUR, choreographr.com.
+3. **Channel updates** — Homebrew tap, choreographr.com (AUR deferred: no account).
 
 One release conductor drives all three. The binary artifacts for all shipped
 platforms are built **on GitHub Actions** by `.github/workflows/release.yml`
@@ -507,18 +507,37 @@ run):
    `brew install ./choreographr.rb` then `choreographr --version` on a Mac).
 5. Commit + push to the **tap repo** (not this repo).
 
-### AUR (`choreographr-bin`)
+### AUR (`choreographr-bin`) — ⏸️ DEFERRED (no AUR account)
 
-Edit `packaging/aur/PKGBUILD`:
+**Skip this channel for now.** There is no AUR account for the project and AUR
+new-account registration is temporarily closed
+(<https://aur.archlinux.org/register>); the `choreographr-bin` package does not
+exist on the AUR. Do **not** tick the AUR gate item — record it as deferred.
+`packaging/aur/` is still kept current (source of truth) so the channel can be
+published the moment an account exists.
+
+When an AUR account is available — `packaging/aur/PKGBUILD`:
 
 1. Bump `pkgver` to `X.Y.Z`, reset `pkgrel` to `1`.
-2. Update the `source` URL and `sha256sums` (take the digest from the combined
-   `SHA256SUMS` — the tarball is `choreographr-<V>-x86_64-unknown-linux-musl.tar.gz`).
-3. Regenerate and push:
+2. Update the `source` URL and `sha256sums` (the digest from the release's
+   `SHA256SUMS` — the tarball is
+   `choreographr-<V>-x86_64-unknown-linux-musl.tar.gz`).
+3. Regenerate `.SRCINFO` and commit **in this repo** (`packaging/aur/` is part
+   of `choreographr/choreographr`, not an AUR checkout):
    ```nu
    cd packaging/aur
    makepkg --printsrcinfo | save -f .SRCINFO
+   cd ../..; git add packaging/aur/PKGBUILD packaging/aur/.SRCINFO
+   git commit -m "chore(release): bump AUR PKGBUILD to X.Y.Z"
+   ```
+4. Upload to the AUR (a **separate** repo; needs your AUR account's SSH key):
+   ```nu
+   git clone ssh://aur.archlinux.org/choreographr-bin.git /tmp/choreographr-bin
+   cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO /tmp/choreographr-bin/
+   cd /tmp/choreographr-bin
    git add PKGBUILD .SRCINFO
+   git commit -m "choreographr-bin X.Y.Z"
+   git push
    ```
 
 ### choreographr.com (static hosting)
@@ -530,7 +549,9 @@ Edit `packaging/aur/PKGBUILD`:
    `.rpm`, Termux `.deb`) → the GitHub release URLs.
 3. Publish `/releases/SHA256SUMS` (the combined file).
 
-**Gate:** every channel's `--version` reports `X.Y.Z`.
+**Gate:** every **published** channel's `--version` reports `X.Y.Z` (Homebrew,
+choreographr.com). AUR is **deferred** (no account; registration closed — see
+above) and is excluded from this gate until an account exists.
 
 ---
 
@@ -543,7 +564,7 @@ Exercise every install route from a clean environment:
 | crates.io (source) | `cargo install choreographr choreo-tui --locked` (with zig) | builds, `--version` = X.Y.Z |
 | binstall (prebuilt) | `cargo binstall choreographr choreo-tui` | fetches tarball, no toolchain |
 | Homebrew | `brew tap choreographr/choreographr` then `brew install choreographr` | no quarantine friction |
-| AUR | `choreographr-bin` | installs, `choreographr --version` |
+| AUR | `choreographr-bin` | **deferred** — no AUR account yet (registration closed) |
 | curl installer | `curl -fsSL https://choreographr.com/install.sh \| sh` | sha256-verified extract |
 | .deb / .rpm | `dpkg -i` / `dnf install` on clean distro VMs | installs; unit present, **not enabled** |
 | Termux | `dpkg -i` the Termux-native `.deb` on a device | installs; binaries run under Termux's $PREFIX |
@@ -584,9 +605,9 @@ Finally, commit any post-release doc/version drift in this repo and push.
 - [ ] Publish in **two batches** (0.2.0 creates 6 new crates > burst 5; a single `--workspace` is refused): dry-run then `-x` each — Batch 1 (`-p choreo-proto … -p choreo-power-events`), wait ≥ 10 min, Batch 2 (`-p choreo-transport … -p choreographr`) → 18 crates on crates.io; `cargo install --locked` verified
 - [ ] Push the bump commit + `vX.Y.Z` tag → CI builds all platforms and creates the GitHub release; verify the release page lists every asset + `SHA256SUMS` and they download
 - [ ] `gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/`, then `scripts/update-homebrew-tap.sh --push` (commit the synced `packaging/homebrew/choreographr.rb`); `gh workflow run homebrew-verify.yml -f version=X.Y.Z` green
-- [ ] AUR `pkgver`/`sha256sums` bumped, `.SRCINFO` regenerated, pushed
+- [ ] AUR — **deferred** (no AUR account; registration closed): `packaging/aur/` bumped in-repo but not pushed
 - [ ] choreographr.com: `install.sh`, `/download/vX.Y.Z/` redirects, `/releases/SHA256SUMS`
-- [ ] All install routes verified (`cargo install`/`binstall`, brew, AUR, curl, .deb, .rpm, Termux)
+- [ ] All install routes verified (`cargo install`/`binstall`, brew, curl, .deb, .rpm, Termux; **AUR deferred**)
 - [ ] Service policy confirmed: installed, never auto-enabled
 
 ---
