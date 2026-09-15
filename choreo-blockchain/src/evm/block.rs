@@ -27,12 +27,12 @@ async fn evm_block_impl(rpc_url: &str, block_tag: Option<&str>) -> Result<String
     let base_fee = block.header.base_fee_per_gas.unwrap_or(0);
 
     let mut out = String::new();
-    let _ = write!(out, "block: #{number}\n");
-    let _ = write!(out, "hash: {hash:#x}\n");
-    let _ = write!(out, "timestamp: {timestamp}\n");
-    let _ = write!(out, "transactions: {tx_count}\n");
-    let _ = write!(out, "gas_used: {gas_used}\n");
-    let _ = write!(out, "gas_limit: {gas_limit}\n");
+    let _ = writeln!(out, "block: #{number}");
+    let _ = writeln!(out, "hash: {hash:#x}");
+    let _ = writeln!(out, "timestamp: {timestamp}");
+    let _ = writeln!(out, "transactions: {tx_count}");
+    let _ = writeln!(out, "gas_used: {gas_used}");
+    let _ = writeln!(out, "gas_limit: {gas_limit}");
     let _ = write!(out, "base_fee: {base_fee} wei");
     Ok(out)
 }

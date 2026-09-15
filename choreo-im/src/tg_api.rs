@@ -52,6 +52,7 @@ pub struct Bot {
 }
 
 impl Bot {
+    #[must_use]
     pub fn new(token: &str) -> Self {
         Self {
             token: token.to_string(),
@@ -64,10 +65,15 @@ impl Bot {
         }
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelegramError::Http`] on request send/parse failure and
+    /// [`TelegramError::Api`] when the Bot API returns `ok: false`.
     pub fn get_updates(&self, offset: u32, timeout: u32) -> Result<Vec<Update>, TelegramError> {
         let base = format!("https://api.telegram.org/bot{}/getUpdates", self.token);
         let body = serde_json::json!({
-            "offset": offset as i64,
+            "offset": i64::from(offset),
             "timeout": timeout,
         });
         let response = self.agent.post(&base).send_json(body)?;
@@ -80,6 +86,11 @@ impl Bot {
         Ok(api_resp.result.unwrap_or_default())
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelegramError::Http`] on network
+    /// failure and [`TelegramError::Api`] when the Bot API returns `ok: false`.
     pub fn send_message(
         &self,
         chat_id: i64,
@@ -108,6 +119,11 @@ impl Bot {
         Ok(())
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelegramError::Http`] on network failure and
+    /// [`TelegramError::Api`] when the Bot API returns `ok: false`.
     pub fn send_photo(&self, chat_id: i64, data: &[u8]) -> Result<(), TelegramError> {
         let base = format!("https://api.telegram.org/bot{}/sendPhoto", self.token);
         // Build a unique boundary for multipart/form-data.
@@ -115,8 +131,7 @@ impl Bot {
             "----choreo{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .map_or(0, |d| d.as_nanos())
         );
 
         let mut body = Vec::new();

@@ -11,8 +11,8 @@
 // out here instead of in clippy.toml.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-/// Isolate known_servers writes (bind pre-send recording and the Bound
-/// confirmation record) in a temp config root. Returns the TempDir AND the
+/// Isolate `known_servers` writes (bind pre-send recording and the `Bound`
+/// confirmation record) in a temp config root. Returns the `TempDir` AND the
 /// override guard — the guard must stay alive for the whole test or the
 /// thread-local override resets and writes hit the real config dir.
 ///
@@ -21,6 +21,7 @@
 /// Panics if the temp dir cannot be created or the config root files cannot
 /// be written — a broken test machine should fail the test loudly rather
 /// than silently fall back to the real config dir.
+#[must_use]
 pub fn isolate_config() -> (tempfile::TempDir, choreo_keystore::paths::TestConfigGuard) {
     let dir = tempfile::tempdir().unwrap();
     let guard = choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));

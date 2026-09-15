@@ -406,13 +406,13 @@ fn dispatch_session_event(
             });
         }
         SessionEvent::TurnAppended { turn_id, turn } => {
-            handler.handle_turn_appended(*session_id, *turn_id, turn.clone());;
+            handler.handle_turn_appended(*session_id, *turn_id, turn.clone());
         }
         SessionEvent::TurnsUndone { turn_ids } => {
-            handler.handle_turns_undone(*session_id, turn_ids);;
+            handler.handle_turns_undone(*session_id, turn_ids);
         }
         SessionEvent::TurnsRedone { turns } => {
-            handler.handle_turns_redone(*session_id, turns.clone());;
+            handler.handle_turns_redone(*session_id, turns.clone());
         }
         SessionEvent::Started {
             request_id,

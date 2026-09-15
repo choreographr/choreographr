@@ -137,8 +137,8 @@ pub fn main() -> anyhow::Result<()> {
 /// step (I/O, protocol, or daemon-reported failure).
 pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
     addr: &str,
-    mut reader: &mut BufReader<R>,
-    mut writer: &mut BufWriter<W>,
+    reader: &mut BufReader<R>,
+    writer: &mut BufWriter<W>,
 ) -> anyhow::Result<()> {
     // Auto-unlock with the key ALREADY associated with this daemon: the
     // stored known_servers unlock_key (falling back to the legacy raw
@@ -158,10 +158,10 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
     // recording cannot clobber a key that does not resolve anyway.
     if let Some(private_key) = choreo_client_core::try_auto_unlock_key(addr) {
         info!("unlocking daemon with stored unlock key");
-        write_message(&mut writer, &ClientMessage::Unlock { private_key })
+        write_message(writer, &ClientMessage::Unlock { private_key })
             .context("failed to send unlock message")?;
         writer.flush().context("failed to flush unlock message")?;
-        match read_message::<_, DaemonMessage>(&mut reader) {
+        match read_message::<_, DaemonMessage>(&mut *reader) {
             Ok(DaemonMessage::Unlocked) => {
                 info!("daemon unlocked");
             }
@@ -171,9 +171,9 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
                 info!(%error, "daemon keystore unbound — auto-binding with a fresh key");
                 let (_key, bind_msg) = choreo_client_core::bind_fresh_daemon(addr)
                     .context("failed to mint and record a fresh bind key")?;
-                write_message(&mut writer, &bind_msg).context("failed to send bind message")?;
+                write_message(writer, &bind_msg).context("failed to send bind message")?;
                 writer.flush().context("failed to flush bind message")?;
-                match read_message::<_, DaemonMessage>(&mut reader) {
+                match read_message::<_, DaemonMessage>(&mut *reader) {
                     // `Bound` is the unlock confirmation for a bind (the
                     // daemon ran the shared unlock tail after adopting the
                     // key) — accept it exactly like `Unlocked`.
@@ -222,9 +222,9 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
         let (_key, bind_msg) = choreo_client_core::bind_fresh_daemon(addr)
             .context("failed to mint and record a fresh bind key")?;
         info!("no stored unlock key — probing daemon with a fresh bind");
-        write_message(&mut writer, &bind_msg).context("failed to send bind message")?;
+        write_message(writer, &bind_msg).context("failed to send bind message")?;
         writer.flush().context("failed to flush bind message")?;
-        match read_message::<_, DaemonMessage>(&mut reader) {
+        match read_message::<_, DaemonMessage>(&mut *reader) {
             Ok(DaemonMessage::Bound) => {
                 info!("daemon keystore bound and unlocked");
             }
@@ -249,9 +249,12 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
     Ok(())
 }
 
+// needless_pass_by_value waived: the reader/writer halves are moved into
+// the bridge threads; taking references would fight the thread handoff.
+#[allow(clippy::needless_pass_by_value)]
 fn run_platform(
     platform: &str,
-    bot_token: String,
+    #[allow(clippy::needless_pass_by_value)] bot_token: String,
     reader: BufReader<UnixStream>,
     writer: BufWriter<UnixStream>,
 ) -> anyhow::Result<()> {
@@ -275,7 +278,7 @@ fn run_platform(
             let bridge = crate::bridge::DaemonBridge::spawn(reader, writer);
             let (tx, rx) = bridge.into_parts();
 
-            crate::telegram::run(bot_token, admin_ids, tx, rx);
+            crate::telegram::run(&bot_token, admin_ids, tx, rx);
             Ok(())
         }
         other => {
@@ -297,7 +300,7 @@ mod tests {
         // clap returns the version as a `DisplayVersion` error instead of a
         // value; match it out by hand (Cli doesn't derive Debug, so
         // `unwrap_err()`'s Debug bound doesn't apply).
-        let Ok(err) = super::Cli::try_parse_from(["choreo-im", "--version"]) else {
+        let Err(err) = super::Cli::try_parse_from(["choreo-im", "--version"]) else {
             panic!("--version should short-circuit before arg validation")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);

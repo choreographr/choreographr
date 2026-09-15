@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GuiSettings {
     /// Whether the iOS embedded daemon registers the on-device tool group
-    /// (clipboard_write/clipboard_read/open_url/notify over the Swift
+    /// (`clipboard_write`/`clipboard_read`/`open_url`/`notify` over the Swift
     /// bridge). Default ON: the four tools need no iOS permission prompts,
     /// so the sensible default is available. Toggling takes effect on the
     /// NEXT app start, because the bridge is handed to `DaemonState::open`
@@ -110,7 +110,7 @@ impl GuiSettings {
 
     /// Persist to an explicit path (the test seam). Whole-file rewrite; the
     /// file is tiny and the GUI is its only writer, so no advisory lock is
-    /// taken (unlike known_servers.toml, which multiple processes share).
+    /// taken (unlike `known_servers.toml`, which multiple processes share).
     pub(crate) fn persist_to(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -180,7 +180,7 @@ mod tests {
     /// Round-trip through the real path resolution with the shared config
     /// root overridden to a tempdir — deterministic, no sleeps, no threads.
     /// `TestConfigGuard` resets the override on drop (even on a panicking
-    /// assert); the TempDir must be held for the whole body.
+    /// assert); the `TempDir` must be held for the whole body.
     #[test]
     fn persist_and_reload_round_trip() {
         let temp = tempfile::TempDir::new().unwrap();

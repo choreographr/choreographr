@@ -71,7 +71,7 @@ fn default_log_file() -> String {
         .into_owned()
 }
 
-fn setup_logging(log_file: &str) -> Result<(), anyhow::Error> {
+fn setup_logging(log_file: &str) {
     // The log file is auxiliary diagnostics — stdout carries the ACP JSON-RPC
     // stream and the adapter's job is to relay it, so a failure to create the
     // log must never kill the adapter (the Termux /tmp lesson: diagnostics
@@ -81,7 +81,7 @@ fn setup_logging(log_file: &str) -> Result<(), anyhow::Error> {
         eprintln!(
             "warning: could not create log file '{log_file}'; continuing without file logging"
         );
-        return Ok(());
+        return;
     };
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::sync::Mutex::new(file))
@@ -98,20 +98,26 @@ fn setup_logging(log_file: &str) -> Result<(), anyhow::Error> {
         .with(filter)
         .with(file_layer)
         .init();
-    Ok(())
 }
 
 /// Entry point for the `choreo-acp` bridge binary.
 ///
 /// The workspace root declares this crate's binary as a thin wrapper that
 /// simply calls this function, so the actual logic lives here in the lib.
+///
+/// # Errors
+///
+/// Returns an error when the given [`Cli`] arguments fail to parse
+/// (`error = ...` returned by clap-derived parsing) or when daemon
+/// initialization fails. A user-C-cancellation returns `Err` with the
+/// propagated [`anyhow::Error`].
 pub fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
     // Logging goes to $TMPDIR/choreo-acp.log (never stderr, which is unused
     // in the ACP protocol — stdout carries the JSON-RPC stream); if the log
     // file cannot be created the adapter continues without file logging.
-    setup_logging(&cli.log_file).context("failed to initialize logging")?;
+    setup_logging(&cli.log_file);
 
     tracing::info!(
         socket_path = %cli.socket_path,
@@ -147,7 +153,7 @@ pub fn main() -> Result<(), anyhow::Error> {
     tracing::info!("entering main event loop");
 
     // 3. Run the main event loop (blocks until both I/O threads exit).
-    if let Err(e) = crate::acp_handler::run_event_loop(event_rx, daemon_client.writer_tx) {
+    if let Err(e) = crate::acp_handler::run_event_loop(&event_rx, daemon_client.writer_tx) {
         tracing::error!(error = %e, "event loop exited with error");
     }
 
@@ -167,16 +173,15 @@ mod cli_tests {
 
     /// `--version` is handled by clap before any real arg parsing: it exits
     /// with a `DisplayVersion` error whose message is the version string.
-    /// Assert both so the flag stays wired to CARGO_PKG_VERSION (it breaks
+    /// Assert both so the flag stays wired to `CARGO_PKG_VERSION` (it breaks
     /// silently if the derive attribute loses the bare `version` marker).
     #[test]
     fn version_flag_displays_package_version() {
         // clap returns the version as a `DisplayVersion` error instead of a
         // value; match it out by hand (Cli doesn't derive Debug, so
         // `unwrap_err()`'s Debug bound doesn't apply).
-        let err = match Cli::try_parse_from(["choreo-acp", "--version"]) {
-            Err(e) => e,
-            Ok(_) => panic!("--version should short-circuit before arg validation"),
+        let Err(err) = Cli::try_parse_from(["choreo-acp", "--version"]) else {
+            panic!("--version should short-circuit before arg validation");
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
@@ -194,7 +199,7 @@ mod cli_tests {
     }
 
     /// A log file that cannot be created must not prevent the adapter from
-    /// starting: setup_logging degrades to no file logging (its stderr
+    /// starting: `setup_logging` degrades to no file logging (its stderr
     /// warning is the only trace, safe in ACP since stdout carries the
     /// JSON-RPC stream).
     #[test]
@@ -205,8 +210,9 @@ mod cli_tests {
         std::fs::write(&blocker, b"not a directory").expect("write blocker file");
         let impossible = blocker.join("choreo-acp.log");
 
-        setup_logging(&impossible.to_string_lossy())
-            .expect("an uncreatable log file must degrade, not fail");
+        // setup_logging cannot fail (it returns unit) — the assertion is
+        // only that reaching here means the function degraded safely.
+        setup_logging(&impossible.to_string_lossy());
 
         let _ = std::fs::remove_file(&blocker);
     }

@@ -16,10 +16,10 @@ async fn evm_chain_impl(rpc_url: &str) -> Result<String, BlockchainError> {
         .map_err(alloy_err)?;
 
     let mut out = String::new();
-    let _ = write!(out, "chain_id: {chain_id}\n");
-    let _ = write!(out, "block_number: {block_number}\n");
-    let _ = write!(out, "gas_price: {gas_price} wei\n");
-    let _ = write!(out, "max_priority_fee: {max_priority_fee} wei\n");
+    let _ = writeln!(out, "chain_id: {chain_id}");
+    let _ = writeln!(out, "block_number: {block_number}");
+    let _ = writeln!(out, "gas_price: {gas_price} wei");
+    let _ = writeln!(out, "max_priority_fee: {max_priority_fee} wei");
     // client_version is a free-form node-supplied string (may embed control
     // chars / terminal escapes from a hostile endpoint) — sanitize it.
     let _ = writeln!(out, "client_version: {}", sanitize_value(&client_version));

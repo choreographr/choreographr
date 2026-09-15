@@ -13,6 +13,7 @@ pub struct ClientCapabilitiesStore {
 }
 
 impl ClientCapabilitiesStore {
+    #[must_use]
     pub fn new() -> Self {
         Self { capabilities: None }
     }
@@ -24,6 +25,7 @@ impl ClientCapabilitiesStore {
     }
 
     /// Whether the editor advertises `fs.readTextFile` support.
+    #[must_use]
     pub fn fs_read_supported(&self) -> bool {
         self.capabilities
             .as_ref()
@@ -33,6 +35,7 @@ impl ClientCapabilitiesStore {
     }
 
     /// Whether the editor advertises `fs.writeTextFile` support.
+    #[must_use]
     pub fn fs_write_supported(&self) -> bool {
         self.capabilities
             .as_ref()
@@ -42,6 +45,7 @@ impl ClientCapabilitiesStore {
     }
 
     /// Whether the editor advertises `terminal` support.
+    #[must_use]
     pub fn terminal_supported(&self) -> bool {
         self.capabilities
             .as_ref()

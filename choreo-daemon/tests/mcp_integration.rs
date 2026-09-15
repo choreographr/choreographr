@@ -3,17 +3,17 @@
 #![cfg(feature = "mcp")]
 use choreo_daemon::tools::ToolOutputFormat;
 /// Integration test for MCP server spawning, tool discovery, and tool
-/// execution through the full Choreographr stack (McpManager + ToolRegistry).
+/// execution through the full Choreographr stack (`McpManager` + `ToolRegistry`).
 ///
 /// Writes an `mcp_servers.json` pointing to the official
 /// `@modelcontextprotocol/server-everything` reference server, sets up a
-/// ToolRegistry with an McpManager, and verifies the whole pipeline:
+/// `ToolRegistry` with an `McpManager`, and verifies the whole pipeline:
 ///
 /// 1. The dynamic group `mcp/everything` appears in `registry.group_names()`.
 /// 2. Tool definitions from the server are available via
 ///    `registry.available_definitions()`.
 /// 3. The `echo` tool can be called and returns the expected message.
-/// 4. Dropping the McpManager shuts down the server cleanly.
+/// 4. Dropping the `McpManager` shuts down the server cleanly.
 ///
 /// Requires Node.js and `npx` to be available on the system.
 ///

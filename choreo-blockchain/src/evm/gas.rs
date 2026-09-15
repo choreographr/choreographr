@@ -14,7 +14,7 @@ async fn evm_gas_impl(rpc_url: &str) -> Result<String, BlockchainError> {
     let estimation = provider.estimate_eip1559_fees().await.map_err(alloy_err)?;
 
     let mut out = String::new();
-    let _ = write!(out, "gas_price: {gas_price} wei\n");
+    let _ = writeln!(out, "gas_price: {gas_price} wei");
     let _ = writeln!(out, "max_priority_fee_per_gas: {max_priority_fee} wei\n");
 
     let _ = writeln!(

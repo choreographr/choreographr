@@ -17,6 +17,11 @@ const MAX_ACP_LINE: usize = 1 << 20; // 1 MiB
 /// the shared event channel.
 ///
 /// When stdin reaches EOF the thread sends `Event::AcpEof` and exits.
+///
+/// # Errors
+///
+/// Returns an [`AcpError::Io`] error when the reader thread could not be
+/// spawned.
 pub fn spawn_acp_reader(event_tx: mpsc::Sender<Event>) -> Result<thread::JoinHandle<()>, AcpError> {
     thread::Builder::new()
         .name("acp-reader".into())

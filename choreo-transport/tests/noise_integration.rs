@@ -44,10 +44,12 @@ fn shrink_socket_buffers(stream: &TcpStream) {
 #[cfg(not(unix))]
 fn shrink_socket_buffers(_stream: &TcpStream) {}
 
+/// Listener + server/client X25519 secret/public keys.
+type NoiseTestSetup = (TcpListener, [u8; 32], [u8; 32], [u8; 32], [u8; 32]);
+
 /// Fresh X25519 keypairs for both handshake sides plus an ephemeral
 /// listener, shared by every test (cuts the per-test keygen boilerplate).
-fn noise_test_pair()
--> std::result::Result<(TcpListener, [u8; 32], [u8; 32], [u8; 32], [u8; 32]), String> {
+fn noise_test_pair() -> std::result::Result<NoiseTestSetup, String> {
     let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
     let server_pk = PublicKey::from(&server_sk);
     let client_sk = StaticSecret::random_from_rng(&mut rand::rng());
@@ -940,7 +942,7 @@ fn noise_rejects_tampered_length_prefix() {
                 len -= 1;
             }
             stream.write_all(&len.to_be_bytes()).expect("write len");
-            stream.write_all(&ct[..usize::from(n)]).expect("write ct");
+            stream.write_all(&ct[..n]).expect("write ct");
         }
     };
 

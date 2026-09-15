@@ -17,7 +17,7 @@ pub fn run(
     bridge_tx: mpsc::Sender<ClientMessage>,
     bridge_rx: mpsc::Receiver<BridgeEvent>,
 ) {
-    let bot = Bot::new(&bot_token);
+    let bot = Bot::new(bot_token);
 
     let (chat_id_tx, chat_id_rx) = mpsc::channel();
 
@@ -88,10 +88,12 @@ fn is_admin(msg: &crate::tg_api::Message, admin_ids: &[i64]) -> bool {
 }
 
 fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message) {
-    let Some(text) = msg.text.as_ref() else { return };
+    let Some(text) = msg.text.as_ref() else {
+        return;
+    };
 
     let user_id = msg.from.as_ref().map_or(0, |u| u.id);
-    if !(is_chat_private(&msg) && is_admin(&msg, &state.admin_ids)) {
+    if !(is_chat_private(msg) && is_admin(msg, &state.admin_ids)) {
         debug!(%user_id, "non-admin or non-private message ignored");
         return;
     }
@@ -102,7 +104,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
     let _ = state.chat_id_tx.send(chat_id_val);
 
     let mut request_id = state.request_id.get();
-    let command = parse_input_line(&text, &mut request_id, None);
+    let command = parse_input_line(text, &mut request_id, None);
     state.request_id.set(request_id);
 
     match command {

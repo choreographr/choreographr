@@ -5,6 +5,7 @@ use crate::acp_jsonrpc::{ConfigOption, ConfigOptionType, ConfigOptionValue, Sele
 /// The option type is `Select` with one entry per model.  If a model is
 /// currently selected, its value is the `current_value`; otherwise the
 /// current value is an empty string.
+#[must_use]
 pub fn build_model_config(models: &[String], selected: &Option<String>) -> ConfigOption {
     let options: Vec<SelectOption> = models
         .iter()
@@ -34,6 +35,7 @@ pub fn build_model_config(models: &[String], selected: &Option<String>) -> Confi
 ///
 /// The option type is `Select` with the standard off/low/medium/high
 /// choices.  Defaults to `"medium"` when no effort is set.
+#[must_use]
 pub fn build_reasoning_effort_config(current: Option<String>) -> ConfigOption {
     let current_value = match current {
         Some(effort) => ConfigOptionValue::String(effort),
@@ -74,6 +76,7 @@ pub fn build_reasoning_effort_config(current: Option<String>) -> ConfigOption {
 ///
 /// Currently hardcoded — future versions may query the daemon for
 /// available tool groups.
+#[must_use]
 pub fn build_tool_groups_config() -> ConfigOption {
     ConfigOption {
         id: "tool_groups".into(),
@@ -90,6 +93,7 @@ pub fn build_tool_groups_config() -> ConfigOption {
 ///
 /// Returns the canonical set of `ConfigOption` objects that choreo-acp
 /// advertises in the `InitializeResult` and `NewSessionResult`.
+#[must_use]
 pub fn build_config_options(
     models: &[String],
     selected_model: &Option<String>,
@@ -119,7 +123,7 @@ mod tests {
         assert_eq!(opts[1].value, "gpt-5");
         match config.current_value {
             ConfigOptionValue::String(v) => assert_eq!(v, "claude-4"),
-            _ => panic!("expected String"),
+            ConfigOptionValue::Bool(_) => panic!("expected String"),
         }
     }
 
@@ -128,8 +132,8 @@ mod tests {
         let models = vec!["claude-4".into()];
         let config = build_model_config(&models, &None);
         match config.current_value {
-            ConfigOptionValue::String(v) => assert!(v.is_empty()),
-            _ => panic!("expected String"),
+            ConfigOptionValue::String(v) => assert_eq!(v, ""),
+            ConfigOptionValue::Bool(_) => panic!("expected String"),
         }
     }
 
@@ -141,7 +145,7 @@ mod tests {
         assert_eq!(opts.len(), 4);
         match config.current_value {
             ConfigOptionValue::String(v) => assert_eq!(v, "high"),
-            _ => panic!("expected String"),
+            ConfigOptionValue::Bool(_) => panic!("expected String"),
         }
     }
 
@@ -150,7 +154,7 @@ mod tests {
         let config = build_reasoning_effort_config(None);
         match config.current_value {
             ConfigOptionValue::String(v) => assert_eq!(v, "medium"),
-            _ => panic!("expected String"),
+            ConfigOptionValue::Bool(_) => panic!("expected String"),
         }
     }
 
@@ -161,7 +165,7 @@ mod tests {
         assert!(matches!(config.option_type, ConfigOptionType::TextField));
         match config.current_value {
             ConfigOptionValue::String(v) => assert_eq!(v, "read,edit,terminal"),
-            _ => panic!("expected String"),
+            ConfigOptionValue::Bool(_) => panic!("expected String"),
         }
     }
 

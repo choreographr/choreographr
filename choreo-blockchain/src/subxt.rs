@@ -280,9 +280,9 @@ async fn subxt_chain_impl(ws_url: &str) -> Result<String, BlockchainError> {
     let _ = writeln!(out, "chain_type: {}\n", sanitize_value(&chain_type));
     let _ = writeln!(out, "node_name: {}\n", sanitize_value(&name));
     let _ = writeln!(out, "node_version: {}\n", sanitize_value(&version));
-    let _ = write!(out, "genesis_hash: {genesis_hash:#x}\n");
-    let _ = write!(out, "best_block: #{best_number} ({best_hash:#x})\n");
-    let _ = write!(out, "finalized_head: {finalized_hash}\n");
+    let _ = writeln!(out, "genesis_hash: {genesis_hash:#x}");
+    let _ = writeln!(out, "best_block: #{best_number} ({best_hash:#x})");
+    let _ = writeln!(out, "finalized_head: {finalized_hash}");
     let _ = writeln!(
         out,
         "properties: {}\n",
@@ -405,8 +405,8 @@ async fn subxt_block_impl(
         .map_err(subxt_err)?;
 
     let mut out = String::new();
-    let _ = write!(out, "block: #{number} ({hash:#x})\n");
-    let _ = write!(out, "spec_version: {spec_version}\n");
+    let _ = writeln!(out, "block: #{number} ({hash:#x})");
+    let _ = writeln!(out, "spec_version: {spec_version}");
     let _ = writeln!(
         out,
         "header parent_hash: {parent_hash:#x}\n",

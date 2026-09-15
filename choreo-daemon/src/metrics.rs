@@ -45,6 +45,11 @@ mod backend {
     /// Register all metrics with the global prometheus registry.
     /// Must be called once before any `record_*` function is used.
     /// Returns an error if any metric name conflicts with an already-registered metric.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a metric name conflicts with an already-registered
+    /// metric, or when the hardcoded Content-Type header fails to parse.
     pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let metrics = Metrics {
             sessions_active: prometheus::register_int_gauge!(
@@ -227,7 +232,7 @@ mod backend {
 
     /// HTTP server loop that serves `/metrics` on the given address.
     /// Checks an `AtomicBool` shutdown flag every 1-second poll and exits when set.
-    pub fn serve_metrics(addr: SocketAddr, shutdown: Arc<AtomicBool>) {
+    pub fn serve_metrics(addr: SocketAddr, shutdown: &Arc<AtomicBool>) {
         let server = match Server::http(addr) {
             Ok(s) => s,
             Err(e) => {
@@ -239,12 +244,9 @@ mod backend {
 
         // The content-type header is pre-parsed during init(). If it's not set,
         // the caller skipped init() — log an error but keep serving.
-        let content_type = match METRICS_CONTENT_TYPE.get() {
-            Some(h) => h,
-            None => {
-                error!("metrics not initialized — call metrics::init() before serve_metrics()");
-                return;
-            }
+        let Some(content_type) = METRICS_CONTENT_TYPE.get() else {
+            error!("metrics not initialized — call metrics::init() before serve_metrics()");
+            return;
         };
 
         loop {
@@ -264,11 +266,11 @@ mod backend {
                             let _ = request.respond(
                                 Response::from_string("internal error").with_status_code(500),
                             );
-                            continue;
+                        } else {
+                            let response =
+                                Response::from_data(buffer).with_header(content_type.clone());
+                            let _ = request.respond(response);
                         }
-                        let response =
-                            Response::from_data(buffer).with_header(content_type.clone());
-                        let _ = request.respond(response);
                     } else {
                         let _ = request
                             .respond(Response::from_string("not found").with_status_code(404));
@@ -276,11 +278,9 @@ mod backend {
                 }
                 Ok(None) => {
                     // Timeout — loop back and check shutdown flag
-                    continue;
                 }
                 Err(e) => {
                     error!(error = %e, "metrics HTTP server error");
-                    continue;
                 }
             }
         }
@@ -459,7 +459,7 @@ mod backend {
     /// # Errors
     ///
     /// Always returns Ok; this stub never binds anything and never fails.
-    pub fn serve_metrics(_addr: SocketAddr, _shutdown: Arc<AtomicBool>) {
+    pub fn serve_metrics(_addr: SocketAddr, _shutdown: &Arc<AtomicBool>) {
         tracing::warn!("metrics support is compiled out — /metrics server not started");
     }
 }

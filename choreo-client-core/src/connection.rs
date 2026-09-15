@@ -75,7 +75,6 @@ pub fn run_daemon_reader<R: BufRead>(
     Ok(())
 }
 
-
 ///
 /// # Errors
 ///
@@ -98,7 +97,6 @@ pub fn run_daemon_connection(
 
     // Channel to signal the writer thread to stop when the reader finishes.
     let (writer_shutdown_tx, writer_shutdown_rx) = mpsc::channel::<()>();
-    
 
     let writer_handle = thread::spawn(move || {
         loop {
@@ -207,7 +205,6 @@ impl Default for ConnectionMode {
 /// The reader thread has no read timeout — it blocks until a message arrives
 /// or the connection is closed. The writer thread uses a short timeout on its
 /// channel receive so it can also check for shutdown signals.
-
 ///
 /// # Errors
 ///
@@ -312,7 +309,6 @@ fn ik_handshake_and_serve(
 ///
 /// Otherwise identical to [`run_daemon_tcp_connection`] (same reader/writer
 /// thread shape, same shutdown semantics — see [`serve_noise_connection`]).
-
 ///
 /// # Errors
 ///
@@ -376,7 +372,6 @@ fn serve_noise_connection(
 ) -> Result<(), ClientError> {
     // Channel to signal writer thread to stop when reader finishes.
     let (writer_shutdown_tx, writer_shutdown_rx) = mpsc::channel::<()>();
-    
 
     // Writer thread: blocks on from_ui.recv_timeout(), sends via NoiseStream.
     // The timeout is only so the writer can check the shutdown signal —
@@ -592,7 +587,6 @@ pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(
 ///
 /// Errors if no pin exists for `addr` — callers must resolve first contact
 /// (probe + confirm + [`KnownServers::pin`]) before using this mode.
-
 ///
 /// # Errors
 ///
@@ -706,7 +700,6 @@ fn run_daemon_connection_in_process(
     // The `from_ui` parameter itself stays std `mpsc`: its type is the
     // pre-existing public signature shared with the socket modes.
     let (writer_shutdown_tx, writer_shutdown_rx) = crossbeam_channel::bounded::<()>(0);
-    
 
     // Writer thread: drains `from_ui` into `daemon_tx` — the identical
     // recv_timeout + shutdown-check loop the socket writer threads run; a
@@ -767,7 +760,6 @@ fn run_daemon_connection_in_process(
 
 /// Connect to a daemon using the given connection mode.
 /// Dispatches to the appropriate connection function.
-
 ///
 /// # Errors
 ///

@@ -41,6 +41,7 @@ pub enum ModelsPending {
 }
 
 impl ModelsPending {
+    #[must_use]
     pub fn jsonrpc_id(&self) -> u64 {
         match self {
             ModelsPending::CreateSession { jsonrpc_id, .. } => *jsonrpc_id,
@@ -51,8 +52,8 @@ impl ModelsPending {
 /// Manages all in-flight requests for the main event loop.
 ///
 /// Because the event loop is single-threaded and all I/O is blocking, we
-/// can use a simple HashMap keyed by `PendingKind` for synchronous requests
-/// and another HashMap keyed by session ID for streaming prompts.
+/// can use a simple `HashMap` keyed by `PendingKind` for synchronous requests
+/// and another `HashMap` keyed by session ID for streaming prompts.
 #[derive(Debug)]
 pub struct PendingRequests {
     pub sync: HashMap<PendingKind, PendingEntry>,
@@ -60,7 +61,7 @@ pub struct PendingRequests {
     /// Tracks what a pending `Models` response is expected for.
     /// `ListModels` (for `session/new`) and `SetModel` both produce a
     /// `Models` response from the daemon.  This slot routes it to the
-    /// correct continuation without relying on the sync HashMap (which
+    /// correct continuation without relying on the sync `HashMap` (which
     /// `SetModel` also uses for `ModelSelectionFailed`).
     pub models_pending: Option<ModelsPending>,
     /// Maps `PendingKind::SetModel` / `SetReasoningEffort` to the ACP session
@@ -75,6 +76,7 @@ impl Default for PendingRequests {
 }
 
 impl PendingRequests {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             sync: HashMap::new(),
@@ -136,6 +138,7 @@ impl PendingRequests {
         prompt
     }
 
+    #[must_use]
     pub fn get_prompt(&self, session_id: &str) -> Option<&ActivePrompt> {
         self.prompts.get(session_id)
     }
@@ -143,6 +146,7 @@ impl PendingRequests {
     /// Find an active prompt by daemon request ID.  This is needed because
     /// streaming `DaemonMessage` values carry `request_id` but not the
     /// session ID, and we need to map back to the ACP session.
+    #[must_use]
     pub fn find_by_request_id(&self, daemon_request_id: u32) -> Option<&ActivePrompt> {
         self.prompts
             .values()
@@ -150,7 +154,7 @@ impl PendingRequests {
     }
 
     /// Drain all active prompts (called when daemon disconnects).
-    /// Returns the list of (session_id, jsonrpc_id) that need error responses.
+    /// Returns the list of (`session_id`, `jsonrpc_id`) that need error responses.
     pub fn drain_prompts(&mut self) -> Vec<(String, u64)> {
         self.prompts
             .drain()
@@ -165,6 +169,7 @@ impl PendingRequests {
 
     /// Returns true if no synchronous or streaming request is in flight,
     /// and no `Models` response is pending.
+    #[must_use]
     pub fn is_idle(&self) -> bool {
         self.sync.is_empty() && self.prompts.is_empty() && self.models_pending.is_none()
     }
@@ -357,7 +362,7 @@ mod tests {
     fn drain_prompts_empty() {
         let mut p = PendingRequests::new();
         let drained = p.drain_prompts();
-        assert!(drained.is_empty());
+        assert_eq!(drained, [] as [(std::string::String, u64); 0]);
     }
 
     #[test]

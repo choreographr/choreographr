@@ -162,7 +162,7 @@ fn start_metrics_server(addr_str: &str, shutdown: &Arc<AtomicBool>) -> io::Resul
     })?;
     let shutdown_flag = Arc::clone(shutdown);
     thread::spawn(move || {
-        crate::metrics::serve_metrics(addr, shutdown_flag);
+        crate::metrics::serve_metrics(addr, &shutdown_flag);
     });
     Ok(())
 }

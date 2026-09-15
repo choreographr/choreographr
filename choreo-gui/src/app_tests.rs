@@ -8,7 +8,7 @@ use choreo_proto::{
 
 #[test]
 fn app_state_stream_updates_history() {
-    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    let mut state = AppState::new("/tmp/choreographr.sock");
 
     // Simulate a Started message to set up request-to-turn mapping.
     dispatch_daemon_message(
@@ -92,7 +92,7 @@ fn app_state_stream_updates_history() {
 
 #[test]
 fn apply_daemon_turn_appended_with_image() {
-    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    let mut state = AppState::new("/tmp/choreographr.sock");
     let metadata = ImageMetadata {
         mime_type: "image/png".to_string(),
         width: 1,
@@ -154,7 +154,7 @@ fn apply_daemon_turn_appended_with_image() {
 
 #[test]
 fn handle_continue_when_attached_sends_continue_generation() {
-    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    let mut state = AppState::new("/tmp/choreographr.sock");
     state.attached_session_id = Some(42);
     state.next_request_id = 5;
     let (tx, rx) = std::sync::mpsc::channel();
@@ -168,7 +168,7 @@ fn handle_continue_when_attached_sends_continue_generation() {
 
 #[test]
 fn handle_continue_when_not_attached_shows_error() {
-    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    let mut state = AppState::new("/tmp/choreographr.sock");
     state.attached_session_id = None;
 
     handle_shell_command(&mut state, None, ShellCommand::Continue);
@@ -183,7 +183,7 @@ fn handle_continue_when_not_attached_shows_error() {
 
 #[test]
 fn handle_stop_when_attached_sends_cancel_all() {
-    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    let mut state = AppState::new("/tmp/choreographr.sock");
     state.attached_session_id = Some(42);
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -195,7 +195,7 @@ fn handle_stop_when_attached_sends_cancel_all() {
 
 #[test]
 fn handle_stop_when_not_attached_shows_error() {
-    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    let mut state = AppState::new("/tmp/choreographr.sock");
     state.attached_session_id = None;
 
     handle_shell_command(&mut state, None, ShellCommand::Stop);
@@ -210,7 +210,7 @@ fn handle_stop_when_not_attached_shows_error() {
 
 #[test]
 fn handle_undo_sends_undo_message() {
-    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    let mut state = AppState::new("/tmp/choreographr.sock");
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_shell_command(&mut state, Some(tx), ShellCommand::Undo);
@@ -221,7 +221,7 @@ fn handle_undo_sends_undo_message() {
 
 #[test]
 fn handle_redo_sends_redo_message() {
-    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    let mut state = AppState::new("/tmp/choreographr.sock");
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_shell_command(&mut state, Some(tx), ShellCommand::Redo);
@@ -235,11 +235,11 @@ fn handle_redo_sends_redo_message() {
 #[test]
 fn bound_message_records_the_pending_key() {
     let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
-    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    let mut state = AppState::new("/tmp/choreographr.sock");
     state.pending_unlock_key = Some(vec![3u8; 32]);
     let (tx, rx) = std::sync::mpsc::channel();
 
-    apply_daemon_message(&mut state, DaemonMessage::Bound, Some(tx)).unwrap();
+    apply_daemon_message(&mut state, DaemonMessage::Bound, Some(tx));
 
     assert!(state.pending_unlock_key.is_none(), "pending key consumed");
     let store = choreo_client_core::KnownServers::load().unwrap();
@@ -255,7 +255,7 @@ fn bound_message_records_the_pending_key() {
 #[test]
 fn keystore_unbound_auto_binds_once() {
     let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
-    let mut state = AppState::new("/tmp/choreographr.sock".to_string());
+    let mut state = AppState::new("/tmp/choreographr.sock");
     // A stale verify-only pending key must be discarded by the unbound arm.
     state.pending_unlock_key = Some(vec![5u8; 32]);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -266,8 +266,7 @@ fn keystore_unbound_auto_binds_once() {
             error: "no binding".into(),
         },
         Some(tx.clone()),
-    )
-    .unwrap();
+    );
     assert!(state.keystore_auto_bind.attempted(), "bind attempt latched");
     assert!(
         state.pending_unlock_key.is_some(),
@@ -291,8 +290,7 @@ fn keystore_unbound_auto_binds_once() {
             error: "still unbound".into(),
         },
         Some(tx),
-    )
-    .unwrap();
+    );
     assert!(rx.try_recv().is_err(), "no second bind attempt");
     assert!(
         state

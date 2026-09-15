@@ -34,8 +34,8 @@ async fn evm_token_balance_impl(
     let balance = balanceOfCall::abi_decode_returns(&result).map_err(alloy_err)?;
 
     let mut out = String::new();
-    let _ = write!(out, "token_address: {token_address_str}\n");
-    let _ = write!(out, "owner_address: {address_str}\n");
+    let _ = writeln!(out, "token_address: {token_address_str}");
+    let _ = writeln!(out, "owner_address: {address_str}");
     let _ = write!(out, "balance: {balance}");
 
     // Best-effort ERC-20 `symbol()` fetch — a non-standard token may revert,

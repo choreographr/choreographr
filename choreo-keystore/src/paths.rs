@@ -58,7 +58,6 @@ pub fn config_dir() -> Result<PathBuf, KeystoreError> {
     Ok(path)
 }
 
-#[must_use]
 /// Path to the identity private key file (`identity.pk` in [`config_dir`]).
 ///
 /// # Errors

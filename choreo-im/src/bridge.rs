@@ -179,7 +179,7 @@ fn daemon_to_bridge_events(
         } => {
             let text = String::from_utf8_lossy(&data);
             let entry = buffers.entry(request_id).or_insert_with(StreamBuffer::new);
-            entry.append(stream, &text);
+            entry.append(&stream, &text);
             None
         }
         DaemonMessage::Session {

@@ -66,6 +66,12 @@ pub struct DaemonClient {
 ///
 /// Returns a `DaemonClient` and the writer thread's join handle.  The caller
 /// should also spawn the ACP reader with another clone of `event_tx`.
+///
+/// # Errors
+///
+/// Returns [`AcpError::DaemonConnection`] when connecting to the daemon's
+/// Unix socket fails, or [`AcpError::Io`] when socket cloning or spawning
+/// one of the I/O threads fails.
 pub fn spawn_daemon_io(
     socket_path: &str,
     event_tx: mpsc::Sender<Event>,

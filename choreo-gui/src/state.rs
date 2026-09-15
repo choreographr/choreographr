@@ -37,7 +37,8 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn new(socket_path: String) -> Self {
+    pub(crate) fn new(socket_path: &str) -> Self {
+        let socket_path = socket_path.to_string();
         Self {
             input: String::new(),
             next_request_id: 1,
@@ -86,7 +87,7 @@ impl TurnEventHandler for AppState {
         data: Cow<'_, str>,
     ) {
         trace!(%request_id, ?stream, len = %data.len(), "handle_request_stream");
-        self.session_view.stream_chunk(request_id, stream, &data);
+        self.session_view.stream_chunk(request_id, &stream, &data);
     }
 
     fn handle_started(
@@ -147,7 +148,7 @@ impl TurnEventHandler for AppState {
                     call_id,
                     tool_name,
                     arguments_json,
-                    invocation_description,
+                    &invocation_description,
                 );
             }
             ToolCallEvent::Finished { .. } | ToolCallEvent::Failed { .. } => {}

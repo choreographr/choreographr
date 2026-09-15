@@ -123,10 +123,10 @@ impl KnownServers {
     ///
     /// A missing file is the normal first-run case: an empty store, not an
     /// error. See the module docs for the full failure policy.
-///
-/// # Errors
-///
-/// Returns [`ClientError::Io`] if the store exists but cannot be read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Io`] if the store exists but cannot be read.
     pub fn load() -> Result<Self, ClientError> {
         let path = known_servers_path()?;
         Self::load_from(&path)
@@ -134,10 +134,10 @@ impl KnownServers {
 
     /// Load from an explicit path (the test seam — production callers use
     /// [`KnownServers::load`]).
-///
-/// # Errors
-///
-/// Returns [`ClientError::Io`] if the file exists but cannot be read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Io`] if the file exists but cannot be read.
     pub fn load_from(path: &Path) -> Result<Self, ClientError> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
@@ -182,11 +182,11 @@ impl KnownServers {
     /// unix-socket unlock-key carrier) also yields `Ok(None)`: TCP callers
     /// see that as "unpinned", which is exactly the first-contact
     /// semantics they already handle.
-///
-/// # Errors
-///
-/// Returns [`ClientError::CredentialParse`] if a stored pin is invalid
-/// base64 or not exactly 32 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::CredentialParse`] if a stored pin is invalid
+    /// base64 or not exactly 32 bytes.
     pub fn lookup(&self, addr: &str) -> Result<Option<[u8; 32]>, ClientError> {
         match self.entries.iter().find(|e| e.addr == addr) {
             None => Ok(None),
@@ -202,11 +202,11 @@ impl KnownServers {
     /// all) — callers fall back to the legacy local key or generate a fresh
     /// one. Entries whose stored `unlock_key` does not decode to 32 bytes are
     /// dropped at load time, so this never surfaces garbage.
-///
-/// # Errors
-///
-/// Returns [`ClientError::CredentialParse`] if a stored unlock key is
-/// invalid base64 or not exactly 32 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::CredentialParse`] if a stored unlock key is
+    /// invalid base64 or not exactly 32 bytes.
     pub fn unlock_key(&self, addr: &str) -> Result<Option<[u8; 32]>, ClientError> {
         match self
             .entries
@@ -226,11 +226,11 @@ impl KnownServers {
     /// TCP daemons already have a pinned entry by the time a credential
     /// flow runs, so the existing entry is updated in place, keeping its
     /// pin intact).
-///
-/// # Errors
-///
-/// Returns [`ClientError::Io`] if the store cannot be read back or
-/// written after the update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Io`] if the store cannot be read back or
+    /// written after the update.
     pub fn set_unlock_key(&mut self, addr: &str, key: &[u8; 32]) -> Result<(), ClientError> {
         let b64 = encode_key(key);
         match self.entries.iter_mut().find(|e| e.addr == addr) {
@@ -264,10 +264,10 @@ impl KnownServers {
     /// the first `set_unlock_key`) would otherwise silently lose the unlock
     /// key, locking the operator out of a now-misbound keystore. There is
     /// no in-code path that replaces a pin without this explicit call.
-///
-/// # Errors
-///
-/// Returns [`ClientError::Io`] if the updated store cannot be persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Io`] if the updated store cannot be persisted.
     pub fn pin(&mut self, addr: &str, pk: &[u8; 32]) -> Result<(), ClientError> {
         match self.entries.iter_mut().find(|e| e.addr == addr) {
             // Update the existing entry in place: swap the pin but leave
@@ -295,10 +295,10 @@ impl KnownServers {
     /// Remove the pin for `addr` (the "server key changed, delete the
     /// `known_hosts` entry to re-pair" path). Returns whether an entry was
     /// removed; persists only when something changed.
-///
-/// # Errors
-///
-/// Returns [`ClientError::Io`] if the updated store cannot be persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Io`] if the updated store cannot be persisted.
     pub fn remove(&mut self, addr: &str) -> Result<bool, ClientError> {
         let before = self.entries.len();
         self.entries.retain(|e| e.addr != addr);
@@ -312,10 +312,10 @@ impl KnownServers {
 
     /// All entries (read-only view — for UIs listing known daemons).
     #[must_use]
-///
-/// # Errors
-///
-/// Returns [`ClientError::Io`] if the store cannot be read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Io`] if the store cannot be read.
     pub fn entries(&self) -> &[KnownServerEntry] {
         &self.entries
     }

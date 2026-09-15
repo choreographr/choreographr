@@ -498,13 +498,7 @@ mod tests {
         assert_eq!(view.get(1).unwrap().tool_results[0].name, "");
 
         // The start event arrives: the name is backfilled onto the stub.
-        view.tool_call_started(
-            7,
-            "call-2".into(),
-            "read_file".into(),
-            "{}".into(),
-            "".into(),
-        );
+        view.tool_call_started(7, "call-2".into(), "read_file".into(), "{}".into(), "");
 
         let turn = view.get(1).unwrap();
         assert_eq!(turn.tool_results[0].name, "read_file");
@@ -525,7 +519,7 @@ mod tests {
             "call-2".into(),
             "sh".into(),
             r#"{"command":"cargo build"}"#.into(),
-            "Running command: `cargo build`.".into(),
+            "Running command: `cargo build`.",
         );
         assert!(
             view.get(1).unwrap().tool_results.is_empty(),
@@ -564,7 +558,7 @@ mod tests {
             "call-2".into(),
             "sh".into(),
             "{}".into(),
-            "Running shell command: `ls`.".into(),
+            "Running shell command: `ls`.",
         );
 
         let turn = view.get(1).unwrap();
@@ -585,7 +579,7 @@ mod tests {
         view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
         view.request_to_turn.insert(7, 1);
 
-        view.tool_call_started(7, "call-1".into(), "sh".into(), "{}".into(), "".into());
+        view.tool_call_started(7, "call-1".into(), "sh".into(), "{}".to_string(), "");
 
         let turn = view.get(1).unwrap();
         assert_eq!(
@@ -609,7 +603,7 @@ mod tests {
             "call-1".into(),
             "sh".into(),
             "{}".into(),
-            "Running shell command: `ls`.".into(),
+            "Running shell command: `ls`.",
         );
         assert_eq!(view.tool_call_descriptions.len(), 1);
 
@@ -620,7 +614,7 @@ mod tests {
             name: "sh".into(),
             content: "done".into(),
             is_error: false,
-            invocation_description: "Running shell command: `ls`.".into(),
+            invocation_description: "Running shell command: `ls`.".to_string(),
             image: None,
         });
         view.insert_or_replace(1, turn);
@@ -645,7 +639,7 @@ mod tests {
             "call-1".into(),
             "sh".into(),
             "{}".into(),
-            "Running shell command: `ls`.".into(),
+            "Running shell command: `ls`.",
         );
         assert_eq!(view.tool_call_descriptions.len(), 1);
 
@@ -687,7 +681,7 @@ mod tests {
             "call-1".into(),
             "sh".into(),
             "{}".into(),
-            "Running shell command: `ls`.".into(),
+            "Running shell command: `ls`.",
         );
 
         view.tool_result_chunk(7, "call-1", "output\n");

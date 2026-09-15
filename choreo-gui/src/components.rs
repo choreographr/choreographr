@@ -22,7 +22,7 @@ pub(crate) fn Toolbar(
         let t = tx;
         move |_| {
             let daemon_tx = t.read().clone();
-            send_client_message(&mut state.write(), daemon_tx, ClientMessage::Ping)
+            send_client_message(&mut state.write(), daemon_tx, ClientMessage::Ping);
         }
     };
 
@@ -30,7 +30,7 @@ pub(crate) fn Toolbar(
         let t = tx;
         move |_| {
             let daemon_tx = t.read().clone();
-            send_client_message(&mut state.write(), daemon_tx, ClientMessage::ListModels)
+            send_client_message(&mut state.write(), daemon_tx, ClientMessage::ListModels);
         }
     };
 

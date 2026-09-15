@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 
 /// Wraps an MCP server tool as a `ToolDyn` for Choreographr's tool registry.
 pub struct McpToolWrapper {
-    /// Full prefixed name: "mcp/<server_slug>/<tool_name>"
+    /// Full prefixed name: "mcp/<`server_slug`>/<`tool_name`>"
     name: String,
-    /// Tool group: "mcp/<server_slug>"
+    /// Tool group: "mcp/<`server_slug`>"
     group: String,
     /// Description with server prefix
     description: String,
@@ -44,7 +44,10 @@ impl McpToolWrapper {
     }
 
     fn call_with_args(&self, args: Value) -> Result<CallToolResult> {
-        let mut client = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         client
             .call_tool(&self.original_name, Some(args), None)
             .with_context(|| format!("MCP tool call '{}' failed", self.original_name))
@@ -63,10 +66,10 @@ fn parse_binary_args(args_bytes: &[u8]) -> Result<Value, Vec<u8>> {
     })
 }
 
-/// Convert an anyhow error to a `ToolError` for the ToolDyn boundary.
+/// Convert an anyhow error to a `ToolError` for the `ToolDyn` boundary.
 /// Uses `{:#}` formatting to include the full error chain (context added
 /// by `.context()` / `.with_context()` upstream).
-fn to_tool_error(e: anyhow::Error) -> ToolError {
+fn to_tool_error(e: &anyhow::Error) -> ToolError {
     ToolError::Other(format!("{e:#}"))
 }
 
@@ -84,7 +87,7 @@ fn mcp_result_to_text_parts(result: &CallToolResult) -> (Vec<String>, bool) {
                 ));
             }
             McpContent::Resource { resource } => {
-                text_parts.push(format!("[Resource: {}]", resource));
+                text_parts.push(format!("[Resource: {resource}]"));
             }
         }
     }
@@ -133,7 +136,7 @@ impl ToolDyn for McpToolWrapper {
         _image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         let args = parse_json_args(args_json)?;
-        let result = self.call_with_args(args).map_err(to_tool_error)?;
+        let result = self.call_with_args(args).map_err(|e| to_tool_error(&e))?;
         let (text_parts, is_error) = mcp_result_to_text_parts(&result);
         let content = text_parts.join("\n");
         Ok(ToolOutput {
@@ -159,7 +162,7 @@ impl ToolDyn for McpToolWrapper {
             Err(e) => return e,
         };
         let result: Result<String, String> = match self.call_with_args(args) {
-            Ok(call_result) => Ok(mcp_result_to_string(call_result)),
+            Ok(call_result) => Ok(mcp_result_to_string(&call_result)),
             Err(e) => Err(format!("{e:#}")),
         };
         encode_outer::<String, String>(&Ok(result))
@@ -176,7 +179,7 @@ impl ToolDyn for McpToolWrapper {
         _image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         let args = parse_json_args(args_json)?;
-        let result = self.call_with_args(args).map_err(to_tool_error)?;
+        let result = self.call_with_args(args).map_err(|e| to_tool_error(&e))?;
         let (text_parts, is_error) = mcp_result_to_text_parts(&result);
         let text_content = text_parts.join("\n");
         // Always stream text content for incremental display.
@@ -195,8 +198,8 @@ impl ToolDyn for McpToolWrapper {
     }
 }
 
-fn mcp_result_to_string(result: CallToolResult) -> String {
-    let (text_parts, _) = mcp_result_to_text_parts(&result);
+fn mcp_result_to_string(result: &CallToolResult) -> String {
+    let (text_parts, _) = mcp_result_to_text_parts(result);
     text_parts.join("\n")
 }
 
@@ -206,8 +209,8 @@ mod tests {
 
     // ── mcp_result_to_tool_output tests ──────────────────────────────
 
-    fn mcp_result_to_tool_output(result: CallToolResult) -> ToolOutput {
-        let (text_parts, is_error) = mcp_result_to_text_parts(&result);
+    fn mcp_result_to_tool_output(result: &CallToolResult) -> ToolOutput {
+        let (text_parts, is_error) = mcp_result_to_text_parts(result);
         ToolOutput {
             content: text_parts.join("\n"),
             is_error,
@@ -224,7 +227,7 @@ mod tests {
             }],
             is_error: false,
         };
-        let output = mcp_result_to_tool_output(result);
+        let output = mcp_result_to_tool_output(&result);
         assert!(!output.is_error);
         assert_eq!(output.content, "hello world");
     }
@@ -242,7 +245,7 @@ mod tests {
             ],
             is_error: false,
         };
-        let output = mcp_result_to_tool_output(result);
+        let output = mcp_result_to_tool_output(&result);
         assert_eq!(output.content, "line 1\nline 2");
     }
 
@@ -255,7 +258,7 @@ mod tests {
             }],
             is_error: false,
         };
-        let output = mcp_result_to_tool_output(result);
+        let output = mcp_result_to_tool_output(&result);
         assert!(output.content.contains("[Image:"));
         assert!(output.content.contains("image/png"));
     }
@@ -269,7 +272,7 @@ mod tests {
             }],
             is_error: false,
         };
-        let output = mcp_result_to_tool_output(result);
+        let output = mcp_result_to_tool_output(&result);
         assert!(output.content.contains("image/png"));
     }
 
@@ -281,7 +284,7 @@ mod tests {
             }],
             is_error: false,
         };
-        let output = mcp_result_to_tool_output(result);
+        let output = mcp_result_to_tool_output(&result);
         assert!(output.content.contains("[Resource:"));
     }
 
@@ -293,7 +296,7 @@ mod tests {
             }],
             is_error: true,
         };
-        let output = mcp_result_to_tool_output(result);
+        let output = mcp_result_to_tool_output(&result);
         assert!(output.is_error);
         assert_eq!(output.content, "error msg");
     }
@@ -304,7 +307,7 @@ mod tests {
             content: vec![],
             is_error: false,
         };
-        let output = mcp_result_to_tool_output(result);
+        let output = mcp_result_to_tool_output(&result);
         assert!(!output.is_error);
         assert_eq!(output.content, "");
     }
@@ -319,7 +322,7 @@ mod tests {
             }],
             is_error: false,
         };
-        assert_eq!(mcp_result_to_string(result), "hello");
+        assert_eq!(mcp_result_to_string(&result), "hello");
     }
 
     #[test]
@@ -331,7 +334,7 @@ mod tests {
             ],
             is_error: false,
         };
-        assert_eq!(mcp_result_to_string(result), "a\nb");
+        assert_eq!(mcp_result_to_string(&result), "a\nb");
     }
 
     // ── parse_json_args tests ────────────────────────────────────────
@@ -358,11 +361,11 @@ mod tests {
     #[test]
     fn parse_json_args_nested_value() {
         let args = parse_json_args(r#"{"nested": {"a": 1}}"#).unwrap();
-        assert!(
+        assert_eq!(
             args.get("nested")
                 .and_then(|v| v.get("a"))
-                .and_then(|v| v.as_i64())
-                == Some(1)
+                .and_then(serde_json::Value::as_i64),
+            Some(1)
         );
     }
 
@@ -371,7 +374,7 @@ mod tests {
     #[test]
     fn parse_binary_args_invalid_returns_error_bytes() {
         let bytes = parse_binary_args(b"not postcard").unwrap_err();
-        assert!(!bytes.is_empty());
+        assert_ne!(bytes, [] as [u8; 0]);
         let decoded: Result<Result<String, String>, ToolError> =
             postcard::from_bytes(&bytes).unwrap();
         assert!(decoded.is_err());

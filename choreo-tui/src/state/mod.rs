@@ -2707,7 +2707,7 @@ impl TurnEventHandler for App {
                 .and_then(|id| display.view.turns.get(&id))
                 .is_some_and(|t| t.assistant_text.is_none());
 
-        display.view.stream_chunk(request_id, stream, &data);
+        display.view.stream_chunk(request_id, &stream, &data);
 
         // The appended chunk changed the turn's rendered content: bump its
         // version so any rebuild (e.g. one triggered by an interleaved
@@ -2852,7 +2852,7 @@ impl TurnEventHandler for App {
                     call_id,
                     tool_name,
                     arguments_json,
-                    invocation_description,
+                    &invocation_description,
                 );
                 if let Some(turn_id) = turn_id {
                     display.bump_turn_version(turn_id);

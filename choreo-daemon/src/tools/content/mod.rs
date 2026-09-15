@@ -24,6 +24,7 @@ use choreo_content::indexer::QueryKey;
 use choreo_keystore::ServiceCredential;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// The single `"content"` group name shared by every tool in this module.
@@ -145,9 +146,8 @@ fn parse_id_list(values: &[String]) -> Result<Vec<[u8; 32]>, ToolExecError> {
 }
 
 /// Parse an optional `0x` hex string into an optional raw 32-byte id.
-fn parse_optional_id(value: &Option<String>) -> Result<Option<[u8; 32]>, ToolExecError> {
+fn parse_optional_id(value: Option<&String>) -> Result<Option<[u8; 32]>, ToolExecError> {
     value
-        .as_deref()
         .map(|v| hex_to_bytes(v).map_err(|e| ToolExecError(e.to_string())))
         .transpose()
 }
@@ -363,7 +363,7 @@ pub(crate) struct CoordDecodeContent;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CoordDecodeContentArgs {
-    /// IPFS content reference: a `0x` digest hex or a Base58 CIDv0.
+    /// IPFS content reference: a `0x` digest hex or a Base58 `CIDv0`.
     pub content_ref: String,
 }
 
@@ -444,13 +444,13 @@ fn execute_coord_publish_item(
     let parents = parse_id_list(&args.parents)?;
     let links = parse_id_list(&args.links)?;
     let mentions = parse_id_list(&args.mentions)?;
-    let nonce = parse_optional_id(&args.nonce)?;
+    let nonce = parse_optional_id(args.nonce.as_ref())?;
     let outcome = choreo_content::orchestrate::publish_item(
         &account,
         &args.content,
-        parents,
-        links,
-        mentions,
+        &parents,
+        &links,
+        &mentions,
         args.flags,
         nonce,
     )?;
@@ -500,8 +500,8 @@ fn execute_coord_publish_revision(
         &account,
         item_id,
         &args.content,
-        links,
-        mentions,
+        &links,
+        &mentions,
     )?;
     Ok(format_publish_outcome(&outcome))
 }
@@ -769,8 +769,9 @@ fn format_revision_entries(entries: &[choreo_content::orchestrate::RevisionEntry
     }
     let mut out = String::new();
     for entry in entries {
-        out.push_str(&format!(
-            "revision {}: ipfs_hash={} block={} timestamp={}\n",
+        let _ = writeln!(
+            out,
+            "revision {}: ipfs_hash={} block={} timestamp={}",
             entry.revision_id,
             entry.ipfs_hash_hex,
             entry
@@ -779,7 +780,7 @@ fn format_revision_entries(entries: &[choreo_content::orchestrate::RevisionEntry
             entry
                 .timestamp
                 .map_or_else(|| "?".into(), |t| t.to_string()),
-        ));
+        );
     }
     out
 }
@@ -790,14 +791,15 @@ fn format_decoded_events(events: &[choreo_content::indexer::DecodedEvent]) -> St
     }
     let mut out = format!("{} event(s):\n", events.len());
     for ev in events {
-        out.push_str(&format!(
-            "block {} event_index {}: {}::{} fields={}\n",
+        let _ = writeln!(
+            out,
+            "block {} event_index {}: {}::{} fields={}",
             ev.block_number,
             ev.event_index,
             ev.event.pallet_name,
             ev.event.event_name,
             ev.event.fields,
-        ));
+        );
     }
     out
 }
@@ -809,8 +811,12 @@ fn format_account_items(items: &[choreo_content::orchestrate::AccountItem]) -> S
     let mut out = String::new();
     for item in items {
         match &item.title {
-            Some(t) => out.push_str(&format!("{} (title: {})\n", item.item_id, t)),
-            None => out.push_str(&format!("{}\n", item.item_id)),
+            Some(t) => {
+                let _ = writeln!(out, "{} (title: {})", item.item_id, t);
+            }
+            None => {
+                let _ = writeln!(out, "{}", item.item_id);
+            }
         }
     }
     out
@@ -825,16 +831,16 @@ fn format_profile(profile: &choreo_content::orchestrate::ProfileResult) -> Strin
         profile.item_id.as_deref().unwrap_or("-")
     );
     if let Some(name) = &profile.name {
-        out.push_str(&format!("name: {name}\n"));
+        let _ = writeln!(out, "name: {name}");
     }
     if let Some(bio) = &profile.bio {
-        out.push_str(&format!("bio: {bio}\n"));
+        let _ = writeln!(out, "bio: {bio}");
     }
     if let Some(location) = &profile.location {
-        out.push_str(&format!("location: {location}\n"));
+        let _ = writeln!(out, "location: {location}");
     }
     if let Some(account_type) = profile.account_type {
-        out.push_str(&format!("account_type: {account_type}\n"));
+        let _ = writeln!(out, "account_type: {account_type}");
     }
     out
 }
@@ -842,45 +848,47 @@ fn format_profile(profile: &choreo_content::orchestrate::ProfileResult) -> Strin
 fn format_decoded_content(content: &choreo_content::encode::DecodedItem) -> String {
     let mut out = format!("content_type: {:?}\n", content.content_type);
     if let Some(title) = &content.title {
-        out.push_str(&format!("title: {title}\n"));
+        let _ = writeln!(out, "title: {title}");
     }
     if let Some(body) = &content.body {
-        out.push_str(&format!("body: {body}\n"));
+        let _ = writeln!(out, "body: {body}");
     }
     if let Some(language) = &content.language {
-        out.push_str(&format!("language: {language}\n"));
+        let _ = writeln!(out, "language: {language}");
     }
     if let Some(image) = &content.image {
-        out.push_str(&format!("image: {}x{}", image.width, image.height,));
+        let _ = write!(out, "image: {}x{}", image.width, image.height);
         // The reference protocol leaves filename/filesize/full-res digest empty
         // and stores the image purely as a mipmap pyramid (level 0 is the
         // full-resolution encode), so surface the levels instead of the
         // always-empty scalar fields.
         if !image.filename.is_empty() {
-            out.push_str(&format!(" filename={}", image.filename));
+            let _ = write!(out, " filename={}", image.filename);
         }
         if image.filesize > 0 {
-            out.push_str(&format!(" filesize={}", image.filesize));
+            let _ = write!(out, " filesize={}", image.filesize);
         }
         if image.digest_hex != "0x" && !image.digest_hex.is_empty() {
-            out.push_str(&format!(" digest_hex={}", image.digest_hex));
+            let _ = write!(out, " digest_hex={}", image.digest_hex);
         }
         out.push('\n');
         for (i, level) in image.mipmap_levels.iter().enumerate() {
             // Level 0 is the full-resolution image; deeper levels are
             // successively halved previews (down to <=64px).
             let note = if i == 0 { " (full-res)" } else { "" };
-            out.push_str(&format!(
-                "  mipmap[{i}]: cid={} filesize={}{note}\n",
+            let _ = writeln!(
+                out,
+                "  mipmap[{i}]: cid={} filesize={}{note}",
                 level.cid, level.filesize,
-            ));
+            );
         }
     }
     if let Some(profile) = &content.profile {
-        out.push_str(&format!(
-            "profile: account_type={} location={}\n",
+        let _ = writeln!(
+            out,
+            "profile: account_type={} location={}",
             profile.account_type, profile.location,
-        ));
+        );
     }
     out
 }
@@ -888,27 +896,32 @@ fn format_decoded_content(content: &choreo_content::encode::DecodedItem) -> Stri
 fn format_status(status: &choreo_content::orchestrate::CoordStatus) -> String {
     let mut out = String::new();
     match &status.chain {
-        Some(chain) => out.push_str(&format!(
-            "chain: genesis={} ss58_prefix={} best_block={} finalized_block={} item_id_namespace={}\n",
-            chain.genesis_hash,
-            chain.ss58_prefix,
-            chain.best_block,
-            chain.finalized_block,
-            chain.item_id_namespace,
-        )),
+        Some(chain) => {
+            let _ = writeln!(
+                out,
+                "chain: genesis={} ss58_prefix={} best_block={} finalized_block={} item_id_namespace={}",
+                chain.genesis_hash,
+                chain.ss58_prefix,
+                chain.best_block,
+                chain.finalized_block,
+                chain.item_id_namespace,
+            );
+        }
         None => out.push_str("chain: unavailable\n"),
     }
     match &status.indexer {
         Some(indexer) => {
-            out.push_str(&format!("indexer: {} span(s)\n", indexer.spans.len()));
+            let _ = writeln!(out, "indexer: {} span(s)", indexer.spans.len());
             for span in &indexer.spans {
-                out.push_str(&format!("  {}..{}\n", span.start, span.end));
+                let _ = writeln!(out, "  {}..{}", span.start, span.end);
             }
         }
         None => out.push_str("indexer: unavailable\n"),
     }
     match &status.ipfs {
-        Some(ipfs) => out.push_str(&format!("ipfs: peer={}\n", ipfs.peer_id)),
+        Some(ipfs) => {
+            let _ = writeln!(out, "ipfs: peer={}", ipfs.peer_id);
+        }
         None => out.push_str("ipfs: unavailable\n"),
     }
     out
@@ -956,14 +969,13 @@ mod tests {
         let account = chain_account_from_credential(Some(&cred)).unwrap();
         assert_eq!(account.account_id, [0x22u8; 32]);
         // The public key round-trips through the account's address form.
-        assert!(!account.address.is_empty());
+        assert_ne!(account.address, "");
     }
 
     #[test]
     fn chain_account_from_credential_none_errors() {
-        let err = match chain_account_from_credential(None) {
-            Err(e) => e,
-            Ok(_) => panic!("expected an error for a missing credential"),
+        let Err(err) = chain_account_from_credential(None) else {
+            panic!("expected an error for a missing credential");
         };
         assert!(err.to_string().contains("Substrate credential"));
     }
@@ -973,9 +985,8 @@ mod tests {
         let cred = ServiceCredential::ApiKey {
             key: "sk-test".into(),
         };
-        let err = match chain_account_from_credential(Some(&cred)) {
-            Err(e) => e,
-            Ok(_) => panic!("expected an error for a non-Substrate credential"),
+        let Err(err) = chain_account_from_credential(Some(&cred)) else {
+            panic!("expected an error for a non-Substrate credential");
         };
         assert!(err.to_string().contains("not a Substrate account"));
     }
@@ -1062,6 +1073,6 @@ mod tests {
     fn parse_id_list_rejects_invalid_length() {
         assert!(parse_id_list(&["0x1234".into()]).is_err());
         assert!(parse_id_list(&["0xzz".into()]).is_err());
-        assert!(parse_id_list(&[]).unwrap().is_empty());
+        assert_eq!(parse_id_list(&[]).unwrap(), [] as [[u8; 32]; 0]);
     }
 }

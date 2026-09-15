@@ -31,12 +31,12 @@ async fn evm_transaction_impl(rpc_url: &str, tx_hash_str: &str) -> Result<String
     let log_count = receipt.logs().len();
 
     let mut out = String::new();
-    let _ = write!(out, "hash: {tx_hash:#x}\n");
-    let _ = write!(out, "block: #{block_number}\n");
-    let _ = write!(out, "from: {from}\n");
-    let _ = write!(out, "to: {to}\n");
-    let _ = write!(out, "gas_used: {gas_used}\n");
-    let _ = write!(out, "effective_gas_price: {effective_gas_price} wei\n");
+    let _ = writeln!(out, "hash: {tx_hash:#x}");
+    let _ = writeln!(out, "block: #{block_number}");
+    let _ = writeln!(out, "from: {from}");
+    let _ = writeln!(out, "to: {to}");
+    let _ = writeln!(out, "gas_used: {gas_used}");
+    let _ = writeln!(out, "effective_gas_price: {effective_gas_price} wei");
     let _ = write!(out, "logs: {log_count}");
     Ok(out)
 }

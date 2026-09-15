@@ -16,7 +16,12 @@
     clippy::expect_used,
     clippy::panic,
     clippy::panic_in_result_fn,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    // pedantic backfill: these helpers predate the pedantic sweep and
+    // were only covered by the deny-set allowance above.
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::doc_markdown
 )]
 use choreo_client_core::KnownServers;
 use choreo_im::establish_keystore;
@@ -84,7 +89,7 @@ fn flush(d_writer: &mut BufWriter<UnixStream>) {
 /// No stored key on a fresh config root: the bridge probes with a fresh
 /// `BindKeystore` (minted + recorded PRE-SEND), and an unbound daemon adopts
 /// it and replies `Bound`.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn unbound_daemon_auto_binds() {
     let (_dir, _guard) = isolated_config();
@@ -110,7 +115,7 @@ fn unbound_daemon_auto_binds() {
 /// A stored key triggers an `Unlock` first; when the daemon answers
 /// `KeystoreUnbound`, the bridge auto-binds with a FRESH key (never the
 /// stored one) that replaces the stored key in known_servers.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn stored_key_unlock_then_auto_bind_mints_fresh_key() {
     let (_dir, _guard) = isolated_config();
@@ -157,7 +162,7 @@ fn stored_key_unlock_then_auto_bind_mints_fresh_key() {
 /// No stored key against an ALREADY-bound daemon: the probe bind is
 /// rejected with `LockedError`, which is a benign fall-through (the
 /// GetCredential tail carries the user-facing unlock guidance).
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn probe_against_bound_daemon_falls_through() {
     let (_dir, _guard) = isolated_config();
@@ -180,7 +185,7 @@ fn probe_against_bound_daemon_falls_through() {
 
 /// Unlock with a stored key rejected by a bound daemon (wrong key) → Err
 /// carrying the re-pair guidance.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn unlock_rejected_yields_repair_guidance() {
     let (_dir, _guard) = isolated_config();
@@ -212,7 +217,7 @@ fn unlock_rejected_yields_repair_guidance() {
 
 /// Weird case: the probe bind is answered with `KeystoreUnbound` (i.e. the
 // daemon claims it is still unbound but rejected the binding) → Err.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn bind_rejected_against_unbound_daemon_is_err() {
     let (_dir, _guard) = isolated_config();
