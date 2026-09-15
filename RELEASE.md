@@ -137,6 +137,10 @@ just ci
 #    CI workflow — no local setup is needed unless you are using the manual
 #    fallback in the appendix.
 just preflight               # checks cargo + zig, notes nextest
+
+# 4. Signed in to crates.io — Phase 2 publishes with this token. Expect 200; a
+#    403 (or an `open`/`get` error if no token is stored) means not signed in.
+curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/credentials.toml | get registry.token)" https://crates.io/api/v1/me
 ```
 
 ---
@@ -239,7 +243,30 @@ Runs **before** any binary building (binaries are versioned by the same
 bump, and `cargo install` must resolve the published crates), on a clean
 tree:
 
-0. **Sync the MSRV claim first.** Dependency resolution is MSRV-unconstrained
+0. **Confirm you are signed in to crates.io.** The publish is
+   token-authenticated; a missing, expired, or wrong-scoped token fails the
+   *upload* — after the earlier crates in a batch have already published — with
+   `403 Forbidden: authentication failed`. Verify the stored token against the
+   crates.io API ( `GET /api/v1/me` answers `200` only for a valid token):
+
+   ```nu
+   curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/credentials.toml | get registry.token)" https://crates.io/api/v1/me
+   ```
+
+   If that is not `200` (or the `open`/`get` errors because no token is
+   stored), mint a token at <https://crates.io/settings/tokens> — it needs the
+   **publish-new** and **publish-update** scopes (a full/legacy token also
+   works) — and store it:
+
+   ```nu
+   cargo login                 # paste the token at the prompt
+   # non-interactively:  $env.CARGO_REGISTRY_TOKEN = "<token>"
+   ```
+
+   Do **not** use `cargo owner --list` as the check — it returns public data
+   even with a bogus token.
+
+1. **Sync the MSRV claim first.** Dependency resolution is MSRV-unconstrained
    (`resolver.incompatible-rust-versions = "allow"` in `.cargo/config.toml`),
    so the workspace `rust-version` may lag the resolved tree. Compute the
    resolved tree's floor:
@@ -561,6 +588,7 @@ Finally, commit any post-release doc/version drift in this repo and push.
 - [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD (Name)` section — ` (Name)` for a major/minor release (name picked at release time), or the current series name kept for a patch — with a fresh empty `[Unreleased]` + compare link above it
 - [ ] `choreo-proto/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch; must match the ` (Name)` on the CHANGELOG heading (enforced by `just check-release-name`)
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
+- [ ] Signed in to crates.io (Phase 2 step 0): the `/api/v1/me` token check returns `200`, else `cargo login` a token with the publish-new/publish-update scopes
 - [ ] Publish in **two batches** (0.2.0 creates 6 new crates > burst 5; a single `--workspace` is refused): dry-run then `-x` each — Batch 1 (`-p choreo-proto … -p choreo-power-events`), wait ≥ 10 min, Batch 2 (`-p choreo-transport … -p choreographr`) → 18 crates on crates.io; `cargo install --locked` verified
 - [ ] Push the bump commit + `vX.Y.Z` tag → CI builds all platforms and creates the GitHub release; verify the release page lists every asset + `SHA256SUMS` and they download
 - [ ] `gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/`, then `scripts/update-homebrew-tap.sh --push`; `brew install` verified on a Mac
