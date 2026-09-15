@@ -3,7 +3,7 @@ use choreo_daemon::{ShArgs, execute_sh_tool};
 use std::path::Path;
 
 /// Helper: set up piped stdout/stderr on a Command for use with
-/// spawn_with_streaming / run_shell_streaming.
+/// `spawn_with_streaming` / `run_shell_streaming`.
 fn cmd(program: &str, arg: &str, dir: &Path) -> std::process::Command {
     let mut c = std::process::Command::new(program);
     c.args(["-c", arg])
@@ -14,7 +14,7 @@ fn cmd(program: &str, arg: &str, dir: &Path) -> std::process::Command {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn spawn_with_streaming_produces_stdout() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "echo hello world", dir);
@@ -31,7 +31,7 @@ fn spawn_with_streaming_produces_stdout() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn spawn_with_streaming_stderr_is_streamed_into_the_body() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "echo errmsg >&2", dir);
@@ -57,7 +57,7 @@ fn spawn_with_streaming_stderr_is_streamed_into_the_body() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn spawn_with_streaming_interleaves_stdout_and_stderr() {
     let dir = Path::new("/tmp");
     // The exact interleave of the three lines is scheduling-dependent; what
@@ -86,7 +86,7 @@ fn spawn_with_streaming_interleaves_stdout_and_stderr() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn run_shell_streaming_final_body_matches_streamed_body() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "echo line1; echo err1 >&2; echo line2", dir);
@@ -123,7 +123,7 @@ fn run_shell_streaming_final_body_matches_streamed_body() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn spawn_with_streaming_timeout_kills() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "sleep 10", dir);
@@ -137,7 +137,7 @@ fn spawn_with_streaming_timeout_kills() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn run_shell_streaming_combines_output() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "echo hello", dir);
@@ -151,7 +151,7 @@ fn run_shell_streaming_combines_output() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn run_shell_streaming_streams_lines_in_realtime() {
     let dir = Path::new("/tmp");
     let mut c = cmd("bash", "echo line1 && echo line2", dir);
@@ -177,7 +177,7 @@ fn run_shell_streaming_streams_lines_in_realtime() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn execute_sh_tool_non_streaming_still_works() {
     let result = execute_sh_tool(
         &ShArgs {
@@ -194,7 +194,7 @@ fn execute_sh_tool_non_streaming_still_works() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn spawn_with_streaming_caps_total_forwarded_bytes() {
     // A chatty command must not push an unbounded live view: the streamed
     // total is capped at MAX_TOOL_OUTPUT_BYTES with one `...[truncated]`
@@ -246,7 +246,7 @@ fn spawn_with_streaming_caps_total_forwarded_bytes() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn run_shell_streaming_truncated_record_matches_streamed_body() {
     // The core "streaming matches the final output" contract under
     // truncation: `run_shell_streaming` reserves the record framing
@@ -302,7 +302,7 @@ fn run_shell_streaming_truncated_record_matches_streamed_body() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn run_shell_streaming_cf_heavy_record_matches_streamed_body() {
     // Regression for the sanitize-expansion hole: Cf chars expand when
     // escaped for the transcript (U+200B → `\u{200b}`, 3 → 7 bytes), so a

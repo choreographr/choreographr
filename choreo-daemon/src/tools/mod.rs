@@ -17,7 +17,7 @@ use crate::tools::ios_bridge::IosToolBridge;
 use std::sync::OnceLock;
 use std::sync::mpsc;
 
-/// Helper: encode Result<Result<R, E>, ToolError> as postcard bytes.
+/// Helper: encode Result<Result<R, E>, `ToolError`> as postcard bytes.
 /// Used by `execute_postcard` to produce a single byte buffer containing
 /// all possible outcomes for the VM guest:
 ///
@@ -25,7 +25,7 @@ use std::sync::mpsc;
 ///   Ok(Err(e))   → tool failed, `e: E` (structured)
 ///   Err(e)       → infrastructure failure, `e: ToolError`
 pub(crate) fn encode_outer<R: Serialize, E: Serialize>(
-    result: Result<Result<R, E>, ToolError>,
+    result: &Result<Result<R, E>, ToolError>,
 ) -> Vec<u8> {
     postcard::to_allocvec(&result).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "failed to postcard-encode tool result");
@@ -126,7 +126,7 @@ pub(crate) const STREAMING_CHANNEL_CAPACITY: usize = 64;
 
 /// Tool arguments for tools that take no parameters.
 ///
-/// Accepts both `null` and `{}` from JSON (serde_json deserializes `()` only
+/// Accepts both `null` and `{}` from JSON (`serde_json` deserializes `()` only
 /// from `null`, but OpenAI-style tool schemas advertise `{"type": "object",
 /// "properties": {}}`, leading the model to send `{}`). This wrapper accepts
 /// both forms so the schema and the actual deserialization agree.
@@ -262,15 +262,19 @@ impl PreparedImage {
     /// `pub(crate)` fields, but must be able to assert on the prepared bytes.
     /// Read-only on purpose — construction stays crate-internal so the
     /// prepare pipeline (`prepare_image_from_bytes`) remains the only entry.
+    #[must_use]
     pub fn mime_type(&self) -> &str {
         &self.mime_type
     }
+    #[must_use]
     pub fn data(&self) -> &[u8] {
         &self.data
     }
+    #[must_use]
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
+    #[must_use]
     pub fn alt_text(&self) -> Option<&str> {
         self.alt.as_deref()
     }
@@ -283,7 +287,7 @@ pub struct ToolGroup {
 }
 
 /// Typed tool trait. Each tool declares its Args, Return, and Error types.
-/// Args and Return must be serde-compatible (JSON path uses serde_json, binary path uses postcard).
+/// Args and Return must be serde-compatible (JSON path uses `serde_json`, binary path uses postcard).
 /// Error must implement `std::error::Error` and be serializable (for the structured-error postcard path).
 pub trait Tool: Send + Sync {
     /// Argument type — must be deserializable from both JSON and postcard.
@@ -329,6 +333,11 @@ pub trait Tool: Send + Sync {
     fn describe_invocation(&self, args: &Self::Args) -> String;
 
     /// Execute the tool with typed arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err with the tool's own error type on invalid arguments,
+    /// I/O failures, or any tool-specific failure condition.
     fn execute(
         &self,
         args: Self::Args,
@@ -339,9 +348,14 @@ pub trait Tool: Send + Sync {
 
     /// Execute with streaming output.
     ///
-    /// The default implementation calls execute() and returns the result.
+    /// The default implementation calls `execute()` and returns the result.
     /// Tools that produce incremental output (shell commands, VM execution)
     /// override this and send intermediate chunks through `output_tx`.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err with the tool's own error type under the same conditions
+    /// as [`Tool::execute`].
     fn execute_streaming(
         &self,
         args: Self::Args,
@@ -395,6 +409,7 @@ pub trait Tool: Send + Sync {
     /// no-output tool emits no chunks at all.  Non-streaming tools (the
     /// default, e.g. `read_file`) emit no chunks; their description arrives
     /// via `ToolOutput.invocation_description` in the `TurnAppended`.
+    #[must_use]
     fn supports_streaming_output() -> bool {
         false
     }
@@ -408,8 +423,8 @@ pub trait Tool: Send + Sync {
     fn return_string(ret: &Self::Return) -> String;
 }
 
-/// Type-erased dispatch trait stored in ToolRegistry.
-/// Converts between JSON/binary and the typed Tool::execute().
+/// Type-erased dispatch trait stored in `ToolRegistry`.
+/// Converts between JSON/binary and the typed `Tool::execute()`.
 pub trait ToolDyn: Send + Sync {
     fn name(&self) -> &str;
     fn group(&self) -> &str;
@@ -425,6 +440,11 @@ pub trait ToolDyn: Send + Sync {
     fn supports_streaming_output(&self) -> bool;
 
     /// JSON path — takes JSON args, returns Result for the caller to handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the arguments JSON cannot be deserialized, the tool
+    /// is unknown, or the tool's execution fails.
     fn execute_json(
         &self,
         args_json: &str,
@@ -437,6 +457,11 @@ pub trait ToolDyn: Send + Sync {
 
     #[expect(clippy::too_many_arguments)]
     /// Streaming JSON path.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the arguments JSON cannot be deserialized, the tool
+    /// is unknown, or the tool's execution fails.
     fn execute_streaming_json(
         &self,
         args_json: &str,
@@ -460,7 +485,7 @@ pub trait ToolDyn: Send + Sync {
     ) -> Vec<u8>;
 }
 
-/// Blanket impl: every TypedTool is also a ToolDyn.
+/// Blanket impl: every `TypedTool` is also a `ToolDyn`.
 impl<T: Tool + 'static> ToolDyn for T {
     fn name(&self) -> &'static str {
         Tool::name(self)
@@ -545,14 +570,14 @@ impl<T: Tool + 'static> ToolDyn for T {
         let args = match postcard::from_bytes::<T::Args>(args_bytes) {
             Ok(a) => a,
             Err(e) => {
-                return encode_outer::<T::Return, T::Error>(Err(ToolError::Postcard(
+                return encode_outer::<T::Return, T::Error>(&Err(ToolError::Postcard(
                     e.to_string(),
                 )));
             }
         };
         let result: Result<T::Return, T::Error> =
             self.execute(args, x_credentials, working_dir, ctx);
-        encode_outer::<T::Return, T::Error>(Ok(result))
+        encode_outer::<T::Return, T::Error>(&Ok(result))
     }
 
     fn execute_streaming_json(
@@ -712,6 +737,7 @@ pub enum ToolPolicy {
 }
 
 impl ToolRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self::new_for_policy(ToolPolicy::Full)
     }
@@ -720,6 +746,7 @@ impl ToolRegistry {
     /// registrations for shell/exec and (in [`build_for_policy`]) the VM
     /// sandbox — see the policy docs for why registration-time filtering is
     /// the right granularity.
+    #[must_use]
     pub fn new_for_policy(policy: ToolPolicy) -> Self {
         let mut reg = Self {
             tools: HashMap::new(),
@@ -867,16 +894,18 @@ impl ToolRegistry {
     /// one (see [`ToolRegistry::register_platform_tools`]). Read by the
     /// unload path (`apply_unload_tools`) so the tool, the session handler,
     /// and the request worker's mirror all share one source of truth.
+    #[must_use]
     pub fn protected_groups(&self) -> &HashSet<String> {
         &self.protected_groups
     }
 
-    /// Build a shared registry with the RunRiscV tool registered.
+    /// Build a shared registry with the `RunRiscV` tool registered.
     ///
     /// Uses `Arc::new_cyclic` to give the RISC-V sandbox a weak reference to
     /// the registry so guest tool calls can be dispatched without a global.
     /// `load_tools`/`unload_tools` also receive a weak reference so their
     /// JSON Schema enums can list the live group catalog at definition time.
+    #[must_use]
     pub fn build(self) -> Arc<Self> {
         self.build_for_policy(ToolPolicy::Full)
     }
@@ -885,6 +914,7 @@ impl ToolRegistry {
     /// `Arc::new_cyclic` rationale; `Mobile` skips the RISC-V sandbox
     /// registration entirely (`run_series`/`load_tools`/`unload_tools` stay —
     /// they are session-surface tools, not execution sandboxes).
+    #[must_use]
     pub fn build_for_policy(self, policy: ToolPolicy) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
             let mut reg = self;
@@ -904,6 +934,11 @@ impl ToolRegistry {
     }
 
     /// JSON path — caller picks Text (LLM) or Json (PTC).
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the tool name is unknown or the tool's execution
+    /// fails.
     pub fn execute_json(
         &self,
         tool_call: &ChatToolCall,
@@ -931,6 +966,11 @@ impl ToolRegistry {
 
     #[expect(clippy::too_many_arguments)]
     /// Streaming JSON path.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the tool name is unknown or the tool's execution
+    /// fails.
     pub fn execute_streaming_json(
         &self,
         tool_call: &ChatToolCall,
@@ -958,6 +998,7 @@ impl ToolRegistry {
         }
     }
 
+    #[must_use]
     pub fn describe_invocation(&self, tool_call: &ChatToolCall) -> String {
         match self.tools.get(tool_call.name.as_str()) {
             Some(tool) => tool.describe_invocation_json(&tool_call.arguments_json),
@@ -965,6 +1006,7 @@ impl ToolRegistry {
         }
     }
 
+    #[must_use]
     pub fn describe_invocation_for(&self, name: &str, args_json: &str) -> Option<String> {
         self.tools
             .get(name)
@@ -972,6 +1014,7 @@ impl ToolRegistry {
     }
 
     /// Postcard binary dispatch (VM path).
+    #[must_use]
     pub fn execute_postcard(
         &self,
         name: &str,
@@ -982,13 +1025,13 @@ impl ToolRegistry {
     ) -> Vec<u8> {
         match self.tools.get(name) {
             Some(tool) => tool.execute_postcard(args_bytes, x_credentials, working_dir, ctx),
-            None => encode_outer::<(), ()>(Err(ToolError::Other(format!("unknown tool: {name}")))),
+            None => encode_outer::<(), ()>(&Err(ToolError::Other(format!("unknown tool: {name}")))),
         }
     }
 
     /// Register a dynamically-loaded tool (e.g. from an MCP server).
     /// The group name must already be registered via `register_dynamic_group`.
-    pub fn register_dynamic(&mut self, name: String, group: String, tool: Box<dyn ToolDyn>) {
+    pub fn register_dynamic(&mut self, name: String, group: &str, tool: Box<dyn ToolDyn>) {
         tracing::debug!(tool = %name, group = %group, "registered dynamic tool");
         self.tools.insert(name, tool);
     }
@@ -1016,6 +1059,7 @@ impl ToolRegistry {
         removed
     }
 
+    #[must_use]
     pub fn groups(&self) -> Vec<ToolGroup> {
         let mut groups: Vec<ToolGroup> = static_groups().to_vec();
         // Protected non-core groups ("ios") don't live in static_groups (it
@@ -1042,7 +1086,8 @@ impl ToolRegistry {
     /// Return group names suitable for a JSON Schema enum (excluding every
     /// PROTECTED group — "core" and, when registered, "ios" — which are
     /// always active and can be neither loaded nor unloaded, so the
-    /// load_tools/unload_tools schemas must not offer them).
+    /// `load_tools/unload_tools` schemas must not offer them).
+    #[must_use]
     pub fn group_names(&self) -> Vec<String> {
         self.groups()
             .into_iter()
@@ -1074,6 +1119,7 @@ impl ToolRegistry {
     /// Completions and Responses API paths.  The Responses API path should
     /// call [`available_definitions_for_responses`] instead when it needs
     /// those fields.
+    #[must_use]
     pub fn available_definitions(&self, active: &HashSet<String>) -> Vec<ChatToolDefinition> {
         self.tools
             .values()
@@ -1090,6 +1136,7 @@ impl ToolRegistry {
     /// Like [`available_definitions`] but includes `output_schema` and
     /// `allowed_callers` for the Responses API (programmatic tool calling).
     /// Only use this when sending requests to a Responses API endpoint.
+    #[must_use]
     pub fn available_definitions_for_responses(
         &self,
         active: &HashSet<String>,
@@ -1141,7 +1188,7 @@ pub(crate) fn unknown_group_names(
 /// from the live registry group catalog (including dynamic MCP groups).  The
 /// schema enum is advisory — the tools validate at execution time — but keeping
 /// the two schema builders in one place prevents drift.
-pub(crate) fn groups_enum_schema(names: Vec<String>, description: &str) -> serde_json::Value {
+pub(crate) fn groups_enum_schema(names: &[String], description: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -1165,26 +1212,23 @@ pub(crate) fn groups_enum_schema(names: Vec<String>, description: &str) -> serde
 /// forms — those are passed through unmodified.
 pub(crate) fn expand_tilde(path: &str) -> String {
     if path == "~" || path.starts_with("~/") {
-        match dirs::home_dir() {
-            Some(home) => {
-                let home_str = home.to_string_lossy();
-                if path == "~" {
-                    home_str.into_owned()
-                } else {
-                    // path starts with "~/" — replace the tilde with the home dir.
-                    // Index 1 is a char boundary ('~' is ASCII); fallback keeps "~".
-                    format!("{home_str}{}", path.get(1..).unwrap_or(path))
-                }
+        if let Some(home) = dirs::home_dir() {
+            let home_str = home.to_string_lossy();
+            if path == "~" {
+                home_str.into_owned()
+            } else {
+                // path starts with "~/" — replace the tilde with the home dir.
+                // Index 1 is a char boundary ('~' is ASCII); fallback keeps "~".
+                format!("{home_str}{}", path.get(1..).unwrap_or(path))
             }
-            None => {
-                // No home directory known (unusual on Linux/macOS, but possible
-                // in containerised or embedded environments).  Pass through.
-                tracing::warn!(
-                    "expand_tilde: no home directory found, leaving '{}' unchanged",
-                    path
-                );
-                path.to_string()
-            }
+        } else {
+            // No home directory known (unusual on Linux/macOS, but possible
+            // in containerised or embedded environments).  Pass through.
+            tracing::warn!(
+                "expand_tilde: no home directory found, leaving '{}' unchanged",
+                path
+            );
+            path.to_string()
         }
     } else {
         path.to_string()
@@ -1576,7 +1620,7 @@ mod tests {
         assert_eq!(tool.group(), "test");
     }
 
-    /// A tool that overrides output_schema and allowed_callers.
+    /// A tool that overrides `output_schema` and `allowed_callers`.
     struct RestrictedTool;
 
     impl Tool for RestrictedTool {
@@ -1652,7 +1696,7 @@ mod tests {
 
     // ── Default schema from () args test ──────────────────────────────
 
-    /// A tool with unit args that exercises the default schema() path.
+    /// A tool with unit args that exercises the default `schema()` path.
     struct UnitArgsTool;
 
     impl Tool for UnitArgsTool {
@@ -1777,7 +1821,7 @@ mod tests {
 
     #[test]
     fn encode_outer_ok_ok() {
-        let bytes = encode_outer::<String, ToolExecError>(Ok(Ok("hello".into())));
+        let bytes = encode_outer::<String, ToolExecError>(&Ok(Ok("hello".into())));
         let decoded: Result<Result<String, ToolExecError>, ToolError> =
             postcard::from_bytes(&bytes).unwrap();
         assert!(matches!(decoded, Ok(Ok(v)) if v == "hello"));
@@ -1785,7 +1829,7 @@ mod tests {
 
     #[test]
     fn encode_outer_ok_err() {
-        let bytes = encode_outer::<String, ToolExecError>(Ok(Err(ToolExecError("fail".into()))));
+        let bytes = encode_outer::<String, ToolExecError>(&Ok(Err(ToolExecError("fail".into()))));
         let decoded: Result<Result<String, ToolExecError>, ToolError> =
             postcard::from_bytes(&bytes).unwrap();
         assert!(matches!(decoded, Ok(Err(e)) if e.to_string() == "fail"));
@@ -1794,7 +1838,7 @@ mod tests {
     #[test]
     fn encode_outer_err_infra() {
         let bytes =
-            encode_outer::<String, ToolExecError>(Err(ToolError::Other("infra fail".into())));
+            encode_outer::<String, ToolExecError>(&Err(ToolError::Other("infra fail".into())));
         let decoded: Result<Result<String, ToolExecError>, ToolError> =
             postcard::from_bytes(&bytes).unwrap();
         assert!(matches!(decoded, Err(e) if e.to_string() == "infra fail"));
@@ -1910,15 +1954,14 @@ mod tests {
         );
         assert!(!result.is_error, "tool should succeed: {}", result.content);
         match output_rx.try_recv() {
-            Err(crossbeam_channel::TryRecvError::Empty)
-            | Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            Err(
+                crossbeam_channel::TryRecvError::Empty
+                | crossbeam_channel::TryRecvError::Disconnected,
+            ) => {
                 // expected — no chunk sent (channel may already be closed)
             }
             Ok(chunk) => {
-                panic!(
-                    "non-streaming tool should NOT send streaming chunks, got: {:?}",
-                    chunk
-                );
+                panic!("non-streaming tool should NOT send streaming chunks, got: {chunk:?}");
             }
         }
     }

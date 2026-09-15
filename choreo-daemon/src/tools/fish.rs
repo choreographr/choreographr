@@ -45,10 +45,10 @@ impl Tool for FishShell {
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Running fish command: `{}`.", args.command)];
         if let Some(ref wd) = args.workdir {
-            parts.push(format!(" Working directory: `{}`.", wd));
+            parts.push(format!(" Working directory: `{wd}`."));
         }
         if let Some(timeout) = args.timeout {
-            parts.push(format!(" Timeout: {}ms.", timeout));
+            parts.push(format!(" Timeout: {timeout}ms."));
         }
         parts.concat()
     }
@@ -89,6 +89,12 @@ impl Tool for FishShell {
     }
 }
 
+/// Run a command in `fish` and return its output.
+///
+/// # Errors
+///
+/// Returns Err if fish cannot be spawned, the command times out, or the
+/// command exits non-zero.
 pub fn execute_fish_tool(
     args: &FishArgs,
     working_dir: Option<&Path>,
@@ -118,8 +124,8 @@ mod tests {
     #[test]
     fn fish_tool_has_valid_metadata() {
         let tool = super::FishShell;
-        assert!(!tool.name().is_empty());
-        assert!(!tool.description().is_empty());
+        assert_ne!(tool.name(), "");
+        assert_ne!(tool.description(), "");
         let schema = tool.schema();
         assert!(schema.is_object());
     }

@@ -3,7 +3,7 @@
 //! This uses `ureq` (synchronous HTTP) so it needs no async runtime, unlike the
 //! subxt path which drives the tokio sidecar. Content is addressed by its
 //! sha2-256 digest (the 32-byte `IpfsHash` stored on-chain); this module
-//! converts between that digest hex and the IPFS CIDv0 that `add`/`cat` speak.
+//! converts between that digest hex and the IPFS `CIDv0` that `add`/`cat` speak.
 //!
 //! - [`add`] uploads bytes (multipart `api/v0/add`) with `pin=true` and returns
 //!   the `0x`-prefixed digest hex that goes into a `publish_*` extrinsic.
@@ -45,6 +45,13 @@ pub struct IpfsPeerInfo {
 
 /// Upload `bytes` to IPFS (with `pin=true`) and return the content's sha2-256
 /// digest hex (`0x`-prefixed) — the value that becomes an `IpfsHash` on-chain.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Ipfs`] when the HTTP upload fails, the response
+/// body cannot be read/decoded, or `add` returns an empty response; and with
+/// [`ContentError::Cid`] when the returned CID cannot be converted to a
+/// digest hex.
 pub fn add(bytes: &[u8], filename: &str) -> Result<String, ContentError> {
     use ureq::unversioned::multipart::{Form, Part};
 
@@ -72,12 +79,24 @@ pub fn add(bytes: &[u8], filename: &str) -> Result<String, ContentError> {
 
 /// Fetch the bytes stored at a digest hex (`0x`-prefixed), converting it to a
 /// CID for `api/v0/cat`.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Cid`] when `digest_hex` is not valid 32-byte
+/// hex, and with [`ContentError::Ipfs`] when the `cat` request or body read
+/// fails (see [`cat_by_cid`]).
 pub fn cat(digest_hex: &str) -> Result<Vec<u8>, ContentError> {
     let cid = digest_hex_to_cid(digest_hex)?;
     cat_by_cid(&cid)
 }
 
 /// Fetch the bytes stored at a raw IPFS CID (Base58).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Ipfs`] when the `api/v0/cat` request fails
+/// (e.g. the daemon is unreachable or the CID is not pinned) or the response
+/// body cannot be read to end.
 pub fn cat_by_cid(cid: &str) -> Result<Vec<u8>, ContentError> {
     let response = agent()
         .post(&format!("{IPFS_API_URL}/api/v0/cat"))
@@ -94,6 +113,11 @@ pub fn cat_by_cid(cid: &str) -> Result<Vec<u8>, ContentError> {
 }
 
 /// Return the local daemon's peer identity (for `coord_status`).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Ipfs`] when the `api/v0/id` request fails or
+/// the response body cannot be read or decoded as JSON.
 pub fn id() -> Result<IpfsPeerInfo, ContentError> {
     let response = agent()
         .post(&format!("{IPFS_API_URL}/api/v0/id"))
@@ -109,6 +133,11 @@ pub fn id() -> Result<IpfsPeerInfo, ContentError> {
 }
 
 /// Convert a digest hex to the raw 32-byte digest (validates the length).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Cid`] when `digest_hex` is not exactly 32
+/// bytes of `0x`-prefixed hex.
 pub fn digest_bytes(digest_hex: &str) -> Result<[u8; 32], ContentError> {
     hex_to_bytes(digest_hex)
 }

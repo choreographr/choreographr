@@ -29,6 +29,7 @@ use crate::sessions::SessionState;
 ///
 /// Public for the daemon integration tests (the `test-utils` feature); the
 /// production caller is `run_agent_loop`.
+#[must_use]
 pub fn build_chat_request_messages(
     session: &SessionState,
     system_prompt: Option<&str>,
@@ -250,9 +251,9 @@ fn turn_has_tool_involvement(turn: &Turn) -> bool {
 ///    its payload replayed, matching pi's isSameModel and Anthropic's
 ///    strip-on-model-change rule.
 /// 2. **The passback policy** for the request:
-///    ToolLoop  → tool-involving turns only
-///    AllTurns / Signature → every turn
-///    None / ResponseId → never via the message
+///    `ToolLoop`  → tool-involving turns only
+///    `AllTurns` / Signature → every turn
+///    None / `ResponseId` → never via the message
 ///
 /// `passback` must be the resolved policy for `(provider_slug, model)`
 /// ([`model_reasoning_passback`]); callers that also need the value for
@@ -370,7 +371,7 @@ pub(crate) fn initial_prev_resp_id(
 /// when clean, so tests can exercise the path deterministically.
 ///
 /// The guard deliberately does NOT disable thinking for the request: for
-/// ToolLoop providers (DeepSeek/Kimi) the 400 comes from *history*, not the
+/// `ToolLoop` providers (DeepSeek/Kimi) the 400 comes from *history*, not the
 /// current request's thinking setting, so flipping the effort to "off" would
 /// not fix the failure and would silently change model behavior — the warn is
 /// the honest signal. ResponseId/None policies skip the check entirely (no
@@ -390,7 +391,7 @@ pub(crate) fn initial_prev_resp_id(
 /// distinguishable.
 ///
 /// Provenance is checked exactly like the builder: an artifact is only
-/// replayed when its producer matches the current (provider_slug, model), so
+/// replayed when its producer matches the current (`provider_slug`, model), so
 /// after a deliberate mid-session model switch every pre-switch turn is
 /// flagged on each request. That is the intended diagnostic signal — the
 /// built request genuinely omits those echoes; if the provider accepts the
@@ -423,7 +424,7 @@ pub(crate) fn warn_on_missing_reasoning_artifacts(
         ReasoningPassback::AllTurns | ReasoningPassback::Signature
     );
     let mut problems = 0;
-    for (turn_id, turn) in session.turns.iter() {
+    for (turn_id, turn) in &session.turns {
         if turn.undone {
             continue;
         }
@@ -529,7 +530,20 @@ pub(crate) fn reasoning_artifact_tokens(
         | ReasoningArtifact::ResponsesItems(b) => b,
     };
     match std::str::from_utf8(bytes) {
-        Ok(text) => enc.count(text) as u32,
-        Err(_) => (bytes.len() / 4) as u32,
+        Ok(text) => {
+            // u128→u32 token counts: informational estimate only; real
+            // payloads are far below u32::MAX tokens.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                enc.count(text) as u32
+            }
+        }
+        Err(_) => {
+            // Same estimate, byte/4 heuristic branch.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                (bytes.len() / 4) as u32
+            }
+        }
     }
 }

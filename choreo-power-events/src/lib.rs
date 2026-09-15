@@ -12,7 +12,7 @@
 //!
 //! These events are a convenience layer, NOT a correctness layer. A machine
 //! can suspend without the platform API firing (logind missing, notification
-//! port failing, the process being SIGSTOPped, a VM's exotic suspend path).
+//! port failing, the process being `SIGSTOP`ped, a VM's exotic suspend path).
 //! Consumers MUST treat the absence of a `Sleep`/`Wake` event as a
 //! non-issue: the kernel-level dead-link detection in `choreo-sockreg`
 //! (TCP keepalives) is the fallback layer that keeps correctness without
@@ -23,7 +23,7 @@
 //! | Platform | Mechanism | Notes |
 //! |---|---|---|
 //! | Linux | systemd-logind `PrepareForSleep(bool)` D-Bus signal | Requires a session/system D-Bus with logind. |
-//! | macOS | `IORegisterForSystemPower` + CFRunLoop | `IOAllowPowerChange` is called for `kIOMessageSystemWillSleep` — declining blocks system sleep for everyone. |
+//! | macOS | `IORegisterForSystemPower` + `CFRunLoop` | `IOAllowPowerChange` is called for `kIOMessageSystemWillSleep` — declining blocks system sleep for everyone. |
 //! | Windows (and anything else) | Inert fallback | [`PowerMonitor::new`] returns `Ok` with a receiver that never fires; `is_active()` is `false`. |
 //!
 //! On Linux, if logind is unreachable, [`PowerMonitor::new`] returns the
@@ -53,7 +53,7 @@ use std::fmt;
 /// A machine power-transition notification.
 ///
 /// Timing guarantees: [`SuspendEvent::Sleep`] is delivered before the
-/// machine actually suspends (logind `PrepareForSleep(true)` / the IOKit
+/// machine actually suspends (logind `PrepareForSleep(true)` / the `IOKit`
 /// `kIOMessageSystemWillSleep` interest callback); [`SuspendEvent::Wake`]
 /// is delivered after resume (logind `PrepareForSleep(false)` /
 /// `kIOMessageSystemHasPoweredOn`).
@@ -121,10 +121,13 @@ pub struct PowerMonitor {
 
 impl fmt::Debug for PowerMonitor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The receiver is not Debug; report only the mode so logs never
-        // pretend the channel contents are inspectable.
+        // The receiver is not Debug; report the mode and whether a sender
+        // is still held so logs never pretend the channel contents are
+        // inspectable.
         f.debug_struct("PowerMonitor")
             .field("active", &self.active)
+            .field("sender", &self.sender.is_some())
+            .field("events", &"<receiver>")
             .finish()
     }
 }
@@ -137,13 +140,20 @@ impl PowerMonitor {
     ///   logind's `PrepareForSleep` signal. Errors (no bus, no logind,
     ///   subscription rejected) are returned as
     ///   [`PowerMonitorError::Connection`] / [`PowerMonitorError::Subscription`].
-    /// - **macOS**: registers an IOKit system-power interest callback on a
+    /// - **macOS**: registers an `IOKit` system-power interest callback on a
     ///   CFRunLoop-driven monitor thread. **The monitor calls
     ///   `IOAllowPowerChange` for every sleep notification** — declining
     ///   would block the whole system from sleeping.
     /// - **Windows / other**: returns `Ok` with an inert monitor whose
     ///   receiver never fires (logged once with `info!`); use
     ///   [`PowerMonitor::is_active`] to report which mode you got.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PowerMonitorError::Connection`] / [`PowerMonitorError::Subscription`]
+    /// when the platform provider cannot be reached or subscribed to (Linux),
+    /// and [`PowerMonitorError::Spawn`] when the monitor thread cannot be
+    /// created. Never fails on platforms without a native mechanism.
     pub fn new() -> Result<Self, PowerMonitorError> {
         platform::spawn_monitor()
     }
@@ -174,6 +184,7 @@ impl PowerMonitor {
     ///
     /// Public so tests (and callers that want the no-op mode explicitly)
     /// can build it without reaching platform code.
+    #[must_use]
     pub fn inert() -> Self {
         // Unbounded: the (potential) producer is the monitor thread and the
         // events are human-rate; an inert monitor simply never sends.
@@ -190,6 +201,7 @@ impl PowerMonitor {
 
     /// The event channel. The single producer is the monitor thread; on
     /// this (inert) monitor nothing is ever sent.
+    #[must_use]
     pub fn events(&self) -> &crossbeam_channel::Receiver<SuspendEvent> {
         &self.events
     }
@@ -198,6 +210,7 @@ impl PowerMonitor {
     /// for the inert fallback (unsupported platform or best-effort
     /// fallback after failure). Callers log this once at startup so the
     /// observability layer knows which mode the daemon is in.
+    #[must_use]
     pub fn is_active(&self) -> bool {
         self.active
     }

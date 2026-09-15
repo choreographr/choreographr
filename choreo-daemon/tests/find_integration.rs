@@ -1,7 +1,7 @@
 use choreo_daemon::{FindArgs, execute_find_tool};
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_substring_match() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("foo.rs"), "").unwrap();
@@ -20,13 +20,12 @@ fn find_substring_match() {
     assert!(content.contains("foo.rs"), "{}", content);
     assert!(
         !content.contains("bar.rs"),
-        "should not match bar: {}",
-        content
+        "should not match bar: {content}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_glob_match() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("foo.rs"), "").unwrap();
@@ -45,13 +44,12 @@ fn find_glob_match() {
     assert!(content.contains("foo.rs"), "{}", content);
     assert!(
         !content.contains("bar.py"),
-        "should not match .py: {}",
-        content
+        "should not match .py: {content}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_directory_gets_trailing_slash() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("srcdir")).unwrap();
@@ -68,13 +66,12 @@ fn find_directory_gets_trailing_slash() {
     let content = result.unwrap_or_default();
     assert!(
         content.contains("srcdir/"),
-        "expected trailing slash: {}",
-        content
+        "expected trailing slash: {content}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_glob_auto_detect() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("foo.rs"), "").unwrap();
@@ -96,13 +93,12 @@ fn find_glob_auto_detect() {
     assert!(content.contains("bar.rs"), "{}", content);
     assert!(
         !content.contains("readme.txt"),
-        "should not match .txt: {}",
-        content
+        "should not match .txt: {content}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_glob_auto_detect_question_mark() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("foo.rs"), "").unwrap();
@@ -123,13 +119,12 @@ fn find_glob_auto_detect_question_mark() {
     assert!(content.contains("fox.rs"), "{}", content);
     assert!(
         !content.contains("bar.rs"),
-        "should not match bar.rs: {}",
-        content
+        "should not match bar.rs: {content}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_no_match_returns_empty() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("foo.rs"), "").unwrap();
@@ -143,11 +138,11 @@ fn find_no_match_returns_empty() {
         },
         None,
     );
-    assert!(result.unwrap_or_default().is_empty());
+    assert_eq!(result.unwrap_or_default(), "");
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_shows_file_sizes() {
     let dir = tempfile::tempdir().unwrap();
     // A 4 KiB file — sizes come from the walker's metadata pass.
@@ -173,7 +168,7 @@ fn find_shows_file_sizes() {
 
 #[cfg(unix)]
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_shows_symlink_targets() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("real.txt"), "hi\n").unwrap();
@@ -193,7 +188,7 @@ fn find_shows_symlink_targets() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_marks_truncation_at_max_results() {
     let dir = tempfile::tempdir().unwrap();
     for i in 0..5 {
@@ -218,7 +213,7 @@ fn find_marks_truncation_at_max_results() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_path_anchored_glob_matches_relative_paths() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
@@ -247,7 +242,7 @@ fn find_path_anchored_glob_matches_relative_paths() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_bare_glob_matches_basename_at_any_depth() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
@@ -270,7 +265,7 @@ fn find_bare_glob_matches_basename_at_any_depth() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_leading_dot_slash_pattern_matches() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
@@ -292,7 +287,7 @@ fn find_leading_dot_slash_pattern_matches() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_absolute_pattern_relative_to_root() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
@@ -315,7 +310,7 @@ fn find_absolute_pattern_relative_to_root() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_absolute_pattern_outside_root_errors() {
     let dir = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
@@ -339,7 +334,7 @@ fn find_absolute_pattern_outside_root_errors() {
 
 #[cfg(unix)]
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn find_sanitizes_control_chars_in_symlink_target() {
     let dir = tempfile::tempdir().unwrap();
     // A symlink whose *target* name contains a literal newline — the target

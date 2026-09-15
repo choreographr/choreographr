@@ -4,7 +4,7 @@ use choreo_proto::ClientMessage;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEvent};
 
 pub(super) fn handle_session_manager_event(
-    event: Event,
+    event: &Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
@@ -15,11 +15,11 @@ pub(super) fn handle_session_manager_event(
 }
 
 fn handle_session_list_event(
-    event: Event,
+    event: &Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    match event {
+    match *event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             handle_session_list_key(key, app, client_tx)
         }
@@ -29,11 +29,11 @@ fn handle_session_list_event(
 }
 
 fn handle_session_detail_event(
-    event: Event,
+    event: &Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    match event {
+    match *event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             handle_session_detail_key(key, app, client_tx)
         }
@@ -49,14 +49,14 @@ fn handle_session_list_key(
     // If in delete-confirmation mode, handle y/n/Esc first
     if app.session_mgr.confirm_delete.is_some() {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Char('y' | 'Y') => {
                 if let Some((session_id, _title)) = app.session_mgr.confirm_delete.take() {
                     client_tx
                         .send(ClientMessage::DeleteSession { session_id })
                         .map_err(broken_pipe)?;
                 }
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
                 app.session_mgr.confirm_delete = None;
             }
             _ => {}

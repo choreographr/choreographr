@@ -8,15 +8,15 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, Mo
 use tui_prompts::State;
 
 pub(super) fn handle_ai_providers_event(
-    event: Event,
+    event: &Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     // The wizard and credential modals are dispatched from `handle_ui_event`
     // before this function; only the accounts list reaches here.
     match event {
-        Event::Key(key) => handle_ai_providers_list_key(key, app, client_tx),
-        Event::Mouse(mouse) => handle_ai_providers_list_mouse(mouse, app, client_tx),
+        Event::Key(key) => handle_ai_providers_list_key(*key, app, client_tx),
+        Event::Mouse(mouse) => handle_ai_providers_list_mouse(*mouse, app, client_tx),
         _ => Ok(()),
     }
 }
@@ -33,7 +33,7 @@ fn handle_ai_providers_list_key(
     // If in delete-confirmation mode, handle y/n/Esc first
     if app.ai_providers.confirm_remove.is_some() {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Char('y' | 'Y') => {
                 if let Some(name) = app.ai_providers.confirm_remove.take() {
                     tracing::info!(name, "sending RemoveAccount");
                     client_tx
@@ -41,7 +41,7 @@ fn handle_ai_providers_list_key(
                         .map_err(broken_pipe)?;
                 }
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 app.ai_providers.confirm_remove = None;
             }
             _ => {}
@@ -176,23 +176,22 @@ fn handle_ai_providers_list_mouse(
 /// credential (auto-unlocking the daemon so it is immediately usable); Esc
 /// cancels without saving; every other key edits the masked input buffer.
 pub(super) fn handle_credential_modal_event(
-    event: Event,
+    event: &Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
-) -> Result<(), ClientError> {
+) {
     let Event::Key(key) = event else {
-        return Ok(());
+        return;
     };
     if key.kind != KeyEventKind::Press {
-        return Ok(());
+        return;
     }
 
     match key.code {
         // Enter saves the credential.
         KeyCode::Enter => {
-            let account_name = match app.ai_providers.credential.target.take() {
-                Some(name) => name,
-                None => return Ok(()),
+            let Some(account_name) = app.ai_providers.credential.target.take() else {
+                return;
             };
             let api_key = app.ai_providers.credential.input.text.trim().to_string();
             // Wipe the typed key from the input buffer before it is dropped
@@ -205,7 +204,7 @@ pub(super) fn handle_credential_modal_event(
                 tracing::debug!(account_name, "credential save rejected: empty key");
                 app.ai_providers.credential.error = Some("API key cannot be empty".to_string());
                 app.ai_providers.credential.target = Some(account_name);
-                return Ok(());
+                return;
             }
 
             app.ai_providers.credential.error = None;
@@ -245,10 +244,9 @@ pub(super) fn handle_credential_modal_event(
         }
         // All other keys go to the credential input buffer.
         _ => {
-            app.ai_providers.credential.input.handle_key(key);
+            app.ai_providers.credential.input.handle_key(*key);
         }
     }
-    Ok(())
 }
 
 /// Handle keys while the Polkadot-account import wizard is open (accounts
@@ -256,15 +254,15 @@ pub(super) fn handle_credential_modal_event(
 /// on the password step triggers the import; Esc backs out one step (cancelling
 /// on the name step); every other key edits the active step's text field.
 pub(super) fn handle_polkadot_import_event(
-    event: Event,
+    event: &Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
-) -> Result<(), ClientError> {
+) {
     let Event::Key(key) = event else {
-        return Ok(());
+        return;
     };
     if key.kind != KeyEventKind::Press {
-        return Ok(());
+        return;
     }
 
     match key.code {
@@ -281,13 +279,13 @@ pub(super) fn handle_polkadot_import_event(
                 if name.is_empty() {
                     app.ai_providers.polkadot_import.error =
                         Some("Account name is required".to_string());
-                    return Ok(());
+                    return;
                 }
                 if !is_valid_account_name(&name) {
                     app.ai_providers.polkadot_import.error = Some(
                         "name must be lowercase alphanumeric, hyphens, or underscores".to_string(),
                     );
-                    return Ok(());
+                    return;
                 }
                 app.ai_providers.polkadot_import.advance();
             }
@@ -302,12 +300,12 @@ pub(super) fn handle_polkadot_import_event(
                 if path.is_empty() {
                     app.ai_providers.polkadot_import.error =
                         Some("Keystore path is required".to_string());
-                    return Ok(());
+                    return;
                 }
                 app.ai_providers.polkadot_import.advance();
             }
             PolkadotImportStep::Password => {
-                submit_polkadot_import(app, client_tx)?;
+                submit_polkadot_import(app, client_tx);
             }
         },
         // Esc backs out one step (cancels on the name step).
@@ -321,10 +319,9 @@ pub(super) fn handle_polkadot_import_event(
         }
         // All other keys edit the active step's text field.
         _ => {
-            app.ai_providers.polkadot_import.handle_key(key);
+            app.ai_providers.polkadot_import.handle_key(*key);
         }
     }
-    Ok(())
 }
 
 /// Read the entered keystore export, decrypt it in the TUI with the account
@@ -333,10 +330,7 @@ pub(super) fn handle_polkadot_import_event(
 ///
 /// The password is used only here (client-side), never logged and never sent
 /// to the daemon; it is zeroized on every exit path.
-fn submit_polkadot_import(
-    app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
-) -> Result<(), ClientError> {
+fn submit_polkadot_import(app: &mut App, client_tx: &std::sync::mpsc::Sender<ClientMessage>) {
     let name = app
         .ai_providers
         .polkadot_import
@@ -390,8 +384,7 @@ fn submit_polkadot_import(
             .map_err(broken_pipe)
             .map_err(|e| e.to_string())?;
         Ok(format!(
-            "[daemon] Substrate account '{name}' stored ({}); unlock the daemon to sign with it",
-            account_id
+            "[daemon] Substrate account '{name}' stored ({account_id}); unlock the daemon to sign with it"
         ))
     })();
 
@@ -408,7 +401,6 @@ fn submit_polkadot_import(
             app.ai_providers.polkadot_import.error = Some(e);
         }
     }
-    Ok(())
 }
 
 /// Handle keys while the new-account wizard modal is open.  Step 1 (Provider):
@@ -420,7 +412,7 @@ fn submit_polkadot_import(
 /// validates and submits `AddAccount` (then auto-opens the credential modal),
 /// Esc returns to the provider picker.
 pub(super) fn handle_account_wizard_event(
-    event: Event,
+    event: &Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
@@ -464,7 +456,7 @@ pub(super) fn handle_account_wizard_event(
                         // backspace, word deletes, cursor movement).  `filter_key`
                         // returns false for Enter/Esc, which are handled above.
                         _ => {
-                            app.ai_providers.wizard.filter_key(key, &app.providers);
+                            app.ai_providers.wizard.filter_key(*key, &app.providers);
                         }
                     }
                 }
@@ -496,7 +488,7 @@ pub(super) fn handle_account_wizard_event(
                         submit_new_account(app, client_tx)?;
                     } else {
                         // All other keys go to the slug input buffer.
-                        app.ai_providers.wizard.slug.handle_key_event(key);
+                        app.ai_providers.wizard.slug.handle_key_event(*key);
                     }
                 }
             }
@@ -561,7 +553,7 @@ pub(super) fn handle_account_wizard_event(
     }
 }
 
-/// Send AddAccount for the slug entered in step 2, then close the wizard and
+/// Send `AddAccount` for the slug entered in step 2, then close the wizard and
 /// auto-open the credential modal so the user can immediately paste an API
 /// key.
 fn submit_new_account(

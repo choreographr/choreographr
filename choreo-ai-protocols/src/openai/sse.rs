@@ -41,7 +41,7 @@ impl SseReader {
                         self.event_lines
                             .push(line.trim_end_matches('\r').to_string());
                     }
-                    return self.finish_event();
+                    return Ok(self.finish_event());
                 }
                 n => {
                     self.pending
@@ -80,14 +80,12 @@ impl SseReader {
         Ok(None)
     }
 
-    fn finish_event(&mut self) -> io::Result<Option<String>> {
-        let Some(event) = build_sse_event(&mut self.event_lines) else {
-            return Ok(None);
-        };
+    fn finish_event(&mut self) -> Option<String> {
+        let event = build_sse_event(&mut self.event_lines)?;
         if event == "[DONE]" {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(event))
+        Some(event)
     }
 }
 
@@ -99,7 +97,7 @@ pub(crate) fn build_sse_event(event_lines: &mut Vec<String>) -> Option<String> {
     let data = event_lines
         .iter()
         .filter_map(|line| line.strip_prefix("data:"))
-        .map(|value| value.trim_start())
+        .map(str::trim_start)
         .collect::<Vec<_>>()
         .join("\n");
     event_lines.clear();
@@ -209,12 +207,12 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             let call_id = payload
                 .get("call_id")
                 .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .unwrap_or_default();
             let delta = payload
                 .get("delta")
                 .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .unwrap_or_default();
             Ok(Some(ResponsesStreamEvent::FunctionCallArgumentsDelta {
                 call_id,
@@ -225,17 +223,17 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             let call_id = payload
                 .get("call_id")
                 .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .unwrap_or_default();
             let name = payload
                 .get("name")
                 .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .unwrap_or_default();
             let arguments = payload
                 .get("arguments")
                 .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .unwrap_or_default();
             Ok(Some(ResponsesStreamEvent::FunctionCallArgumentsDone {
                 call_id,
@@ -267,8 +265,7 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
                     other => other
                         .get("message")
                         .and_then(|m| m.as_str())
-                        .map(String::from)
-                        .unwrap_or_else(|| other.to_string()),
+                        .map_or_else(|| other.to_string(), String::from),
                 })
                 .unwrap_or_default();
             Ok(Some(ResponsesStreamEvent::ResponseFailed(error)))
@@ -285,7 +282,7 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             let call_id = payload
                 .get("call_id")
                 .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -295,7 +292,7 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             let fingerprint = payload
                 .get("fingerprint")
                 .and_then(|value| value.as_str())
-                .map(|s| s.to_string());
+                .map(std::string::ToString::to_string);
             Ok(Some(ResponsesStreamEvent::ProgramCodeDone {
                 call_id,
                 fingerprint,
@@ -305,7 +302,7 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             let call_id = payload
                 .get("call_id")
                 .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -315,12 +312,12 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             let result = payload
                 .get("result")
                 .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .unwrap_or_default();
             let status = payload
                 .get("status")
                 .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .unwrap_or_default();
             Ok(Some(ResponsesStreamEvent::ProgramOutputDone {
                 call_id,

@@ -195,7 +195,7 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
         .into_iter()
         .map(|(model, m)| ModelEntry {
             model,
-            context_window: m.limit.as_ref().map(|l| l.context).unwrap_or(0),
+            context_window: m.limit.as_ref().map_or(0, |l| l.context),
             reasoning_supported: m.reasoning,
             openai_reasoning_levels: effort_levels(&m.reasoning_options),
             openai_responses,
@@ -229,8 +229,7 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
             supports_vision: m
                 .modalities
                 .as_ref()
-                .map(|mods| mods.input.iter().any(|m| m == "image"))
-                .unwrap_or(false),
+                .is_some_and(|mods| mods.input.iter().any(|m| m == "image")),
             // Image OUTPUT: same safe-default pattern, on the `output` side
             // of the modalities pair. `"image"` there means the model can
             // *produce* images (gpt-image-1, Gemini image models, …);
@@ -238,8 +237,7 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
             supports_image_output: m
                 .modalities
                 .as_ref()
-                .map(|mods| mods.output.iter().any(|m| m == "image"))
-                .unwrap_or(false),
+                .is_some_and(|mods| mods.output.iter().any(|m| m == "image")),
         })
         .collect();
 
@@ -453,8 +451,14 @@ mod tests {
             vec!["off", "low", "medium", "high", "xhigh"]
         );
         // Toggle / budget_tokens options carry no explicit levels.
-        assert!(catalog[2].models[0].openai_reasoning_levels.is_empty());
-        assert!(catalog[3].models[0].openai_reasoning_levels.is_empty());
+        assert_eq!(
+            catalog[2].models[0].openai_reasoning_levels,
+            [] as [String; 0]
+        );
+        assert_eq!(
+            catalog[3].models[0].openai_reasoning_levels,
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -466,7 +470,10 @@ mod tests {
         assert_eq!(catalog[2].models[0].context_window, 200_000);
         // reasoning=false model has no levels.
         assert!(!catalog[4].models[0].reasoning_supported);
-        assert!(catalog[4].models[0].openai_reasoning_levels.is_empty());
+        assert_eq!(
+            catalog[4].models[0].openai_reasoning_levels,
+            [] as [String; 0]
+        );
     }
 
     #[test]

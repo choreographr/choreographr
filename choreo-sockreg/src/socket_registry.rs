@@ -78,6 +78,7 @@ pub struct SocketRegistry {
 
 impl SocketRegistry {
     /// Creates an empty registry.
+    #[must_use]
     pub fn new() -> Self {
         // Start at 1 so no valid SocketId is ever 0 (see SocketId's docs).
         Self {
@@ -108,7 +109,10 @@ impl SocketRegistry {
     /// is dropped.
     pub fn register(&self, socket: impl Into<OwnedSock>) -> SocketId {
         let id = SocketId::next(&self.next_id);
-        let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sockets = self
+            .sockets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Prune BEFORE pushing so the cap applies to the steady-state size;
         // the new socket is by definition alive, so pruning first never
         // evicts it.
@@ -143,7 +147,10 @@ impl SocketRegistry {
     /// the registry holds its dup), so a no-op here leaves no leak: the
     /// transport's own fd is closed by normal `Drop` regardless.
     pub fn unregister(&self, id: SocketId) {
-        let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sockets = self
+            .sockets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match sockets.iter().position(|e| e.id == id) {
             Some(pos) => {
                 let entry = sockets.remove(pos);
@@ -165,8 +172,12 @@ impl SocketRegistry {
     }
 
     /// Number of currently registered fds (mainly for tests and metrics).
+    #[must_use]
     pub fn registered_count(&self) -> usize {
-        self.sockets.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.sockets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Force-closes every registered socket, then clears the list.
@@ -184,7 +195,10 @@ impl SocketRegistry {
 
         use nix::sys::socket::{Shutdown, shutdown};
 
-        let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sockets = self
+            .sockets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = sockets.len();
         // Drain removes each entry FIRST, transferring close ownership to
         // this loop (the invariant `unregister` relies on: a concurrent or
@@ -198,7 +212,7 @@ impl SocketRegistry {
                 Ok(()) => tracing::debug!(fd = raw, "socket shut down"),
                 // The fd was already closed by someone else — nothing to do.
                 Err(nix::Error::EBADF) => {
-                    tracing::debug!(fd = raw, "socket already closed (EBADF)")
+                    tracing::debug!(fd = raw, "socket already closed (EBADF)");
                 }
                 // Not connected — shutdown is a no-op there, still fine.
                 Err(nix::Error::ENOTCONN) => tracing::debug!(fd = raw, "socket not connected"),
@@ -223,7 +237,10 @@ impl SocketRegistry {
         tracing::warn!(
             "shutdown_all is not implemented on this platform yet (planned Winsock follow-up); fds will only be closed, not shut down"
         );
-        let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sockets = self
+            .sockets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = sockets.len();
         // Draining (instead of `clear()`) keeps the remove-then-close order
         // the ownership invariant expects; dropping OwnedSocket closes it.
@@ -247,14 +264,19 @@ impl SocketRegistry {
     ///
     /// Returns the number of dead entries removed and closed.
     #[cfg(unix)]
+    #[must_use]
     pub fn prune_dead(&self) -> usize {
-        let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sockets = self
+            .sockets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         prune_locked(&mut sockets)
     }
 
     /// Windows no-op for now (probing needs `ioctlsocket`-based non-blocking
     /// recv; planned with the Winsock follow-up).
     #[cfg(not(unix))]
+    #[must_use]
     pub fn prune_dead(&self) -> usize {
         tracing::warn!(
             "prune_dead is not implemented on this platform yet (planned Winsock follow-up)"
@@ -337,11 +359,10 @@ fn probe_alive(fd: std::os::fd::BorrowedFd<'_>) -> bool {
 
     // Save the current flags so the restore puts back EXACTLY what the
     // owner of the twin fd had (the caller's stream may legitimately be
-    // non-blocking already).
-    let flags = match fcntl(fd, FcntlArg::F_GETFL) {
-        Ok(f) => f,
-        // Can't even read flags — the fd is unusable, treat as dead.
-        Err(_) => return false,
+    // non-blocking already). Can't even read flags means the fd is
+    // unusable — treat as dead.
+    let Ok(flags) = fcntl(fd, FcntlArg::F_GETFL) else {
+        return false;
     };
     let flags = OFlag::from_bits_truncate(flags);
     if fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).is_err() {
@@ -443,8 +464,8 @@ mod tests {
     }
 
     /// Closes a raw fd "elsewhere" (simulating the caller closing its twin)
-    /// and hands the raw number back wrapped in a fresh OwnedFd, exactly the
-    /// shape `register` expects to receive for an already-dead fd.
+    /// and hands the raw number back wrapped in a fresh `OwnedFd`, exactly the
+    /// shape `register` expects to receive for an already-dead `OwnedFd`.
     fn dead_fd() -> OwnedFd {
         let (a, _b) = pair();
         let raw = a.into_raw_fd();
@@ -543,7 +564,9 @@ mod tests {
         // The live entry keeps BOTH ends alive so the probe keeps it.
         let (live, _peer) = pair();
         let id = registry.register(live);
-        registry.prune_dead();
+        // must_use: discard the pruned count, the assertions below observe
+        // the effect through `registered_count`.
+        let _ = registry.prune_dead();
         assert_eq!(registry.registered_count(), 1);
         // The pruned entry's id must no-op (ownership was transferred to
         // prune_locked); the surviving entry's id must still unregister it.
@@ -580,6 +603,8 @@ mod tests {
 
     #[test]
     fn prune_dead_removes_only_dead_sockets() {
+        use std::io::Write;
+
         let registry = SocketRegistry::new();
         let (live, peer) = pair();
         // Register a duplicate so the test still holds `live` for verification
@@ -589,13 +614,14 @@ mod tests {
         registry.register(dead_fd());
         assert_eq!(registry.registered_count(), 2);
 
-        registry.prune_dead();
+        // must_use: discard the pruned count, the assertions below observe
+        // the effect through `registered_count`.
+        let _ = registry.prune_dead();
         assert_eq!(registry.registered_count(), 1);
 
         // The surviving registration is the live one: the fd still functions
         // (write from the peer, read the byte back), proving prune kept an
         // ALIVE socket and removed only the dead one.
-        use std::io::Write;
         let mut peer_file = std::fs::File::from(peer);
         peer_file.write_all(b"x").expect("write to peer");
         let mut buf = [0u8; 1];

@@ -62,6 +62,11 @@ impl subxt::tx::Signer<PolkadotConfig> for ChoreoSigner {
 }
 
 /// Parse an SS58 account address into its raw 32-byte account id.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::InvalidArgument`] when `address` is not a valid
+/// SS58-check encoding of a 32-byte sr25519 public key.
 pub fn account_id_from_address(address: &str) -> Result<[u8; 32], ContentError> {
     let public = Public::from_ss58check(address).map_err(|e| {
         ContentError::InvalidArgument(format!("invalid SS58 address {address}: {e}"))
@@ -70,6 +75,7 @@ pub fn account_id_from_address(address: &str) -> Result<[u8; 32], ContentError> 
 }
 
 /// Render a raw 32-byte account id as an SS58 address (chain prefix).
+#[must_use]
 pub fn account_address(bytes: [u8; 32]) -> String {
     AccountId32(bytes).to_string()
 }
@@ -91,6 +97,7 @@ pub struct ChainAccount {
 
 impl ChainAccount {
     /// Build a chain account from a 32-byte account id + 64-byte expanded secret.
+    #[must_use]
     pub fn from_parts(account_id: [u8; 32], secret: Vec<u8>) -> Self {
         Self {
             address: account_address(account_id),
@@ -100,6 +107,14 @@ impl ChainAccount {
     }
     /// Build a chain account from an SS58 address + 64-byte expanded secret
     /// (validates that the address matches the secret's public key).
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`ContentError::Account`] when `secret` is not a valid
+    /// 64-byte expanded ed25519 secret, or when the address does not match
+    /// the secret's derived public key; with
+    /// [`ContentError::InvalidArgument`] when `address` is not valid SS58
+    /// (see [`account_id_from_address`]).
     pub fn from_address(address: &str, secret: Vec<u8>) -> Result<Self, ContentError> {
         let signer = ChoreoSigner::from_expanded_secret(&secret)?;
         let account_id = account_id_from_address(address)?;
@@ -235,6 +250,16 @@ pub struct ChainStatus {
 /// (bounded by [`CHAIN_TIMEOUT`]) so the caller's status report can show the
 /// chain as unavailable rather than fabricating a healthy snapshot from pinned
 /// configuration.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Substrate`] when the node cannot be reached at
+/// [`crate::config::CHAIN_WS_URL`], its genesis hash does not match the pinned
+/// [`crate::config::GENESIS_HASH`], the `System::SS58Prefix` constant or best
+/// block header cannot be read, the node returns no best header, or the whole
+/// probe exceeds [`CHAIN_TIMEOUT`]; with
+/// [`ContentError::RuntimeNotInitialized`] when the sidecar runtime was never
+/// initialized.
 pub fn chain_status() -> Result<ChainStatus, ContentError> {
     crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
@@ -289,6 +314,14 @@ pub fn chain_status() -> Result<ChainStatus, ContentError> {
 }
 
 /// Read an item's on-chain control state (owner, revision, flags).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Content`] when the item does not exist on-chain;
+/// with [`ContentError::Substrate`] when the node is unreachable, the genesis
+/// hash mismatches, the storage query or decode fails, or [`CHAIN_TIMEOUT`]
+/// is exceeded; with [`ContentError::RuntimeNotInitialized`] when the sidecar
+/// runtime was never initialized.
 pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, ContentError> {
     crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
@@ -322,6 +355,14 @@ pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, ContentError> {
 }
 
 /// Read the list of item ids an account has pinned in `pallet-account-content`.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Substrate`] when the node is unreachable, the
+/// genesis hash mismatches, the storage query or bounded-vec decode fails, or
+/// [`CHAIN_TIMEOUT`] is exceeded; with
+/// [`ContentError::RuntimeNotInitialized`] when the sidecar runtime was never
+/// initialized. An account with no pinned items yields `Ok(vec![])`.
 pub fn account_item_ids(account: [u8; 32]) -> Result<Vec<[u8; 32]>, ContentError> {
     crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
@@ -348,6 +389,14 @@ pub fn account_item_ids(account: [u8; 32]) -> Result<Vec<[u8; 32]>, ContentError
 }
 
 /// Read the profile item id an account has set (`pallet-account-profile`).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Substrate`] when the node is unreachable, the
+/// genesis hash mismatches, the storage query or decode fails, or
+/// [`CHAIN_TIMEOUT`] is exceeded; with
+/// [`ContentError::RuntimeNotInitialized`] when the sidecar runtime was never
+/// initialized. `Ok(None)` means the account has no profile set.
 pub fn profile_item(account: [u8; 32]) -> Result<Option<[u8; 32]>, ContentError> {
     crate::runtime::block_on(with_chain_timeout(async move {
         let client = connect().await?;
@@ -402,44 +451,74 @@ fn account_bounded(list: &[[u8; 32]]) -> BoundedVec<AccountId32> {
 // ── Write (submit extrinsics) ────────────────────────────────────────────────
 
 /// Publish a brand-new item (optionally batched with an account add).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
+/// submitted, is not finalized successfully, or the `PublishItem` event
+/// cannot be decoded; with [`ContentError::Substrate`] when the node is
+/// unreachable, the genesis hash mismatches, or [`CHAIN_TIMEOUT`] is
+/// exceeded; with [`ContentError::Account`] when the stored secret cannot be
+/// rebuilt into a signer; with [`ContentError::RuntimeNotInitialized`] when
+/// the sidecar runtime was never initialized.
 pub fn publish_item(
     account: &ChainAccount,
     nonce: [u8; 32],
-    parents: Vec<[u8; 32]>,
+    parents: &[[u8; 32]],
     flags: u8,
-    links: Vec<[u8; 32]>,
-    mentions: Vec<[u8; 32]>,
+    links: &[[u8; 32]],
+    mentions: &[[u8; 32]],
     ipfs_hash: [u8; 32],
 ) -> Result<TxOutcome, ContentError> {
     let call = api::tx().content().publish_item(
         api::runtime_types::pallet_content::Nonce(nonce),
-        item_bounded(&parents),
+        item_bounded(parents),
         flags,
-        item_bounded(&links),
-        account_bounded(&mentions),
+        item_bounded(links),
+        account_bounded(mentions),
         api::runtime_types::pallet_content::pallet::IpfsHash(ipfs_hash),
     );
     crate::runtime::block_on(with_chain_timeout(submit_publish(&call, account)))?
 }
 
 /// Publish a new revision of an existing item.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
+/// submitted, is not finalized successfully, or the `PublishItem` event
+/// cannot be decoded; with [`ContentError::Substrate`] when the node is
+/// unreachable, the genesis hash mismatches, or [`CHAIN_TIMEOUT`] is
+/// exceeded; with [`ContentError::Account`] when the stored secret cannot be
+/// rebuilt into a signer; with [`ContentError::RuntimeNotInitialized`] when
+/// the sidecar runtime was never initialized.
 pub fn publish_revision(
     account: &ChainAccount,
     item_id: [u8; 32],
-    links: Vec<[u8; 32]>,
-    mentions: Vec<[u8; 32]>,
+    links: &[[u8; 32]],
+    mentions: &[[u8; 32]],
     ipfs_hash: [u8; 32],
 ) -> Result<TxOutcome, ContentError> {
     let call = api::tx().content().publish_revision(
         ItemId(item_id),
-        item_bounded(&links),
-        account_bounded(&mentions),
+        item_bounded(links),
+        account_bounded(mentions),
         api::runtime_types::pallet_content::pallet::IpfsHash(ipfs_hash),
     );
     crate::runtime::block_on(with_chain_timeout(submit_publish(&call, account)))?
 }
 
 /// Retract an item.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
+/// submitted or is not finalized successfully; with
+/// [`ContentError::Substrate`] when the node is unreachable, the genesis
+/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
+/// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
+/// runtime was never initialized.
 pub fn retract_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .content()
@@ -449,6 +528,16 @@ pub fn retract_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), Con
 }
 
 /// Clear the REVISIONABLE flag on an item.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
+/// submitted or is not finalized successfully; with
+/// [`ContentError::Substrate`] when the node is unreachable, the genesis
+/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
+/// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
+/// runtime was never initialized.
 pub fn set_not_revisionable(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .content()
@@ -458,6 +547,16 @@ pub fn set_not_revisionable(account: &ChainAccount, item_id: [u8; 32]) -> Result
 }
 
 /// Clear the RETRACTABLE flag on an item.
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
+/// submitted or is not finalized successfully; with
+/// [`ContentError::Substrate`] when the node is unreachable, the genesis
+/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
+/// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
+/// runtime was never initialized.
 pub fn set_not_retractable(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .content()
@@ -467,6 +566,16 @@ pub fn set_not_retractable(account: &ChainAccount, item_id: [u8; 32]) -> Result<
 }
 
 /// Pin an item to an account (`account_content::add_item`).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
+/// submitted or is not finalized successfully; with
+/// [`ContentError::Substrate`] when the node is unreachable, the genesis
+/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
+/// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
+/// runtime was never initialized.
 pub fn add_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .account_content()
@@ -476,6 +585,16 @@ pub fn add_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(),
 }
 
 /// Unpin an item from an account (`account_content::remove_item`).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
+/// submitted or is not finalized successfully; with
+/// [`ContentError::Substrate`] when the node is unreachable, the genesis
+/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
+/// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
+/// runtime was never initialized.
 pub fn remove_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .account_content()
@@ -485,6 +604,16 @@ pub fn remove_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<
 }
 
 /// Point an account's profile at an item (`account_profile::set_profile`).
+///
+/// # Errors
+///
+/// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
+/// submitted or is not finalized successfully; with
+/// [`ContentError::Substrate`] when the node is unreachable, the genesis
+/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
+/// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
+/// runtime was never initialized.
 pub fn set_profile(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), ContentError> {
     let call = api::tx()
         .account_profile()

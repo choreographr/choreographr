@@ -44,6 +44,11 @@ async fn evm_resolve_impl(rpc_url: &str, name_or_address: &str) -> Result<String
 
 /// Synchronous entry point: runs [`evm_resolve_impl`] on the sidecar runtime
 /// and caps the output at the shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`BlockchainError`] when the node is unreachable, the RPC call
+/// fails, or the capped sanitized output cannot be produced.
 pub fn execute_evm_resolve(args: &EvmResolveArgs) -> Result<String, BlockchainError> {
     log_execution("evm_resolve", &args.rpc_url);
     let output = block_on(rpc_call(evm_resolve_impl(
@@ -53,6 +58,7 @@ pub fn execute_evm_resolve(args: &EvmResolveArgs) -> Result<String, BlockchainEr
     Ok(truncate_tool_output(&output))
 }
 
+#[must_use]
 pub fn describe_evm_resolve_invocation(args: &EvmResolveArgs) -> String {
     format!(
         "Resolving {} via ENS on {}.",

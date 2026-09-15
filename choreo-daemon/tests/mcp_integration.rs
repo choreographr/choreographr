@@ -3,28 +3,28 @@
 #![cfg(feature = "mcp")]
 use choreo_daemon::tools::ToolOutputFormat;
 /// Integration test for MCP server spawning, tool discovery, and tool
-/// execution through the full Choreographr stack (McpManager + ToolRegistry).
+/// execution through the full Choreographr stack (`McpManager` + `ToolRegistry`).
 ///
 /// Writes an `mcp_servers.json` pointing to the official
 /// `@modelcontextprotocol/server-everything` reference server, sets up a
-/// ToolRegistry with an McpManager, and verifies the whole pipeline:
+/// `ToolRegistry` with an `McpManager`, and verifies the whole pipeline:
 ///
 /// 1. The dynamic group `mcp/everything` appears in `registry.group_names()`.
 /// 2. Tool definitions from the server are available via
 ///    `registry.available_definitions()`.
 /// 3. The `echo` tool can be called and returns the expected message.
-/// 4. Dropping the McpManager shuts down the server cleanly.
+/// 4. Dropping the `McpManager` shuts down the server cleanly.
 ///
 /// Requires Node.js and `npx` to be available on the system.
 ///
-/// Marked #[ignore] per AGENTS.md — integration tests belong in crate-level
+/// Marked #[ignore = "integration"] per AGENTS.md — integration tests belong in crate-level
 /// tests/ directories and must be ignored; `cargo test` runs only unit tests.
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn mcp_server_everything_tools_are_discovered_and_callable() {
     // The stdlib test harness has no per-test timeout, so a regression in the
     // MCP stack (e.g. a shutdown that blocks) would hang CI forever. Install a

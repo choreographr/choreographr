@@ -9,5 +9,5 @@
 //! wrapper matches that exactly.
 
 fn main() {
-    choreo_gui::main()
+    choreo_gui::main();
 }

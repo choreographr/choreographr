@@ -155,6 +155,9 @@ impl StatefulWidget for SmoothScrollbar {
             let top_in_thumb = top_slot >= thumb_start && top_slot < thumb_end;
             let bot_in_thumb = bot_slot >= thumb_start && bot_slot < thumb_end;
 
+            // `i` ranges over `0..track_height` where `track_height` is
+            // `area.height as usize`, so it always fits back into a `u16`.
+            #[allow(clippy::cast_possible_truncation)] // i < area.height <= u16::MAX
             let y = area.y + i as u16;
             let x = area.x;
 
@@ -354,7 +357,7 @@ mod tests {
 
     // ── Marker tests ─────────────────────────────────────────────
 
-    /// Like `render_to_symbols` but with markers and marker_fg set.
+    /// Like `render_to_symbols` but with markers and `marker_fg` set.
     /// Markers are pre-computed virtual-slot positions.
     fn render_to_symbols_with_markers(
         height: u16,

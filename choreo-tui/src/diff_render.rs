@@ -180,7 +180,7 @@ fn highlight_lines_cached(
         GlobalLruCache::new();
 
     let code = lines.join("\n");
-    let key = (syntax.name.to_string(), code);
+    let key = (syntax.name.clone(), code);
 
     CACHE.get_or_insert_with(&key, || {
         let ss = syntax_set();
@@ -234,7 +234,7 @@ fn highlight_bucket(
             // `idx` was collected from this same `rows` slice above, so it is
             // always in bounds; the .get() keeps the indexing lint quiet.
             if let Some(row) = rows.get_mut(idx) {
-                *spans(row) = hl.clone();
+                spans(row).clone_from(hl);
             }
         }
     }
@@ -316,7 +316,7 @@ pub fn build_diff_panes(diffs: &[FileDiff]) -> Vec<DiffPaneRow> {
 /// Ensure a collection of spans adds up to exactly `width` columns by
 /// truncating content or padding with spaces.
 fn spans_fixed_width(spans: &mut Vec<Span<'static>>, width: usize) {
-    let total: usize = spans.iter().map(|s| s.width()).sum();
+    let total: usize = spans.iter().map(Span::width).sum();
     if total == width {
         return;
     }
@@ -356,7 +356,7 @@ fn spans_fixed_width(spans: &mut Vec<Span<'static>>, width: usize) {
         // cuts on the character before the overflow), and the keep-loop can
         // finish with leftover budget — re-measure and pad so the pane is
         // exactly `width` columns wide.
-        let actual: usize = spans.iter().map(|s| s.width()).sum();
+        let actual: usize = spans.iter().map(Span::width).sum();
         if actual < width {
             spans.push(Span::styled(" ".repeat(width - actual), Style::default()));
         }
@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn parse_empty_diff_returns_empty_vec() {
         let files = parse_diff("");
-        assert!(files.is_empty());
+        assert_eq!(files, Vec::new());
     }
 
     // ── build_diff_panes ──
@@ -710,7 +710,7 @@ mod tests {
             .find(|r| r.left_kind == DiffLineKind::Deletion)
             .unwrap();
         assert_eq!(deletion.left_content, "old");
-        assert!(deletion.right_content.is_empty());
+        assert_eq!(deletion.right_content, "");
     }
 
     #[test]
@@ -722,7 +722,7 @@ mod tests {
             .find(|r| r.right_kind == DiffLineKind::Addition)
             .unwrap();
         assert_eq!(addition.right_content, "new");
-        assert!(addition.left_content.is_empty());
+        assert_eq!(addition.left_content, "");
     }
 
     #[test]
@@ -753,7 +753,7 @@ mod tests {
         assert!(!lines.is_empty(), "should produce at least one line");
         // Each line should be exactly 80 columns wide
         for line in &lines {
-            let w: usize = line.spans.iter().map(|s| s.width()).sum();
+            let w: usize = line.spans.iter().map(Span::width).sum();
             assert_eq!(w, 80, "side-by-side line should be exactly width=80");
         }
     }
@@ -763,7 +763,7 @@ mod tests {
         let result = try_render_diff_content(simple_diff_text(), 30);
         assert!(result.is_some());
         let lines = result.unwrap();
-        assert!(!lines.is_empty());
+        assert_ne!(lines, Vec::new());
     }
 
     #[test]
@@ -808,14 +808,14 @@ mod tests {
     fn spans_padded_to_width() {
         let mut spans = vec![Span::styled("hi", Style::default())];
         spans_fixed_width(&mut spans, 5);
-        assert_eq!(spans.iter().map(|s| s.width()).sum::<usize>(), 5);
+        assert_eq!(spans.iter().map(Span::width).sum::<usize>(), 5);
     }
 
     #[test]
     fn spans_truncated_to_width() {
         let mut spans = vec![Span::styled("hello world", Style::default())];
         spans_fixed_width(&mut spans, 5);
-        assert_eq!(spans.iter().map(|s| s.width()).sum::<usize>(), 5);
+        assert_eq!(spans.iter().map(Span::width).sum::<usize>(), 5);
         // Content should be truncated with … not dropped entirely.
         let text: String = spans.iter().flat_map(|s| s.content.chars()).collect();
         assert_eq!(text.chars().count(), 5, "should be 5 chars wide");
@@ -840,7 +840,7 @@ mod tests {
         ];
         spans_fixed_width(&mut spans, 20);
         // Total width should be exactly 20.
-        assert_eq!(spans.iter().map(|s| s.width()).sum::<usize>(), 20);
+        assert_eq!(spans.iter().map(Span::width).sum::<usize>(), 20);
         // The first two spans should be preserved as-is.
         assert_eq!(spans[0].content, "        ", "indent span preserved");
         assert_eq!(spans[1].content, "\"", "opening quote preserved");
@@ -870,7 +870,7 @@ mod tests {
         // Single span wider than the target — should be truncated, not dropped.
         let mut spans = vec![Span::styled("aaabbbcccddd".to_string(), Style::default())];
         spans_fixed_width(&mut spans, 6);
-        assert_eq!(spans.iter().map(|s| s.width()).sum::<usize>(), 6);
+        assert_eq!(spans.iter().map(Span::width).sum::<usize>(), 6);
         let text: String = spans.iter().flat_map(|s| s.content.chars()).collect();
         assert_eq!(text.chars().count(), 6, "should be 6 chars wide");
         assert!(
@@ -895,7 +895,7 @@ mod tests {
         ];
         spans_fixed_width(&mut spans, 7);
         assert_eq!(
-            spans.iter().map(|s| s.width()).sum::<usize>(),
+            spans.iter().map(Span::width).sum::<usize>(),
             7,
             "exact-fit-then-overflow must not overshoot the pane"
         );
@@ -914,7 +914,7 @@ mod tests {
         ];
         spans_fixed_width(&mut spans, 11);
         assert_eq!(
-            spans.iter().map(|s| s.width()).sum::<usize>(),
+            spans.iter().map(Span::width).sum::<usize>(),
             11,
             "wide-char shortfall must be padded to the target width"
         );
@@ -971,8 +971,8 @@ mod tests {
         // Mix of even and odd total widths — the divisibility of the panes
         // changes the truncation boundaries, exercising the exact-fit-then-
         // overflow span pattern on both panes.
-        for width in [80usize, 85, 101, 120, 140, 150] {
-            let lines = try_render_diff_content(diff, width as u16).expect("render");
+        for width in [80u16, 85, 101, 120, 140, 150] {
+            let lines = try_render_diff_content(diff, width).expect("render");
             let mut gutter_cols: Vec<usize> = Vec::new();
             for (i, line) in lines.iter().enumerate() {
                 let mut col = 0usize;
@@ -985,7 +985,8 @@ mod tests {
                     col += w;
                 }
                 assert_eq!(
-                    col, width,
+                    col,
+                    usize::from(width),
                     "row {i} at width {width} must be exactly {width} columns wide"
                 );
                 gutter_cols.push(gutter.expect("every side-by-side row has a gutter"));

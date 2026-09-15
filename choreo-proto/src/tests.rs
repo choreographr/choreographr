@@ -165,7 +165,7 @@ fn sync_read_write_round_trip() {
 
 #[test]
 fn read_payload_rejects_oversized_frame() {
-    let oversized_len = (MAX_FRAME_SIZE as u32) + 1;
+    let oversized_len = u32::try_from(MAX_FRAME_SIZE).expect("MAX_FRAME_SIZE fits in u32") + 1;
     let mut cursor = Cursor::new(oversized_len.to_be_bytes().to_vec());
     let err = read_payload(&mut cursor).expect_err("should fail");
     assert!(matches!(err, ProtoError::FrameTooLarge));

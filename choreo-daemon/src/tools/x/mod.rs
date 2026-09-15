@@ -1,4 +1,5 @@
 use choreo_keystore::{ServiceCredential, XCredentialView};
+use std::fmt::Write as _;
 
 mod post;
 mod search_recent;
@@ -22,7 +23,7 @@ fn urlencode(s: &str) -> String {
                 result.push(byte as char);
             }
             _ => {
-                result.push_str(&format!("%{:02X}", byte));
+                let _ = write!(result, "%{byte:02X}");
             }
         }
     }
@@ -64,12 +65,13 @@ fn build_oauth1_header(
         .as_secs()
         .to_string();
 
-    let nonce: String = (0..32)
-        .map(|_| {
-            let b: u8 = rand::random();
-            format!("{:02x}", b)
-        })
-        .collect();
+    // Two hex chars per byte; write! into a String is infallible, so `let _`
+    // just discards the never-failing Result without a panic surface.
+    let mut nonce = String::with_capacity(64);
+    for _ in 0..32 {
+        let b: u8 = rand::random();
+        let _ = write!(nonce, "{b:02x}");
+    }
 
     let mut oauth_params: Vec<(String, String)> = vec![
         ("oauth_consumer_key".to_string(), creds.api_key.to_string()),
@@ -258,6 +260,6 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
         );
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
     }
 }

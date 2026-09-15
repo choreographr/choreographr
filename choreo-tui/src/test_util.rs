@@ -22,8 +22,8 @@ pub fn test_app() -> App {
     app
 }
 
-/// Add a UserText turn to the session, mimicking what the daemon sends after
-/// processing a RunInput.
+/// Add a `UserText` turn to the session, mimicking what the daemon sends after
+/// processing a `RunInput`.
 pub fn add_user_text(app: &mut App, content: &str) {
     let turn_id = app.next_request_id;
     app.next_request_id += 1;
@@ -55,8 +55,8 @@ pub fn make_session(id: u64, title: &str, model: &str, count: u32) -> choreo_pro
         reasoning_effort: None,
         parent_session_id: None,
         working_dir: None,
-        created_at: 1705314000000,
-        last_modified: 1705314000000,
+        created_at: 1_705_314_000_000,
+        last_modified: 1_705_314_000_000,
         turn_count: count,
         status: choreo_proto::SessionStatus::Inactive,
         active_tool_groups: Vec::new(),

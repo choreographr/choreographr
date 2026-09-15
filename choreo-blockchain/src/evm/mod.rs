@@ -30,7 +30,7 @@ sol! {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RpcUrlArgs {
-    /// JSON-RPC URL of the EVM node (e.g., https://ethereum-rpc.publicnode.com)
+    /// JSON-RPC URL of the EVM node (e.g., `<https://ethereum-rpc.publicnode.com>`)
     pub rpc_url: String,
 }
 

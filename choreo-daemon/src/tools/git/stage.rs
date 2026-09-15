@@ -18,12 +18,18 @@ pub struct GitAddArgs {
     pub pathspec: Vec<String>,
 }
 
+/// Stage a file or pathspec in Git.
+///
+/// # Errors
+///
+/// Returns Err if the repository cannot be opened, the pathspec is empty
+/// or invalid, or the staging operation fails.
 pub fn execute_git_add_tool(
     args: &GitAddArgs,
     working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     let pathspec = normalize_pathspecs(args.pathspec.clone())?;
-    let output = git_add_impl(args.repo_path.as_deref(), pathspec, working_dir)?;
+    let output = git_add_impl(args.repo_path.as_deref(), &pathspec, working_dir)?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -44,7 +50,7 @@ fn normalize_pathspecs(pathspec: Vec<String>) -> Result<Vec<String>, ToolError> 
 
 fn git_add_impl(
     repo_path: Option<&str>,
-    pathspec: Vec<String>,
+    pathspec: &[String],
     working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     debug!(
@@ -53,13 +59,13 @@ fn git_add_impl(
         "executing git_add"
     );
     let repo = open_repo(repo_path, working_dir)?;
-    let effective_pathspec = prefix_pathspecs(&repo, repo_path, &pathspec, working_dir)?;
+    let effective_pathspec = prefix_pathspecs(&repo, repo_path, pathspec, working_dir)?;
     let mut index = load_mutable_index(&repo)?;
     let paths = collect_paths_to_stage(&repo, &index, &effective_pathspec)?;
     if paths.is_empty() {
         let msg = format!(
             "pathspec did not match any tracked or untracked paths: {}",
-            humfmt::list(&pathspec)
+            humfmt::list(pathspec)
         );
         warn!(%msg, "git_add found no matching paths");
         return Err(ToolError::Other(msg));
@@ -73,7 +79,13 @@ fn git_add_impl(
         // and the index is unsorted after earlier calls to dangerously_push_entry.
         let path_bstr = path.as_bstr();
         let previous = current_entry_snapshot(&index, path_bstr);
-        changed |= stage_path(&repo, &mut pipeline, &mut index, path_bstr, previous)?;
+        changed |= stage_path(
+            &repo,
+            &mut pipeline,
+            &mut index,
+            path_bstr,
+            previous.as_ref(),
+        )?;
     }
 
     finalize_index(&mut index)?;
@@ -146,7 +158,7 @@ fn stage_path(
     pipeline: &mut gix::filter::Pipeline<'_>,
     index: &mut gix::index::File,
     path: &BStr,
-    previous: Option<IndexEntrySnapshot>,
+    previous: Option<&IndexEntrySnapshot>,
 ) -> Result<bool, ToolError> {
     debug!(%path, previous_present = previous.is_some(), "staging path");
     remove_entries_for_path(index, path);
@@ -174,7 +186,7 @@ fn stage_path(
                 stat,
                 path: path.to_owned(),
             };
-            Ok(previous.as_ref() != Some(&current))
+            Ok(Some(&current) != previous)
         }
         None => Ok(previous.is_some()),
     }
@@ -198,13 +210,10 @@ fn prefix_pathspecs(
 ) -> Result<Vec<String>, ToolError> {
     // Delegate the prefix-computation logic to the shared helper so that
     // both git_add and git_diff handle pathspec-prefixing consistently.
-    let prefix = match super::resolve_pathspec_prefix(repo, repo_path, working_dir)? {
-        Some(p) => p,
-        None => {
-            // No prefix needed -- we are at the repo root, so filter out
-            // "." and "./" which gix doesn't interpret as "match all".
-            return Ok(super::filter_repo_root_pathspecs(pathspec.to_vec()));
-        }
+    let Some(prefix) = super::resolve_pathspec_prefix(repo, repo_path, working_dir)? else {
+        // No prefix needed -- we are at the repo root, so filter out
+        // "." and "./" which gix doesn't interpret as "match all".
+        return Ok(super::filter_repo_root_pathspecs(pathspec.to_vec()));
     };
 
     Ok(pathspec
@@ -234,7 +243,11 @@ fn worktree_metadata(
 fn finalize_index(index: &mut gix::index::File) -> Result<(), ToolError> {
     index.sort_entries();
     let _ = index.remove_tree();
-    index.write(Default::default()).map_err(io::Error::other)?;
+    // gix's default write options are correct for every in-crate caller; no
+    // custom config is ever needed here.
+    index
+        .write(gix::index::write::Options::default())
+        .map_err(io::Error::other)?;
     Ok(())
 }
 
@@ -262,8 +275,8 @@ impl IndexEntrySnapshot {
 pub fn describe_git_add_invocation(args: &GitAddArgs) -> String {
     let paths = args.pathspec.join("`, `");
     match &args.repo_path {
-        Some(p) => format!("Staging `{}` in repository `{}`.", paths, p),
-        None => format!("Staging `{}`.", paths),
+        Some(p) => format!("Staging `{paths}` in repository `{p}`."),
+        None => format!("Staging `{paths}`."),
     }
 }
 
@@ -286,13 +299,13 @@ mod tests {
 
     #[test]
     fn normalize_pathspecs_filters_empty() {
-        let result = normalize_pathspecs(vec!["  ".into(), "a.txt".into(), "".into()]);
+        let result = normalize_pathspecs(vec!["  ".into(), "a.txt".into(), String::new()]);
         assert_eq!(result.unwrap(), vec!["a.txt"]);
     }
 
     #[test]
     fn normalize_pathspecs_all_empty_fails() {
-        let result = normalize_pathspecs(vec!["   ".into(), "".into()]);
+        let result = normalize_pathspecs(vec!["   ".into(), String::new()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("at least one"));
     }
@@ -309,7 +322,7 @@ mod tests {
         assert_eq!(result.unwrap(), vec!["foo.rs"]);
     }
 
-    /// Verify IndexEntrySnapshot equality comparison works as expected.
+    /// Verify `IndexEntrySnapshot` equality comparison works as expected.
     #[test]
     fn index_entry_snapshot_eq() {
         let id = ObjectId::null(gix::hash::Kind::Sha1);

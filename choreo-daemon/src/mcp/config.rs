@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Top-level structure matching the standard mcp_servers.json format.
+/// Top-level structure matching the standard `mcp_servers.json` format.
 #[derive(Deserialize, Debug)]
 struct McpServersFile {
     #[serde(rename = "mcpServers")]
@@ -51,7 +51,11 @@ pub fn set_test_config_root(root: Option<PathBuf>) {
     TEST_CONFIG_ROOT.with(|cell| cell.replace(root));
 }
 
-/// Resolve the path to mcp_servers.json.
+/// Resolve the path to `mcp_servers.json`.
+///
+/// # Errors
+///
+/// Returns an error when the user's config directory cannot be determined.
 pub fn mcp_config_path() -> Result<PathBuf> {
     if let Some(root) = TEST_CONFIG_ROOT.with(|cell| cell.borrow().clone()) {
         return Ok(root.join("choreographr").join("mcp_servers.json"));
@@ -60,8 +64,12 @@ pub fn mcp_config_path() -> Result<PathBuf> {
     Ok(config_dir.join("choreographr").join("mcp_servers.json"))
 }
 
-/// Load MCP server configurations from mcp_servers.json.
+/// Load MCP server configurations from `mcp_servers.json`.
 /// Returns an empty Vec if the file doesn't exist.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
 pub fn load_mcp_config() -> Result<Vec<McpServerConfig>> {
     let path = mcp_config_path()?;
     if !path.exists() {
@@ -119,7 +127,7 @@ mod tests {
         let json = r#"{"command": "npx"}"#;
         let entry: ServerEntry = serde_json::from_str(json).expect("minimal server entry");
         assert_eq!(entry.command, "npx");
-        assert!(entry.args.is_empty());
+        assert_eq!(entry.args, [] as [std::string::String; 0]);
         assert!(entry.env.is_empty());
         assert!(entry.enabled);
         assert!(entry.auto_load);
@@ -137,7 +145,10 @@ mod tests {
         let entry: ServerEntry = serde_json::from_value(json).expect("full server entry");
         assert_eq!(entry.command, "python");
         assert_eq!(entry.args, vec!["-m", "server"]);
-        assert_eq!(entry.env.get("KEY").map(|s| s.as_str()), Some("value"));
+        assert_eq!(
+            entry.env.get("KEY").map(std::string::String::as_str),
+            Some("value")
+        );
         assert!(!entry.enabled);
         assert!(!entry.auto_load);
     }

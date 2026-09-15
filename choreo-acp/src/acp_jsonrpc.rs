@@ -70,6 +70,7 @@ pub enum RpcMessage {
 
 impl RpcMessage {
     /// Get the JSON-RPC request ID if this is a request, `None` if a notification.
+    #[must_use]
     pub fn id(&self) -> Option<u64> {
         match self {
             RpcMessage::Request(req) => Some(req.id),
@@ -78,6 +79,7 @@ impl RpcMessage {
     }
 
     /// Get the method name.
+    #[must_use]
     pub fn method(&self) -> &str {
         match self {
             RpcMessage::Request(req) => &req.method,
@@ -127,6 +129,11 @@ pub fn make_notification(method: &str, params: serde_json::Value) -> JsonRpcNoti
 ///
 /// Uses untagged deserialisation on `RpcMessage` so serde handles the
 /// routing in a single pass — no intermediate `Value` allocation needed.
+///
+/// # Errors
+///
+/// Returns [`AcpError::Serde`] (with the underlying [`serde_json::Error`])
+/// when the line is not valid JSON or does not match either `RpcMessage` shape.
 pub fn parse_request(line: &str) -> Result<RpcMessage, AcpError> {
     let msg: RpcMessage = serde_json::from_str(line)?;
     match &msg {
@@ -714,7 +721,7 @@ mod tests {
         }
         match parsed.current_value {
             ConfigOptionValue::Bool(v) => assert!(v),
-            _ => panic!("expected Bool"),
+            ConfigOptionValue::String(_) => panic!("expected Bool"),
         }
     }
 

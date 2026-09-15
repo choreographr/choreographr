@@ -4,17 +4,19 @@ use std::time::SystemTime;
 
 /// Returns the current Unix timestamp in milliseconds since the epoch.
 ///
-/// Propagates a [`ToolExecError`] if the system clock is set before UNIX_EPOCH
+/// Propagates a [`ToolExecError`] if the system clock is set before `UNIX_EPOCH`
 /// (essentially impossible on real hardware, but handled gracefully rather
 /// than silently returning 0).
 pub(crate) fn execute_get_current_time(
     _args: &EmptyArgs,
     _working_dir: Option<&Path>,
 ) -> Result<u64, ToolExecError> {
-    let millis = SystemTime::now()
+    let duration = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| ToolExecError(format!("system clock before epoch: {e}")))?
-        .as_millis() as u64;
+        .map_err(|e| ToolExecError(format!("system clock before epoch: {e}")))?;
+    // u128→u64 keeps semantics: epoch millis fit u64 for the next ~292 million years.
+    #[allow(clippy::cast_possible_truncation)]
+    let millis = duration.as_millis() as u64;
     tracing::debug!(millis, "get_current_time");
     Ok(millis)
 }

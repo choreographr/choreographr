@@ -42,9 +42,18 @@ mod tests {
                 .to_string()
                 .contains("runtime not initialized")
         );
-        assert!(BlockchainError::Alloy("boom".into()).to_string() == "alloy error: boom");
-        assert!(BlockchainError::Subxt("boom".into()).to_string() == "subxt error: boom");
-        assert!(BlockchainError::InvalidUrl("nope".into()).to_string() == "invalid RPC URL: nope");
+        assert_eq!(
+            BlockchainError::Alloy("boom".into()).to_string(),
+            "alloy error: boom"
+        );
+        assert_eq!(
+            BlockchainError::Subxt("boom".into()).to_string(),
+            "subxt error: boom"
+        );
+        assert_eq!(
+            BlockchainError::InvalidUrl("nope".into()).to_string(),
+            "invalid RPC URL: nope"
+        );
     }
 
     #[test]

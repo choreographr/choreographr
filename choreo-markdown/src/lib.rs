@@ -41,7 +41,7 @@ pub enum MarkdownBlock {
     },
     /// A fenced or indented code block.
     CodeBlock {
-        /// The language annotation, if any (e.g. `"rust"` for `` ```rust ```).
+        /// The language annotation, if any (e.g. `"rust"` for a ```` ```rust ```` fence).
         language: Option<String>,
         /// The raw code text.
         code: String,
@@ -167,6 +167,7 @@ enum InlineContext {
 ///
 /// This is a convenience function that combines parsing and HTML rendering.
 /// It sanitizes the output with [`ammonia`] to prevent XSS attacks.
+#[must_use]
 pub fn render_markdown_html(input: &str) -> String {
     let mut html_output = String::new();
     html::push_html(&mut html_output, Parser::new_ext(input, markdown_options()));
@@ -228,7 +229,7 @@ impl MarkdownDocument {
                     Tag::Emphasis => inline_stack.push(InlineContext::Emphasis(Vec::new())),
                     Tag::Strong => inline_stack.push(InlineContext::Strong(Vec::new())),
                     Tag::Strikethrough => {
-                        inline_stack.push(InlineContext::Strikethrough(Vec::new()))
+                        inline_stack.push(InlineContext::Strikethrough(Vec::new()));
                     }
                     Tag::Link { dest_url, .. } => inline_stack.push(InlineContext::Link {
                         destination: dest_url.to_string(),
@@ -438,7 +439,7 @@ impl MarkdownDocument {
                     MarkdownInline::DisplayMath(text.to_string()),
                 ),
                 Event::FootnoteReference(text) => {
-                    push_text(&mut block_stack, &mut inline_stack, &format!("[{text}]"))
+                    push_text(&mut block_stack, &mut inline_stack, &format!("[{text}]"));
                 }
                 Event::TaskListMarker(checked) => push_text(
                     &mut block_stack,
@@ -454,6 +455,7 @@ impl MarkdownDocument {
     /// Convert the AST back to markdown, then render that to sanitized HTML.
     ///
     /// This is useful when you need to modify the AST and then produce HTML output.
+    #[must_use]
     pub fn to_html(&self) -> String {
         render_markdown_html(&self.to_markdown())
     }
@@ -462,6 +464,7 @@ impl MarkdownDocument {
     ///
     /// The output uses `*` for emphasis, `**` for strong, and standard GFM
     /// formatting throughout.
+    #[must_use]
     pub fn to_markdown(&self) -> String {
         let mut markdown = String::new();
         for (index, block) in self.blocks.iter().enumerate() {
@@ -672,6 +675,7 @@ fn push_inline(
 ///
 /// Recursively flattens all inline formatting (emphasis, links, etc.)
 /// and returns only the raw text without any markdown delimiters.
+#[must_use]
 pub fn inline_text(inlines: &[MarkdownInline]) -> String {
     let mut text = String::new();
     for inline in inlines {
@@ -887,6 +891,7 @@ const MAX_MATH_DEPTH: u32 = 24;
 /// brackets, and unknown commands are preserved verbatim.  When nothing can be
 /// mapped the source is returned unchanged, so this is safe to call on
 /// arbitrary provider-produced math.
+#[must_use]
 pub fn render_math_pretty(tex: &str) -> String {
     if tex.is_empty() || tex.len() > MAX_MATH_INPUT_LEN {
         return tex.to_string();
@@ -963,7 +968,7 @@ impl MathPretty {
 
     /// Skip runs of math-mode whitespace (which carries no meaning).
     fn skip_math_space(&mut self) {
-        while self.peek().is_some_and(|c| c.is_whitespace()) {
+        while self.peek().is_some_and(char::is_whitespace) {
             self.bump();
         }
     }
@@ -1063,19 +1068,18 @@ impl MathPretty {
         if rendered.is_empty() {
             return;
         }
-        match map_script_run(&rendered, is_superscript) {
-            Some(mapped) => out.push_str(&mapped),
-            None => {
-                // Unmappable (semantic letters have no Unicode script forms):
-                // keep the LaTeX so the formula stays recoverable.
-                out.push(if is_superscript { '^' } else { '_' });
-                if was_group || rendered.chars().count() > 1 {
-                    out.push('(');
-                    out.push_str(&rendered);
-                    out.push(')');
-                } else {
-                    out.push_str(&rendered);
-                }
+        if let Some(mapped) = map_script_run(&rendered, is_superscript) {
+            out.push_str(&mapped);
+        } else {
+            // Unmappable (semantic letters have no Unicode script forms):
+            // keep the LaTeX so the formula stays recoverable.
+            out.push(if is_superscript { '^' } else { '_' });
+            if was_group || rendered.chars().count() > 1 {
+                out.push('(');
+                out.push_str(&rendered);
+                out.push(')');
+            } else {
+                out.push_str(&rendered);
             }
         }
     }
@@ -1098,7 +1102,7 @@ impl MathPretty {
     /// Handle a backslash token: a named command, an escaped character, or the
     /// `\ ` / `\\` specials.
     fn parse_command(&mut self, out: &mut String) {
-        debug_assert!(self.peek() == Some('\\'));
+        debug_assert_eq!(self.peek(), Some('\\'));
         self.bump(); // the backslash
         match self.peek() {
             Some(' ') => {
@@ -1393,12 +1397,9 @@ impl MathPretty {
             return;
         }
         self.skip_math_space();
-        let env = match self.scan_group_content() {
-            Some(inner) => inner,
-            None => {
-                out.push_str("\\begin");
-                return;
-            }
+        let Some(env) = self.scan_group_content() else {
+            out.push_str("\\begin");
+            return;
         };
         // `\begin{array}{cc}` carries a column spec after the name — skip it.
         let env_str: String = env.iter().collect();
@@ -1407,24 +1408,21 @@ impl MathPretty {
             let _ = self.scan_group_content();
         }
         let body_start = self.pos;
-        match self.find_env_end(&env, body_start) {
-            Some((end_token_start, after_end)) => {
-                // `find_env_end` returns indices within `self.chars`; `.get`
-                // with an empty fallback keeps the slicing lint quiet.
-                let body: Vec<char> = self
-                    .chars
-                    .get(body_start..end_token_start)
-                    .unwrap_or_default()
-                    .to_vec();
-                self.pos = after_end;
-                out.push_str(&self.render_environment_body(&body, &env_str));
-            }
-            None => {
-                // No matching `\end`: emit the `\begin{...}` literally.
-                out.push_str("\\begin{");
-                out.push_str(&env_str);
-                out.push('}');
-            }
+        if let Some((end_token_start, after_end)) = self.find_env_end(&env, body_start) {
+            // `find_env_end` returns indices within `self.chars`; `.get`
+            // with an empty fallback keeps the slicing lint quiet.
+            let body: Vec<char> = self
+                .chars
+                .get(body_start..end_token_start)
+                .unwrap_or_default()
+                .to_vec();
+            self.pos = after_end;
+            out.push_str(&self.render_environment_body(&body, &env_str));
+        } else {
+            // No matching `\end`: emit the `\begin{...}` literally.
+            out.push_str("\\begin{");
+            out.push_str(&env_str);
+            out.push('}');
         }
     }
 

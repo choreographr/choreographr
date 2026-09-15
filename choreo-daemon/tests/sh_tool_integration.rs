@@ -4,7 +4,7 @@ use std::path::Path;
 const SHELL: Shell = Shell::Bash;
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn echo_hello() {
     let result = execute_sh_tool(
         &ShArgs {
@@ -21,7 +21,7 @@ fn echo_hello() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn exit_nonzero() {
     let result = execute_sh_tool(
         &ShArgs {
@@ -37,7 +37,7 @@ fn exit_nonzero() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn working_directory() {
     // `pwd` prints the physical (symlink-resolved) directory, so on macOS the
     // expected path must be canonicalized (/var → /private/var).
@@ -56,7 +56,7 @@ fn working_directory() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn timeout_kills_command() {
     let result = execute_sh_tool(
         &ShArgs {
@@ -73,7 +73,7 @@ fn timeout_kills_command() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn output_truncation() {
     let result = execute_sh_tool(
         &ShArgs {
@@ -89,7 +89,7 @@ fn output_truncation() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn stderr_output_included() {
     let result = execute_sh_tool(
         &ShArgs {

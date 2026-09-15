@@ -9,7 +9,7 @@ use std::io::Cursor;
 /// version field does not match, ensuring that mixed-version peers are
 /// caught at deserialisation time.
 ///
-/// 1 = postcard era; 2 = MessagePack (named mode, rmp-serde >= 1.3);
+/// 1 = postcard era; 2 = `MessagePack` (named mode, `rmp-serde` >= 1.3);
 /// 3 = removed `TurnFinalized` (the final-turn snapshot now rides
 /// `TurnAppended`), added `Evicted` (best-effort lag-eviction advisory);
 /// 4 = session-scoped messages are now wrapped in
@@ -31,7 +31,7 @@ pub const PROTOCOL_VERSION: u8 = 4;
 /// overflow the frame when the client re-attaches to a session.
 pub const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
 
-/// Encode `(PROTOCOL_VERSION, message)` as named MessagePack, enforcing
+/// Encode `(PROTOCOL_VERSION, message)` as named `MessagePack`, enforcing
 /// [`MAX_FRAME_SIZE`]. Shared by [`encode_payload`] (transport-provided
 /// framing) and [`encode_frame`] (4-byte length prefix added by the caller),
 /// so the codec and the size policy live in exactly one place.
@@ -48,11 +48,23 @@ fn encode_inner<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
 /// Encode a message without the 4-byte length prefix.
 ///
 /// This is used when the transport layer already provides its own
-/// framing (e.g. NoiseStream), so only the raw MessagePack payload is needed.
+/// framing (e.g. `NoiseStream`), so only the raw `MessagePack` payload is needed.
+///
+/// # Errors
+///
+/// Returns [`ProtoError::Codec`] when serialization fails and
+/// [`ProtoError::FrameTooLarge`] when the payload exceeds [`MAX_FRAME_SIZE`].
 pub fn encode_payload<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
     encode_inner(message)
 }
 
+/// Encode a message with the 4-byte big-endian length prefix.
+///
+/// # Errors
+///
+/// Returns [`ProtoError::Codec`] when serialization fails,
+/// [`ProtoError::FrameTooLarge`] when the payload exceeds [`MAX_FRAME_SIZE`],
+/// and the same error if the length prefix itself would overflow `u32`.
 pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
     let payload = encode_inner(message)?;
 
@@ -66,6 +78,15 @@ pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
     Ok(frame)
 }
 
+/// Decode a payload produced by [`encode_payload`] into `T`, enforcing the
+/// protocol-version gate and the trailing-bytes contract.
+///
+/// # Errors
+///
+/// Returns [`ProtoError::UnsupportedVersion`] when the frame's version byte
+/// does not match [`PROTOCOL_VERSION`], [`ProtoError::Codec`] when
+/// deserialization fails, and [`ProtoError::TrailingBytes`] when the payload
+/// carries bytes beyond the decoded message.
 pub fn decode_frame<T>(payload: &[u8]) -> Result<T, ProtoError>
 where
     T: for<'de> Deserialize<'de>,
@@ -94,7 +115,7 @@ where
     let mut de = rmp_serde::Deserializer::new(Cursor::new(payload));
     let (version, message): (u8, T) =
         serde::Deserialize::deserialize(&mut de).map_err(|e| ProtoError::Codec(e.to_string()))?;
-    let used = de.position() as usize;
+    let used = usize::try_from(de.position()).map_err(|_| ProtoError::TrailingBytes)?;
 
     if used != payload.len() {
         return Err(ProtoError::TrailingBytes);

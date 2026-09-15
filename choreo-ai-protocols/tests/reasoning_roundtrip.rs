@@ -7,7 +7,7 @@
 //! and drives a two-request tool loop:
 //!
 //!   turn 1: provider responds with a tool call + reasoning payload
-//!           (chat `reasoning_content`, Anthropic thinking/redacted_thinking
+//!           (chat `reasoning_content`, Anthropic `thinking/redacted_thinking`
 //!           blocks, Gemini thought signatures) → the adapter captures the
 //!           payload into the opaque `ReasoningArtifact` at the parse boundary
 //!   turn 2: the same messages plus the artifact are sent back → the adapter
@@ -108,7 +108,7 @@ fn user_message(text: &str) -> ChatRequestMessage {
 /// `reasoning_content` on the second (tool-loop) request, byte-for-byte.
 /// This is the DeepSeek/Kimi contract: a tool-loop request whose assistant
 /// message drops `reasoning_content` is rejected with a 400.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn deepseek_tool_loop_echoes_reasoning_content_verbatim() {
     const REASONING: &str = "DeepSeek is analyzing the weather data step by step.";
@@ -262,11 +262,11 @@ fn deepseek_tool_loop_echoes_reasoning_content_verbatim() {
 // ── 2. Anthropic: thinking blocks echoed byte-identical ─────────────────
 
 /// Anthropic requires the encrypted thinking blocks (signature +
-/// redacted_thinking data) from turn 1 to be echoed back, complete and
+/// `redacted_thinking` data) from turn 1 to be echoed back, complete and
 /// unmodified, alongside the `tool_use` block on the next request — modified
 /// or missing blocks are a 400. The wire body must contain the exact block
 /// JSON captured at parse time.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn anthropic_thinking_blocks_echoed_byte_identical() {
     // The exact artifact the non-streaming path assembles from these blocks:
@@ -419,7 +419,7 @@ fn anthropic_thinking_blocks_echoed_byte_identical() {
 /// (the `thought: true` marker can carry the signature on ANY part type) and
 /// requires them back for reasoning continuity. The signature(s) captured on
 /// turn 1 must be attached to the assistant parts of the turn-2 request.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn gemini_thought_signatures_reemitted() {
     let tool_use_response = r#"{
@@ -558,7 +558,7 @@ fn gemini_thought_signatures_reemitted() {
 /// side chain (`previous_response_id`) plus the opaque reasoning items, which
 /// are captured into the round-trip artifact and re-emitted into `input` only
 /// on non-chained turns (daemon-side, see the daemon integration tests).
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn responses_chains_reasoning_continuity_via_response_id() {
     let tool_use_response = r#"{
@@ -768,7 +768,7 @@ fn chat_turn_request(config: ServiceConfig) -> CapturedRequest {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn opencode_provider_sends_per_session_gateway_headers() {
     // opencode-go (the go tier) and opencode (zen) route each turn by hashing
     // the per-session sticky id, so the headers must carry the REAL session
@@ -800,7 +800,7 @@ fn opencode_provider_sends_per_session_gateway_headers() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn user_agent_from_config_is_sent_on_inference_requests() {
     // The daemon sets "choreographr/<version>" on every client config (see
     // providers::from_account_config); build_agent must put it on the wire in
@@ -819,7 +819,7 @@ fn user_agent_from_config_is_sent_on_inference_requests() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn non_opencode_provider_omits_x_opencode_session_header() {
     // Providers that aren't opencode gateways must not get the headers — the
     // gateway routing semantics only apply to opencode.ai endpoints.

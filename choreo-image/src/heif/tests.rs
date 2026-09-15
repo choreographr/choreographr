@@ -7,11 +7,11 @@
 
 use super::*;
 
-fn box_(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
-    let size = (8 + content.len()) as u32;
-    let mut b = Vec::with_capacity(size as usize);
+fn box_(box_type: [u8; 4], content: &[u8]) -> Vec<u8> {
+    let size = u32::try_from(8 + content.len()).expect("test boxes fit u32");
+    let mut b = Vec::with_capacity(size as usize); // size <= 8 + test content length, fits usize
     b.extend_from_slice(&size.to_be_bytes());
-    b.extend_from_slice(box_type);
+    b.extend_from_slice(&box_type);
     b.extend_from_slice(content);
     b
 }
@@ -20,7 +20,7 @@ fn box_(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
 fn meta_box(children: &[u8]) -> Vec<u8> {
     let mut c = vec![0, 0, 0, 0]; // version/flags
     c.extend_from_slice(children);
-    box_(b"meta", &c)
+    box_(*b"meta", &c)
 }
 
 /// A single `ispe` property box for a `w`×`h` extent.
@@ -28,44 +28,52 @@ fn ispe_box(w: u32, h: u32) -> Vec<u8> {
     let mut c = vec![0; 4]; // version/flags
     c.extend_from_slice(&w.to_be_bytes());
     c.extend_from_slice(&h.to_be_bytes());
-    box_(b"ispe", &c)
+    box_(*b"ispe", &c)
 }
 
 /// `meta > iprp > ipco > ispe` wrapping one extent.
 fn extents_container(w: u32, h: u32) -> Vec<u8> {
-    let ipco = box_(b"ipco", &ispe_box(w, h));
-    let iprp = box_(b"iprp", &ipco);
+    let ipco = box_(*b"ipco", &ispe_box(w, h));
+    let iprp = box_(*b"iprp", &ipco);
     meta_box(&iprp)
 }
 
 /// An `infe` entry (version 2) for `item_id` of the given item type.
-fn infe2(item_id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+fn infe2(item_id: u16, item_type: [u8; 4]) -> Vec<u8> {
     let mut c = vec![2, 0, 0, 0]; // version/flags
     c.extend_from_slice(&item_id.to_be_bytes());
     c.extend_from_slice(&0u16.to_be_bytes()); // protection_index
-    c.extend_from_slice(item_type);
-    box_(b"infe", &c)
+    c.extend_from_slice(&item_type);
+    box_(*b"infe", &c)
 }
 
-/// `iinf` (full box, version 2 — u32 entry_count) listing the given items
+/// `iinf` (full box, version 2 — `u32` `entry_count`) listing the given items
 /// (each an `infe` full box).
 fn iinf(items: &[Vec<u8>]) -> Vec<u8> {
     let mut c = vec![2u8, 0, 0, 0]; // version 2, flags 0
-    c.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    c.extend_from_slice(
+        &u32::try_from(items.len())
+            .expect("test item counts fit u32")
+            .to_be_bytes(),
+    );
     for it in items {
         c.extend_from_slice(it);
     }
-    box_(b"iinf", &c)
+    box_(*b"iinf", &c)
 }
 
 /// `iloc` (version 2) with `offset_size=4, length_size=4,
 /// base_offset_size=4`, mapping `items: [(item_id, offset, length)]`.
-/// Version 2 item ids are u32.
+/// Version 2 item ids are `u32`.
 fn iloc_v2(items: &[(u32, u32, u32)]) -> Vec<u8> {
     let mut c = vec![2, 0, 0, 0]; // version/flags
     c.push(0x44); // offset_size=4, length_size=4
     c.push(0x40); // base_offset_size=4, index_size=0
-    c.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    c.extend_from_slice(
+        &u32::try_from(items.len())
+            .expect("test item counts fit u32")
+            .to_be_bytes(),
+    );
     for &(id, off, len) in items {
         c.extend_from_slice(&id.to_be_bytes()); // u32 item id
         c.extend_from_slice(&0u16.to_be_bytes()); // construction_method
@@ -75,10 +83,10 @@ fn iloc_v2(items: &[(u32, u32, u32)]) -> Vec<u8> {
         c.extend_from_slice(&off.to_be_bytes());
         c.extend_from_slice(&len.to_be_bytes());
     }
-    box_(b"iloc", &c)
+    box_(*b"iloc", &c)
 }
 
-/// A grid item payload: version(1) flags(1) rows(1) cols(1) [out_w, out_h].
+/// A grid item payload: version(1) flags(1) rows(1) cols(1) [`out_w`, `out_h`].
 fn grid_payload(rows: u8, cols: u8, out_w: u16, out_h: u16) -> Vec<u8> {
     let mut p = vec![0, 0, rows, cols];
     p.extend_from_slice(&out_w.to_be_bytes());
@@ -111,7 +119,7 @@ fn ignores_geometry_inside_mdat() {
     // An `mdat` sibling after `meta` whose payload is an `ispe` lookalike
     // must NOT be parsed — it is raw media data.
     let mut data = extents_container(4000, 3000);
-    data.extend_from_slice(&box_(b"mdat", &ispe_box(0xFFFF_FFFF, 0xFFFF_FFFF)));
+    data.extend_from_slice(&box_(*b"mdat", &ispe_box(0xFFFF_FFFF, 0xFFFF_FFFF)));
     let geo = heif_geometry(&data).expect("should parse");
     assert_eq!((geo.max_ispe_w, geo.max_ispe_h), (4000, 3000));
 }
@@ -122,19 +130,27 @@ fn grid_canvas_is_bounded_from_grid_payload() {
     // 3000x2000 tile extents → canvas 15000x8000, which must be rejected.
     let grid_payload = grid_payload(3, 4, 12000, 9000); // rows=4, cols=5
     let mut meta_children = Vec::new();
-    meta_children.extend_from_slice(&iinf(&[infe2(1, b"hvc1"), infe2(100, b"grid")]));
-    meta_children.extend_from_slice(&iloc_v2(&[(100, 0, grid_payload.len() as u32)]));
-    let ipco = box_(b"ipco", &ispe_box(3000, 2000)); // tile extents
-    let iprp = box_(b"iprp", &ipco);
+    meta_children.extend_from_slice(&iinf(&[infe2(1, *b"hvc1"), infe2(100, *b"grid")]));
+    meta_children.extend_from_slice(&iloc_v2(&[(
+        100,
+        0,
+        u32::try_from(grid_payload.len()).expect("test payload fits u32"),
+    )]));
+    let ipco = box_(*b"ipco", &ispe_box(3000, 2000)); // tile extents
+    let iprp = box_(*b"iprp", &ipco);
     meta_children.extend_from_slice(&iprp);
     // The grid payload is appended after the meta box; its absolute offset
     // is the meta box's length.
     let off = meta_box(&meta_children).len();
     let mut meta_children2 = Vec::new();
-    meta_children2.extend_from_slice(&iinf(&[infe2(1, b"hvc1"), infe2(100, b"grid")]));
-    meta_children2.extend_from_slice(&iloc_v2(&[(100, off as u32, grid_payload.len() as u32)]));
-    let ipco2 = box_(b"ipco", &ispe_box(3000, 2000));
-    let iprp2 = box_(b"iprp", &ipco2);
+    meta_children2.extend_from_slice(&iinf(&[infe2(1, *b"hvc1"), infe2(100, *b"grid")]));
+    meta_children2.extend_from_slice(&iloc_v2(&[(
+        100,
+        u32::try_from(off).expect("test offset fits u32"),
+        u32::try_from(grid_payload.len()).expect("test payload fits u32"),
+    )]));
+    let ipco2 = box_(*b"ipco", &ispe_box(3000, 2000));
+    let iprp2 = box_(*b"iprp", &ipco2);
     meta_children2.extend_from_slice(&iprp2);
     let mut file = meta_box(&meta_children2);
     assert_eq!(file.len(), off);
@@ -155,19 +171,27 @@ fn in_limits_grid_passes_the_guard() {
     // 2x2 grid of 500x250 tiles → canvas 1000x500, in-limits.
     let grid_payload = grid_payload(1, 1, 2000, 1000); // rows=2, cols=2
     let mut meta_children = Vec::new();
-    meta_children.extend_from_slice(&iinf(&[infe2(1, b"hvc1"), infe2(100, b"grid")]));
-    meta_children.extend_from_slice(&iloc_v2(&[(100, 0, grid_payload.len() as u32)]));
-    let ipco = box_(b"ipco", &ispe_box(500, 250));
-    let iprp = box_(b"iprp", &ipco);
+    meta_children.extend_from_slice(&iinf(&[infe2(1, *b"hvc1"), infe2(100, *b"grid")]));
+    meta_children.extend_from_slice(&iloc_v2(&[(
+        100,
+        0,
+        u32::try_from(grid_payload.len()).expect("test payload fits u32"),
+    )]));
+    let ipco = box_(*b"ipco", &ispe_box(500, 250));
+    let iprp = box_(*b"iprp", &ipco);
     meta_children.extend_from_slice(&iprp);
     // Determine the grid payload's absolute offset (appended after meta).
     let off = meta_box(&meta_children).len();
     // Rebuild with the correct extent offset.
     let mut meta_children2 = Vec::new();
-    meta_children2.extend_from_slice(&iinf(&[infe2(1, b"hvc1"), infe2(100, b"grid")]));
-    meta_children2.extend_from_slice(&iloc_v2(&[(100, off as u32, grid_payload.len() as u32)]));
-    let ipco2 = box_(b"ipco", &ispe_box(500, 250));
-    let iprp2 = box_(b"iprp", &ipco2);
+    meta_children2.extend_from_slice(&iinf(&[infe2(1, *b"hvc1"), infe2(100, *b"grid")]));
+    meta_children2.extend_from_slice(&iloc_v2(&[(
+        100,
+        u32::try_from(off).expect("test offset fits u32"),
+        u32::try_from(grid_payload.len()).expect("test payload fits u32"),
+    )]));
+    let ipco2 = box_(*b"ipco", &ispe_box(500, 250));
+    let iprp2 = box_(*b"iprp", &ipco2);
     meta_children2.extend_from_slice(&iprp2);
     let mut file = meta_box(&meta_children2);
     assert_eq!(file.len(), off);
@@ -192,15 +216,23 @@ fn grid_payload_returns_a_borrow_not_a_copy() {
     // single grid payload is read once and never re-allocated.
     let payload = grid_payload(1, 1, 2000, 1000);
     let mut children = Vec::new();
-    children.extend_from_slice(&iinf(&[infe2(1, b"hvc1"), infe2(100, b"grid")]));
-    children.extend_from_slice(&iloc_v2(&[(100, 0, payload.len() as u32)]));
-    let ipco = box_(b"ipco", &ispe_box(500, 250));
-    let iprp = box_(b"iprp", &ipco);
+    children.extend_from_slice(&iinf(&[infe2(1, *b"hvc1"), infe2(100, *b"grid")]));
+    children.extend_from_slice(&iloc_v2(&[(
+        100,
+        0,
+        u32::try_from(payload.len()).expect("test payload fits u32"),
+    )]));
+    let ipco = box_(*b"ipco", &ispe_box(500, 250));
+    let iprp = box_(*b"iprp", &ipco);
     children.extend_from_slice(&iprp);
     let off = meta_box(&children).len();
     let mut children2 = Vec::new();
-    children2.extend_from_slice(&iinf(&[infe2(1, b"hvc1"), infe2(100, b"grid")]));
-    children2.extend_from_slice(&iloc_v2(&[(100, off as u32, payload.len() as u32)]));
+    children2.extend_from_slice(&iinf(&[infe2(1, *b"hvc1"), infe2(100, *b"grid")]));
+    children2.extend_from_slice(&iloc_v2(&[(
+        100,
+        u32::try_from(off).expect("test offset fits u32"),
+        u32::try_from(payload.len()).expect("test payload fits u32"),
+    )]));
     children2.extend_from_slice(&iprp);
     let mut file = meta_box(&children2);
     assert_eq!(file.len(), off);

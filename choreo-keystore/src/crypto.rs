@@ -57,7 +57,12 @@ fn aes_decrypt(
 /// Encrypt `plaintext` with `pub_key` using ECDH + HKDF + AES-256-GCM.
 ///
 /// Output format:
-///   eph_public(32) || salt(32) || nonce(12) || ciphertext(rest)
+///   `eph_public(32) || salt(32) || nonce(12) || ciphertext(rest)`
+///
+/// # Errors
+///
+/// Returns [`KeystoreError::EncryptionFailed`] when ephemeral key material
+/// cannot be generated, HKDF derivation fails, or the AEAD seal fails.
 pub fn encrypt_with_public_key(
     pub_key: &[u8; 32],
     plaintext: &[u8],
@@ -102,6 +107,13 @@ pub fn encrypt_with_public_key(
 }
 
 /// Decrypt data that was encrypted with `encrypt_with_public_key`.
+///
+/// # Errors
+///
+/// Returns [`KeystoreError::TooShort`] when `data` is shorter than the fixed
+/// header, [`KeystoreError::DecryptionFailed`] when the AEAD tag check or the
+/// decryption fails, and [`KeystoreError::InvalidKeyLength`] when key
+/// derivation produces an unexpected length.
 pub fn decrypt_with_private_key(
     priv_key: &[u8; 32],
     data: &[u8],
@@ -182,8 +194,7 @@ mod tests {
 
         assert!(
             matches!(result, Err(KeystoreError::DecryptionFailed)),
-            "expected DecryptionFailed, got {:?}",
-            result
+            "expected DecryptionFailed, got {result:?}"
         );
     }
 

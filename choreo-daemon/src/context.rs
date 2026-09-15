@@ -4,6 +4,7 @@ use itertools::Itertools;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,15 +41,24 @@ pub struct LoadedSkill {
     pub body: String,
 }
 
+/// Discover context files for a working directory and bundle them with a
+/// content fingerprint.
+///
+/// # Errors
+///
+/// Returns Err if reading any context file or directory walk fails with an
+/// I/O error other than a missing file (missing files are skipped).
 pub fn discover_context(working_dir: &Path, config: &ContextConfig) -> io::Result<ContextBundle> {
     let mut files = Vec::new();
-    load_global_files(&mut files, config)?;
-    load_project_files(working_dir, &mut files, config)?;
+    load_global_files(&mut files, config);
+    load_project_files(working_dir, &mut files, config);
     let fingerprint = compute_fingerprint(&files);
     Ok(ContextBundle { files, fingerprint })
 }
 
-fn load_global_files(files: &mut Vec<DiscoveredFile>, config: &ContextConfig) -> io::Result<()> {
+// Neither loader can fail (file loads degrade to skips), so they return () —
+// no transparent Ok(()) wrappers to force `?` on callers.
+fn load_global_files(files: &mut Vec<DiscoveredFile>, config: &ContextConfig) {
     if let Some(config_dir) = dirs::config_dir() {
         let path = config_dir.join("choreographr").join("AGENTS.md");
         if let Some(df) = try_load_file(&path) {
@@ -71,15 +81,9 @@ fn load_global_files(files: &mut Vec<DiscoveredFile>, config: &ContextConfig) ->
             files.push(df);
         }
     }
-
-    Ok(())
 }
 
-fn load_project_files(
-    working_dir: &Path,
-    files: &mut Vec<DiscoveredFile>,
-    config: &ContextConfig,
-) -> io::Result<()> {
+fn load_project_files(working_dir: &Path, files: &mut Vec<DiscoveredFile>, config: &ContextConfig) {
     let git_root = find_git_root(working_dir);
     let boundary = git_root.as_deref().unwrap_or_else(|| Path::new("/"));
 
@@ -101,13 +105,11 @@ fn load_project_files(
         if dir == boundary {
             break;
         }
-        current = dir.parent().map(|p| p.to_path_buf());
+        current = dir.parent().map(std::path::Path::to_path_buf);
     }
 
     found.reverse();
     files.append(&mut found);
-
-    Ok(())
 }
 
 fn find_git_root(working_dir: &Path) -> Option<PathBuf> {
@@ -117,7 +119,7 @@ fn find_git_root(working_dir: &Path) -> Option<PathBuf> {
         if git_path.exists() {
             return Some(dir.clone());
         }
-        let parent = dir.parent().map(|p| p.to_path_buf());
+        let parent = dir.parent().map(std::path::Path::to_path_buf);
         if parent == current {
             break;
         }
@@ -144,6 +146,7 @@ fn try_load_file(path: &Path) -> Option<DiscoveredFile> {
     })
 }
 
+#[must_use]
 pub fn compute_fingerprint(files: &[DiscoveredFile]) -> u64 {
     let mut hasher = Sha256::new();
     let mut entries: Vec<(&Path, SystemTime)> =
@@ -166,6 +169,7 @@ pub fn compute_fingerprint(files: &[DiscoveredFile]) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+#[must_use]
 pub fn assemble_context(bundle: &ContextBundle) -> String {
     if bundle.files.is_empty() {
         return String::new();
@@ -174,10 +178,11 @@ pub fn assemble_context(bundle: &ContextBundle) -> String {
     let mut out = String::new();
     for file in &bundle.files {
         let path_display = file.path.display();
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<agent_instructions path=\"{path_display}\">\n{}\n</agent_instructions>\n",
             file.content
-        ));
+        );
     }
     out
 }
@@ -194,14 +199,14 @@ pub fn build_base_prompt(
     base.push_str("\n\n## Tool groups\n");
     base.push_str("Tools are organized into groups. Only **core**, **git**, and **shell** are active by default. Use the `load_tools` tool to activate additional groups and `unload_tools` to deactivate them.\n\n");
     for g in groups {
-        base.push_str(&format!("- **{}**: {}\n", g.name, g.description));
+        let _ = writeln!(base, "- **{}**: {}", g.name, g.description);
     }
 
     if !skills.is_empty() {
         base.push_str("\n## Available skills\n");
         base.push_str("Use the `load_skill` tool to load a skill's full instructions when a task matches its description:\n\n");
         for skill in skills {
-            base.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
+            let _ = writeln!(base, "- **{}**: {}", skill.name, skill.description);
         }
     }
 
@@ -210,11 +215,12 @@ pub fn build_base_prompt(
             "\n## Loaded skills\nThe following skills have been loaded and are active:\n\n",
         );
         for ls in loaded_skills {
-            base.push_str(&format!(
+            let _ = write!(
+                base,
                 "<skill name=\"{name}\">\n{body}\n</skill>\n\n",
                 name = ls.name,
                 body = ls.body
-            ));
+            );
         }
     }
     base
@@ -263,6 +269,7 @@ pub struct SkillScopes<'a> {
 /// frontmatter `name`, the identity `load_skill` resolves by). Within the
 /// project walk the most-local directory is scanned first, so a skill beats a
 /// same-named one higher up the tree.
+#[must_use]
 pub fn discover_skills(scopes: SkillScopes<'_>) -> Vec<SkillMeta> {
     let mut skills = Vec::new();
     // Dedup by frontmatter name: the first occurrence wins. Because the
@@ -286,7 +293,7 @@ pub fn discover_skills(scopes: SkillScopes<'_>) -> Vec<SkillMeta> {
             if dir == boundary {
                 break;
             }
-            current = dir.parent().map(|p| p.to_path_buf());
+            current = dir.parent().map(Path::to_path_buf);
         }
     }
 
@@ -307,6 +314,7 @@ pub fn discover_skills(scopes: SkillScopes<'_>) -> Vec<SkillMeta> {
 /// [`discover_skills`] with the real home directory (`dirs::home_dir()`) as the
 /// global scope. Production call sites use this; tests call [`discover_skills`]
 /// directly to inject a temp home so global discovery is deterministic.
+#[must_use]
 pub fn discover_skills_ambient(working_dir: Option<&Path>) -> Vec<SkillMeta> {
     discover_skills(SkillScopes {
         global_home: dirs::home_dir().as_deref(),
@@ -315,9 +323,8 @@ pub fn discover_skills_ambient(working_dir: Option<&Path>) -> Vec<SkillMeta> {
 }
 
 fn scan_skills_dir(dir: &Path, skills: &mut Vec<SkillMeta>, seen_names: &mut HashSet<String>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
     };
 
     // Collect the candidate skill directories and sort them by path before
@@ -326,7 +333,7 @@ fn scan_skills_dir(dir: &Path, skills: &mut Vec<SkillMeta>, seen_names: &mut Has
     // otherwise have an arbitrary winner. Sorting makes the within-scope
     // shadowing deterministic (the lexicographically-first path wins).
     let dirs: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|path| path.is_dir())
         .sorted()
@@ -374,6 +381,7 @@ fn extract_yaml_frontmatter(content: &str) -> Option<String> {
 /// Callers that hold a discovered/cached skill set — notably
 /// `persist_loaded_skill` reusing `SessionState::discovered_skills` — use this
 /// to avoid re-walking the filesystem.
+#[must_use]
 pub fn load_skill_body_from(skills: &[SkillMeta], name: &str) -> Option<String> {
     let meta = skills.iter().find(|s| s.name == name)?;
     let content = fs::read_to_string(&meta.path).ok()?;
@@ -383,6 +391,7 @@ pub fn load_skill_body_from(skills: &[SkillMeta], name: &str) -> Option<String> 
 /// Discover then read a skill's body. Convenience for callers without a cached
 /// skill set (the `load_skill` tool); the persistence path uses
 /// [`load_skill_body_from`] with the session's cached skills instead.
+#[must_use]
 pub fn load_skill_body(name: &str, working_dir: Option<&Path>) -> Option<String> {
     let skills = discover_skills_ambient(working_dir);
     load_skill_body_from(&skills, name)
@@ -403,6 +412,12 @@ fn extract_skill_body(content: &str) -> Option<String> {
     if body.is_empty() { None } else { Some(body) }
 }
 
+/// Re-discover context files and compare against the previous fingerprint.
+///
+/// # Errors
+///
+/// Returns Err under the same conditions as [`discover_context`] (I/O
+/// failure while loading context files).
 pub fn recheck_context(
     working_dir: &Path,
     config: &ContextConfig,
@@ -416,6 +431,7 @@ pub fn recheck_context(
     }
 }
 
+#[must_use]
 pub fn subdirectory_hints(
     tool_name: &str,
     arguments_json: &str,
@@ -429,9 +445,8 @@ pub fn subdirectory_hints(
     // walk should start.
     let resolved = crate::tools::resolve_path(&target_path, working_dir);
     let parent = resolved.parent()?;
-    let working_dir_canonical = working_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let working_dir_canonical =
+        working_dir.map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
     let working_dir_canonical = working_dir_canonical
         .canonicalize()
         .unwrap_or_else(|_| working_dir_canonical.clone());
@@ -466,7 +481,7 @@ pub fn subdirectory_hints(
             }
         }
 
-        current = dir.parent().map(|p| p.to_path_buf());
+        current = dir.parent().map(std::path::Path::to_path_buf);
     }
 
     if hints.is_empty() {
@@ -475,11 +490,12 @@ pub fn subdirectory_hints(
 
     let mut out = String::from("Context from subdirectory:\n\n");
     for (path, content) in hints.iter().rev() {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<agent_instructions path=\"{}\">\n{}\n</agent_instructions>\n",
             path.display(),
             content
-        ));
+        );
     }
     Some((out, new_paths))
 }
@@ -487,22 +503,23 @@ pub fn subdirectory_hints(
 fn extract_tool_path(tool_name: &str, arguments_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(arguments_json).ok()?;
     match tool_name {
-        "read_file" | "read_file_range" | "write_file" | "edit_file" => {
-            v.get("path")?.as_str().map(|s| s.to_string())
-        }
+        "read_file" | "read_file_range" | "write_file" | "edit_file" => v
+            .get("path")?
+            .as_str()
+            .map(std::string::ToString::to_string),
         "list_files" => v
             .get("path")
             .or_else(|| v.get("directory"))
             .and_then(|p| p.as_str())
-            .map(|s| s.to_string()),
+            .map(std::string::ToString::to_string),
         "grep" => v
             .get("path")
             .and_then(|p| p.as_str())
-            .map(|s| s.to_string()),
+            .map(std::string::ToString::to_string),
         "find" => v
             .get("path")
             .and_then(|p| p.as_str())
-            .map(|s| s.to_string()),
+            .map(std::string::ToString::to_string),
         _ => None,
     }
 }
@@ -554,7 +571,7 @@ mod tests {
         let path = extract_tool_path("list_files", r#"{"directory": "/tmp"}"#).unwrap();
         assert_eq!(path, "/tmp");
 
-        assert!(extract_tool_path("git_status", r#"{}"#).is_none());
+        assert!(extract_tool_path("git_status", r"{}").is_none());
     }
 
     #[test]

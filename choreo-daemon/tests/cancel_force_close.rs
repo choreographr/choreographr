@@ -16,7 +16,7 @@
 //! `SessionEvent::Done`, well inside the configured 30 s request timeout.
 //!
 //! This binds real sockets and spawns the real daemon, so per AGENTS.md it
-//! lives in `tests/`, is `#[ignore]`, and runs under `cargo test-integration`.
+//! lives in `tests/`, is `#[ignore = "integration"]`, and runs under `cargo test-integration`.
 
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
 // allow-*-in-tests config only recognizes #[test]-annotated functions —
@@ -29,6 +29,7 @@
     clippy::indexing_slicing
 )]
 use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, SessionStatus};
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
@@ -51,7 +52,7 @@ fn sse_prefix(chunks: usize) -> String {
     for i in 0..chunks {
         let payload =
             serde_json::json!({ "choices": [{ "delta": { "content": format!("c{i} ") } }] });
-        sse.push_str(&format!("data: {payload}\n\n"));
+        let _ = write!(sse, "data: {payload}\n\n");
     }
     sse.push_str("data: [DONE]\n\n");
     sse
@@ -71,7 +72,7 @@ struct StallingSseServer {
     /// cancelling earlier races the worker's dial (under a loaded test box
     /// the worker can be delayed by seconds after `Started`), and a cancel
     /// that lands on an empty registry closes nothing — the request then
-    /// stalls to its full 30 s request timeout, past DONE_TIMEOUT.
+    /// stalls to its full 30 s request timeout, past `DONE_TIMEOUT`.
     prefix_flushed_rx: std::sync::mpsc::Receiver<()>,
 }
 
@@ -119,10 +120,7 @@ impl StallingSseServer {
                         if matches!(
                             e.kind(),
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        continue;
-                    }
+                        ) => {}
                     Err(_) => break,
                 }
             }
@@ -152,7 +150,7 @@ fn read_message<R: Read, T: serde::de::DeserializeOwned>(reader: &mut R) -> T {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
     // The stalling server lives OUTSIDE the daemon-state closure so its join
     // handle stays with the test (SpawnedDaemon's keepalive box takes a

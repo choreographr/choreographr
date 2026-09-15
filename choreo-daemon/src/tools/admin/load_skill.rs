@@ -83,7 +83,7 @@ impl Tool for LoadSkill {
         // so the free function falls back to a fresh ambient walk.
         let skills = ctx
             .and_then(|c| c.discovered_skills.as_deref())
-            .map(|v| v.as_slice());
+            .map(Vec::as_slice);
         execute_load_skill(&args, working_dir, skills)
     }
 }

@@ -53,7 +53,7 @@ fn build_sse_event_joins_multiple_data_lines() {
     ];
     let event = build_sse_event(&mut lines).expect("event");
     assert_eq!(event, "hello\nworld");
-    assert!(lines.is_empty());
+    assert_eq!(lines, [] as [String; 0]);
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn build_sse_event_returns_done_marker() {
     let mut lines = vec!["data: [DONE]".to_string()];
     let event = build_sse_event(&mut lines).expect("event");
     assert_eq!(event, "[DONE]");
-    assert!(lines.is_empty());
+    assert_eq!(lines, [] as [String; 0]);
 }
 
 #[test]
@@ -168,9 +168,9 @@ fn parse_responses_stream_event_text_done() {
 
 #[test]
 fn parse_responses_stream_event_function_call_args() {
-    // Delta — use r##"..."## so the \" inside doesn't collide with the delimiter.
+    // Delta — use r"..."## so the \" inside doesn't collide with the delimiter.
     let event = parse_responses_stream_event(
-        r##"{"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"{\"city\":"}"##,
+        r#"{"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"{\"city\":"}"#,
     )
     .expect("parse")
     .expect("event");
@@ -240,7 +240,7 @@ fn parse_responses_stream_event_response_failed_decodes_error_object() {
     .expect("event");
     match event {
         ResponsesStreamEvent::ResponseFailed(error) => {
-            assert_eq!(error, "Request failed due to internal server error.")
+            assert_eq!(error, "Request failed due to internal server error.");
         }
         _ => panic!("expected ResponseFailed"),
     }
@@ -270,7 +270,7 @@ fn parse_responses_stream_event_response_failed_object_without_message_keeps_ser
     .expect("event");
     match event {
         ResponsesStreamEvent::ResponseFailed(error) => {
-            assert!(error.contains("internal_error"), "got: {error}")
+            assert!(error.contains("internal_error"), "got: {error}");
         }
         _ => panic!("expected ResponseFailed"),
     }

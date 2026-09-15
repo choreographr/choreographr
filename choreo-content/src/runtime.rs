@@ -22,6 +22,12 @@ static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 ///
 /// Fails only if the OS refuses to spawn the worker threads, surfaced as an
 /// error instead of panicking so the daemon can abort startup cleanly.
+///
+/// # Errors
+///
+/// Returns the underlying `std::io::Error` boxed if `tokio::runtime::Builder`
+/// cannot build the multi-threaded runtime (e.g. worker-thread spawn
+/// failure). Never fails once the runtime is already initialized.
 pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if RUNTIME.get().is_some() {
         return Ok(());

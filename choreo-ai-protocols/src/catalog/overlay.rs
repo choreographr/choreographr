@@ -73,28 +73,25 @@ pub fn merge_overlay(base: &[ProviderEntry], overlay_src: &str) -> Vec<ProviderE
             warn!(slug, "overlay provider is not a table; skipping");
             continue;
         };
-        match merged.iter_mut().find(|e| e.slug == *slug) {
-            Some(entry) => {
-                trace!(slug, "overlay: applying provider overrides");
-                apply_provider_overlay(entry, table, &mut models_touched);
-                overridden += 1;
-            }
-            None => {
-                trace!(slug, "overlay: adding new provider");
-                let mut entry = ProviderEntry {
-                    slug: slug.clone(),
-                    display_name: slug.clone(),
-                    protocol: ProviderProtocol::OpenAi {
-                        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-                    },
-                    base_url: String::new(),
-                    default_model: String::new(),
-                    models: Vec::new(),
-                };
-                apply_provider_overlay(&mut entry, table, &mut models_touched);
-                merged.push(entry);
-                added += 1;
-            }
+        if let Some(entry) = merged.iter_mut().find(|e| e.slug == *slug) {
+            trace!(slug, "overlay: applying provider overrides");
+            apply_provider_overlay(entry, table, &mut models_touched);
+            overridden += 1;
+        } else {
+            trace!(slug, "overlay: adding new provider");
+            let mut entry = ProviderEntry {
+                slug: slug.clone(),
+                display_name: slug.clone(),
+                protocol: ProviderProtocol::OpenAi {
+                    max_tokens_field: MaxTokensField::MaxCompletionTokens,
+                },
+                base_url: String::new(),
+                default_model: String::new(),
+                models: Vec::new(),
+            };
+            apply_provider_overlay(&mut entry, table, &mut models_touched);
+            merged.push(entry);
+            added += 1;
         }
     }
     debug!(overridden, added, models_touched, "overlay merge complete",);
@@ -111,28 +108,37 @@ fn apply_provider_overlay(
 ) {
     for (key, value) in table {
         match key.as_str() {
-            "protocol" => match parse_protocol(value) {
-                Some(protocol) => entry.protocol = protocol,
-                None => warn!(slug = %entry.slug, "overlay: unknown protocol; skipping"),
-            },
-            "max_tokens_field" => match parse_max_tokens_field(value) {
-                Some(field) => set_max_tokens_field(entry, field),
-                None => warn!(slug = %entry.slug, "overlay: unknown max_tokens_field; skipping"),
-            },
-            "base_url" => match value.as_str() {
-                Some(url) => entry.base_url = url.to_string(),
-                None => warn!(slug = %entry.slug, "overlay: base_url is not a string; skipping"),
-            },
+            "protocol" => {
+                if let Some(protocol) = parse_protocol(value) {
+                    entry.protocol = protocol;
+                } else {
+                    warn!(slug = %entry.slug, "overlay: unknown protocol; skipping");
+                }
+            }
+            "max_tokens_field" => {
+                if let Some(field) = parse_max_tokens_field(value) {
+                    set_max_tokens_field(entry, field);
+                } else {
+                    warn!(slug = %entry.slug, "overlay: unknown max_tokens_field; skipping");
+                }
+            }
+            "base_url" => {
+                if let Some(url) = value.as_str() {
+                    entry.base_url = url.to_string();
+                } else {
+                    warn!(slug = %entry.slug, "overlay: base_url is not a string; skipping");
+                }
+            }
             "default_model" => match value.as_str() {
                 Some(model) => entry.default_model = model.to_string(),
                 None => {
-                    warn!(slug = %entry.slug, "overlay: default_model is not a string; skipping")
+                    warn!(slug = %entry.slug, "overlay: default_model is not a string; skipping");
                 }
             },
             "display_name" => match value.as_str() {
                 Some(name) => entry.display_name = name.to_string(),
                 None => {
-                    warn!(slug = %entry.slug, "overlay: display_name is not a string; skipping")
+                    warn!(slug = %entry.slug, "overlay: display_name is not a string; skipping");
                 }
             },
             "models" => apply_models_overlay(entry, value, models_touched),
@@ -165,115 +171,154 @@ fn apply_models_overlay(
             );
             continue;
         };
-        match entry.models.iter_mut().find(|m| m.model == *model_id) {
-            Some(model) => {
-                apply_model_overlay(&mut *model, table);
-                *models_touched += 1;
-            }
-            None => {
-                let mut model = ModelEntry {
-                    model: model_id.clone(),
-                    ..Default::default()
-                };
-                apply_model_overlay(&mut model, table);
-                entry.models.push(model);
-                *models_touched += 1;
-            }
+        if let Some(model) = entry.models.iter_mut().find(|m| m.model == *model_id) {
+            apply_model_overlay(&mut *model, table);
+            *models_touched += 1;
+        } else {
+            let mut model = ModelEntry {
+                model: model_id.clone(),
+                ..Default::default()
+            };
+            apply_model_overlay(&mut model, table);
+            entry.models.push(model);
+            *models_touched += 1;
         }
     }
 }
 
 /// Apply a single model overlay table onto a model entry, field-wise.
+/// Overlay integer coercion, `n.max(0) as u32`. Negative values were
+/// already rejected by the `max(0)` above; values above `u32::MAX` give the
+/// same wrapped result as before the lint (behavior is pinned by tests), so
+/// the raw cast is kept rather than clamping.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn u32_len(n: i64) -> u32 {
+    n.max(0) as u32
+}
+
 fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
     for (key, value) in table {
         match key.as_str() {
-            "context_window" => match value.as_integer() {
-                Some(n) => model.context_window = n.max(0) as u32,
-                None => warn!(
-                    model = %model.model,
-                    "overlay: context_window is not an integer; skipping",
-                ),
-            },
-            "reasoning_supported" => match value.as_bool() {
-                Some(b) => model.reasoning_supported = b,
-                None => warn!(
-                    model = %model.model,
-                    "overlay: reasoning_supported is not a bool; skipping",
-                ),
-            },
-            "reasoning_levels" => match value.as_array() {
-                Some(levels) => model.openai_reasoning_levels = parse_string_array(levels),
-                None => warn!(
-                    model = %model.model,
-                    "overlay: reasoning_levels is not an array; skipping",
-                ),
-            },
-            "responses" => match value.as_bool() {
-                Some(b) => model.openai_responses = b,
-                None => warn!(
-                    model = %model.model,
-                    "overlay: responses is not a bool; skipping",
-                ),
-            },
-            "reasoning_passback" => match value.as_str().and_then(parse_passback) {
-                Some(passback) => model.reasoning_passback = Some(passback),
-                None => warn!(
-                    model = %model.model,
-                    "overlay: unknown reasoning_passback; skipping",
-                ),
-            },
-            "reasoning_content_required" => match value.as_bool() {
-                Some(required) => model.reasoning_content_required = Some(required),
-                None => warn!(
-                    model = %model.model,
-                    "overlay: reasoning_content_required is not a bool; skipping",
-                ),
-            },
-            "supports_vision" => match value.as_bool() {
-                Some(support) => model.supports_vision = support,
-                None => warn!(
-                    model = %model.model,
-                    "overlay: supports_vision is not a bool; skipping",
-                ),
-            },
+            "context_window" => {
+                if let Some(n) = value.as_integer() {
+                    model.context_window = u32_len(n);
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: context_window is not an integer; skipping",
+                    );
+                }
+            }
+            "reasoning_supported" => {
+                if let Some(b) = value.as_bool() {
+                    model.reasoning_supported = b;
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: reasoning_supported is not a bool; skipping",
+                    );
+                }
+            }
+            "reasoning_levels" => {
+                if let Some(levels) = value.as_array() {
+                    model.openai_reasoning_levels = parse_string_array(levels);
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: reasoning_levels is not an array; skipping",
+                    );
+                }
+            }
+            "responses" => {
+                if let Some(b) = value.as_bool() {
+                    model.openai_responses = b;
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: responses is not a bool; skipping",
+                    );
+                }
+            }
+            "reasoning_passback" => {
+                if let Some(passback) = value.as_str().and_then(parse_passback) {
+                    model.reasoning_passback = Some(passback);
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: unknown reasoning_passback; skipping",
+                    );
+                }
+            }
+            "reasoning_content_required" => {
+                if let Some(required) = value.as_bool() {
+                    model.reasoning_content_required = Some(required);
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: reasoning_content_required is not a bool; skipping",
+                    );
+                }
+            }
+            "supports_vision" => {
+                if let Some(support) = value.as_bool() {
+                    model.supports_vision = support;
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: supports_vision is not a bool; skipping",
+                    );
+                }
+            }
             // Image-output override: same shape as supports_vision, for
             // pinning image generation where the snapshot's output
             // modalities are wrong or a new image model is not yet listed.
-            "supports_image_output" => match value.as_bool() {
-                Some(support) => model.supports_image_output = support,
-                None => warn!(
-                    model = %model.model,
-                    "overlay: supports_image_output is not a bool; skipping",
-                ),
-            },
+            "supports_image_output" => {
+                if let Some(support) = value.as_bool() {
+                    model.supports_image_output = support;
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: supports_image_output is not a bool; skipping",
+                    );
+                }
+            }
             // Output-token ceiling: overrides the ingested `limit.output`
             // (0 = unknown, same convention as `context_window`).
-            "max_output_tokens" => match value.as_integer() {
-                Some(n) => model.max_output_tokens = n.max(0) as u32,
-                None => warn!(
-                    model = %model.model,
-                    "overlay: max_output_tokens is not an integer; skipping",
-                ),
-            },
+            "max_output_tokens" => {
+                if let Some(n) = value.as_integer() {
+                    model.max_output_tokens = u32_len(n);
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: max_output_tokens is not an integer; skipping",
+                    );
+                }
+            }
             // Temperature acceptance: models.dev records the fact only when
             // it is "no", so the overlay is where a "yes" can be pinned for
             // a gateway that proxies a temperature-less base model.
-            "temperature" => match value.as_bool() {
-                Some(supports) => model.supports_temperature = supports,
-                None => warn!(
-                    model = %model.model,
-                    "overlay: temperature is not a bool; skipping",
-                ),
-            },
+            "temperature" => {
+                if let Some(supports) = value.as_bool() {
+                    model.supports_temperature = supports;
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: temperature is not a bool; skipping",
+                    );
+                }
+            }
             // Lifecycle status override (e.g. pinning a snapshot entry the
             // upstream has since retired, or un-deprecating a re-listed one).
-            "deprecated" => match value.as_bool() {
-                Some(deprecated) => model.deprecated = deprecated,
-                None => warn!(
-                    model = %model.model,
-                    "overlay: deprecated is not a bool; skipping",
-                ),
-            },
+            "deprecated" => {
+                if let Some(deprecated) = value.as_bool() {
+                    model.deprecated = deprecated;
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: deprecated is not a bool; skipping",
+                    );
+                }
+            }
             other => warn!(
                 model = %model.model,
                 key = other,
@@ -493,7 +538,7 @@ base_url = "http://localhost:11434/v1"
 default_model = "llama3.1"
 
 [provider.ollama.models."llama3.1"]
-context_window = 131072
+context_window = 131_072
 reasoning_supported = false
 reasoning_levels = []
 responses = false
@@ -509,7 +554,7 @@ reasoning_passback = "none"
         assert_eq!(ollama.default_model, "llama3.1");
         assert_eq!(ollama.models.len(), 1);
         assert_eq!(ollama.models[0].model, "llama3.1");
-        assert_eq!(ollama.models[0].context_window, 131072);
+        assert_eq!(ollama.models[0].context_window, 131_072);
         assert_eq!(
             ollama.models[0].reasoning_passback,
             Some(ReasoningPassback::None)
@@ -524,7 +569,7 @@ reasoning_passback = "none"
             &base(),
             r#"
 [provider.acme.models."brand-new"]
-context_window = 100000
+context_window = 100_000
 reasoning_supported = true
 "#,
         );
@@ -534,7 +579,7 @@ reasoning_supported = true
             .iter()
             .find(|m| m.model == "brand-new")
             .expect("brand-new added");
-        assert_eq!(new_model.context_window, 100000);
+        assert_eq!(new_model.context_window, 100_000);
         assert!(new_model.reasoning_supported);
         assert_eq!(acme.models.len(), 3);
     }

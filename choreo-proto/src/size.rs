@@ -11,7 +11,7 @@
 //! MAINTENANCE: the per-arm `named_field_overhead(n)` field counts, the
 //! per-record allowances in [`Turn::approx_size`], and the fixed
 //! [`DaemonMessage::approx_wire_size`] envelope are hand-tuned against the
-//! MessagePack named-mode encoder. When a serialized struct/variant gains a
+//! `MessagePack` named-mode encoder. When a serialized struct/variant gains a
 //! field, or a record type's shape changes, update the count/allowance HERE
 //! in the same change — the pin test
 //! `types::tests::approx_wire_size_never_underestimates_encoded_payload`
@@ -107,14 +107,14 @@ impl Turn {
 
 /// Byte length of an `Option<String>`'s payload (0 when None). Shared by
 /// [`DaemonMessage::approx_wire_size`] so every optional string field is
-/// counted the same way. Only the payload is counted here — the MessagePack
+/// counted the same way. Only the payload is counted here — the `MessagePack`
 /// field-name key and length prefix are covered by the per-field allowance of
 /// [`named_field_overhead`], which the arm's fixed base provides.
-fn option_str_len(s: &Option<String>) -> usize {
-    s.as_ref().map_or(0, String::len)
+fn option_str_len(s: Option<&String>) -> usize {
+    s.map_or(0, String::len)
 }
 
-/// Estimated MessagePack named-mode overhead for a struct variant with `n`
+/// Estimated `MessagePack` named-mode overhead for a struct variant with `n`
 /// fields: the variant tag, map headers, and one field-name key per field.
 /// The allowance is ~24 bytes per field (the longest field-name keys in use
 /// are ~21 chars plus a length prefix; the value side is a nil marker, a
@@ -174,11 +174,11 @@ fn session_event_size(event: &SessionEvent) -> usize {
             ..
         } => {
             named_field_overhead(6)
-                + option_str_len(title)
-                + option_str_len(working_dir)
-                + option_str_len(account_name)
-                + option_str_len(selected_model)
-                + option_str_len(reasoning_effort)
+                + option_str_len(title.as_ref())
+                + option_str_len(working_dir.as_ref())
+                + option_str_len(account_name.as_ref())
+                + option_str_len(selected_model.as_ref())
+                + option_str_len(reasoning_effort.as_ref())
         }
         SessionEvent::SessionAttached | SessionEvent::SessionDeleted => OVERHEAD,
         SessionEvent::SessionState {
@@ -193,10 +193,10 @@ fn session_event_size(event: &SessionEvent) -> usize {
             ..
         } => {
             named_field_overhead(12)
-                + option_str_len(title)
-                + option_str_len(selected_model)
-                + option_str_len(working_dir)
-                + option_str_len(reasoning_effort)
+                + option_str_len(title.as_ref())
+                + option_str_len(selected_model.as_ref())
+                + option_str_len(working_dir.as_ref())
+                + option_str_len(reasoning_effort.as_ref())
                 + active_tool_groups.iter().map(String::len).sum::<usize>()
                 + turns
                     .iter()
@@ -277,7 +277,7 @@ fn session_event_size(event: &SessionEvent) -> usize {
         SessionEvent::SessionAccountSet { account } => named_field_overhead(1) + account.len(),
         SessionEvent::ContextWindowResolved { .. } => named_field_overhead(1),
         SessionEvent::SessionWorkingDirSet { path } => {
-            named_field_overhead(1) + option_str_len(path)
+            named_field_overhead(1) + option_str_len(path.as_ref())
         }
         SessionEvent::SessionTitleSet { title } => named_field_overhead(1) + title.len(),
         SessionEvent::ReasoningEffortSet { effort } => named_field_overhead(1) + effort.len(),
@@ -290,7 +290,7 @@ fn session_event_size(event: &SessionEvent) -> usize {
 impl DaemonMessage {
     /// Cheap, conservative estimate of this message's serialized byte size.
     ///
-    /// Used by the daemon's lag accounting (broadcast::SubscriberSink) to
+    /// Used by the daemon's lag accounting (`broadcast::SubscriberSink`) to
     /// gauge how many bytes a slow client has fallen behind the streaming
     /// frontier. It
     /// deliberately over-estimates rather than serializes: the accounting is
@@ -327,11 +327,11 @@ impl DaemonMessage {
                             // + status string (the variable-size status
                             // payload is not otherwise counted).
                             named_field_overhead(15)
-                                + option_str_len(&s.title)
-                                + option_str_len(&s.selected_model)
-                                + option_str_len(&s.reasoning_effort)
-                                + option_str_len(&s.working_dir)
-                                + option_str_len(&s.account_name)
+                                + option_str_len(s.title.as_ref())
+                                + option_str_len(s.selected_model.as_ref())
+                                + option_str_len(s.reasoning_effort.as_ref())
+                                + option_str_len(s.working_dir.as_ref())
+                                + option_str_len(s.account_name.as_ref())
                                 + s.active_tool_groups.iter().map(String::len).sum::<usize>()
                                 + session_status_size(&s.status)
                         })
@@ -344,7 +344,7 @@ impl DaemonMessage {
             } => {
                 named_field_overhead(2)
                     + models.iter().map(String::len).sum::<usize>()
-                    + option_str_len(selected_model)
+                    + option_str_len(selected_model.as_ref())
             }
             Self::ModelsFailed { error } => named_field_overhead(1) + error.len(),
             Self::Unlocked | Self::Locked | Self::Bound | Self::ShuttingDown | Self::Evicted => {
@@ -364,7 +364,7 @@ impl DaemonMessage {
             Self::AclAddResult { ok: _, message } => named_field_overhead(2) + message.len(),
             Self::AclUpdated { .. } => named_field_overhead(1),
             Self::Credential { service, key } => {
-                named_field_overhead(2) + service.len() + option_str_len(key)
+                named_field_overhead(2) + service.len() + option_str_len(key.as_ref())
             }
             Self::AccountAdded { name } => named_field_overhead(1) + name.len(),
             Self::AccountAddFailed { name, error } => {

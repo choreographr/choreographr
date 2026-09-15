@@ -2,7 +2,7 @@ use crate::tools::{ToolError, truncate_tool_output};
 use gix::status::UntrackedFiles;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::{fmt::Write as _, io, ops::Deref};
+use std::{fmt::Write as _, io};
 
 use super::{
     collect_cached_diff_lines, open_repo, path_from_bytes, pathspec_patterns, repo_work_dir_display,
@@ -18,9 +18,9 @@ pub struct GitDiffArgs {
 /// Append a unified diff wrapped in a `` `diff` `` fenced code block.
 ///
 /// This ensures the diff content is clearly delimited from surrounding tool
-/// output when rendered in markdown or the TUI. It goes through the shared
+/// output when rendered in `markdown` or the TUI. It goes through the shared
 /// `fence_content` helper so a diff whose content contains a backtick run
-/// (e.g. editing a Markdown file that holds a bare ``` line as a context
+/// (e.g. editing a Markdown file that holds a bare fence line as a context
 /// line) cannot close the fence early in a markdown-parsing client — the
 /// same hardening applied to blob/commit-message bodies. A backtick-free
 /// diff still gets the canonical 3-backtick ```` ```diff ```` fence.
@@ -30,6 +30,12 @@ pub fn append_fenced_diff(out: &mut String, diff: &str) {
     }
 }
 
+/// Show a unified diff for staged or unstaged changes.
+///
+/// # Errors
+///
+/// Returns Err if the repository cannot be opened, the diff computation
+/// fails, or a pathspec cannot be parsed.
 pub fn execute_git_diff_tool(
     args: &GitDiffArgs,
     working_dir: Option<&std::path::Path>,
@@ -52,7 +58,7 @@ pub fn execute_git_diff_tool(
 /// Added files diff against an empty string; deleted files diff against HEAD content.
 ///
 /// `include_header` controls the two-line `repository:`/`mode:` preamble: the
-/// standalone git_diff tool emits it, while git_add embeds this output under
+/// standalone `git_diff` tool emits it, while `git_add` embeds this output under
 /// its own summary (which already prints `repository:`, `head:`,
 /// `staged_paths:`, `index_changed:`) and passes `false` to avoid duplicating
 /// `repository:` and leaking a `mode: staged` line into the result.
@@ -74,7 +80,7 @@ pub(crate) fn git_diff_impl(
     if let Some(prefix) = super::resolve_pathspec_prefix(&repo, repo_path, working_dir)? {
         for spec in &mut pathspec {
             if spec == "." || spec == "./" {
-                *spec = prefix.clone();
+                spec.clone_from(&prefix);
             } else {
                 *spec = format!("{}/{}", prefix, spec.trim_start_matches("./"));
             }
@@ -226,7 +232,7 @@ fn head_content_by_path(repo: &gix::Repository, path: &str) -> Option<String> {
     let entry = tree.peel_to_entry_by_path(path).ok()?;
     let entry = entry?;
     let obj = entry.object().ok()?;
-    String::from_utf8(obj.data.to_vec()).ok()
+    String::from_utf8(obj.data.clone()).ok()
 }
 
 /// Search the index for a matching entry by path, then return its blob content.
@@ -238,14 +244,14 @@ fn entry_content_by_path(
     index: &gix::index::File,
     path: &str,
 ) -> Option<String> {
-    let state: &gix::index::State = index.deref();
+    let state: &gix::index::State = index;
     let backing = state.path_backing();
     let entry = index.entries().iter().find(|e| {
         let p = e.path_in(backing);
         path_from_bytes(p.as_ref()) == path
     })?;
     let obj = repo.find_object(entry.id).ok()?;
-    String::from_utf8(obj.data.to_vec()).ok()
+    String::from_utf8(obj.data.clone()).ok()
 }
 
 pub fn describe_git_diff_invocation(args: &GitDiffArgs) -> String {

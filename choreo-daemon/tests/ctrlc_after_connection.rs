@@ -8,12 +8,12 @@
 //!
 //! These tests run the REAL `run_server` and deliver a real SIGINT to the
 //! test process (the same delivery path as pressing Ctrl+C in a terminal,
-//! since the test process IS the daemon's process — the signal_hook handler
+//! since the test process IS the daemon's process — the `signal_hook` handler
 //! is registered in-process). They then POLL the server thread's exit with a
 //! hard deadline instead of joining it, so a wedged shutdown fails the test
 //! loudly instead of hanging the suite forever.
 //!
-//! Belongs to the `#[ignore]` integration suite (real sockets, real signal
+//! Belongs to the `#[ignore = "integration"]` integration suite (real sockets, real signal
 //! delivery, real threads).
 
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
@@ -41,7 +41,7 @@ mod common;
 /// graces sum to a few seconds at most. Anything past this is the wedge.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Deliver SIGINT to our own process (the daemon's signal_hook handler is
+/// Deliver SIGINT to our own process (the daemon's `signal_hook` handler is
 /// registered in-process) and poll — never join — the server thread until it
 /// exits or the deadline passes. Returns `true` when it exited in time.
 fn sigint_and_wait(daemon: &mut common::SpawnedDaemon) -> bool {
@@ -74,7 +74,7 @@ fn sigint_and_wait(daemon: &mut common::SpawnedDaemon) -> bool {
 /// CONTROL: a fresh daemon with zero connections must exit promptly on
 /// SIGINT (the bug report confirms this works in the field).
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn sigint_exits_fresh_daemon_with_no_connections() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     assert!(
@@ -86,7 +86,7 @@ fn sigint_exits_fresh_daemon_with_no_connections() {
 /// A client that connects, exchanges a Ping/Pong, and disconnects cleanly —
 /// the minimal "opened and closed a connection" from the bug report.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn sigint_exits_after_ping_pong_connect_and_disconnect() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     {
@@ -130,7 +130,7 @@ fn sigint_exits_after_ping_pong_connect_and_disconnect() {
 /// and disconnects — leaving a live session thread behind, as the phone/local
 /// TUI flow does. The session thread persists after the client is gone.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn sigint_exits_after_create_session_connect_and_disconnect() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     {
@@ -172,7 +172,7 @@ fn sigint_exits_after_create_session_connect_and_disconnect() {
                     created = true;
                     break;
                 }
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(_) => break,
             }
         }
@@ -195,7 +195,7 @@ fn sigint_exits_after_create_session_connect_and_disconnect() {
 /// A raw connect + close with NO protocol traffic at all: the accept path
 /// runs, the connection thread starts and immediately sees EOF.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn sigint_exits_after_bare_connect_and_close() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     {
@@ -214,7 +214,7 @@ fn sigint_exits_after_bare_connect_and_close() {
 /// driven over the Unix socket here as the cheapest equivalent: connect and
 /// write one garbage byte, then close).
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn sigint_exits_after_garbage_byte_connect_and_close() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     {

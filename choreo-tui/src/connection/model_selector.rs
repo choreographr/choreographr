@@ -13,11 +13,11 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind
 /// on the filter row positions the input cursor.  Quit is handled via Ctrl+Q
 /// at the terminal-event level.
 pub(super) fn handle_model_selector_event(
-    event: Event,
+    event: &Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    match event {
+    match *event {
         Event::Key(key) => {
             if key.kind != KeyEventKind::Press {
                 return Ok(());

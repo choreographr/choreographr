@@ -49,6 +49,12 @@ pub const MAX_DECODE_PIXELS: u64 = (MAX_SOURCE_DIMENSION as u64).pow(2);
 /// JPEG/WebP/PNG-`eXIf` orientation is applied in place after a single decode
 /// pass, so phone/camera photos come out upright. The decode runs under a
 /// decompression-bomb `image::Limits` guard derived from [`MAX_SOURCE_DIMENSION`].
+///
+/// # Errors
+///
+/// Returns a human-readable error string when the data is not a supported
+/// raster format, is corrupt, or declares dimensions beyond the
+/// decompression-bomb guard.
 pub fn decode_raster_oriented(data: &[u8]) -> Result<DynamicImage, String> {
     let mut reader = ImageReader::new(Cursor::new(data))
         .with_guessed_format()
@@ -82,6 +88,11 @@ pub fn decode_raster_oriented(data: &[u8]) -> Result<DynamicImage, String> {
 /// display-ready sRGB, so no further rotation is needed. A *pre-decode*
 /// allocation guard rejects hostile declared geometry before the decoder runs
 /// (see [`heic_geometry_within_limits`]).
+///
+/// # Errors
+///
+/// Returns a human-readable error string when the declared HEIC geometry
+/// exceeds the pre-decode guard or the decode itself fails.
 pub fn decode_heic(data: &[u8]) -> Result<DynamicImage, String> {
     if !heic_geometry_within_limits(data) {
         warn!(
@@ -104,7 +115,7 @@ pub fn decode_heic(data: &[u8]) -> Result<DynamicImage, String> {
 /// hostile size.
 ///
 /// `heif-oxide` exposes no decoder limit, so we pre-parse the container for
-/// the geometry it allocates: every `ispe` (ImageSpatialExtentsProperty)
+/// the geometry it allocates: every `ispe` (`ImageSpatialExtentsProperty`)
 /// extent (the per-item frame size a single coded image or grid tile is
 /// decoded from) and every `grid` derived item's canvas (tile extent ×
 /// rows/cols, read from the grid item payload located via `iinf`/`iloc`).
@@ -122,11 +133,11 @@ mod tests {
 
     /// Build a box header + the given content. `size` is written as the box
     /// size (content + header).
-    fn box_(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
-        let size = (8 + content.len()) as u32;
+    fn box_(box_type: [u8; 4], content: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(8 + content.len()).expect("test boxes fit u32");
         let mut b = Vec::with_capacity(size as usize);
         b.extend_from_slice(&size.to_be_bytes());
-        b.extend_from_slice(box_type);
+        b.extend_from_slice(&box_type);
         b.extend_from_slice(content);
         b
     }
@@ -137,12 +148,12 @@ mod tests {
         let mut ispe = vec![0u8; 4]; // version/flags
         ispe.extend_from_slice(&w.to_be_bytes());
         ispe.extend_from_slice(&h.to_be_bytes());
-        let ispe = box_(b"ispe", &ispe);
-        let ipco = box_(b"ipco", &ispe);
-        let iprp = box_(b"iprp", &ipco);
+        let ispe = box_(*b"ispe", &ispe);
+        let ipco = box_(*b"ipco", &ispe);
+        let iprp = box_(*b"iprp", &ipco);
         let mut meta = vec![0u8; 4]; // meta full-box version/flags
         meta.extend_from_slice(&iprp);
-        box_(b"meta", &meta)
+        box_(*b"meta", &meta)
     }
 
     #[test]
@@ -182,7 +193,7 @@ mod tests {
         lookalike.extend_from_slice(&[0; 4]); // version/flags
         lookalike.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // hostile width
         lookalike.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // hostile height
-        container.extend_from_slice(&box_(b"mdat", &lookalike));
+        container.extend_from_slice(&box_(*b"mdat", &lookalike));
         assert!(heic_geometry_within_limits(&container));
     }
 
@@ -190,8 +201,10 @@ mod tests {
     fn decode_raster_oriented_preserves_dimensions() {
         // A valid PNG with no EXIF orientation decodes to the same dimensions
         // (the orientation path must be a no-op for the default orientation).
+        // Pixel values wrap modulo 256 by design — only dimensions matter.
+        #[allow(clippy::cast_possible_truncation)]
         let img = RgbaImage::from_fn(4, 3, |x, y| {
-            image::Rgba([x as u8 * 60, y as u8 * 80, 0, 255])
+            image::Rgba([(x * 60) as u8, (y * 80) as u8, 0, 255])
         });
         let mut png = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(img)

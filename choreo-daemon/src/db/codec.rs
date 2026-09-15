@@ -1,6 +1,6 @@
 //! zstd codec for `session_turns` value blobs.
 //!
-//! The schema-2 contract is "a standard zstd frame around the MessagePack
+//! The schema-2 contract is "a standard zstd frame around the `MessagePack`
 //! serialization of a [`Turn`](choreo_proto::Turn)". The codec is implemented
 //! by `structured-zstd` (pure Rust, no libzstd C build); numeric compression
 //! levels map onto C zstd numbering, so [`COMPRESSION_LEVEL`] keeps the tuning
@@ -28,7 +28,7 @@ use super::db_err;
 /// encode cost (12+ is ~18× slower for ~0.01 more ratio), so 6 balances ratio
 /// and write-path cost. Tuning this is a constant, not a design change — the
 /// codec is concrete (zstd frame format) and the on-disk contract is
-/// "zstd-compressed MessagePack", independent of the implementation.
+/// "zstd-compressed `MessagePack`", independent of the implementation.
 const COMPRESSION_LEVEL: i32 = 6;
 
 /// Maximum number of bytes a single `session_turns` value may expand to when a
@@ -57,7 +57,7 @@ pub(super) const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Encode a MessagePack-encoded `Turn` with zstd at [`COMPRESSION_LEVEL`] into
 /// one complete, standard zstd frame. Compression is applied to the WHOLE
 /// serialized blob (never per-field): zstd matches redundancy across the entire
-/// buffer, so it also compresses the MessagePack framing overhead (field keys,
+/// buffer, so it also compresses the `MessagePack` framing overhead (field keys,
 /// headers) on top of the string payloads. Pure-Rust `structured-zstd`; numeric
 /// levels match C zstd numbering, so [`COMPRESSION_LEVEL`] keeps its tuned
 /// meaning. Infallible for our purposes — any input can be framed — so we
@@ -69,7 +69,7 @@ pub(super) fn zstd_encode(payload: &[u8]) -> Vec<u8> {
     )
 }
 
-/// Recover the original MessagePack bytes from a zstd frame, bounded by
+/// Recover the original `MessagePack` bytes from a zstd frame, bounded by
 /// [`MAX_TURN_DECODED_BYTES`] (see [`zstd_decode_with_limit`]).
 pub(super) fn zstd_decode(blob: &[u8]) -> io::Result<Vec<u8>> {
     zstd_decode_with_limit(blob, MAX_TURN_DECODED_BYTES)
@@ -134,6 +134,9 @@ pub(super) fn zstd_decode_with_limit(blob: &[u8], limit: u64) -> io::Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The fixture builders write into Strings via `write!` — fmt::Write only
+    // exists in test builds, so the import lives here rather than at the top.
+    use std::fmt::Write as _;
 
     #[test]
     fn zstd_round_trip_and_bounded_decode() {
@@ -224,8 +227,8 @@ mod tests {
         let mut state: u64 = 0x5EED_CAFE;
         let mut next = move || {
             state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             (state >> 33) as usize
         };
         let words = [
@@ -251,10 +254,11 @@ mod tests {
         ];
         let mut out = String::new();
         for block in 0..60 {
-            out.push_str(&format!(
-                "user: What about the {} in block {block}?\n",
+            let _ = writeln!(
+                out,
+                "user: What about the {} in block {block}?",
                 words[next() % words.len()]
-            ));
+            );
             out.push_str("assistant: The ");
             for _ in 0..next() % 10 + 3 {
                 out.push_str(words[next() % words.len()]);

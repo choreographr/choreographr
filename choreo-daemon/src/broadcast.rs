@@ -86,6 +86,7 @@ pub struct SubscriberSink {
 }
 
 impl SubscriberSink {
+    #[must_use]
     pub fn new(tx: Sender<DaemonMessage>) -> Self {
         SubscriberSink {
             tx,

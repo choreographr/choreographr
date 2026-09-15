@@ -353,7 +353,7 @@ fn response_empty_content_errors() {
 #[test]
 fn known_models_are_sorted() {
     let models = KNOWN_CLAUDE_MODELS;
-    assert!(!models.is_empty());
+    assert_ne!(models, [] as [String; 0]);
     // Verify at least some well-known models are present.
     assert!(models.contains(&"claude-sonnet-4-20250514"));
     assert!(models.contains(&"claude-haiku-3-5-20241022"));

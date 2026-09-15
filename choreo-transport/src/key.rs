@@ -33,11 +33,17 @@ pub struct TransportSecretKey(pub(crate) [u8; 32]);
 
 impl TransportSecretKey {
     /// Wrap a raw 32-byte secret key.
+    ///
+    /// # Errors
+    ///
+    /// Never fails; infallible by construction.
+    #[must_use]
     pub fn new(bytes: [u8; 32]) -> Self {
         TransportSecretKey(bytes)
     }
 
     /// Expose the inner bytes for use in handshake APIs.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -84,11 +90,21 @@ fn keypair_dir() -> Result<PathBuf, TransportError> {
 }
 
 /// Path to the Noise IK static secret key (~/.config/choreographr/transport.sec)
+///
+/// # Errors
+///
+/// Returns [`TransportError::ConfigDirNotFound`] when no config directory
+/// exists.
 pub fn transport_sec_path() -> Result<PathBuf, TransportError> {
     Ok(keypair_dir()?.join("transport.sec"))
 }
 
 /// Path to the Noise IK static public key (~/.config/choreographr/transport.pub)
+///
+/// # Errors
+///
+/// Returns [`TransportError::ConfigDirNotFound`] when no config directory
+/// exists.
 pub fn transport_pub_path() -> Result<PathBuf, TransportError> {
     Ok(keypair_dir()?.join("transport.pub"))
 }
@@ -100,10 +116,17 @@ pub fn transport_pub_path() -> Result<PathBuf, TransportError> {
 ///
 /// Returns the 32-byte key on success, or a `TransportError` on I/O
 /// failure, invalid length, or missing config directory.
+///
+/// # Errors
+///
+/// Returns [`TransportError`] on file I/O failure, a key file of a length
+/// other than exactly 32 bytes, or a missing config directory (from the
+/// [`transport_pub_path`] fallback).
 pub fn read_server_pk(path: Option<&str>) -> Result<[u8; 32], TransportError> {
-    let pk_path = path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| transport_pub_path().unwrap_or_else(|_| PathBuf::from("transport.pub")));
+    let pk_path = path.map_or_else(
+        || transport_pub_path().unwrap_or_else(|_| PathBuf::from("transport.pub")),
+        PathBuf::from,
+    );
     let bytes = std::fs::read(&pk_path)?;
     if bytes.len() != 32 {
         return Err(TransportError::Io(std::io::Error::new(
@@ -131,6 +154,11 @@ pub fn read_server_pk(path: Option<&str>) -> Result<[u8; 32], TransportError> {
 /// client's, for the ACL), and the client's first-contact flow displays it
 /// for the human confirm step. The base64 cluster groups are small enough
 /// to compare by eye without mistaking a single changed character.
+///
+/// # Errors
+///
+/// Never fails; infallible by construction.
+#[must_use]
 pub fn fingerprint(pk: &[u8; 32]) -> String {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(pk);
@@ -154,6 +182,11 @@ pub fn fingerprint(pk: &[u8; 32]) -> String {
 /// (to verify a download) or any pinned known-servers entry. Enforces the
 /// 32-byte length exactly like [`read_server_pk`] — a truncated or padded
 /// file is an error, never a quietly wrong fingerprint.
+///
+/// # Errors
+///
+/// Returns [`TransportError`] on file I/O failure or a key file of a
+/// length other than exactly 32 bytes.
 pub fn fingerprint_of_file(path: &std::path::Path) -> Result<String, TransportError> {
     let bytes = std::fs::read(path)?;
     let len = bytes.len();
@@ -172,8 +205,17 @@ pub fn fingerprint_of_file(path: &std::path::Path) -> Result<String, TransportEr
 /// If both files exist and are valid (32 bytes each), loads and returns them.
 /// Otherwise generates a new X25519 keypair and writes both files.
 ///
-/// Returns (secret_key, public_key).
+/// Returns (`secret_key`, `public_key`).
+///
+/// # Errors
+///
+/// Returns [`TransportError`] on config-directory resolution, file I/O,
+/// or lock/unlock failures.
 pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), TransportError> {
+    // Hoisted to the top of the function per clippy::items_after_statements:
+    // the traits are needed in both the fast path and the write path below.
+    use std::io::{Seek, SeekFrom, Write};
+
     let sec_path = transport_sec_path()?;
     let pub_path = transport_pub_path()?;
 
@@ -217,7 +259,6 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
             debug!("loaded existing transport keypair (written concurrently)");
             return Ok((TransportSecretKey(sk), pk));
         }
-        use std::io::{Seek, SeekFrom, Write};
         sec_file.set_len(0)?;
         sec_file.seek(SeekFrom::Start(0))?;
         sec_file.write_all(&secret)?;
@@ -348,6 +389,10 @@ mod tests {
     /// the original key.
     #[test]
     fn fingerprint_is_deterministic_grouped_and_bijective() {
+        // Base64 engine trait, needed by the decode at the bottom of the
+        // test; hoisted to the first statement per items_after_statements.
+        use base64::Engine as _;
+
         let pk = [
             0x3F, 0x2A, 0x9C, 0x11, 0x7B, 0x04, 0xE5, 0xD8, 0xA1, 0xC6, 0x42, 0xD9, 0x08, 0xF3,
             0xB7, 0xE2, 0x5D, 0x60, 0x19, 0xAB, 0xCC, 0x37, 0x84, 0x0E, 0x71, 0xFA, 0x92, 0x63,
@@ -364,7 +409,6 @@ mod tests {
 
         // Stripping the separators yields the plain base64 — the same
         // string the ACL stores — and decoding THAT is the original key.
-        use base64::Engine as _;
         let joined: String = groups.concat();
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&joined)

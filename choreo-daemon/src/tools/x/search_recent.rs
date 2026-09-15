@@ -64,7 +64,7 @@ impl crate::tools::Tool for XSearchRecent {
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Searching X for: `{}`.", args.query)];
         if let Some(max) = args.max_results {
-            parts.push(format!(" Max results: {}.", max));
+            parts.push(format!(" Max results: {max}."));
         }
         parts.concat()
     }

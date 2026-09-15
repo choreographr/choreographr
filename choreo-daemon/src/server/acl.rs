@@ -87,16 +87,19 @@ impl Acl {
     }
 
     /// Check whether a client's public key is authorized.
+    #[must_use]
     pub fn contains(&self, pubkey: &[u8; 32]) -> bool {
         self.keys.contains(pubkey)
     }
 
     /// The number of authorized clients (for counts in replies/logs).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.keys.len()
     }
 
     /// Whether no clients are authorized.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -123,6 +126,7 @@ pub struct SharedAcl {
 
 impl SharedAcl {
     /// Load the ACL from `path` and wrap it in a hot-reloadable holder.
+    #[must_use]
     pub fn load(path: &Path) -> std::sync::Arc<Self> {
         let acl = Acl::load(path);
         std::sync::Arc::new(SharedAcl {
@@ -209,8 +213,15 @@ impl SharedAcl {
 /// concurrent reload reads, socket-driven adds, and CLI adds serialize
 /// instead of tearing each other's entries. Creates the parent dir and the
 /// file itself as needed. Returns after an fsync: the entry is on disk.
+///
+/// # Errors
+///
+/// Returns Err (as a descriptive message) if the parent directory or file
+/// cannot be created/opened, locking fails, the write or fsync fails, or
+/// base64 encoding the key fails.
 pub fn append_key_locked(path: &Path, key: &[u8; 32]) -> Result<(), String> {
     use base64::Engine as _;
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create the ACL directory: {e}"))?;
@@ -237,7 +248,6 @@ pub fn append_key_locked(path: &Path, key: &[u8; 32]) -> Result<(), String> {
         .map_err(|e| format!("cannot lock the ACL file: {e}"))?;
     // Append mode (O_APPEND): the entry lands atomically at the end even
     // against another process's concurrent append.
-    use std::io::Write;
     write!(
         &file,
         "[[client]]\npubkey = \"{}\"\n",
@@ -268,7 +278,7 @@ pub fn spawn_acl_watcher(
     let _ = std::thread::Builder::new()
         .name("acl-config-watch".into())
         .spawn(move || {
-            for _first in acl_rx.iter() {
+            for _first in &acl_rx {
                 // Coalesce a save burst (temp + rename fans out several
                 // events) into ONE AclReload — the command loop's
                 // parse-compare makes the redundant events no-ops anyway.
@@ -310,7 +320,12 @@ pubkey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
         // The base64-decoded key is 0x01..0x20 (32 bytes).
         let mut expected = [0u8; 32];
         for (i, elem) in expected.iter_mut().enumerate() {
-            *elem = (i as u8) + 1;
+            // Index 0..32 into u8: the loop bound is the array length.
+            *elem = {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = i as u8;
+                v + 1
+            };
         }
         assert!(acl.contains(&expected));
 
@@ -344,7 +359,12 @@ pubkey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
 
         let mut expected = [0u8; 32];
         for (i, elem) in expected.iter_mut().enumerate() {
-            *elem = (i as u8) + 1;
+            // Index 0..32 into u8: the loop bound is the array length.
+            *elem = {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = i as u8;
+                v + 1
+            };
         }
         assert!(acl.contains(&expected));
     }
@@ -368,7 +388,12 @@ pubkey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
 
         let mut expected = [0u8; 32];
         for (i, elem) in expected.iter_mut().enumerate() {
-            *elem = (i as u8) + 1;
+            // Index 0..32 into u8: the loop bound is the array length.
+            *elem = {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = i as u8;
+                v + 1
+            };
         }
         assert!(acl.contains(&expected));
     }
@@ -389,7 +414,7 @@ pubkey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
         format!("[[client]]\npubkey = \"{key_b64}\"\n")
     }
 
-    /// The base64 forms of KEY_A / KEY_B.
+    /// The base64 forms of `KEY_A` / `KEY_B`.
     fn b64(key: &[u8; 32]) -> String {
         BASE64.encode(key)
     }

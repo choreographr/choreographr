@@ -43,6 +43,11 @@ async fn evm_call_impl(
 
 /// Synchronous entry point: runs [`evm_call_impl`] on the sidecar runtime and
 /// caps the output at the shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`BlockchainError`] when the node is unreachable, the RPC call
+/// fails, or the capped sanitized output cannot be produced.
 pub fn execute_evm_call(args: &EvmCallArgs) -> Result<String, BlockchainError> {
     log_execution("evm_call", &args.rpc_url);
     let output = block_on(rpc_call(evm_call_impl(
@@ -54,6 +59,7 @@ pub fn execute_evm_call(args: &EvmCallArgs) -> Result<String, BlockchainError> {
     Ok(truncate_tool_output(&output))
 }
 
+#[must_use]
 pub fn describe_evm_call_invocation(args: &EvmCallArgs) -> String {
     match args.block_tag.as_deref() {
         Some(tag) => format!(

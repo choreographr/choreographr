@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tracing::{debug, info, trace, warn};
 pub(crate) fn extract_json_string(json: &str, key: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    v.get(key)?.as_str().map(|s| s.to_string())
+    v.get(key)?.as_str().map(std::string::ToString::to_string)
 }
 
 pub(crate) struct SystemContentParams<'a> {
@@ -25,7 +25,7 @@ pub(crate) struct SystemContentParams<'a> {
 }
 
 pub(crate) fn build_system_content(
-    params: SystemContentParams,
+    params: &SystemContentParams,
     context_cache: &mut Option<(u64, Arc<String>)>,
 ) -> String {
     let groups = params.tool_registry.groups();
@@ -87,7 +87,7 @@ pub(crate) fn build_system_content(
 }
 
 /// Detect a `load_skill` tool call and persist the loaded skill body into
-/// the session's loaded_skill_bodies accumulator so it appears in subsequent
+/// the session's `loaded_skill_bodies` accumulator so it appears in subsequent
 /// system prompts.
 pub(crate) fn persist_loaded_skill(
     session: &mut SessionState,
@@ -117,13 +117,13 @@ pub(crate) fn persist_loaded_skill(
     // mutably.
     let body = {
         let discovered;
-        let skills: &[context::SkillMeta] = match session.discovered_skills.as_deref() {
-            Some(skills) => skills,
-            None => {
-                discovered =
-                    context::discover_skills_ambient(session.config.working_dir.as_deref());
-                &discovered
-            }
+        let skills: &[context::SkillMeta] = if let Some(skills) =
+            session.discovered_skills.as_deref()
+        {
+            skills
+        } else {
+            discovered = context::discover_skills_ambient(session.config.working_dir.as_deref());
+            &discovered
         };
         context::load_skill_body_from(skills, &name)
     };

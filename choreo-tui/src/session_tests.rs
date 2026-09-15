@@ -22,6 +22,9 @@ fn app_starts_in_chat_page() {
     );
 }
 
+// The suggested rewrite (asserting on a match of the concrete collection type)
+// is worse; clippy::assert_is_empty fires on plain is_empty asserts here.
+#[allow(clippy::assert_is_empty)]
 #[test]
 fn session_manager_state_new_is_empty() {
     let state = SessionManagerState::new();
@@ -33,6 +36,7 @@ fn session_manager_state_new_is_empty() {
     assert!(state.detail_data.is_none());
 }
 
+#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn session_manager_set_sessions_empty() {
     let mut state = SessionManagerState::new();
@@ -543,7 +547,7 @@ mod session_manager_key_tests {
 
 // ── multi-session streaming: switching keeps accumulated content ──
 
-/// A turn whose assistant text was streamed in via OutputChunk.
+/// A turn whose assistant text was streamed in via `OutputChunk`.
 fn streamed_turn(user_text: &str, assistant_text: &str) -> Turn {
     Turn {
         created_at: choreo_proto::TimestampMs::now(),
@@ -581,6 +585,7 @@ fn placeholder_turn(user_text: &str) -> Turn {
     }
 }
 
+#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn reset_for_session_switch_preserves_accumulated_streaming_state() {
     let mut app = test_app();
@@ -783,20 +788,24 @@ fn handle_session_status_changed_updates_attached_status() {
     assert!(app.attached_status.is_none());
 
     // With no attached session, status should not be cached.
-    app.handle_session_status_changed(42, &SessionStatus::Inference, 1705314000000);
+    app.handle_session_status_changed(42, &SessionStatus::Inference, 1_705_314_000_000);
     assert!(app.attached_status.is_none());
 
     // Once attached, a status change for that session should be cached.
     app.attached_session_id = Some(42);
-    app.handle_session_status_changed(42, &SessionStatus::Inference, 1705314000000);
+    app.handle_session_status_changed(42, &SessionStatus::Inference, 1_705_314_000_000);
     assert_eq!(app.attached_status, Some(SessionStatus::Inference));
 
     // A status change for a different session should not overwrite.
-    app.handle_session_status_changed(99, &SessionStatus::Sleeping, 1705314000000);
+    app.handle_session_status_changed(99, &SessionStatus::Sleeping, 1_705_314_000_000);
     assert_eq!(app.attached_status, Some(SessionStatus::Inference));
 
     // A subsequent change for the attached session should update.
-    app.handle_session_status_changed(42, &SessionStatus::ToolCall("test".into()), 1705314000000);
+    app.handle_session_status_changed(
+        42,
+        &SessionStatus::ToolCall("test".into()),
+        1_705_314_000_000,
+    );
     assert_eq!(
         app.attached_status,
         Some(SessionStatus::ToolCall("test".into()))
@@ -1469,7 +1478,7 @@ fn attached_subsession_finished_detects_active_to_idle_only() {
 
     // Idle → idle (the child already finished; this is a duplicate or a
     // summary refresh) must not re-fire.
-    app.handle_session_status_changed(99, &SessionStatus::Inactive, 1705315000000);
+    app.handle_session_status_changed(99, &SessionStatus::Inactive, 1_705_315_000_000);
     assert_eq!(
         app.attached_subsession_finished(99, &SessionStatus::Inactive),
         None,
@@ -1528,7 +1537,7 @@ fn subsession_finish_switches_back_to_parent_with_notification() {
             session_id: Some(99),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
-                last_modified: 1705315000000,
+                last_modified: 1_705_315_000_000,
             },
         },
         &mut app,
@@ -1578,14 +1587,14 @@ fn subsession_finish_does_not_fire_on_duplicate_idle_broadcast() {
         make_session(42, "parent session", "m1", 3),
         make_subsession(99, "child task", 42),
     ]);
-    app.handle_session_status_changed(99, &SessionStatus::Inactive, 1705315000000);
+    app.handle_session_status_changed(99, &SessionStatus::Inactive, 1_705_315_000_000);
 
     handle_daemon_message(
         DaemonMessage::Session {
             session_id: Some(99),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
-                last_modified: 1705315000000,
+                last_modified: 1_705_315_000_000,
             },
         },
         &mut app,
@@ -1615,7 +1624,7 @@ fn top_level_session_finish_does_not_switch() {
             session_id: Some(42),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
-                last_modified: 1705315000000,
+                last_modified: 1_705_315_000_000,
             },
         },
         &mut app,
@@ -1647,7 +1656,7 @@ fn subsession_finish_with_missing_parent_does_not_switch() {
             session_id: Some(99),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
-                last_modified: 1705315000000,
+                last_modified: 1_705_315_000_000,
             },
         },
         &mut app,

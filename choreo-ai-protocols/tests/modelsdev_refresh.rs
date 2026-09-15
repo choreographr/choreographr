@@ -13,7 +13,7 @@ use choreo_ai_protocols::normalize_modelsdev;
 
 /// A plain fetch must return a non-empty body that normalizes into a
 /// non-empty catalog.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn live_fetch_normalizes_to_a_catalog() {
     let outcome = fetch_modelsdev(None, false).expect("models.dev fetch succeeds");
@@ -35,8 +35,8 @@ fn live_fetch_normalizes_to_a_catalog() {
 }
 
 /// The etag round trip must be a valid conditional GET: either the server
-/// says NotModified (cache current) or returns a fresh body — never an error.
-#[ignore]
+/// says `NotModified` (cache current) or returns a fresh body — never an error.
+#[ignore = "integration"]
 #[test]
 fn live_etag_round_trip_never_errors() {
     let first = fetch_modelsdev(None, false).expect("first fetch succeeds");
@@ -58,7 +58,7 @@ fn live_etag_round_trip_never_errors() {
 
 /// `--force` must bypass the etag and return a fresh body even right after a
 /// plain fetch.
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn live_force_fetch_returns_fresh_body() {
     let first = fetch_modelsdev(None, false).expect("first fetch succeeds");

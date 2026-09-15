@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Weak;
 use std::thread;
@@ -27,7 +28,7 @@ impl RunSeries {
 pub(crate) struct SeriesStep {
     /// Name of the tool to call.
     tool: String,
-    /// Arguments for the tool. Use {{step_1}}, {{step_2}}, etc. nested in
+    /// Arguments for the tool. Use {{`step_1`}}, {{`step_2`}}, etc. nested in
     /// string values to reference the output of a previous step (1-based).
     arguments: serde_json::Value,
 }
@@ -118,7 +119,7 @@ impl Tool for RunSeries {
             x_credentials,
             working_dir,
             ctx,
-            Some(output_tx),
+            Some(&output_tx),
         )
     }
 }
@@ -148,11 +149,11 @@ fn substitute_args(args: &Value, outputs: &HashMap<usize, String>) -> Value {
                             result.push_str(output);
                         } else {
                             // Unknown step index — emit the placeholder as-is.
-                            result.push_str(&format!("{{{{step_{idx}}}}}"));
+                            let _ = write!(result, "{{{{step_{idx}}}}}");
                         }
                     } else {
                         // Non-numeric index — emit the full placeholder as-is.
-                        result.push_str(&format!("{{{{step_{}}}}}", rest.get(..end).unwrap_or("")));
+                        let _ = write!(result, "{{{{step_{}}}}}", rest.get(..end).unwrap_or(""));
                     }
                     rest = rest.get(end + 2..).unwrap_or(""); // advance past "}}"
                 } else {
@@ -189,7 +190,7 @@ fn execute_series(
     x_credentials: Option<&ServiceCredential>,
     working_dir: Option<&Path>,
     ctx: Option<&ToolContext>,
-    output_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
+    output_tx: Option<&crossbeam_channel::Sender<Vec<u8>>>,
 ) -> Result<String, ToolExecError> {
     let registry = registry
         .upgrade()
@@ -233,7 +234,7 @@ fn execute_series(
             let (sub_tx, sub_rx) =
                 crossbeam_channel::bounded::<Vec<u8>>(STREAMING_CHANNEL_CAPACITY);
             let relay_handle = thread::spawn({
-                let parent_tx = parent_tx.clone();
+                let parent_tx = (*parent_tx).clone();
                 move || {
                     for chunk in sub_rx {
                         if parent_tx.send(chunk).is_err() {

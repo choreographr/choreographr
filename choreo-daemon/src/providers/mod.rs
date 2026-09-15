@@ -24,7 +24,7 @@ pub struct InferenceProvider {
     client: Arc<dyn ProviderClient>,
     /// The provider slug from the catalog (e.g. "openai", "anthropic", "opencode").
     /// Used for catalog lookups instead of delegating to the client, which may
-    /// return a generic value (e.g. OpenAiClient always says "openai"). Owned
+    /// return a generic value (e.g. `OpenAiClient` always says "openai"). Owned
     /// because the catalog lookup that supplies it returns a clone, not a
     /// `'static` reference.
     slug: String,
@@ -74,6 +74,7 @@ fn daemon_user_agent() -> String {
 }
 
 impl InferenceProvider {
+    #[must_use]
     pub fn from_openai(client: OpenAiClient) -> Self {
         Self {
             client: Arc::new(client),
@@ -82,6 +83,7 @@ impl InferenceProvider {
         }
     }
 
+    #[must_use]
     pub fn from_anthropic(client: AnthropicClient) -> Self {
         Self {
             client: Arc::new(client),
@@ -90,6 +92,7 @@ impl InferenceProvider {
         }
     }
 
+    #[must_use]
     pub fn from_google(client: GoogleClient) -> Self {
         Self {
             client: Arc::new(client),
@@ -99,8 +102,13 @@ impl InferenceProvider {
     }
 
     /// Create a provider from an account config + credential key.
-    /// Applies all account-level overrides (base_url, streaming, timeouts)
+    /// Applies all account-level overrides (`base_url`, streaming, timeouts)
     /// onto the service config before constructing the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err if the account's provider protocol is not supported or
+    /// the client construction fails (e.g. missing credential).
     pub fn from_account_config(
         config: &crate::accounts::AccountConfig,
         api_key: Option<String>,
@@ -117,7 +125,7 @@ impl InferenceProvider {
         match entry.protocol {
             ProviderProtocol::OpenAi { max_tokens_field } => {
                 let mut svc_config = ServiceConfig {
-                    base_url: entry.base_url.to_string(),
+                    base_url: entry.base_url.clone(),
                     chat_completions_max_tokens_field: max_tokens_field,
                     provider_slug: entry.slug.clone(),
                     // Every inference request identifies as the daemon
@@ -173,11 +181,11 @@ impl InferenceProvider {
                 let mut anthro_cfg = AnthropicConfig::default();
                 // If the account doesn't specify a base_url, use the catalog default.
                 if config.base_url.is_none() {
-                    anthro_cfg.base_url = entry.base_url.to_string();
+                    anthro_cfg.base_url.clone_from(&entry.base_url);
                 }
                 // Catalog slug (not hardcoded "anthropic") so gateway header
                 // gating and metrics see e.g. "opencode-go-anthropic-compatible".
-                anthro_cfg.provider_slug = entry.slug.clone();
+                anthro_cfg.provider_slug.clone_from(&entry.slug);
                 anthro_cfg.user_agent = Some(daemon_user_agent());
                 let overrides = config.provider_overrides();
                 anthro_cfg.apply_overrides(&overrides);
@@ -197,7 +205,7 @@ impl InferenceProvider {
                 let mut google_cfg = GoogleConfig::default();
                 // If the account doesn't specify a base_url, use the catalog default.
                 if config.base_url.is_none() {
-                    google_cfg.base_url = entry.base_url.to_string();
+                    google_cfg.base_url.clone_from(&entry.base_url);
                 }
                 google_cfg.user_agent = Some(daemon_user_agent());
                 let overrides = config.provider_overrides();
@@ -223,6 +231,13 @@ impl InferenceProvider {
         }
     }
 
+    /// Run a single non-streaming chat-completion turn and record API
+    /// latency metrics for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err when the underlying client reports an
+    /// [`InferenceError`] (transport, auth, or API failure).
     pub fn chat_completion_turn(
         &self,
         params: ChatTurnRequest<'_>,
@@ -237,6 +252,14 @@ impl InferenceProvider {
         result
     }
 
+    /// Run a single streaming chat-completion turn, forwarding events to
+    /// `on_event`, and record API latency metrics for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err when the underlying client reports an
+    /// [`InferenceError`] (transport, auth, or API failure) or the event
+    /// callback fails with an I/O error.
     pub fn chat_completion_turn_streaming(
         &self,
         params: ChatTurnRequest<'_>,
@@ -279,27 +302,37 @@ impl InferenceProvider {
     /// tool thread via `DaemonCommand::GetImageGenerationProvider` — owns a
     /// share. The client is immutable, so sharing it is safe with no
     /// additional synchronization.
+    #[must_use]
     pub fn image_client(&self) -> Option<Arc<dyn ImageGenerationClient>> {
         self.image_client.clone()
     }
 
     /// Return the provider slug (e.g. "openai", "anthropic").
+    #[must_use]
     pub fn provider_slug(&self) -> &str {
         self.slug.as_str()
     }
 
     /// Resolve the context window for a model, using the client config first
     /// and falling back to the static catalog for known model slugs.
+    #[must_use]
     pub fn resolve_context_window(&self, model: &str) -> Option<u32> {
         self.client
             .context_window_for_model(model)
             .or_else(|| choreo_ai_protocols::lookup_context_window(&self.slug, model))
     }
 
+    /// List the model slugs available from this provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err when the underlying client reports an
+    /// [`InferenceError`] (transport, auth, or API failure).
     pub fn list_models(&self) -> Result<Vec<String>, InferenceError> {
         self.client.list_models()
     }
 
+    #[must_use]
     pub fn supports_programmatic_tool_calling(&self, model: &str) -> bool {
         self.client.supports_programmatic_tool_calling(model)
     }
@@ -457,7 +490,7 @@ mod tests {
         let image_client = provider
             .image_client()
             .expect("OpenAI protocol gets an image client");
-        let debug = format!("{:?}", image_client);
+        let debug = format!("{image_client:?}");
         assert!(debug.starts_with("ZaiImageClient"), "{debug}");
         // Mainland zhipuai resolves to the same Zhipu image adapter.
         let cfg = AccountConfig::simple("zhipu", "zhipuai");
@@ -503,7 +536,7 @@ mod tests {
         .unwrap();
         let provider = InferenceProvider::from_anthropic(client);
         let models = provider.list_models().unwrap();
-        assert!(!models.is_empty());
+        assert_ne!(models, [] as [std::string::String; 0]);
         assert!(models.contains(&"claude-sonnet-4-20250514".to_string()));
     }
 
@@ -565,6 +598,8 @@ pub(crate) mod test_util {
     // clippy::panic_in_result_fn has no allow-*-in-tests config option.
     #[allow(clippy::panic_in_result_fn)]
     impl ProviderClient for StubProviderClient {
+        // &'static str is the trait's required lifetime, not an over-bound literal.
+        #[allow(clippy::unnecessary_literal_bound)]
         fn provider_slug(&self) -> &str {
             "test-stub"
         }
@@ -604,6 +639,8 @@ pub(crate) mod test_util {
     pub(crate) struct FailingProviderClient;
 
     impl ProviderClient for FailingProviderClient {
+        // &'static str is the trait's required lifetime, not an over-bound literal.
+        #[allow(clippy::unnecessary_literal_bound)]
         fn provider_slug(&self) -> &str {
             "test-failing"
         }

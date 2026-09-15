@@ -5,7 +5,7 @@ use std::thread;
 
 use choreo_client_core::run_daemon_connection;
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn local_shutdown_unblocks_daemon_connection_without_eof() {
     // Keep the socket name short: macOS caps Unix socket paths at ~104 bytes,

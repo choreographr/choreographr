@@ -7,7 +7,7 @@
 //! point of the hot-reload (and the prerequisite for phase 5's `/acl add`
 //! and phase 6's `choreographr acl-add`, which rely on the same chain).
 //!
-//! `#[ignore]` per test discipline (real sockets, spawned daemon). Waiting
+//! `#[ignore = "integration"]` per test discipline (real sockets, spawned daemon). Waiting
 //! for the watcher is bounded POLLING: reconnect attempts in a deadline
 //! loop — never a fixed sleep — so the test is as deterministic as the
 //! filesystem event delivery allows and fails loudly on timeout.
@@ -105,8 +105,9 @@ fn test_keypair() -> (tempfile::TempDir, [u8; 32]) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn acl_edit_authorizes_new_client_without_restart() {
+    use base64::Engine as _;
     let (key_dir_a, client_pk_a) = test_keypair();
     let (key_dir_b, client_pk_b) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk_a]);
@@ -127,7 +128,6 @@ fn acl_edit_authorizes_new_client_without_restart() {
     // THE hot-reload trigger: append client B's key to the ACL file the
     // running daemon loaded. File format per server/acl.rs ([[client]] with
     // base64 pubkey) — the same the daemon wrote at startup.
-    use base64::Engine as _;
     let existing = std::fs::read_to_string(&daemon.acl_path).expect("read ACL");
     let addition = format!(
         "[[client]]\npubkey = \"{}\"\n",
@@ -191,8 +191,10 @@ fn acl_edit_authorizes_new_client_without_restart() {
 /// daemon restart. This is the phase-5 flow that replaces the manual
 /// file-edit from `acl_edit_authorizes_new_client_without_restart`.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn acl_add_from_local_client_enrolls_new_tcp_client() {
+    use base64::Engine as _;
+    use choreo_client_core::run_daemon_connection;
     let (_key_dir_a, client_pk_a) = test_keypair();
     let (key_dir_b, client_pk_b) = test_keypair();
     let mut daemon = common::SpawnedDaemon::start(&[client_pk_a]);
@@ -201,7 +203,6 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
     // the reader can be severed deterministically at teardown (the daemon
     // does not close an idle connection just because the client's writer
     // side dropped).
-    use choreo_client_core::run_daemon_connection;
     let (from_ui, to_daemon) = mpsc::channel();
     let (tx, rx) = mpsc::channel();
     let (unix_shutdown_tx, unix_shutdown_rx) = mpsc::channel();
@@ -223,9 +224,7 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
         .send(choreo_proto::ClientMessage::SubscribeAllActivity)
         .expect("subscribe to activity");
 
-    use base64::Engine as _;
     let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(client_pk_b);
-
     // Sanity: client B is rejected BEFORE enrollment.
     {
         let mut rejected = Client::connect(
@@ -260,12 +259,12 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
                 assert!(ok, "/acl add from a local client must succeed");
                 break;
             }
-            choreo_proto::DaemonMessage::CatalogUpdated { .. } => continue,
+            choreo_proto::DaemonMessage::CatalogUpdated { .. } => {}
             // The daemon pushes its current lock state to every activity
             // subscriber on subscribe (like CatalogUpdated) and re-broadcasts
             // it on any lock-state change, so an unsolicited Locked/Unlocked
             // can arrive mid-wait — treat it as informational and keep going.
-            choreo_proto::DaemonMessage::Locked | choreo_proto::DaemonMessage::Unlocked => continue,
+            choreo_proto::DaemonMessage::Locked | choreo_proto::DaemonMessage::Unlocked => {}
             other => panic!("expected AclAddResult, got {other:?}"),
         }
     }

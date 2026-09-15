@@ -1,6 +1,6 @@
 //! Integration tests for the bounded session-thread shutdown join.
 //!
-//! These exercise real threads and real time, so they are `#[ignore]`d like
+//! These exercise real threads and real time, so they are `#[ignore = "integration"]`d like
 //! all other integration tests (run with `cargo test -- --ignored`).
 //!
 //! They use the grace-parameterized seam
@@ -15,7 +15,7 @@ use std::time::Duration;
 use choreo_daemon::join_session_shutdown_with_grace_for_test;
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn joins_a_finished_session_thread() {
     // A thread that returns immediately exits before the grace period
     // elapses, so the bounded join must report success.
@@ -25,7 +25,7 @@ fn joins_a_finished_session_thread() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn abandons_a_stuck_session_thread() {
     // A thread blocked on a channel that is never sent to models a request
     // worker stuck in a provider read.  The bounded join must give up after

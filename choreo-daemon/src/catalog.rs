@@ -61,7 +61,7 @@ use crate::db::{get_catalog_etag, get_catalog_last_attempt_ms, set_catalog_last_
 /// daemons (or across days for one daemon) the load wraps around the daily
 /// cycle instead of a majority always hitting the server during working
 /// hours. `/refresh-models` bypasses it anytime.
-const REFRESH_ATTEMPT_INTERVAL: Duration = Duration::from_secs(25 * 60 * 60);
+const REFRESH_ATTEMPT_INTERVAL: Duration = Duration::from_hours(25);
 
 /// Postcard cache filename under the data dir.
 const CATALOG_BIN_NAME: &str = "catalog.bin";
@@ -130,19 +130,18 @@ impl CatalogPaths {
     pub fn from_dirs() -> Self {
         let data_dir = dirs::data_dir().map(|d| d.join("choreographr"));
         let config_dir = dirs::config_dir().map(|d| d.join("choreographr"));
-        match (&data_dir, &config_dir) {
-            (Some(data), Some(config)) => Self {
+        if let (Some(data), Some(config)) = (&data_dir, &config_dir) {
+            Self {
                 bin: data.join(CATALOG_BIN_NAME),
                 overlay: config.join(USER_OVERLAY_NAME),
-            },
-            _ => {
-                warn!(
-                    ?data_dir,
-                    ?config_dir,
-                    "could not resolve catalog cache/overlay dirs; using the embedded catalog only",
-                );
-                Self::default()
             }
+        } else {
+            warn!(
+                ?data_dir,
+                ?config_dir,
+                "could not resolve catalog cache/overlay dirs; using the embedded catalog only",
+            );
+            Self::default()
         }
     }
 }
@@ -248,7 +247,7 @@ pub(crate) fn spawn_catalog_maintenance(
     let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceEvent>();
     let _ = std::thread::Builder::new()
         .name("catalog-maintenance".into())
-        .spawn(move || maintenance_loop(daemon_tx, db, paths, rx, overlay_rx));
+        .spawn(move || maintenance_loop(&daemon_tx, &db, &paths, &rx, &overlay_rx));
     tx
 }
 
@@ -268,15 +267,15 @@ struct MaintenanceState {
 }
 
 fn maintenance_loop(
-    daemon_tx: mpsc::Sender<DaemonCommand>,
-    db: Arc<redb::Database>,
-    paths: CatalogPaths,
-    rx: Receiver<MaintenanceEvent>,
-    overlay_rx: Receiver<ConfigChange>,
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    db: &Arc<redb::Database>,
+    paths: &CatalogPaths,
+    rx: &Receiver<MaintenanceEvent>,
+    overlay_rx: &Receiver<ConfigChange>,
 ) {
     // ── 0. Ensure the catalog data dir exists so the cache can be written.
     // (The config dir is created by the shared config transport, not here.)
-    ensure_runtime_dirs(&paths);
+    ensure_runtime_dirs(paths);
 
     // ── 1. Load the base: valid cache file first, embedded catalog.bin as
     // the fallback (the S4 load order). The etag is only read from the DB
@@ -284,37 +283,34 @@ fn maintenance_loop(
     // None` so the next fetch is a plain GET that rebuilds both — a 304
     // with no cache would otherwise leave the daemon on the embedded blob
     // forever (the etag-requires-cache invariant, pinned by tests).
-    let (base, etag, cache_valid) = match load_cached_base(&paths.bin) {
-        Some(base) => {
-            let etag = match get_catalog_etag(&db) {
-                Ok(etag) => etag,
-                Err(e) => {
-                    warn!(error = %e, "failed to read the catalog etag from the DB; \
-                          the next refresh will be a plain GET");
-                    None
-                }
-            };
-            info!(
-                providers = base.len(),
-                "loaded catalog cache from disk ({} bytes)",
-                std::fs::metadata(&paths.bin).map(|m| m.len()).unwrap_or(0),
-            );
-            (base, etag, true)
-        }
-        None => {
-            let base = load_bundled_base();
-            info!(
-                providers = base.len(),
-                "no valid catalog cache; using the embedded catalog.bin",
-            );
-            (base, None, false)
-        }
+    let (base, etag, cache_valid) = if let Some(base) = load_cached_base(&paths.bin) {
+        let etag = match get_catalog_etag(db) {
+            Ok(etag) => etag,
+            Err(e) => {
+                warn!(error = %e, "failed to read the catalog etag from the DB; \
+                      the next refresh will be a plain GET");
+                None
+            }
+        };
+        info!(
+            providers = base.len(),
+            "loaded catalog cache from disk ({} bytes)",
+            std::fs::metadata(&paths.bin).map_or(0, |m| m.len()),
+        );
+        (base, etag, true)
+    } else {
+        let base = load_bundled_base();
+        info!(
+            providers = base.len(),
+            "no valid catalog cache; using the embedded catalog.bin",
+        );
+        (base, None, false)
     };
 
     // ── 1b. Load the persisted last-attempt anchor. `None` (never attempted
     // — first run, or an upgrade from a build without the key) means stale:
     // the startup gate below fetches immediately.
-    let last_attempt_ms = match get_catalog_last_attempt_ms(&db) {
+    let last_attempt_ms = match get_catalog_last_attempt_ms(db) {
         Ok(last_attempt) => last_attempt,
         Err(e) => {
             warn!(
@@ -367,8 +363,8 @@ fn maintenance_loop(
     // cooldown window does NOT hit the network at every start, and the 25 h
     // drift of the fetch time across the daily cycle survives restarts.
     if should_fetch_at_startup(cache_valid, state.last_attempt_ms, wall_now_ms()) {
-        record_attempt(&db, &mut state);
-        run_refresh(&daemon_tx, &mut state, false, Vec::new());
+        record_attempt(db, &mut state);
+        run_refresh(daemon_tx, &mut state, false, Vec::new());
     } else if let Some(deadline) =
         next_retry_deadline(state.last_attempt_ms, Instant::now(), wall_now_ms())
     {
@@ -385,10 +381,9 @@ fn maintenance_loop(
     // `select!`. The timer (`after(timeout)`) fires when a revalidation is
     // due; the two channels wake the loop on requests and overlay edits.
     loop {
-        let timeout = state
-            .next_retry_at
-            .map(|at| at.saturating_duration_since(Instant::now()))
-            .unwrap_or(REFRESH_ATTEMPT_INTERVAL);
+        let timeout = state.next_retry_at.map_or(REFRESH_ATTEMPT_INTERVAL, |at| {
+            at.saturating_duration_since(Instant::now())
+        });
         select! {
             recv(rx) -> msg => match msg {
                 Ok(MaintenanceEvent::RefreshNow { force, reply }) => {
@@ -399,17 +394,17 @@ fn maintenance_loop(
                     // edit is applied even when the conditional GET below
                     // returns 304 (a 304 sends no CatalogBaseChanged, so
                     // without this the reload is lost).
-                    reload_user_overlay(&daemon_tx, &mut state, &paths.overlay);
+                    reload_user_overlay(daemon_tx, &mut state, &paths.overlay);
                     // Coalesce: drain any RefreshNows queued while idle so a
                     // burst of /refresh-models becomes ONE fetch. Fold the
                     // force flag (a --force anywhere in the burst forces) and
                     // keep every reply sender. The whole burst is ONE attempt.
-                    let (any_force, replies) = fold_refresh_nows(&rx, force, reply);
+                    let (any_force, replies) = fold_refresh_nows(rx, force, reply);
                     // Explicit user intent bypasses the cooldown, but the
                     // attempt is still recorded (and the timer re-armed by
                     // run_refresh) so the DB anchor reflects reality.
-                    record_attempt(&db, &mut state);
-                    run_refresh(&daemon_tx, &mut state, any_force, replies);
+                    record_attempt(db, &mut state);
+                    run_refresh(daemon_tx, &mut state, any_force, replies);
                 }
                 Err(_) => {
                     info!("catalog maintenance channel closed; exiting");
@@ -420,7 +415,7 @@ fn maintenance_loop(
                 Ok(_change) => {
                     // The transport already filtered to this basename and a
                     // create/modify/remove kind; re-read + fingerprint-gate.
-                    reload_user_overlay(&daemon_tx, &mut state, &paths.overlay);
+                    reload_user_overlay(daemon_tx, &mut state, &paths.overlay);
                 }
                 Err(_) => {
                     // The config transport died; continue on the maintenance
@@ -436,8 +431,8 @@ fn maintenance_loop(
                     && Instant::now() >= at
                 {
                     state.next_retry_at = None;
-                    record_attempt(&db, &mut state);
-                    run_refresh(&daemon_tx, &mut state, false, Vec::new());
+                    record_attempt(db, &mut state);
+                    run_refresh(daemon_tx, &mut state, false, Vec::new());
                 }
             },
         }
@@ -459,7 +454,12 @@ fn should_fetch_at_startup(cache_valid: bool, last_attempt_ms: Option<u64>, now_
     }
     match last_attempt_ms {
         None => true,
-        Some(at) => now_ms.saturating_sub(at) >= REFRESH_ATTEMPT_INTERVAL.as_millis() as u64,
+        // u128→u64 interval millis: the constant is a Duration well under u64::MAX.
+        Some(at) => {
+            #[allow(clippy::cast_possible_truncation)]
+            let interval_ms = REFRESH_ATTEMPT_INTERVAL.as_millis() as u64;
+            now_ms.saturating_sub(at) >= interval_ms
+        }
     }
 }
 
@@ -488,10 +488,13 @@ fn next_retry_deadline(last_attempt_ms: Option<u64>, now: Instant, now_ms: u64) 
 /// (see [`next_retry_deadline`]). Falls back to 0 (ancient → stale → fetch)
 /// if the clock is before the Unix epoch, which never happens in practice.
 fn wall_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        // u128→u64 epoch millis: fits u64 for the next ~292 million years.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            d.as_millis() as u64
+        }
+    })
 }
 
 /// Record the start of a fetch attempt (wall-clock epoch millis) in the DB
@@ -678,7 +681,7 @@ fn reload_user_overlay(
                     present = contents.is_some(),
                     "user overlay changed; reloading",
                 );
-                state.last_applied_user_overlay = contents.clone();
+                state.last_applied_user_overlay.clone_from(&contents);
                 let _ = daemon_tx.send(DaemonCommand::CatalogBaseChanged {
                     base: state.base.clone(),
                     etag: state.etag.clone(),

@@ -24,6 +24,7 @@ fn next_message_id() -> String {
 /// Multiple updates are returned as a `Vec` because a single daemon message
 /// can map to several ACP notifications (e.g. `Done` → usage update + status
 /// update).
+#[must_use]
 pub fn translate_message(
     msg: &DaemonMessage,
     session_acp_id: &str,
@@ -215,6 +216,7 @@ fn tool_kind_from_name(name: &str) -> String {
 }
 
 /// Convenience constructor for a text `ContentBlock`.
+#[must_use]
 pub fn text_block(text: String) -> ContentBlock {
     ContentBlock::Text { text }
 }

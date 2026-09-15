@@ -42,7 +42,7 @@ pub(crate) fn daemon_binary_path(exe_dir: &Path) -> PathBuf {
 
 /// The daemon's log file path: under the PLATFORM temp dir (TMPDIR-aware —
 /// see `init_file_logging` for the Termux rationale), keyed by the TUI's OWN
-/// pid. The child's pid is unknowable before spawn via std::process::Command
+/// pid. The child's pid is unknowable before spawn via `std::process::Command`
 /// (`Command` has no pre-spawn handle), so the TUI pid is the unique key that
 /// distinguishes parallel spawns from different TUI instances sharing one
 /// machine — each spawn gets its own log file and never clobbers another's.
@@ -207,7 +207,7 @@ mod tests {
         );
         let name = path.file_name().and_then(|n| n.to_str()).expect("utf8");
         assert!(
-            name.starts_with("choreo-daemon-") && name.ends_with(".log"),
+            name.starts_with("choreo-daemon-") && name.to_lowercase().ends_with(".log"),
             "the log name must be choreo-daemon-<pid>.log, got {name}"
         );
     }

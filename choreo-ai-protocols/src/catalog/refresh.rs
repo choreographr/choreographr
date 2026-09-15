@@ -77,10 +77,19 @@ pub enum RefreshError {
 /// Returns [`RefreshOutcome::NotModified`] on 304, [`RefreshOutcome::Fetched`]
 /// on 200, and a structured [`RefreshError`] on transport/status/body
 /// problems. Never panics.
+/// Fetch the models.dev catalog, honoring conditional GET (etag) semantics.
+///
+/// # Errors
+///
+/// Returns [`RefreshError`] on network failure, non-200/304 status, or body
+/// parsing failures.
 pub fn fetch_modelsdev(
     current_etag: Option<&str>,
     force: bool,
 ) -> Result<RefreshOutcome, RefreshError> {
+    // Status-match enum used below; hoisted per clippy::items_after_statements.
+    use ureq::http::StatusCode;
+
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_global(Some(FETCH_TIMEOUT))
@@ -104,7 +113,6 @@ pub fn fetch_modelsdev(
         .map_err(|e| RefreshError::Network(e.to_string()))?;
     let status = response.status();
 
-    use ureq::http::StatusCode;
     match status {
         StatusCode::NOT_MODIFIED => Ok(RefreshOutcome::NotModified),
         StatusCode::OK => {

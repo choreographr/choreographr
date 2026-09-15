@@ -2,6 +2,7 @@ use crate::tools::glob_util::GlobFilter;
 use crate::tools::{ToolExecError, resolve_path, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::path::Path;
 use tracing::{error, info, warn};
 use zlob::ZlobFlags;
@@ -176,18 +177,18 @@ pub(crate) fn execute_delete_files_tool(
     // Build the output string with results grouped by success/failure.
     let mut output = String::new();
     if !deleted.is_empty() {
-        output.push_str(&format!("Deleted {} item(s):\n", deleted.len()));
+        let _ = writeln!(output, "Deleted {} item(s):", deleted.len());
         for item in &deleted {
-            output.push_str(&format!("  - {item}\n"));
+            let _ = writeln!(output, "  - {item}");
         }
     }
     if !errors.is_empty() {
         if !output.is_empty() {
             output.push('\n');
         }
-        output.push_str(&format!("Failed to delete {} item(s):\n", errors.len()));
+        let _ = writeln!(output, "Failed to delete {} item(s):", errors.len());
         for error in &errors {
-            output.push_str(&format!("  - {error}\n"));
+            let _ = writeln!(output, "  - {error}");
         }
     }
 
@@ -209,10 +210,10 @@ pub fn describe_delete_files_invocation(args: &DeleteFilesArgs) -> String {
         }
     } else {
         if literal_count > 0 {
-            parts.push(format!("Deleting {} path(s).", literal_count));
+            parts.push(format!("Deleting {literal_count} path(s)."));
         }
         if glob_count > 0 {
-            parts.push(format!("Expanding {} glob pattern(s).", glob_count));
+            parts.push(format!("Expanding {glob_count} glob pattern(s)."));
         }
     }
     if args.recursive.unwrap_or(false) {

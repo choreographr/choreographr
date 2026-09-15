@@ -65,7 +65,7 @@ pub enum ProviderError {
     Cancelled,
     #[error("total request deadline exceeded while reading streaming response")]
     DeadlineExceeded,
-    #[error("tool call arguments truncated by provider: {}", .discarded.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "))]
+    #[error("tool call arguments truncated by provider: {}", .discarded.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", "))]
     TruncatedToolCall {
         discarded: Vec<choreo_proto::DiscardedToolCall>,
     },
@@ -119,7 +119,7 @@ pub(crate) fn read_slice(buf: &[u8], n: usize) -> &[u8] {
     buf.get(..n).unwrap_or(&[])
 }
 
-/// Map a ProviderError variant to a stable label string.
+/// Map a `ProviderError` variant to a stable label string.
 ///
 /// Test-only helper. Delegates to [`InferenceError::metric_label`] so the
 /// mapping cannot drift from the canonical variant list that owns it in
@@ -130,8 +130,8 @@ pub(crate) fn error_type_label(e: ProviderError) -> &'static str {
     provider_error_to_inference(e).metric_label()
 }
 
-/// Convert a ProviderError into the shared InferenceError type used
-/// across the ProviderClient trait boundary.
+/// Convert a `ProviderError` into the shared `InferenceError` type used
+/// across the `ProviderClient` trait boundary.
 pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
     match e {
         ProviderError::Unauthorized { status, detail } => {
@@ -260,7 +260,7 @@ pub(crate) const OPENCODE_CLIENT_ID: &str = "choreographr";
 ///
 /// Only the known gateway slugs get headers (exact match, so an unrelated
 /// `opencode-*` slug is never given routing behavior it wasn't configured
-/// for); every other slug gets an empty list. Used by both the OpenAI client
+/// for); every other slug gets an empty list. Used by both the `OpenAI` client
 /// path and the Anthropic Messages path — the gateway reads the header
 /// before protocol dispatch, so both wire formats route identically.
 pub(crate) fn opencode_gateway_headers(
@@ -285,7 +285,7 @@ pub(crate) fn list_models_with_fallback<F, E>(
     fetch: F,
     static_list: &[&str],
     provider_name: &str,
-) -> Result<Vec<String>, E>
+) -> Vec<String>
 where
     F: FnOnce() -> Result<Vec<String>, E>,
     E: std::fmt::Display,
@@ -293,13 +293,16 @@ where
     match fetch() {
         Ok(models) => {
             tracing::info!("{provider_name} models returned: {}", models.len());
-            Ok(models)
+            models
         }
         Err(e) => {
             tracing::warn!(
                 "failed to list models from {provider_name} API, using static list: {e}"
             );
-            Ok(static_list.iter().map(|s| s.to_string()).collect())
+            static_list
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect()
         }
     }
 }
@@ -407,7 +410,7 @@ mod tests {
             response_id: None,
             reasoning_artifact: None,
         });
-        assert!(collect_events(result).is_empty());
+        assert_eq!(collect_events(result), [] as [StreamEvent; 0]);
     }
 
     #[test]
@@ -472,7 +475,7 @@ mod tests {
     #[test]
     fn tool_use_empty_content_empty_reasoning_emits_nothing() {
         let result = make_tool_use(None, None);
-        assert!(collect_events(result).is_empty());
+        assert_eq!(collect_events(result), [] as [StreamEvent; 0]);
     }
 
     #[test]

@@ -385,7 +385,7 @@ fn App() -> Element {
             Some(ConnectionMode::InProcess { .. }) => "embedded daemon".to_string(),
             None => socket_path(),
         };
-        AppState::new(display_path)
+        AppState::new(&display_path)
     });
 
     let tx = daemon_tx.read().clone();
@@ -410,15 +410,13 @@ fn App() -> Element {
 
                     match event {
                         UiEvent::Daemon(message) => {
-                            let result = {
+                            // The message is fully applied (state + any reply
+                            // send); no failure channel since the apply path
+                            // cannot fail.
+                            {
                                 let mut app_state = state.write();
-                                apply_daemon_message(&mut app_state, message, tx.clone())
+                                apply_daemon_message(&mut app_state, message, tx.clone());
                             };
-                            if let Err(error) = result {
-                                state.write().status_texts.push(format!(
-                                    "[client] failed to process daemon message: {error}"
-                                ));
-                            }
                         }
                         UiEvent::ReaderClosed => {
                             state
@@ -456,16 +454,15 @@ mod cli_tests {
 
     /// `--version` is handled by clap before any real arg parsing: it exits
     /// with a `DisplayVersion` error whose message is the version string.
-    /// Assert both so the flag stays wired to CARGO_PKG_VERSION (it breaks
+    /// Assert both so the flag stays wired to `CARGO_PKG_VERSION` (it breaks
     /// silently if the derive attribute loses the bare `version` marker).
     #[test]
     fn version_flag_displays_package_version() {
         // clap returns the version as a `DisplayVersion` error instead of a
         // value; match it out by hand (Cli doesn't derive Debug, so
         // `unwrap_err()`'s Debug bound doesn't apply).
-        let err = match Cli::try_parse_from(["choreo-gui", "--version"]) {
-            Err(e) => e,
-            Ok(_) => panic!("--version should short-circuit before arg validation"),
+        let Err(err) = Cli::try_parse_from(["choreo-gui", "--version"]) else {
+            panic!("--version should short-circuit before arg validation")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));

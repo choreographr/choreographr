@@ -36,8 +36,7 @@ fn execute_list_sessions(
             let model = s.selected_model.as_deref().unwrap_or("(no model)");
             let parent = s
                 .parent_session_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "none".to_string());
+                .map_or_else(|| "none".to_string(), |id| id.to_string());
             let working_dir = s.working_dir.as_deref().unwrap_or("(none)");
             format!(
                 "Session {}: \"{}\" | model: {} | turns: {} | parent: {} | working_dir: {}",
@@ -116,9 +115,9 @@ mod tests {
 
     #[test]
     fn execute_list_sessions_disconnected() {
-        let (tx, _rx) = std::sync::mpsc::channel::<DaemonCommand>();
+        let (tx, rx) = std::sync::mpsc::channel::<DaemonCommand>();
         // Drop the receiver so sends fail.
-        drop(_rx);
+        drop(rx);
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let ctx = ToolContext::new(42, db, tx);

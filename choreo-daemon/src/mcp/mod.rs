@@ -27,7 +27,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(feature = "mcp")]
 pub struct McpManager {
     /// MCP client per server, keyed by server slug. Arc<Mutex<>> so
-    /// McpToolWrapper instances can share the same client reference.
+    /// `McpToolWrapper` instances can share the same client reference.
     clients: HashMap<String, Arc<Mutex<McpClient>>>,
 }
 
@@ -43,12 +43,12 @@ impl McpManager {
         McpClient::spawn(cfg).with_context(|| format!("failed to spawn MCP server '{}'", cfg.slug))
     }
 
-    /// Discover tools from an MCP client and register them in the ToolRegistry.
+    /// Discover tools from an MCP client and register them in the `ToolRegistry`.
     fn register_server_tools(
         slug: &str,
         client: &mut McpClient,
         registry: &mut ToolRegistry,
-        shared: Arc<Mutex<McpClient>>,
+        shared: &Arc<Mutex<McpClient>>,
     ) {
         match client.list_tools() {
             Ok(tools) => {
@@ -71,13 +71,14 @@ impl McpManager {
                         &mcp_tool.name,
                         &description,
                         mcp_tool.input_schema,
-                        Arc::clone(&shared),
+                        Arc::clone(shared),
                     );
-                    registry.register_dynamic(
-                        wrapper.name().to_string(),
-                        wrapper.group().to_string(),
-                        Box::new(wrapper),
-                    );
+                    // Own the strings BEFORE moving `wrapper` into the box:
+                    // a borrow extending into the call would conflict with the
+                    // move (this path only builds under --all-features).
+                    let name = wrapper.name().to_string();
+                    let group = wrapper.group().to_string();
+                    registry.register_dynamic(name, &group, Box::new(wrapper));
                 }
             }
             Err(e) => {
@@ -91,8 +92,8 @@ impl McpManager {
         }
     }
 
-    /// Create a new McpManager, spawn all enabled servers, discover their
-    /// tools, and register them in the ToolRegistry.
+    /// Create a new `McpManager`, spawn all enabled servers, discover their
+    /// tools, and register them in the `ToolRegistry`.
     pub fn from_config(registry: &mut ToolRegistry) -> Self {
         let configs = match config::load_mcp_config() {
             Ok(c) => c,
@@ -133,7 +134,7 @@ impl McpManager {
                         }
                     };
 
-                    Self::register_server_tools(&slug, &mut guard, registry, Arc::clone(&shared));
+                    Self::register_server_tools(&slug, &mut guard, registry, &shared);
 
                     // Drop the lock so the manager doesn't hold it while storing the Arc.
                     drop(guard);
@@ -178,7 +179,8 @@ impl McpManager {
         info!("all MCP servers shut down");
     }
 
-    /// Create an empty McpManager with no servers (for testing).
+    /// Create an empty `McpManager` with no servers (for testing).
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             clients: HashMap::new(),
@@ -186,6 +188,7 @@ impl McpManager {
     }
 
     /// Return a reference to the clients map (for testing/inspection).
+    #[must_use]
     pub fn clients(&self) -> &HashMap<String, Arc<Mutex<McpClient>>> {
         &self.clients
     }
@@ -207,7 +210,7 @@ impl Drop for McpManager {
 mod imp {
     use crate::tools::ToolRegistry;
 
-    /// No-op stand-in for the real McpManager (see the module-level cfg note).
+    /// No-op stand-in for the real `McpManager` (see the module-level cfg note).
     pub struct McpManager;
 
     impl McpManager {
@@ -221,6 +224,7 @@ mod imp {
 
         /// Stub: creates an empty manager (same seam the real one exposes for
         /// tests).
+        #[must_use]
         pub fn empty() -> Self {
             Self
         }

@@ -47,6 +47,12 @@ pub mod prelude {
 
 /// Uniffi-style init hook: build the sidecar runtime. The daemon calls this
 /// from `main()`. Idempotent.
+///
+/// # Errors
+///
+/// Fails with an opaque boxed error if the OS refuses to spawn the tokio
+/// worker threads while building the sidecar runtime (see
+/// [`runtime::init`]); subsequent calls after a successful init never fail.
 pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     runtime::init()
 }

@@ -46,17 +46,35 @@ pub trait ProviderClient: Debug + Send + Sync {
     /// Return the provider slug for catalog lookups.
     fn provider_slug(&self) -> &str;
 
+    /// Non-streaming turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] on HTTP, provider, cancellation, or
+    /// decoding failures.
     fn chat_completion_turn(
         &self,
         params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, InferenceError>;
 
+    /// Streaming turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] on HTTP, provider, cancellation, or
+    /// event-callback failures.
     fn chat_completion_turn_streaming(
         &self,
         params: ChatTurnRequest<'_>,
         on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError>;
 
+    /// List models for the configured provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] on HTTP failure, provider error responses,
+    /// or body decoding failures.
     fn list_models(&self) -> Result<Vec<String>, InferenceError>;
 
     /// Returns whether programmatic tool calling should be enabled for the given model.

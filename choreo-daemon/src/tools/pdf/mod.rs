@@ -41,7 +41,7 @@ use std::path::Path;
 use tracing::warn;
 
 /// Hard cap on PDF input size (50 MiB). Bounds how much a malicious PDF can
-/// expand via nested FlateDecode streams before the parser ever sees it; the
+/// expand via nested `FlateDecode` streams before the parser ever sees it; the
 /// OS-level memory backstop (`RLIMIT_AS`) is a follow-up sandbox concern.
 const MAX_PDF_BYTES: u64 = 50 * 1024 * 1024;
 
@@ -65,7 +65,7 @@ const UNTRUSTED_CONTENT_FOOTER: &str = "--- end untrusted content ---";
 const DELIMITER_REDACTION: &str = "[untrusted-content delimiter redacted]";
 
 /// Hard cap on extracted markdown (256 MiB). Real extracted text is a few MiB
-/// at most; anything near this cap means a small FlateDecode stream expanded
+/// at most; anything near this cap means a small `FlateDecode` stream expanded
 /// into hundreds of MiB of text — a decompression bomb. This is an
 /// output-bounding stopgap: it refuses to ship the giant string into the LLM
 /// context / TUI and stops repeated attempts with an actionable error, but
@@ -73,7 +73,7 @@ const DELIMITER_REDACTION: &str = "[untrusted-content delimiter redacted]";
 /// backstop remains the sandbox phase.
 const MAX_PDF_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 
-/// Human-readable snake_case labels for [`pdf_inspector::PdfType`].
+/// Human-readable `snake_case` labels for [`pdf_inspector::PdfType`].
 fn pdf_type_label(t: pdf_inspector::PdfType) -> &'static str {
     match t {
         pdf_inspector::PdfType::TextBased => "text_based",

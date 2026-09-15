@@ -38,7 +38,7 @@ impl Tool for DbCount {
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
         match &args.prefix {
-            Some(p) => format!("Counting database entries with prefix `{}`.", p),
+            Some(p) => format!("Counting database entries with prefix `{p}`."),
             None => "Counting all database entries.".to_string(),
         }
     }

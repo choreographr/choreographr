@@ -79,6 +79,9 @@ fn locate(app: &App, needle: &str) -> ((u16, u16), (u16, u16)) {
                 // Every rendered line occupies one visual row in practice.
                 let screen_row = content_to_screen_row(app, turn_start + row_lo)
                     .expect("needle must be on screen");
+                // Display columns of a rendered row always fit u16 (the
+                // viewport is u16-bounded); the cast is exact in practice.
+                #[allow(clippy::cast_possible_truncation)] // viewport-bounded columns
                 return ((screen_row, col_start as u16), (screen_row, col_end as u16));
             }
         }
@@ -575,6 +578,9 @@ fn apply_selection_to_lines_overflowing_history_styles_visible_rows() {
         let display = app.active_display_ref().unwrap();
         let mut content_row = None;
         let mut chrome_row = None;
+        // The viewport height is a u16 field read into usize; the cast
+        // back is exact for any real terminal.
+        #[allow(clippy::cast_possible_truncation)] // u16 viewport height round-trip
         for screen_row in 0..vh as u16 {
             let (turn_idx, visual_row) = find_turn_at_row(&app, screen_row).expect("row maps");
             let cached = display.render_cache[turn_idx].as_ref().unwrap();

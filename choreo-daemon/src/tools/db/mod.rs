@@ -79,7 +79,7 @@ pub(crate) mod tests {
     use crate::tools::context::ToolContext;
     use std::sync::Arc;
 
-    /// Build a temporary redb Database + ToolContext with a fresh channel.
+    /// Build a temporary redb Database + `ToolContext` with a fresh channel.
     /// Shared by all seven db tool files' test modules so they each get an
     /// isolated, pre-warmed session store.
     pub(crate) fn test_context() -> (tempfile::TempDir, ToolContext) {

@@ -16,13 +16,20 @@ use crate::{PowerMonitor, PowerMonitorError};
 
 /// Spawn/subscribe for the current platform (see crate docs for the
 /// per-platform table).
+///
+/// # Errors
+///
+/// Returns [`PowerMonitorError::Connection`] / [`PowerMonitorError::Subscription`]
+/// when the platform provider cannot be reached or subscribed to, and
+/// [`PowerMonitorError::Spawn`] when the monitor thread cannot be created.
+/// Never fails on platforms without a native mechanism.
 pub fn spawn_monitor() -> Result<PowerMonitor, PowerMonitorError> {
     #[cfg(target_os = "linux")]
     return linux::spawn_monitor();
     #[cfg(target_os = "macos")]
     return macos::spawn_monitor();
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    return unsupported_monitor();
+    return Ok(unsupported_monitor());
 }
 
 /// The inert fallback used on platforms without a wired-up mechanism
@@ -35,12 +42,12 @@ pub fn spawn_monitor() -> Result<PowerMonitor, PowerMonitorError> {
 // called, but it MUST stay compiled everywhere so the unsupported-platform
 // path is never accidentally deleted when a new platform module is added.
 #[allow(dead_code)]
-fn unsupported_monitor() -> Result<PowerMonitor, PowerMonitorError> {
+fn unsupported_monitor() -> PowerMonitor {
     tracing::info!(
         platform = std::env::consts::OS,
         "power notifications unavailable; falling back to kernel-level dead-link detection"
     );
-    Ok(PowerMonitor::inert())
+    PowerMonitor::inert()
 }
 
 /// Shared helper for the platform modules: spawn a named monitor thread,

@@ -187,6 +187,8 @@ mod tests {
     fn write_png() -> tempfile::NamedTempFile {
         // A tiny 3×2 opaque PNG via the image crate (used by image_prep tests).
         let buf = image::ImageBuffer::from_fn(3, 2, |x, y| {
+            // u8 pixel coordinates (3×2 image): the arithmetic never exceeds u8.
+            #[allow(clippy::cast_possible_truncation)]
             image::Rgb([(x * 80) as u8, (y * 90) as u8, 40])
         });
         let mut file = tempfile::NamedTempFile::new().unwrap();

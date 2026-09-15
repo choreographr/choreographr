@@ -50,14 +50,14 @@ impl Tool for Exec {
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let full_cmd: Vec<&str> = std::iter::once(&args.command)
             .chain(args.args.iter())
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
             .collect();
         let mut parts = vec![format!("Running command: `{}`.", full_cmd.join(" "))];
         if let Some(ref wd) = args.workdir {
-            parts.push(format!(" Working directory: `{}`.", wd));
+            parts.push(format!(" Working directory: `{wd}`."));
         }
         if let Some(timeout) = args.timeout {
-            parts.push(format!(" Timeout: {}ms.", timeout));
+            parts.push(format!(" Timeout: {timeout}ms."));
         }
         parts.concat()
     }
@@ -97,7 +97,7 @@ impl Tool for Exec {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let display_cmd = if prog_args.is_empty() {
-            program.to_string()
+            program.clone()
         } else {
             format!("{} {}", program, prog_args.join(" "))
         };
@@ -154,9 +154,7 @@ fn is_executable_file(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {
@@ -205,9 +203,10 @@ fn validate_exec_invocation(
     if resolve_program(&args.command, &workdir).is_none() {
         // Surface the searched PATH so the model can see exactly what was
         // tried, and give it two concrete recovery paths.
-        let path_list = std::env::var_os("PATH")
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "<unset>".to_string());
+        let path_list = std::env::var_os("PATH").map_or_else(
+            || "<unset>".to_string(),
+            |p| p.to_string_lossy().into_owned(),
+        );
         return Err(ToolExecError(format!(
             "command not found: '{}'. Searched PATH: {path_list}. Verify the program is \
              installed, pass an absolute path, or use `sh` with `command -v <name>` to \
@@ -218,6 +217,12 @@ fn validate_exec_invocation(
     Ok(())
 }
 
+/// Run an external program and return its combined output.
+///
+/// # Errors
+///
+/// Returns Err if the program cannot be found on `PATH` or spawned, the
+/// process times out, or the process exits non-zero.
 pub fn execute_exec_tool(
     args: &ExecArgs,
     working_dir: Option<&Path>,
@@ -238,7 +243,7 @@ pub fn execute_exec_tool(
 
     // Build a display string like "$ program arg1 arg2"
     let display_cmd = if prog_args.is_empty() {
-        program.to_string()
+        program.clone()
     } else {
         format!("{} {}", program, prog_args.join(" "))
     };
@@ -259,8 +264,8 @@ mod tests {
     #[test]
     fn exec_tool_has_valid_metadata() {
         let tool = super::Exec;
-        assert!(!tool.name().is_empty());
-        assert!(!tool.description().is_empty());
+        assert_ne!(tool.name(), "");
+        assert_ne!(tool.description(), "");
         let schema = tool.schema();
         assert!(schema.is_object());
     }

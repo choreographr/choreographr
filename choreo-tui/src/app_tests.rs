@@ -286,7 +286,7 @@ fn empty_submission_while_busy_is_a_noop() {
     let mut app = test_app();
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Inference);
-    app.input.text = "".to_string();
+    app.input.text = String::new();
     let (tx, rx) = std::sync::mpsc::channel();
 
     press_enter(&mut app, &tx);
@@ -943,7 +943,7 @@ mod unsent_draft_tests {
 
         assert_eq!(app.attached_session_id, None);
         assert_eq!(app.attached_status, None);
-        assert!(app.attached_tool_groups.is_empty());
+        assert_eq!(app.attached_tool_groups.is_empty(), true);
     }
 
     #[test]
@@ -982,6 +982,7 @@ mod unsent_draft_tests {
         assert_eq!(app.input.cursor, 4);
     }
 
+    #[allow(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
     #[test]
     fn editing_history_entry_becomes_the_draft_on_switch() {
         let (tx, _rx) = std::sync::mpsc::channel();

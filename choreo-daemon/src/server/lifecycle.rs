@@ -98,7 +98,7 @@ pub(crate) const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 /// can be moved into the spawned connection thread.
 ///
 /// `pub(crate)`: the embedded daemon's `connect()` takes the same slot type
-/// so MAX_CONCURRENT_CONNECTIONS applies uniformly across all three
+/// so `MAX_CONCURRENT_CONNECTIONS` applies uniformly across all three
 /// transports.
 pub(crate) struct ConnectionSlot(Arc<AtomicUsize>);
 
@@ -120,7 +120,7 @@ pub(crate) fn try_take_connection_slot(count: &Arc<AtomicUsize>) -> Option<Conne
     Some(ConnectionSlot(Arc::clone(count)))
 }
 
-/// Track a connection thread's JoinHandle for the shutdown drain, pruning
+/// Track a connection thread's `JoinHandle` for the shutdown drain, pruning
 /// handles of already-finished threads once the Vec grows past
 /// [`CLIENT_THREAD_PRUNE_THRESHOLD`]. A finished thread's handle can be
 /// dropped without joining (the OS thread is already reaped); a still-running
@@ -162,7 +162,7 @@ fn start_metrics_server(addr_str: &str, shutdown: &Arc<AtomicBool>) -> io::Resul
     })?;
     let shutdown_flag = Arc::clone(shutdown);
     thread::spawn(move || {
-        crate::metrics::serve_metrics(addr, shutdown_flag);
+        crate::metrics::serve_metrics(addr, &shutdown_flag);
     });
     Ok(())
 }
@@ -181,13 +181,13 @@ fn start_metrics_server(addr_str: &str, _shutdown: &Arc<AtomicBool>) -> io::Resu
     )))
 }
 
-/// Handle an accept() error the way both accept loops do: a transient error
-/// (interrupted syscall — `signal_hook` does not use SA_RESTART — or a
+/// Handle an `accept()` error the way both accept loops do: a transient error
+/// (interrupted syscall — `signal_hook` does not use `SA_RESTART` — or a
 /// connection aborted before accept completed, which consumed no FD) is
 /// retried immediately; a resource-exhaustion error (EMFILE/ENFILE/…) is
 /// logged and backed off so other threads can close FDs. Both loops continue
 /// after this, so it returns nothing.
-fn handle_accept_error(e: io::Error) {
+fn handle_accept_error(e: &io::Error) {
     match e.kind() {
         io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => {}
         _ => {
@@ -240,13 +240,20 @@ pub(crate) fn remove_stale_socket(socket_path: &str) -> io::Result<()> {
     })
 }
 
+/// Serve both accept loops (Unix socket and optional TCP listener plus the
+/// optional metrics server) until shutdown.
+///
+/// # Errors
+///
+/// Returns Err if the Unix socket path cannot be prepared/bound, the TCP
+/// or metrics listener cannot be bound, or a fatal accept error occurs.
 pub fn run_server(
     socket_path: &str,
     state: DaemonState,
-    metrics_addr: Option<String>,
-    tcp_addr: Option<String>,
+    metrics_addr: Option<&String>,
+    tcp_addr: Option<&String>,
     transport_sk: TransportSecretKey,
-    acl: std::sync::Arc<crate::server::acl::SharedAcl>,
+    acl: &std::sync::Arc<crate::server::acl::SharedAcl>,
     // `--auto-exit`: shut down gracefully when the last client disconnects.
     // Connection threads then report their disconnect to the command loop
     // (see `DaemonCommand::LastClientDisconnected`); with this off the send
@@ -278,14 +285,14 @@ pub fn run_server(
     let core = start_daemon_core(
         state,
         CoreOptions {
-            acl: Some(Arc::clone(&acl)),
+            acl: Some(Arc::clone(acl)),
             config_watchers: true,
             // Auto-exit only makes sense for a socket-listening daemon: the
             // decision arm wakes THIS socket's accept loop. The embedded
             // daemon passes `None` (no socket, no auto-exit).
             auto_exit_wake_path: auto_exit.then(|| socket_path.to_string()),
         },
-    )?;
+    );
     // Local clone of the core's command sender: the accept paths below clone
     // per connection and the shutdown drain sends over this one, then drops
     // it to close the command loop. `core.daemon_tx` itself stays in `core`.
@@ -383,7 +390,7 @@ pub fn run_server(
     // script that passes it gets a clear, actionable error instead of clap's
     // confusing "unexpected argument"), but the daemon refuses to start
     // rather than silently ignoring the requested endpoint.
-    if let Some(ref addr_str) = metrics_addr {
+    if let Some(addr_str) = metrics_addr {
         start_metrics_server(addr_str, &shutdown)?;
     }
 
@@ -412,7 +419,7 @@ pub fn run_server(
     // after each spawn), so the final drain below captures all of them.
     let mut tcp_accept_handle: Option<thread::JoinHandle<()>> = None;
     let mut tcp_accept_addr: Option<SocketAddr> = None;
-    if let Some(ref tcp_addr_str) = tcp_addr {
+    if let Some(tcp_addr_str) = tcp_addr {
         let addr: SocketAddr = tcp_addr_str.parse().map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -425,7 +432,7 @@ pub fn run_server(
         info!("TCP (Noise IK) listening on {addr}");
 
         let daemon_tx = daemon_tx.clone();
-        let acl = Arc::clone(&acl);
+        let acl = Arc::clone(acl);
         let tcp_client_tx = tcp_client_tx.clone();
         // Clone the connection counter into this accept thread (same pattern
         // as the daemon_tx/acl clones above): the main thread keeps its own
@@ -488,25 +495,27 @@ pub fn run_server(
                             // connection thread: released when this thread
                             // exits (handshake failure or connection end),
                             // even on panic.
-                            let _slot = slot;
+                            let conn_slot = slot;
                             // The preamble read + handshake-mode dispatch +
                             // responder handshake all live in
                             // tcp_handshake_and_client_thread (server/connection.rs)
                             // so the accept thread stays a pure spawn loop; it
                             // also unregisters the writer channel on every
                             // pre-transport failure path.
-                            let result = crate::server::connection::tcp_handshake_and_client_thread(
-                                tcp, sk_bytes, acl, tx, client_id, writer_tx, writer_rx, global_lag,
-                            );
-                            if let Err(e) = result {
+                            if let Err(e) =
+                                crate::server::connection::tcp_handshake_and_client_thread(
+                                    tcp, sk_bytes, &acl, tx, client_id, writer_tx, writer_rx,
+                                    global_lag,
+                                )
+                            {
                                 error!(error = %e, "TCP client error");
                             }
                             // Auto-exit: the connection has fully ended and
-                            // `_slot` is about to drop. Release it FIRST so
+                            // `conn_slot` is about to drop. Release it FIRST so
                             // the command loop's count is accurate when it
                             // processes the report, then send the event (see
                             // DaemonCommand::LastClientDisconnected).
-                            drop(_slot);
+                            drop(conn_slot);
                             if let Some(tx) = auto_exit_tx {
                                 let _ = tx.send(DaemonCommand::LastClientDisconnected);
                             }
@@ -516,7 +525,7 @@ pub fn run_server(
                         let _ = tcp_client_tx.send(handle);
                     }
                     Err(e) => {
-                        handle_accept_error(e);
+                        handle_accept_error(&e);
                     }
                 }
             }
@@ -569,7 +578,7 @@ pub fn run_server(
                         // Held for this thread's whole lifetime: released
                         // (decrementing the counter) when the connection
                         // thread exits, even on panic.
-                        let _slot = slot;
+                        let conn_slot = slot;
                         let result = crate::server::connection::client_thread(
                             stream, tx, client_id, writer_tx, writer_rx, global_lag,
                         );
@@ -578,7 +587,7 @@ pub fn run_server(
                         }
                         // Auto-exit: release the slot BEFORE the report so the
                         // command loop's zero-check sees the true live count.
-                        drop(_slot);
+                        drop(conn_slot);
                         if let Some(tx) = auto_exit_tx {
                             let _ = tx.send(DaemonCommand::LastClientDisconnected);
                         }
@@ -586,7 +595,7 @@ pub fn run_server(
                 );
             }
             Err(e) => {
-                handle_accept_error(e);
+                handle_accept_error(&e);
             }
         }
     }
@@ -746,7 +755,7 @@ mod tests {
 
     /// Finished connection threads are pruned once the retained Vec grows past
     /// the threshold, so a long-running daemon does not accumulate one
-    /// JoinHandle per connection ever accepted; a still-running handle is
+    /// `JoinHandle` per connection ever accepted; a still-running handle is
     /// retained for the shutdown join.
     #[test]
     fn push_client_thread_prunes_finished_handles() {

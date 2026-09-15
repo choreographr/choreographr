@@ -69,11 +69,11 @@ pub enum ReasoningPassback {
     /// (DeepSeek/Kimi chat, and the minimum for Anthropic tool loops).
     ToolLoop,
     /// Echo reasoning across all turns of the session (Anthropic keep-all,
-    /// GPT-5.6 all_turns).
+    /// GPT-5.6 `all_turns`).
     AllTurns,
     /// Send back encrypted thought signatures (Gemini).
     Signature,
-    /// Chain via previous_response_id / opaque reasoning items
+    /// Chain via `previous_response_id` / opaque reasoning items
     /// (OpenAI/xAI Responses).
     ResponseId,
 }
@@ -86,8 +86,8 @@ pub struct ModelEntry {
     pub model: String,
     pub context_window: u32,
     /// Whether this model supports reasoning/thinking at all.
-    /// Applicable across all protocols — OpenAi, AnthropicMessages,
-    /// and GoogleGenerativeAi all use this flag to enable/disable
+    /// Applicable across all protocols — `OpenAi`, `AnthropicMessages`,
+    /// and `GoogleGenerativeAi` all use this flag to enable/disable
     /// their respective reasoning features per model.
     /// When `false`, the model entry's `openai_reasoning_levels`
     /// (if any) is ignored and the model is treated as non-reasoning.
@@ -98,8 +98,8 @@ pub struct ModelEntry {
     /// `model_reasoning_capability()`). Non-OpenAi protocols always
     /// use their own default levels — see `protocol_default_levels()`.
     pub openai_reasoning_levels: Vec<String>,
-    /// Whether this model uses OpenAI's Responses API vs Chat Completions.
-    /// Only relevant for OpenAi protocol providers.
+    /// Whether this model uses `OpenAI`'s Responses API vs Chat Completions.
+    /// Only relevant for `OpenAi` protocol providers.
     pub openai_responses: bool,
     /// How reasoning is replayed back to the provider on subsequent turns.
     /// `None` means "no override — `model_reasoning_passback` derives the
@@ -557,7 +557,7 @@ mod tests {
     #[test]
     fn all_display_names_are_non_empty() {
         for name in all_display_names() {
-            assert!(!name.is_empty());
+            assert_ne!(name, "");
         }
     }
 

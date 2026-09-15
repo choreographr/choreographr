@@ -27,7 +27,7 @@ fn dir_args(pattern: &str, dir: &tempfile::TempDir) -> GrepArgs {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_plain_text_finds_content() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.txt"), "hello world\nfoo bar").unwrap();
@@ -38,7 +38,7 @@ fn grep_plain_text_finds_content() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_with_include_filter() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.rs"), "hello").unwrap();
@@ -51,13 +51,12 @@ fn grep_with_include_filter() {
     assert!(content.contains("test.rs"), "{}", content);
     assert!(
         !content.contains("test.txt"),
-        "should not match .txt files: {}",
-        content
+        "should not match .txt files: {content}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_regex_mode() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.rs"), "fn hello() {}\nfn world() {}").unwrap();
@@ -71,7 +70,7 @@ fn grep_regex_mode() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_no_match_returns_message() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.txt"), "hello world").unwrap();
@@ -85,7 +84,7 @@ fn grep_no_match_returns_message() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_ignore_case() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.txt"), "Hello World\nfoo").unwrap();
@@ -98,7 +97,7 @@ fn grep_ignore_case() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_context_lines() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.txt"), "a\nb\nhello\nc\nd").unwrap();
@@ -113,7 +112,7 @@ fn grep_context_lines() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_files_with_matches() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "hello\n").unwrap();
@@ -126,11 +125,11 @@ fn grep_files_with_matches() {
     let content = result.unwrap_or_default();
     // One line per hit file, sorted, deduplicated — b.txt has two matches
     // but appears once.
-    assert_eq!(content, "a.rs\nb.txt", "{}", content);
+    assert_eq!(content, "a.rs\nb.txt", "{content}");
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_count_mode() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "world\n").unwrap();
@@ -141,11 +140,11 @@ fn grep_count_mode() {
     args.output_mode = GrepOutputMode::Count;
     let result = execute_grep_tool(&args, None);
     let content = result.unwrap_or_default();
-    assert_eq!(content, "a.txt: 1\nb.txt: 2", "{}", content);
+    assert_eq!(content, "a.txt: 1\nb.txt: 2", "{content}");
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_marks_truncation_at_max_results() {
     let dir = tempfile::tempdir().unwrap();
     for i in 0..5 {
@@ -165,7 +164,7 @@ fn grep_marks_truncation_at_max_results() {
 
 #[cfg(unix)]
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_sanitizes_control_chars_in_filename() {
     let dir = tempfile::tempdir().unwrap();
     // A filename containing a literal newline would split the match across
@@ -187,7 +186,7 @@ fn grep_sanitizes_control_chars_in_filename() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_src_anchored_include_matches_relative_to_root() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
@@ -207,7 +206,7 @@ fn grep_src_anchored_include_matches_relative_to_root() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn grep_single_file_include_filters_by_basename() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("main.rs");

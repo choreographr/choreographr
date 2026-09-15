@@ -15,7 +15,7 @@ fn test_dir() -> PathBuf {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration: performs real filesystem I/O / env setup per workspace test discipline"]
 fn encrypt_decrypt_credential_round_trip_with_key_files() {
     let dir = test_dir();
     fs::create_dir_all(&dir).expect("create test dir");
@@ -56,7 +56,7 @@ fn encrypt_decrypt_credential_round_trip_with_key_files() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration: performs real filesystem I/O / env setup per workspace test discipline"]
 fn decrypt_credential_with_wrong_key_fails() {
     let (_secret, public) = generate_keypair();
     let (wrong_secret, _) = generate_keypair();
@@ -67,25 +67,23 @@ fn decrypt_credential_with_wrong_key_fails() {
 
     assert!(
         matches!(result, Err(KeystoreError::DecryptionFailed)),
-        "expected DecryptionFailed, got {:?}",
-        result
+        "expected DecryptionFailed, got {result:?}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration: performs real filesystem I/O / env setup per workspace test discipline"]
 fn decrypt_too_short_data_fails() {
     let secret = [0u8; 32];
     let result = decrypt_with_private_key(&secret, &[0u8; 10]);
     assert!(
         matches!(result, Err(KeystoreError::TooShort)),
-        "expected TooShort, got {:?}",
-        result
+        "expected TooShort, got {result:?}"
     );
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration: performs real filesystem I/O / env setup per workspace test discipline"]
 fn keystore_crypto_helpers_available() {
     // A smoke test that the core crypto helpers (used by the per-daemon
     // keystore unlock-key design) are exported and round-trip, in the real

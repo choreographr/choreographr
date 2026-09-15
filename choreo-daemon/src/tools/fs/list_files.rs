@@ -4,6 +4,7 @@ use crate::tools::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use tracing::warn;
@@ -99,11 +100,7 @@ fn describe_entry(entry: &fs::DirEntry) -> EntryRecord {
     // so a symlink-to-dir is correctly classified as a link here.
     let meta = entry.metadata();
 
-    if meta
-        .as_ref()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
+    if meta.as_ref().is_ok_and(|m| m.file_type().is_symlink()) {
         return describe_symlink(&raw_name, &entry.path());
     }
 
@@ -153,6 +150,11 @@ fn count_label(count: usize, singular: &str, plural: &str) -> String {
     }
 }
 
+/// List the entries of a directory with sizes and subdirectory counts.
+///
+/// # Errors
+///
+/// Returns Err if the path is invalid or the directory cannot be read.
 pub fn execute_list_files_tool(
     args: &ListFilesArgs,
     working_dir: Option<&Path>,
@@ -200,7 +202,7 @@ pub fn execute_list_files_tool(
         parts.push(count_label(others, "other", "others"));
     }
     if !parts.is_empty() {
-        out.push_str(&format!(" ({})", parts.join(", ")));
+        let _ = write!(out, " ({})", parts.join(", "));
     }
     out.push('\n');
 
@@ -215,9 +217,11 @@ pub fn execute_list_files_tool(
         let name_col = format!("{:<width$}", record.name);
         match &record.detail {
             EntryDetail::Size(bytes) => {
-                out.push_str(&format!("{name_col} {}\n", human_size(*bytes)));
+                let _ = writeln!(out, "{name_col} {}", human_size(*bytes));
             }
-            EntryDetail::Note(note) => out.push_str(&format!("{name_col} {note}\n")),
+            EntryDetail::Note(note) => {
+                let _ = writeln!(out, "{name_col} {note}");
+            }
         }
     }
     Ok(truncate_tool_output(&out))
@@ -225,7 +229,7 @@ pub fn execute_list_files_tool(
 
 pub fn describe_list_files_invocation(args: &ListFilesArgs) -> String {
     match &args.path {
-        Some(p) => format!("Listing files in `{}`.", p),
+        Some(p) => format!("Listing files in `{p}`."),
         None => "Listing files in the working directory.".to_string(),
     }
 }

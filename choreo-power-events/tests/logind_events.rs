@@ -15,7 +15,7 @@
 use crossbeam_channel::TryRecvError;
 
 #[test]
-#[ignore]
+#[ignore = "integration: binds the system D-Bus socket per workspace test discipline"]
 fn logind_subscription_establishes() {
     match choreo_power_events::PowerMonitor::new() {
         Ok(monitor) => {

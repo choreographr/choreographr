@@ -23,7 +23,7 @@ mod common;
 /// (a live daemon keeps working). A regular file at the path, by contrast, is
 /// stale and is removed.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn remove_stale_socket_refuses_live_listener() {
     let dir = tempfile::tempdir().expect("tempdir for socket");
     let path = dir.path().join("live.sock");
@@ -37,7 +37,7 @@ fn remove_stale_socket_refuses_live_listener() {
     let acl = choreo_daemon::server::acl::SharedAcl::load(std::path::Path::new("/nonexistent"));
     let socket_str = path.to_str().expect("valid socket path").to_string();
 
-    let err = run_server(&socket_str, state, None, None, transport_sk, acl, false)
+    let err = run_server(&socket_str, state, None, None, transport_sk, &acl, false)
         .expect_err("run_server over a live socket must fail");
     let msg = err.to_string();
     assert!(
@@ -53,7 +53,7 @@ fn remove_stale_socket_refuses_live_listener() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn server_accepts_ping_and_shuts_down_on_signal() {
     let dir = tempfile::tempdir().expect("tempdir for socket");
     let socket_path = dir.path().join("test.sock");
@@ -67,7 +67,7 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
 
     // Run the server in a background thread.
     let handle = thread::spawn(move || {
-        run_server(&socket_str, state, None, None, transport_sk, acl, false).expect("run_server");
+        run_server(&socket_str, state, None, None, transport_sk, &acl, false)
     });
 
     // Wait for the socket to appear (server is ready).

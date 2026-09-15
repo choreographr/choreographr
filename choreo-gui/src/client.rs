@@ -9,6 +9,9 @@ use dioxus::prelude::*;
 use futures_channel::mpsc::UnboundedSender;
 use zeroize::Zeroize;
 
+// needless_pass_by_value waived: the sender is handed to the daemon
+// closure for the whole connection lifetime.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn run_client(
     mode: ConnectionMode,
     client_rx: std::sync::mpsc::Receiver<ClientMessage>,
@@ -46,7 +49,7 @@ pub(crate) fn submit_input(
     handle_shell_command(&mut state.write(), daemon_tx, command);
 }
 
-/// The address string used to key per-daemon unlock keys in known_servers:
+/// The address string used to key per-daemon unlock keys in `known_servers`:
 /// the actual dial address for TCP, the unix socket path otherwise. This is
 /// the same address the daemon's keystore binding is recorded against, so
 /// every `Unlock`/`AddCredential`/record must use it consistently.
@@ -188,7 +191,7 @@ pub(crate) fn send_client_message(
 /// this function.
 fn handle_session_message(
     state: &mut AppState,
-    daemon_tx: &Option<std::sync::mpsc::Sender<ClientMessage>>,
+    daemon_tx: Option<&std::sync::mpsc::Sender<ClientMessage>>,
     message: &DaemonMessage,
 ) -> bool {
     match message {
@@ -234,18 +237,16 @@ fn handle_session_message(
                     }) {
                         tracing::error!("failed to send AttachSession: {e}");
                     }
-                } else {
-                    if let Err(e) = sender.send(ClientMessage::CreateSession {
-                        title: Some("default".to_string()),
-                        parent_session_id: None,
-                        working_dir: None,
-                        context_config: None,
-                        account_name: None,
-                        selected_model: None,
-                        reasoning_effort: None,
-                    }) {
-                        tracing::error!("failed to send CreateSession: {e}");
-                    }
+                } else if let Err(e) = sender.send(ClientMessage::CreateSession {
+                    title: Some("default".to_string()),
+                    parent_session_id: None,
+                    working_dir: None,
+                    context_config: None,
+                    account_name: None,
+                    selected_model: None,
+                    reasoning_effort: None,
+                }) {
+                    tracing::error!("failed to send CreateSession: {e}");
                 }
             }
             true
@@ -254,13 +255,17 @@ fn handle_session_message(
     }
 }
 
+// needless_pass_by_value waived: callers pass an owned message envelope and
+// an owned sender exactly once per message; keeping by-value clarity beats
+// an extra lifetime dance at every call site.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn apply_daemon_message(
     state: &mut AppState,
     message: DaemonMessage,
     daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
-) -> Result<(), ClientError> {
-    if handle_session_message(state, &daemon_tx, &message) {
-        return Ok(());
+) {
+    if handle_session_message(state, daemon_tx.as_ref(), &message) {
+        return;
     }
 
     // Unlock/AddCredential outcome (per-daemon keystore): resolve what the
@@ -350,5 +355,4 @@ pub(crate) fn apply_daemon_message(
     }
 
     dispatch_daemon_message(&message, state);
-    Ok(())
 }

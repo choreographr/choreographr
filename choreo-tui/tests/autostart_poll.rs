@@ -15,7 +15,7 @@ use std::time::Duration;
 /// have run (the budget is checked before each probe, so a too-large budget
 /// relative to the interval is the only thing that guarantees progress).
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn poll_returns_false_when_the_probe_never_succeeds() {
     let mut probes = 0;
     let ok = poll_until_listening(
@@ -34,7 +34,7 @@ fn poll_returns_false_when_the_probe_never_succeeds() {
 /// Simulates the daemon coming up after a few failed probes (slow cold
 /// start) — the success path that motivates the whole poll loop.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn poll_returns_true_once_the_probe_flips_live() {
     let mut probes_left = 3;
     let ok = poll_until_listening(
@@ -61,7 +61,7 @@ fn poll_returns_true_once_the_probe_flips_live() {
 /// through the same dial.
 #[cfg(unix)]
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn poll_succeeds_against_a_real_listening_socket() {
     let dir = std::env::temp_dir().join(format!(
         "choreo-tui-autostart-test-{}-{}",

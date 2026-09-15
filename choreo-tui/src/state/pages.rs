@@ -755,7 +755,7 @@ pub(crate) struct SessionManagerState {
     /// Session id to highlight on the next list refresh.  `select_session`
     /// records this when navigating to the session manager (Ctrl+S) so the
     /// freshly fetched list lands on the session the user was just viewing
-    /// — even on the first visit, before the daemon's ListSessions reply has
+    /// — even on the first visit, before the daemon's `ListSessions` reply has
     /// (re)populated `sessions`.
     pub(crate) pending_select: Option<u64>,
     /// Index of the first visible session row.  Navigation shifts this
@@ -953,9 +953,9 @@ impl ModelSelectorState {
             step_focus(self.focused, self.scroll, len, self.viewport_height, true);
     }
 
-    /// Page the highlight up by `PROVIDER_PAGE_LINES` rows (PgUp); the render
-    /// window follows the focus.  Like `move_up`, paging up cannot drift past
-    /// the top of the list, so no clamp is needed.
+    /// Page the highlight up by `PROVIDER_PAGE_LINES` rows (`PgUp`); the render
+    /// window follows the focus.  Like [`Self::move_up`], paging up cannot
+    /// drift past the top of the list, so no clamp is needed.
     pub(crate) fn page_up(&mut self) {
         self.focused = self.focused.saturating_sub(PROVIDER_PAGE_LINES);
     }
@@ -1000,7 +1000,10 @@ impl ModelSelectorState {
 
     /// The highlighted model ID, if the filtered list is non-empty.
     pub(crate) fn highlighted(&self) -> Option<String> {
-        self.filtered().get(self.focused).map(|s| s.to_string())
+        self.filtered()
+            .get(self.focused)
+            .copied()
+            .map(str::to_string)
     }
 
     /// Return the highlighted model and close the selector.  The caller
@@ -1058,7 +1061,7 @@ impl SessionManagerState {
     /// loaded, and remember the preference so the next [`Self::set_sessions`]
     /// refresh re-selects it even if the current list is empty or stale
     /// (e.g. the very first visit to the session manager, before the
-    /// ListSessions reply has arrived).
+    /// `ListSessions` reply has arrived).
     pub(crate) fn select_session(&mut self, session_id: u64) {
         self.pending_select = Some(session_id);
         if let Some(idx) = self
@@ -1131,7 +1134,7 @@ impl SessionManagerState {
         }
     }
 
-    /// Move the selection up by a page (PgUp).  The render window follows
+    /// Move the selection up by a page (`PgUp`).  The render window follows
     /// the selection with the same directional anchoring as `select_up`.
     pub(crate) fn scroll_up_page(&mut self) {
         self.reanchor_scroll();
@@ -1144,7 +1147,9 @@ impl SessionManagerState {
         }
     }
 
-    /// Move the selection down by a page (PgDn), clamped to the last row.
+    /// Move the selection down by a page (`PgDn`), clamped to the last row.
+    /// The render window follows the selection with the same anchoring as
+    /// `select_down`.
     pub(crate) fn scroll_down_page(&mut self) {
         self.reanchor_scroll();
         let max = self.sessions.len().saturating_sub(1);

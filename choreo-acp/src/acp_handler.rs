@@ -25,8 +25,23 @@ const DISCONNECT_ERR_MSG: &str = "Daemon disconnected";
 // Top-level dispatch
 // ---------------------------------------------------------------------------
 
+/// Runs the main ACP event loop until both I/O threads shut down.
+///
+/// # Errors
+///
+/// Propagates [`AcpError`] from the per-message handlers and from writing
+/// error responses; any handler failure aborts the event loop.
+///
+/// # Panics
+///
+/// Never panics.
+///
+/// # Cancellation
+///
+/// Returns as soon as both the daemon-reader and ACP-reader threads have
+/// dropped their event senders.
 pub fn run_event_loop(
-    event_rx: mpsc::Receiver<Event>,
+    event_rx: &mpsc::Receiver<Event>,
     daemon_writer: mpsc::Sender<ClientMessage>,
 ) -> Result<(), AcpError> {
     let mut sessions = SessionManager::new();
@@ -37,12 +52,12 @@ pub fn run_event_loop(
     let mut out = BufWriter::new(stdout.lock());
 
     loop {
-        let event = match event_rx.recv() {
-            Ok(e) => e,
-            Err(mpsc::RecvError) => {
-                info!("both I/O threads exited, shutting down");
-                break;
-            }
+        // Both sender halves of both I/O threads dropping is the loop's only
+        // normal exit condition — a `let...else` reads better than a two-arm
+        // match whose fallthrough arm is the only other one.
+        let Ok(event) = event_rx.recv() else {
+            info!("both I/O threads exited, shutting down");
+            break;
         };
 
         match event {
@@ -70,10 +85,16 @@ pub fn run_event_loop(
 
                 match msg {
                     RpcMessage::Request(req) => {
-                        handle_request(&req, &mut sessions, &mut pending, &daemon_writer, &mut out)?
+                        handle_request(
+                            &req,
+                            &mut sessions,
+                            &mut pending,
+                            &daemon_writer,
+                            &mut out,
+                        )?;
                     }
                     RpcMessage::Notification(notif) => {
-                        handle_notification(&notif, &mut pending, &daemon_writer)?
+                        handle_notification(&notif, &mut pending, &daemon_writer)?;
                     }
                 }
             }
@@ -85,7 +106,7 @@ pub fn run_event_loop(
             }
 
             Event::DaemonMessage(msg) => {
-                handle_daemon_message(msg, &mut sessions, &mut pending, &daemon_writer, &mut out)?
+                handle_daemon_message(&msg, &mut sessions, &mut pending, &daemon_writer, &mut out)?;
             }
 
             Event::DaemonDisconnected => {
@@ -130,9 +151,8 @@ pub fn run_event_loop(
 // missing/invalid params without needing to clone the full Value first.
 // ---------------------------------------------------------------------------
 
-fn parse_params<T: serde::de::DeserializeOwned>(params: &Option<serde_json::Value>) -> Option<T> {
-    let value = params.as_ref()?;
-    serde_json::from_value(value.clone()).ok()
+fn parse_params<T: serde::de::DeserializeOwned>(params: Option<&serde_json::Value>) -> Option<T> {
+    serde_json::from_value(params?.clone()).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -170,12 +190,11 @@ fn handle_notification(
     pending: &mut PendingRequests,
     daemon_writer: &mpsc::Sender<ClientMessage>,
 ) -> Result<(), AcpError> {
-    match notif.method.as_str() {
-        "session/cancel" => dispatch_cancel(notif, pending, daemon_writer),
-        _ => {
-            debug!(method = %notif.method, "ignoring unknown notification");
-            Ok(())
-        }
+    if notif.method.as_str() == "session/cancel" {
+        dispatch_cancel(notif, pending, daemon_writer)
+    } else {
+        debug!(method = %notif.method, "ignoring unknown notification");
+        Ok(())
     }
 }
 
@@ -244,13 +263,14 @@ fn dispatch_new_session(
         return respond_err(req.id, -32000, "Session creation in progress", out);
     }
 
-    let account_name = parse_params::<acp_jsonrpc::NewSessionRequest>(&req.params).and_then(|r| {
-        r.metadata
-            .as_ref()
-            .and_then(|m| m.get("account_name"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-    });
+    let account_name = parse_params::<acp_jsonrpc::NewSessionRequest>(req.params.as_ref())
+        .and_then(|r| {
+            r.metadata
+                .as_ref()
+                .and_then(|m| m.get("account_name"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
 
     send_to_daemon(daemon_writer, ClientMessage::ListModels)?;
     pending.set_models_pending(ModelsPending::CreateSession {
@@ -288,7 +308,7 @@ fn dispatch_load_session(
 ) -> Result<(), AcpError> {
     info!("dispatching session/load (id={})", req.id);
 
-    let acp_id = parse_params::<acp_jsonrpc::LoadSessionRequest>(&req.params)
+    let acp_id = parse_params::<acp_jsonrpc::LoadSessionRequest>(req.params.as_ref())
         .map(|r| r.session_id)
         .unwrap_or_default();
 
@@ -296,9 +316,8 @@ fn dispatch_load_session(
         return respond_err(req.id, -32602, "Missing session_id", out);
     }
 
-    let session = match sessions.get(&acp_id) {
-        Some(s) => s,
-        None => return respond_err(req.id, -32602, &format!("Session not found: {acp_id}"), out),
+    let Some(session) = sessions.get(&acp_id) else {
+        return respond_err(req.id, -32602, &format!("Session not found: {acp_id}"), out);
     };
 
     // Include the current model as the only entry so the editor sees it
@@ -335,7 +354,7 @@ fn dispatch_delete_session(
 ) -> Result<(), AcpError> {
     info!("dispatching session/delete (id={})", req.id);
 
-    let session_id = parse_params::<acp_jsonrpc::DeleteSessionRequest>(&req.params)
+    let session_id = parse_params::<acp_jsonrpc::DeleteSessionRequest>(req.params.as_ref())
         .map(|r| r.session_id)
         .unwrap_or_default();
 
@@ -370,7 +389,7 @@ fn dispatch_close_session(
 ) -> Result<(), AcpError> {
     info!("dispatching session/close (id={})", req.id);
 
-    let session_id = parse_params::<acp_jsonrpc::CloseSessionRequest>(&req.params)
+    let session_id = parse_params::<acp_jsonrpc::CloseSessionRequest>(req.params.as_ref())
         .map(|r| r.session_id)
         .unwrap_or_default();
 
@@ -402,9 +421,9 @@ fn dispatch_set_config_option(
 ) -> Result<(), AcpError> {
     info!("dispatching session/set_config_option (id={})", req.id);
 
-    let config_req = match parse_params::<acp_jsonrpc::SetConfigOptionRequest>(&req.params) {
-        Some(r) => r,
-        None => return respond_err(req.id, -32602, "Invalid params", out),
+    let Some(config_req) = parse_params::<acp_jsonrpc::SetConfigOptionRequest>(req.params.as_ref())
+    else {
+        return respond_err(req.id, -32602, "Invalid params", out);
     };
 
     let acp_id = &config_req.session_id;
@@ -436,7 +455,9 @@ fn handle_set_model(
 ) -> Result<(), AcpError> {
     let model = match &config_req.value {
         ConfigOptionValue::String(m) => m.clone(),
-        _ => return respond_err(req.id, -32602, "Model value must be a string", out),
+        ConfigOptionValue::Bool(_) => {
+            return respond_err(req.id, -32602, "Model value must be a string", out);
+        }
     };
     send_to_daemon(
         daemon_writer,
@@ -473,7 +494,9 @@ fn handle_set_reasoning_effort(
                 }
             }
         }
-        _ => return respond_err(req.id, -32602, "Reasoning effort must be a string", out),
+        ConfigOptionValue::Bool(_) => {
+            return respond_err(req.id, -32602, "Reasoning effort must be a string", out);
+        }
     };
     send_to_daemon(daemon_writer, ClientMessage::SetReasoningEffort { effort })?;
     pending.insert_sync(PendingKind::SetReasoningEffort, req.id);
@@ -508,9 +531,8 @@ fn dispatch_prompt(
 ) -> Result<(), AcpError> {
     info!("dispatching session/prompt (id={})", req.id);
 
-    let prompt_req = match parse_params::<acp_jsonrpc::PromptRequest>(&req.params) {
-        Some(r) => r,
-        None => return respond_err(req.id, -32602, "Invalid params", out),
+    let Some(prompt_req) = parse_params::<acp_jsonrpc::PromptRequest>(req.params.as_ref()) else {
+        return respond_err(req.id, -32602, "Invalid params", out);
     };
 
     let acp_id = &prompt_req.session_id;
@@ -562,16 +584,13 @@ fn dispatch_cancel(
     pending: &mut PendingRequests,
     daemon_writer: &mpsc::Sender<ClientMessage>,
 ) -> Result<(), AcpError> {
-    let acp_id = parse_params::<acp_jsonrpc::CancelNotification>(&notif.params)
+    let acp_id = parse_params::<acp_jsonrpc::CancelNotification>(notif.params.as_ref())
         .map(|r| r.session_id)
         .unwrap_or_default();
 
-    let prompt = match pending.get_prompt(&acp_id) {
-        Some(p) => p,
-        None => {
-            warn!(acp_id, "cancel for session with no active prompt");
-            return Ok(());
-        }
+    let Some(prompt) = pending.get_prompt(&acp_id) else {
+        warn!(acp_id, "cancel for session with no active prompt");
+        return Ok(());
     };
 
     info!(
@@ -593,13 +612,13 @@ fn dispatch_cancel(
 // ---------------------------------------------------------------------------
 
 fn handle_daemon_message(
-    msg: DaemonMessage,
+    msg: &DaemonMessage,
     sessions: &mut SessionManager,
     pending: &mut PendingRequests,
     daemon_writer: &mpsc::Sender<ClientMessage>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
-    match &msg {
+    match msg {
         DaemonMessage::Session {
             event:
                 SessionEvent::OutputChunk { .. }
@@ -611,8 +630,8 @@ fn handle_daemon_message(
                 | SessionEvent::Failed { .. }
                 | SessionEvent::Cancelled { .. },
             ..
-        } => handle_streaming_message(&msg, pending, sessions, out),
-        _ => handle_sync_message(&msg, sessions, pending, daemon_writer, out),
+        } => handle_streaming_message(msg, pending, sessions, out),
+        _ => handle_sync_message(msg, sessions, pending, daemon_writer, out),
     }
 }
 
@@ -649,9 +668,8 @@ fn handle_streaming_message(
     // Find the matching prompt.  If this request_id doesn't belong to any
     // active prompt, the message is stale (e.g. from a prior connection)
     // and can be safely ignored.
-    let prompt = match pending.find_by_request_id(request_id) {
-        Some(p) => p,
-        None => return Ok(()),
+    let Some(prompt) = pending.find_by_request_id(request_id) else {
+        return Ok(());
     };
     let jsonrpc_id = prompt.jsonrpc_id;
     let session_acp_id = prompt.session_acp_id.clone();
@@ -792,7 +810,7 @@ fn handle_sync_message(
                     if let Some(session_id) = pending.take_pending_session(&PendingKind::SetModel)
                         && let Some(s) = sessions.get_mut(&session_id)
                     {
-                        s.model = selected_model.clone();
+                        s.model.clone_from(selected_model);
                     }
                     respond(entry.jsonrpc_id, serde_json::json!({}), out)?;
                 }
@@ -832,10 +850,10 @@ fn handle_sync_message(
                 let infos: Vec<SessionInfo> = session_list
                     .iter()
                     .map(|s| {
-                        let acp_id = sessions
-                            .get_by_daemon_id(s.session_id)
-                            .map(|id| id.to_string())
-                            .unwrap_or_else(|| format!("daemon_{}", s.session_id));
+                        let acp_id = sessions.get_by_daemon_id(s.session_id).map_or_else(
+                            || format!("daemon_{}", s.session_id),
+                            ToString::to_string,
+                        );
                         SessionInfo {
                             session_id: acp_id,
                             title: s.title.clone(),

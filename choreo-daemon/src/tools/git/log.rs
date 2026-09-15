@@ -12,6 +12,11 @@ pub struct GitLogArgs {
     pub limit: Option<usize>,
 }
 
+/// Show recent Git commits for the repository containing the given path.
+///
+/// # Errors
+///
+/// Returns Err if the repository cannot be opened or the walk fails.
 pub fn execute_git_log_tool(
     args: &GitLogArgs,
     working_dir: Option<&std::path::Path>,
@@ -30,9 +35,8 @@ pub(crate) fn git_log_impl(
     working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     let repo = open_repo(repo_path, working_dir)?;
-    let head = match repo.head_id() {
-        Ok(head) => head,
-        Err(_) => return Ok("repository has no commits yet".to_string()),
+    let Ok(head) = repo.head_id() else {
+        return Ok("repository has no commits yet".to_string());
     };
 
     let mut walk = repo
@@ -76,8 +80,8 @@ pub(crate) fn git_log_impl(
 pub fn describe_git_log_invocation(args: &GitLogArgs) -> String {
     let limit = args.limit.unwrap_or(10).clamp(1, 100);
     match &args.repo_path {
-        Some(p) => format!("Showing git log for `{}` (last {} commits).", p, limit),
-        None => format!("Showing git log (last {} commits).", limit),
+        Some(p) => format!("Showing git log for `{p}` (last {limit} commits)."),
+        None => format!("Showing git log (last {limit} commits)."),
     }
 }
 

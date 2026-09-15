@@ -1,4 +1,4 @@
-//! OpenAI Images API adapter ([`OpenAiImageClient`]).
+//! `OpenAI` Images API adapter ([`OpenAiImageClient`]).
 //!
 //! Talks to `{base_url}/images/generations` (the same endpoint shape the
 //! Chat Completions client builds from `ServiceConfig::base_url`, reusing
@@ -21,7 +21,7 @@ use std::io;
 // super::IMAGE_MAX_ATTEMPTS) — identical across every image adapter and
 // reused for the URL-download path too.
 
-/// Images API path under the configured base URL (OpenAI: `/v1`).
+/// Images API path under the configured base URL (`OpenAI`: `/v1`).
 const IMAGE_GENERATIONS_PATH: &str = "/images/generations";
 
 const IMAGE_MAX_ATTEMPTS: u32 = super::IMAGE_MAX_ATTEMPTS;
@@ -48,7 +48,7 @@ struct ImagesResponse {
     data: Vec<ImageDataItem>,
 }
 
-/// Client for the OpenAI Images API (`/images/generations`).
+/// Client for the `OpenAI` Images API (`/images/generations`).
 ///
 /// Construction mirrors [`super::OpenAiClient::new`]: it takes the same
 /// [`ServiceConfig`] shape so an account configured for chat works as-is
@@ -79,6 +79,7 @@ impl OpenAiImageClient {
     /// timeout — the deadline lives on the agent, so
     /// `config.total_timeout_secs` is deliberately overridden here and the
     /// caller's value for that one field is not honored.
+    #[must_use]
     pub fn new(mut config: ServiceConfig, api_key: String, registry: &SocketRegistry) -> Self {
         let http = crate::shared::build_agent(
             registry,
@@ -100,6 +101,7 @@ impl OpenAiImageClient {
         }
     }
 
+    #[must_use]
     pub fn config(&self) -> &ServiceConfig {
         &self.config
     }

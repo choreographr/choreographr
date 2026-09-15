@@ -1,5 +1,6 @@
 use super::error::ToolExecError;
 use super::sanitize::sanitize_content;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 
@@ -78,17 +79,14 @@ pub(crate) fn read_line_capped<R: BufRead>(
             // WIDEN the range and defeat the `take` cap if an invariant ever
             // broke — the helper returns an error so the violation is loud.
             let window = cap_slice(available, ..take)?;
-            match window.iter().position(|&b| b == b'\n') {
-                Some(idx) => {
-                    // `idx < take`, so the range is in bounds (and the
-                    // loud-error helper applies for the same reason as above).
-                    buf.extend_from_slice(cap_slice(available, ..=idx)?);
-                    (idx + 1, true)
-                }
-                None => {
-                    buf.extend_from_slice(window);
-                    (take, false)
-                }
+            if let Some(idx) = window.iter().position(|&b| b == b'\n') {
+                // `idx < take`, so the range is in bounds (and the
+                // loud-error helper applies for the same reason as above).
+                buf.extend_from_slice(cap_slice(available, ..=idx)?);
+                (idx + 1, true)
+            } else {
+                buf.extend_from_slice(window);
+                (take, false)
             }
         };
         reader.consume(consumed);
@@ -359,7 +357,7 @@ pub(crate) fn render_streamed_line(
     let display = sanitize_content(display);
     let mut display_line = String::new();
     if numbered {
-        display_line.push_str(&format!("{} | {display}", line.line_number));
+        let _ = write!(display_line, "{} | {display}", line.line_number);
     } else {
         display_line.push_str(&display);
     }

@@ -58,6 +58,9 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
         .text
         .get(..app.model_selector.filter.cursor)
         .unwrap_or(&app.model_selector.filter.text);
+    // The `.min()` clamp below bounds the column to the row width, and a
+    // filter prefix wider than `u16::MAX` columns cannot fit any terminal.
+    #[allow(clippy::cast_possible_truncation)]
     let cursor_col =
         filter_row.x + filter_prefix.len() as u16 + display_width(before_cursor) as u16;
     let cursor_col = cursor_col.min(filter_row.x + filter_row.width.saturating_sub(1));

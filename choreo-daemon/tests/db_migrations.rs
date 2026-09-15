@@ -4,7 +4,7 @@
 //!
 //! These tests bind the system boundary (the `CHOREOGRAPHR_DB_PATH`
 //! environment variable, the filesystem, and a real redb database), so per
-//! AGENTS.md they belong in the `#[ignore]` suite:
+//! AGENTS.md they belong in the `#[ignore = "integration"]` suite:
 //! `cargo nextest run -p choreo-daemon --run-ignored only`.
 
 use choreo_daemon::db;
@@ -15,7 +15,7 @@ use redb::ReadableDatabase;
 const META: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn open_db_creates_migrates_and_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let db_file = dir.path().join("state.redb");
@@ -90,7 +90,7 @@ fn open_db_creates_migrates_and_round_trips() {
         created_at: 1,
         last_modified: 1,
         active_tool_groups: vec![],
-        context_config: Default::default(),
+        context_config: choreo_proto::ContextConfig::default(),
         account_name: None,
         last_response_id: None,
         last_response_id_producer: None,
@@ -116,7 +116,7 @@ fn open_db_creates_migrates_and_round_trips() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn open_db_recreates_zero_byte_corpse_and_initializes() {
     // A 0-byte `state.redb` is the corpse of an interrupted create (crash
     // between file creation and the first write): it holds no recoverable
@@ -177,7 +177,7 @@ const SESSION_TURNS: redb::TableDefinition<(u64, u32), &[u8]> =
     redb::TableDefinition::new("session_turns");
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn open_db_migrates_legacy_turns_to_zstd() {
     // The full production startup sequence against a real file: open_db
     // creates + stamps the initial version, a PRE-UPGRADE (v1) database holds
@@ -206,7 +206,10 @@ fn open_db_migrates_legacy_turns_to_zstd() {
 
     // Before migration the raw row is undecodable through the now-decompressing
     // reader.
-    assert!(db::read_turns(&db, 7).unwrap().is_empty());
+    assert_eq!(
+        db::read_turns(&db, 7).unwrap(),
+        [] as [(u32, choreo_proto::Turn); 0]
+    );
 
     // The startup migration chain (1→2) rewrites it to a zstd frame.
     db::run_migrations(&db).unwrap();

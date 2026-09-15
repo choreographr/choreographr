@@ -36,6 +36,7 @@ fn parse(raw: &str) -> Option<&str> {
 /// The `'static` lifetime is required (and intended): the value is a slice of
 /// the compile-time [`RELEASE_NAME`] literal, so it borrows nothing from the
 /// caller.
+#[must_use]
 pub fn release_name() -> Option<&'static str> {
     parse(RELEASE_NAME)
 }
@@ -45,6 +46,7 @@ pub fn release_name() -> Option<&'static str> {
 ///
 /// `base` is the binary's OWN `CARGO_PKG_VERSION` (passed by the caller) so a
 /// future per-crate version cannot be misreported by this shared crate.
+#[must_use]
 pub fn version_string(base: &str) -> String {
     match release_name() {
         Some(name) => format!("{base} ({name})"),

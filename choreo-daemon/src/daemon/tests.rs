@@ -58,7 +58,7 @@ pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>
 
 /// Seed an account config + decrypted credential so the new lazy provider
 /// gate (`self.accounts.contains + self.api_key_for`) sees the account as
-/// resolvable. When `base_url` is given the OpenAI client is pointed there
+/// resolvable. When `base_url` is given the `OpenAI` client is pointed there
 /// — used with a dead local port so background prefetch fetches fail
 /// instantly (connection refused) without touching the real network.
 fn seed_credentialed_account(
@@ -105,7 +105,7 @@ fn dead_base_url() -> String {
     format!("http://{}", listener.local_addr().unwrap())
 }
 
-/// `handle_suspend_event` is the power-event policy: SuspendEvent::Sleep
+/// `handle_suspend_event` is the power-event policy: `SuspendEvent::Sleep`
 /// must force-close every registered provider socket (observable as EOF on
 /// the peer end of a registered duplicate fd), Wake must leave the registry
 /// untouched.
@@ -136,7 +136,7 @@ mod suspend_tests {
         // (An empty session-map is fine here: the session-scoped close is
         // pinned separately by the cancel-isolation tests below.)
         let empty: std::collections::HashMap<u64, SocketRegistry> = HashMap::new();
-        handle_suspend_event(&SuspendEvent::Sleep, &registry, &empty);
+        handle_suspend_event(SuspendEvent::Sleep, &registry, &empty);
 
         // The registry cleared its list (shutdown_all closes each fd).
         assert_eq!(registry.registered_count(), 0);
@@ -162,7 +162,7 @@ mod suspend_tests {
         }
         assert_eq!(daemon_registry.registered_count(), 0);
 
-        handle_suspend_event(&SuspendEvent::Sleep, &daemon_registry, &sessions);
+        handle_suspend_event(SuspendEvent::Sleep, &daemon_registry, &sessions);
 
         assert_eq!(daemon_registry.registered_count(), 0);
         for (id, r) in &sessions {
@@ -192,7 +192,7 @@ mod suspend_tests {
         dead_pair(&session_registry);
         sessions.insert(1, session_registry);
 
-        handle_suspend_event(&SuspendEvent::Wake, &registry, &sessions);
+        handle_suspend_event(SuspendEvent::Wake, &registry, &sessions);
 
         // Only the dead entries were removed (2 registered → 1 per registry).
         assert_eq!(registry.registered_count(), 1);
@@ -260,7 +260,7 @@ mod cancel_isolation_tests {
 
     /// EOF on the peer end (the successful force-close observable). A read
     /// timeout guards every call so an *untouched* socket's read returns
-    /// TimedOut (not Ok(0)) instead of blocking a unit test forever.
+    /// `TimedOut` (not Ok(0)) instead of blocking a unit test forever.
     fn peer_saw_close(b: &mut UnixStream) -> bool {
         use std::time::Duration;
         let _ = b.set_read_timeout(Some(Duration::from_secs(1)));
@@ -270,6 +270,7 @@ mod cancel_isolation_tests {
 
     #[test]
     fn cancel_of_session_a_leaves_session_b_registry_untouched() {
+        use std::io::Write;
         let (mut state, _daemon_rx) = make_daemon_state();
         let (_a_handle, mut a_peer) = {
             let r = seed_session(&mut state, 1);
@@ -287,7 +288,6 @@ mod cancel_isolation_tests {
         // Session B — even sharing NOTHING — is untouched: its registry
         // still holds its entry and its socket is still writable.
         assert_eq!(state.session_registries[&2].registered_count(), 1);
-        use std::io::Write;
         b_handle
             .write_all(b"x")
             .expect("uncancelled session's socket must survive the cancel");
@@ -404,7 +404,7 @@ fn handle_list_sessions_empty() {
     let (reply, rx) = mpsc::channel();
     state.handle_command(DaemonCommand::ListSessions { reply });
     let sessions = rx.recv().unwrap();
-    assert!(sessions.is_empty());
+    assert_eq!(sessions, [] as [choreo_proto::SessionSummary; 0]);
 }
 
 #[test]
@@ -484,6 +484,8 @@ fn handle_list_sessions_tiebreaks_by_session_id_desc() {
                 reasoning_effort: None,
                 parent_session_id: None,
                 working_dir: None,
+                // u64→i64 id*1000: test ids are tiny (1..=3); no wrap possible.
+                #[allow(clippy::cast_possible_wrap)]
                 created_at: id as i64 * 1000,
                 last_modified: 5000,
                 turn_count: 0,
@@ -1246,7 +1248,7 @@ fn broadcast_sends_to_subscriber() {
         session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     };
-    state.broadcast(msg.clone());
+    state.broadcast(&msg.clone());
     let received = rx.recv().unwrap();
     assert_eq!(received, msg);
     // Subscriber should still be registered
@@ -1259,7 +1261,7 @@ fn broadcast_removes_disconnected_subscriber() {
     let (tx, rx) = test_sink();
     state.summary_subscribers.insert(1, tx);
     drop(rx); // Disconnect the receiver
-    state.broadcast(DaemonMessage::Session {
+    state.broadcast(&DaemonMessage::Session {
         session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     });
@@ -1286,7 +1288,7 @@ fn broadcast_enqueues_losslessly_and_evicts_over_lag_client() {
         session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     };
-    state.broadcast(msg.clone());
+    state.broadcast(&msg.clone());
 
     // Lossless: the crossing message is still delivered, never dropped.
     assert_eq!(rx.recv().unwrap(), msg);
@@ -1344,7 +1346,7 @@ fn broadcast_lifecycle_delivers_to_summary_and_activity_exactly_once_per_client(
         session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     };
-    state.broadcast(msg.clone());
+    state.broadcast(&msg.clone());
 
     // Summary-only client: delivered via the summary fan-out.
     assert_eq!(rx1.recv().unwrap(), msg);
@@ -1740,7 +1742,7 @@ fn acl_b64(key: &[u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(key)
 }
 
-/// A DaemonState with a SharedAcl loaded from a temp file containing KEY_A.
+/// A `DaemonState` with a `SharedAcl` loaded from a temp file containing `KEY_A`.
 fn make_acl_state() -> (DaemonState, tempfile::TempDir) {
     let (mut state, _rx) = make_daemon_state();
     let dir = tempfile::tempdir().unwrap();
@@ -1815,6 +1817,7 @@ fn handle_acl_add_is_idempotent_for_an_already_trusted_key() {
 
 #[test]
 fn handle_acl_add_rejects_a_bad_key() {
+    use base64::Engine as _;
     let (mut state, _dir) = make_acl_state();
 
     let (reply_tx, reply_rx) = mpsc::channel();
@@ -1825,7 +1828,6 @@ fn handle_acl_add_rejects_a_bad_key() {
     assert!(reply_rx.recv().unwrap().is_err(), "bad base64 must fail");
 
     // Valid base64, wrong length.
-    use base64::Engine as _;
     let short = base64::engine::general_purpose::STANDARD.encode([9u8; 16]);
     let (reply_tx, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::AclAddCmd {
@@ -2988,12 +2990,15 @@ fn activity_subscriber_gets_current_provider_list_on_register() {
     let (mut state, _rx) = make_daemon_state();
     let (writer_tx, writer_rx) = test_sink();
 
-    state.handle_register_activity_subscriber(1, writer_tx);
+    state.handle_register_activity_subscriber(1, &writer_tx);
 
     let msg = writer_rx.recv().unwrap();
     match &msg {
         DaemonMessage::CatalogUpdated { providers } => {
-            assert!(!providers.is_empty());
+            assert_ne!(
+                providers.as_slice(),
+                [] as [choreo_proto::CatalogProvider; 0]
+            );
             assert!(providers.iter().any(|p| p.slug == "openai"));
         }
         other => panic!("expected CatalogUpdated, got {other:?}"),
@@ -3013,7 +3018,7 @@ fn activity_subscriber_gets_current_lock_state_on_register() {
     let (writer_tx, writer_rx) = test_sink();
 
     // Test state starts locked → the subscribe push is `Locked`.
-    state.handle_register_activity_subscriber(1, writer_tx);
+    state.handle_register_activity_subscriber(1, &writer_tx);
     let msg = writer_rx.recv().unwrap(); // CatalogUpdated
     assert!(matches!(&msg, DaemonMessage::CatalogUpdated { .. }));
     match writer_rx.recv().unwrap() {
@@ -3024,7 +3029,7 @@ fn activity_subscriber_gets_current_lock_state_on_register() {
     // After unlocking, a fresh subscriber is told `Unlocked`.
     state.locked = false;
     let (writer_tx2, writer_rx2) = test_sink();
-    state.handle_register_activity_subscriber(2, writer_tx2);
+    state.handle_register_activity_subscriber(2, &writer_tx2);
     let _ = writer_rx2.recv().unwrap(); // CatalogUpdated
     match writer_rx2.recv().unwrap() {
         DaemonMessage::Unlocked => {}
@@ -3312,8 +3317,8 @@ fn create_session_with_account_spawns_background_prefetch() {
 
 /// Build a state whose session 1 points at `account`, backed by a
 /// credentialed account whose endpoint is a dead local port (instant fetch
-/// failure). Shared by the ListModels prefetch tests to keep the verbose
-/// SessionMetadata boilerplate in one place.
+/// failure). Shared by the `ListModels` prefetch tests to keep the verbose
+/// `SessionMetadata` boilerplate in one place.
 fn state_with_session_account(account: &str) -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
     let (mut state, rx) = make_daemon_state();
     seed_credentialed_account_with_url(&mut state, account, "openai", Some(dead_base_url()));
@@ -3608,7 +3613,7 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
     // The REGISTERED activity subscriber (a separate sink from the acting
     // client's client_writer below) receives the transition broadcasts.
     let (sub_writer, sub_rx) = test_sink();
-    state.handle_register_activity_subscriber(1, sub_writer);
+    state.handle_register_activity_subscriber(1, &sub_writer);
     drain_send_on_subscribe(&sub_rx);
 
     let key: [u8; 32] = [7u8; 32];

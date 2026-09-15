@@ -1,14 +1,14 @@
 //! Integration tests for the `list_files` tool.
 //!
-//! These exercise real filesystem I/O (TempDir + writes) and therefore live
+//! These exercise real filesystem I/O (`TempDir` + writes) and therefore live
 //! in `tests/` per the project's Test Discipline policy rather than in
-//! `src/` unit-test modules. They are marked `#[ignore]` so `cargo test`
+//! `src/` unit-test modules. They are marked `#[ignore = "integration"]` so `cargo test`
 //! runs only unit tests; run with `cargo test-integration`.
 
 use choreo_daemon::{ListFilesArgs, execute_list_files_tool};
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn lists_files_with_rich_metadata() {
     let dir = tempfile::tempdir().unwrap();
     // A small text file with a known size.
@@ -36,7 +36,7 @@ fn lists_files_with_rich_metadata() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn empty_directory_reports_zero_entries() {
     let dir = tempfile::tempdir().unwrap();
     let args = ListFilesArgs {
@@ -49,7 +49,7 @@ fn empty_directory_reports_zero_entries() {
 
 #[cfg(unix)]
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn symlink_shows_target() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("real.txt"), "hi\n").unwrap();
@@ -65,7 +65,7 @@ fn symlink_shows_target() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn default_path_lists_working_directory() {
     // Execute with a temp working dir so the result is deterministic.
     let dir = tempfile::tempdir().unwrap();

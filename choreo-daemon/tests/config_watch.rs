@@ -4,7 +4,7 @@
 //! logic; these exercise the real end-to-end path — `notify` observing a real
 //! filesystem, the transport thread routing a real event to a subscribed
 //! consumer. They bind real FS and use short bounded polls, so they belong in
-//! `tests/` and are `#[ignore]`d (run via `cargo test-integration`).
+//! `tests/` and are `#[ignore = "integration"]`d (run via `cargo test-integration`).
 
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
 // allow-*-in-tests config only recognizes #[test]-annotated functions —
@@ -43,13 +43,13 @@ fn wait_for(what: &str, cond: impl Fn() -> bool) {
 
 /// Scan the subscriber's receiver for a change of the expected kind within a
 /// bounded window, tolerating extra/noise events the platform may interleave
-/// (e.g. macOS FSEvents emits extra events around the one we care about).
+/// (e.g. macOS `FSEvents` emits extra events around the one we care about).
 fn recv_kind(rx: &Receiver<ConfigChange>, expected: ChangeKind) {
     let deadline = Instant::now() + WAIT_DEADLINE;
     while Instant::now() < deadline {
         match rx.try_recv() {
             Ok(c) if c.kind == expected => return,
-            Ok(_) => continue,
+            Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(10)),
         }
     }

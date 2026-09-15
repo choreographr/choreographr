@@ -17,8 +17,10 @@
     clippy::expect_used,
     clippy::panic,
     clippy::panic_in_result_fn,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation
 )]
+use std::fmt::Write as _;
 use std::io::Write;
 
 /// Build a deterministic PDF from per-page content streams, with correctly
@@ -79,7 +81,7 @@ pub fn build_pdf(contents: &[&str]) -> Vec<u8> {
     let mut xref = format!("xref\n0 {}\n", objs.len() + 1);
     xref.push_str("0000000000 65535 f \n");
     for off in &offsets {
-        xref.push_str(&format!("{off:010} 00000 n \n"));
+        let _ = writeln!(xref, "{off:010} 00000 n ");
     }
     out.extend_from_slice(xref.as_bytes());
     out.extend_from_slice(
@@ -135,7 +137,7 @@ pub fn image_only_pdf() -> Vec<u8> {
     let mut xref = format!("xref\n0 {}\n", objs.len() + 1);
     xref.push_str("0000000000 65535 f \n");
     for off in &offsets {
-        xref.push_str(&format!("{off:010} 00000 n \n"));
+        let _ = writeln!(xref, "{off:010} 00000 n ");
     }
     out.extend_from_slice(xref.as_bytes());
     out.extend_from_slice(
@@ -156,7 +158,7 @@ pub fn write_temp(bytes: &[u8]) -> tempfile::NamedTempFile {
     file
 }
 
-/// Build the RUSTSEC-2026-0187 PoC: a minimal PDF whose Catalog carries a
+/// Build the RUSTSEC-2026-0187 `PoC`: a minimal PDF whose Catalog carries a
 /// deeply nested array (`/X [[[ … ]]]`, ~10,380 levels).
 ///
 /// With `lopdf < 0.42` parsing this aborts the whole process via stack

@@ -5,7 +5,7 @@
 //! the exported tool functions against real tempfile PDFs. The deterministic
 //! fixture builders live in `src/tools/pdf/test_fixtures.rs` and are shared
 //! with the unit tests via a `#[path]` include (integration tests cannot
-//! `use` items from `src/` directly). Marked `#[ignore]` per repo
+//! `use` items from `src/` directly). Marked `#[ignore = "integration"]` per repo
 //! conventions: `cargo test -- --ignored pdf`.
 //!
 //! The whole module used to be gated on a `pdf` feature while the parser
@@ -33,7 +33,7 @@ use test_fixtures::{
 };
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn pdf_tools_registered_in_core_group() {
     let registry = ToolRegistry::new().build();
     let mut active = HashSet::new();
@@ -46,7 +46,7 @@ fn pdf_tools_registered_in_core_group() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn pdf_classify_through_registry() {
     let registry = ToolRegistry::new().build();
     let file = write_temp(&minimal_text_pdf());
@@ -69,7 +69,7 @@ fn pdf_classify_through_registry() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn pdf_to_markdown_through_registry() {
     let registry = ToolRegistry::new().build();
     let file = write_temp(&minimal_text_pdf());
@@ -98,7 +98,7 @@ fn pdf_to_markdown_through_registry() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn pdf_to_markdown_pages_filter() {
     let file = write_temp(&build_pdf(&[
         "BT /F1 24 Tf 72 720 Td (FIRST PAGE ONLY) Tj ET",
@@ -118,7 +118,7 @@ fn pdf_to_markdown_pages_filter() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn pdf_to_markdown_routes_scanned_to_ocr() {
     let file = write_temp(&image_only_pdf());
     let out = execute_pdf_to_markdown(
@@ -137,7 +137,7 @@ fn pdf_to_markdown_routes_scanned_to_ocr() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn pdf_classify_scanned_is_not_text_based() {
     let file = write_temp(&image_only_pdf());
     let out = execute_pdf_classify(
@@ -152,7 +152,7 @@ fn pdf_classify_scanned_is_not_text_based() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn nested_array_poc_does_not_abort_process() {
     // Regression guard for RUSTSEC-2026-0187. With lopdf < 0.42 this PDF
     // (deeply nested /X array in the Catalog) aborts the process via stack

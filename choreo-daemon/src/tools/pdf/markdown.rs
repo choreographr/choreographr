@@ -10,6 +10,7 @@ use crate::tools::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -24,6 +25,13 @@ pub struct PdfToMarkdownArgs {
     pub compact: Option<bool>,
 }
 
+/// Convert a text-based PDF to Markdown.
+///
+/// # Errors
+///
+/// Returns Err if the path is empty/invalid, the file cannot be read, is
+/// not a valid PDF, extraction fails, or the decompression budget is
+/// exceeded.
 pub fn execute_pdf_to_markdown(
     args: &PdfToMarkdownArgs,
     working_dir: Option<&Path>,
@@ -163,7 +171,7 @@ pub fn describe_pdf_to_markdown_invocation(args: &PdfToMarkdownArgs) -> String {
     let path = sanitize_name(&args.path);
     let mut desc = format!("Converting PDF `{path}` to Markdown.");
     if let Some(pages) = &args.pages {
-        desc.push_str(&format!(" pages: [{}].", render_page_list(pages)));
+        let _ = write!(desc, " pages: [{}].", render_page_list(pages));
     }
     if args.compact.unwrap_or(false) {
         desc.push_str(" compact mode.");

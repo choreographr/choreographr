@@ -80,7 +80,7 @@ impl AnthropicConfig {
     /// types. `None` fields leave the provider default in place.
     pub fn apply_overrides(&mut self, overrides: &ProviderOverrides) {
         if let Some(base_url) = &overrides.base_url {
-            self.base_url = base_url.clone();
+            self.base_url.clone_from(base_url);
         }
         if let Some(streaming) = overrides.streaming {
             self.streaming = streaming;
@@ -178,6 +178,12 @@ impl ProviderClient for AnthropicClient {
 }
 
 impl AnthropicClient {
+    /// Create the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` if the shared HTTP agent cannot be built from the
+    /// registry/timeouts.
     pub fn new(
         config: AnthropicConfig,
         api_key: String,
@@ -199,10 +205,12 @@ impl AnthropicClient {
         })
     }
 
+    #[must_use]
     pub fn config(&self) -> &AnthropicConfig {
         &self.config
     }
 
+    #[must_use]
     pub fn api_key(&self) -> &str {
         // `Zeroizing<String>` derefs to `String`, so `as_str()` works directly.
         self.api_key.as_str()
@@ -210,15 +218,29 @@ impl AnthropicClient {
 
     /// List available models from the API, falling back to the curated static list
     /// if the endpoint is unreachable or the API key lacks permission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnthropicError`] if the HTTP request fails and no static
+    /// fallback covers it, or the response cannot be decoded.
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, AnthropicError> {
-        crate::shared::list_models_with_fallback(
+        Ok(crate::shared::list_models_with_fallback(
             || requests::list_models_request(&self.http, &self.config, &self.api_key),
             KNOWN_CLAUDE_MODELS,
             "Anthropic",
-        )
+        ))
     }
 
     /// Non-streaming chat completion turn via the Messages API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnthropicError`] on HTTP, provider, decoding, cancellation,
+    /// or retry-callback failures.
+    // TEMP(`needless_pass_by_value`): the body moves `params`' borrowed
+    // parts straight into `messages_request`; taking a reference would
+    // ripple through every caller across the daemon and tests.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn chat_completion_turn(
         &self,
         params: ChatTurnRequest<'_>,
@@ -246,6 +268,12 @@ impl AnthropicClient {
     }
 
     /// Streaming chat completion turn via the Messages API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnthropicError`] on HTTP, provider, decoding, cancellation,
+    /// or event-callback failures.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn chat_completion_turn_streaming<F>(
         &self,
         params: ChatTurnRequest<'_>,
@@ -355,7 +383,7 @@ enum ContentBlockPayload<'a> {
         r#type: &'a str,
         source: ImageSourcePayload<'a>,
     },
-    /// Provider-owned thinking / redacted_thinking block, replayed verbatim
+    /// Provider-owned thinking / `redacted_thinking` block, replayed verbatim
     /// from the round-trip artifact (never rebuilt or reordered). Serializes
     /// as the embedded JSON value; untagged serialization delegates to the
     /// actual variant, so the raw block passes through unchanged.
@@ -428,7 +456,7 @@ enum ContentBlock {
     RedactedThinking { data: String },
 }
 
-/// One thinking / redacted_thinking content block captured for the opaque
+/// One thinking / `redacted_thinking` content block captured for the opaque
 /// round-trip artifact, kept in original wire order.
 ///
 /// The payload is provider-owned: only the Anthropic adapter may interpret it
@@ -442,7 +470,7 @@ pub(super) enum ThinkingArtifactBlock {
     RedactedThinking { data: String },
 }
 
-/// Serialize the ordered thinking / redacted_thinking blocks into the opaque
+/// Serialize the ordered thinking / `redacted_thinking` blocks into the opaque
 /// [`ReasoningArtifact::AnthropicThinking`] payload, or `None` when nothing was
 /// captured. The payload is the JSON serialization of the block array exactly
 /// as received — block order preserved, signatures and redacted data intact —
@@ -590,7 +618,7 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
 }
 
 /// Decode the opaque Anthropic thinking artifact into verbatim content blocks
-/// (thinking + redacted_thinking, signatures and redacted data intact, order
+/// (thinking + `redacted_thinking`, signatures and redacted data intact, order
 /// preserved). Returns an empty vec when the artifact is absent or owned by a
 /// different adapter — payloads stay opaque until their producer decodes them.
 fn artifact_thinking_blocks(
@@ -618,11 +646,13 @@ const ANTHROPIC_IMAGE_MEDIA_TYPES: [&str; 4] =
 /// `None` when the MIME type is not Anthropic-allowlisted (the caller keeps a
 /// text marker in its place). The base64 payload is owned; `media_type`
 /// borrows from the message.
-fn anthropic_image_block<'a>(image: &'a ChatImagePart) -> Option<ContentBlockPayload<'a>> {
+fn anthropic_image_block(image: &ChatImagePart) -> Option<ContentBlockPayload<'_>> {
+    // Base64 engine trait, hoisted to the first statement per
+    // clippy::items_after_statements.
+    use base64::Engine as _;
     if !ANTHROPIC_IMAGE_MEDIA_TYPES.contains(&image.mime_type.as_str()) {
         return None;
     }
-    use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD.encode(&image.data);
     Some(ContentBlockPayload::Image {
         r#type: "image",
@@ -637,7 +667,7 @@ fn anthropic_image_block<'a>(image: &'a ChatImagePart) -> Option<ContentBlockPay
 /// Convert a list of messages + tools into the format expected by the
 /// Anthropic Messages API.
 ///
-/// `thinking_enabled` gates the replay of thinking / redacted_thinking blocks
+/// `thinking_enabled` gates the replay of thinking / `redacted_thinking` blocks
 /// from the round-trip artifact: Anthropic rejects thinking blocks sent
 /// without a matching thinking config, so they are dropped when thinking is
 /// off for this request (goose's `!thinking_disabled` gate).
@@ -773,7 +803,7 @@ fn build_tool_payloads(tools: &[ChatToolDefinition]) -> Vec<ToolPayload<'_>> {
 
 /// Map reasoning slug to Anthropic thinking config.
 /// "off" → None (no thinking block).
-/// Others → enabled thinking with budget_tokens.
+/// Others → enabled thinking with `budget_tokens`.
 ///
 /// The catalog advertises the Anthropic effort set as `off` / `minimal` /
 /// `low` / `medium` / `high` / `xhigh`; every slug except `off` must map to a

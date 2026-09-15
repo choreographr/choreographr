@@ -13,6 +13,12 @@ pub struct PdfClassifyArgs {
     pub path: String,
 }
 
+/// Classify a PDF as text-based, scanned, image-based, or mixed.
+///
+/// # Errors
+///
+/// Returns Err if the path is empty/invalid, the file cannot be read, is
+/// not a valid PDF, or classification fails.
 pub fn execute_pdf_classify(
     args: &PdfClassifyArgs,
     working_dir: Option<&Path>,
@@ -102,9 +108,14 @@ mod tests {
 
     #[test]
     fn classify_rejects_empty_path() {
-        let err = execute_pdf_classify(&PdfClassifyArgs { path: "".into() }, None)
-            .unwrap_err()
-            .to_string();
+        let err = execute_pdf_classify(
+            &PdfClassifyArgs {
+                path: String::new(),
+            },
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("path"), "{err}");
     }
 

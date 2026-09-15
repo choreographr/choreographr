@@ -2,7 +2,7 @@
 // local headless Chromium/Chrome and returns its HTML.
 //
 // This lives in tests/ per AGENTS.md (system-boundary: it launches a browser
-// process and hits the network) and is marked #[ignore] so plain `cargo test`
+// process and hits the network) and is marked #[ignore = "integration"] so plain `cargo test`
 // runs only the unit tests. Run it with the integration alias
 // (`cargo test-integration`) on a host that has Chromium/Chrome installed and
 // network access. If no browser is found the test skips gracefully.
@@ -10,7 +10,7 @@ use choreo_ai_protocols::ChatToolCall;
 use choreo_daemon::tools::{ToolOutputFormat, ToolRegistry};
 
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn retrieve_webpage_renders_a_real_page() {
     // No per-test timeout under the stdlib harness, so a hung browser (or a
     // networking stall) would block CI forever. Watchdog-abort if the body
@@ -77,8 +77,10 @@ fn retrieve_webpage_renders_a_real_page() {
 /// round-trip). Chromium resolves and loads them natively, so this needs no
 /// network and is just as suitable for the browser-boundary test suite.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn retrieve_webpage_renders_a_local_file() {
+    // A distinctive marker so the test cannot false-positive on an empty page.
+    const MARKER: &str = "choreo-file-scheme-marker";
     // Watchdog: a hung browser (or a stuck CDP prompt) would block CI forever.
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(90));
@@ -86,8 +88,6 @@ fn retrieve_webpage_renders_a_local_file() {
         std::process::abort();
     });
 
-    // A distinctive marker so the test cannot false-positive on an empty page.
-    const MARKER: &str = "choreo-file-scheme-marker";
     let dir = std::env::temp_dir().join("choreo-retrieve-webpage-file-test");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join("index.html");
@@ -138,7 +138,7 @@ fn retrieve_webpage_renders_a_local_file() {
 }
 
 /// Element-scoped screenshots must capture the target element even when it
-/// sits **below the fold**. Regression test for the bug where headless_chrome's
+/// sits **below the fold**. Regression test for the bug where `headless_chrome`'s
 /// `Element::capture_screenshot` clipped against the viewport with
 /// `captureBeyondViewport` unset, so off-screen elements came back as solid
 /// body-background pixels. The fix clips against the element's document-space
@@ -150,7 +150,7 @@ fn retrieve_webpage_renders_a_local_file() {
 /// and assert at least one pixel is exactly that color (a viewport-clip bug
 /// would return only the white body background).
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn retrieve_webpage_element_screenshot_below_the_fold() {
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(90));

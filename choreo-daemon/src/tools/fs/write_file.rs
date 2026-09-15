@@ -17,6 +17,13 @@ pub struct WriteFileArgs {
     pub create_parents: Option<bool>,
 }
 
+/// Write a UTF-8 text file, optionally creating missing parent directories
+/// and overwriting an existing file.
+///
+/// # Errors
+///
+/// Returns Err if the path is invalid, the file exists without
+/// `overwrite`, parent creation fails, or the write fails.
 pub fn execute_write_file_tool(
     args: &WriteFileArgs,
     working_dir: Option<&Path>,

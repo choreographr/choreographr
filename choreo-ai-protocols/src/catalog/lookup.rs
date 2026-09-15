@@ -60,6 +60,7 @@ fn with_model_fact<T>(
 /// Returns `None` if no entry matches, the provider is unknown, or the
 /// entry has no known window (`context_window == 0`, e.g. a model whose
 /// window was never recorded — callers then fall back to the client config).
+#[must_use]
 pub fn lookup_context_window(provider_slug: &str, model: &str) -> Option<u32> {
     // `0` is the "unknown" sentinel shared with `max_output_tokens`; map it
     // back to `None` so callers keep their config fallback.
@@ -70,6 +71,7 @@ pub fn lookup_context_window(provider_slug: &str, model: &str) -> Option<u32> {
 /// mirroring [`lookup_context_window`]: `None` for an unknown provider or
 /// model, and `None` for a recorded `0` (models.dev omits `limit.output`
 /// when it has no fact — 0 means unknown, exactly like `context_window`).
+#[must_use]
 pub fn lookup_max_output_tokens(provider_slug: &str, model: &str) -> Option<u32> {
     // Same 0-is-unknown convention as the context window: 0 maps to `None`.
     with_model_fact(provider_slug, model, |m| m.max_output_tokens)
@@ -82,6 +84,7 @@ pub fn lookup_max_output_tokens(provider_slug: &str, model: &str) -> Option<u32>
 /// to `true`: the snapshot records the fact only when the answer is "no",
 /// so absence of a record must not silently drop the parameter from
 /// requests to new/untracked models (the permissive wire default).
+#[must_use]
 pub fn model_supports_temperature(provider_slug: &str, model: &str) -> bool {
     with_model_fact(provider_slug, model, |m| m.supports_temperature).unwrap_or(true)
 }
@@ -93,6 +96,7 @@ pub fn model_supports_temperature(provider_slug: &str, model: &str) -> bool {
 /// and providers default to `false` (text-only) — the safe conservative
 /// choice: sending an image to a text-only model would 400 the whole request,
 /// whereas gating it out only degrades the image to a placeholder.
+#[must_use]
 pub fn model_supports_vision(provider_slug: &str, model: &str) -> bool {
     with_model_fact(provider_slug, model, |m| m.supports_vision).unwrap_or(false)
 }
@@ -102,6 +106,7 @@ pub fn model_supports_vision(provider_slug: &str, model: &str) -> bool {
 /// the modalities pair. Unknown models and providers default to `false` —
 /// the safe conservative choice: an image-capable capability gate must never
 /// enable itself for an untracked model.
+#[must_use]
 pub fn model_supports_image_output(provider_slug: &str, model: &str) -> bool {
     with_model_fact(provider_slug, model, |m| m.supports_image_output).unwrap_or(false)
 }
@@ -156,8 +161,9 @@ pub fn requires_reasoning_content(provider_slug: &str, model: &str) -> bool {
     required
 }
 
-/// Look up whether a model should use OpenAI's Responses API.
-/// Returns None for unknown models — caller falls back to default_request_format.
+/// Look up whether a model should use `OpenAI`'s Responses API.
+/// Returns None for unknown models — caller falls back to `default_request_format`.
+#[must_use]
 pub fn model_request_format(provider_slug: &str, model: &str) -> Option<RequestFormat> {
     with_model_fact(provider_slug, model, |m| {
         if m.openai_responses {
@@ -359,7 +365,7 @@ mod tests {
     #[test]
     fn model_reasoning_capability_openai_unknown_model() {
         let cap = model_reasoning_capability("openai", "gpt-4.1");
-        assert!(cap.available_effort_levels.is_empty());
+        assert_eq!(cap.available_effort_levels, [] as [String; 0]);
     }
 
     #[test]
@@ -387,7 +393,7 @@ mod tests {
         // current anthropic models are non-reasoning, so assert against a
         // known non-reasoning OpenAI model on the openai provider instead.
         let cap = model_reasoning_capability("openai", "gpt-4.1");
-        assert!(cap.available_effort_levels.is_empty());
+        assert_eq!(cap.available_effort_levels, [] as [String; 0]);
     }
 
     #[test]
@@ -406,7 +412,7 @@ mod tests {
     #[test]
     fn model_reasoning_capability_none_provider() {
         let cap = model_reasoning_capability("nonexistent", "any-model");
-        assert!(cap.available_effort_levels.is_empty());
+        assert_eq!(cap.available_effort_levels, [] as [String; 0]);
     }
 
     #[test]
@@ -872,7 +878,10 @@ mod tests {
             vec!["image-a".to_string(), "image-b".to_string()]
         );
         // Unknown provider → empty, never an error.
-        assert!(image_models_for_provider("no-such-provider").is_empty());
+        assert_eq!(
+            image_models_for_provider("no-such-provider"),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -898,7 +907,7 @@ mod tests {
         );
         crate::catalog::replace_catalog(off);
         assert!(!model_supports_image_output("tiny-test", "tiny-model"));
-        assert!(image_models_for_provider("tiny-test").is_empty());
+        assert_eq!(image_models_for_provider("tiny-test"), [] as [String; 0]);
     }
 
     #[test]

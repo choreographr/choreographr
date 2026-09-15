@@ -40,9 +40,9 @@ impl Tool for DbList {
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
         match (&args.start, &args.end) {
-            (Some(s), Some(e)) => format!("Listing database keys from `{}` to `{}`.", s, e),
-            (Some(s), None) => format!("Listing database keys starting from `{}`.", s),
-            (None, Some(e)) => format!("Listing database keys up to `{}`.", e),
+            (Some(s), Some(e)) => format!("Listing database keys from `{s}` to `{e}`."),
+            (Some(s), None) => format!("Listing database keys starting from `{s}`."),
+            (None, Some(e)) => format!("Listing database keys up to `{e}`."),
             (None, None) => "Listing all database keys.".to_string(),
         }
     }

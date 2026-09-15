@@ -18,7 +18,7 @@ fn temp_socket_path() -> (std::path::PathBuf, std::path::PathBuf) {
 /// replies with a `Models` message, then echoes back any `DaemonMessage` it
 /// receives as an `OutputChunk`.
 #[test]
-#[ignore]
+#[ignore = "binds a Unix socket (integration test); run via placement tests, not unit runs"]
 fn daemon_io_send_and_receive() {
     let (_dir, socket_path) = temp_socket_path();
 

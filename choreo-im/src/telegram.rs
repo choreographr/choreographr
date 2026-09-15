@@ -12,12 +12,12 @@ use crate::bridge::BridgeEvent;
 use crate::tg_api::Bot;
 
 pub fn run(
-    bot_token: String,
+    bot_token: &str,
     admin_ids: Vec<i64>,
     bridge_tx: mpsc::Sender<ClientMessage>,
     bridge_rx: mpsc::Receiver<BridgeEvent>,
 ) {
-    let bot = Bot::new(&bot_token);
+    let bot = Bot::new(bot_token);
 
     let (chat_id_tx, chat_id_rx) = mpsc::channel();
 
@@ -56,7 +56,7 @@ pub fn run(
                 for update in updates {
                     if let Some(msg) = update.message {
                         update_id = update.update_id;
-                        handle_message(&bot, &state, msg);
+                        handle_message(&bot, &state, &msg);
                     } else {
                         update_id = update.update_id;
                     }
@@ -87,14 +87,13 @@ fn is_admin(msg: &crate::tg_api::Message, admin_ids: &[i64]) -> bool {
         .is_some_and(|user| admin_ids.contains(&user.id))
 }
 
-fn handle_message(bot: &Bot, state: &TelegramState, msg: crate::tg_api::Message) {
-    let text = match msg.text.as_ref() {
-        Some(t) => t.clone(),
-        None => return,
+fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message) {
+    let Some(text) = msg.text.as_ref() else {
+        return;
     };
 
-    let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
-    if !(is_chat_private(&msg) && is_admin(&msg, &state.admin_ids)) {
+    let user_id = msg.from.as_ref().map_or(0, |u| u.id);
+    if !(is_chat_private(msg) && is_admin(msg, &state.admin_ids)) {
         debug!(%user_id, "non-admin or non-private message ignored");
         return;
     }
@@ -105,7 +104,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: crate::tg_api::Message)
     let _ = state.chat_id_tx.send(chat_id_val);
 
     let mut request_id = state.request_id.get();
-    let command = parse_input_line(&text, &mut request_id, None);
+    let command = parse_input_line(text, &mut request_id, None);
     state.request_id.set(request_id);
 
     match command {
@@ -246,7 +245,11 @@ fn send_daemon_event(bot: &Bot, chat_id: i64, event: BridgeEvent) {
                 } else {
                     "-"
                 };
-                text.push_str(&format!("  {marker} {model}\n"));
+                text.push_str("  ");
+                text.push_str(marker);
+                text.push(' ');
+                text.push_str(model);
+                text.push('\n');
             }
             if let Err(e) = bot.send_message(chat_id, &text, None) {
                 warn!("failed to send models list to telegram: {e}");

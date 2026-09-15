@@ -27,7 +27,7 @@ impl StreamBuffer {
         }
     }
 
-    fn append(&mut self, stream: OutputStream, data: &str) {
+    fn append(&mut self, stream: &OutputStream, data: &str) {
         match stream {
             OutputStream::Reasoning => self.reasoning.push_str(data),
             OutputStream::Answer => self.answer.push_str(data),
@@ -155,6 +155,7 @@ impl DaemonBridge {
         }
     }
 
+    #[must_use]
     pub fn into_parts(self) -> (mpsc::Sender<ClientMessage>, mpsc::Receiver<BridgeEvent>) {
         (self.client_tx, self.event_rx)
     }
@@ -178,7 +179,7 @@ fn daemon_to_bridge_events(
         } => {
             let text = String::from_utf8_lossy(&data);
             let entry = buffers.entry(request_id).or_insert_with(StreamBuffer::new);
-            entry.append(stream, &text);
+            entry.append(&stream, &text);
             None
         }
         DaemonMessage::Session {

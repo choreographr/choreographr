@@ -204,9 +204,7 @@ pub(crate) fn simple_glob_matches(pattern: &str, text: &str) -> bool {
     if !zlob::has_wildcards(pattern, ZlobFlags::RECOMMENDED) {
         return false;
     }
-    ZlobPattern::compile(pattern, ZlobFlags::RECOMMENDED)
-        .map(|p| p.matches_default(text))
-        .unwrap_or(false)
+    ZlobPattern::compile(pattern, ZlobFlags::RECOMMENDED).is_ok_and(|p| p.matches_default(text))
 }
 
 /// Given a repo, an optional explicit `repo_path`, and the session
@@ -320,10 +318,10 @@ pub(crate) fn format_tree_index_change(change: &gix::diff::index::Change) -> Str
             entry_mode,
             ..
         } => {
-            let prefix = if previous_entry_mode != entry_mode {
-                "T"
-            } else {
+            let prefix = if previous_entry_mode == entry_mode {
                 "M"
+            } else {
+                "T"
             };
             format!("{prefix} {}", path_from_bytes(location.as_ref()))
         }
@@ -494,13 +492,13 @@ mod tests {
     #[test]
     fn test_filter_repo_root_pathspecs_removes_dot() {
         let result = filter_repo_root_pathspecs(vec![".".into()]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [std::string::String; 0]);
     }
 
     #[test]
     fn test_filter_repo_root_pathspecs_removes_dot_slash() {
         let result = filter_repo_root_pathspecs(vec!["./".into()]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -518,7 +516,7 @@ mod tests {
     #[test]
     fn test_filter_repo_root_pathspecs_empty() {
         let result = filter_repo_root_pathspecs(vec![]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [std::string::String; 0]);
     }
 
     #[test]

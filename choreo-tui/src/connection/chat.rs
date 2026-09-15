@@ -64,7 +64,7 @@ fn send_continue_generation(
 }
 
 pub(super) fn handle_chat_event(
-    event: Event,
+    event: &Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
@@ -83,7 +83,7 @@ pub(super) fn handle_chat_event(
             match key.code {
                 // All Ctrl+ combinations delegated to a dedicated handler.
                 _ if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    handle_chat_ctrl_key(key, app, client_tx)?;
+                    handle_chat_ctrl_key(*key, app, client_tx)?;
                 }
                 // Alt+Enter → continue generation.  Shares the new-turn guard
                 // and the `ContinueGeneration` send with the `/continue`
@@ -106,8 +106,7 @@ pub(super) fn handle_chat_event(
                 KeyCode::Up => {
                     let inner = app
                         .last_terminal_size
-                        .map(|(w, _)| input_inner_width(w))
-                        .unwrap_or(78);
+                        .map_or(78, |(w, _)| input_inner_width(w));
                     if app.input.is_on_first_visual_line(inner) {
                         app.navigate_history_up();
                     } else {
@@ -118,8 +117,7 @@ pub(super) fn handle_chat_event(
                 KeyCode::Down => {
                     let inner = app
                         .last_terminal_size
-                        .map(|(w, _)| input_inner_width(w))
-                        .unwrap_or(78);
+                        .map_or(78, |(w, _)| input_inner_width(w));
                     if app.input.is_on_last_visual_line(inner) {
                         // Down only drives history navigation while an entry
                         // is loaded.  When editing the draft itself there is
@@ -180,7 +178,7 @@ pub(super) fn handle_chat_event(
                     {
                         ShellCommand::Empty => {}
                         ShellCommand::InvalidCancel(value) => {
-                            app.status = Some(format!("invalid request id: {value}"))
+                            app.status = Some(format!("invalid request id: {value}"));
                         }
                         ShellCommand::UnknownCommand(error) => app.status = Some(error),
                         ShellCommand::Send(message) => {
@@ -194,8 +192,10 @@ pub(super) fn handle_chat_event(
                                 let valid = app
                                     .active_display_ref()
                                     .and_then(|d| d.reasoning_capability.as_ref())
-                                    .map(|c| c.available_effort_levels.iter().any(|l| l == effort))
-                                    .unwrap_or(true); // No capability cached → let daemon validate
+                                    // No capability cached → let daemon validate.
+                                    .is_none_or(|c| {
+                                        c.available_effort_levels.iter().any(|l| l == effort)
+                                    });
                                 if !valid {
                                     tracing::warn!(
                                         %effort,
@@ -378,11 +378,11 @@ pub(super) fn handle_chat_event(
                 | KeyCode::Right
                 | KeyCode::Home
                 | KeyCode::End => {
-                    handle_input_key(key, &mut app.input);
+                    handle_input_key(*key, &mut app.input);
                     app.ensure_input_cursor_visible();
                 }
                 KeyCode::Char(_) => {
-                    handle_input_key(key, &mut app.input);
+                    handle_input_key(*key, &mut app.input);
                     app.ensure_input_cursor_visible();
                 }
                 KeyCode::PageUp => {
@@ -405,7 +405,7 @@ pub(super) fn handle_chat_event(
         // only the clipboard write and the status message belong to the UI
         // loop.
         Event::Mouse(mouse) if selection::is_selecting(app) => {
-            if let Some(text) = selection::handle_selection_mouse(app, &mouse) {
+            if let Some(text) = selection::handle_selection_mouse(app, mouse) {
                 if clipboard::copy_to_clipboard(&text) {
                     tracing::info!(
                         bytes = text.len(),
@@ -620,10 +620,15 @@ pub(super) fn handle_chat_event(
                     let content_row = (mouse.row - box_rect.y - 1) as usize;
                     // Subtract the left padding, clamping into [0, inner_width]
                     // so clicks in the padding land at the line start/end.
+                    // `inner_width` is a terminal column count (always far
+                    // below u16::MAX), so the narrowing cast cannot truncate
+                    // in practice.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let inner_w = inner_width as u16;
                     let content_col = mouse
                         .column
                         .saturating_sub(box_rect.x.saturating_add(INPUT_PAD))
-                        .min(inner_width as u16) as usize;
+                        .min(inner_w) as usize;
                     app.input.cursor = app.input.byte_offset_at_click(
                         inner_width,
                         visible_height,
@@ -756,7 +761,7 @@ fn handle_chat_ctrl_key(
                 .send(ClientMessage::ListAccounts)
                 .map_err(broken_pipe)?;
         }
-        KeyCode::Char('m') | KeyCode::Char('o') => {
+        KeyCode::Char('m' | 'o') => {
             // Two bindings, deliberately BOTH always live:
             //   - Ctrl+M is the historical binding; it can only arrive as
             //     Char('m')+CONTROL on a terminal that emitted the kitty CSI-u

@@ -145,29 +145,29 @@ pub fn describe_random_invocation(args: &RandomArgs) -> String {
     match args.r#type.as_ref().unwrap_or(&RandomType::Int) {
         RandomType::Int => {
             if let Some(min) = args.min {
-                parts.push(format!(" Min: {}.", min));
+                parts.push(format!(" Min: {min}."));
             }
             if let Some(max) = args.max {
-                parts.push(format!(" Max: {}.", max));
+                parts.push(format!(" Max: {max}."));
             }
         }
         RandomType::Float => {
             if let Some(min) = args.min_float {
-                parts.push(format!(" Min: {}.", min));
+                parts.push(format!(" Min: {min}."));
             }
             if let Some(max) = args.max_float {
-                parts.push(format!(" Max: {}.", max));
+                parts.push(format!(" Max: {max}."));
             }
         }
         RandomType::Bytes => {
             if let Some(len) = args.length {
-                parts.push(format!(" Length: {}.", len));
+                parts.push(format!(" Length: {len}."));
             }
         }
         _ => {}
     }
     if let Some(seed) = args.seed {
-        parts.push(format!(" Seed: {}.", seed));
+        parts.push(format!(" Seed: {seed}."));
     }
     parts.concat()
 }
@@ -268,6 +268,9 @@ mod tests {
     }
 
     #[test]
+    // why: the `value || !value` tautology is the point — it only type-checks
+    // that the parsed value is a bool, so silence the logic-bug lint here.
+    #[allow(clippy::overly_complex_bool_expr)]
     fn random_bool() {
         let args = RandomArgs {
             r#type: Some(RandomType::Bool),
@@ -357,7 +360,7 @@ mod tests {
         let args_a = RandomArgs {
             r#type: Some(RandomType::Int),
             min: Some(0),
-            max: Some(1000000),
+            max: Some(1_000_000),
             min_float: None,
             max_float: None,
             length: None,
@@ -366,7 +369,7 @@ mod tests {
         let args_b = RandomArgs {
             r#type: Some(RandomType::Int),
             min: Some(0),
-            max: Some(1000000),
+            max: Some(1_000_000),
             min_float: None,
             max_float: None,
             length: None,

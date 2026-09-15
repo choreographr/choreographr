@@ -4,10 +4,11 @@ use super::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::path::Path;
 use tracing::debug;
 
-/// Maximum number of lines read_file_range returns per call. Deliberately
+/// Maximum number of lines `read_file_range` returns per call. Deliberately
 /// small enough that a full page fits well under the shared byte budget
 /// while keeping round-trips low on large files; the byte budget is the
 /// real backstop for very long lines.
@@ -114,10 +115,11 @@ pub(crate) fn execute_read_file_range_tool(
         // so "showing X of Y bytes" matches the returned content exactly
         // (the marker text itself is appended past the budget).
         let returned_bytes = budget.shown_bytes() + header.len() + 1;
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "\n...[truncated: showing {returned_bytes} of {total_bytes} bytes \
              ({lines_shown} of {total_lines} lines) — use a smaller range]"
-        ));
+        );
     }
 
     debug!(

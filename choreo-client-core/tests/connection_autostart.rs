@@ -21,7 +21,7 @@ use std::sync::mpsc;
 /// hook must never run, and the pump must end cleanly on the listener's
 /// immediate close.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn autostart_hook_skipped_when_daemon_listens() {
     let dir = std::env::temp_dir().join(format!(
         "choreo-core-autostart-live-{}-{}",

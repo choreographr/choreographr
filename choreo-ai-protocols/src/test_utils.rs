@@ -50,6 +50,7 @@ pub struct CapturedRequest {
 
 impl CapturedRequest {
     /// Look up a request header by name (case-insensitive).
+    #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -58,6 +59,11 @@ impl CapturedRequest {
     }
 
     /// Parse the captured request body as JSON.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the captured body is not valid JSON.
+    #[must_use]
     pub fn body_json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).expect("captured request body is JSON")
     }
@@ -89,6 +95,12 @@ pub struct MockProvider {
 impl MockProvider {
     /// `responses`: `(status, content_type, body)` served in order; the last
     /// entry repeats for any excess requests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TCP listener cannot be bound or configured; the mock
+    /// provider has no non-panicking fallback.
+    #[must_use]
     pub fn start(responses: Vec<(u16, &'static str, String)>) -> Self {
         // `start_scripted` with no address to embed — the common shape.
         Self::start_scripted(move |_| responses)
@@ -99,6 +111,10 @@ impl MockProvider {
     /// can embed a URL pointing back at this very server (the z.ai adapter
     /// tests' `data[0].url` CDN download — the port does not exist before
     /// the bind, so the body cannot carry it).
+    /// # Panics
+    ///
+    /// Panics if the TCP listener cannot be bound or configured; the mock
+    /// provider has no non-panicking fallback.
     pub fn start_scripted<F>(make: F) -> Self
     where
         F: FnOnce(&str) -> Vec<(u16, &'static str, String)>,
@@ -112,10 +128,7 @@ impl MockProvider {
         // arrives.
         listener.set_nonblocking(true).expect("nonblocking");
         let addr = listener.local_addr().expect("mock provider local addr");
-        let responses = Arc::new(Mutex::new(VecDeque::from(make(&format!(
-            "http://{}",
-            addr
-        )))));
+        let responses = Arc::new(Mutex::new(VecDeque::from(make(&format!("http://{addr}")))));
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_thread = Arc::clone(&captured);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -147,9 +160,10 @@ impl MockProvider {
                             if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                                 break pos;
                             }
-                            if buf.len() > 1 << 20 {
-                                panic!("mock provider: request head too large");
-                            }
+                            assert!(
+                                buf.len() <= 1 << 20,
+                                "mock provider: request head too large"
+                            );
                         }
                         Err(e)
                             if matches!(
@@ -160,7 +174,6 @@ impl MockProvider {
                             if shutdown_requested() {
                                 return;
                             }
-                            continue;
                         }
                         Err(_) => return, // connection error; move on
                     }
@@ -193,7 +206,6 @@ impl MockProvider {
                             if shutdown_requested() {
                                 return;
                             }
-                            continue;
                         }
                         Err(_) => return,
                     }
@@ -216,7 +228,7 @@ impl MockProvider {
                 // thread, which would stall `Drop`'s join and leak the thread.
                 captured_thread
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(CapturedRequest {
                         method,
                         path,
@@ -230,7 +242,9 @@ impl MockProvider {
                 // blocking reads above would let an in-flight request stall
                 // `requests()` from the test thread.
                 let (status, content_type, response_body) = {
-                    let mut responses = responses.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut responses = responses
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if responses.len() > 1 {
                         responses.pop_front().expect("scripted response")
                     } else {
@@ -281,6 +295,7 @@ impl MockProvider {
     }
 
     /// Base URL for the given path prefix (e.g. `"v1"` → `http://…/v1`).
+    #[must_use]
     pub fn base_url(&self, prefix: &str) -> String {
         format!(
             "http://127.0.0.1:{}/{}",
@@ -290,10 +305,11 @@ impl MockProvider {
     }
 
     /// Every request captured so far, in arrival order.
+    #[must_use]
     pub fn requests(&self) -> Vec<CapturedRequest> {
         self.captured
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 }

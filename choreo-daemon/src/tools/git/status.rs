@@ -17,6 +17,12 @@ pub struct GitRepoArgs {
     pub repo_path: Option<String>,
 }
 
+/// Show the status of the Git repository containing the given path.
+///
+/// # Errors
+///
+/// Returns Err if the repository cannot be opened or the status
+/// computation fails.
 pub fn execute_git_status_tool(
     args: &GitRepoArgs,
     working_dir: Option<&std::path::Path>,
@@ -74,7 +80,7 @@ fn git_status_impl(
 
 pub fn describe_git_status_invocation(args: &GitRepoArgs) -> String {
     match &args.repo_path {
-        Some(p) => format!("Checking git repository status in `{}`.", p),
+        Some(p) => format!("Checking git repository status in `{p}`."),
         None => "Checking git repository status.".to_string(),
     }
 }

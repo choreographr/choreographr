@@ -5,7 +5,7 @@
 //! huge allocation before we get a chance to resize. This module reads just
 //! enough of the container to bound that geometry without decoding any pixels:
 //!
-//!   - every `ispe` (ImageSpatialExtentsProperty) extent — the per-item frame
+//!   - every `ispe` (`ImageSpatialExtentsProperty`) extent — the per-item frame
 //!     size a single coded image or grid tile is decoded from; and
 //!   - every `grid` derived item's canvas — the declared tile `rows`/`cols`
 //!     (from the grid item payload, located via `iinf`/`iloc`) multiplied by
@@ -108,12 +108,11 @@ pub(crate) fn heif_geometry(data: &[u8]) -> Option<HeifGeometry> {
     // corrupt), we cannot bound it — reject rather than decode.
     let mut grids = Vec::new();
     for &gid in &grid_ids {
-        match grid_payload(&locations, idat, data, gid).and_then(parse_grid_payload) {
-            Some(g) => grids.push(g),
-            None => {
-                invalid = true;
-                break;
-            }
+        if let Some(g) = grid_payload(&locations, idat, data, gid).and_then(parse_grid_payload) {
+            grids.push(g);
+        } else {
+            invalid = true;
+            break;
         }
     }
     if invalid {
@@ -172,7 +171,7 @@ fn parse_infe(content: &[u8]) -> Option<(u32, [u8; 4])> {
         return None;
     }
     let (item_id, type_off) = if version == 2 {
-        (u16_at(content, 4)? as u32, 8)
+        (u32::from(u16_at(content, 4)?), 8)
     } else {
         (u32_at(content, 4)?, 10)
     };
@@ -201,7 +200,7 @@ fn parse_iloc(content: &[u8], locations: &mut HashMap<u32, ItemLoc>) {
     let base_offset_size = header2 >> 4;
     let index_size = if version >= 1 { header2 & 0xF } else { 0 };
     let Some(item_count) = (if version < 2 {
-        r.u16().map(|v| v as u32)
+        r.u16().map(u32::from)
     } else {
         r.u32()
     }) else {
@@ -210,7 +209,7 @@ fn parse_iloc(content: &[u8], locations: &mut HashMap<u32, ItemLoc>) {
 
     for _ in 0..item_count {
         let Some(item_id) = (if version < 2 {
-            r.u16().map(|v| v as u32)
+            r.u16().map(u32::from)
         } else {
             r.u32()
         }) else {
@@ -268,7 +267,7 @@ fn parse_iloc(content: &[u8], locations: &mut HashMap<u32, ItemLoc>) {
     }
 }
 
-/// Assemble a single-extent item payload (construction_method 0 or 1) as a
+/// Assemble a single-extent item payload (`construction_method` 0 or 1) as a
 /// borrow into the file (or `idat`) buffer — no copy, `heif-oxide`-style
 /// single-extent read.
 fn grid_payload<'a>(
@@ -286,11 +285,11 @@ fn grid_payload<'a>(
         1 => idat?,
         _ => return None, // construction_method 2 (into another item) — reject
     };
-    let start = loc.base_offset.checked_add(loc.extent_offset)? as usize;
+    let start = usize::try_from(loc.base_offset.checked_add(loc.extent_offset)?).ok()?;
     let end = if loc.extent_length == 0 {
         source.len()
     } else {
-        start.checked_add(loc.extent_length as usize)?
+        start.checked_add(usize::try_from(loc.extent_length).ok()?)?
     };
     // start/end are already validated above (start <= end <= source.len()),
     // so this slice is in-bounds; use `get` for the lint rather than indexing.
@@ -309,12 +308,12 @@ fn parse_grid_payload(p: &[u8]) -> Option<GridGeometry> {
     if p.len() < 8 || version != 0 {
         return None;
     }
-    let rows = rows_byte as u32 + 1;
-    let cols = cols_byte as u32 + 1;
+    let rows = u32::from(rows_byte) + 1;
+    let cols = u32::from(cols_byte) + 1;
     let (out_w, out_h) = if flags & 1 != 0 {
         (u32_at(p, 4)?, u32_at(p, 8)?)
     } else {
-        (u16_at(p, 4)? as u32, u16_at(p, 6)? as u32)
+        (u32::from(u16_at(p, 4)?), u32::from(u16_at(p, 6)?))
     };
     if out_w == 0 || out_h == 0 {
         return None;
@@ -346,7 +345,7 @@ pub(crate) fn geometry_within_limits(data: &[u8], max_side: u32, max_pixels: u64
         max_w = max_w.max(canvas_w).max(g.out_w);
         max_h = max_h.max(canvas_h).max(g.out_h);
     }
-    max_w <= max_side && max_h <= max_side && (max_w as u64) * (max_h as u64) <= max_pixels
+    max_w <= max_side && max_h <= max_side && u64::from(max_w) * u64::from(max_h) <= max_pixels
 }
 
 /// Iterate sibling boxes in `bytes`, calling `f(box_type, content)` for each.
@@ -372,6 +371,12 @@ fn for_each_box<'a>(bytes: &'a [u8], mut f: impl FnMut([u8; 4], &'a [u8]) -> boo
         let next = match size {
             0 => bytes.len(),
             1 => match u64_at(bytes, off + 8) {
+                // A u64 box size larger than the address space cannot be
+                // sliced anyway (the whole file is a `&[u8]`, so any valid
+                // size fits `usize` on this target); the truncating cast is
+                // unreachable in practice and `saturating_add` keeps the
+                // walk bounded regardless.
+                #[allow(clippy::cast_possible_truncation)]
                 Some(large) => off.saturating_add(large as usize),
                 None => return,
             },
@@ -428,7 +433,7 @@ impl<'a> ByteCursor<'a> {
     fn uint(&mut self, width: u8) -> Option<u64> {
         match width {
             0 => Some(0),
-            4 => self.u32().map(|v| v as u64),
+            4 => self.u32().map(u64::from),
             8 => {
                 let v = u64_at(self.data, self.pos)?;
                 self.pos += 8;

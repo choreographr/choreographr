@@ -21,7 +21,7 @@ use std::time::Duration;
 static WARNED_CLAMPS: LazyLock<Mutex<HashSet<(u64, u64)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Called before each retry attempt with (current_attempt, max_attempts, delay).
+/// Called before each retry attempt with (`current_attempt`, `max_attempts`, delay).
 pub type RetryCallback = Box<dyn FnMut(u32, u32, Duration) + Send>;
 
 /// Hard ceiling on a single retry delay, in milliseconds.
@@ -67,7 +67,7 @@ impl RetryConfig {
             // misconfigured caller must not spam the log for its whole life.
             let fresh = WARNED_CLAMPS
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert((raw_initial, raw_max));
             if fresh {
                 tracing::warn!(
@@ -113,6 +113,7 @@ impl AttemptDeadline {
     /// Create a deadline for the given budget, left unarmed until
     /// [`AttemptDeadline::reset`] is called — [`retry_loop`] does that at the
     /// top of every attempt, including the first.
+    #[must_use]
     pub fn new(total_timeout_secs: u64) -> Self {
         Self {
             total_timeout_secs,
@@ -141,7 +142,7 @@ impl AttemptDeadline {
 /// wall-clock deadline.  Bundled so the retry entry points do not grow a new
 /// parameter every time a knob is added.
 pub struct AttemptContext<'a> {
-    /// Invoked before each retry wait with (attempt, max_attempts, delay).
+    /// Invoked before each retry wait with (attempt, `max_attempts`, delay).
     pub on_retry: &'a mut Option<RetryCallback>,
     /// Cancellation channel; `None` when cancellation is not wired up.
     /// Crossbeam so waits can `select!` on it alongside a retry timer.
@@ -230,6 +231,12 @@ impl std::error::Error for ProviderHttpError {
     }
 }
 
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 pub fn backoff_duration(retry_number: u32, config: &RetryConfig) -> Duration {
     let multiplier = 2u64.saturating_pow(retry_number.saturating_sub(1));
     let base = config.initial_backoff_ms.saturating_mul(multiplier);
@@ -248,6 +255,7 @@ pub fn backoff_duration(retry_number: u32, config: &RetryConfig) -> Duration {
 /// needs the `Retry-After` header (see [`retry_decision`]): the status alone
 /// cannot distinguish a throttle that clears in seconds from a cooldown that
 /// outlives the retry budget.
+#[must_use]
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
@@ -315,6 +323,7 @@ fn retry_decision(
 /// Returns `None` when the value is absent or in neither form — a malformed
 /// header is never guessed at, and the caller falls back to exponential
 /// backoff.
+#[must_use]
 pub fn parse_retry_after_secs(value: Option<&str>) -> Option<u64> {
     let value = value?.trim();
     if value.is_empty() {
@@ -334,7 +343,7 @@ pub fn parse_retry_after_secs(value: Option<&str>) -> Option<u64> {
         .with_timezone(&chrono::Utc)
         .signed_duration_since(chrono::Utc::now())
         .num_seconds();
-    Some(delta.max(0) as u64)
+    Some(delta.max(0).cast_unsigned())
 }
 
 /// Returns `true` when a cancellation signal is pending on `cancel_rx`.
@@ -347,6 +356,11 @@ pub(crate) fn cancellation_pending(cancel_rx: Option<&crossbeam_channel::Receive
 /// Returns `Err(ProviderHttpError::Cancelled)` if the channel contains a
 /// pending message, or `Ok(())` when no cancellation is pending (or when
 /// no channel is provided).
+/// Returns `Ok(())` when not cancelled.
+///
+/// # Errors
+///
+/// Returns [`ProviderHttpError::Cancelled`] when a pending signal is found.
 pub fn check_cancelled(
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<(), ProviderHttpError> {
@@ -359,6 +373,12 @@ pub fn check_cancelled(
 
 /// Block for `delay`, returning `Cancelled` early if a signal arrives on
 /// `cancel_rx`.  When no channel is provided, falls back to `thread::sleep`.
+/// Returns `Ok(())` once the sleep completes uncancelled.
+///
+/// # Errors
+///
+/// Returns [`ProviderHttpError::Cancelled`] when a signal arrives during
+/// the sleep.
 pub fn sleep_or_cancel(
     delay: Duration,
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
@@ -398,6 +418,12 @@ pub fn sleep_or_cancel(
 
 /// Invoke the retry callback (if any) then wait for the backoff duration.
 /// Returns `Cancelled` if the user cancelled during the wait.
+/// Returns `Ok(())` when the wait completed uncancelled.
+///
+/// # Errors
+///
+/// Returns [`ProviderHttpError::Cancelled`] if the user cancels during the
+/// backoff wait.
 pub fn wait_before_retry(
     attempt: u32,
     max_attempts: u32,
@@ -456,6 +482,12 @@ fn status_to_error(status: u16, detail: &str, retry_after_secs: Option<u64>) -> 
 /// The agent must be created with `http_status_as_error(false)` so that 4xx/5xx
 /// arrive as `Ok(response)` rather than `Err`.  Only transport errors
 /// (connection refused, timeout, etc.) produce `Err`.
+/// Returns the final (non-transient) HTTP response.
+///
+/// # Errors
+///
+/// Returns [`ProviderHttpError`] on transport failure, non-retryable
+/// status, exhausted attempts, or cancellation.
 pub fn retry_loop<F>(
     send_request: F,
     retry: &RetryConfig,
@@ -575,7 +607,7 @@ where
 /// Extract a concise human-readable message from a provider error body,
 /// unwrapping the standard JSON error envelopes used across providers:
 ///
-/// - OpenAI-compatible APIs (OpenAI, DeepSeek, OpenRouter, Groq, …):
+/// - OpenAI-compatible APIs (`OpenAI`, `DeepSeek`, `OpenRouter`, Groq, …):
 ///   `{"error": {"message": "…", "type": "…", "param": …,
 ///   "code": …}}` — `error.message` is the standard human-readable field.
 /// - Anthropic: `{"type": "error", "error": {"type": "…",
@@ -605,6 +637,9 @@ fn extract_error_message(body: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+// Test-module casts: f64 comparisons for backoff math are intentionally
+// approximate, and the u128->u64 millis downcast is bounded by the backoff cap.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use std::sync::Arc;

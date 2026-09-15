@@ -6,7 +6,12 @@
     clippy::expect_used,
     clippy::panic,
     clippy::panic_in_result_fn,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    // pedantic backfill: these helpers predate the pedantic sweep and
+    // were only covered by the deny-set allowance above.
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::doc_markdown
 )]
 use choreo_im::bridge::{BridgeEvent, DaemonBridge};
 use choreo_proto::{
@@ -22,7 +27,7 @@ fn connected_bridge() -> (DaemonBridge, BufReader<UnixStream>, BufWriter<UnixStr
     (bridge, BufReader::new(my_reader), BufWriter::new(my_writer))
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn bridge_ping_pong() {
     let (bridge, mut daemon_reader, mut daemon_writer) = connected_bridge();
@@ -41,7 +46,7 @@ fn bridge_ping_pong() {
     assert!(matches!(event, BridgeEvent::Pong));
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn bridge_unlock_locked() {
     let (bridge, mut daemon_reader, mut daemon_writer) = connected_bridge();
@@ -63,7 +68,7 @@ fn bridge_unlock_locked() {
     assert!(matches!(event, BridgeEvent::Unlocked));
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn bridge_text_streaming() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
@@ -114,7 +119,7 @@ fn bridge_text_streaming() {
     assert!(matches!(&event, BridgeEvent::Text(text) if text == "hello world"));
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn bridge_tool_call_events() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
@@ -176,7 +181,7 @@ fn bridge_tool_call_events() {
     );
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn bridge_tool_call_failed() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
@@ -203,7 +208,7 @@ fn bridge_tool_call_failed() {
         if name == "read_file" && error == "permission denied"));
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn bridge_turn_images() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
@@ -250,7 +255,7 @@ fn bridge_turn_images() {
         if _mime == "image/png" && data == b"abcd"));
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn bridge_error_variants() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
@@ -286,7 +291,7 @@ fn bridge_error_variants() {
     assert!(matches!(&event, BridgeEvent::Error(msg) if msg == "already locked"));
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn bridge_models() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
@@ -329,7 +334,7 @@ fn bridge_models() {
     assert!(matches!(&event, BridgeEvent::ModelSelected(model) if model == "claude"));
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn bridge_cancelled_clears_buffer() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();

@@ -13,7 +13,7 @@ use std::net::TcpListener;
 
 use choreo_daemon::tools::http::{HttpRequestArgs, execute_http_request_tool};
 
-/// Spawn a minimal HTTP server for testing the http_request tool.
+/// Spawn a minimal HTTP server for testing the `http_request` tool.
 fn spawn_http_tool_server() -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind http tool server");
     let addr = listener.local_addr().expect("http tool server addr");
@@ -156,7 +156,7 @@ fn spawn_http_tool_server() -> (String, std::thread::JoinHandle<()>) {
     (format!("http://{addr}"), handle)
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn http_request_tool_supports_range_header() {
     let (base_url, server) = spawn_http_tool_server();
@@ -187,7 +187,7 @@ fn http_request_tool_supports_range_header() {
     drop(server);
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn http_request_tool_supports_head_requests() {
     let (base_url, server) = spawn_http_tool_server();
@@ -195,7 +195,7 @@ fn http_request_tool_supports_head_requests() {
         &HttpRequestArgs {
             method: "HEAD".into(),
             url: format!("{base_url}/meta"),
-            headers: Default::default(),
+            headers: std::collections::HashMap::default(),
             body: None,
             timeout_secs: None,
         },
@@ -210,7 +210,7 @@ fn http_request_tool_supports_head_requests() {
     drop(server);
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn http_request_tool_summarizes_non_text_responses() {
     let (base_url, server) = spawn_http_tool_server();
@@ -218,7 +218,7 @@ fn http_request_tool_summarizes_non_text_responses() {
         &HttpRequestArgs {
             method: "GET".into(),
             url: format!("{base_url}/binary"),
-            headers: Default::default(),
+            headers: std::collections::HashMap::default(),
             body: None,
             timeout_secs: None,
         },
@@ -240,7 +240,7 @@ fn http_request_tool_summarizes_non_text_responses() {
     drop(server);
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn http_request_tool_truncates_large_text_responses() {
     let (base_url, server) = spawn_http_tool_server();
@@ -248,7 +248,7 @@ fn http_request_tool_truncates_large_text_responses() {
         &HttpRequestArgs {
             method: "GET".into(),
             url: format!("{base_url}/long"),
-            headers: Default::default(),
+            headers: std::collections::HashMap::default(),
             body: None,
             timeout_secs: None,
         },
@@ -261,7 +261,7 @@ fn http_request_tool_truncates_large_text_responses() {
     drop(server);
 }
 
-#[ignore]
+#[ignore = "integration"]
 #[test]
 fn http_request_tool_supports_post_body() {
     let (base_url, server) = spawn_http_tool_server();
@@ -269,7 +269,7 @@ fn http_request_tool_supports_post_body() {
         &HttpRequestArgs {
             method: "POST".into(),
             url: format!("{base_url}/echo"),
-            headers: Default::default(),
+            headers: std::collections::HashMap::default(),
             body: Some("hello".into()),
             timeout_secs: None,
         },

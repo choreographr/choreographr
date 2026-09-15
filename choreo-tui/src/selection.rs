@@ -86,6 +86,11 @@ pub(crate) struct TextSelection {
 /// line (a drag past the pane edge selects through the bottom).  The column
 /// is left as-is — it is resolved against the line's content range at
 /// highlight/extraction time.
+/// The signed arithmetic runs in isize over u16-bounded rows and small
+/// non-negative height/scroll counts (far below isize range), and the
+/// result is clamped back into the valid non-negative range before the
+/// conversion back.
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)] // small non-negative values, see above
 fn screen_to_content(app: &App, row: u16, column: u16) -> (usize, u16) {
     let vh = app.history_viewport.height as isize;
     let total = app.total_history_height() as isize;
@@ -101,6 +106,14 @@ fn screen_to_content(app: &App, row: u16, column: u16) -> (usize, u16) {
 /// scrolled out of view.  Shared by the tests that locate content on screen
 /// (`locate`, `first_content_row`) so the bottom-anchored formula lives in
 /// one place.
+/// Same small-range reasoning as [`screen_to_content`]: isize arithmetic
+/// over u16-bounded rows and non-negative counts, guarded by the range
+/// check before the u16 conversion.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)] // see above
 #[cfg(test)]
 pub(crate) fn content_to_screen_row(app: &App, content_line: usize) -> Option<u16> {
     let vh = app.history_viewport.height as isize;
@@ -283,6 +296,7 @@ pub(crate) fn finish_selection(app: &mut App) -> Option<String> {
 /// selection (`None` otherwise — a plain click, a cancelled gesture, or any
 /// drag/scroll event).  The caller performs the clipboard write and surfaces
 /// the status; the entire gesture state machine lives here.
+#[allow(clippy::trivially_copy_pass_by_ref)] // &MouseEvent reads naturally at call sites; the copy saving is trivial
 pub(crate) fn handle_selection_mouse(app: &mut App, mouse: &MouseEvent) -> Option<String> {
     match mouse.kind {
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -387,8 +401,7 @@ fn extract_selection_text(app: &App) -> Option<String> {
         // were ever handed an inconsistent slice.
         let (prev_turn, prev_line) = slots
             .get(i - 1)
-            .map(|p| (p.turn_idx, p.line_idx))
-            .unwrap_or((slot.turn_idx, slot.line_idx));
+            .map_or((slot.turn_idx, slot.line_idx), |p| (p.turn_idx, p.line_idx));
         let join = if prev_turn == slot.turn_idx && prev_line == slot.line_idx {
             // Same semantic line across two viewport rows — contiguous text.
             LineJoin::Join
@@ -608,9 +621,8 @@ pub(crate) fn apply_selection_to_lines(
     line_start: usize,
     lines: &mut [Line<'static>],
 ) {
-    let (anchor, head) = match selection_range(app) {
-        Some(range) => range,
-        None => return,
+    let Some((anchor, head)) = selection_range(app) else {
+        return;
     };
     let vp = app.history_viewport;
     let (start_line, end_line) = (anchor.0.min(head.0), anchor.0.max(head.0));

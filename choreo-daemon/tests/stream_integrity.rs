@@ -27,8 +27,8 @@
 //! (EOF) while a second client still gets a Pong.
 //!
 //! These tests bind real sockets and spawn real subprocesses, so per
-//! AGENTS.md they live in `tests/`, are marked `#[ignore]`, and run under
-//! `cargo test-integration`. Time-based waits are bounded (recv_timeout /
+//! AGENTS.md they live in `tests/`, are marked `#[ignore = "integration"]`, and run under
+//! `cargo test-integration`. Time-based waits are bounded (`recv_timeout` /
 //! wait-for-EOF deadlines), never unbounded.
 
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
@@ -47,6 +47,7 @@ use choreo_daemon::broadcast::{LagLimits, SubscriberSink};
 use choreo_daemon::providers::InferenceProvider;
 use choreo_daemon::{RequestContext, SessionCommand, session_main};
 use choreo_proto::{ClientMessage, DaemonMessage, OutputStream, SessionEvent, Turn};
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -76,7 +77,7 @@ fn sse_text_stream(chunks: &[&str]) -> String {
     let mut sse = String::new();
     for chunk in chunks {
         let payload = serde_json::json!({ "choices": [{ "delta": { "content": chunk } }] });
-        sse.push_str(&format!("data: {payload}\n\n"));
+        let _ = write!(sse, "data: {payload}\n\n");
     }
     sse.push_str("data: [DONE]\n\n");
     sse
@@ -107,7 +108,7 @@ fn sse_repeat_chunks(chunk: &str, count: usize) -> String {
     let mut sse = String::with_capacity(chunk.len() * count + 64);
     for _ in 0..count {
         let payload = serde_json::json!({ "choices": [{ "delta": { "content": chunk } }] });
-        sse.push_str(&format!("data: {payload}\n\n"));
+        let _ = write!(sse, "data: {payload}\n\n");
     }
     sse.push_str("data: [DONE]\n\n");
     sse
@@ -154,12 +155,12 @@ fn spawn_session_with_provider(
     let cmd_tx = session_tx.clone();
     let handle = std::thread::spawn(move || {
         session_main(
-            session_rx,
+            &session_rx,
             Some(provider),
             choreo_ai_protocols::SocketRegistry::default(),
             None,
             None,
-            RequestContext {
+            &RequestContext {
                 cmd_tx,
                 session_id: 1,
                 db,
@@ -283,7 +284,7 @@ fn collect_tool_chunks_until_done(
 /// exactly — the daemon never drops a broadcast message, so the live view
 /// and the record cannot diverge.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn streamed_answer_matches_final_turn_byte_for_byte() {
     let chunks: Vec<String> = (0..64)
         .map(|i| format!("chunk {i:02} — {}\n", "x".repeat(80)))
@@ -359,7 +360,7 @@ fn streamed_answer_matches_final_turn_byte_for_byte() {
 /// body recorded on the turn (the same `$ {cmd}\n<body>\n\nExit code: N`
 /// framing the shell-streaming unit tests pin).
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn tool_streaming_delivers_every_chunk_in_order() {
     const COMMAND: &str = "seq 1 10000";
 
@@ -421,7 +422,7 @@ fn tool_streaming_delivers_every_chunk_in_order() {
 /// reaped — the connection reports EOF within a bounded window — and the
 /// daemon keeps serving other clients.
 #[test]
-#[ignore]
+#[ignore = "integration"]
 fn evicts_client_that_stops_reading() {
     // Tiny lag caps: the per-client cap is a few KiB, so the first big
     // OutputChunk crosses it and the daemon must evict the client (removing
@@ -590,7 +591,7 @@ fn wait_for_eof(stream: &mut UnixStream, deadline: Duration) {
 }
 
 /// Write a protocol message to a raw socket (4-byte BE length prefix +
-/// MessagePack envelope).
+/// `MessagePack` envelope).
 fn write_message<W: Write, T: serde::Serialize>(writer: &mut W, msg: &T) {
     choreo_proto::write_message(writer, msg).expect("write protocol message");
 }

@@ -118,7 +118,7 @@ mod tests {
     use crate::tools::context::ToolContext;
     use std::sync::Arc;
 
-    /// Build a ToolContext with a mock daemon channel.
+    /// Build a `ToolContext` with a mock daemon channel.
     /// Returns (context, sender, receiver) so the test can keep the
     /// receiver alive and verify messages.
     ///

@@ -54,6 +54,7 @@ impl Default for SessionManager {
 }
 
 impl SessionManager {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
@@ -98,6 +99,7 @@ impl SessionManager {
         self.by_daemon_id.insert(daemon_id, owned);
     }
 
+    #[must_use]
     pub fn get(&self, acp_id: &str) -> Option<&AcpSession> {
         self.sessions.get(acp_id)
     }
@@ -106,8 +108,9 @@ impl SessionManager {
         self.sessions.get_mut(acp_id)
     }
 
+    #[must_use]
     pub fn get_by_daemon_id(&self, daemon_id: u64) -> Option<&str> {
-        self.by_daemon_id.get(&daemon_id).map(|s| s.as_str())
+        self.by_daemon_id.get(&daemon_id).map(String::as_str)
     }
 
     /// Remove a session from the manager.  Returns `true` if the session
@@ -124,7 +127,7 @@ impl SessionManager {
     }
 
     /// Allocate the next monotonically-increasing request ID.  Wraps on
-    /// overflow (u32::MAX → 0) since request IDs only need to be unique
+    /// overflow (`u32::MAX` → 0) since request IDs only need to be unique
     /// per-daemon-connection-lifetime.
     pub fn next_request_id(&mut self) -> u32 {
         let id = self.next_request_id;
@@ -135,6 +138,12 @@ impl SessionManager {
     /// Try to begin a prompt for the given session.  Returns
     /// `Err(SessionBusy)` if the session already has an active prompt, or
     /// `Err(SessionNotFound)` if the session doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::SessionNotFound`] when the ACP session ID is
+    /// unknown, and [`AcpError::SessionBusy`] when the session already has
+    /// an active prompt; the prompt guard is only set on success.
     pub fn try_begin_prompt(&mut self, acp_id: &str, request_id: u32) -> Result<(), AcpError> {
         let session = self
             .sessions
@@ -161,6 +170,7 @@ impl SessionManager {
     }
 
     /// Check whether the given session currently has an active prompt.
+    #[must_use]
     pub fn is_prompt_active(&self, acp_id: &str) -> bool {
         self.sessions
             .get(acp_id)

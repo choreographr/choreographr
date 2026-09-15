@@ -39,7 +39,12 @@ where
     where
         F: FnOnce() -> V,
     {
-        let mut cache = self.get_or_init().lock().unwrap_or_else(|e| e.into_inner());
+        // Recover from a poisoned mutex instead of panicking: the closure
+        // is just `PoisonError::into_inner`.
+        let mut cache = self
+            .get_or_init()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(value) = cache.get(key) {
             return value.clone();
         }

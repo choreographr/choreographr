@@ -39,6 +39,13 @@ pub struct McpClient {
 
 impl McpClient {
     /// Spawn the MCP server subprocess and perform the initialize handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::SpawnFailed`] when the subprocess cannot be spawned
+    /// or its stdio pipes captured, [`McpError::InitializeFailed`] when the
+    /// handshake fails or the response is malformed, and [`McpError::Io`] /
+    /// [`McpError::Timeout`] when the wire exchange fails.
     pub fn spawn(config: &McpServerConfig) -> Result<Self, McpError> {
         let mut transport = StdioTransport::spawn(&config.command, &config.args, &config.env)?;
 
@@ -104,6 +111,13 @@ impl McpClient {
     }
 
     /// Fetch the list of tools from the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::ServerShutdown`] when the transport is closed,
+    /// [`McpError::Io`] on write failures, [`McpError::Timeout`] when the
+    /// response does not arrive in time, and [`McpError::JsonRpcError`] /
+    /// [`McpError::ProtocolError`] for a malformed or error response.
     pub fn list_tools(&mut self) -> Result<Vec<McpTool>, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let req = JsonRpcRequest {
@@ -134,6 +148,14 @@ impl McpClient {
     }
 
     /// Call a tool on the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::ServerShutdown`] when the transport is closed,
+    /// [`McpError::ProtocolError`] when params or the response cannot be
+    /// serialized/deserialized, [`McpError::Io`] on write failures,
+    /// [`McpError::Timeout`] when the response does not arrive in time, and
+    /// [`McpError::JsonRpcError`] when the server returns an error response.
     pub fn call_tool(
         &mut self,
         name: &str,
