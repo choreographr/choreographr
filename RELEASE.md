@@ -226,7 +226,13 @@ curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/cred
    > the `check-release-name` guard, so the heading and the file must agree.
 
 4. **Tag the bump commit** (cargo-release reads the version back from
-   `Cargo.toml`): `cargo release tag -x` → creates `vX.Y.Z` at HEAD. The tag
+   `Cargo.toml`): `cargo release tag -p choreographr -x` → creates `vX.Y.Z` at
+   HEAD. **Select the root package explicitly with `-p choreographr`:** with no
+   `-p`/`--workspace`, cargo-release acts on the workspace's
+   `default-members = [".", "choreo-tui"]`, so a bare `cargo release tag -x`
+   also tags the `choreo-tui` member as `choreo-tui-vX.Y.Z` (a non-root package
+   gets a `<crate-name>-` tag prefix). That stray tag lands on the same commit
+   but is not the release tag and does not match the CI `v*` trigger. The tag
    is pushed together with the commit once Phase 2 has published. First
    release only: if `v0.1.0` was already tagged locally before the release
    tooling existed (`git tag -l`), `cargo release tag` reports `disabled due
@@ -564,7 +570,7 @@ Finally, commit any post-release doc/version drift in this repo and push.
 - [ ] MSRV sync: `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'` → update `rust-version` in `[workspace.package]` (with `Cargo.lock`) if changed
 - [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD (Name)` section — ` (Name)` for a major/minor release (name picked at release time), or the current series name kept for a patch — with a fresh empty `[Unreleased]` + compare link above it
 - [ ] `choreo-proto/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch; must match the ` (Name)` on the CHANGELOG heading (enforced by `just check-release-name`)
-- [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
+- [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -p choreographr -x` → `vX.Y.Z` (the explicit `-p` avoids a stray `choreo-tui-vX.Y.Z` tag)
 - [ ] Signed in to crates.io (Phase 2 step 0): the `/api/v1/me` token check returns `200`, else `cargo login` a token with the publish-new/publish-update scopes
 - [ ] Publish in **two batches** (0.2.0 creates 6 new crates > burst 5; a single `--workspace` is refused): dry-run then `-x` each — Batch 1 (`-p choreo-proto … -p choreo-power-events`), wait ≥ 10 min, Batch 2 (`-p choreo-transport … -p choreographr`) → 18 crates on crates.io; `cargo install --locked` verified
 - [ ] Push the bump commit + `vX.Y.Z` tag → CI builds all platforms and creates the GitHub release; verify the release page lists every asset + `SHA256SUMS` and they download
