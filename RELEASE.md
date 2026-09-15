@@ -467,28 +467,34 @@ artifacts that were uploaded; it does not re-download to compare):
 ```nu
 gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/
 ./scripts/update-homebrew-tap.sh            # dry-run: shows the diff, pushes nothing
-./scripts/update-homebrew-tap.sh --push     # commit + push to the tap repo
+./scripts/update-homebrew-tap.sh --push     # push the tap + sync the in-repo mirror
 ```
 
 `scripts/update-homebrew-tap.sh` reads the version from `Cargo.toml`,
-recomputes both `sha256` digests from the `dist/` tarballs, rewrites
+recomputes both `sha256` digests from the `dist/` tarballs, and rewrites
 `Formula/choreographr.rb` in `choreographr/homebrew-choreographr` (version,
-both `url` lines, both digests), validates the result (exact-count rewrite
-checks, no stale version/placeholder, `ruby -c` syntax check when ruby is
-present), and prints the diff. `--push` commits and pushes to the tap repo's
-default branch. The x86_64 branch is left untouched when no
-`choreographr-<V>-x86_64-apple-darwin.tar.gz` is in `dist/` (Intel macOS is
-not shipped yet — the branch stays a placeholder).
+both `url` lines, both digests). It also reconciles the tap's `bin.install`
+list against the in-repo mirrored formula
+(`packaging/homebrew/choreographr.rb`, the source of truth for it), so a
+changed shipped-binary set cannot silently break `brew install`. It validates
+the result (exact-count rewrite checks, no stale version/placeholder, `ruby -c`
+syntax check when ruby is present) and prints the diff. `--push` writes the
+resolved formula back to `packaging/homebrew/choreographr.rb` (keeping the two
+in lockstep — **commit that file with the rest of the release**) and commits +
+pushes to the tap repo's default branch. The x86_64 branch is left untouched
+when no `choreographr-<V>-x86_64-apple-darwin.tar.gz` is in `dist/` (Intel
+macOS is not shipped yet — the branch stays a placeholder).
 
-The one step that stays manual, on a Mac (Homebrew is macOS-only):
+Then verify the channel — no Mac required: the `homebrew-verify` workflow
+installs from the tap on a macOS arm64 runner and asserts `--version`:
 
 ```nu
-brew install ./choreographr.rb
-choreographr --version
+gh workflow run homebrew-verify.yml --ref master -f version=X.Y.Z
+gh run watch
 ```
 
-…then commit the mirrored-formula drift in this repo
-(`packaging/homebrew/choreographr.rb`) during Phase 5.
+(On a Mac you can do the same check by hand:
+`brew install ./choreographr.rb` then `choreographr --version`.)
 
 Manual fallback (what the script automates — only when the script cannot be
 run):
@@ -497,7 +503,8 @@ run):
    repo at `packaging/homebrew/choreographr.rb`).
 2. Update both `url` lines — tag, filename, and embedded version.
 3. Recompute the digests: `curl -fL -O <url>` then `shasum -a 256 <downloaded>.tar.gz`.
-4. Sanity-check: `brew install ./choreographr.rb` then `choreographr --version`.
+4. Verify: `gh workflow run homebrew-verify.yml -f version=X.Y.Z` (or
+   `brew install ./choreographr.rb` then `choreographr --version` on a Mac).
 5. Commit + push to the **tap repo** (not this repo).
 
 ### AUR (`choreographr-bin`)
@@ -576,7 +583,7 @@ Finally, commit any post-release doc/version drift in this repo and push.
 - [ ] Signed in to crates.io (Phase 2 step 0): the `/api/v1/me` token check returns `200`, else `cargo login` a token with the publish-new/publish-update scopes
 - [ ] Publish in **two batches** (0.2.0 creates 6 new crates > burst 5; a single `--workspace` is refused): dry-run then `-x` each — Batch 1 (`-p choreo-proto … -p choreo-power-events`), wait ≥ 10 min, Batch 2 (`-p choreo-transport … -p choreographr`) → 18 crates on crates.io; `cargo install --locked` verified
 - [ ] Push the bump commit + `vX.Y.Z` tag → CI builds all platforms and creates the GitHub release; verify the release page lists every asset + `SHA256SUMS` and they download
-- [ ] `gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/`, then `scripts/update-homebrew-tap.sh --push`; `brew install` verified on a Mac
+- [ ] `gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/`, then `scripts/update-homebrew-tap.sh --push` (commit the synced `packaging/homebrew/choreographr.rb`); `gh workflow run homebrew-verify.yml -f version=X.Y.Z` green
 - [ ] AUR `pkgver`/`sha256sums` bumped, `.SRCINFO` regenerated, pushed
 - [ ] choreographr.com: `install.sh`, `/download/vX.Y.Z/` redirects, `/releases/SHA256SUMS`
 - [ ] All install routes verified (`cargo install`/`binstall`, brew, AUR, curl, .deb, .rpm, Termux)

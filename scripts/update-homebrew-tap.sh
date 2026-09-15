@@ -201,19 +201,36 @@ elif [ -n "$X86_64_SHA" ] && [ "$OLD_X86_64_SHA" != "$X86_64_SHA" ]; then
     NEEDS_DIGEST=1
 fi
 [ "$OLD_INSTALL" = "$NEW_INSTALL" ] || NEEDS_INSTALL=1
+if [ "$NEEDS_REWRITE" -eq 1 ] || [ "$NEEDS_DIGEST" -eq 1 ] || [ "$NEEDS_INSTALL" -eq 1 ]; then
+    TAP_CHANGED=1
+else
+    TAP_CHANGED=0
+fi
 
-if [ "$NEEDS_REWRITE" -eq 0 ] && [ "$NEEDS_DIGEST" -eq 0 ] && [ "$NEEDS_INSTALL" -eq 0 ]; then
-    echo "==> tap formula already at v${VERSION} with matching digests + bin.install — nothing to do"
+# The in-repo mirrored formula is kept in lockstep with the deployed tap: this
+# script reads the mirror as the source of truth for the formula's structure
+# (e.g. bin.install) and rewrites the tap copy to satisfy the NEEDS_* flags;
+# on --push it then writes the resolved formula BACK to the mirror, so the two
+# files are always identical. "nothing to do" therefore must also account for a
+# mirror that is merely behind the tap.
+MIRROR_OUTDATED=0
+[ "$(cat "$MIRROR_FORMULA")" = "$(cat "$FORMULA")" ] || MIRROR_OUTDATED=1
+
+if [ "$TAP_CHANGED" -eq 0 ] && [ "$MIRROR_OUTDATED" -eq 0 ]; then
+    echo "==> tap formula already at v${VERSION} with matching digests + bin.install, and the mirror matches — nothing to do"
     exit 0
 fi
 
 if [ "$NEEDS_REWRITE" -eq 1 ]; then
     echo "==> tap formula at v${OLD_VERSION} — bumping version + urls to v${VERSION}"
-else
+elif [ "$TAP_CHANGED" -eq 1 ]; then
     echo "==> tap formula already at v${VERSION} — updating changed fields"
 fi
 if [ "$NEEDS_INSTALL" -eq 1 ]; then
     echo "==> tap bin.install differs from ${MIRROR_FORMULA} — reconciling"
+fi
+if [ "$TAP_CHANGED" -eq 0 ]; then
+    echo "==> tap formula already current; only the in-repo mirror needs syncing"
 fi
 
 # ── rewrite ──────────────────────────────────────────────────────────────────
@@ -238,7 +255,9 @@ replace_literal() {
     mv "$FORMULA.tmp" "$FORMULA"
 }
 
-echo "==> rewriting $FORMULA"
+if [ "$TAP_CHANGED" -eq 1 ]; then
+    echo "==> rewriting $FORMULA"
+fi
 
 # 1. Version + urls — only when the version actually changed.
 if [ "$NEEDS_REWRITE" -eq 1 ]; then
@@ -267,7 +286,7 @@ if [ "$NEEDS_INSTALL" -eq 1 ]; then
 fi
 
 # ── post-verification: every field must now be exactly what we expect ────────
-echo "==> verifying rewritten formula"
+echo "==> verifying formula"
 
 ARM64_URL="https://github.com/choreographr/choreographr/releases/download/v${VERSION}/choreographr-${VERSION}-aarch64-apple-darwin.tar.gz"
 X86_64_URL="https://github.com/choreographr/choreographr/releases/download/v${VERSION}/choreographr-${VERSION}-x86_64-apple-darwin.tar.gz"
@@ -324,14 +343,28 @@ echo "==> formula changes (tap repo):"
 git -C "$TAP_DIR" --no-pager diff
 
 if [ "$PUSH" -eq 1 ]; then
-    TAP_BRANCH="$(git -C "$TAP_DIR" branch --show-current)"
-    git -C "$TAP_DIR" add Formula/choreographr.rb
-    git -C "$TAP_DIR" commit -m "release: choreographr v${VERSION}"
-    echo "==> pushing to origin/$TAP_BRANCH"
-    git -C "$TAP_DIR" push origin "HEAD:$TAP_BRANCH"
+    # Keep the in-repo mirrored formula in lockstep with the deployed tap: this
+    # script reads the mirror as the source of truth for structure, so write the
+    # resolved formula back so version/url/digest stay current too. Commit it
+    # with the release (RELEASE.md Phase 5).
+    cp "$FORMULA" "$MIRROR_FORMULA"
+    echo "==> synced in-repo mirror $MIRROR_FORMULA — commit it with the release"
+
+    if [ "$TAP_CHANGED" -eq 1 ]; then
+        TAP_BRANCH="$(git -C "$TAP_DIR" branch --show-current)"
+        git -C "$TAP_DIR" add Formula/choreographr.rb
+        git -C "$TAP_DIR" commit -m "release: choreographr v${VERSION}"
+        echo "==> pushing to origin/$TAP_BRANCH"
+        git -C "$TAP_DIR" push origin "HEAD:$TAP_BRANCH"
+    else
+        echo "==> tap formula already up to date — no tap commit"
+    fi
 else
     echo
     echo "==> dry run — nothing committed or pushed. Re-run with --push to apply."
+    if [ "$TAP_CHANGED" -eq 1 ] || [ "$MIRROR_OUTDATED" -eq 1 ]; then
+        echo "    (the tap and/or the in-repo mirror would be updated on --push)"
+    fi
 fi
 
 cat <<EOF
@@ -340,6 +373,6 @@ cat <<EOF
     gh workflow run homebrew-verify.yml -f version=${VERSION}
     (or, on a Mac: brew install ./choreographr.rb && choreographr --version)
 
-==> remember to sync the mirrored formula in this repo:
-    packaging/homebrew/choreographr.rb  (commit the drift — RELEASE.md Phase 5)
+==> the in-repo mirror (packaging/homebrew/choreographr.rb) is synced by this
+    script on --push — commit it together with the rest of the release (Phase 5).
 EOF
