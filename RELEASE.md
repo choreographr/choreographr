@@ -275,17 +275,43 @@ tree:
    `Cargo.toml`), committing the bump together with `Cargo.lock`, so the
    crates.io metadata published below is truthful.
 
-**This release (0.2.0) publishes in two batches — the single-shot
-`publish --workspace` cannot work for it.** 0.2.0 creates **six new crates**
-(`choreo-blockchain`, `choreo-sanitize`, `choreo-image`, `choreo-sockreg`,
-`choreo-power-events`, `choreo-content`), which is more than crates.io's
-per-account burst of **5**; cargo-release refuses a plan that exceeds the burst
-upfront and does not spread new crates out for you (see
-[New-crate rate limit](#new-crate-rate-limit)). Publish in **two
-dependency-closed batches**, dry-running each (no `-x`) and confirming it ends
-with `aborting release due to dry run` before re-running it with `-x` to
-execute. `publish` does NOT bump or tag — that was `cargo release version` and
-`cargo release tag` in Phase 1.
+#### New-crate rate limit
+
+crates.io throttles **new-crate creation** per account to a burst of **5** with
+refill of **1 every 10 minutes** (a token bucket; updates to existing crates get
+burst 30/minute). cargo-release mirrors this via its `rate-limit-new-packages`
+setting (default 5, which the workspace does not override) and refuses a plan
+upfront when it would publish more new crates than the burst:
+
+```
+error: attempting to publish N new crates which is above the rate limit: 5
+error: dry-run failed, resolve the above errors and try again.
+```
+
+The 0.1.0 first release had **12 new crates**, staged in dependency-closed
+batches. **Whenever a release creates more than the burst of 5 new crates, the
+single-shot `publish --workspace` cannot succeed** — take one of two paths:
+
+1. **Ask crates.io for a burst override** on the publishing account (the
+   crates.io team raises the per-user burst in `publish_rate_overrides`). Then
+   set `rate-limit-new-packages` to match and publish in one shot:
+   `./scripts/publish-stable.sh publish --workspace -x`.
+2. **Stage in two dependency-closed batches, ≥ 10 minutes apart.** Batch 1
+   holds every crate that depends on no other workspace member; batch 2 holds
+   the rest, which cargo-release publishes in dependency order.
+
+**0.2.0 takes path 2.** It creates **six new crates** (`choreo-blockchain`,
+`choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`,
+`choreo-content`), each of which *must* ship because a published crate depends
+on it (cargo refuses to publish a crate whose dependency — optional deps
+included — is not on crates.io). The split is 4 new + 2 new; the token bucket
+(burst 5, +1 per 10 min) covers batch 2 after a single refill (4 spent → 1 left
+→ +1 = 2 ≥ 2).
+
+**Publish procedure.** Run each batch below twice — once as a dry run (no
+`-x`), confirming it ends with `aborting release due to dry run`, then again
+with `-x` to execute. `publish` does NOT bump or tag — that was
+`cargo release version` and `cargo release tag` in Phase 1.
 
 ```nu
 # Nushell has no `\` line continuation — collect the flags in a list and spread
@@ -387,55 +413,6 @@ cargo install choreographr choreo-tui --locked
 ^$"($env.CARGO_HOME)/bin/choreographr" --version    # must print X.Y.Z
 ^$"($env.CARGO_HOME)/bin/choreo-tui" --version      # the TUI is its own package now
 ```
-
-#### New-crate rate limit
-
-crates.io throttles **new-crate creation** per account to a burst of **5** with
-refill of **1 every 10 minutes** (a token bucket; updates to existing crates
-get burst 30/minute). cargo-release mirrors this via its
-`rate-limit-new-packages` setting (default 5, which the workspace does not
-override) and refuses upfront when a plan would publish more new crates than
-the burst:
-
-```
-error: attempting to publish N new crates which is above the rate limit: 5
-error: dry-run failed, resolve the above errors and try again.
-```
-
-The 0.1.0 first release had **12 new crates**, staged in dependency-closed
-batches exactly as described below. **Whenever a release creates more than the
-burst of 5 new crates, take one of the two paths below** — the single-shot
-`publish --workspace -x` cannot succeed for it. The 0.2.0 release is such a
-case: it creates **six new crates** — `choreo-blockchain`, `choreo-sanitize`,
-`choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content` —
-every one of which *must* ship because a published crate depends on it (cargo
-refuses to publish a crate whose dependency — optional deps included — is not
-on crates.io). For 0.2.0, use **path 2's plan verbatim**:
-
-1. **Ask crates.io for a burst override** on the publishing account (the
-   crates.io team raises the per-user burst in `publish_rate_overrides`). Then
-   set `rate-limit-new-packages` to match and publish in one shot:
-   `./scripts/publish-stable.sh publish --workspace -x`.
-
-2. **Stage it in two dependency-closed batches, ≥ 10 minutes apart.** Batch 1
-   holds every crate that depends on no other workspace member; batch 2 holds
-   the rest, which cargo-release publishes in dependency order. The split is
-   4 new + 2 new, and the token bucket (burst 5, +1 per 10 min) covers batch 2
-   after a single refill (4 spent → 1 left → +1 = 2 ≥ 2):
-
-   - **Batch 1** — the eight dependency leaves (4 new: `choreo-sanitize`,
-     `choreo-image`, `choreo-sockreg`, `choreo-power-events`).
-   - *(wait ≥ 10 minutes so the token bucket refills)*
-   - **Batch 2** — everything else (2 new: `choreo-blockchain`,
-     `choreo-content`); cargo-release orders these by dependency.
-
-   The exact nushell commands are the **Batch 1** / **Batch 2** blocks in the
-   Phase 2 publish step above — run each once as a dry run (it must end with
-   `aborting release due to dry run`) and once with `-x` to execute. Every
-   workspace dependency of a batched crate is either in the same batch
-   (published first — cargo-release orders by dependency) or in an earlier
-   batch. Once all 18 exist on crates.io, later releases are *updates* and go
-   in a single `./scripts/publish-stable.sh publish --workspace -x`.
 
 **Gate:** 18 crates published, `cargo install choreographr choreo-tui --locked`
 works in a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
