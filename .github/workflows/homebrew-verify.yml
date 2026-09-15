@@ -1,0 +1,103 @@
+name: homebrew-verify
+
+# Verifies the Homebrew channel end-to-end — the SOP's manual
+# "on a Mac: `brew install … && choreographr --version`" final step
+# (RELEASE.md Phase 4) — on a GitHub-hosted macOS arm64 runner, so closing
+# this channel no longer needs a physical Mac.
+#
+# Triggered by the conductor with `workflow_dispatch` AFTER the tap has been
+# bumped (Phase 4). It is deliberately NOT `on: release`: the GitHub release
+# is created by release.yml with the default GITHUB_TOKEN, and events raised by
+# GITHUB_TOKEN do not start further workflow runs (GitHub's anti-recursion
+# rule). It is also the wrong moment — the tap is updated in a later, manual
+# Phase-4 step, and this workflow asserts the tap already points here.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Release version to verify (e.g. 0.2.0). Defaults to the workspace
+          version in Cargo.toml at the checked-out ref.
+        required: false
+        type: string
+      ref:
+        description: "Git ref to check out (default: the ref this was dispatched on)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # Deterministic, quiet brew on the runner.
+  HOMEBREW_NO_ANALYTICS: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+
+jobs:
+  verify:
+    # The shipped macOS artifact is aarch64-apple-darwin, so the formula's
+    # arm64 branch is the one under test; a non-arm runner would exercise the
+    # x86_64 placeholder branch and fail for the wrong reason. macos-latest is
+    # arm64 today; the step below fails loudly if that ever changes.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Require an arm64 runner
+        run: |
+          arch="$(uname -m)"
+          [ "$arch" = "arm64" ] || {
+            echo "::error::expected arm64 (aarch64-apple-darwin is the shipped macOS target), got $arch"
+            exit 1
+          }
+
+      - name: Resolve the version
+        id: v
+        run: |
+          v="${{ inputs.version }}"
+          if [ -z "$v" ]; then
+            v="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
+          v="${v#v}"   # tolerate a leading "v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "==> verifying choreographr ${v}"
+
+      - name: Tap formula must already be at this version
+        # Fail with a clear message if the tap has not been bumped yet (the
+        # usual cause of a red run) rather than deep inside brew.
+        run: |
+          want="${{ steps.v.outputs.version }}"
+          raw="https://raw.githubusercontent.com/choreographr/homebrew-choreographr/master/Formula/choreographr.rb"
+          have="$(curl -fsSL "$raw" | sed -n 's/^  version "\([^"]*\)"/\1/p' | head -n1)"
+          echo "tap formula version: '${have:-<none>}'   wanted: '${want}'"
+          [ "$have" = "$want" ] || {
+            echo "::error::tap is at '${have:-none}', not '$want' — run RELEASE.md Phase 4 (update-homebrew-tap.sh --push) first"
+            exit 1
+          }
+
+      - name: Install from the tap and assert --version
+        run: |
+          want="${{ steps.v.outputs.version }}"
+          brew update
+          brew install choreographr/choreographr/choreographr
+          got="$(choreographr --version)"
+          echo "choreographr --version => $got"
+          case "$got" in
+            *"${want}"*) echo "OK: --version reports ${want}" ;;
+            *) echo "::error::--version '$got' does not report '$want'"; exit 1 ;;
+          esac
+
+      - name: Formula test
+        run: brew test choreographr/choreographr/choreographr
+
+      - name: Service must be installed but NOT started
+        # SOP invariant: the launchd agent is installed, never auto-enabled.
+        run: |
+          brew services list | sed 's/^/  /'
+          if brew services list | grep -Eq '^choreographr[[:space:]]+started'; then
+            echo "::error::the choreographr service was auto-started — it must stay disabled"
+            exit 1
+          fi
+          echo "OK: service installed but not started"

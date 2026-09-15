@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A `homebrew-verify` GitHub Actions workflow runs the SOP's manual Homebrew
+  check (`brew install` + `choreographr --version`) on a macOS arm64 runner,
+  so the Homebrew channel can be verified in CI without a physical Mac. It is
+  dispatched by hand after the tap is bumped and asserts the tap formula's
+  version, the installed `--version`, the formula test, and that the service is
+  installed but not auto-started.
+
 ### Fixed
 
 - The release workflow no longer attaches the not-yet-shippable Windows
