@@ -279,7 +279,7 @@ and is kept alive — but only because you asked; nothing is ever auto-enabled.
 Alternatives:
 
 - **GitHub Releases tarball** — download
-  `choreographr-0.1.0-aarch64-apple-darwin.tar.gz` from the
+  `choreographr-0.2.0-aarch64-apple-darwin.tar.gz` from the
   [releases page](https://github.com/choreographr/choreographr/releases) and
   put the shipped binaries on your `PATH`. The binaries are unsigned, so
   Gatekeeper quarantines them: clear the attribute with
@@ -298,11 +298,12 @@ Alternatives:
 ### Linux
 
 - **Debian / Ubuntu** — install the `.deb` from the release:
-  `sudo apt install ./choreographr-0.1.0-x86_64.deb`
+  `sudo apt install ./choreographr-0.2.0-x86_64.deb`
 - **Fedora / RHEL / openSUSE** — install the `.rpm` from the release:
-  `sudo dnf install ./choreographr-0.1.0-x86_64.rpm`
-- **Arch Linux (AUR)** — the prebuilt `choreographr-bin` package:
-  `paru -S choreographr-bin` (or `yay -S choreographr-bin`)
+  `sudo dnf install ./choreographr-0.2.0-x86_64.rpm`
+- **Arch Linux (AUR)** — the prebuilt `choreographr-bin` package is **not yet
+  published** (no maintainer account yet; AUR registration is closed). For now
+  use the tarball/installer or `cargo install` below.
 - **Any distro** — tarball + installer, or cargo:
   `curl -fsSL https://choreographr.com/install.sh | sh` ·
   `cargo binstall choreographr` (prebuilt, no toolchain — fetches the static
@@ -370,10 +371,9 @@ client disconnects; daemon logs land in `$TMPDIR/choreo-daemon-<pid>.log`),
 and a second `choreographr` refuses to start while another daemon is already
 listening.
 
-> **Zig?** Only source builds need it. Homebrew, the `.deb`/`.rpm`, the AUR
-> `-bin` package, the tarball, and `cargo binstall` all use prebuilt
-> binaries — `cargo install` and the [Build from source](#build-from-source)
-> path need the Zig toolchain.
+> **Zig?** Only source builds need it. Homebrew, the `.deb`/`.rpm`, the tarball,
+> and `cargo binstall` all use prebuilt binaries — `cargo install` and the
+> [Build from source](#build-from-source) path need the Zig toolchain.
 
 ## Build from source
 
@@ -1168,7 +1168,7 @@ scripts/release.sh                 # dry-run: build, tarball, SHA256SUMS, .deb/.
 scripts/release.sh --upload        # also run `gh release create` (never uploads by default)
 scripts/update-homebrew-tap.sh     # dry-run: bump the tap formula (never pushes)
 scripts/update-homebrew-tap.sh --push   # commit + push to choreographr/homebrew-choreographr
-scripts/smoke-test.sh dist/choreographr-0.1.0-x86_64-unknown-linux-musl.tar.gz
+scripts/smoke-test.sh dist/choreographr-0.2.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 Prebuilt installs (no Rust toolchain needed) use `scripts/install.sh`, which
