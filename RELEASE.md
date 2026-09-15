@@ -26,6 +26,13 @@ normal path — it is documented in condensed form in the
 machines without push access (rare; it also covers what CI does not, namely
 nothing — the channel updates are conductor tasks in every case).
 
+> **Shell.** Every command snippet in this SOP is written for
+> [nushell](https://www.nushell.sh) (`nu`). Nushell has no `\` line
+> continuation and no `&&`: long commands collect their flags in a list and
+> spread it with `...$list`, and `&&` becomes `;` (or two lines). Angle-bracket
+> tokens (`<level>`, `<V>`, `<url>`) and `X.Y.Z` are **placeholders** — replace
+> them before running.
+
 ---
 
 ## CI builds (GitHub Actions)
@@ -116,10 +123,11 @@ channel updates in Phase 4 as before.
 
 ### Preflight (before Phase 1)
 
-```bash
+```nu
 # 1. Working tree clean, on master, up to date with origin.
 git status --porcelain      # must be empty
-git checkout master && git pull --ff-only origin master
+git checkout master
+git pull --ff-only origin master
 
 # 2. Full quality gate — fmt, clippy (warnings denied), unit + integration.
 just ci
@@ -169,11 +177,10 @@ just preflight               # checks cargo + zig, notes nextest
    makes the single `[workspace.package] version` edit (plus `Cargo.lock`);
    all members inherit it. Dry-run first (the default); `-x` applies it:
 
-   ```bash
-   cargo release version <level>    # dry-run: preview the bump plan
-   cargo release version <level> -x # apply — e.g. decided `minor`:
-                                    #   cargo release version minor -x
-                                    # edits version = "0.1.1" → "0.2.0"
+   ```nu
+   # Substitute the level you decided in step 1 (patch | minor | major).
+   cargo release version minor        # dry-run: preview the bump plan
+   cargo release version minor -x     # apply — edits version = "0.1.1" → "0.2.0"
    ```
 
    `cargo release version` only edits the manifests — it does **not** commit
@@ -194,7 +201,7 @@ just preflight               # checks cargo + zig, notes nextest
    4. Update any user-facing docs that state a version or install command
       (README install section).
 
-   ```bash
+   ```nu
    git add Cargo.toml Cargo.lock choreo-proto/release-name.txt CHANGELOG.md README.md  # + any other docs touched
    git commit -m "release: bump to X.Y.Z"
    ```
@@ -253,30 +260,29 @@ with `aborting release due to dry run` before re-running it with `-x` to
 execute. `publish` does NOT bump or tag — that was `cargo release version` and
 `cargo release tag` in Phase 1.
 
-```bash
+```nu
+# Nushell has no `\` line continuation — collect the flags in a list and spread
+# them into the command with `...$list`.
 # ── Batch 1 — the eight dependency leaves (4 new crates) ──
-# dry-run first; it must end with `aborting release due to dry run`
-./scripts/publish-stable.sh publish -p choreo-proto -p choreo-keystore \
-  -p choreo-markdown -p choreo-mcp -p choreo-sanitize -p choreo-image \
-  -p choreo-sockreg -p choreo-power-events
-# then execute
-./scripts/publish-stable.sh publish -p choreo-proto -p choreo-keystore \
-  -p choreo-markdown -p choreo-mcp -p choreo-sanitize -p choreo-image \
-  -p choreo-sockreg -p choreo-power-events -x
+let b1 = ["publish"
+  "-p" "choreo-proto" "-p" "choreo-keystore"
+  "-p" "choreo-markdown" "-p" "choreo-mcp"
+  "-p" "choreo-sanitize" "-p" "choreo-image"
+  "-p" "choreo-sockreg" "-p" "choreo-power-events"]
+./scripts/publish-stable.sh ...$b1        # dry-run; must end `aborting release due to dry run`
+./scripts/publish-stable.sh ...$b1 -x     # execute
 
 # ── wait ≥ 10 minutes so the new-crate token bucket refills (5 → 1 → +1 = 2) ──
 
 # ── Batch 2 — everything else (2 new crates) ──
-# dry-run first; it must end with `aborting release due to dry run`
-./scripts/publish-stable.sh publish -p choreo-transport \
-  -p choreo-ai-protocols -p choreo-acp -p choreo-blockchain \
-  -p choreo-content -p choreo-client-core -p choreo-im -p choreo-tui \
-  -p choreo-daemon -p choreographr
-# then execute
-./scripts/publish-stable.sh publish -p choreo-transport \
-  -p choreo-ai-protocols -p choreo-acp -p choreo-blockchain \
-  -p choreo-content -p choreo-client-core -p choreo-im -p choreo-tui \
-  -p choreo-daemon -p choreographr -x
+let b2 = ["publish"
+  "-p" "choreo-transport" "-p" "choreo-ai-protocols"
+  "-p" "choreo-acp" "-p" "choreo-blockchain"
+  "-p" "choreo-content" "-p" "choreo-client-core"
+  "-p" "choreo-im" "-p" "choreo-tui"
+  "-p" "choreo-daemon" "-p" "choreographr"]
+./scripts/publish-stable.sh ...$b2        # dry-run; must end `aborting release due to dry run`
+./scripts/publish-stable.sh ...$b2 -x     # execute
 ```
 
 > **This step is written for 0.2.0.** It is the only release that creates new
@@ -348,11 +354,11 @@ fail on cargo's own refusal).
 - Verify the published suite installs cleanly from source in a scratch
   `CARGO_HOME` (needs `zig` on PATH — zlob's `build.rs`):
 
-```bash
-export CARGO_HOME=$(mktemp -d)
+```nu
+$env.CARGO_HOME = (mktemp -d)
 cargo install choreographr choreo-tui --locked
-~/.cargo/bin/choreographr --version    # must print X.Y.Z
-~/.cargo/bin/choreo-tui --version      # the TUI is its own package now
+^$"($env.CARGO_HOME)/bin/choreographr" --version    # must print X.Y.Z
+^$"($env.CARGO_HOME)/bin/choreo-tui" --version      # the TUI is its own package now
 ```
 
 #### New-crate rate limit
@@ -391,27 +397,18 @@ on crates.io). For 0.2.0, use **path 2's plan verbatim**:
    after a single refill (4 spent → 1 left → +1 = 2 ≥ 2):
 
    - **Batch 1** — the eight dependency leaves (4 new: `choreo-sanitize`,
-     `choreo-image`, `choreo-sockreg`, `choreo-power-events`):
-     ```bash
-     ./scripts/publish-stable.sh publish -p choreo-proto -p choreo-keystore \
-       -p choreo-markdown -p choreo-mcp -p choreo-sanitize -p choreo-image \
-       -p choreo-sockreg -p choreo-power-events -x
-     ```
+     `choreo-image`, `choreo-sockreg`, `choreo-power-events`).
    - *(wait ≥ 10 minutes so the token bucket refills)*
    - **Batch 2** — everything else (2 new: `choreo-blockchain`,
-     `choreo-content`); cargo-release orders these by dependency:
-     ```bash
-     ./scripts/publish-stable.sh publish -p choreo-transport \
-       -p choreo-ai-protocols -p choreo-acp -p choreo-blockchain \
-       -p choreo-content -p choreo-client-core -p choreo-im -p choreo-tui \
-       -p choreo-daemon -p choreographr -x
-     ```
+     `choreo-content`); cargo-release orders these by dependency.
 
-   Dry-run each batch first (omit `-x`) and confirm it plans only that
-   batch's crates. Every workspace dependency of a batched crate is either in
-   the same batch (published first — cargo-release orders by dependency) or in
-   an earlier batch. Once all 18 exist on crates.io, later releases are
-   *updates* and go in a single `./scripts/publish-stable.sh publish --workspace -x`.
+   The exact nushell commands are the **Batch 1** / **Batch 2** blocks in the
+   Phase 2 publish step above — run each once as a dry run (it must end with
+   `aborting release due to dry run`) and once with `-x` to execute. Every
+   workspace dependency of a batched crate is either in the same batch
+   (published first — cargo-release orders by dependency) or in an earlier
+   batch. Once all 18 exist on crates.io, later releases are *updates* and go
+   in a single `./scripts/publish-stable.sh publish --workspace -x`.
 
 **Gate:** 18 crates published, `cargo install choreographr choreo-tui --locked`
 works in a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
@@ -455,10 +452,10 @@ Run the tap updater from a `dist/` holding the release's tarballs — with the
 CI path, download them from the release first (the updater hashes the exact
 artifacts that were uploaded; it does not re-download to compare):
 
-```bash
+```nu
 gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/
-scripts/update-homebrew-tap.sh            # dry-run: shows the diff, pushes nothing
-scripts/update-homebrew-tap.sh --push     # commit + push to the tap repo
+./scripts/update-homebrew-tap.sh            # dry-run: shows the diff, pushes nothing
+./scripts/update-homebrew-tap.sh --push     # commit + push to the tap repo
 ```
 
 `scripts/update-homebrew-tap.sh` reads the version from `Cargo.toml`,
@@ -473,8 +470,9 @@ not shipped yet — the branch stays a placeholder).
 
 The one step that stays manual, on a Mac (Homebrew is macOS-only):
 
-```bash
-brew install ./choreographr.rb && choreographr --version
+```nu
+brew install ./choreographr.rb
+choreographr --version
 ```
 
 …then commit the mirrored-formula drift in this repo
@@ -486,8 +484,8 @@ run):
 1. Bump `version` to `X.Y.Z` in `Formula/choreographr.rb` (mirrored in this
    repo at `packaging/homebrew/choreographr.rb`).
 2. Update both `url` lines — tag, filename, and embedded version.
-3. Recompute the digests: `curl -fL -O <url> && shasum -a 256 <downloaded>.tar.gz`.
-4. Sanity-check: `brew install ./choreographr.rb && choreographr --version`.
+3. Recompute the digests: `curl -fL -O <url>` then `shasum -a 256 <downloaded>.tar.gz`.
+4. Sanity-check: `brew install ./choreographr.rb` then `choreographr --version`.
 5. Commit + push to the **tap repo** (not this repo).
 
 ### AUR (`choreographr-bin`)
@@ -498,8 +496,10 @@ Edit `packaging/aur/PKGBUILD`:
 2. Update the `source` URL and `sha256sums` (take the digest from the combined
    `SHA256SUMS` — the tarball is `choreographr-<V>-x86_64-unknown-linux-musl.tar.gz`).
 3. Regenerate and push:
-   ```bash
-   cd packaging/aur && makepkg --printsrcinfo > .SRCINFO && git add PKGBUILD .SRCINFO
+   ```nu
+   cd packaging/aur
+   makepkg --printsrcinfo | save -f .SRCINFO
+   git add PKGBUILD .SRCINFO
    ```
 
 ### choreographr.com (static hosting)
@@ -523,7 +523,7 @@ Exercise every install route from a clean environment:
 |---|---|---|
 | crates.io (source) | `cargo install choreographr choreo-tui --locked` (with zig) | builds, `--version` = X.Y.Z |
 | binstall (prebuilt) | `cargo binstall choreographr choreo-tui` | fetches tarball, no toolchain |
-| Homebrew | `brew tap choreographr/choreographr && brew install choreographr` | no quarantine friction |
+| Homebrew | `brew tap choreographr/choreographr` then `brew install choreographr` | no quarantine friction |
 | AUR | `choreographr-bin` | installs, `choreographr --version` |
 | curl installer | `curl -fsSL https://choreographr.com/install.sh \| sh` | sha256-verified extract |
 | .deb / .rpm | `dpkg -i` / `dnf install` on clean distro VMs | installs; unit present, **not enabled** |
@@ -611,7 +611,7 @@ it).
 
 ### Linux x86_64 box
 
-```bash
+```nu
 just release            # dry-run: musl tarball + SHA256SUMS + .deb + .rpm
 just smoke-test         # extract tarball; verify 2 binaries, --version, --help
 ```
@@ -620,7 +620,7 @@ Confirm `dist/` contains the musl tarball, `.deb`, `.rpm`, and `SHA256SUMS`.
 
 ### M1 MacBook
 
-```bash
+```nu
 just release            # dry-run: aarch64 tarball + SHA256SUMS (no .deb/.rpm)
 just smoke-test
 ```
@@ -640,8 +640,8 @@ Then the **manual daemon smoke test** (the tarball smoke test only checks
 GitHub uploads happen **once, from the Linux box**, so all assets land in one
 release:
 
-```bash
-scp macbook:…/choreographr-<V>-aarch64-apple-darwin.tar.gz dist/
+```nu
+scp "macbook:…/choreographr-<V>-aarch64-apple-darwin.tar.gz" dist/
 just smoke-test         # re-validate on the Linux box for good measure
 just release-upload     # regenerates a combined SHA256SUMS over ALL dist/ artifacts
                         # (host tarball + staged macOS tarball + .deb/.rpm) and
@@ -657,22 +657,26 @@ Equivalent manual form (what `--upload` assembles) — the title comes from the
 source-of-truth file, so it matches the CI-produced title exactly (an empty
 `release-name.txt`, the unnamed series, yields the bare `choreographr X.Y.Z`):
 
-```bash
-# Title from the source-of-truth file, matching the CI job: named series get a
-# trailing " (Name)", the unnamed series stays bare.
-TITLE="choreographr X.Y.Z"
-NAME="$(head -n1 choreo-proto/release-name.txt | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-[ -n "$NAME" ] && TITLE="${TITLE} (${NAME})"
+```nu
+# Title from the source-of-truth file, matching the CI job: a named series gets
+# a trailing " (Name)", the unnamed series stays bare.
+let NAME = (open --raw choreo-proto/release-name.txt | str trim)
+let TITLE = if ($NAME | is-empty) { "choreographr X.Y.Z" } else { "choreographr X.Y.Z (" + $NAME + ")" }
 
-gh release create vX.Y.Z \
-  dist/choreographr-X.Y.Z-x86_64-unknown-linux-musl.tar.gz \
-  dist/choreographr-X.Y.Z-aarch64-apple-darwin.tar.gz \
-  dist/choreographr-X.Y.Z-x86_64.deb \
-  dist/choreographr-X.Y.Z-x86_64.rpm \
-  dist/SHA256SUMS \
-  --title "$TITLE" \
-  --notes-file <(awk -v ver="X.Y.Z" 'index($0, "## [" ver "]") == 1 {f=1; next} f && /^## /{exit} f{print}' CHANGELOG.md) \
-  --generate-notes
+# gh needs a real path for --notes-file (nushell has no <(...) substitution):
+# extract the release's CHANGELOG section to a temp file.
+let NOTES = (mktemp)
+awk -v "ver=X.Y.Z" 'index($0, "## [" ver "]") == 1 {f=1; next} f && /^## /{exit} f{print}' CHANGELOG.md | save -f $NOTES
+
+# spread the asset paths from a list (no line continuation in nushell)
+let assets = [
+  "dist/choreographr-X.Y.Z-x86_64-unknown-linux-musl.tar.gz"
+  "dist/choreographr-X.Y.Z-aarch64-apple-darwin.tar.gz"
+  "dist/choreographr-X.Y.Z-x86_64.deb"
+  "dist/choreographr-X.Y.Z-x86_64.rpm"
+  "dist/SHA256SUMS"
+]
+gh release create vX.Y.Z ...$assets --title $TITLE --notes-file $NOTES --generate-notes
 ```
 
 **Gate:** release page lists the five manual-flow assets + `SHA256SUMS`;
