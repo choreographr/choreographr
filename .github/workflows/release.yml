@@ -46,10 +46,14 @@
 #
 # The windows-msvc build is TEMPORARILY excluded from the published release:
 # the job still runs (build + smoke tests + artifact upload) so the Windows
-# binary stays exercised on every tag, but the release job does NOT list it in
-# `needs`, so the Windows zip never lands in the GitHub release. Re-add
-# windows-msvc to the release job's `needs` once the Windows runtime is ready
-# to ship.
+# binary stays exercised on every tag, but the release job neither lists it in
+# `needs` NOR downloads it — its `download-artifact` step enumerates the three
+# shipping platforms, with a guard that fails on a stray Windows artifact.
+# `needs` alone is not enough (it only gates when the job starts): a bare
+# `pattern: "*"` download pulls in EVERY artifact in the run, so the zip once
+# raced into a release and leaked into SHA256SUMS. When the Windows runtime is
+# ready to ship: add windows-msvc to `needs` AND to the download `pattern`,
+# and drop the guard.
 #
 # Every desktop job additionally runs scripts/daemon-smoke.sh on its artifact
 # (after smoke-test.sh): smoke-test.sh only exercises the clap --version/--help
@@ -650,11 +654,27 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Enumerate the SHIPPING platforms explicitly — do NOT use `pattern: "*"`,
+      # which downloads EVERY artifact in the run and races the not-yet-shippable
+      # windows-msvc zip into the release (it once did, and leaked into
+      # SHA256SUMS). `needs` gates when this job starts; it does not scope the
+      # download.
       - uses: actions/download-artifact@v8
         with:
-          pattern: "*"
+          pattern: "{linux-x86_64-musl,macos-aarch64,android-aarch64-termux}"
           merge-multiple: true
           path: dist
+
+      - name: Guard against unintended artifacts
+        # Belt-and-suspenders: if a future artifact rename silently re-includes a
+        # platform that is not shipping yet (Windows today), fail the release
+        # rather than publish it.
+        run: |
+          if ls dist/*windows* >/dev/null 2>&1; then
+            echo "error: unexpected Windows artifact in dist/ — the Windows build is not shipping yet" >&2
+            ls dist >&2
+            exit 1
+          fi
 
       - name: Combined SHA256SUMS
         run: |

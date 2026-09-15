@@ -70,7 +70,9 @@ comes up), and the android job **executes** its binaries under qemu-user
 against the official Termux aarch64 rootfs (skopeo fetches the image layers;
 no docker), closing the "never executed before release" gap.
 
-The `release` job (tag pushes only) downloads all build-job artifacts,
+The `release` job (tag pushes only) downloads the three shipping platforms'
+build artifacts (`linux-musl`, `macos-arm64`, `android-termux` — deliberately
+not the not-yet-shipped `windows-msvc`),
 generates one combined `SHA256SUMS` over everything, guards that the pushed
 tag matches the manifest version, extracts the version's section from
 `CHANGELOG.md` (the Keep a Changelog promotion from Phase 1 makes it the

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The release workflow no longer attaches the not-yet-shippable Windows
+  `.zip` to GitHub releases. The `release` job downloaded every artifact in
+  the run (`pattern: "*"`), so the zip landed on a release whenever the
+  `windows-msvc` job finished first — and leaked into `SHA256SUMS`. The
+  download now names the three shipping platforms, and a guard fails the
+  release on any stray Windows artifact.
+
 ## [0.2.0] - 2026-09-15 (Lindy)
 
 ### Added
@@ -1020,5 +1031,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Initial release: daemon, TUI, protocol, Noise transport, provider catalog,
 markdown rendering, PDF tooling, and the 12-crate crates.io suite.
 
-[Unreleased]: https://github.com/choreographr/choreographr/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/choreographr/choreographr/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/choreographr/choreographr/releases/tag/v0.2.0
 [0.1.0]: https://github.com/choreographr/choreographr/releases/tag/v0.1.0
