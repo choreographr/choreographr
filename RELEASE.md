@@ -241,12 +241,22 @@ tree:
    `Cargo.toml`), committing the bump together with `Cargo.lock`, so the
    crates.io metadata published below is truthful.
 
+**Pick the publish shape first — it depends on how many crates this release
+*creates*.** cargo-release refuses a plan upfront when it would publish more
+*new* crates than crates.io's per-account burst (**5**); it does not spread them
+out for you. A release creating **≤ 5** new crates publishes in one shot; one
+creating **more** must use the batched path in
+[New-crate rate limit](#new-crate-rate-limit) instead.
+
 ```bash
-# Dry-run FIRST (the default), then re-run with `-x` / `--execute` to upload.
+# Dry-run FIRST (the default — uploads nothing), then read the ending:
+#   `…aborting release due to dry run`             → updates only; proceed to -x.
+#   `…dry-run failed` + "above the rate limit: 5"  → > 5 new crates; do NOT run
+#                                                    -x here — use the batches.
 # `publish` does NOT bump or tag (that was `cargo release version` and
 # `cargo release tag` in Phase 1).
-./scripts/publish-stable.sh publish --workspace      # dry-run: prints the plan, uploads nothing
-./scripts/publish-stable.sh publish --workspace -x   # execute: uploads in dependency order
+./scripts/publish-stable.sh publish --workspace      # dry-run: prints the plan
+./scripts/publish-stable.sh publish --workspace -x   # execute (ONLY if the dry run was clean)
 ```
 
 Publishing runs through `scripts/publish-stable.sh` (or `just publish-stable`),
@@ -333,13 +343,14 @@ error: dry-run failed, resolve the above errors and try again.
 ```
 
 The 0.1.0 first release had **12 new crates**, staged in dependency-closed
-batches the same way described below. The next release publishes **12 updates
-plus six new crates** — `choreo-blockchain`, `choreo-sanitize`,
-`choreo-image`, `choreo-sockreg`, `choreo-power-events`, and `choreo-content`
-— every one of which must ship because a published crate depends on it (cargo
+batches exactly as described below. **Whenever a release creates more than the
+burst of 5 new crates, take one of the two paths below** — the single-shot
+`publish --workspace -x` cannot succeed for it. The 0.2.0 release is such a
+case: it creates **six new crates** — `choreo-blockchain`, `choreo-sanitize`,
+`choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content` —
+every one of which *must* ship because a published crate depends on it (cargo
 refuses to publish a crate whose dependency — optional deps included — is not
-on crates.io). **Six new crates exceed the burst of 5**, so the next release
-must do one of:
+on crates.io). For 0.2.0, use **path 2's plan verbatim**:
 
 1. **Ask crates.io for a burst override** on the publishing account (the
    crates.io team raises the per-user burst in `publish_rate_overrides`). Then
@@ -523,8 +534,8 @@ Finally, commit any post-release doc/version drift in this repo and push.
 - [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD (Name)` section — ` (Name)` for a major/minor release (name picked at release time), or the current series name kept for a patch — with a fresh empty `[Unreleased]` + compare link above it
 - [ ] `choreo-proto/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch; must match the ` (Name)` on the CHANGELOG heading (enforced by `just check-release-name`)
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
-- [ ] `./scripts/publish-stable.sh publish --workspace -x` (dry-run it first **without** `-x`; add `-x` to execute) → 18 crates on crates.io; `cargo install --locked` verified
-- [ ] Next release only: the six new crates exceed the burst of 5 — use the burst override or the two batches in Phase 2 (`choreo-blockchain`, `choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content`)
+- [ ] `./scripts/publish-stable.sh publish --workspace -x` (dry-run first **without** `-x`) → 18 crates on crates.io; `cargo install --locked` verified — **only when the release creates ≤ 5 new crates**
+- [ ] If the dry run reports "above the rate limit: 5" (> 5 new crates), use the two batches in Phase 2's *New-crate rate limit* instead (`choreo-blockchain`, `choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content` are the six new crates in 0.2.0)
 - [ ] Push the bump commit + `vX.Y.Z` tag → CI builds all platforms and creates the GitHub release; verify the release page lists every asset + `SHA256SUMS` and they download
 - [ ] `gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/`, then `scripts/update-homebrew-tap.sh --push`; `brew install` verified on a Mac
 - [ ] AUR `pkgver`/`sha256sums` bumped, `.SRCINFO` regenerated, pushed
