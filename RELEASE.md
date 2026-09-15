@@ -242,10 +242,11 @@ tree:
    crates.io metadata published below is truthful.
 
 ```bash
-./scripts/publish-stable.sh publish --workspace  # publishes the Phase-1-bumped version in
-                                                 # topological order — publish does NOT bump
-                                                 # or tag (that was `cargo release version`
-                                                 # and `cargo release tag` in Phase 1)
+# Dry-run FIRST (the default), then re-run with `-x` / `--execute` to upload.
+# `publish` does NOT bump or tag (that was `cargo release version` and
+# `cargo release tag` in Phase 1).
+./scripts/publish-stable.sh publish --workspace      # dry-run: prints the plan, uploads nothing
+./scripts/publish-stable.sh publish --workspace -x   # execute: uploads in dependency order
 ```
 
 Publishing runs through `scripts/publish-stable.sh` (or `just publish-stable`),
@@ -522,7 +523,7 @@ Finally, commit any post-release doc/version drift in this repo and push.
 - [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD (Name)` section — ` (Name)` for a major/minor release (name picked at release time), or the current series name kept for a patch — with a fresh empty `[Unreleased]` + compare link above it
 - [ ] `choreo-proto/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch; must match the ` (Name)` on the CHANGELOG heading (enforced by `just check-release-name`)
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -x` → `vX.Y.Z`
-- [ ] `./scripts/publish-stable.sh publish --workspace` → 18 crates on crates.io; `cargo install --locked` verified
+- [ ] `./scripts/publish-stable.sh publish --workspace -x` (dry-run it first **without** `-x`; add `-x` to execute) → 18 crates on crates.io; `cargo install --locked` verified
 - [ ] Next release only: the six new crates exceed the burst of 5 — use the burst override or the two batches in Phase 2 (`choreo-blockchain`, `choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`, `choreo-content`)
 - [ ] Push the bump commit + `vX.Y.Z` tag → CI builds all platforms and creates the GitHub release; verify the release page lists every asset + `SHA256SUMS` and they download
 - [ ] `gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/`, then `scripts/update-homebrew-tap.sh --push`; `brew install` verified on a Mac
