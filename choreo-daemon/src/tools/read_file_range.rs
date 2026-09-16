@@ -14,13 +14,29 @@ use tracing::debug;
 /// real backstop for very long lines.
 const MAX_READ_FILE_RANGE_LINES: usize = 500;
 
+/// Serde defaults for omitted `start_line` / `max_lines`: the un-marked case of
+/// "read a range" is "the whole file from the top", which degenerates to what
+/// `read_file` does (with range metadata). `max_lines` defaults to the cap
+/// rather than a smaller courtesy window — a caller wanting a narrow window
+/// names it; omitting it means "don't make me paginate", and the byte budget
+/// still backstops huge files.
+fn default_start_line() -> usize {
+    1
+}
+
+fn default_max_lines() -> usize {
+    MAX_READ_FILE_RANGE_LINES
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadFileRangeArgs {
     /// Relative or absolute path to a text file
     pub path: String,
-    /// 1-based inclusive start line
+    /// 1-based inclusive start line (defaults to 1)
+    #[serde(default = "default_start_line")]
     pub start_line: usize,
-    /// Maximum number of lines to return (1-500)
+    /// Maximum number of lines to return (1-500; defaults to 500)
+    #[serde(default = "default_max_lines")]
     pub max_lines: usize,
 }
 
@@ -147,7 +163,7 @@ pub(crate) struct ReadFileRange;
 define_tool!(
     ReadFileRange,
     "read_file_range",
-    "Read a line range from a UTF-8 text file in the local workspace. Rejects binary files; max 500 lines per call.",
+    "Read a line range from a UTF-8 text file in the local workspace. Defaults to reading the whole file from line 1 when start_line/max_lines are omitted; rejects binary files; max 500 lines per call.",
     ReadFileRangeArgs,
     execute_read_file_range_tool,
     "core",
@@ -180,6 +196,49 @@ mod tests {
             },
             None,
         )
+    }
+
+    // ── omitted-range defaults tests ────────────────────────────────
+
+    #[test]
+    fn omitted_ranges_default_to_whole_file() {
+        // The failure this exists to fix: the model sends only a path. The
+        // serde defaults must yield start_line 1 / max_lines 500, not a
+        // "missing field` parse error.
+        let args: ReadFileRangeArgs = serde_json::from_str(r#"{"path": "CHANGELOG.md"}"#)
+            .expect("omitted range fields must default");
+        assert_eq!(args.start_line, 1);
+        assert_eq!(args.max_lines, MAX_READ_FILE_RANGE_LINES);
+    }
+
+    #[test]
+    fn omitted_ranges_read_whole_file() {
+        // End-to-end on the defaults: same result as read_file would give
+        // (with range metadata in the header).
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"alpha\nbeta\ngamma\n").unwrap();
+        let args: ReadFileRangeArgs =
+            serde_json::from_str(&format!(r#"{{"path": "{}"}}"#, file.path().display())).unwrap();
+        let out = execute_read_file_range_tool(&args, None).unwrap();
+        assert!(out.contains("lines: 1-3 of 3"), "{out}");
+        assert!(out.contains("2 | beta"), "{out}");
+    }
+
+    #[test]
+    fn only_start_line_supplied_max_lines_defaulted() {
+        // Partially supplied payloads must work: defaults fill the *other*
+        // field, never clobber a supplied one.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"alpha\nbeta\ngamma\n").unwrap();
+        let args: ReadFileRangeArgs = serde_json::from_str(&format!(
+            r#"{{"path": "{}", "start_line": 2}}"#,
+            file.path().display()
+        ))
+        .unwrap();
+        assert_eq!(args.start_line, 2);
+        assert_eq!(args.max_lines, MAX_READ_FILE_RANGE_LINES);
+        let out = execute_read_file_range_tool(&args, None).unwrap();
+        assert!(out.contains("lines: 2-3 of 3"), "{out}");
     }
 
     #[test]

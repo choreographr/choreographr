@@ -65,11 +65,11 @@ pub struct ImageProviderHandle {
     pub client: Arc<dyn ImageGenerationClient>,
 }
 
-/// User-Agent product string for every inference request: names the daemon
-/// with its own crate version (the version users actually run), so providers'
-/// metrics and any UA-based allowlisting see "choreographr/x.y.z" instead of
-/// ureq's generic default.
-fn daemon_user_agent() -> String {
+/// User-Agent product string for both callers: every inference request and
+/// the `http_request` tool. Both are raw `ureq` clients reaching servers that
+/// use the User-Agent for metrics and allowlisting, so both must name the
+/// daemon identically.
+pub(crate) fn daemon_user_agent() -> String {
     format!("choreographr/{}", env!("CARGO_PKG_VERSION"))
 }
 

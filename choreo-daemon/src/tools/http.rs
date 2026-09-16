@@ -31,9 +31,19 @@ pub enum HttpError {
     RequestFailed(String),
 }
 
+/// Serde default for [`HttpRequestArgs::method`]: GET is the unmarked case of
+/// an HTTP request, and models omit the field far more often than they mean a
+/// non-GET method with it (curl/fetch/browsers all treat GET as the default).
+/// Defaulting here turns the former hard "missing field `method`" parse error
+/// into a successful GET.
+fn default_method() -> String {
+    "GET".to_string()
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HttpRequestArgs {
-    /// HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD)
+    /// HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD; defaults to GET)
+    #[serde(default = "default_method")]
     pub method: String,
     /// Request URL
     pub url: String,
@@ -56,7 +66,12 @@ pub fn execute_http_request_tool(
     args: &HttpRequestArgs,
     _working_dir: Option<&Path>,
 ) -> Result<String, HttpError> {
-    match args.method.as_str() {
+    // Normalize once here, not at each match: models emit "get"/"Get" nearly
+    // as often as they omit the field entirely, and both match sites below
+    // (validation + dispatch) must see the same canonical form.
+    let method = args.method.to_ascii_uppercase();
+
+    match method.as_str() {
         "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" => {}
         other => return Err(HttpError::UnsupportedMethod(other.to_string())),
     }
@@ -101,7 +116,7 @@ pub fn execute_http_request_tool(
         }
     }
 
-    let response = match args.method.as_str() {
+    let response = match method.as_str() {
         "GET" => apply_headers(agent.get(&args.url), &args.headers).call(),
         "POST" => {
             let req = apply_headers(agent.post(&args.url), &args.headers);
@@ -153,7 +168,7 @@ pub fn execute_http_request_tool(
         })
         .collect();
 
-    let body = if args.method == "HEAD" {
+    let body = if method == "HEAD" {
         String::new()
     } else if is_text_content_type(&content_type) {
         read_bounded_text_body(response)
@@ -240,11 +255,15 @@ fn is_text_content_type(content_type: &str) -> bool {
 }
 
 /// Apply User-Agent and user-supplied headers to a ureq request builder.
+///
+/// The UA comes from [`crate::providers::daemon_user_agent`] so the tool names
+/// the daemon exactly as inference requests do. User-supplied headers are
+/// applied *after* the UA, so an explicit caller-side User-Agent wins.
 fn apply_headers<B>(
     req: RequestBuilder<B>,
     headers: &HashMap<String, String>,
 ) -> RequestBuilder<B> {
-    let mut req = req.header("User-Agent", "choreographr/0.1");
+    let mut req = req.header("User-Agent", crate::providers::daemon_user_agent());
     for (name, value) in headers {
         req = req.header(name.as_str(), value.as_str());
     }
@@ -295,7 +314,7 @@ impl crate::tools::Tool for HttpRequest {
     }
 
     fn description(&self) -> &'static str {
-        "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests."
+        "Make an HTTP request to an absolute URL and return status, response headers, and response body text. HTTP method defaults to GET when omitted (lowercase method names are accepted). Supports custom headers such as Range for partial content requests."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
@@ -309,7 +328,7 @@ impl crate::tools::Tool for HttpRequest {
         if let Some(ref body) = args.body {
             parts.push(format!(" Body: {} bytes.", body.len()));
         }
-        parts.push(format!(" Timeout: {}s.", args.timeout_secs.unwrap_or(30)));
+        parts.push(format!(" Timeout: {}s.", args.timeout_secs.unwrap_or(10)));
         parts.concat()
     }
 
@@ -538,6 +557,41 @@ mod tests {
         };
         let desc = tool.describe_invocation(&args);
         assert!(desc.contains("Making GET HTTP request to https://example.com."));
-        assert!(desc.contains("Timeout: 30s."));
+        assert!(desc.contains("Timeout: 10s."));
+    }
+
+    // ── method default & normalization tests ────────────────────────
+
+    #[test]
+    fn method_omitted_defaults_to_get() {
+        // The exact failure mode this feature exists for: the model sends
+        // only a URL. The serde default must produce GET, not a "missing
+        // field" parse error.
+        let args: HttpRequestArgs = serde_json::from_str(r#"{"url": "http://example.com"}"#)
+            .expect("omitted method must deserialize to the GET default");
+        assert_eq!(args.method, "GET");
+    }
+
+    #[test]
+    fn lowercase_method_accepted() {
+        // "get" must reach the same validated GET path as "GET" — the
+        // normalization happens before validation, not after.
+        let args = HttpRequestArgs {
+            method: "get".into(),
+            url: "http://example.com".into(),
+            headers: [].into(),
+            body: None,
+            timeout_secs: None,
+        };
+        let result = execute_http_request_tool(&args, None);
+        // Header validation must pass (GET is recognized); only the network
+        // layer may fail in offline tests.
+        match result {
+            Ok(_) => {}
+            Err(e) => assert!(
+                matches!(e, HttpError::RequestFailed(_)),
+                "expected RequestFailed, got {e}"
+            ),
+        }
     }
 }

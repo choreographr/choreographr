@@ -17,7 +17,7 @@ All shell tools run in a child process with resource limits and a configurable t
 ## Web content
 When you need to read or fetch a webpage, try these options **in order** and only fall back to the next one when the previous fails or is clearly unsuitable:
 
-1. `http_request` — plain HTTP GET/HEAD; the fastest option. Try this first for any static page, documentation site, or API endpoint.
+1. `http_request` — plain HTTP request (method defaults to GET when omitted); the fastest option. Try this first for any static page, documentation site, or API endpoint.
 2. `retrieve_webpage` — headless-browser rendering; use when `http_request` returns JavaScript stubs, bot-protection/challenge pages, or otherwise obviously client-side-rendered content.
 3. Skills and other tools (`load_skill`, shell utilities) — last resort only. Never choose these before trying `http_request` and `retrieve_webpage`.
 

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`read_file_range` no longer rejects calls that omit the range fields** —
+  `start_line` defaults to `1` and `max_lines` to the 500-line cap, so calling
+  it with only `path` reads the whole file (with its usual range metadata)
+  instead of failing with "missing field `start_line`".
+- **`http_request` no longer rejects calls that omit `method`** — the field
+  now defaults to `GET` (the schema marks it optional), and method names are
+  case-normalized (`"get"` behaves like `"GET"`), so the model-facing
+  failures "missing field `method`" and unsupported lowercase variants are
+  gone.
+- **`http_request` sends the same structured `User-Agent`
+  (`choreographr/<daemon version>`) as inference requests** instead of a
+  stale hardcoded `choreographr/0.1`; the product string is now shared via
+  a single helper. An explicit caller-supplied `User-Agent` header still
+  overrides it.
 - **Provider connections no longer stall or give up when the first resolved
   IP is unreachable instead of declining the connection.** The daemon's HTTP
   connector previously only moved on to the next resolved address after an
