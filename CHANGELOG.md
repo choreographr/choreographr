@@ -48,6 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Tool-result images now "decay" out of older requests.** When a tool produces
+  an image, the model sees its pixels for the duration of that request; from the
+  next message onward the conversation carries only the existing text placeholder
+  naming the tool and the source path, so a large history of images no longer
+  bloats every request (a previously-attached image no longer re-rides the wire multi-megabyte at a time). Nothing is lost: the
+  model can re-read the image from its path with a file tool, images still render
+  normally in the UI, and a session loaded from disk starts with all historical
+  images decayed.
 - Internal cleanup of the daemon's keystore handlers (`daemon/keystore.rs`):
   one shared `unlock_error_reply` mapping for the Unlock/Bind add-credential
   reply construction, one `send_targeted_ack` for the targeted-reply-plus-ACK

@@ -203,7 +203,11 @@ fn build_report(
     state.config.selected_model = Some(model.clone());
 
     let guard_problems = warn_on_missing_reasoning_artifacts(&state, session_id, &provider, &model);
-    let messages = build_chat_request_messages(&state, None, &provider, &model);
+    // The dry-run has no request in flight, so the builder's image-decay
+    // marker is `None`: every historical tool-result image renders as a text
+    // placeholder here, exactly as it would on the request a freshly-loaded
+    // session would build (only a live agent loop's own turns carry pixels).
+    let messages = build_chat_request_messages(&state, None, &provider, &model, None);
 
     // Wire accounting: serialize each built message exactly as the adapter
     // would (the manual `Serialize` impl re-emits the artifact into the wire

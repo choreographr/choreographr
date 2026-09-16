@@ -108,7 +108,7 @@ fn builder_model_switch_drops_old_turn_artifacts() {
 
     // Control — same model as the producing turns: the ToolLoop policy
     // replays both artifacts on the tool-involving assistant messages.
-    let same = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let same = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let same_assistants = assistant_messages(&same);
     assert_eq!(same_assistants.len(), 2);
     assert!(
@@ -120,7 +120,7 @@ fn builder_model_switch_drops_old_turn_artifacts() {
 
     // After a mid-session model switch (deepseek-v4-pro → deepseek-chat):
     // every old turn's artifact is dropped, so nothing is replayed.
-    let switched = build_chat_request_messages(&session, None, "deepseek", "deepseek-chat");
+    let switched = build_chat_request_messages(&session, None, "deepseek", "deepseek-chat", None);
     let switched_assistants = assistant_messages(&switched);
     assert_eq!(switched_assistants.len(), 2);
     assert!(
@@ -199,7 +199,7 @@ fn model_switch_sends_no_reasoning_on_the_wire() {
     };
 
     // ── Request 1: same model as the producing turns → artifacts replayed ──
-    let same = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let same = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     send(&same);
     let requests = mock.requests();
     assert_eq!(requests[0].path, "/v1/chat/completions");
@@ -224,7 +224,7 @@ fn model_switch_sends_no_reasoning_on_the_wire() {
     );
 
     // ── Request 2: after switching to deepseek-chat → nothing replayed ──
-    let switched = build_chat_request_messages(&session, None, "deepseek", "deepseek-chat");
+    let switched = build_chat_request_messages(&session, None, "deepseek", "deepseek-chat", None);
     send(&switched);
     let requests = mock.requests();
     assert_eq!(requests[1].path, "/v1/chat/completions");

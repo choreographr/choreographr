@@ -402,6 +402,16 @@ pub(crate) fn run_agent_loop(
     }
 
     let mut turn_iter: u32 = 0;
+    // Tool-result image decay: capture the turn id this request's FIRST turn
+    // will get — `start_turn` hands out exactly `session.next_turn_id`, so
+    // reading it here (before the loop's first `start_turn`) is the exact
+    // boundary, not an approximation. Everything in the builder with a turn id
+    // at or after it belongs to this request (the user turn + every tool-loop
+    // turn it creates) and attaches image bytes; turns from BEFORE this
+    // request decay to text placeholders. Nothing is persisted: after the
+    // request ends, the next request captures a newer boundary, so old images
+    // stay decayed without any cleanup.
+    let request_first_turn_id = session.next_turn_id;
     loop {
         // Enforce the iteration limit only when one is configured.
         // When `max_turns == 0` the loop is unbounded.
@@ -461,8 +471,13 @@ pub(crate) fn run_agent_loop(
             )
         };
         pending_hints.clear();
-        let messages =
-            build_chat_request_messages(session, Some(&system_content), provider_slug, model);
+        let messages = build_chat_request_messages(
+            session,
+            Some(&system_content),
+            provider_slug,
+            model,
+            Some(request_first_turn_id),
+        );
 
         // The estimate counts `messages` as-is — the FULL conversation, not
         // the chained tail the adapter puts on the wire. That is intentional:

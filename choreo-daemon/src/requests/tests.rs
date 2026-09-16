@@ -52,15 +52,20 @@ const TEST_MODEL: &str = "test-model";
 #[test]
 fn build_chat_request_messages_empty() {
     let session = SessionState::empty();
-    let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL);
+    let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL, None);
     assert!(result.is_empty());
 }
 
 #[test]
 fn build_chat_request_messages_with_system_prompt() {
     let session = SessionState::empty();
-    let result =
-        build_chat_request_messages(&session, Some("system prompt"), TEST_PROVIDER, TEST_MODEL);
+    let result = build_chat_request_messages(
+        &session,
+        Some("system prompt"),
+        TEST_PROVIDER,
+        TEST_MODEL,
+        None,
+    );
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].role, "system");
     assert_eq!(result[0].content.as_deref(), Some("system prompt"));
@@ -69,7 +74,7 @@ fn build_chat_request_messages_with_system_prompt() {
 #[test]
 fn build_chat_request_messages_user_and_assistant() {
     let session = make_session_with_turns();
-    let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL);
+    let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL, None);
     assert_eq!(result.len(), 2);
     assert_eq!(result[0].role, "user");
     assert_eq!(result[0].content.as_deref(), Some("hello"));
@@ -109,7 +114,7 @@ fn build_chat_request_messages_with_tool_calls() {
         },
     );
 
-    let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL);
+    let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL, None);
     assert_eq!(result.len(), 3);
     assert_eq!(result[0].role, "user");
     assert_eq!(result[1].role, "assistant");
@@ -178,12 +183,19 @@ fn session_with_image_result() -> (SessionState, tempfile::NamedTempFile) {
 
 #[test]
 fn build_chat_request_messages_vision_model_attaches_image() {
-    // On a vision-capable model, an image-bearing tool result yields a
-    // synthetic user message carrying the image, appended after the tool
-    // message (tool_use→tool_result adjacency preserved).
+    // On a vision-capable model, an image-bearing tool result whose turn
+    // belongs to the request IN FLIGHT (in-flight marker `Some(0)` — the
+    // turn id 0 is the request's first turn) yields a synthetic user message
+    // carrying the image, appended after the tool message (tool_use→tool_result
+    // adjacency preserved).
     let (session, _file) = session_with_image_result();
-    let result =
-        build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-flash-vision-exp");
+    let result = build_chat_request_messages(
+        &session,
+        None,
+        "deepseek",
+        "deepseek-v4-flash-vision-exp",
+        Some(0),
+    );
     assert_eq!(result.len(), 4); // user, assistant, tool, image-user
     assert_eq!(result[2].role, "tool");
     assert_eq!(result[3].role, "user");
@@ -201,9 +213,11 @@ fn build_chat_request_messages_vision_model_attaches_image() {
 #[test]
 fn build_chat_request_messages_non_vision_model_gates_image() {
     // On a text-only model the gate replaces the image with a placeholder
-    // text message (no pixels), so the request never 400s.
+    // text message (no pixels), so the request never 400s — even for a turn
+    // that is part of the in-flight request (`Some(0)`).
     let (session, _file) = session_with_image_result();
-    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let result =
+        build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", Some(0));
     assert_eq!(result.len(), 4); // user, assistant, tool, placeholder-user
     assert_eq!(result[3].role, "user");
     assert_eq!(result[3].images.len(), 0);
@@ -257,8 +271,13 @@ fn build_chat_request_messages_vision_model_empty_bytes_places_placeholder() {
             ..Default::default()
         },
     );
-    let result =
-        build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-flash-vision-exp");
+    let result = build_chat_request_messages(
+        &session,
+        None,
+        "deepseek",
+        "deepseek-v4-flash-vision-exp",
+        Some(0),
+    );
     assert_eq!(result.len(), 4);
     assert_eq!(result[3].role, "user");
     assert_eq!(result[3].images.len(), 0);
@@ -294,10 +313,201 @@ fn build_chat_request_messages_skips_undone_turns() {
         turn.undone = true;
     }
 
-    let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL);
+    let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL, None);
     assert_eq!(result.len(), 2);
     assert_eq!(result[0].role, "user");
     assert_eq!(result[0].content.as_deref(), Some("visible"));
+}
+
+// -- Tool-result image decay (only in-flight-request turns attach pixels) --
+
+/// Append a turn whose `read_image` tool result carries an image reference
+/// with NON-empty stored bytes at `image_path`, in the same shape
+/// `session_with_image_result` builds.
+fn add_image_turn(session: &mut SessionState, user_text: &str, image_path: &str) -> u32 {
+    let (tid, _) = session.start_turn(Some(user_text.to_string()));
+    session.set_assistant_response(
+        tid,
+        AssistantResponse {
+            text: Some("Reading the image.".into()),
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: format!("call_img_{tid}"),
+                name: "read_image".into(),
+                arguments_json: r#"{"path": "/tmp/x.png"}"#.into(),
+            }],
+            ..Default::default()
+        },
+    );
+    let calls = session.turns[&tid].tool_calls.clone();
+    session.seed_tool_results(tid, &calls, &[String::new()]);
+    let img_ref = choreo_proto::ImageReference {
+        path: image_path.to_string(),
+        mime_type: "image/jpeg".into(),
+        width: 3,
+        height: 2,
+        data: vec![0u8; 16],
+    };
+    session.update_tool_result(
+        tid,
+        &format!("call_img_{tid}"),
+        "read_image".into(),
+        &ToolOutput {
+            content: "read image: (3x2, image/jpeg)".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            image_ref: Some(img_ref),
+            ..Default::default()
+        },
+    );
+    tid
+}
+
+#[test]
+fn builder_attaches_pixels_for_current_request_and_decays_older_turn() {
+    // Two image-bearing turns; the request currently in flight starts at
+    // turn 1. Turn 0 is history: on a VISION model with valid stored bytes
+    // it must still decay to a placeholder naming the source path, while
+    // turn 1 (the request's own turn) attaches its pixels.
+    let mut session = SessionState::empty();
+    add_image_turn(&mut session, "first image", "/old/first.png");
+    let current_tid = add_image_turn(&mut session, "look again", "/new/second.png");
+
+    let result = build_chat_request_messages(
+        &session,
+        None,
+        "deepseek",
+        "deepseek-v4-flash-vision-exp",
+        Some(current_tid),
+    );
+
+    // Per turn: user, assistant, tool, image-user (either pixel or decayed
+    // placeholder) — 8 messages total.
+    assert_eq!(result.len(), 8);
+    // Found message index for each turn's image message: the first turn's
+    // image message is at position 3, the second at position 7.
+    let old_msg = &result[3];
+    assert_eq!(old_msg.role, "user");
+    assert_eq!(old_msg.images.len(), 0, "older turn must decay: no pixels");
+    let old_text = old_msg.content.as_deref().expect("placeholder text");
+    assert!(old_text.contains("[image from `read_image` tool result: /old/first.png]"));
+    assert!(
+        old_text.contains("no longer attached as pixels"),
+        "{old_text}"
+    );
+    // The placeholder must name the SOURCE path so the model can re-read it.
+    assert!(old_text.contains("/old/first.png"), "{old_text}");
+
+    let current_msg = &result[7];
+    assert_eq!(current_msg.role, "user");
+    assert_eq!(
+        current_msg.images.len(),
+        1,
+        "in-flight turn attaches pixels"
+    );
+    assert_eq!(current_msg.images[0].mime_type, "image/jpeg");
+}
+
+#[test]
+fn builder_decays_all_images_without_an_in_flight_marker() {
+    // No request in flight (session load / dry-run): every image-bearing
+    // turn decays to its placeholder, even on a vision model — the agreed
+    // force-decay-on-load behavior (no pixels ever re-attached from history).
+    let mut session = SessionState::empty();
+    add_image_turn(&mut session, "one", "/first.png");
+    add_image_turn(&mut session, "two", "/second.png");
+
+    let result = build_chat_request_messages(
+        &session,
+        None,
+        "deepseek",
+        "deepseek-v4-flash-vision-exp",
+        None,
+    );
+    assert_eq!(result.len(), 8);
+    // The two synthetic image/placeholder user messages (one per turn).
+    let image_msgs: Vec<_> = result
+        .iter()
+        .filter(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains("[image from"))
+        })
+        .collect();
+    assert_eq!(image_msgs.len(), 2);
+    for msg in &image_msgs {
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.images.len(), 0, "no pixels without an in-flight marker");
+        assert!(
+            msg.content
+                .as_deref()
+                .unwrap()
+                .contains("no longer attached as pixels"),
+        );
+    }
+    // Both paths are named in their placeholders.
+    assert!(result[3].content.as_deref().unwrap().contains("/first.png"));
+    assert!(
+        result[7]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("/second.png")
+    );
+}
+
+#[test]
+fn builder_decayed_turn_on_non_vision_model_gets_decay_placeholder() {
+    // The decay gate runs before the vision gate: a decayed turn on a
+    // text-only model still carries the decay wording (both paths send no
+    // pixels; the decay message names the source path).
+    let mut session = SessionState::empty();
+    add_image_turn(&mut session, "one", "/first.png");
+
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
+    assert_eq!(result.len(), 4);
+    assert_eq!(result[3].images.len(), 0);
+    let text = result[3].content.as_deref().expect("text");
+    assert!(
+        text.contains("[image from `read_image` tool result: /first.png]"),
+        "{text}"
+    );
+    assert!(text.contains("no longer attached as pixels"), "{text}");
+}
+
+#[test]
+fn builder_undone_turn_image_is_not_resurrected_in_request_window() {
+    // An undone turn is skipped entirely — image decay must never bring an
+    // undone turn's image back, even when its id falls in the in-flight
+    // request window.
+    let mut session = SessionState::empty();
+    add_image_turn(&mut session, "visible", "/visible.png");
+    let undone_tid = add_image_turn(&mut session, "hidden", "/hidden.png");
+    session
+        .turns
+        .get_mut(&undone_tid)
+        .expect("turn exists")
+        .undone = true;
+
+    let result = build_chat_request_messages(
+        &session,
+        None,
+        "deepseek",
+        "deepseek-v4-flash-vision-exp",
+        Some(0),
+    );
+    // Only the visible turn's 4 messages; no image or placeholder for the
+    // undone turn.
+    assert_eq!(result.len(), 4);
+    let joined = result
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !joined.contains("hidden.png"),
+        "undone image leaked: {joined}"
+    );
+    assert_eq!(result[3].images.len(), 1, "visible turn's pixels attached");
 }
 
 // -- Reasoning passback builder policy (phase 4b) -----------------------
@@ -404,7 +614,7 @@ fn builder_tool_loop_attaches_artifact_only_for_tool_involving_turns() {
     );
 
     // deepseek-v4-pro carries an explicit `tool_loop` passback override.
-    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 2);
     assert_eq!(
@@ -446,7 +656,7 @@ fn builder_tool_loop_attaches_artifact_for_tool_result_turns() {
             image: None,
         });
 
-    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(
@@ -471,7 +681,7 @@ fn builder_injects_empty_reasoning_content_for_deepseek_without_artifact() {
         vec![tool_call_record("call_1", "exec")],
     );
 
-    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(
@@ -496,7 +706,7 @@ fn builder_deepseek_artifact_text_outranks_empty_injection() {
         vec![tool_call_record("call_1", "exec")],
     );
 
-    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_content, None);
@@ -522,7 +732,7 @@ fn builder_does_not_inject_empty_reasoning_content_for_non_deepseek() {
         vec![tool_call_record("call_1", "exec")],
     );
 
-    let result = build_chat_request_messages(&session, None, "openai", "gpt-4");
+    let result = build_chat_request_messages(&session, None, "openai", "gpt-4", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_content, None);
@@ -547,7 +757,7 @@ fn builder_requires_rc_empty_content_turn_echoes_artifact() {
         vec![],
     );
 
-    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(
@@ -581,7 +791,7 @@ fn builder_requires_rc_empty_content_turn_keeps_content_turn_bare() {
         vec![],
     );
 
-    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
@@ -605,7 +815,7 @@ fn builder_requires_rc_empty_content_turn_foreign_artifact_not_replayed() {
         vec![],
     );
 
-    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
@@ -681,7 +891,7 @@ fn builder_wire_empty_turn_echoes_artifact_on_non_requires_rc_provider() {
         vec![],
     );
 
-    let result = build_chat_request_messages(&session, None, "groq", GROQ_MODEL);
+    let result = build_chat_request_messages(&session, None, "groq", GROQ_MODEL, None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(
@@ -718,7 +928,7 @@ fn guard_wire_empty_turn_without_artifact_flagged_on_non_requires_rc() {
         1,
         "wire-empty turn with no artifact to fill it is flagged on any echo-capable chat provider",
     );
-    let result = build_chat_request_messages(&session, None, "groq", GROQ_MODEL);
+    let result = build_chat_request_messages(&session, None, "groq", GROQ_MODEL, None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
@@ -743,7 +953,7 @@ fn builder_wire_empty_turn_never_echoes_under_none_passback() {
         vec![],
     );
 
-    let result = build_chat_request_messages(&session, None, "cerebras", "gpt-oss-120b");
+    let result = build_chat_request_messages(&session, None, "cerebras", "gpt-oss-120b", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
@@ -784,7 +994,8 @@ fn builder_all_turns_attaches_always() {
 
     // Anthropic → AllTurns: every assistant message replays its artifact,
     // even non-tool turns.
-    let result = build_chat_request_messages(&session, None, "anthropic", "claude-unknown-model");
+    let result =
+        build_chat_request_messages(&session, None, "anthropic", "claude-unknown-model", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 2);
     assert_eq!(assistants[0].reasoning_artifact, Some(artifact(b"one")));
@@ -807,7 +1018,7 @@ fn builder_signature_policy_attaches_always() {
     );
 
     // Google → Signature: every assistant message replays the signatures.
-    let result = build_chat_request_messages(&session, None, "google", "gemini-2.5-pro");
+    let result = build_chat_request_messages(&session, None, "google", "gemini-2.5-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(
@@ -833,7 +1044,7 @@ fn builder_none_never_attaches() {
         vec![tool_call_record("call_1", "ls")],
     );
 
-    let result = build_chat_request_messages(&session, None, "unknown-provider", "m");
+    let result = build_chat_request_messages(&session, None, "unknown-provider", "m", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
@@ -856,7 +1067,7 @@ fn builder_response_id_policy_never_attaches_via_message() {
 
     // gpt-4 is a Responses model → ResponseId policy: continuity flows via
     // previous_response_id, so the message must NOT carry the artifact.
-    let result = build_chat_request_messages(&session, None, "openai", "gpt-4");
+    let result = build_chat_request_messages(&session, None, "openai", "gpt-4", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
@@ -892,7 +1103,7 @@ fn builder_same_model_mismatch_drops_artifact() {
         vec![tool_call_record("call_2", "grep")],
     );
 
-    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 2);
     assert_eq!(assistants[0].reasoning_artifact, Some(artifact(b"kept")));
@@ -929,7 +1140,7 @@ fn builder_undone_turn_artifact_is_skipped() {
         .expect("turn exists")
         .undone = true;
 
-    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro");
+    let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1, "undone turn must be skipped entirely");
     assert_eq!(assistants[0].reasoning_artifact, Some(artifact(b"kept")));

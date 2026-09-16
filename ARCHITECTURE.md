@@ -3114,9 +3114,11 @@ message** appended *after* all of the turn's tool messages (preserving
 ```
 read_image tool → image_prep::load_and_normalize → ImageReference(data) → ToolResultRecord.image
   → persisted: bytes → session_attachments; blob carries byte-less turn
-  → build_chat_request_messages: model_supports_vision gate
-      vision model  → attach ImageReference.data → ChatRequestMessage.images (synthetic user msg)
-      text-only     → placeholder text message (never pixels) — the vision gate
+  → build_chat_request_messages: decay gate + model_supports_vision gate
+      turn in current request + vision model
+                    → attach ImageReference.data → ChatRequestMessage.images (synthetic user msg)
+      older turn (decay) OR turn in current request + text-only
+                    → placeholder text message (never pixels) — decay / vision gate
   → provider serializer: OpenAI chat image_url / Responses input_image /
                          Anthropic image / Google inline_data
 ```
@@ -3125,13 +3127,24 @@ The bytes never reach clients: `turn_for_client` strips `ToolResultRecord.image`
 client-facing turn (display images, which clients render, travel separately via
 `displayed_images` and persist in the same `session_attachments` table).
 
-Replay across turns is byte-identical (the same normalized bytes from `session_attachments`
-every request), which keeps provider prompt/image caches hitting.
+**Image decay** replaces the old always-replay policy: previously the same normalized
+bytes rode EVERY later request too, so a long image-heavy session re-attached megabytes
+of PNG/JPEG to each request indefinitely. The builder now takes the request's first
+turn id (captured exactly by `run_agent_loop` as `session.next_turn_id` before its first
+`start_turn`; `None` for callers with no request in flight — the `session_inspect`
+dry-run): only turns at or after that id (the request's own tool-loop turns, user turn
+included) attach pixels, every OLDER turn emits the placeholder instead. Decayed
+placeholders never convert back to pixels. A session loaded from disk decays
+all historical images automatically (no persisted marker — the window is derived purely
+from each request's own turn-id boundary, so no schema change), and undone turns are
+skipped by the builder before the decay gate, so undo still never resurrects anything.
+The placeholder names the source path so the model can re-read the file with a text tool
+if it needs the image again.
 
-The **vision gate** uses `catalog::model_supports_vision(provider_slug, model)` (from the
-models.dev `modalities.input` flag, overridable via the overlay). On a text-only model the
-image bytes are never sent — a placeholder text message names the source path so the model
-can re-read it with a text tool. Images contribute a fixed `IMAGE_TOKEN_ESTIMATE` (1000)
+The **vision gate** is `catalog::model_supports_vision(provider_slug, model)` (from the
+models.dev `modalities.input` flag, overridable via the overlay): on a text-only model
+no bytes are ever sent, whatever the decay marker says. Attached images contribute
+a fixed `IMAGE_TOKEN_ESTIMATE` (1000)
 per image to the prompt-token estimate for context-window accounting.
 
 

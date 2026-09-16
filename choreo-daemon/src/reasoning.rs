@@ -29,12 +29,23 @@ use crate::sessions::SessionState;
 ///
 /// Public for the daemon integration tests (the `test-utils` feature); the
 /// production caller is `run_agent_loop`.
+///
+/// `in_flight_from_turn` carries the image-decay marker: the turn id of the
+/// FIRST turn of the request currently in flight (captured by the agent loop
+/// before its first `start_turn`), or `None` when no request is in flight
+/// (session load / dry-run). Turns with id >= the marker belong to the
+/// current request and attach image bytes; every OLDER turn decays to a text
+/// placeholder (see [`tool_result_image_messages`]). This is purely a request-
+/// builder parameter — nothing is persisted on the turn, and after the request
+/// finishes the next request's window simply starts at a newer turn id, so
+/// all earlier images naturally decay without any cleanup.
 #[must_use]
 pub fn build_chat_request_messages(
     session: &SessionState,
     system_prompt: Option<&str>,
     provider_slug: &str,
     model: &str,
+    in_flight_from_turn: Option<u32>,
 ) -> Vec<ChatRequestMessage> {
     let mut messages = Vec::new();
 
@@ -56,7 +67,7 @@ pub fn build_chat_request_messages(
     // text placeholder (the vision gate). Constant per request.
     let vision = model_supports_vision(provider_slug, model);
 
-    for turn in session.turns.values() {
+    for (turn_id, turn) in &session.turns {
         if turn.undone {
             continue;
         }
@@ -155,11 +166,15 @@ pub fn build_chat_request_messages(
         // Synthetic user messages carrying tool-result images (vision input),
         // appended AFTER every tool message of the turn so the provider's
         // tool_use → tool_result adjacency holds (a user message interleaved
-        // between tool results would break it). The image bytes are read from
-        // the stored reference (`img.data`), not re-read from the source file
-        // at request time. On non-vision models the gate emits a text
-        // placeholder instead of pixels.
-        messages.extend(tool_result_image_messages(turn, vision));
+        // between tool results would break it). Image BYTES are read from the
+        // stored reference (`img.data`), not re-read from the source file at
+        // request time, and are attached ONLY for turns that belong to the
+        // request currently in flight (turn id >= `in_flight_from_turn`) —
+        // older history replays a text placeholder instead (the decay gate:
+        // re-attaching megabytes of every historical screenshot would bloat
+        // every request without limit).
+        let attach_images = in_flight_from_turn.is_some_and(|first| *turn_id >= first);
+        messages.extend(tool_result_image_messages(turn, vision, attach_images));
     }
     messages
 }
@@ -168,20 +183,55 @@ pub fn build_chat_request_messages(
 /// (vision input) for the request builder. Each image-bearing tool result
 /// yields one user message placed after the turn's tool messages.
 ///
-/// On a vision-capable model the normalized image bytes are attached directly
-/// from the stored reference (`ImageReference::data`) — no file I/O, no source
-/// path dependency; on a non-vision model, or when the reference carries no
-/// bytes (e.g. an old persisted turn whose `data` deserialized empty), a text
-/// placeholder is emitted instead so the model is never sent pixels it cannot
-/// process and never silently loses the image. The placeholder names the
-/// source path so the model can re-read it with a text tool if it wants.
-fn tool_result_image_messages(turn: &Turn, vision: bool) -> Vec<ChatRequestMessage> {
+/// Three gates decide whether the normalized image bytes ride the request:
+///
+/// 1. **Decay** (`attach_images == false`): only turns belonging to the
+///    request currently in flight attach pixels — the first request that
+///    produced a tool-result image sees every pixel of it, but on every
+///    LATER request (or a request built without an in-flight marker, e.g.
+///    right after a session load) the turn replays only a text placeholder
+///    naming the source path, so the model can re-read the file with a text
+///    tool if it needs the image again. This keeps an hour-old screenshot out
+///    of every subsequent request without losing the fact that one existed.
+/// 2. **Vision** — on a non-vision model no pixels are ever sent, whatever
+///    the decay marker says.
+/// 3. **Stored bytes** — when the reference carries no bytes (e.g. an old
+///    persisted turn whose `data` deserialized empty), a text placeholder is
+///    emitted instead so the model is never silently left without the image.
+///
+/// Every branch keeps the same message shape `[image from `<tool>` tool
+/// result: <path>]`, so the model can always tell which tool produced the
+/// image and where its source lives.
+fn tool_result_image_messages(
+    turn: &Turn,
+    vision: bool,
+    attach_images: bool,
+) -> Vec<ChatRequestMessage> {
     let mut out = Vec::new();
     for tr in &turn.tool_results {
         let Some(img) = &tr.image else {
             continue;
         };
         let lead = format!("[image from `{}` tool result: {}]", tr.name, img.path);
+        if !attach_images {
+            // Decay policy: the turn is not part of the request currently in
+            // flight, so only the placeholder naming the source path is sent —
+            // the model can re-read the file with a text tool if it needs the
+            // image again. Even on a vision model with valid stored bytes.
+            debug!(
+                path = %img.path,
+                "tool-result image decayed; attaching placeholder"
+            );
+            out.push(ChatRequestMessage::with_images(
+                "user",
+                format!(
+                    "{lead} — the image was shown in an earlier request and is no longer \
+                     attached as pixels; re-read it with a file tool if you need it again."
+                ),
+                Vec::new(),
+            ));
+            continue;
+        }
         if !vision {
             out.push(ChatRequestMessage::with_images(
                 "user",
