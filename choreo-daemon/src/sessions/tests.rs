@@ -52,6 +52,7 @@ fn test_state() -> SessionState {
         subscribers: HashMap::new(),
         active_requests: BTreeMap::new(),
         provider: None,
+        provider_slug: None,
         // A fresh empty registry: any provider client this test state builds
         // registers here, mirroring the production per-session scope.
         registry: choreo_ai_protocols::SocketRegistry::default(),
@@ -329,6 +330,52 @@ fn session_state_message_strips_artifacts_from_turns() {
     let authoritative = state.turns.get(&tid).expect("turn exists");
     assert!(authoritative.reasoning_artifact.is_some());
     assert!(authoritative.reasoning_producer.is_some());
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn slug_keyed_catalog_facts_resolve_without_a_live_provider() {
+    // Regression: a session bound to an account whose provider slug is
+    // recorded but which has NO provider client yet (keystore locked, no
+    // first request) must still resolve its static catalog facts from the
+    // recorded slug. Precedence: the provider's own client-config override
+    // when a client exists, else the catalog; the reasoning capability always
+    // resolves from the slug.
+    use choreo_proto::{DaemonMessage, SessionEvent};
+
+    // Sanity: the bundled catalog pins a known window for this model.
+    assert_eq!(
+        choreo_ai_protocols::lookup_context_window("openai", "gpt-5"),
+        Some(400_000)
+    );
+
+    let mut state = SessionState::empty();
+    state.config.selected_model = Some("gpt-5".into());
+    state.provider_slug = Some("openai".into());
+    assert!(state.provider.is_none(), "precondition: no live client");
+
+    // The context window resolves from the slug alone.
+    assert_eq!(
+        state.resolve_context_window_for_model("gpt-5"),
+        Some(400_000)
+    );
+
+    // ...and the attach snapshot reports the model's reasoning capability,
+    // so Ctrl+R never shows "reasoning capability not yet available" on a
+    // locked daemon.
+    let DaemonMessage::Session {
+        event:
+            SessionEvent::SessionState {
+                reasoning_capability,
+                ..
+            },
+        ..
+    } = state.session_state_message(7)
+    else {
+        panic!("expected SessionState message");
+    };
+    let capability = reasoning_capability.expect("capability reported without a live provider");
+    assert_ne!(capability.available_effort_levels, [] as [String; 0]);
 }
 
 #[test]

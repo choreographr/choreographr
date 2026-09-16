@@ -160,6 +160,7 @@ fn spawn_session_with_provider(
             choreo_ai_protocols::SocketRegistry::default(),
             None,
             None,
+            None,
             &RequestContext {
                 cmd_tx,
                 session_id: 1,

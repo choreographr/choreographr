@@ -35,6 +35,7 @@ fn spawn_session(
             choreo_ai_protocols::SocketRegistry::default(),
             None,
             None,
+            None,
             &RequestContext {
                 cmd_tx,
                 session_id,

@@ -99,6 +99,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The context window and reasoning capability no longer blink out on a
+  locked keystore.** A session's static catalog facts — the model's context
+  window and its reasoning effort levels — are pure catalog lookups keyed by
+  the account's provider slug (e.g. `opencode-go`), but the daemon resolved
+  them through the lazily-built, credential-bound `InferenceProvider`
+  client. Until the client existed (keystore unlocked + first request, or a
+  SetAccount/SetModel with a stored key), the attach snapshot reported no
+  capability (Ctrl+R answered "reasoning capability not yet available") and
+  the context window stayed unresolved — so e.g. glm-5.3-flash over
+  opencode-go displayed 1M one moment and nothing the next. The session now
+  records the provider slug the moment the account config resolves (at
+  spawn time from `AccountManager` — a non-secret fact — in lazy provider
+  resolution, and on `SetAccount` even before unlock) and resolves both
+  facts from the slug: the context window prefers the client-config
+  override when a client exists and otherwise falls back to the catalog,
+  and the reasoning capability always resolves from the slug. Wire behavior
+  and lookups are unchanged for sessions with a live client.
 - **A failed unlock could leak freshly decrypted credentials into daemon
   state with `locked` still `true`.** The unlock tail populated
   `state.credentials` (the plaintext `ServiceCredential` map) BEFORE loading the

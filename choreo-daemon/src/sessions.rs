@@ -534,6 +534,9 @@ pub struct SessionSnapshot {
     pub loaded_skill_bodies: Vec<LoadedSkill>,
     pub context_cache: Option<(u64, Arc<String>)>,
     pub discovered_skills: Option<Vec<SkillMeta>>,
+    /// The recorded provider slug (see `SessionState::provider_slug`) —
+    /// restored so slug-keyed catalog lookups survive the worker swap.
+    pub provider_slug: Option<String>,
 }
 
 pub(crate) struct ActiveRequest {
@@ -564,6 +567,19 @@ pub struct SessionState {
     subscribers: HashMap<u64, SubscriberSink>,
     pub(crate) active_requests: BTreeMap<u32, ActiveRequest>,
     pub provider: Option<InferenceProvider>,
+    /// The account's **provider slug** (catalog key, e.g. "opencode-go"),
+    /// recorded as soon as the account config resolves — at spawn time (the
+    /// daemon command loop knows it from `AccountManager` with no credential
+    /// involved), in [`SessionState::resolve_provider`], and on
+    /// `SessionCommand::SetAccount` even before the keystore unlocks.
+    ///
+    /// Rationale: a model's static catalog facts (context window, reasoning
+    /// capability) are pure catalog lookups keyed by the slug; they must NOT
+    /// wait for the credential-bound `InferenceProvider` client to exist. The
+    /// client is only built after unlock/first request, so resolving facts
+    /// through it made the context window and effort cycling blink in and out
+    /// of availability around keystore transitions.
+    provider_slug: Option<String>,
     /// This session's provider-socket registry. The provider client built for
     /// this session registers every dialed socket here, so closing the
     /// registry (cancel / suspend / keystore-lock) force-closes THIS
@@ -598,6 +614,36 @@ pub struct AssistantResponse {
 }
 
 impl SessionState {
+    /// The effective provider slug for static catalog-fact lookups (context
+    /// window, reasoning capability). Prefers the live provider client's slug;
+    /// falls back to the recorded slug that travels with the account config,
+    /// which is available BEFORE the keystore unlocks (no credential needed).
+    /// `None` only while no account is bound to the session.
+    fn provider_slug(&self) -> Option<&str> {
+        self.provider
+            .as_ref()
+            .map_or(self.provider_slug.as_deref(), |p| Some(p.provider_slug()))
+    }
+
+    /// Resolve one static catalog fact for `model` — the context window — keyed
+    /// by the provider slug, not the credential-bound provider instance, so the
+    /// fact is available on a locked daemon / pre-first-request session. (Other
+    /// static facts — e.g. the reasoning capability — resolve from
+    /// [`SessionState::provider_slug`] directly.)
+    ///
+    /// The context window prefers the client-config override when the provider
+    /// client exists (same precedence as `InferenceProvider::
+    /// resolve_context_window`), falling back to the catalog lookup.
+    fn resolve_context_window_for_model(&self, model: &str) -> Option<u32> {
+        self.provider
+            .as_ref()
+            .and_then(|p| p.resolve_context_window(model))
+            .or_else(|| {
+                self.provider_slug()
+                    .and_then(|slug| choreo_ai_protocols::lookup_context_window(slug, model))
+            })
+    }
+
     /// Re-resolve context window from the catalog when the stored value
     /// is `None` (e.g. sessions created before a model was added to the
     /// catalog, or after the provider was lazily resolved on unlock).
@@ -605,10 +651,10 @@ impl SessionState {
         if self.config.context_window.is_some() {
             return;
         }
-        let (Some(model), Some(provider)) = (&self.config.selected_model, &self.provider) else {
+        let Some(model) = &self.config.selected_model else {
             return;
         };
-        if let Some(cw) = provider.resolve_context_window(model) {
+        if let Some(cw) = self.resolve_context_window_for_model(model) {
             debug!(
                 "session {}: re-resolved context_window={} for model={}",
                 ctx.session_id, cw, model
@@ -632,6 +678,7 @@ impl SessionState {
             loaded_skill_bodies: self.loaded_skill_bodies.clone(),
             context_cache: self.context_cache.clone(),
             discovered_skills: self.discovered_skills.clone(),
+            provider_slug: self.provider_slug.clone(),
         }
     }
 
@@ -648,6 +695,7 @@ impl SessionState {
             subscribers,
             active_requests: BTreeMap::new(),
             provider: None,
+            provider_slug: snapshot.provider_slug,
             // Restored snapshots never carry a live provider client; the next
             // request rebuilds one lazily against this fresh registry.
             registry: choreo_ai_protocols::SocketRegistry::default(),
@@ -662,7 +710,11 @@ impl SessionState {
     /// so that every broadcast site stays consistent when new fields are added.
     pub(crate) fn session_state_message(&self, session_id: u64) -> DaemonMessage {
         let reasoning_capability = self.config.selected_model.as_ref().and_then(|model| {
-            let slug = self.provider.as_ref()?.provider_slug();
+            // Slug-keyed lookup (not the provider instance): the capability is
+            // a static catalog fact and must be reported even while the
+            // keystore is locked, so Ctrl+R works on an attached session
+            // before any client has been built.
+            let slug = self.provider_slug()?;
             Some(model_reasoning_capability(slug, model))
         });
         DaemonMessage::Session {
@@ -901,6 +953,7 @@ impl SessionState {
             subscribers: HashMap::new(),
             active_requests: BTreeMap::new(),
             provider: None,
+            provider_slug: None,
             // A fresh empty registry: any provider client built for this
             // state registers its sockets here, so cancelling this session
             // (or dropping it) never touches another session's connections.
@@ -952,6 +1005,10 @@ impl SessionState {
                 "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
             ));
         };
+        // Record the provider slug BEFORE the key check: the slug is a
+        // non-secret catalog fact, so static catalog lookups (context window,
+        // reasoning capability) stay correct even on this failed resolution.
+        self.provider_slug = Some(config.provider.clone());
         let Some(api_key) = api_key else {
             return Err(format!(
                 "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
@@ -1140,6 +1197,12 @@ pub fn session_main(
     initial_provider: Option<InferenceProvider>,
     registry: choreo_ai_protocols::SocketRegistry,
     account_name: Option<String>,
+    // The account's provider slug (catalog key), resolved by the daemon
+    // command loop from `AccountManager` WITHOUT touching credentials — a
+    // non-secret fact supplied at spawn so session-thread catalog lookups
+    // (context window, reasoning capability) work before the keystore
+    // unlocks.
+    provider_slug: Option<String>,
     // `init_record` is only read (title/model/effort/etc. are cloned out of
     // it); the caller in daemon.rs still owns the record it built.
     init_record: Option<&SessionRecord>,
@@ -1190,6 +1253,7 @@ pub fn session_main(
         // resolves lazily on the session thread); tests may seed a provider
         // directly to avoid driving the daemon resolution round-trip.
         provider: initial_provider,
+        provider_slug,
         registry,
         ..SessionState::empty()
     };
@@ -1572,10 +1636,10 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
     }
 
     state.config.selected_model = Some(model.clone());
-    let cw = state
-        .provider
-        .as_ref()
-        .and_then(|p| p.resolve_context_window(&model));
+    // Static catalog facts keyed by the recorded slug — no credential-bound
+    // client needed, so the context window and ModelSelected capability are
+    // exact even before the keystore unlocks.
+    let cw = state.resolve_context_window_for_model(&model);
     debug!(
         "session {}: resolved context_window={:?} for model={}",
         ctx.session_id, cw, model
@@ -1592,9 +1656,8 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         );
     }
     let capability = state
-        .provider
-        .as_ref()
-        .map(|p| model_reasoning_capability(p.provider_slug(), &model));
+        .provider_slug()
+        .map(|slug| model_reasoning_capability(slug, &model));
 
     // Re-validate the current reasoning effort against the new model's
     // capability.  Slugs that were valid on the old model may not be
@@ -2225,7 +2288,15 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
         account: name.clone(),
         reply,
     });
-    if let Ok(Some((config, Some(api_key)))) = rx.recv()
+    let resolved = rx.recv().ok().flatten();
+    // The provider slug is a NON-SECRET catalog fact: record it from the
+    // account config even when the keystore is locked (no key, no client).
+    // Static catalog lookups — context window, reasoning capability — are
+    // slug-keyed, so they must be exact on a locked daemon too.
+    if let Some((ref config, _)) = resolved {
+        state.provider_slug = Some(config.provider.clone());
+    }
+    if let Some((config, Some(api_key))) = resolved
         && let Ok(provider) = InferenceProvider::from_account_config(
             &config,
             // See resolve_provider: the Zeroizing wrapper protects the
@@ -2297,7 +2368,7 @@ fn handle_set_reasoning_effort(
 
     // Compute capability for the current model (if any).
     let capability = state.config.selected_model.as_ref().and_then(|model| {
-        let slug = state.provider.as_ref()?.provider_slug();
+        let slug = state.provider_slug()?;
         Some(model_reasoning_capability(slug, model))
     });
 

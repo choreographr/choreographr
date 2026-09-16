@@ -821,6 +821,15 @@ impl DaemonState {
         // keystore is locked, so the session thread builds its client lazily
         // on the first request (see `SessionState::resolve_provider`).
         let provider = None;
+        // The provider slug, though, is a NON-SECRET catalog fact the command
+        // loop already knows from the account config: hand it to the session
+        // thread so slug-keyed catalog lookups (context window, reasoning
+        // capability) are exact even while the keystore is locked.
+        let provider_slug = account_name.as_ref().and_then(|name| {
+            self.accounts
+                .get(name)
+                .map(|config| config.provider.clone())
+        });
 
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let cmd_tx = session_tx.clone();
@@ -831,6 +840,7 @@ impl DaemonState {
                 provider,
                 session_registry,
                 account_name,
+                provider_slug,
                 Some(&record),
                 &RequestContext {
                     cmd_tx,
