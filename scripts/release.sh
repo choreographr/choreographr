@@ -196,7 +196,15 @@ else
     # the musl branch above, and the same reason this build is its own cargo
     # invocation: rustflags differ per triple within one pass.
     echo "==> cross-building the macOS x86_64 tarball"
-    rustup target add x86_64-apple-darwin
+    # --toolchain stable is REQUIRED (not the default bare invocation): the
+    # workspace default toolchain is NIGHTLY (rust-toolchain.toml), so a bare
+    # `rustup target add` installs x86_64-apple-darwin std on nightly — and
+    # then the build-stable.sh cross build (cargo +stable) fails with
+    # E0463 "can't find crate for `core`" because STABLE has no std for that
+    # target (seen in the 2026-09-16 release run). add --toolchain stable
+    # (build-stable.sh resolves `stable`; this installs for the same toolchain
+    # the build actually uses).
+    rustup target add x86_64-apple-darwin --toolchain stable
     RUSTFLAGS="-C target-cpu=x86-64-v3" ./scripts/build-stable.sh build --locked --profile dist -p choreographr -p choreo-tui --target x86_64-apple-darwin --features choreographr/metrics,choreographr/blockchain
     TARBALL_JOBS+=("x86_64-apple-darwin target/x86_64-apple-darwin/dist")
 fi

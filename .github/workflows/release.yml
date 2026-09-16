@@ -220,7 +220,10 @@ jobs:
           # hatch (the BSD-sed run died inside the strips — never reached the
           # build — so any tooling-dirt here has not surfaced yet; the
           # diagnostic above the linux build would show it).
-          rustup target add x86_64-apple-darwin
+          # --toolchain stable: see release.sh's cross-build comment — a
+          # bare target add lands on the workspace's NIGHTLY default, leaving
+          # stable (which build-stable.sh uses) without the std crates.
+          rustup target add x86_64-apple-darwin --toolchain stable
           ./scripts/release.sh --allow-dirty
 
       - name: Smoke-test the aarch64 tarball
