@@ -786,6 +786,27 @@ pub enum SessionEvent {
     },
 }
 
+/// Authoritative daemon keystore STATUS (see [`DaemonMessage::Keystore`]).
+///
+/// Three states, because "unbound" is a distinct fact from "locked": a fresh
+/// daemon has no binding at all and a client must BIND it (auto-bind with a
+/// freshly minted key), whereas a bound-but-locked daemon needs only an
+/// `Unlock`. Collapsing the two into a single "locked" boolean is what left a
+/// first-run client unable to bind the daemon (it had no key, and the wire
+/// carried no signal that the keystore was unbound).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KeystoreState {
+    /// No binding exists yet — a fresh daemon. A client mints a bind key and
+    /// sends [`ClientMessage::BindKeystore`]; the frontends do this
+    /// automatically, once per connection, when they observe this state.
+    Unbound,
+    /// A binding exists, but no cleartext credentials are in memory. A client
+    /// unlocks by presenting the bound key via [`ClientMessage::Unlock`].
+    Locked,
+    /// A binding exists and the credentials are decrypted in memory.
+    Unlocked,
+}
+
 /// Messages sent from the daemon to a client.
 ///
 /// Split into two families:
@@ -837,8 +858,25 @@ pub enum DaemonMessage {
     ModelsFailed {
         error: String,
     },
+    /// Targeted reply to [`ClientMessage::Unlock`]: the presented key matched
+    /// the binding and the daemon decrypted its credentials. This is an
+    /// OPERATION OUTCOME; the current keystore *status* is pushed separately
+    /// as [`DaemonMessage::Keystore`].
     Unlocked,
+    /// Targeted reply to [`ClientMessage::Lock`]: the daemon wiped its
+    /// in-memory credentials and re-latched the locked state. An OPERATION
+    /// OUTCOME; the current keystore *status* is pushed separately as
+    /// [`DaemonMessage::Keystore`].
     Locked,
+    /// The daemon's authoritative keystore STATUS. Pushed to a client the
+    /// moment it registers for notifications (activity or session-summary)
+    /// and broadcast to every activity subscriber on each transition, so a
+    /// client latches the real state instead of inferring it from operation
+    /// replies. The `Unbound` push is what lets a first-run client with no key
+    /// bind the daemon automatically.
+    Keystore {
+        state: KeystoreState,
+    },
     LockedError {
         error: String,
     },
@@ -1636,6 +1674,12 @@ mod tests {
             ),
             ("Unlocked", DaemonMessage::Unlocked),
             ("Locked", DaemonMessage::Locked),
+            (
+                "Keystore",
+                DaemonMessage::Keystore {
+                    state: KeystoreState::Unbound,
+                },
+            ),
             (
                 "LockedError",
                 DaemonMessage::LockedError {

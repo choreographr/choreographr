@@ -37,6 +37,8 @@ pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>
         x_credentials: None,
         // Test states start locked, matching the production daemon.
         locked: true,
+        // No binding in a fresh test DB.
+        keystore_bound: false,
         db,
         tool_registry,
         daemon_tx,
@@ -1718,7 +1720,7 @@ fn handle_unload_tools_nonexistent_session_replies_error() {
 /// subscriber delivers to the fresh client, so tests can assert on the
 /// messages that follow registration. Registration pushes TWO flat control
 /// messages in order: the current provider list (`CatalogUpdated`) and the
-/// current keystore lock state (`Locked`/`Unlocked`). Both are drained and
+/// current keystore status (`Keystore { state }`). Both are drained and
 /// asserted so a later `recv`/`try_recv` sees only post-registration traffic.
 fn drain_send_on_subscribe(rx: &crossbeam_channel::Receiver<DaemonMessage>) {
     let msg = rx.recv().unwrap();
@@ -1727,8 +1729,8 @@ fn drain_send_on_subscribe(rx: &crossbeam_channel::Receiver<DaemonMessage>) {
         "expected the send-on-subscribe CatalogUpdated, got {msg:?}",
     );
     match rx.recv().unwrap() {
-        DaemonMessage::Locked | DaemonMessage::Unlocked => {}
-        other => panic!("expected the send-on-subscribe lock state, got {other:?}"),
+        DaemonMessage::Keystore { .. } => {}
+        other => panic!("expected the send-on-subscribe keystore state, got {other:?}"),
     }
 }
 
@@ -3009,41 +3011,49 @@ fn activity_subscriber_gets_current_provider_list_on_register() {
 
 #[test]
 fn activity_subscriber_gets_current_lock_state_on_register() {
-    // A freshly-subscribed client must receive the CURRENT keystore lock
-    // state immediately (send-on-subscribe Locked/Unlocked) so it can show
-    // the startup lock banner without waiting for the next lock-state
-    // *transition* — a client connecting to an already-locked daemon has no
-    // other reason to latch `locked`.
+    // A freshly-subscribed client must receive the CURRENT keystore status
+    // immediately (send-on-subscribe) so it can show the startup banner — and,
+    // on a fresh daemon, learn the keystore is `Unbound` and auto-bind —
+    // without waiting for the next *transition*. A client connecting to an
+    // already-bound daemon has no other reason to latch the state.
     let (mut state, _rx) = make_daemon_state();
     let (writer_tx, writer_rx) = test_sink();
 
-    // Test state starts locked → the subscribe push is `Locked`.
+    // Fresh state: no binding yet → the subscribe push is `Unbound`.
     state.handle_register_activity_subscriber(1, &writer_tx);
     let msg = writer_rx.recv().unwrap(); // CatalogUpdated
     assert!(matches!(&msg, DaemonMessage::CatalogUpdated { .. }));
     match writer_rx.recv().unwrap() {
-        DaemonMessage::Locked => {}
-        other => panic!("expected subscribe-time Locked, got {other:?}"),
+        DaemonMessage::Keystore { state } => {
+            assert_eq!(state, choreo_proto::KeystoreState::Unbound);
+        }
+        other => panic!("expected subscribe-time Unbound, got {other:?}"),
     }
 
-    // After unlocking, a fresh subscriber is told `Unlocked`.
+    // Bound + unlocked: a fresh subscriber is told `Unlocked`.
+    state.keystore_bound = true;
     state.locked = false;
     let (writer_tx2, writer_rx2) = test_sink();
     state.handle_register_activity_subscriber(2, &writer_tx2);
     let _ = writer_rx2.recv().unwrap(); // CatalogUpdated
     match writer_rx2.recv().unwrap() {
-        DaemonMessage::Unlocked => {}
+        DaemonMessage::Keystore { state } => {
+            assert_eq!(state, choreo_proto::KeystoreState::Unlocked);
+        }
         other => panic!("expected subscribe-time Unlocked, got {other:?}"),
     }
 }
 
 #[test]
-fn broadcast_lock_state_sends_current_state_to_all_activity_subscribers() {
-    // The transition helper fans the CURRENT lock state out to every activity
-    // subscriber on a locked→unlocked (Unlock / AddCredential) or
+fn broadcast_keystore_state_sends_current_state_to_all_activity_subscribers() {
+    // The transition helper fans the CURRENT keystore status out to every
+    // activity subscriber on a locked→unlocked (Unlock / AddCredential) or
     // unlocked→locked (/lock) transition, so client B's unlock re-latches
     // client A's banner.
     let (mut state, _rx) = make_daemon_state();
+    // A bound daemon is the precondition for `Locked`/`Unlocked` (an unbound
+    // keystore reports `Unbound` regardless of the lock flag).
+    state.keystore_bound = true;
     let (writer_a, rx_a) = test_sink();
     let (writer_b, rx_b) = test_sink();
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
@@ -3059,14 +3069,34 @@ fn broadcast_lock_state_sends_current_state_to_all_activity_subscribers() {
 
     // Both clients are notified of the transitioned state.
     state.locked = false;
-    state.broadcast_lock_state();
-    assert!(matches!(rx_a.recv().unwrap(), DaemonMessage::Unlocked));
-    assert!(matches!(rx_b.recv().unwrap(), DaemonMessage::Unlocked));
+    state.broadcast_keystore_state();
+    assert!(matches!(
+        rx_a.recv().unwrap(),
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Unlocked
+        }
+    ));
+    assert!(matches!(
+        rx_b.recv().unwrap(),
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Unlocked
+        }
+    ));
 
     state.locked = true;
-    state.broadcast_lock_state();
-    assert!(matches!(rx_a.recv().unwrap(), DaemonMessage::Locked));
-    assert!(matches!(rx_b.recv().unwrap(), DaemonMessage::Locked));
+    state.broadcast_keystore_state();
+    assert!(matches!(
+        rx_a.recv().unwrap(),
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Locked
+        }
+    ));
+    assert!(matches!(
+        rx_b.recv().unwrap(),
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Locked
+        }
+    ));
 }
 
 #[test]
@@ -3079,9 +3109,10 @@ fn handle_lock_clears_credentials_latches_locked_and_broadcasts() {
     });
     drain_send_on_subscribe(&writer_rx);
 
-    // Simulate an unlocked daemon holding decrypted credentials and a live
-    // session with a cached client — the client must be invalidated so its
-    // next request rebuilds against fresh credentials.
+    // Simulate an unlocked, BOUND daemon holding decrypted credentials and a
+    // live session with a cached client — the client must be invalidated so
+    // its next request rebuilds against fresh credentials.
+    state.keystore_bound = true;
     state.locked = false;
     state.credentials.insert(
         "openai".to_string(),
@@ -3111,7 +3142,9 @@ fn handle_lock_clears_credentials_latches_locked_and_broadcasts() {
     drop(release);
     // The transition was broadcast to every activity subscriber.
     match writer_rx.recv().unwrap() {
-        DaemonMessage::Locked => {}
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Locked,
+        } => {}
         other => panic!("expected Locked transition broadcast, got {other:?}"),
     }
 }
@@ -3517,10 +3550,16 @@ fn bind_keystore_adopts_on_unbound_and_runs_unlock_tail() {
     reply_rx.recv().unwrap();
     // The targeted Bound confirmation reached the acting client's sink.
     assert!(matches!(writer_rx.recv().unwrap(), DaemonMessage::Bound));
-    // The binding was persisted (TOFU adopt happened here and ONLY here).
+    // The binding was persisted (TOFU adopt happened here and ONLY here) and
+    // the cached status flag was flipped so the daemon now reports `Unbound →
+    // bound`.
     assert_eq!(
         db::get_keystore_binding(&state.db).unwrap(),
         Some(test_pub(key))
+    );
+    assert!(
+        state.keystore_bound,
+        "a successful bind flips keystore_bound"
     );
     // The shared unlock tail ran: the daemon left the locked state.
     assert!(!state.locked, "BindKeystore must run the unlock tail");
@@ -3627,7 +3666,12 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
     });
     reply_rx.recv().unwrap();
     // The bind's implicit-unlock transition broadcast reached the subscriber.
-    assert!(matches!(sub_rx.recv().unwrap(), DaemonMessage::Unlocked));
+    assert!(matches!(
+        sub_rx.recv().unwrap(),
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Unlocked
+        }
+    ));
 
     // Re-lock so the AddCredential implicit unlock below is a REAL
     // locked→unlocked transition (the bind already left the daemon unlocked,
@@ -3666,7 +3710,12 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
         Some(TestCred::ApiKey { key }) if key == "k"
     ));
     // The implicit-unlock transition was broadcast to the activity subscriber.
-    assert!(matches!(sub_rx.recv().unwrap(), DaemonMessage::Unlocked));
+    assert!(matches!(
+        sub_rx.recv().unwrap(),
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Unlocked
+        }
+    ));
 }
 
 #[test]

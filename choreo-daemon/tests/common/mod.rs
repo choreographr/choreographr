@@ -88,6 +88,8 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         x_credentials: None,
         // Test daemons start locked, matching the production daemon.
         locked: true,
+        // No binding in a fresh test DB.
+        keystore_bound: false,
         db,
         tool_registry,
         daemon_tx,

@@ -105,6 +105,16 @@ pub struct DaemonState {
     /// every transition and pushed to each fresh activity subscriber at
     /// subscribe time, so client UIs latch the real state instead of guessing.
     pub locked: bool,
+    /// Whether the daemon's keystore has a binding at all (TOFU-adopted once
+    /// via `BindKeystore`). Loaded from the DB at `DaemonState::open` and
+    /// flipped to `true` exactly once, inside `bind_keystore` (the sole
+    /// adoption path, single-writer on the command loop), so it can be read
+    /// cheaply to derive the authoritative [`choreo_proto::KeystoreState`]
+    /// pushed to clients — `Unbound` when there is no binding yet, else
+    /// `Locked`/`Unlocked` per `self.locked`. Without this, a fresh daemon
+    /// could only report "locked", never "unbound", so a first-run client
+    /// with no key had no signal that it should auto-bind.
+    pub keystore_bound: bool,
     pub db: Arc<redb::Database>,
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
@@ -1542,7 +1552,7 @@ impl DaemonState {
         // UI clears its lock banner — e.g. client B unlocking updates client
         // A's status bar.
         if result.is_ok() && was_locked {
-            self.broadcast_lock_state();
+            self.broadcast_keystore_state();
         }
         info!("Unlock result: success={}", result.is_ok());
     }
@@ -1576,7 +1586,7 @@ impl DaemonState {
         Self::send_targeted(client_writer, &self.global_lag, &reply_msg);
         let _ = reply.send(());
         if result.is_ok() && was_locked {
-            self.broadcast_lock_state();
+            self.broadcast_keystore_state();
         }
         info!("BindKeystore result: success={}", result.is_ok());
     }
@@ -1613,7 +1623,7 @@ impl DaemonState {
         // connection layer; this transition broadcast reaches every connected
         // client (the acting one included, harmlessly idempotent).
         if !was_locked {
-            self.broadcast_lock_state();
+            self.broadcast_keystore_state();
         }
         let _ = reply.send(Ok(()));
     }
@@ -1810,7 +1820,7 @@ impl DaemonState {
         // (implicit unlock): fan out the newly-unlocked state to ALL activity
         // subscribers so every connected UI clears its lock banner.
         if was_locked && !self.locked {
-            self.broadcast_lock_state();
+            self.broadcast_keystore_state();
         }
     }
 
@@ -2810,7 +2820,7 @@ fn zeroized_key_or_wipe(key: &mut Vec<u8>) -> Result<Zeroizing<[u8; 32]>, Keysto
 /// X25519 public key and persist it. This is a one-time, security-relevant
 /// event, so the log is deliberately LOUD. A bound keystore is verified
 /// instead: a mismatching key is rejected (no overwrite, no unlock).
-fn bind_keystore(state: &DaemonState, key: &[u8; 32]) -> Result<(), KeystoreOpError> {
+fn bind_keystore(state: &mut DaemonState, key: &[u8; 32]) -> Result<(), KeystoreOpError> {
     let binding = db::get_keystore_binding(&state.db)
         .map_err(|e| KeystoreOpError::Other(format!("failed to read keystore binding: {e}")))?;
     // x25519_dalek: the public key is what the binding stores (and what the
@@ -2830,6 +2840,11 @@ fn bind_keystore(state: &DaemonState, key: &[u8; 32]) -> Result<(), KeystoreOpEr
                  attempts must present this key, others are rejected",
                 hex::encode(derived.as_bytes())
             );
+            // Flip the cached status flag the command loop reads to derive the
+            // authoritative `KeystoreState` (`Unbound` → now bound). This is
+            // the sole adoption path, so it can never drift from the persisted
+            // binding.
+            state.keystore_bound = true;
             Ok(())
         }
         Some(stored) if stored == *derived.as_bytes() => {

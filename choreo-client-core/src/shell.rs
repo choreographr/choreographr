@@ -12,9 +12,9 @@ pub enum UnlockMethod {
     /// the single source of truth).
     Raw,
     /// Unlock with the base64-encoded 32-byte key given by the user. The key
-    /// is recorded into `known_servers.toml` for `addr` BEFORE the Unlock is
-    /// sent (survivor semantics: a wrong key simply replays its rejection
-    /// until manually replaced).
+    /// is WRITE-FREE here: it is decoded, validated, and sent as an `Unlock`,
+    /// and recorded into `known_servers.toml` for `addr` only AFTER the daemon
+    /// CONFIRMS it (`Unlocked`) — a rejected key never pollutes the store.
     Key(String),
 }
 

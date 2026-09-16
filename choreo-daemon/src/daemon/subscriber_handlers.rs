@@ -20,6 +20,7 @@ use super::{
     SubscriberSink, catalog_provider_pairs, debug, info, warn,
 };
 use crate::broadcast::fan_out_evicting;
+use choreo_proto::KeystoreState;
 
 /// True when a [`DaemonCommand::BroadcastActivity`] command's provenance and
 /// its message's origin disagree — a dedup-contract violation.
@@ -258,15 +259,17 @@ impl DaemonState {
             &self.lag_limits,
             &self.global_lag,
         );
-        // Send the CURRENT keystore lock state so a freshly-connecting client
-        // learns immediately whether the daemon is locked — this is what makes
-        // the startup banner possible without waiting for the next
-        // lock-state *transition* (a client that connects to an already-
-        // locked daemon would otherwise have no reason to latch `locked`).
-        // Mirrors the send-on-subscribe catalog: flat control message, lossless
-        // enqueue, outcome ignored (a fresh subscription cannot be over lag).
-        let lock_msg = self.current_lock_message();
-        let _ = writer.enqueue(&lock_msg, &self.lag_limits, &self.global_lag);
+        // Send the CURRENT keystore status so a freshly-connecting client
+        // learns immediately whether the daemon is `Unbound` (no binding yet
+        // — it must auto-bind), `Locked` (bound, present the key to unlock),
+        // or `Unlocked`. This is what makes the startup banner possible
+        // without waiting for the next lock-state *transition*, AND what lets
+        // a first-run client with no key discover it should bind the daemon.
+        // Mirrors the send-on-subscribe catalog: flat control message,
+        // lossless enqueue, outcome ignored (a fresh subscription cannot be
+        // over lag).
+        let keystore_msg = self.current_keystore_message();
+        let _ = writer.enqueue(&keystore_msg, &self.lag_limits, &self.global_lag);
     }
 
     /// Unregister a client from all session activity broadcasts.
@@ -287,32 +290,35 @@ impl DaemonState {
     }
 
     /// The flat control message representing the daemon's CURRENT keystore
-    /// lock state (no wire change — the existing `Locked`/`Unlocked`
-    /// variants). One construction site so the subscribe-time push and the
-    /// transition broadcast cannot drift.
-    pub(super) fn current_lock_message(&self) -> DaemonMessage {
-        if self.locked {
-            DaemonMessage::Locked
+    /// status: `Unbound` when no binding exists yet, else `Locked`/`Unlocked`
+    /// per the in-memory lock flag. One construction site so the
+    /// subscribe-time push and the transition broadcast cannot drift.
+    pub(super) fn current_keystore_message(&self) -> DaemonMessage {
+        let state = if !self.keystore_bound {
+            KeystoreState::Unbound
+        } else if self.locked {
+            KeystoreState::Locked
         } else {
-            DaemonMessage::Unlocked
-        }
+            KeystoreState::Unlocked
+        };
+        DaemonMessage::Keystore { state }
     }
 
-    /// Broadcast the daemon's CURRENT keystore lock state to every activity
-    /// subscriber, reusing the flat `Locked`/`Unlocked` variants (no wire
-    /// change).
+    /// Broadcast the daemon's CURRENT keystore status to every activity
+    /// subscriber.
     ///
-    /// Called on a REAL lock-state TRANSITION (locked→unlocked after a
-    /// successful Unlock / `AddCredential` implicit unlock; unlocked→locked on
-    /// `/lock`) so every connected client re-latches its banner — client B
-    /// unlocking updates client A's status bar. `None` provenance (a flat,
-    /// empty-variant control message) rides the standard lossless
-    /// activity fan-out; the acting client, if it is an activity subscriber,
-    /// receives this in addition to its own `send_to_writer` reply — that
-    /// duplicate is idempotent (latching the same state twice) and cheap, so
-    /// keeping one shared broadcast path beats special-casing it away.
-    pub(super) fn broadcast_lock_state(&mut self) {
-        let msg = self.current_lock_message();
+    /// Called on a REAL status TRANSITION (unbound→bound+unlocked after a
+    /// successful `BindKeystore`; locked→unlocked after a successful `Unlock` /
+    /// `AddCredential` implicit unlock; unlocked→locked on `/lock`) so every
+    /// connected client re-latches its banner — client B unlocking updates
+    /// client A's status bar. `None` provenance (a flat, empty-variant control
+    /// message) rides the standard lossless activity fan-out; the acting
+    /// client, if it is an activity subscriber, receives this in addition to
+    /// its own `send_to_writer` reply — that duplicate is idempotent and
+    /// cheap, so keeping one shared broadcast path beats special-casing it
+    /// away.
+    pub(super) fn broadcast_keystore_state(&mut self) {
+        let msg = self.current_keystore_message();
         self.handle_broadcast_activity(None, &msg);
     }
 

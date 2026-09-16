@@ -177,6 +177,23 @@ fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandle
         DaemonMessage::Locked => {
             handler.handle_status_text("[daemon] keystore locked, credentials cleared".to_string());
         }
+        // Authoritative keystore status push (subscribe-time + transitions).
+        // `Unbound` is the first-run signal from which the frontends trigger
+        // their auto-bind; the status text here is informational.
+        DaemonMessage::Keystore { state } => {
+            let text = match state {
+                choreo_proto::KeystoreState::Unbound => {
+                    "[daemon] keystore not initialized — a binding will be created automatically"
+                }
+                choreo_proto::KeystoreState::Locked => {
+                    "[daemon] keystore locked, credentials cleared"
+                }
+                choreo_proto::KeystoreState::Unlocked => {
+                    "[daemon] keystore unlocked, credentials available"
+                }
+            };
+            handler.handle_status_text(text.to_string());
+        }
         DaemonMessage::LockedError { error } => {
             handler.handle_error(format!("[daemon] locked: {error}"));
         }

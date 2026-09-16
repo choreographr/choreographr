@@ -38,6 +38,32 @@ pub(crate) fn use_daemon_connection() -> DaemonConnection {
         if let Err(e) = client_tx.send(ClientMessage::SubscribeSessionsSummary) {
             tracing::error!("failed to send SubscribeSessionsSummary: {e}");
         }
+        // Connect-time keystore bootstrap (mirrors choreo-im's
+        // `establish_keystore`). The GUI does not subscribe to the all-activity
+        // bus, so it never receives the daemon's authoritative `Keystore`
+        // status push; it drives the keystore itself. If a stored/legacy key
+        // resolves, unlock with it; otherwise PROBE with a freshly minted
+        // `BindKeystore` — an UNBOUND daemon adopts it (replies `Bound`, now
+        // unlocked), a BOUND daemon rejects the mismatch (verify-only, no
+        // overwrite) and stays locked until the real key is supplied. The
+        // probe key is recorded into known_servers PRE-SEND by
+        // `bind_fresh_daemon`, so a lost confirmation cannot orphan it.
+        let keystore_addr = crate::client::connection_addr();
+        match choreo_client_core::try_auto_unlock_key(&keystore_addr) {
+            Some(private_key) => {
+                if let Err(e) = client_tx.send(ClientMessage::Unlock { private_key }) {
+                    tracing::error!("failed to send Unlock: {e}");
+                }
+            }
+            None => match choreo_client_core::bind_fresh_daemon(&keystore_addr) {
+                Ok((_key, msg)) => {
+                    if let Err(e) = client_tx.send(msg) {
+                        tracing::error!("failed to send BindKeystore: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!(%e, "connect-time keystore bind probe failed"),
+            },
+        }
         daemon_tx.set(Some(client_tx));
         events_rx.set(Some(ui_rx));
         let tx = ui_tx.clone();

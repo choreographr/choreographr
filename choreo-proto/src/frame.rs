@@ -18,7 +18,12 @@ use std::io::Cursor;
 /// version gate, unchanged. The v4 shape was amended in place — the
 /// envelope's `session_id` became `Option<u64>` before first release, so it
 /// stays version 4 with no bump (mixed-version peers do not exist yet).
-pub const PROTOCOL_VERSION: u8 = 4;
+/// 5 = replaced the `Locked`/`Unlocked` status *broadcasts* with a dedicated
+/// `DaemonMessage::Keystore { state: KeystoreState }` carrying the
+/// authoritative three-state keystore status (`Unbound`/`Locked`/`Unlocked`),
+/// so a first-run client learns the keystore is unbound and auto-binds.
+/// `Locked`/`Unlocked` remain as targeted operation replies.
+pub const PROTOCOL_VERSION: u8 = 5;
 /// Max serialised *payload* size, enforced identically on encode (before the
 /// 4-byte length prefix is added — [`encode_inner`]) and on decode
 /// (`read_payload`, which checks the length prefix before reading the body).

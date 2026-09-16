@@ -786,8 +786,11 @@ daemon without requesting daemon shutdown.
 
 ## Security model
 
-The daemon starts **locked**. When a client connects and the daemon's keystore
-has NO binding yet, the client AUTO-BINDS it once per connection: it mints a
+The daemon starts **locked**. It publishes its authoritative keystore status
+on the wire (`DaemonMessage::Keystore { state }`, with `Unbound`/`Locked`/
+`Unlocked`) to each client at subscribe time and on every transition. When a
+client connects and the daemon's keystore has NO binding yet (the `Unbound`
+status), the client AUTO-BINDS it once per connection: it mints a
 fresh 32-byte key with its CSPRNG, records it into `known_servers.toml`
 (pre-send — an unbound daemon adopts whatever key arrives first, so the record
 matches the binding even if the confirmation is lost), and sends
@@ -817,14 +820,15 @@ binding; the next connect auto-binds a fresh key.
   blob it cannot test-decrypt with its bound key.
 - `/lock` destroys all in-memory credentials and returns the daemon to the
   locked state.
-- **Lock state is broadcast to every client.** The daemon tracks an
-  authoritative `locked` state and broadcasts the current state to all activity
-  subscribers on every transition (`Unlocked` after a successful unlock, bind,
-  or `AddCredential` implicit unlock; `Locked` on `/lock`), and pushes it to each
-  freshly-connecting client at subscribe time. The TUI latches this into a
-  persistent `keystore_locked` flag that drives a status-bar banner
+- **Keystore status is broadcast to every client.** The daemon tracks its
+  authoritative keystore status (`Unbound` — no binding yet; `Locked` — bound
+  but no cleartext in memory; `Unlocked`) and pushes `DaemonMessage::Keystore
+  { state }` to each freshly-connecting client at subscribe time and to all
+  activity subscribers on every transition. `Unbound` is what lets a first-run
+  client auto-bind; `Locked`/`Unlocked` drive the banner. The TUI latches this
+  into a persistent `keystore_locked` flag that drives a status-bar banner
   (`🔒 keystore locked`) which survives every keypress, shows the locked state
-  at startup, reject prompts to a locked daemon with clear "daemon is locked —
+  at startup, rejects prompts to a locked daemon with clear "daemon is locked —
   unlock it first" feedback instead of silent failure, and suppresses the
   `X / ?` context readout while credentials are not loaded. So one client
   unlocking (or locking) updates every other connected UI immediately.

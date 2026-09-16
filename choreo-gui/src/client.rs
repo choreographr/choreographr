@@ -255,6 +255,37 @@ fn handle_session_message(
     }
 }
 
+/// Trigger the once-per-connection auto-bind of an unbound daemon. Shared by
+/// the `KeystoreUnbound` reply and the `Keystore { Unbound }` status push so
+/// the bind policy cannot drift between them (and matches the TUI's
+/// `trigger_keystore_auto_bind`). Mints a fresh CSPRNG bind key, records it
+/// into `known_servers` PRE-SEND (mandatory: an unbound daemon adopts whatever
+/// arrives first), sends `BindKeystore`, and holds the key pending for the
+/// `Bound` confirm. Returns `false` when the bind-loop guard suppressed it.
+fn trigger_keystore_auto_bind(
+    state: &mut AppState,
+    daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
+) -> bool {
+    match state.keystore_auto_bind.on_unbound(&connection_addr()) {
+        Ok(Some((key, msg))) => {
+            tracing::info!("auto-binding unbound daemon with a fresh key");
+            // Same pending-confirm flow as Unlock/AddCredential: the `Bound`
+            // reply records the minted key.
+            state.pending_unlock_key = Some(key.to_vec());
+            send_client_message(state, daemon_tx, msg);
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(%e, "auto-bind failed");
+            state
+                .status_texts
+                .push(format!("[error] auto-bind failed: {e}"));
+            true
+        }
+    }
+}
+
 // needless_pass_by_value waived: callers pass an owned message envelope and
 // an owned sender exactly once per message; keeping by-value clarity beats
 // an extra lifetime dance at every call site.
@@ -305,36 +336,42 @@ pub(crate) fn apply_daemon_message(
                     "daemon keystore is unbound; discarding the verify-only pending key"
                 );
             }
-            // The once-per-connection latch and the mint+pre-send-record live
-            // in the shared `choreo_client_core` state machine so the TUI and
-            // GUI cannot drift on the bind-loop policy.
-            match state.keystore_auto_bind.on_unbound(&connection_addr()) {
-                Ok(Some((key, msg))) => {
-                    tracing::info!("auto-binding unbound daemon with a fresh key");
-                    // Same pending-confirm flow as Unlock/AddCredential:
-                    // the `Bound` reply records the minted key.
-                    state.pending_unlock_key = Some(key.to_vec());
-                    send_client_message(state, daemon_tx, msg);
-                }
-                // Bind-loop guard: a second `KeystoreUnbound` after our bind
-                // was sent means the confirmation was lost or the daemon
-                // re-keyed — surface an error, leave the connection as-is.
-                Ok(None) => {
-                    state.status_texts.push(
-                        "[daemon] keystore still unbound after bind attempt — reconnect to retry"
-                            .to_string(),
-                    );
-                }
-                // Persist failure (refused pre-send) or store errors: the
-                // daemon stays unbound; the user can reconnect to retry.
-                Err(e) => {
-                    tracing::warn!(%e, "auto-bind failed");
-                    state
-                        .status_texts
-                        .push(format!("[error] auto-bind failed: {e}"));
-                }
+            // Bind-loop guard: a second `KeystoreUnbound` after our bind was
+            // sent means the confirmation was lost or the daemon re-keyed —
+            // surface an error, leave the connection as-is.
+            if !trigger_keystore_auto_bind(state, daemon_tx) {
+                state.status_texts.push(
+                    "[daemon] keystore still unbound after bind attempt — reconnect to retry"
+                        .to_string(),
+                );
             }
         }
+        // Authoritative keystore status push. The GUI does not subscribe to
+        // the all-activity bus, so this normally only reaches it if it ever
+        // opts in; it is handled here for correctness and forward-compat. The
+        // GUI's connect-time bootstrap (hooks.rs) drives the bind today.
+        DaemonMessage::Keystore { state: ks } => match ks {
+            choreo_proto::KeystoreState::Unbound => {
+                if !state.keystore_auto_bind.attempted() {
+                    // Discard any pending verify key; the minted bind key then
+                    // becomes the pending one.
+                    if let Some(mut key) = state.pending_unlock_key.take() {
+                        key.zeroize();
+                    }
+                    let _ = trigger_keystore_auto_bind(state, daemon_tx);
+                }
+            }
+            choreo_proto::KeystoreState::Locked => {}
+            choreo_proto::KeystoreState::Unlocked => {
+                if let Some(key) = state.pending_unlock_key.take()
+                    && let Err(e) = record_unlock_key(&connection_addr(), &key)
+                {
+                    state
+                        .status_texts
+                        .push(format!("[error] failed to record unlock key: {e}"));
+                }
+            }
+        },
         // REJECTED (Unlock/AddCredential failure). Drop the pending key
         // (zeroized — it is secret material) so a later, unrelated
         // confirmation cannot attribute the rejection back. Deliberately does

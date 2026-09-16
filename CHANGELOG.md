@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Server-authoritative keystore status (`choreo-proto`, `choreo-daemon`):**
+  the daemon now models its keystore as three states — `Unbound` (no binding
+  yet), `Locked` (bound, no cleartext in memory), and `Unlocked` — and exposes
+  them on the wire as `DaemonMessage::Keystore { state: KeystoreState }`. The
+  authoritative status is pushed to a client the moment it registers for
+  notifications (activity subscribers) and broadcast to every activity
+  subscriber on each transition, replacing the two-state `Locked`/`Unlocked`
+  status *broadcasts*. `Unlocked`/`Locked`/`Bound`/`LockedError`/`KeystoreUnbound`
+  remain targeted operation replies. This is what lets a first-run client LEARN
+  the keystore is unbound and auto-bind, instead of inferring it from an
+  operation reply. Wire protocol bumped v4 → v5.
+
 - A `homebrew-verify` GitHub Actions workflow runs the SOP's manual Homebrew
   check (`brew install` + `choreographr --version`) on a macOS arm64 runner,
   so the Homebrew channel can be verified in CI without a physical Mac. It is
@@ -29,6 +41,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source changes.
 
 ### Fixed
+
+- **A first-run client could never bind a fresh daemon (the "keystore is
+  locked" dead end).** A fresh daemon starts both locked AND unbound, but the
+  clients only auto-bound on a `KeystoreUnbound` reply to an `Unlock` — which
+  `choreo-tui` never sent when it had no key (a genuine first run has neither a
+  stored per-daemon key nor a legacy `identity.pk`). The subscribe-time push
+  was a bare `Locked`, carrying no "unbound" signal, so the user was stuck at
+  the `🔒 keystore locked` banner with the (false) guidance that "a fresh daemon
+  binds automatically" — while `/unlock` failed with `NoUnlockKey`. `choreo-tui`
+  now auto-binds on the authoritative `Keystore { Unbound }` status push, and
+  the startup guidance no longer promises a bind it cannot perform. `choreo-gui`
+  — which does not subscribe to the all-activity bus and so never receives the
+  push — gains a connect-time keystore bootstrap mirroring `choreo-im`'s
+  `establish_keystore`: unlock with a resolved key, else PROBE with a freshly
+  minted `BindKeystore` (verify-only against an already-bound daemon, so it
+  never overwrites a binding).
 
 - The Homebrew tap formula installed the 0.1.0 binary set (`choreo-im`,
   `choreo-acp`), which the 0.2.0 release build no longer ships, so

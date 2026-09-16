@@ -350,6 +350,10 @@ impl DaemonMessage {
             Self::Unlocked | Self::Locked | Self::Bound | Self::ShuttingDown | Self::Evicted => {
                 OVERHEAD
             }
+            // `state` is a small (1–2 byte) enum, but its named-mode encoding
+            // includes the variant-name string; one field's allowance covers
+            // the key + tag + name comfortably.
+            Self::Keystore { .. } => named_field_overhead(1),
             Self::LockedError { error } | Self::KeystoreUnbound { error } => {
                 named_field_overhead(1) + error.len()
             }

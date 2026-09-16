@@ -300,3 +300,36 @@ fn keystore_unbound_auto_binds_once() {
         "the repeat unbound report is surfaced"
     );
 }
+
+#[test]
+fn keystore_unbound_status_push_auto_binds() {
+    // The server-authoritative `Keystore { Unbound }` push triggers the same
+    // auto-bind as the `KeystoreUnbound` reply.
+    let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
+    let mut state = AppState::new("/tmp/choreographr.sock");
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    apply_daemon_message(
+        &mut state,
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Unbound,
+        },
+        Some(tx.clone()),
+    );
+    assert!(state.keystore_auto_bind.attempted());
+    assert!(state.pending_unlock_key.is_some());
+    assert!(matches!(
+        rx.recv().expect("bind sent"),
+        ClientMessage::BindKeystore { .. }
+    ));
+
+    // A duplicate unbound push is inert: no re-bind.
+    apply_daemon_message(
+        &mut state,
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Unbound,
+        },
+        Some(tx),
+    );
+    assert!(rx.try_recv().is_err(), "no second bind attempt");
+}

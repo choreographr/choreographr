@@ -589,17 +589,17 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         app.pending_unlock_key = Some(private_key.clone());
         let _ = client_tx.send(ClientMessage::Unlock { private_key });
     } else {
-        tracing::info!("[choreo-tui] no unlock key available — daemon starts locked");
-        // Useful startup feedback: surface the locked state immediately. The
-        // persistent status-bar banner (driven by the latched `keystore_locked`
-        // flag, set when the daemon's subscribe-time lock-state push arrives a
-        // moment later) keeps this visible; the transient status offers the
-        // how-to-unlock guidance. A FRESH daemon (no binding yet) needs none
-        // of this: it answers `KeystoreUnbound` and the message handler
-        // auto-binds it with a minted key (see `handle_daemon_message`).
+        tracing::info!("[choreo-tui] no unlock key available — awaiting keystore status");
+        // Startup feedback while the daemon's authoritative keystore status
+        // push is in flight (sent at subscribe time, a moment after connect).
+        // A FRESH daemon (no binding) reports `Unbound` and the message handler
+        // AUTO-BINDS it with a minted key — no user action. A daemon already
+        // bound to ANOTHER client's key reports `Locked` and cannot be unlocked
+        // without that key: /unlock <base64-key> supplies it (bare /unlock has
+        // nothing stored to use).
         app.status = Some(
-            "daemon is locked — use /unlock, or /unlock <base64 unlock-key> to supply one \
-             (a fresh daemon binds automatically)"
+            "daemon is locked — if it is bound to another key, supply it with \
+             /unlock <base64 unlock-key> (a fresh daemon binds automatically)"
                 .to_string(),
         );
     }

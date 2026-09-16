@@ -2,7 +2,7 @@ use super::{SessionUpdateRouting, route_session_update};
 use crate::state::{App, Page, ProviderInfo, merge_token_usage};
 use crate::terminal_progress;
 use choreo_client_core::{ClientError, dispatch_daemon_message, record_unlock_key};
-use choreo_proto::{ClientMessage, DaemonMessage, RefreshStatus, SessionEvent};
+use choreo_proto::{ClientMessage, DaemonMessage, KeystoreState, RefreshStatus, SessionEvent};
 use zeroize::Zeroize;
 
 // Owned-message call sites live in test files outside connection/, so the
@@ -679,45 +679,92 @@ pub(crate) fn handle_daemon_message(
             app.status = Some(
                 "keystore not initialized — a binding will be created automatically".to_string(),
             );
-            // The once-per-connection latch and the mint+pre-send-record live
-            // in the shared `choreo_client_core` state machine so the TUI and
-            // GUI cannot drift on the bind-loop policy.
-            match app.keystore_auto_bind.on_unbound(&app.connection_addr) {
-                Ok(Some((key, msg))) => {
-                    tracing::info!(
-                        addr = %app.connection_addr,
-                        "auto-binding unbound daemon with a fresh key"
-                    );
-                    // The minted key is held pending so the `Bound`
-                    // confirmation records it through the SAME path as an
-                    // `Unlocked` — one confirm flow for all three senders.
-                    app.pending_unlock_key = Some(key.to_vec());
-                    let _ = client_tx.send(msg);
-                }
-                // Bind-loop guard: a second `KeystoreUnbound` after our bind
-                // was sent means the confirmation was lost or the daemon
-                // re-keyed — surface an error, leave the connection as-is.
-                Ok(None) => {
-                    app.error = Some(
-                        "[daemon] keystore still unbound after bind attempt — reconnect to retry"
-                            .to_string(),
-                    );
-                }
-                // Persist failure (refused pre-send) or store errors: the
-                // daemon stays unbound and locked; the user can reconnect
-                // to retry.
-                Err(e) => {
-                    tracing::warn!(addr = %app.connection_addr, %e, "auto-bind failed");
-                    app.error = Some(format!("[error] auto-bind failed: {e}"));
-                }
+            // Bind-loop guard: a second `KeystoreUnbound` after our bind was
+            // sent means the confirmation was lost or the daemon re-keyed —
+            // surface an error, leave the connection as-is.
+            if !trigger_keystore_auto_bind(app, client_tx) {
+                app.error = Some(
+                    "[daemon] keystore still unbound after bind attempt — reconnect to retry"
+                        .to_string(),
+                );
             }
         }
+        // The daemon's authoritative keystore STATUS (subscribe-time push and
+        // every transition). This is the signal that lets a first-run client
+        // with NO key discover the keystore is `Unbound` and auto-bind — the
+        // core of the fix: the client no longer has to guess from an operation
+        // reply. No early return: the generic dispatch still prints the status.
+        DaemonMessage::Keystore { state } => match state {
+            KeystoreState::Unbound => {
+                app.keystore_locked = true;
+                // The `KeystoreUnbound` reply to a connect-time auto-unlock
+                // attempt may ALREADY have triggered the bind; this push
+                // reports the SAME unbound fact, so only act when no bind is
+                // in flight — otherwise the latch would surface a spurious
+                // "still unbound" error and drop the minted pending key.
+                if !app.keystore_auto_bind.attempted() {
+                    discard_rejected_unlock_key(app);
+                    app.status = Some(
+                        "keystore not initialized — a binding will be created automatically"
+                            .to_string(),
+                    );
+                    let _ = trigger_keystore_auto_bind(app, client_tx);
+                }
+            }
+            KeystoreState::Locked => {
+                app.keystore_locked = true;
+            }
+            KeystoreState::Unlocked => {
+                app.keystore_locked = false;
+                record_confirmed_unlock_key(app);
+            }
+        },
         _ => {}
     }
 
     // Dispatch remaining variants through the generic turn-event handler.
     dispatch_daemon_message(&message, app);
     Ok(())
+}
+
+/// Trigger the once-per-connection auto-bind of an unbound daemon. Shared by
+/// the two delivery paths of the same fact — the `KeystoreUnbound` operation
+/// reply and the `Keystore { Unbound }` status push — so the bind policy
+/// cannot drift between them. On the first call it mints a fresh CSPRNG bind
+/// key, records it into `known_servers` PRE-SEND (mandatory: an unbound daemon
+/// adopts whatever arrives first, so the record cannot be wrong), sends the
+/// `BindKeystore` message, and holds the key pending for the `Bound` confirm.
+///
+/// Returns `true` when the attempt was made (or a mint/persist error was
+/// surfaced), and `false` when the bind-loop guard suppressed it because a
+/// bind was already in flight on this connection.
+fn trigger_keystore_auto_bind(
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> bool {
+    match app.keystore_auto_bind.on_unbound(&app.connection_addr) {
+        Ok(Some((key, msg))) => {
+            tracing::info!(
+                addr = %app.connection_addr,
+                "auto-binding unbound daemon with a fresh key"
+            );
+            // The minted key is held pending so the `Bound` confirmation
+            // records it through the SAME path as an `Unlocked` — one confirm
+            // flow for all senders.
+            app.pending_unlock_key = Some(key.to_vec());
+            let _ = client_tx.send(msg);
+            true
+        }
+        // Bind-loop guard: already attempted on this connection.
+        Ok(None) => false,
+        // Persist failure (refused pre-send) or store errors: the daemon
+        // stays unbound and locked; the user can reconnect to retry.
+        Err(e) => {
+            tracing::warn!(addr = %app.connection_addr, %e, "auto-bind failed");
+            app.error = Some(format!("[error] auto-bind failed: {e}"));
+            true
+        }
+    }
 }
 
 /// Record the daemon-confirmed unlock key per-daemon, exactly once.
@@ -969,5 +1016,79 @@ mod tests {
             Some(minted.as_slice().try_into().unwrap()),
             "the minted key is the recorded key"
         );
+    }
+
+    #[test]
+    fn keystore_unbound_status_push_auto_binds() {
+        // The server-authoritative signal: a `Keystore { Unbound }` push (sent
+        // at subscribe time) triggers the SAME auto-bind as the
+        // `KeystoreUnbound` reply — this is what lets a FIRST-RUN client with
+        // no key bind a fresh daemon, the bug this change fixes.
+        let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
+        let mut app = test_app();
+        app.connection_addr = "push-bind:1".to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        handle_daemon_message(
+            DaemonMessage::Keystore {
+                state: KeystoreState::Unbound,
+            },
+            &mut app,
+            &tx,
+        )
+        .unwrap();
+
+        assert!(app.keystore_locked, "unbound latches the lock banner");
+        assert!(app.keystore_auto_bind.attempted(), "bind latched");
+        assert!(app.pending_unlock_key.is_some(), "minted key held pending");
+        let ClientMessage::BindKeystore { key } = rx.try_recv().unwrap() else {
+            panic!("unbound status push must auto-bind");
+        };
+        let store = choreo_client_core::KnownServers::load().unwrap();
+        assert_eq!(
+            store.unlock_key("push-bind:1").unwrap(),
+            Some(key.as_slice().try_into().unwrap()),
+            "the minted key is recorded pre-send"
+        );
+
+        // A SECOND unbound push on the same connection is inert: no re-bind
+        // and no spurious "still unbound" error.
+        app.error = None;
+        handle_daemon_message(
+            DaemonMessage::Keystore {
+                state: KeystoreState::Unbound,
+            },
+            &mut app,
+            &tx,
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err(), "no second bind attempt");
+        assert!(app.error.is_none(), "duplicate unbound push is silent");
+    }
+
+    #[test]
+    fn keystore_locked_and_unlocked_status_push_latch() {
+        // The status push latches the banner in both directions.
+        let mut app = test_app();
+        app.keystore_locked = false;
+        let (tx, _rx) = std::sync::mpsc::channel::<ClientMessage>();
+        handle_daemon_message(
+            DaemonMessage::Keystore {
+                state: KeystoreState::Locked,
+            },
+            &mut app,
+            &tx,
+        )
+        .unwrap();
+        assert!(app.keystore_locked);
+        handle_daemon_message(
+            DaemonMessage::Keystore {
+                state: KeystoreState::Unlocked,
+            },
+            &mut app,
+            &tx,
+        )
+        .unwrap();
+        assert!(!app.keystore_locked);
     }
 }

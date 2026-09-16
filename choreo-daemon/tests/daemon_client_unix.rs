@@ -409,8 +409,17 @@ fn drain_subscribe_push(client: &Client) {
         matches!(first, DaemonMessage::CatalogUpdated { .. }),
         "{first:?}"
     );
-    let second = recv_until_not_catalog(client, "subscribe-time lock state");
-    assert!(matches!(second, DaemonMessage::Locked), "{second:?}");
+    let second = recv_until_not_catalog(client, "subscribe-time keystore state");
+    // A freshly spawned daemon has no binding → the push is `Unbound`.
+    assert!(
+        matches!(
+            second,
+            DaemonMessage::Keystore {
+                state: choreo_proto::KeystoreState::Unbound
+            }
+        ),
+        "{second:?}"
+    );
 }
 
 /// `BindKeystore` on an unbound daemon adopts the key, replies the targeted
@@ -436,7 +445,9 @@ fn unix_bind_keystore_adopts_and_replies_bound() {
     // are skipped, but the RELATIVE order of Bound before Unlocked is still
     // asserted strictly (FIFO per-client sink).
     match recv_until_not_catalog(&client, "Unlocked broadcast") {
-        DaemonMessage::Unlocked => {}
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Unlocked,
+        } => {}
         other => panic!("expected Unlocked broadcast after Bound, got {other:?}"),
     }
 
@@ -527,17 +538,29 @@ fn unix_targeted_reply_precedes_lock_state_broadcast() {
     ));
     assert!(matches!(
         recv_until_not_catalog(&client, "Unlocked broadcast"),
-        DaemonMessage::Unlocked
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Unlocked
+        }
     ));
 
-    // Same invariant for Unlock: lock, then unlock again.
+    // `/lock` is the ONE op whose targeted reply is NOT ordered before the
+    // transition broadcast: `handle_lock` broadcasts the `Keystore { Locked }`
+    // status from the command loop, and the connection layer enqueues the
+    // targeted `Locked` reply only AFTER the command returns. That is harmless
+    // — a lock carries no key to record — so accept the broadcast FIRST, then
+    // the reply. (The strict reply-first ordering matters only for the
+    // key-carrying ops — Unlock/Bind/AddCredential — which `handle_unlock`/
+    // `handle_bind_keystore` satisfy by enqueuing the targeted reply before the
+    // transition broadcast.)
     client.send(ClientMessage::Lock);
     assert!(matches!(
-        recv_until_not_catalog(&client, "lock reply"),
-        DaemonMessage::Locked
+        recv_until_not_catalog(&client, "Locked broadcast"),
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Locked
+        }
     ));
     assert!(matches!(
-        recv_until_not_catalog(&client, "Locked broadcast"),
+        recv_until_not_catalog(&client, "lock reply"),
         DaemonMessage::Locked
     ));
     client.send(ClientMessage::Unlock {
@@ -549,7 +572,9 @@ fn unix_targeted_reply_precedes_lock_state_broadcast() {
     ));
     assert!(matches!(
         recv_until_not_catalog(&client, "Unlocked broadcast"),
-        DaemonMessage::Unlocked
+        DaemonMessage::Keystore {
+            state: choreo_proto::KeystoreState::Unlocked
+        }
     ));
 
     daemon.shutdown();

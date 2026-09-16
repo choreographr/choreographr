@@ -153,6 +153,23 @@ impl DaemonState {
         };
         let tool_registry = tool_registry.build_for_policy(opts.tool_policy);
 
+        // Authoritative keystore status source: is a binding present yet?
+        // Read once at startup; `bind_keystore` flips it live (single writer
+        // on the command loop). A read error is treated as UNBOUND — the
+        // tolerant policy used wherever the binding is consulted; the worst
+        // case is a client offering a bind that the daemon then re-reads and
+        // rejects, which is the same recovery as an unbound daemon.
+        let keystore_bound = match db::get_keystore_binding(&db) {
+            Ok(binding) => binding.is_some(),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "failed to read keystore binding at startup; treating keystore as unbound"
+                );
+                false
+            }
+        };
+
         Ok(DaemonState {
             // Placeholder command channel: `start_daemon_core` overwrites
             // `daemon_tx` with the real command-loop channel before any
@@ -180,6 +197,8 @@ impl DaemonState {
             // The daemon starts locked: credentials are only decrypted into
             // memory once a client presents the valid unlock key.
             locked: true,
+            // Whether a binding already exists (persisted by a previous run).
+            keystore_bound,
             db,
             tool_registry,
             summary_subscribers: HashMap::new(),
