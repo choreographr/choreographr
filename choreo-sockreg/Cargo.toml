@@ -22,10 +22,16 @@ ureq = ["dep:ureq"]
 
 [dependencies]
 tracing.workspace = true
-# nix does not build on non-Unix targets at all, so it is target-gated; the
-# non-Unix fallback in this crate is a documented no-op (see lib.rs).
+# nix does not build on non-Unix targets at all, so it is target-gated; Windows
+# now has a real Winsock implementation of the same API (see lib.rs).
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["socket", "net", "fs"] }
+
+# Winsock FFI for the Windows path: shutdown/recv/ioctlsocket/setsockopt/
+# WSAIoctl live in WinSock; WSAIoctl's signature also names
+# Win32_System_IO::OVERLAPPED, so that feature is required too.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [dependencies.ureq]
 workspace = true

@@ -226,28 +226,59 @@ impl SocketRegistry {
         tracing::info!(count, "force-closed all registered sockets");
     }
 
-    /// Windows no-op for now. Winsock shutdown on duplicated SOCKET handles is
-    /// a planned follow-up (WINDOWS-FOLLOW-UP); until then the registry still
-    /// tracks fds so accounting code behaves identically, but shutdown has no
-    /// effect. Dropping the fds (via the clear below) does close them, which
-    /// is still correct — the registry owns them — it just lacks the
-    /// "un-block the readers first" semantics of a real shutdown.
-    #[cfg(not(unix))]
+    /// Force-closes every registered socket, then clears the list.
+    ///
+    /// Winsock analogue of the Unix path: `shutdown(SD_BOTH)` makes a peer
+    /// thread blocked in `recv`/`send` return immediately, then the registry's
+    /// duplicate handle is closed (it owns it). Per-socket errors are tolerated
+    /// and logged, mirroring the Unix errno handling: `WSAENOTSOCK` means the
+    /// handle was already closed elsewhere, `WSAENOTCONN` means the socket was
+    /// already disconnected (both debug), anything else is warn.
+    ///
+    /// After this returns every registered handle has been closed exactly once,
+    /// so a later `unregister` of one of these ids is a documented no-op.
+    #[cfg(windows)]
     pub fn shutdown_all(&self) {
-        tracing::warn!(
-            "shutdown_all is not implemented on this platform yet (planned Winsock follow-up); fds will only be closed, not shut down"
-        );
+        use std::os::windows::io::AsRawSocket;
+
+        use windows_sys::Win32::Networking::WinSock::{
+            SD_BOTH, SOCKET_ERROR, WSAENOTCONN, WSAENOTSOCK, WSAGetLastError, shutdown,
+        };
+
         let mut sockets = self
             .sockets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = sockets.len();
-        // Draining (instead of `clear()`) keeps the remove-then-close order
-        // the ownership invariant expects; dropping OwnedSocket closes it.
+        // Drain removes each entry FIRST, transferring close ownership to this
+        // loop (the invariant `unregister` relies on). shutdown() does not
+        // close the handle, so each is closed via `close_logged` afterwards.
         for entry in sockets.drain(..) {
-            let _ = entry.sock;
+            // SOCKET is `usize` in windows-sys but std's RawSocket differs on
+            // 64-bit; `socket_handle` bridges them (see its docs).
+            let raw = crate::socket_handle(entry.sock.as_raw_socket());
+            // SAFETY: `raw` is a live SOCKET owned by `entry` (drained, not yet
+            // dropped); shutdown only reads it. SD_BOTH disables both directions
+            // — the whole point is to un-block a peer thread.
+            let rc = unsafe { shutdown(raw, SD_BOTH) };
+            if rc == SOCKET_ERROR {
+                // SAFETY: WSAGetLastError reads this thread's last Winsock error.
+                let err = unsafe { WSAGetLastError() };
+                match err {
+                    WSAENOTSOCK => {
+                        tracing::debug!(handle = raw, "socket already closed (WSAENOTSOCK)");
+                    }
+                    WSAENOTCONN => {
+                        tracing::debug!(handle = raw, "socket not connected (WSAENOTCONN)");
+                    }
+                    _ => tracing::warn!(handle = raw, error = err, "socket shutdown failed"),
+                }
+            } else {
+                tracing::debug!(handle = raw, "socket shut down");
+            }
+            close_logged(entry.sock);
         }
-        tracing::info!(count, "cleared registered sockets (no shutdown performed)");
+        tracing::info!(count, "force-closed all registered sockets");
     }
 
     /// Probes every registered fd and removes (and closes) the dead ones.
@@ -273,15 +304,27 @@ impl SocketRegistry {
         prune_locked(&mut sockets)
     }
 
-    /// Windows no-op for now (probing needs `ioctlsocket`-based non-blocking
-    /// recv; planned with the Winsock follow-up).
-    #[cfg(not(unix))]
+    /// Probes every registered handle and removes (and closes) the dead ones.
+    ///
+    /// The Winsock probe mirrors ureq's `TcpTransport::is_open` (and the Unix
+    /// `probe_alive`): flip the socket non-blocking, do a 1-byte
+    /// `recv(MSG_PEEK)`, then restore blocking mode.
+    ///
+    /// * `WSAEWOULDBLOCK` — nothing buffered to read, socket alive: keep.
+    /// * `recv == Ok(0)` — EOF (peer closed): remove and close.
+    /// * `recv == Ok(n>0)` — unsolicited peer data (the stream is already
+    ///   corrupt for us, as ureq treats it): remove and close.
+    /// * any other Winsock error (`WSAECONNRESET`, `WSAENOTSOCK`, …) — dead.
+    ///
+    /// Returns the number of dead entries removed and closed.
+    #[cfg(windows)]
     #[must_use]
     pub fn prune_dead(&self) -> usize {
-        tracing::warn!(
-            "prune_dead is not implemented on this platform yet (planned Winsock follow-up)"
-        );
-        0
+        let mut sockets = self
+            .sockets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_locked(&mut sockets)
     }
 }
 
@@ -332,20 +375,34 @@ fn prune_locked(sockets: &mut Vec<Entry>) -> usize {
     pruned
 }
 
-/// Windows cap-enforcement stand-in for the Unix probe-based prune: without
-/// a liveness probe (Winsock follow-up) we cannot tell dead from alive, so
-/// when the cap is hit we close-and-drop the OLDEST entries to stay bounded.
-/// Same growth guarantee as the Unix path, weaker eviction policy.
+/// Lock-held prune worker (Windows), shared by [`SocketRegistry::prune_dead`]
+/// and the opportunistic prune in [`SocketRegistry::register`] (which must
+/// not re-acquire the already-held mutex). Mirrors the Unix worker: walk by
+/// index because removing an entry shifts later ones down, and close each
+/// removed handle exactly once through `close_logged`. Returns the number
+/// removed.
 #[cfg(windows)]
-fn prune_locked(sockets: &mut Vec<Entry>) {
-    while sockets.len() >= MAX_REGISTERED_SOCKETS {
-        let oldest = sockets.remove(0);
-        let _ = oldest.sock; // dropping OwnedSocket closes the handle
+fn prune_locked(sockets: &mut Vec<Entry>) -> usize {
+    use std::os::windows::io::AsSocket;
+
+    let before = sockets.len();
+    let mut i = 0;
+    while let Some(entry) = sockets.get(i) {
+        let alive = probe_alive(entry.sock.as_socket());
+        if alive {
+            i += 1;
+            continue;
+        }
+        // Remove then close explicitly (ownership transfer), so a later
+        // unregister of this id is a no-op and the handle is closed once.
+        let entry = sockets.remove(i);
+        close_logged(entry.sock);
     }
-    tracing::debug!(
-        remaining = sockets.len(),
-        "trimmed socket registry to cap (no probe on this platform)"
-    );
+    let pruned = before - sockets.len();
+    if pruned > 0 {
+        tracing::debug!(pruned, remaining = sockets.len(), "pruned dead sockets");
+    }
+    pruned
 }
 
 /// The liveness probe, split out of the removal loop for readability.
@@ -394,6 +451,56 @@ fn probe_alive(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     alive
 }
 
+/// The liveness probe (Windows). Returns `true` when the socket looks usable
+/// (see `prune_dead`'s docs). Windows has no way to READ the current FIONBIO
+/// state (`ioctlsocket` is set-only), so the probe restores BLOCKING mode —
+/// correct for every socket this registry holds (the connector registers
+/// `try_clone`d blocking `std::net::TcpStream`s).
+#[cfg(windows)]
+fn probe_alive(socket: std::os::windows::io::BorrowedSocket<'_>) -> bool {
+    use std::os::windows::io::AsRawSocket;
+
+    use windows_sys::Win32::Networking::WinSock::{
+        FIONBIO, MSG_PEEK, SOCKET_ERROR, WSAEINTR, WSAEWOULDBLOCK, WSAGetLastError, ioctlsocket,
+        recv,
+    };
+
+    // SOCKET is `usize` in windows-sys but std's RawSocket differs on 64-bit;
+    // `socket_handle` bridges them (see its docs).
+    let raw = crate::socket_handle(socket.as_raw_socket());
+    // Flip to non-blocking so the peek returns immediately instead of
+    // blocking on an idle-but-open socket.
+    let mut nonblocking: u32 = 1;
+    // SAFETY: `raw` is a live SOCKET; FIONBIO takes a *mut u32 flag
+    // (nonzero = non-blocking). `&raw mut` is the raw-pointer form clippy
+    // prefers over an implicitly-coerced `&mut`.
+    if unsafe { ioctlsocket(raw, FIONBIO, &raw mut nonblocking) } == SOCKET_ERROR {
+        return false;
+    }
+
+    let mut buf = [0u8; 1];
+    // SAFETY: `buf` is one byte and `raw` is live; MSG_PEEK leaves the
+    // receive queue untouched; non-blocking mode makes this immediate.
+    let n = unsafe { recv(raw, buf.as_mut_ptr(), 1, MSG_PEEK) };
+
+    // Restore blocking mode regardless of the verdict (0 = blocking).
+    let mut blocking: u32 = 0;
+    // SAFETY: same live SOCKET; a zero flag clears FIONBIO.
+    let _ = unsafe { ioctlsocket(raw, FIONBIO, &raw mut blocking) };
+
+    if n == SOCKET_ERROR {
+        // SAFETY: reads this thread's last Winsock error.
+        let err = unsafe { WSAGetLastError() };
+        // Nothing buffered, no error: open and idle => alive. EINTR is an
+        // indeterminate interrupted probe; keep conservatively (mirrors the
+        // Unix path).
+        return err == WSAEWOULDBLOCK || err == WSAEINTR;
+    }
+    // Ok(0) = EOF, Ok(n>0) = unsolicited data: both mean the connection is
+    // done for us (ureq semantics) => dead.
+    false
+}
+
 /// Takes ownership of an fd and closes it, logging (never panicking on) the
 /// result. `EBADF` is expected for sockets that were already closed
 /// elsewhere — the registry tolerates that case by contract.
@@ -415,17 +522,17 @@ fn close_logged(socket: OwnedSock) {
 }
 
 /// Windows variant of [`close_logged`]: `OwnedSocket`'s `Drop` closes the
-/// SOCKET handle via `closesocket`, which is the closest analogue of
-/// `close(fd)` Winsock gives us (the real Winsock bounded shutdown —
-/// `shutdown(SD_BOTH)` + error mapping — is the WINDOWS-FOLLOW-UP). Created
-/// so the RAII `unregister` (shared, uncfg'd) compiles and behaves correctly
-/// on Windows too. CRITICAL: ownership must NOT be stolen from `OwnedSocket`
-/// — `into_raw_socket()` TRANSFERS ownership out, and a raw SOCKET nobody
-/// closes leaks the handle for the process's lifetime (exactly the bug the
-/// Unix path's explicit `close(raw)` avoids). So we only LOG the handle via
-/// a borrow (`as_raw_socket`), then drop the `OwnedSocket` and let `Drop` close
-/// it — Drop's close errors are unobservable, which is acceptable: the Unix
-/// path logs EBADF only because nix maps errno; the close-once-ownership
+/// SOCKET handle via `closesocket`, the Winsock analogue of `close(fd)`.
+/// `shutdown_all`/`prune_locked` call Winsock `shutdown`/probe BEFORE this,
+/// so by the time we close, the force-close/un-block and liveness decisions
+/// are already made; this helper only owns the single close. CRITICAL:
+/// ownership must NOT be stolen from `OwnedSocket` — `into_raw_socket()`
+/// TRANSFERS ownership out, and a raw SOCKET nobody closes leaks the handle
+/// for the process's lifetime (exactly the bug the Unix path's explicit
+/// `close(raw)` avoids). So we only LOG the handle via a borrow
+/// (`as_raw_socket`), then drop the `OwnedSocket` and let `Drop` close it —
+/// Drop's close errors are unobservable, which is acceptable: the Unix path
+/// logs EBADF only because nix maps errno; the close-once-ownership
 /// invariant this helper serves is identical on both platforms.
 #[cfg(windows)]
 fn close_logged(socket: OwnedSock) {
@@ -433,10 +540,11 @@ fn close_logged(socket: OwnedSock) {
 
     // Borrow for logging first — the value is still owned and will be closed
     // exactly once by Drop below. `as_raw_socket` gives the numeric SOCKET
-    // value without taking ownership (the equivalent of `as_raw_fd`).
+    // value without taking ownership (the equivalent of `as_raw_fd`);
+    // `socket_handle` normalizes it for the log field (see its docs).
     let raw = socket.as_raw_socket();
     tracing::debug!(
-        handle = raw as usize,
+        handle = crate::socket_handle(raw),
         "registered socket closed (Winsock path)"
     );
     // Drop of `OwnedSocket` = closesocket, guaranteed once (the value was
@@ -444,7 +552,13 @@ fn close_logged(socket: OwnedSock) {
     drop(socket);
 }
 
+// Two separate cfg attrs (not `cfg(all(test, unix))`): clippy's
+// `allow-expect-in-tests` only recognizes a bare `cfg(test)` when scanning
+// enclosing scopes, so the combined form would leave the test helpers below
+// subject to the workspace's expect/unwrap denies. Unix-gated because the
+// helpers use `std::os::fd` and `nix`, neither of which exists on Windows.
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd};

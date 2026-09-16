@@ -87,6 +87,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version, the installed `--version`, the formula test, and that the service is
   installed but not auto-started.
 
+- **`choreo-sockreg` now implements its Windows (Winsock) path instead of
+  logging no-ops.** `SocketRegistry::shutdown_all` issues a Winsock
+  `shutdown(SD_BOTH)` on every registered socket before closing it, so a cancel
+  or a suspend can now un-block an inference worker wedged in a provider read
+  on Windows — the same service `shutdown(SHUT_RDWR)` provides on Unix.
+  `prune_dead` probes each socket for liveness with the same non-blocking
+  `recv(MSG_PEEK)` technique the Unix path uses (via `ioctlsocket(FIONBIO)`),
+  replacing the old "close the oldest entry once the 256-entry cap is hit"
+  stand-in; and `SocketTuning::apply` applies `SO_KEEPALIVE` plus the idle /
+  interval timings through `WSAIoctl(SIO_KEEPALIVE_VALS)` (Windows has no
+  per-socket probe-count knob). All three previously emitted a `tracing::warn!`
+  no-op and were marked `WINDOWS-FOLLOW-UP`. The crate's Windows unit and
+  integration tests are cfg-gated, so a Windows `cargo test` compiles too (the
+  Unix test module used `nix`/`std::os::fd`, which broke it).
+
+- **`choreo-power-events` gains a Windows suspend/resume backend.** It
+  registers user32's `RegisterSuspendResumeNotification` with a
+  `DEVICE_NOTIFY_CALLBACK` (Windows 8+), so the daemon now receives
+  `SuspendEvent::Sleep` before the machine sleeps and `SuspendEvent::Wake` on
+  resume instead of the previous inert, never-firing monitor. Windows invokes
+  the callback on a system thread, so this backend spawns no dedicated monitor
+  thread (unlike the Linux/macOS backends) and deliberately leaks its
+  registration context; a registration failure logs and degrades to the inert
+  monitor, matching the crate's best-effort contract.
+
 ### Changed
 
 - **Tool-result images now "decay" out of older requests.** When a tool produces

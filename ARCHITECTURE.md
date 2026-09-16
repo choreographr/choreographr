@@ -58,11 +58,12 @@ Choreographr (workspace)
 ├── choreo-sockreg         Live provider-socket registry + TCP keepalive tuning —
 │                       force-close (`shutdown_all`) and liveness-prune for sockets
 │                       registered by provider clients, so cancels/suspends can un-block
-│                       workers wedged in a provider read (Unix via nix; Windows no-op
-│                       with a planned Winsock follow-up)
+│                       workers wedged in a provider read (Unix via nix; Windows via
+│                       Winsock shutdown/prune + keepalive tuning)
 ├── choreo-power-events    Platform suspend/wake notifications as crossbeam events —
 │                       logind PrepareForSleep (Linux), IOKit power notifications (macOS),
-│                       inert fallback elsewhere; best-effort convenience layer over
+│                       user32 suspend/resume callbacks (Windows), inert fallback elsewhere;
+│                       best-effort convenience layer over
 │                       sockreg's kernel keepalives, never a correctness layer
 ├── choreo-daemon          Unix socket server — the core engine (library; the
 │                       daemon binary `choreographr` is declared by the root
@@ -751,24 +752,38 @@ the 256-entry cap remain purely as backstops.
 `RegisteringTcpConnector`
 (behind the crate's `ureq` feature) is the ureq agent connector stage that
 registers each dialed socket, so every provider HTTP connection is reachable
-by `shutdown_all`. All real functionality is Unix-only; the Windows analogue
-(duplicated-`SOCKET` shutdown) is a marked `WINDOWS-FOLLOW-UP`.
+by `shutdown_all`. Both platforms are implemented: Unix via `nix`
+(`shutdown(SHUT_RDWR)` + a non-blocking `recv(MSG_PEEK)` probe + `setsockopt`,
+including Linux `TCP_USER_TIMEOUT`), Windows via `windows-sys` (Winsock
+`shutdown(SD_BOTH)`, the same `MSG_PEEK` probe, and `SO_KEEPALIVE` +
+`WSAIoctl(SIO_KEEPALIVE_VALS)` — which carries idle/interval in milliseconds
+and has no per-socket probe-count knob). Every FFI handoff bridges std's
+`RawSocket` (a `u64` on 64-bit Windows) to windows-sys's `SOCKET` (`usize`)
+through one documented `socket_handle` helper; the Windows unit/integration
+tests are cfg-gated so a Windows `cargo test` compiles too (the Unix test
+module uses `nix`/`std::os::fd`, which do not exist there).
 
 | Module | Purpose |
 |---|---|
-| `socket_registry.rs` | `SocketRegistry` — `register` / `shutdown_all` / `prune_dead` / `registered_count`; cheap `Clone` (shared fd list) |
-| `tuning.rs` | `SocketTuning` — TCP keepalive (idle/interval/retries) applied post-connect |
+| `socket_registry.rs` | `SocketRegistry` — `register` / `shutdown_all` / `prune_dead` / `registered_count`; cheap `Clone` (shared fd list). `shutdown_all` uses `shutdown(SHUT_RDWR)` (Unix) / `shutdown(SD_BOTH)` (Windows) to un-block readers; `prune_dead` probes with a non-blocking `recv(MSG_PEEK)` on both (Windows reuses `ioctlsocket(FIONBIO)`) |
+| `tuning.rs` | `SocketTuning` — TCP keepalive (idle/interval/retries) applied post-connect. Unix sets `SO_KEEPALIVE` + per-platform timing sockopts; Windows sets `SO_KEEPALIVE` + the timings via `WSAIoctl(SIO_KEEPALIVE_VALS)` |
 | `connector.rs` | `RegisteringTcpConnector` (`ureq` feature) — dialing connector that registers every socket; mirrors ureq's address-fallback face (geometric per-address budget split, fall-through on address-specific failures and on dial timeouts while overall connect budget remains, ureq #1184 parity) |
 
 ### `choreo-power-events` — Platform suspend/wake notifications
 
 One small leaf crate emitting `SuspendEvent::{Sleep, Wake}` on an unbounded
-crossbeam channel from a single dedicated monitor thread (all platform
-async→sync bridging lives inside that thread — no tokio). Linux subscribes to
+crossbeam channel — from a single dedicated monitor thread on Linux and macOS
+(all platform async→sync bridging lives inside that thread — no tokio), and
+from the OS's system thread on Windows (below). Linux subscribes to
 systemd-logind `PrepareForSleep` via zbus's blocking API; macOS uses
 `IORegisterForSystemPower` + CFRunLoop (with `IOAllowPowerChange` so the
 decline-free interest callback does not block system sleep for everyone);
-everything else is an inert fallback. `PowerMonitor::new` is strict (returns
+Windows registers user32 `RegisterSuspendResumeNotification` with a
+`DEVICE_NOTIFY_CALLBACK` (Windows 8+), whose callback Windows invokes on a
+SYSTEM thread — so this backend spawns NO monitor thread and instead leaks its
+registration context and `DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS` so they outlive
+the process's registration (the same deliberate leak the macOS backend uses for
+its run-loop context); everything else is an inert fallback. `PowerMonitor::new` is strict (returns
 the underlying error); `PowerMonitor::best_effort` logs once and falls back
 to the inert mode — the daemon uses `best_effort`. These events are a
 CONVENIENCE layer, never a correctness layer: a machine can suspend without

@@ -42,6 +42,14 @@ io-kit-sys = "0.5"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 
+# Windows: suspend/resume notifications via `RegisterSuspendResumeNotification`
+# with a `DEVICE_NOTIFY_CALLBACK` (user32, Windows 8+). `Win32_System_Power`
+# holds the registration API and the callback type; the `PBT_APM*` constants
+# live in `Win32_UI_WindowsAndMessaging` (whose `REGISTER_NOTIFICATION_FLAGS`
+# type the registration signature also names).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Power", "Win32_UI_WindowsAndMessaging"] }
+
 # Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
 [lints]
 workspace = true

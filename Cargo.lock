@@ -3057,6 +3057,7 @@ dependencies = [
  "io-kit-sys",
  "thiserror 2.0.20",
  "tracing",
+ "windows-sys 0.61.2",
  "zbus 5.19.0",
 ]
 
@@ -3086,6 +3087,7 @@ dependencies = [
  "nix 0.31.3",
  "tracing",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

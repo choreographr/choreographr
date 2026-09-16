@@ -131,15 +131,113 @@ impl SocketTuning {
         Ok(())
     }
 
-    /// Windows no-op for now (WINDOWS-FOLLOW-UP: keepalive tuning belongs
-    /// with the Winsock shutdown work — `WSAIoctl(SIO_KEEPALIVE_VALS)`).
+    /// Applies the tuning to a socket handle. Windows implementation.
+    ///
+    /// `SO_KEEPALIVE` is the one fatal option (as on Unix); the timings go
+    /// through `WSAIoctl(SIO_KEEPALIVE_VALS)`, which carries the idle time and
+    /// probe interval in MILLISECONDS. Windows has no per-socket probe-COUNT
+    /// knob (the `TcpMaxDataRetransmissions` registry/TCP global applies), so
+    /// `PROBE_COUNT` is unused here — the same "best-effort per option" policy
+    /// as the Unix path.
+    ///
+    /// # Errors
+    ///
+    /// `Err` when the `SO_KEEPALIVE` set fails, when the follow-up get fails,
+    /// or when the get shows the kernel ignored the set.
     #[cfg(windows)]
-    pub fn apply(&self, _fd: std::os::windows::io::BorrowedSocket<'_>) -> std::io::Result<()> {
-        tracing::warn!(
-            "SocketTuning::apply is not implemented on this platform yet (planned Winsock follow-up)"
-        );
+    pub fn apply(&self, socket: std::os::windows::io::BorrowedSocket<'_>) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawSocket;
+
+        use windows_sys::Win32::Networking::WinSock::{
+            SIO_KEEPALIVE_VALS, SO_KEEPALIVE, SOCKET_ERROR, SOL_SOCKET, WSAIoctl, getsockopt,
+            setsockopt, tcp_keepalive,
+        };
+
+        // SOCKET is `usize` in windows-sys but std's RawSocket differs on
+        // 64-bit; `socket_handle` bridges them (see its docs).
+        let raw = crate::socket_handle(socket.as_raw_socket());
+
+        // The one option whose failure is fatal (module docs explain why). A
+        // Win32 BOOL is a 4-byte u32 (1 = on).
+        let enabled: u32 = 1;
+        // SAFETY: `raw` is a live connected SOCKET; `enabled` is a 4-byte BOOL
+        // for the SO_KEEPALIVE int option and the length matches.
+        let rc = unsafe {
+            setsockopt(
+                raw,
+                SOL_SOCKET,
+                SO_KEEPALIVE,
+                std::ptr::from_ref(&enabled).cast(),
+                win32_opt_len(),
+            )
+        };
+        if rc == SOCKET_ERROR {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Best-effort per-socket timings. SIO_KEEPALIVE_VALS wants a
+        // tcp_keepalive { onoff, keepalivetime (ms), keepaliveinterval (ms) }.
+        let vals = tcp_keepalive {
+            onoff: 1,
+            keepalivetime: Self::IDLE_SECS.saturating_mul(1000),
+            keepaliveinterval: Self::INTERVAL_SECS.saturating_mul(1000),
+        };
+        let mut bytes_returned: u32 = 0;
+        // SAFETY: in-buffer is the tcp_keepalive struct SIO_KEEPALIVE_VALS
+        // expects; no out-buffer, no overlapped (synchronous call, so a null
+        // OVERLAPPED and a None completion routine are correct).
+        let rc = unsafe {
+            WSAIoctl(
+                raw,
+                SIO_KEEPALIVE_VALS,
+                std::ptr::from_ref(&vals).cast(),
+                u32::try_from(std::mem::size_of::<tcp_keepalive>()).unwrap_or_default(),
+                std::ptr::null_mut(),
+                0,
+                &raw mut bytes_returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "best-effort SIO_KEEPALIVE_VALS could not be set"
+            );
+        }
+
+        // Round-trip sanity: confirm the master switch actually stuck (mirrors
+        // the Unix path's getsockopt check).
+        let mut current: u32 = 0;
+        let mut len = win32_opt_len();
+        // SAFETY: `current` is a 4-byte BOOL out-buffer with `len` its size.
+        let rc = unsafe {
+            getsockopt(
+                raw,
+                SOL_SOCKET,
+                SO_KEEPALIVE,
+                std::ptr::from_mut(&mut current).cast(),
+                &raw mut len,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            return Err(std::io::Error::last_os_error());
+        }
+        if current == 0 {
+            return Err(std::io::Error::other(
+                "SO_KEEPALIVE did not stick after setsockopt",
+            ));
+        }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+/// The `optlen`/`socklen_t` for a 4-byte Win32 socket option (a `c_int` at the
+/// FFI boundary). `size_of::<u32>()` is always 4, so the `try_from` fallback is
+/// unreachable — it exists only to avoid a lossy `as` cast that clippy denies.
+fn win32_opt_len() -> i32 {
+    i32::try_from(std::mem::size_of::<u32>()).unwrap_or_default()
 }
 
 #[cfg(unix)]
@@ -216,5 +314,49 @@ mod tests {
         let file = std::fs::File::create(std::env::temp_dir().join("sockreg-not-a-socket"))
             .expect("create temp file");
         assert!(SocketTuning.apply(file.as_fd()).is_err());
+    }
+}
+
+// Windows twin of the Unix tuning test, kept as a SEPARATE module so each
+// platform's test module is self-contained (and so the two cfg attrs can stay
+// bare `cfg(test)` + `cfg(windows)` — see the note on the Unix module above
+// for why the combined form breaks clippy's allow-expect-in-tests).
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_tests {
+    use std::net::{TcpListener, TcpStream};
+    use std::os::windows::io::{AsRawSocket, AsSocket};
+
+    use windows_sys::Win32::Networking::WinSock::{SO_KEEPALIVE, SOL_SOCKET, getsockopt};
+
+    use super::{SocketTuning, win32_opt_len};
+
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        (client, server)
+    }
+
+    #[test]
+    fn tuning_applies_and_keepalive_round_trips() {
+        let (client, _server) = loopback_pair();
+        SocketTuning.apply_stream(&client).expect("apply");
+
+        let mut enabled: u32 = 0;
+        let mut len = win32_opt_len();
+        // SAFETY: `client` is a live connected socket; `enabled` is a
+        // 4-byte BOOL out-buffer and `len` its size.
+        let rc = unsafe {
+            getsockopt(
+                crate::socket_handle(client.as_socket().as_raw_socket()),
+                SOL_SOCKET,
+                SO_KEEPALIVE,
+                std::ptr::from_mut(&mut enabled).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt(SO_KEEPALIVE) failed");
+        assert_eq!(enabled, 1, "SO_KEEPALIVE must be on after apply");
     }
 }

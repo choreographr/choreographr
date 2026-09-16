@@ -481,6 +481,12 @@ bs58 = "0.5"
 # into the static-musl release). `handshake` enables `tungstenite::connect`.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 nix = "0.31.3"
+# Windows FFI (Win32 APIs): Job Objects kill-switch (choreo-daemon), Winsock
+# socket shutdown/probe/keepalive (choreo-sockreg), suspend/resume
+# notifications (choreo-power-events). Per AGENTS.md a crate used by two or
+# more members lives here; each consumer target-gates it under cfg(windows)
+# and enables only the features its FFI needs.
+windows-sys = "0.61.2"
 unicode-segmentation = "1.13"
 # Filesystem notification for the user-overlay watcher (S4). 8.2.0 is the
 # latest stable; 9.0.0-rc.x is a pre-release and is deliberately NOT used.

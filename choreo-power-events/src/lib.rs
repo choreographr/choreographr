@@ -24,7 +24,8 @@
 //! |---|---|---|
 //! | Linux | systemd-logind `PrepareForSleep(bool)` D-Bus signal | Requires a session/system D-Bus with logind. |
 //! | macOS | `IORegisterForSystemPower` + `CFRunLoop` | `IOAllowPowerChange` is called for `kIOMessageSystemWillSleep` — declining blocks system sleep for everyone. |
-//! | Windows (and anything else) | Inert fallback | [`PowerMonitor::new`] returns `Ok` with a receiver that never fires; `is_active()` is `false`. |
+//! | Windows | user32 `RegisterSuspendResumeNotification` + `DEVICE_NOTIFY_CALLBACK` (Windows 8+) | Fires on a **system thread**, so no dedicated monitor thread is spawned. |
+//! | Other | Inert fallback | [`PowerMonitor::new`] returns `Ok` with a receiver that never fires; `is_active()` is `false`. |
 //!
 //! On Linux, if logind is unreachable, [`PowerMonitor::new`] returns the
 //! underlying error and [`PowerMonitor::best_effort`] logs once and falls
@@ -32,9 +33,11 @@
 //!
 //! # Threading model
 //!
-//! [`PowerMonitor::new`] spawns one dedicated, daemon-like monitor thread
-//! that owns the platform subscription and is the single producer on an
-//! unbounded crossbeam channel. All the platform-specific async→sync
+//! On Linux and macOS [`PowerMonitor::new`] spawns one dedicated,
+//! daemon-like monitor thread that owns the platform subscription and is
+//! the single producer on an unbounded crossbeam channel. On Windows there
+//! is no dedicated thread: the producer is the **system thread** Windows
+//! invokes the power callback on. All the platform-specific async→sync
 //! bridging (zbus's `block_on` on Linux) lives entirely inside that thread
 //! — no tokio, no async runtimes leak out of this crate. [`Drop`] is
 //! best-effort and NEVER blocks on the monitor thread: the thread is
@@ -144,9 +147,14 @@ impl PowerMonitor {
     ///   CFRunLoop-driven monitor thread. **The monitor calls
     ///   `IOAllowPowerChange` for every sleep notification** — declining
     ///   would block the whole system from sleeping.
-    /// - **Windows / other**: returns `Ok` with an inert monitor whose
-    ///   receiver never fires (logged once with `info!`); use
-    ///   [`PowerMonitor::is_active`] to report which mode you got.
+    /// - **Windows**: registers a suspend/resume callback via user32's
+    ///   `RegisterSuspendResumeNotification` with a `DEVICE_NOTIFY_CALLBACK`
+    ///   (Windows 8+). Windows invokes the callback on a **system thread**,
+    ///   so no dedicated monitor thread is spawned; on registration failure
+    ///   it degrades to the inert monitor.
+    /// - **Other**: returns `Ok` with an inert monitor whose receiver never
+    ///   fires (logged once with `info!`); use [`PowerMonitor::is_active`] to
+    ///   report which mode you got.
     ///
     /// # Errors
     ///

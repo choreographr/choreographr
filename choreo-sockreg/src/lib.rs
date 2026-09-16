@@ -36,12 +36,12 @@
 //!
 //! # Portability
 //!
-//! All real functionality is Unix-only (`cfg(unix)`, implemented via `nix`).
-//! On non-Unix targets (Windows, for now) the same public API compiles but
-//! `shutdown_all` / `prune_dead` / `SocketTuning::apply` are logged no-ops.
-//! Windows Winsock shutdown (`WSASendDisconnect` / `closesocket` on a
-//! duplicated `SOCKET`) is a planned follow-up — the call sites are marked
-//! with `WINDOWS-FOLLOW-UP` comments so they are easy to find.
+//! Unix uses `nix`. Windows implements the same public API via `windows-sys`:
+//! `shutdown_all` issues a Winsock `shutdown(SD_BOTH)` (to un-block a peer
+//! thread) then closes the duplicate handle; `prune_dead` probes liveness with
+//! a non-blocking `recv(MSG_PEEK)` (the `TcpTransport::is_open` technique); and
+//! `SocketTuning::apply` sets `SO_KEEPALIVE` plus the timings through
+//! `WSAIoctl(SIO_KEEPALIVE_VALS)`.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -56,3 +56,18 @@ pub use tuning::SocketTuning;
 
 #[cfg(feature = "ureq")]
 pub use connector::RegisteringTcpConnector;
+
+/// Bridges std's `RawSocket` (the value `AsRawSocket::as_raw_socket` returns)
+/// to the `SOCKET` type `windows-sys` expects at the FFI boundary.
+///
+/// std models a Windows socket as `u64` on 64-bit targets (and `u32` on
+/// 32-bit), while `windows-sys` models the Win32 `SOCKET` (`UINT_PTR`) as
+/// `usize`. Both are pointer-width, so the conversion is *infallible* on every
+/// Windows target — `usize::try_from` is used only to keep clippy's lossy-cast
+/// lints quiet, and its `0` fallback is unreachable (0 is not a valid SOCKET;
+/// the OS would reject it). Shared by the registry's `shutdown`/`probe` and the
+/// tuning FFI so all three call sites convert identically.
+#[cfg(windows)]
+pub(crate) fn socket_handle(raw: std::os::windows::io::RawSocket) -> usize {
+    usize::try_from(raw).unwrap_or_default()
+}

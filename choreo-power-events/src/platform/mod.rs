@@ -11,6 +11,8 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 use crate::{PowerMonitor, PowerMonitorError};
 
@@ -28,15 +30,16 @@ pub fn spawn_monitor() -> Result<PowerMonitor, PowerMonitorError> {
     return linux::spawn_monitor();
     #[cfg(target_os = "macos")]
     return macos::spawn_monitor();
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    return windows::spawn_monitor();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     return Ok(unsupported_monitor());
 }
 
-/// The inert fallback used on platforms without a wired-up mechanism
-/// (Windows today): `Ok` with a never-firing receiver, logged ONCE so the
-/// observability layer knows power events are unavailable and the
-/// kernel-level dead-link detection (sockreg keepalives) is the active
-/// layer.
+/// The inert fallback used on platforms without a wired-up mechanism: `Ok`
+/// with a never-firing receiver, logged ONCE so the observability layer
+/// knows power events are unavailable and the kernel-level dead-link
+/// detection (sockreg keepalives) is the active layer.
 // `allow(dead_code)` is scoped to exactly this function: on Linux/macOS the
 // platform module below handles subscription and this fallback is never
 // called, but it MUST stay compiled everywhere so the unsupported-platform
@@ -54,9 +57,10 @@ fn unsupported_monitor() -> PowerMonitor {
 /// mapping spawn failure to [`PowerMonitorError::Spawn`]. The thread is
 /// daemon-like — it never blocks process exit handling and is not joined
 /// (see the `Drop` rationale on [`crate::PowerMonitor`]).
-// `allow(dead_code)`: the Windows/unsupported fallback never spawns a
-// thread, but the helper must stay compiled on every target so each
-// platform module can rely on it.
+// `allow(dead_code)`: Windows uses a system-thread callback (no monitor
+// thread) and the unsupported fallback never spawns one either, but the
+// helper must stay compiled on every target so each platform module can
+// rely on it.
 #[allow(dead_code)]
 pub(crate) fn spawn_thread(
     name: &'static str,
