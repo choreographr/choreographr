@@ -375,7 +375,156 @@ fn slug_keyed_catalog_facts_resolve_without_a_live_provider() {
         panic!("expected SessionState message");
     };
     let capability = reasoning_capability.expect("capability reported without a live provider");
-    assert_ne!(capability.available_effort_levels, [] as [String; 0]);
+    assert!(
+        !capability.available_effort_levels.is_empty(),
+        "reasoning capability must report at least one effort level"
+    );
+}
+
+#[test]
+fn set_provider_slug_command_updates_and_clears_recorded_slug() {
+    // The daemon's accounts-reload path pushes the account's (non-secret)
+    // provider slug here; the handler records it, and `None` (account removed)
+    // clears it so a stale slug can't keep feeding catalog lookups.
+    let dir = tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
+    let (daemon_tx, _daemon_rx) = std::sync::mpsc::channel();
+    let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 9,
+        db,
+        tool_registry: ToolRegistry::new().build(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: LagLimits::default(),
+        global_lag: Arc::new(AtomicUsize::new(0)),
+        substrate_credential: None,
+    };
+
+    let mut state = SessionState::empty();
+    assert!(!handle_set_provider_slug(
+        Some("anthropic".into()),
+        &mut state,
+        &ctx
+    ));
+    assert_eq!(state.provider_slug.as_deref(), Some("anthropic"));
+    // Removal clears the recorded slug.
+    assert!(!handle_set_provider_slug(None, &mut state, &ctx));
+    assert_eq!(state.provider_slug, None);
+}
+
+#[test]
+fn set_account_switches_slug_and_drops_stale_client_when_locked() {
+    // Switching to a KNOWN account while the keystore is locked: the config
+    // resolves but there is no key, so no client is built. The new slug must
+    // still be recorded (so static facts are exact) AND the previous account's
+    // client dropped — `resolve_provider` returns a cached client
+    // unconditionally, so keeping it would dial the old provider under the new
+    // account name.
+    use std::sync::mpsc;
+
+    use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
+    let (daemon_tx, daemon_rx) = mpsc::channel();
+    let (cmd_tx, _cmd_rx) = mpsc::channel();
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 3,
+        db,
+        tool_registry: ToolRegistry::new().build(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: LagLimits::default(),
+        global_lag: Arc::new(AtomicUsize::new(0)),
+        substrate_credential: None,
+    };
+
+    // The fake daemon resolves the new account's CONFIG but serves no key
+    // (keystore locked) — the exact shape the real loop sends.
+    let server = std::thread::spawn(move || {
+        while let Ok(DaemonCommand::ResolveAccountCmd { reply, .. }) = daemon_rx.recv() {
+            let config = crate::accounts::AccountConfig::simple("new-account", "anthropic");
+            let _ = reply.send(Some((config, None)));
+        }
+    });
+
+    // Pre-existing client for a DIFFERENT account.
+    let mut state = SessionState::empty();
+    let client =
+        OpenAiClient::new(ServiceConfig::default(), "old-key".into(), &state.registry).unwrap();
+    state.provider = Some(InferenceProvider::from_openai(client));
+    state.provider_slug = Some("openai".into());
+    state.config.account_name = Some("old-account".into());
+
+    handle_set_account("new-account".into(), &mut state, &ctx);
+
+    assert!(
+        state.provider.is_none(),
+        "account switch must drop the previous account's client"
+    );
+    assert_eq!(
+        state.provider_slug.as_deref(),
+        Some("anthropic"),
+        "the new account's slug is recorded even without a client"
+    );
+    assert_eq!(state.config.account_name.as_deref(), Some("new-account"));
+
+    drop(ctx.daemon_tx);
+    drop(ctx.cmd_tx);
+    server.join().unwrap();
+}
+
+#[test]
+fn set_account_clears_slug_and_client_when_new_account_unknown() {
+    // The new account can't be resolved at all (unknown): both the stale
+    // client and the stale slug must be cleared so neither keeps serving the
+    // old account's facts.
+    use std::sync::mpsc;
+
+    use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
+    let (daemon_tx, daemon_rx) = mpsc::channel();
+    let (cmd_tx, _cmd_rx) = mpsc::channel();
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 4,
+        db,
+        tool_registry: ToolRegistry::new().build(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: LagLimits::default(),
+        global_lag: Arc::new(AtomicUsize::new(0)),
+        substrate_credential: None,
+    };
+
+    // Unknown account: the daemon replies `None`.
+    let server = std::thread::spawn(move || {
+        while let Ok(DaemonCommand::ResolveAccountCmd { reply, .. }) = daemon_rx.recv() {
+            let _ = reply.send(None);
+        }
+    });
+
+    let mut state = SessionState::empty();
+    let client =
+        OpenAiClient::new(ServiceConfig::default(), "old-key".into(), &state.registry).unwrap();
+    state.provider = Some(InferenceProvider::from_openai(client));
+    state.provider_slug = Some("openai".into());
+    state.config.account_name = Some("old-account".into());
+
+    handle_set_account("ghost-account".into(), &mut state, &ctx);
+
+    assert!(state.provider.is_none(), "stale client dropped");
+    assert_eq!(state.provider_slug, None, "stale slug cleared");
+    assert_eq!(state.config.account_name.as_deref(), Some("ghost-account"));
+
+    drop(ctx.daemon_tx);
+    drop(ctx.cmd_tx);
+    server.join().unwrap();
 }
 
 #[test]

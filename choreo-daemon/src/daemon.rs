@@ -825,11 +825,9 @@ impl DaemonState {
         // loop already knows from the account config: hand it to the session
         // thread so slug-keyed catalog lookups (context window, reasoning
         // capability) are exact even while the keystore is locked.
-        let provider_slug = account_name.as_ref().and_then(|name| {
-            self.accounts
-                .get(name)
-                .map(|config| config.provider.clone())
-        });
+        let provider_slug = account_name
+            .as_ref()
+            .and_then(|name| self.account_provider_slug(name));
 
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let cmd_tx = session_tx.clone();
@@ -928,14 +926,27 @@ impl DaemonState {
         .ok()
     }
 
-    /// Drop the cached provider client of every active session bound to
-    /// `account` (or ALL sessions when `account` is `None`, e.g. `/lock`) by
-    /// sending `SessionCommand::DropProvider`. The session thread then
-    /// rebuilds its client lazily on the next request — against fresh
-    /// credentials and its own registry. This replaces the old per-account
-    /// provider cache: there is no daemon-side cache to clear, only live
-    /// session clients to invalidate.
-    fn drop_session_clients(&mut self, account: Option<&str>) {
+    /// The account's provider slug (catalog key, e.g. "opencode-go"), if the
+    /// account is known. A NON-SECRET catalog fact — readable with no
+    /// credential — used to seed a session's slug-keyed catalog lookups before
+    /// its provider client exists. Single source for the `AccountManager`
+    /// account→slug mapping.
+    fn account_provider_slug(&self, name: &str) -> Option<String> {
+        self.accounts
+            .get(name)
+            .map(|config| config.provider.clone())
+    }
+
+    /// Send a freshly-built `SessionCommand` to every active session bound to
+    /// `account` (or ALL sessions when `account` is `None`), returning how many
+    /// sends succeeded. The single fan-out point shared by provider-client
+    /// invalidation and the account-reload slug refresh, so both target exactly
+    /// the same session set. `make` is called once per target because
+    /// `SessionCommand` (which carries reply channels) is not `Clone`.
+    fn for_each_session_bound_to<F>(&self, account: Option<&str>, mut make: F) -> usize
+    where
+        F: FnMut() -> SessionCommand,
+    {
         let targets: Vec<u64> = self
             .session_metadata
             .iter()
@@ -947,19 +958,51 @@ impl DaemonState {
             })
             .map(|(id, _)| *id)
             .collect();
-        let mut dropped = 0;
+        let mut sent = 0;
         for id in targets {
             if let Some(entry) = self.active_sessions.get(&id)
-                && entry.cmd_tx.send(SessionCommand::DropProvider).is_ok()
+                && entry.cmd_tx.send(make()).is_ok()
             {
-                dropped += 1;
+                sent += 1;
             }
         }
+        sent
+    }
+
+    /// Drop the cached provider client of every active session bound to
+    /// `account` (or ALL sessions when `account` is `None`, e.g. `/lock`) by
+    /// sending `SessionCommand::DropProvider`. The session thread then
+    /// rebuilds its client lazily on the next request — against fresh
+    /// credentials and its own registry. This replaces the old per-account
+    /// provider cache: there is no daemon-side cache to clear, only live
+    /// session clients to invalidate.
+    fn drop_session_clients(&self, account: Option<&str>) {
+        let dropped = self.for_each_session_bound_to(account, || SessionCommand::DropProvider);
         if dropped > 0 {
             info!(
                 account = ?account,
                 dropped,
                 "invalidated cached session provider clients; they rebuild on next use"
+            );
+        }
+    }
+
+    /// Push the account's (non-secret) provider slug to every active session
+    /// bound to it, so slug-keyed static catalog facts stay exact immediately
+    /// after an external account edit — instead of going stale until the next
+    /// request rebuilds the client. `None` clears the recorded slug (the
+    /// account was removed).
+    fn set_session_provider_slug(&self, account: &str, slug: Option<&str>) {
+        let sent =
+            self.for_each_session_bound_to(Some(account), || SessionCommand::SetProviderSlug {
+                slug: slug.map(str::to_owned),
+            });
+        if sent > 0 {
+            debug!(
+                account,
+                ?slug,
+                sessions = sent,
+                "pushed provider slug to account's sessions"
             );
         }
     }
@@ -1148,10 +1191,9 @@ impl DaemonState {
         // Resolve context window from the provider catalog at creation time
         // when both account and model are known — no provider instance needed.
         let context_window = account_name.as_ref().and_then(|name| {
-            self.accounts.get(name).and_then(|config| {
-                selected_model
-                    .as_ref()
-                    .and_then(|model| lookup_context_window(&config.provider, model))
+            selected_model.as_ref().and_then(|model| {
+                self.account_provider_slug(name)
+                    .and_then(|slug| lookup_context_window(&slug, model))
             })
         });
 
@@ -2371,14 +2413,23 @@ impl DaemonState {
         // sessions bound to UNTOUCHED accounts: they tore down cached
         // clients and their HTTP connection pools and rebuilt on the next
         // request for no reason. The diff computed above says exactly which
-        // accounts changed — use it. Broad targets are sent in one pass
-        // (order is irrelevant; each send is just a command on the session's
-        // control channel, and DropProvider is idempotent for a clientless
-        // session). Added names cannot have existing sessions bound to them
-        // (the session was bound BEFORE the reload), so additions need no
-        // invalidation.
-        for name in removed.iter().chain(changed.iter()) {
+        // accounts changed — use it. Added names cannot have existing sessions
+        // bound to them (the session was bound BEFORE the reload), so additions
+        // need no invalidation.
+        //
+        // Each touched account also gets its (non-secret) provider slug
+        // refreshed — a removed account clears it (`None`), a changed one
+        // pushes the new catalog key — so slug-keyed static facts stay exact
+        // without waiting for the next request to rebuild the client.
+        // Order matters: invalidate the client first, then refresh the slug.
+        for name in &removed {
             self.drop_session_clients(Some(name));
+            self.set_session_provider_slug(name, None);
+        }
+        for name in &changed {
+            let slug = self.account_provider_slug(name);
+            self.drop_session_clients(Some(name));
+            self.set_session_provider_slug(name, slug.as_deref());
         }
         // Push the fresh list to activity subscribers (global/control
         // provenance — a flat, non-session message — so no origin-contract

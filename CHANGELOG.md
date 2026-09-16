@@ -97,6 +97,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `derive-where`, `zlib-rs`, and the `yoke-derive`/`zerofrom-derive` pair. No
   source changes.
 
+- **External account edits now refresh a session's recorded provider slug.**
+  The accounts-reload path already invalidated the cached client of every
+  session bound to a removed/changed account; it now also pushes the new
+  catalog key (`SessionCommand::SetProviderSlug`) — or clears it on removal —
+  so slug-keyed static facts (context window, reasoning capability) stay exact
+  immediately instead of going stale until the next request rebuilds the
+  client. Internally, the client-invalidation and slug-refresh fan-outs share
+  one `for_each_session_bound_to` helper and the account→slug lookup is a
+  single `account_provider_slug` helper; the session's effective-slug accessor
+  is renamed `effective_provider_slug` so it no longer shadows the
+  `provider_slug` field.
+
 ### Fixed
 
 - **The context window and reasoning capability no longer blink out on a
@@ -116,6 +128,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override when a client exists and otherwise falls back to the catalog,
   and the reasoning capability always resolves from the slug. Wire behavior
   and lookups are unchanged for sessions with a live client.
+- **Switching a session's account could keep serving the previous account's
+  provider client.** `SetAccount` rebuilt the client only on success and never
+  dropped the old one, while `resolve_provider` returns any cached client
+  unconditionally — so setting a new account whose config/key was not yet
+  resolvable (e.g. the keystore was locked) left the session dialing the OLD
+  provider (wrong endpoint, wrong key) under the new account name, and the
+  attach snapshot kept reporting the old account's slug-keyed facts. A real
+  account switch now drops the previous client up front (a failed re-resolve
+  leaves the session clientless, rebuilt lazily on the next request) and
+  records—or clears—the recorded provider slug to match the new account, even
+  when no client can be built.
 - **A failed unlock could leak freshly decrypted credentials into daemon
   state with `locked` still `true`.** The unlock tail populated
   `state.credentials` (the plaintext `ServiceCredential` map) BEFORE loading the

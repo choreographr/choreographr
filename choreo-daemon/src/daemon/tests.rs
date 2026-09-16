@@ -1994,6 +1994,13 @@ fn handle_accounts_reload_invalidates_session_clients_of_removed_account() {
         "removed account's session client must be invalidated"
     );
     assert!(
+        matches!(
+            gone_cmd_rx.try_recv(),
+            Ok(SessionCommand::SetProviderSlug { slug: None })
+        ),
+        "removed account's recorded provider slug must be cleared"
+    );
+    assert!(
         keep_cmd_rx.try_recv().is_err(),
         "session bound to an untouched account must NOT be invalidated — \
          its cached client and connection pool stay warm"
@@ -2037,6 +2044,13 @@ fn handle_accounts_reload_drops_stale_client_for_modified_account() {
     assert!(
         matches!(cmd_rx.try_recv(), Ok(SessionCommand::DropProvider)),
         "modified account's session client must be invalidated"
+    );
+    assert!(
+        matches!(
+            cmd_rx.try_recv(),
+            Ok(SessionCommand::SetProviderSlug { slug: Some(ref s) }) if s == "bogus"
+        ),
+        "modified account's recorded provider slug must be refreshed"
     );
     drop(release);
 }

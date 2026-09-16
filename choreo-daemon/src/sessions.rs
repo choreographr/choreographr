@@ -240,6 +240,15 @@ pub enum SessionCommand {
     /// revoked) key. The session registry itself stays alive: the session
     /// keeps its own cancellable scope; only the client is discarded.
     DropProvider,
+    /// Push the (non-secret) provider slug the daemon now knows for this
+    /// session's account, so slug-keyed static catalog facts (context window,
+    /// reasoning capability) stay exact after an external account edit without
+    /// waiting for the next request to rebuild the client. `None` means the
+    /// account was removed — clear the recorded slug. Sent alongside
+    /// [`SessionCommand::DropProvider`] by the daemon's accounts-reload path.
+    SetProviderSlug {
+        slug: Option<String>,
+    },
     SetReasoningEffort {
         effort: String,
     },
@@ -616,32 +625,37 @@ pub struct AssistantResponse {
 impl SessionState {
     /// The effective provider slug for static catalog-fact lookups (context
     /// window, reasoning capability). Prefers the live provider client's slug;
-    /// falls back to the recorded slug that travels with the account config,
+    /// falls back to the `provider_slug` field recorded with the account config,
     /// which is available BEFORE the keystore unlocks (no credential needed).
     /// `None` only while no account is bound to the session.
-    fn provider_slug(&self) -> Option<&str> {
+    ///
+    /// Named distinctly from the `provider_slug` field so a call site reads
+    /// clearly: the field is the recorded fact, this resolves the one to use
+    /// right now.
+    fn effective_provider_slug(&self) -> Option<&str> {
         self.provider
             .as_ref()
             .map_or(self.provider_slug.as_deref(), |p| Some(p.provider_slug()))
     }
 
-    /// Resolve one static catalog fact for `model` — the context window — keyed
-    /// by the provider slug, not the credential-bound provider instance, so the
-    /// fact is available on a locked daemon / pre-first-request session. (Other
-    /// static facts — e.g. the reasoning capability — resolve from
-    /// [`SessionState::provider_slug`] directly.)
+    /// Resolve the context window for `model`, keyed by provider slug rather
+    /// than the credential-bound client, so the fact is available on a locked
+    /// daemon / pre-first-request session. (Other static facts — e.g. the
+    /// reasoning capability — resolve from [`Self::effective_provider_slug`].)
     ///
-    /// The context window prefers the client-config override when the provider
-    /// client exists (same precedence as `InferenceProvider::
-    /// resolve_context_window`), falling back to the catalog lookup.
+    /// With a live client this defers entirely to
+    /// [`InferenceProvider::resolve_context_window`] (client-config override
+    /// first, then the catalog through the client's slug). With no client — the
+    /// locked/pre-first-request case — it is a pure catalog read keyed by the
+    /// recorded slug, which is the whole reason the slug is stored.
     fn resolve_context_window_for_model(&self, model: &str) -> Option<u32> {
-        self.provider
-            .as_ref()
-            .and_then(|p| p.resolve_context_window(model))
-            .or_else(|| {
-                self.provider_slug()
-                    .and_then(|slug| choreo_ai_protocols::lookup_context_window(slug, model))
-            })
+        match &self.provider {
+            Some(provider) => provider.resolve_context_window(model),
+            None => self
+                .provider_slug
+                .as_deref()
+                .and_then(|slug| choreo_ai_protocols::lookup_context_window(slug, model)),
+        }
     }
 
     /// Re-resolve context window from the catalog when the stored value
@@ -714,7 +728,7 @@ impl SessionState {
             // a static catalog fact and must be reported even while the
             // keystore is locked, so Ctrl+R works on an attached session
             // before any client has been built.
-            let slug = self.provider_slug()?;
+            let slug = self.effective_provider_slug()?;
             Some(model_reasoning_capability(slug, model))
         });
         DaemonMessage::Session {
@@ -1381,6 +1395,7 @@ fn process_command(
             }
             false
         }
+        SessionCommand::SetProviderSlug { slug } => handle_set_provider_slug(slug, state, ctx),
         SessionCommand::SetReasoningEffort { effort } => {
             handle_set_reasoning_effort(effort, state, ctx)
         }
@@ -1656,7 +1671,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         );
     }
     let capability = state
-        .provider_slug()
+        .effective_provider_slug()
         .map(|slug| model_reasoning_capability(slug, &model));
 
     // Re-validate the current reasoning effort against the new model's
@@ -2275,14 +2290,47 @@ fn handle_unload_tools(
     false
 }
 
+/// Apply a provider-slug update pushed by the daemon's accounts-reload path.
+///
+/// The slug is a NON-SECRET catalog fact; refreshing it here keeps slug-keyed
+/// static catalog lookups (context window, reasoning capability) exact right
+/// after an external account edit, instead of going stale until the next
+/// request rebuilds the client. `None` (the account was removed) clears it.
+fn handle_set_provider_slug(
+    slug: Option<String>,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    debug!(
+        session_id = ctx.session_id,
+        old = ?state.provider_slug,
+        new = ?slug,
+        "recorded provider slug updated from account reload"
+    );
+    state.provider_slug = slug;
+    false
+}
+
 /// Set the account for this session and try to resolve its provider.
 fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
     info!("session {}: SetAccount account={}", ctx.session_id, name);
+    // Switching accounts must never leave the PREVIOUS account's client in
+    // place: `resolve_provider` returns any cached client unconditionally, so a
+    // stale client would keep serving requests against the old provider (wrong
+    // endpoint, wrong key) under the newly-set account name. Drop it now and
+    // rebuild below on success, or lazily on the next request on failure
+    // (locked / no credential). Re-setting the SAME account keeps the warm
+    // client — no needless churn.
+    let switching = state.config.account_name.as_deref() != Some(name.as_str());
+    if switching {
+        state.provider = None;
+    }
+
     // Try to resolve the account config + API key from the daemon; the client
     // itself is built HERE against this session's registry so its sockets are
-    // session-cancellable. If resolution fails (locked, no credential yet)
-    // the provider stays None — the account name is still recorded and the
-    // next request retries lazily (see `SessionState::resolve_provider`).
+    // session-cancellable. If resolution fails (locked, no credential yet) the
+    // provider stays None — the account name is still recorded and the next
+    // request retries lazily (see `SessionState::resolve_provider`).
     let (reply, rx) = crossbeam_channel::unbounded();
     let _ = ctx.daemon_tx.send(DaemonCommand::ResolveAccountCmd {
         account: name.clone(),
@@ -2290,42 +2338,49 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
     });
     let resolved = rx.recv().ok().flatten();
     // The provider slug is a NON-SECRET catalog fact: record it from the
-    // account config even when the keystore is locked (no key, no client).
-    // Static catalog lookups — context window, reasoning capability — are
-    // slug-keyed, so they must be exact on a locked daemon too.
-    if let Some((ref config, _)) = resolved {
-        state.provider_slug = Some(config.provider.clone());
-    }
-    if let Some((config, Some(api_key))) = resolved
-        && let Ok(provider) = InferenceProvider::from_account_config(
-            &config,
+    // account config even when the keystore is locked (config present, key
+    // absent) or the client can't be built. A `None` reply (unknown account)
+    // clears it so stale facts can't masquerade for the new account.
+    state.provider_slug = resolved.as_ref().map(|(config, _)| config.provider.clone());
+    // Build the client when a credential is present. Held in a local so the
+    // immutable borrow of `state.registry` is released before the assignment
+    // below (a let-chain condition would otherwise keep it live into the body).
+    let new_provider = resolved.as_ref().and_then(|(config, api_key)| {
+        let key = api_key.as_ref()?;
+        InferenceProvider::from_account_config(
+            config,
             // See resolve_provider: the Zeroizing wrapper protects the
-            // in-transit key; the client constructor takes ownership from
-            // here and stores the credential in its own config.
-            Some((*api_key).clone()),
+            // in-transit key; the client constructor takes ownership from here
+            // and stores the credential in its own config.
+            Some((**key).clone()),
             &state.registry,
         )
-    {
-        // Re-resolve context window if a model is already selected.
-        if let Some(ref model) = state.config.selected_model {
-            let cw = provider.resolve_context_window(model);
-            debug!(
-                "session {}: re-resolved context_window={:?} after account change for model={}",
-                ctx.session_id, cw, model
-            );
-            state.config.context_window = cw;
-            if let Some(cw) = cw {
-                broadcast(
-                    &mut state.subscribers,
-                    ctx,
-                    &DaemonMessage::Session {
-                        session_id: Some(ctx.session_id),
-                        event: SessionEvent::ContextWindowResolved { context_window: cw },
-                    },
-                );
-            }
-        }
+        .ok()
+    });
+    if let Some(provider) = new_provider {
         state.provider = Some(provider);
+    }
+    // Re-resolve the context window after an account switch: a pure catalog
+    // read keyed by the recorded slug, so it works even when no client could
+    // be built (locked keystore) — the client-config override still wins when a
+    // client exists (see `resolve_context_window_for_model`).
+    if switching && let Some(model) = &state.config.selected_model {
+        let cw = state.resolve_context_window_for_model(model);
+        debug!(
+            "session {}: re-resolved context_window={:?} after account change for model={}",
+            ctx.session_id, cw, model
+        );
+        state.config.context_window = cw;
+        if let Some(cw) = cw {
+            broadcast(
+                &mut state.subscribers,
+                ctx,
+                &DaemonMessage::Session {
+                    session_id: Some(ctx.session_id),
+                    event: SessionEvent::ContextWindowResolved { context_window: cw },
+                },
+            );
+        }
     }
     // Always store the account name on the session, even if the
     // provider wasn't resolvable yet (e.g. no credential stored,
@@ -2368,7 +2423,7 @@ fn handle_set_reasoning_effort(
 
     // Compute capability for the current model (if any).
     let capability = state.config.selected_model.as_ref().and_then(|model| {
-        let slug = state.provider_slug()?;
+        let slug = state.effective_provider_slug()?;
         Some(model_reasoning_capability(slug, model))
     });
 
