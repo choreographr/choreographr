@@ -336,7 +336,7 @@ fn transport_loop(
         // dir whose creation failed at spawn). Debug, not warn: this retries
         // on a fixed cadence until it succeeds, so a warn would spam the log.
         if !armed && let Some(w) = watcher.as_mut() {
-            match w.watch(&dir, RecursiveMode::NonRecursive) {
+            match w.watch(dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     armed = true;
                     info!(
@@ -385,7 +385,7 @@ fn transport_loop(
                 // runtime), the inotify/kqueue watch is now dead — drop `armed`
                 // so the loop re-arms once the directory comes back, instead of
                 // sitting on a stale watch that never fires again.
-                if armed && dir_was_removed(&dir, &event) {
+                if armed && dir_was_removed(dir, &event) {
                     armed = false;
                     info!(
                         dir = %dir.display(),
@@ -404,10 +404,10 @@ fn transport_loop(
                         dir = %dir.display(),
                         "watcher queue overflow detected; rescanning the config dir",
                     );
-                    for (basename, kind) in rescan_changes(&dir, &subscribers, &mut last_known) {
+                    for (basename, kind) in rescan_changes(dir, subscribers, &mut last_known) {
                         debug!(basename = %basename.display(), ?kind,
                             "overflow rescan synthesized a change");
-                        deliver(&subscribers, &dir, &basename, kind);
+                        deliver(subscribers, dir, &basename, kind);
                     }
                     debug!(
                         dir = %dir.display(),
@@ -415,17 +415,17 @@ fn transport_loop(
                         "overflow rescan complete; last-known state refreshed",
                     );
                 } else {
-                    let routed = route(&subscribers, &event);
+                    let routed = route(subscribers, &event);
                     // Snapshot BEFORE delivery (single thread — either order
                     // is race-free); what matters is refreshing the view per
                     // real event, so a subsequent overflow rescan compares
                     // against the freshest on-disk content rather than a
                     // stale view and replays nothing subscribers already
                     // saw (or never saw, because nothing diverged).
-                    note_routed_state(&dir, &mut last_known, &routed);
+                    note_routed_state(dir, &mut last_known, &routed);
                     for (basename, kind) in routed {
                         trace!(basename = %basename.display(), ?kind, "delivering config change");
-                        deliver(&subscribers, &dir, &basename, kind);
+                        deliver(subscribers, dir, &basename, kind);
                     }
                 }
             }
@@ -437,10 +437,10 @@ fn transport_loop(
                 // nothing actually diverged.
                 warn!(error = %e, dir = %dir.display(),
                     "config watcher error; rescanning the config dir to replay any missed changes");
-                for (basename, kind) in rescan_changes(&dir, &subscribers, &mut last_known) {
+                for (basename, kind) in rescan_changes(dir, subscribers, &mut last_known) {
                     debug!(basename = %basename.display(), ?kind,
                         "error-path rescan synthesized a change");
-                    deliver(&subscribers, &dir, &basename, kind);
+                    deliver(subscribers, dir, &basename, kind);
                 }
             }
         }

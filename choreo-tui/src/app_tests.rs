@@ -943,7 +943,7 @@ mod unsent_draft_tests {
 
         assert_eq!(app.attached_session_id, None);
         assert_eq!(app.attached_status, None);
-        assert_eq!(app.attached_tool_groups.is_empty(), true);
+        assert_eq!(app.attached_tool_groups, [] as [std::string::String; 0]);
     }
 
     #[test]
