@@ -381,7 +381,7 @@ choreo-transport = { path = "choreo-transport", version = "0.2" }
 ureq = { version = "3", features = ["json", "brotli", "multipart"] }
 ammonia = "4"
 base64 = "0.23"
-dirs = "6"
+dirs = "7"
 redb = "4"
 # Raster image codecs. Trimmed from default (which would pull the AVIF
 # *encoder* `ravif` — dead weight, since we only ever re-encode to PNG/JPEG).
@@ -407,7 +407,7 @@ heif-oxide = "0.1"
 rand = "0.10"
 resvg = "0.48"
 serde_json = "1"
-schemars = { version = "1.2.1", features = ["derive"] }
+schemars = { version = "1.2.2", features = ["derive"] }
 yaml_serde = "0.10"
 signal-hook = "0.4"
 serial_test = "4"
@@ -432,7 +432,7 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 # frames, so the on-disk schema-2 contract is unchanged. Numeric compression
 # levels 1–22 map to C zstd numbering (COMPRESSION_LEVEL=6 keeps the tuned
 # speed/ratio trade-off). Apache-2.0, matching the workspace license.
-structured-zstd = "0.0.49"
+structured-zstd = "0.0.53"
 # Atomic lock-free snapshot swap for process-wide state with a single writer
 # (the provider catalog in choreo-ai-protocols, the client ACL in
 # choreo-daemon — both read from many threads and swapped only from the

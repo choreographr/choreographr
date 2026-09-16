@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version, the installed `--version`, the formula test, and that the service is
   installed but not auto-started.
 
+### Changed
+
+- Routine dependency refresh: every manifest requirement was bumped to its
+  latest stable release and `Cargo.lock` re-resolved to current upstream.
+  Manifest requirement bumps: `dirs` 6 → 7, `schemars` 1.2.1 → 1.2.2, and
+  `structured-zstd` 0.0.49 → 0.0.53 (workspace); `alloy` 2.3 → 2.4
+  (`choreo-blockchain`); and `ckb-vm` 0.24.14 → 0.24.15 (`choreo-daemon`). The
+  lock additionally advances `clap` 4.6.6 → 4.6.7, `pdf-inspector` 1.19 →
+  1.20, `lopdf` 0.44 → 0.45, `redb` 4.2 → 4.3, plus `const-hex`, `ruint`,
+  `derive-where`, `zlib-rs`, and the `yoke-derive`/`zerofrom-derive` pair. No
+  source changes.
+
 ### Fixed
 
 - The Homebrew tap formula installed the 0.1.0 binary set (`choreo-im`,
