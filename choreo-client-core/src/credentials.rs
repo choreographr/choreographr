@@ -417,7 +417,12 @@ impl KeystoreAutoBind {
 /// The outcome of one shared auto-bind attempt — see
 /// [`attempt_keystore_auto_bind`] for the policy and the delivery-contract
 /// comments on each variant.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: [`AutoBindAttempt::Failed`] carries the structured
+/// [`ClientError`] (so a frontend CAN distinguish a refused pre-send persist
+/// from a store load failure) and the minted key material in
+/// [`AutoBindAttempt::Bind`] must not be silently duplicated.
+#[derive(Debug)]
 pub enum AutoBindAttempt {
     /// A fresh bind key was minted and recorded into `known_servers` PRE-SEND.
     /// The caller MUST send `msg` and hold `key` in its pending-key lifecycle
@@ -432,8 +437,9 @@ pub enum AutoBindAttempt {
     /// The pre-send persist (or store load) was REFUSED, so no
     /// `BindKeystore` was built — sending nothing is the only safe outcome
     /// (an unrecorded bind key risks an unrecoverable orphaned binding).
-    /// The latch stays set; the caller surfaces the error text.
-    Failed { error: String },
+    /// The latch stays set; the caller surfaces the error (structured, not a
+    /// pre-flattened string — keep the cause type for future UI branching).
+    Failed { error: ClientError },
 }
 
 /// Trigger the once-per-connection auto-bind of an unbound daemon — the
@@ -458,9 +464,7 @@ pub fn attempt_keystore_auto_bind(bind: &mut KeystoreAutoBind, addr: &str) -> Au
         Ok(None) => AutoBindAttempt::Suppressed,
         Err(e) => {
             warn!(addr, error = %e, "auto-bind failed");
-            AutoBindAttempt::Failed {
-                error: e.to_string(),
-            }
+            AutoBindAttempt::Failed { error: e }
         }
     }
 }
@@ -1066,7 +1070,10 @@ mod tests {
         let AutoBindAttempt::Failed { error } = &failed else {
             panic!("refused store must surface as Failed, got {failed:?}");
         };
-        assert!(!error.is_empty(), "the failure is surfaced with context");
+        assert!(
+            !error.to_string().is_empty(),
+            "the failure is surfaced with context"
+        );
         assert!(bind.attempted(), "the failed attempt consumed the latch");
     }
 }

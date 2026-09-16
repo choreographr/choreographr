@@ -30,6 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Internal cleanup of the daemon's keystore handlers (`daemon/keystore.rs`):
+  one shared `unlock_error_reply` mapping for the Unlock/Bind add-credential
+  reply construction, one `send_targeted_ack` for the targeted-reply-plus-ACK
+  pair, and one `send_credential_add_failed` helper for every `AddCredential`
+  rejection path. The `BindKeystore` reply no longer spells out the
+  unreachable `Unbound` arm (the bind path TOFU-adopts, so it can never
+  report unbound). `AddCredential`'s implicit-unlock tail no longer
+  re-decrypts the just-test-decrypted blob from the DB — the decoded
+  credential is seeded into the tail instead. No behavior change.
+
+- `AutoBindAttempt::Failed` (the shared auto-bind trigger in
+  `choreo-client-core`) now carries the structured `ClientError` rather than
+  a pre-flattened string, so a frontend can distinguish a refused pre-send
+  persist from a store-load failure. The enum is consequently no longer
+  `Clone` (key material in the `Bind` variant should not be silently
+  duplicated). UI output is unchanged.
+
 - **The daemon's keystore handlers live in their own module
   (`choreo-daemon/src/daemon/keystore.rs`):** the `Unlock` / `BindKeystore` /
   `Lock` / `AddCredential` command handlers, the TOFU binding helpers
@@ -63,6 +80,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source changes.
 
 ### Fixed
+
+- **A failed unlock could leak freshly decrypted credentials into daemon
+  state with `locked` still `true`.** The unlock tail populated
+  `state.credentials` (the plaintext `ServiceCredential` map) BEFORE loading the
+  accounts TOML, so an account-load failure returned an error from an unlock
+  that had already published decrypted secrets into reachable state — and a
+  later `/lock` only clears what the state maps contain at that moment, so
+  the partial state was never committed by the usual lock path. The tail now
+  performs every fallible step (bulk decrypt, accounts load, default-account
+  resolution) on locals and only then commits credentials, accounts, and
+  `locked = false` in one shot, so a failing unlock leaves the daemon exactly
+  as it was.
 
 - **A first-run client could never bind a fresh daemon (the "keystore is
   locked" dead end).** A fresh daemon starts both locked AND unbound, but the

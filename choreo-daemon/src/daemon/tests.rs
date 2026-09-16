@@ -3530,7 +3530,7 @@ use choreo_keystore::ServiceCredential as TestCred;
 use x25519_dalek::StaticSecret as TestSecret;
 
 /// Derive the X25519 public key a key binds as (what the daemon persists).
-fn test_pub(key: [u8; 32]) -> [u8; 32] {
+pub(super) fn test_pub(key: [u8; 32]) -> [u8; 32] {
     *x25519_dalek::PublicKey::from(&TestSecret::from(key)).as_bytes()
 }
 
