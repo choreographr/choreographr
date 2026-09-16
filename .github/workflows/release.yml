@@ -250,7 +250,24 @@ jobs:
           # structurally protects the Intel channel is generation-side (both
           # tarballs required by release.sh and update-homebrew-tap.sh),
           # plus the digest-level checks downstream.
-          softwareupdate --install-rosetta --agree-to-license || true
+          #
+          # softwareupdate is a belt-and-braces bootstrap (runners normally
+          # have Rosetta preinstalled) — package metadata for Apple's own
+          # RosettaUpdateAuto always prints harmless noise ("Package
+          # Authoring Error: ... missing installKBytes attribute"), which is
+          # Apple-side and unfixable, so the update is run ONLY when Rosetta
+          # is actually absent (oahd = the Rosetta AOT daemon; the
+          # RosettaUpdateAuto receipt is the authoritative receipt probe).
+          # This skips the noise AND the needless install on every run after
+          # image refresh; a failure at this step must not abort the smoke —
+          # the arch -x86_64 command below fails its own way if Rosetta is
+          # truly absent.
+          if ! /usr/bin/pgrep -qx oahd && \
+             ! /usr/sbin/pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            softwareupdate --install-rosetta --agree-to-license || true
+          else
+            echo "Rosetta 2 already present — skipping install"
+          fi
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           arch -x86_64 ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-x86_64-apple-darwin.tar.gz"
 
