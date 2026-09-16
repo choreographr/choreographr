@@ -30,6 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The daemon's keystore handlers live in their own module
+  (`choreo-daemon/src/daemon/keystore.rs`):** the `Unlock` / `BindKeystore` /
+  `Lock` / `AddCredential` command handlers, the TOFU binding helpers
+  (`bind_keystore` / `verify_keystore_binding`), the key-wipe helpers, and the
+  shared `unlock_tail` were extracted out of the already-large
+  `daemon.rs` into a child module, alongside the existing
+  `daemon/subscriber_handlers.rs` / `daemon/image_provider.rs` split. Pure
+  code motion — no behavior change.
+
+- The once-per-connection auto-bind trigger is now SHARED (`choreo-client-core`):
+  the mint-fresh-key / pre-send record / bind-loop latch policy previously
+  duplicated across `choreo-tui` and `choreo-gui` (two nearly identical
+  `trigger_keystore_auto_bind` copies) has been hoisted into
+  `choreo_client_core::attempt_keystore_auto_bind`, returning a structured
+  `AutoBindAttempt` (`Bind` / `Suppressed` / `Failed`); the frontends keep only
+  the UI mapping and the send. No behavior change.
+
+- A `/lock` against an UNBOUND daemon no longer re-broadcasts the (unchanged)
+  `Unbound` status to all activity subscribers: the transition broadcast is
+  now gated on the keystore actually being bound. Latching clients already
+  held that state, so this only removes redundant chatter.
+
 - Routine dependency refresh: every manifest requirement was bumped to its
   latest stable release and `Cargo.lock` re-resolved to current upstream.
   Manifest requirement bumps: `dirs` 6 → 7, `schemars` 1.2.1 → 1.2.2, and

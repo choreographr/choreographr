@@ -414,6 +414,57 @@ impl KeystoreAutoBind {
     }
 }
 
+/// The outcome of one shared auto-bind attempt — see
+/// [`attempt_keystore_auto_bind`] for the policy and the delivery-contract
+/// comments on each variant.
+#[derive(Debug, Clone)]
+pub enum AutoBindAttempt {
+    /// A fresh bind key was minted and recorded into `known_servers` PRE-SEND.
+    /// The caller MUST send `msg` and hold `key` in its pending-key lifecycle
+    /// for the targeted `DaemonMessage::Bound` confirmation (`record_unlock_key`
+    /// re-records the already-persisted key, so the confirm is a no-op-safe
+    /// uniform path).
+    Bind { key: [u8; 32], msg: ClientMessage },
+    /// Bind-loop guard: a `BindKeystore` was already minted on this
+    /// connection. The caller must NOT re-mint; it surfaces its own
+    /// "reconnect to retry" UI.
+    Suppressed,
+    /// The pre-send persist (or store load) was REFUSED, so no
+    /// `BindKeystore` was built — sending nothing is the only safe outcome
+    /// (an unrecorded bind key risks an unrecoverable orphaned binding).
+    /// The latch stays set; the caller surfaces the error text.
+    Failed { error: String },
+}
+
+/// Trigger the once-per-connection auto-bind of an unbound daemon — the
+/// SHARED implementation behind the `KeystoreUnbound` operation reply and the
+/// `Keystore { Unbound }` status push in every frontend, so the mint/pre-send
+/// record/latch policy lives in exactly one place. Frontends keep only the
+/// UI mapping: `Bind` → send + hold the key pending, `Suppressed` → surface
+/// "reconnect to retry", `Failed` → surface the error.
+///
+/// See [`KeystoreAutoBind::on_unbound`] for the underlying latch semantics;
+/// all `tracing` observability (bind made / suppressed / refused, with the
+/// address) is emitted HERE so the policy is fully described by the shared
+/// function, never by a copy of it.
+#[must_use]
+pub fn attempt_keystore_auto_bind(bind: &mut KeystoreAutoBind, addr: &str) -> AutoBindAttempt {
+    match bind.on_unbound(addr) {
+        Ok(Some((key, msg))) => {
+            info!(addr, "auto-binding unbound daemon with a fresh key");
+            AutoBindAttempt::Bind { key, msg }
+        }
+        // The warn log for the suppression already happened in `on_unbound`.
+        Ok(None) => AutoBindAttempt::Suppressed,
+        Err(e) => {
+            warn!(addr, error = %e, "auto-bind failed");
+            AutoBindAttempt::Failed {
+                error: e.to_string(),
+            }
+        }
+    }
+}
+
 /// Build an `AddCredential` message from an already-parsed credential, by
 /// resolving the daemon's unlock key and encrypting the serialized blob to the
 /// public key derived from that key.
@@ -959,5 +1010,63 @@ mod tests {
         // The failed attempt still consumed the connection's one bind.
         assert!(bind.attempted());
         assert!(bind.on_unbound("bind-fail:1").unwrap().is_none());
+    }
+
+    /// `attempt_keystore_auto_bind` (the SHARED trigger behind both
+    /// frontends): the first call returns `Bind` with the minted key, the
+    /// second returns the `Suppressed` bind-loop guard, and a refused
+    /// pre-send persist surfaces as `Failed` — the policy every frontend
+    /// inherits from this one site.
+    #[test]
+    fn attempt_keystore_auto_bind_maps_the_three_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard =
+            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
+
+        let mut bind = KeystoreAutoBind::new();
+        let first = attempt_keystore_auto_bind(&mut bind, "attempt-test:1");
+        let AutoBindAttempt::Bind {
+            key,
+            msg: ClientMessage::BindKeystore { key: wire_key },
+        } = &first
+        else {
+            panic!("first attempt must bind, got {first:?}");
+        };
+        assert_eq!(
+            wire_key,
+            &key.to_vec(),
+            "the message carries the minted key"
+        );
+        // Pre-send record: the shared trigger persisted the key into
+        // known_servers BEFORE returning, so a lost confirmation still leaves
+        // a matching record.
+        let recorded = KnownServers::load()
+            .unwrap()
+            .unlock_key("attempt-test:1")
+            .unwrap();
+        assert_eq!(recorded, Some(*key));
+
+        // Second attempt: the bind-loop guard exposes as `Suppressed`, so the
+        // callers surface their own reconnect-to-retry UI and never re-mint.
+        let second = attempt_keystore_auto_bind(&mut bind, "attempt-test:1");
+        assert!(
+            matches!(second, AutoBindAttempt::Suppressed),
+            "the bind-loop guard must suppress, got {second:?}"
+        );
+
+        // Refused store: a blocker file in place of the config directory makes
+        // the pre-send store write fail → `Failed` with the error text, and
+        // the latch still counts the attempt as the connection's one bind.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        let _guard = choreo_keystore::paths::TestConfigGuard::set_root(Some(blocker.clone()));
+        let mut bind = KeystoreAutoBind::new();
+        let failed = attempt_keystore_auto_bind(&mut bind, "attempt-fail:1");
+        let AutoBindAttempt::Failed { error } = &failed else {
+            panic!("refused store must surface as Failed, got {failed:?}");
+        };
+        assert!(!error.is_empty(), "the failure is surfaced with context");
+        assert!(bind.attempted(), "the failed attempt consumed the latch");
     }
 }

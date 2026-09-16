@@ -869,10 +869,13 @@ pub enum DaemonMessage {
     /// [`DaemonMessage::Keystore`].
     Locked,
     /// The daemon's authoritative keystore STATUS. Pushed to a client the
-    /// moment it registers for notifications (activity or session-summary)
-    /// and broadcast to every activity subscriber on each transition, so a
-    /// client latches the real state instead of inferring it from operation
-    /// replies. The `Unbound` push is what lets a first-run client with no key
+    /// moment it registers as an ACTIVITY subscriber and broadcast to every
+    /// activity subscriber on each transition, so a client latches the real
+    /// state instead of inferring it from operation replies. (A client that
+    /// subscribes ONLY to session summaries does NOT receive it — a frontend
+    /// that only needs the session list drives its keystore itself, e.g. an
+    /// unlock-at-connect probe.) The `Unbound` push is what lets a first-run
+    /// client with no key
     /// bind the daemon automatically.
     Keystore {
         state: KeystoreState,

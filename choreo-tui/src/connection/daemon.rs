@@ -1,7 +1,10 @@
 use super::{SessionUpdateRouting, route_session_update};
 use crate::state::{App, Page, ProviderInfo, merge_token_usage};
 use crate::terminal_progress;
-use choreo_client_core::{ClientError, dispatch_daemon_message, record_unlock_key};
+use choreo_client_core::{
+    AutoBindAttempt, ClientError, attempt_keystore_auto_bind, dispatch_daemon_message,
+    record_unlock_key,
+};
 use choreo_proto::{ClientMessage, DaemonMessage, KeystoreState, RefreshStatus, SessionEvent};
 use zeroize::Zeroize;
 
@@ -727,27 +730,22 @@ pub(crate) fn handle_daemon_message(
     Ok(())
 }
 
-/// Trigger the once-per-connection auto-bind of an unbound daemon. Shared by
-/// the two delivery paths of the same fact — the `KeystoreUnbound` operation
-/// reply and the `Keystore { Unbound }` status push — so the bind policy
-/// cannot drift between them. On the first call it mints a fresh CSPRNG bind
-/// key, records it into `known_servers` PRE-SEND (mandatory: an unbound daemon
-/// adopts whatever arrives first, so the record cannot be wrong), sends the
-/// `BindKeystore` message, and holds the key pending for the `Bound` confirm.
+/// Trigger the once-per-connection auto-bind of an unbound daemon. The bind
+/// POLICY (mint + pre-send record + latch + suppression) lives in the shared
+/// `choreo_client_core` state machine (`attempt_keystore_auto_bind`) —
+/// exactly like the underlying latch — so the TUI and GUI cannot drift on it;
+/// this wrapper only maps the outcome to the TUI's status/error surfaces and
+/// performs the send.
 ///
-/// Returns `true` when the attempt was made (or a mint/persist error was
-/// surfaced), and `false` when the bind-loop guard suppressed it because a
-/// bind was already in flight on this connection.
+/// Returns `true` when the attempt was made (or the failure was surfaced),
+/// and `false` when the bind-loop guard suppressed it because a bind was
+/// already in flight on this connection.
 fn trigger_keystore_auto_bind(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> bool {
-    match app.keystore_auto_bind.on_unbound(&app.connection_addr) {
-        Ok(Some((key, msg))) => {
-            tracing::info!(
-                addr = %app.connection_addr,
-                "auto-binding unbound daemon with a fresh key"
-            );
+    match attempt_keystore_auto_bind(&mut app.keystore_auto_bind, &app.connection_addr) {
+        AutoBindAttempt::Bind { key, msg } => {
             // The minted key is held pending so the `Bound` confirmation
             // records it through the SAME path as an `Unlocked` — one confirm
             // flow for all senders.
@@ -755,13 +753,15 @@ fn trigger_keystore_auto_bind(
             let _ = client_tx.send(msg);
             true
         }
-        // Bind-loop guard: already attempted on this connection.
-        Ok(None) => false,
+        // Bind-loop guard: already attempted on this connection. The caller
+        // (the `KeystoreUnbound` arm) surfaces its own reconnect-to-retry
+        // error; the `Keystore { Unbound }` push pre-guards with `attempted()`
+        // so this arm never fires there.
+        AutoBindAttempt::Suppressed => false,
         // Persist failure (refused pre-send) or store errors: the daemon
         // stays unbound and locked; the user can reconnect to retry.
-        Err(e) => {
-            tracing::warn!(addr = %app.connection_addr, %e, "auto-bind failed");
-            app.error = Some(format!("[error] auto-bind failed: {e}"));
+        AutoBindAttempt::Failed { error } => {
+            app.error = Some(format!("[error] auto-bind failed: {error}"));
             true
         }
     }

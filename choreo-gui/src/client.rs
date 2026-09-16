@@ -1,8 +1,8 @@
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{
-    ClientError, ConnectionMode, ShellCommand, build_add_credential_message,
-    dispatch_daemon_message, parse_input_line, record_unlock_key, resolve_private_key,
-    run_daemon_connection_with_mode, shell_command_echo,
+    AutoBindAttempt, ClientError, ConnectionMode, ShellCommand, attempt_keystore_auto_bind,
+    build_add_credential_message, dispatch_daemon_message, parse_input_line, record_unlock_key,
+    resolve_private_key, run_daemon_connection_with_mode, shell_command_echo,
 };
 use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, socket_path};
 use dioxus::prelude::*;
@@ -255,32 +255,33 @@ fn handle_session_message(
     }
 }
 
-/// Trigger the once-per-connection auto-bind of an unbound daemon. Shared by
-/// the `KeystoreUnbound` reply and the `Keystore { Unbound }` status push so
-/// the bind policy cannot drift between them (and matches the TUI's
-/// `trigger_keystore_auto_bind`). Mints a fresh CSPRNG bind key, records it
-/// into `known_servers` PRE-SEND (mandatory: an unbound daemon adopts whatever
-/// arrives first), sends `BindKeystore`, and holds the key pending for the
-/// `Bound` confirm. Returns `false` when the bind-loop guard suppressed it.
+/// Trigger the once-per-connection auto-bind of an unbound daemon. The bind
+/// POLICY (mint + pre-send record + latch + suppression) lives in the shared
+/// `choreo_client_core` state machine (`attempt_keystore_auto_bind`) —
+/// exactly like the underlying latch — so the GUI and TUI cannot drift on it;
+/// this wrapper only maps the outcome to the GUI's status surfaces and
+/// performs the send. Returns `false` when the bind-loop guard suppressed it
+/// (the callers surface their own reconnect-to-retry message then).
 fn trigger_keystore_auto_bind(
     state: &mut AppState,
     daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
 ) -> bool {
-    match state.keystore_auto_bind.on_unbound(&connection_addr()) {
-        Ok(Some((key, msg))) => {
-            tracing::info!("auto-binding unbound daemon with a fresh key");
+    match attempt_keystore_auto_bind(&mut state.keystore_auto_bind, &connection_addr()) {
+        AutoBindAttempt::Bind { key, msg } => {
             // Same pending-confirm flow as Unlock/AddCredential: the `Bound`
             // reply records the minted key.
             state.pending_unlock_key = Some(key.to_vec());
             send_client_message(state, daemon_tx, msg);
             true
         }
-        Ok(None) => false,
-        Err(e) => {
-            tracing::warn!(%e, "auto-bind failed");
+        // Bind-loop guard: already attempted on this connection.
+        AutoBindAttempt::Suppressed => false,
+        // Persist failure (refused pre-send) or store errors: the daemon
+        // stays unbound; the user can reconnect to retry.
+        AutoBindAttempt::Failed { error } => {
             state
                 .status_texts
-                .push(format!("[error] auto-bind failed: {e}"));
+                .push(format!("[error] auto-bind failed: {error}"));
             true
         }
     }

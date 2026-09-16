@@ -21,8 +21,9 @@ pub use connection::{
     run_daemon_tcp_connection_xx_first_contact, verify_daemon_authorization,
 };
 pub use credentials::{
-    KeystoreAutoBind, bind_fresh_daemon, build_add_credential_from_credential,
-    build_add_credential_message, record_unlock_key, resolve_private_key, try_auto_unlock_key,
+    AutoBindAttempt, KeystoreAutoBind, attempt_keystore_auto_bind, bind_fresh_daemon,
+    build_add_credential_from_credential, build_add_credential_message, record_unlock_key,
+    resolve_private_key, try_auto_unlock_key,
 };
 pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 pub use dispatch::{SessionStateData, ToolCallEvent, TurnEventHandler, dispatch_daemon_message};
