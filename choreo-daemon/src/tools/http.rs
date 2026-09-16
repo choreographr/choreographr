@@ -16,6 +16,14 @@ use ureq::RequestBuilder;
 /// regardless.
 const MAX_HTTP_BODY_BYTES: usize = MAX_TOOL_OUTPUT_BYTES + 64 * 1024;
 
+/// Default request timeout when the caller omits `timeout_secs`, and the
+/// inclusive bounds every resolved timeout is clamped into. One source of
+/// truth so execution, the argument schema, and the invocation summary can
+/// never disagree about what a `timeout_secs` value means.
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
+const MIN_HTTP_TIMEOUT_SECS: u64 = 1;
+const MAX_HTTP_TIMEOUT_SECS: u64 = 30;
+
 /// HTTP tool errors — a structured error type for `http_request` failures.
 #[derive(Debug, Serialize, Deserialize, thiserror::Error)]
 pub enum HttpError {
@@ -52,8 +60,19 @@ pub struct HttpRequestArgs {
     pub headers: HashMap<String, String>,
     /// Optional request body
     pub body: Option<String>,
-    /// Optional timeout in seconds (default 30)
+    /// Optional timeout in seconds (default 10, clamped to 1–30)
     pub timeout_secs: Option<u64>,
+}
+
+/// Resolve the effective request timeout: the caller's value (or
+/// [`DEFAULT_HTTP_TIMEOUT_SECS`]) clamped into the supported range. Shared by
+/// `execute_http_request_tool` and `HttpRequest::describe_invocation` so the
+/// model-facing description reports the timeout the request will actually
+/// use, not the raw argument.
+fn effective_timeout_secs(args: &HttpRequestArgs) -> u64 {
+    args.timeout_secs
+        .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS)
+        .clamp(MIN_HTTP_TIMEOUT_SECS, MAX_HTTP_TIMEOUT_SECS)
 }
 
 /// Make an HTTP request and return status, headers, and body text.
@@ -83,7 +102,7 @@ pub fn execute_http_request_tool(
         other => return Err(HttpError::UnsupportedUrlScheme(other.to_string())),
     }
 
-    let timeout_secs = args.timeout_secs.unwrap_or(10).clamp(1, 30);
+    let timeout_secs = effective_timeout_secs(args);
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(timeout_secs)))
@@ -254,16 +273,31 @@ fn is_text_content_type(content_type: &str) -> bool {
         || mime.ends_with("+xml")
 }
 
-/// Apply User-Agent and user-supplied headers to a ureq request builder.
+/// Apply the default User-Agent and the caller-supplied headers to a ureq
+/// request builder.
 ///
 /// The UA comes from [`crate::providers::daemon_user_agent`] so the tool names
-/// the daemon exactly as inference requests do. User-supplied headers are
-/// applied *after* the UA, so an explicit caller-side User-Agent wins.
+/// the daemon exactly as inference requests do — but it is applied only when
+/// the caller did not supply one of their own. ureq's `RequestBuilder::header`
+/// APPENDS (its `http::request::Builder::header` is `HeaderMap::try_append`,
+/// documented as "does not replace headers"), so setting our UA
+/// unconditionally and then the caller's would put TWO `user-agent` lines on
+/// the wire instead of letting the caller override ours. Suppressing the
+/// default instead yields exactly one. The presence check is case-insensitive
+/// because `headers` is caller-keyed while ureq normalizes names to
+/// lowercase.
 fn apply_headers<B>(
     req: RequestBuilder<B>,
     headers: &HashMap<String, String>,
 ) -> RequestBuilder<B> {
-    let mut req = req.header("User-Agent", crate::providers::daemon_user_agent());
+    let caller_supplied_ua = headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("user-agent"));
+    let mut req = if caller_supplied_ua {
+        req
+    } else {
+        req.header("User-Agent", crate::providers::daemon_user_agent())
+    };
     for (name, value) in headers {
         req = req.header(name.as_str(), value.as_str());
     }
@@ -318,9 +352,13 @@ impl crate::tools::Tool for HttpRequest {
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
+        // Normalize the method exactly as `execute` does, so a lowercase
+        // "get" is reported as the "GET" the request actually uses (both
+        // paths see one canonical form).
         let mut parts = vec![format!(
             "Making {} HTTP request to {}.",
-            args.method, args.url
+            args.method.to_ascii_uppercase(),
+            args.url
         )];
         if !args.headers.is_empty() {
             parts.push(format!(" {} header(s).", args.headers.len()));
@@ -328,7 +366,10 @@ impl crate::tools::Tool for HttpRequest {
         if let Some(ref body) = args.body {
             parts.push(format!(" Body: {} bytes.", body.len()));
         }
-        parts.push(format!(" Timeout: {}s.", args.timeout_secs.unwrap_or(10)));
+        // `effective_timeout_secs` applies the same default and clamp the
+        // request will use, so the summary never advertises a value the tool
+        // won't honour (e.g. a raw 60 shown for a 30-clamped request).
+        parts.push(format!(" Timeout: {}s.", effective_timeout_secs(args)));
         parts.concat()
     }
 
@@ -542,7 +583,9 @@ mod tests {
         assert!(desc.contains("Making POST HTTP request to https://api.example.com/data."));
         assert!(desc.contains("1 header(s)."));
         assert!(desc.contains("Body: 15 bytes."));
-        assert!(desc.contains("Timeout: 60s."));
+        // The tool clamps timeout_secs into 1–30s, so the summary reports the
+        // clamped 30s the request will actually use, not the raw 60.
+        assert!(desc.contains("Timeout: 30s."));
     }
 
     #[test]
@@ -593,5 +636,80 @@ mod tests {
                 "expected RequestFailed, got {e}"
             ),
         }
+    }
+
+    #[test]
+    fn describe_invocation_normalizes_lowercase_method() {
+        // `describe_invocation` must render the same canonical method the
+        // request uses: "get" runs as GET, so the summary must say GET.
+        let tool = HttpRequest;
+        let args = HttpRequestArgs {
+            method: "get".into(),
+            url: "https://example.com".into(),
+            headers: std::collections::HashMap::new(),
+            body: None,
+            timeout_secs: None,
+        };
+        let desc = tool.describe_invocation(&args);
+        assert!(
+            desc.contains("Making GET HTTP request to https://example.com."),
+            "{desc}"
+        );
+        assert!(desc.contains("Timeout: 10s."), "{desc}");
+    }
+
+    // ── User-Agent default vs caller override ───────────────────────
+
+    /// Number of `user-agent` header values on a built request (a duplicate
+    /// default+caller UA would show up as 2). No socket is involved: ureq's
+    /// `RequestBuilder::headers_ref` exposes the header map directly.
+    fn user_agent_values<B>(req: &RequestBuilder<B>) -> Vec<String> {
+        req.headers_ref()
+            .expect("valid builder")
+            .get_all("user-agent")
+            .iter()
+            .map(|v| v.to_str().expect("ascii UA").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn default_user_agent_applied_when_caller_omits_it() {
+        let req = apply_headers(ureq::get("http://example.com"), &HashMap::new());
+        let uas = user_agent_values(&req);
+        assert_eq!(uas.len(), 1, "exactly one default UA expected: {uas:?}");
+        assert!(
+            uas[0].starts_with("choreographr/"),
+            "default UA should name the daemon: {uas:?}"
+        );
+    }
+
+    #[test]
+    fn caller_user_agent_replaces_default() {
+        // Regression for the append-vs-replace bug: a caller-supplied UA must
+        // REPLACE ours, not ride alongside it as a second header line.
+        let headers = HashMap::from([("User-Agent".to_string(), "custom/1".to_string())]);
+        let req = apply_headers(ureq::get("http://example.com"), &headers);
+        let uas = user_agent_values(&req);
+        assert_eq!(
+            uas.len(),
+            1,
+            "caller UA must not be appended to ours: {uas:?}"
+        );
+        assert_eq!(uas[0], "custom/1");
+    }
+
+    #[test]
+    fn caller_user_agent_match_is_case_insensitive() {
+        // A lowercase `user-agent` key must still suppress the default (ureq
+        // lowercases names, so the caller's key can be any case).
+        let headers = HashMap::from([("user-agent".to_string(), "custom/2".to_string())]);
+        let req = apply_headers(ureq::get("http://example.com"), &headers);
+        let uas = user_agent_values(&req);
+        assert_eq!(
+            uas.len(),
+            1,
+            "lowercase user-agent key must suppress the default: {uas:?}"
+        );
+        assert_eq!(uas[0], "custom/2");
     }
 }

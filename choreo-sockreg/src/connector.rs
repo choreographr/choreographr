@@ -5,6 +5,10 @@
 //! [`SocketTuning`] and registers a duplicate of every live socket in a
 //! [`SocketRegistry`].
 //!
+//! The geometric scheduling matches ureq exactly: a fast address-specific
+//! failure leaves the following address's time slice unchanged (it cost no
+//! budget), whereas a dial timeout — which did consume budget — halves it.
+//!
 //! This is what lets a control thread force-close hung HTTP connections: the
 //! registry ends up holding a fd for every connection this connector opened.
 
@@ -118,10 +122,11 @@ impl<In: Transport> Connector<In> for RegisteringTcpConnector {
 /// ConnectionRefused-only fall-through in an earlier version of this file was
 /// a deviation from upstream that gave up on blackholed first addresses —
 /// the macOS IPv6-first scenario, ureq issue #1184 — and burned the whole
-/// budget on the first IP). An address-specific failure (`Failure::TryNext`)
-/// falls through to the next resolved address; a dial timeout falls through
-/// while overall budget remains and gives up once it is exhausted; any other
-/// error bails immediately.
+/// budget on the first IP). An address-specific failure (`TryNext`,
+/// `halve_weight: false`) falls through to the next resolved address without
+/// shrinking its slice; a dial timeout (`TryNext`, `halve_weight: true`) both
+/// falls through while overall budget remains and halves the next slice, and
+/// gives up once the budget is exhausted; any other error bails immediately.
 fn try_connect(
     addrs: &ResolvedSocketAddrs,
     start: Instant,
@@ -206,17 +211,23 @@ fn try_connect_with<T>(
                 let elapsed =
                     std_instant(current_time()).saturating_duration_since(std_instant(start));
                 match classify_failure(err, elapsed, *timeout.after, timeout.reason) {
-                    Failure::TryNext(e) => {
+                    Failure::TryNext { err, halve_weight } => {
                         tracing::debug!(%addr, "address failed; trying next resolved address");
-                        last_err = Some(e);
+                        last_err = Some(err);
+                        // Halve the slice for the next address ONLY when this
+                        // attempt actually consumed budget (a dial timeout).
+                        // An instant address-specific failure (refusal /
+                        // unreachable) cost no time, so shrinking the next
+                        // slice would waste the budget — ureq's `continue`
+                        // skips its own halving for exactly this case.
+                        if halve_weight {
+                            weight /= 2.0;
+                        }
                     }
                     Failure::GiveUp(e) => return Err(e),
                 }
             }
         }
-
-        // Halve the weight for the next address (geometric split).
-        weight /= 2.0;
     }
 
     tracing::debug!(num_addrs, "failed to connect to any resolved address");
@@ -231,12 +242,19 @@ fn try_connect_with<T>(
 }
 
 /// Outcome of one address attempt that did NOT connect: either this address
-/// alone is at fault and the next resolved one might still work
-/// (`TryNext`, carrying the error for `last_err`), or dialing stops entirely
-/// (`GiveUp`). Extracted as a pure function so the state machine is unit
-/// testable without sockets or wall-clock waiting.
+/// alone is at fault and the next resolved one might still work (`TryNext`),
+/// or dialing stops entirely (`GiveUp`). Extracted as a pure function so the
+/// state machine is unit testable without sockets or wall-clock waiting.
 enum Failure {
-    TryNext(Error),
+    /// Try the next resolved address. `halve_weight` mirrors ureq's
+    /// scheduling: `true` only when the attempt burned dial budget (a
+    /// timeout), which halves the next address's time slice; a fast
+    /// address-specific failure leaves it unchanged. `err` is carried so the
+    /// aggregate failure can report what actually happened.
+    TryNext {
+        err: Error,
+        halve_weight: bool,
+    },
     GiveUp(Error),
 }
 
@@ -272,17 +290,25 @@ fn classify_failure(
     match &err {
         // Only this ADDRESS failed (refused, or the local stack rejected the
         // route without consulting the peer); the next address may succeed.
-        Error::Io(e) if is_addr_specific_error(e) => Failure::TryNext(err),
+        // This fails fast — it consumes ~no budget — so the next address's
+        // slice is NOT halved (ureq parity: its `continue` skips the halving).
+        Error::Io(e) if is_addr_specific_error(e) => Failure::TryNext {
+            err,
+            halve_weight: false,
+        },
         // A dial timeout: keep trying while the OVERALL connect budget has
         // not been burned. An unbounded budget can never be exceeded, so the
         // comparison never trips — fall through, but still stop after the
         // address list is exhausted (the loop's only termination for that
-        // case).
+        // case). A timeout DID consume budget, so the next slice is halved.
         _ if matches!(err, Error::Timeout(_)) => {
             if elapsed > budget {
                 Failure::GiveUp(Error::Timeout(reason))
             } else {
-                Failure::TryNext(err)
+                Failure::TryNext {
+                    err,
+                    halve_weight: true,
+                }
             }
         }
         // Everything else (e.g. a generic PermissionDenied) is not
@@ -578,20 +604,31 @@ mod tests {
 
     #[test]
     fn classify_refused_tries_next() {
-        let d = classify_failure(refused(), ZERO, B_10S, Timeout::Connect);
-        assert!(matches!(d, Failure::TryNext(_)));
+        // An instant address-specific failure must try the next address and
+        // must NOT shrink its slice (ureq parity — it cost no budget).
+        match classify_failure(refused(), ZERO, B_10S, Timeout::Connect) {
+            Failure::TryNext { halve_weight, .. } => {
+                assert!(!halve_weight, "a refusal must not halve the next slice");
+            }
+            Failure::GiveUp(_) => panic!("refused must try the next address"),
+        }
     }
 
     #[test]
     fn classify_dial_timeout_under_budget_tries_next() {
         let elapsed = time::Duration::from_secs(2);
-        let d = classify_failure(
+        // A timeout consumed budget, so the next slice IS halved.
+        match classify_failure(
             Error::Timeout(Timeout::Connect),
             elapsed,
             B_10S,
             Timeout::Connect,
-        );
-        assert!(matches!(d, Failure::TryNext(_)));
+        ) {
+            Failure::TryNext { halve_weight, .. } => {
+                assert!(halve_weight, "a dial timeout must halve the next slice");
+            }
+            Failure::GiveUp(_) => panic!("under-budget timeout must try the next address"),
+        }
     }
 
     #[test]
@@ -619,7 +656,10 @@ mod tests {
             BUDGET_UNBOUNDED,
             Timeout::Connect,
         );
-        assert!(matches!(d, Failure::TryNext(_)));
+        match d {
+            Failure::TryNext { halve_weight, .. } => assert!(halve_weight),
+            Failure::GiveUp(_) => panic!("infinite budget must fall through on timeout"),
+        }
     }
 
     #[test]
@@ -649,6 +689,31 @@ mod tests {
             self.seen.push(addr);
             self.results.remove(0)
         }
+    }
+
+    /// Fake dialer that records the per-address budget the PRODUCTION slicing
+    /// hands it, so the geometric split can be asserted against real code.
+    struct Recording {
+        results: Vec<Result<(), Error>>,
+        budgets: Vec<Option<Duration>>,
+    }
+
+    impl Recording {
+        fn dial(&mut self, _addr: SocketAddr, per_addr: Option<Duration>) -> Result<(), Error> {
+            self.budgets.push(per_addr);
+            self.results.remove(0)
+        }
+    }
+
+    fn per_addr_secs(rec: &Recording) -> Vec<f64> {
+        rec.budgets
+            .iter()
+            .map(|b| {
+                b.as_ref()
+                    .expect("a configured timeout yields a per-address budget")
+                    .as_secs_f64()
+            })
+            .collect()
     }
 
     #[test]
@@ -741,26 +806,73 @@ mod tests {
     }
 
     #[test]
-    fn geometric_split_sums_to_budget() {
-        // With the 10 ms floor inactive (large budget), the weights sum to
-        // exactly the budget: 10 s over 3 addresses ≈ 5s + 2.5s + 1.25s (the
-        // remainder is rounding). Verify each slice is ~half of the previous.
+    fn geometric_split_halves_the_slice_each_turn() {
+        // Exercise the PRODUCTION slicing (not a re-derivation): with a 10 s
+        // budget over 3 addresses, each address that a TIMEOUT falls through
+        // on (the halving path) must observe a slice half the previous one,
+        // and the slices must sum to ~the overall budget (10 s / 1.75 =
+        // 5.71, 2.86, 1.43 s).
+        let chased = [loopback(1), loopback(2), loopback(3)];
+        let mut rec = Recording {
+            results: vec![
+                Err(Error::Timeout(Timeout::Connect)),
+                Err(Error::Timeout(Timeout::Connect)),
+                Err(Error::Timeout(Timeout::Connect)),
+            ],
+            budgets: Vec::new(),
+        };
+        let start = Instant::Exact(time::Instant::now());
+        // Clock pinned to `start`, so every timeout is under budget and falls
+        // through; only the address-list exhaustion ends the dial.
+        let clock = Arc::new(move || start) as Arc<dyn Fn() -> Instant + Send + Sync>;
         let timeout = NextTimeout {
             after: BUDGET_10S,
             reason: Timeout::Connect,
         };
-        let per_addr = [0.5, 0.25, 0.125].map(|w| {
-            timeout
-                .not_zero()
-                .map(|t| std::time::Duration::from_secs_f64(t.as_secs_f64() * w))
-        });
-        for (a, b) in per_addr.iter().zip(per_addr.iter().skip(1)) {
-            let (a, b) = (a.expect("configured"), b.expect("configured"));
-            // Second slice ≈ half of the previous (± a millisecond).
+        let addrs = addrs(chased);
+        let _ = try_connect_with(&addrs, start, timeout, &clock, |a, t| rec.dial(a, t));
+
+        let secs = per_addr_secs(&rec);
+        assert_eq!(secs.len(), 3, "every address must be dialed");
+        for w in secs.windows(2) {
             assert!(
-                (b.as_secs_f64() * 2.0 - a.as_secs_f64()).abs() < 0.01,
-                "non-halving split: {a:?} -> {b:?}"
+                (w[0] - 2.0 * w[1]).abs() < 0.01,
+                "each slice must be half the previous: {secs:?}"
             );
         }
+        let sum: f64 = secs.iter().sum();
+        assert!(
+            (sum - 10.0).abs() < 0.02,
+            "slices must sum to the overall budget: {sum}"
+        );
+    }
+
+    #[test]
+    fn refused_address_does_not_shrink_the_next_slice() {
+        // ureq parity: a FAST address-specific failure (a refusal) must leave
+        // the next address's slice at full size, since it burned no budget.
+        // Were this to regress to an always-halve behaviour, the second slice
+        // would be half the first.
+        let chased = [loopback(1), loopback(2)];
+        let mut rec = Recording {
+            results: vec![Err(refused()), Ok(())],
+            budgets: Vec::new(),
+        };
+        let start = Instant::Exact(time::Instant::now());
+        let clock = Arc::new(move || start) as Arc<dyn Fn() -> Instant + Send + Sync>;
+        let timeout = NextTimeout {
+            after: BUDGET_10S,
+            reason: Timeout::Connect,
+        };
+        let addrs = addrs(chased);
+        try_connect_with(&addrs, start, timeout, &clock, |a, t| rec.dial(a, t))
+            .expect("the second address connects");
+
+        let secs = per_addr_secs(&rec);
+        assert_eq!(secs.len(), 2);
+        assert!(
+            (secs[0] - secs[1]).abs() < 1e-9,
+            "a refusal must not shrink the next slice: {secs:?}"
+        );
     }
 }

@@ -22,7 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`choreographr/<daemon version>`) as inference requests** instead of a
   stale hardcoded `choreographr/0.1`; the product string is now shared via
   a single helper. An explicit caller-supplied `User-Agent` header still
-  overrides it.
+  overrides it (matched case-insensitively) — the default is now applied only
+  when the caller omits one, because ureq *appends* request headers, so the
+  old "set ours, then the caller's" order put two `user-agent` lines on the
+  wire instead of replacing ours.
+- **`http_request` reports the timeout and method it actually uses.** The
+  `timeout_secs` argument's schema text claimed a 30-second default while the
+  tool defaulted to 10s and clamped to 1–30s, and the invocation summary
+  echoed the raw (unclamped) value while the request used the clamped one;
+  the default, bounds, and summary now derive from one helper. The summary
+  also upper-cases the method (`"get"` is shown as `GET`) to match the
+  canonical form the request dispatch uses.
 - **Provider connections no longer stall or give up when the first resolved
   IP is unreachable instead of declining the connection.** The daemon's HTTP
   connector previously only moved on to the next resolved address after an
@@ -33,7 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connector: the overall connect budget is split across resolved addresses,
   address-specific failures (refused, host/network unreachable, address
   unavailable) and dial timeouts fall through to the next address while
-  budget remains, and the total dial is bounded by the connect timeout.
+  budget remains, and the total dial is bounded by the connect timeout. A
+  fast address-specific failure (a refusal or an unreachable route) leaves the
+  next address's time slice intact — it consumed no budget — whereas a dial
+  timeout halves it, exactly as ureq's own geometric scheduling does.
 
 ### Added
 
