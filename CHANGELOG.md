@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **macOS x86_64 (Intel) release target:** a `choreographr-<version>-x86_64-apple-darwin.tar.gz`
+  now ships alongside the arm64 tarball. It is cross-built in the same
+  `scripts/release.sh` pass on the arm64 runner/host (Apple's toolchain
+  targeting x86_64 from an arm64 Mac is first-class; no second build machine,
+  and no reliance on the paid x64 CI runners) with `-C target-cpu=x86-64-v3`
+  — every Intel Mac supported by the last Intel-capable macOS (26 Tahoe) is
+  AVX2-class — while the arm64 tarball keeps its fleet-tuned target default.
+  The Homebrew tap formula's x86_64 branch is now real (brew picks the archive
+  by CPU at install time, so Intel Macs get the Intel tarball automatically);
+  the curl installer gained the `Darwin-x86_64` mapping; the release first
+  hard-fails if either darwin tarball is missing before generating
+  `SHA256SUMS`, and `scripts/update-homebrew-tap.sh` requires both darwin
+  tarballs and rewrites both digests in one pass, so a stale/placeholder Intel
+  digest can never reach the tap. The Intel slice is not executed natively in
+  CI (no free x64 macOS runner) — it is smoke-tested under Rosetta 2 on the
+  arm64 job and verified by construction (digests + tap metadata) downstream;
+  see the release.yml comments.
+
 - **Server-authoritative keystore status (`choreo-proto`, `choreo-daemon`):**
   the daemon now models its keystore as three states — `Unbound` (no binding
   yet), `Locked` (bound, no cleartext in memory), and `Unlocked` — and exposes

@@ -35,10 +35,17 @@ env:
 
 jobs:
   verify:
-    # The shipped macOS artifact is aarch64-apple-darwin, so the formula's
-    # arm64 branch is the one under test; a non-arm runner would exercise the
-    # x86_64 placeholder branch and fail for the wrong reason. macos-latest is
-    # arm64 today; the step below fails loudly if that ever changes.
+    # The shipped macOS artifacts are aarch64-apple-darwin AND
+    # x86_64-apple-darwin (both produced by one release.sh pass on the arm64
+    # release job). This job runs on `macos-latest` (arm64) because it is the
+    # only free macOS runner: brew evaluates `Hardware::CPU.arm?` and installs
+    # the arm64 branch E2E (download, checksum, binaries, service). The
+    # x86_64 branch CANNOT be exercised here — an Intel brew under /usr/local
+    # needs either a paid x64 runner or a fragile Rosetta-brew bootstrap, and
+    # the install itself would run translated. The Intel channel is instead
+    # verified by construction: update-homebrew-tap.sh ABORTS unless both
+    # tarballs exist in dist/ and rewrites BOTH digests from the exact release
+    # artifacts, so a wrong/placeholder Intel digest cannot reach the tap.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,7 +56,7 @@ jobs:
         run: |
           arch="$(uname -m)"
           [ "$arch" = "arm64" ] || {
-            echo "::error::expected arm64 (aarch64-apple-darwin is the shipped macOS target), got $arch"
+            echo "::error::expected arm64 (this job verifies the formula's arm64 branch E2E; the x86_64 branch is verified by construction — see the comment on the verify job), got $arch"
             exit 1
           }
 
@@ -91,6 +98,34 @@ jobs:
 
       - name: Formula test
         run: brew test choreographr/choreographr/choreographr
+
+      - name: Verify BOTH branches' digests against the release assets
+        # The install above exercises only the arm64 branch on this arm64
+        # runner. This step closes the Intel branch's remaining failure mode
+        # (metadata-level: wrong digest or 404): download BOTH tarballs from the
+        # LIVE tap formula's URLs and assert each matches the sha256 string
+        # parsed from the same formula. Digest-level only — nothing is
+        # executed — but it is arch-agnostic, so the x86_64 branch gets exactly
+        # the same check brew itself would perform on an Intel Mac.
+        run: |
+          raw="https://raw.githubusercontent.com/choreographr/homebrew-choreographr/master/Formula/choreographr.rb"
+          curl -fsSL "$raw" -o /tmp/formula.rb
+          ver="$(sed -n 's/^  version "\([^"]*\)"/\1/p' /tmp/formula.rb | head -n1)"
+          base="https://github.com/choreographr/choreographr/releases/download/v${ver}"
+          check() { # <arch> <branch-sha>
+            local arch="$1" want="$2"
+            curl -fsSL "$base/choreographr-${ver}-${arch}.tar.gz" -o "/tmp/${arch}.tar.gz"
+            got="$(shasum -a 256 "/tmp/${arch}.tar.gz" | awk '{print $1}')"
+            [ "$got" = "$want" ] || {
+              echo "::error::${arch} tarball digest mismatch: formula says ${want}, downloaded asset hashes to ${got}"
+              exit 1
+            }
+            echo "OK: ${arch} digest matches (${got:0:12}…)"
+          }
+          arm_sha="$(sed -n '/if Hardware::CPU.arm?/,/^  else/ s/^    sha256 "\([^"]*\)"/\1/p' /tmp/formula.rb | head -n1)"
+          x86_sha="$(sed -n '/^  else/,/^  end/ s/^    sha256 "\([^"]*\)"/\1/p' /tmp/formula.rb | head -n1)"
+          check aarch64-apple-darwin "$arm_sha"
+          check x86_64-apple-darwin "$x86_sha"
 
       - name: Service must be installed but NOT started
         # SOP invariant: the launchd agent is installed, never auto-enabled.

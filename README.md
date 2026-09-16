@@ -256,7 +256,8 @@ parallel and can be interacted with independently. How the other agents compare:
 Prebuilt releases ship exactly two binaries — `choreographr choreo-tui`
 (`choreo-mcp` is a library-only crate and ships no binary; the `choreo-im`
 and `choreo-acp` bridges ship only in source builds — `cargo build -p choreo-im`
-/ `cargo build -p choreo-acp`) — for **x86_64 Linux**, **macOS (Apple Silicon)**, **Windows (x86_64)**,
+/ `cargo build -p choreo-acp`) — for **x86_64 Linux**, **macOS (Apple Silicon
+and Intel)**, **Windows (x86_64)**,
 and **Android/Termux (aarch64)**. All installs below use prebuilt binaries; no
 Rust or Zig toolchain is required. (The binaries are built by the GitHub
 Actions `release` workflow on every `vX.Y.Z` tag — see RELEASE.md's
@@ -273,13 +274,20 @@ brew install choreographr
 brew services start choreographr
 ```
 
+The tap formula picks the archive by CPU at install time — Apple Silicon
+machines get the native `aarch64-apple-darwin` tarball, Intel Macs the
+`x86_64-apple-darwin` one — so the same three commands serve both.
+
 `brew services` registers a **launchd agent**, so the daemon starts at login
 and is kept alive — but only because you asked; nothing is ever auto-enabled.
 
 Alternatives:
 
 - **GitHub Releases tarball** — download
-  `choreographr-0.2.0-aarch64-apple-darwin.tar.gz` from the
+  `choreographr-0.2.0-aarch64-apple-darwin.tar.gz` (Apple Silicon) or
+  `choreographr-0.2.0-x86_64-apple-darwin.tar.gz` (Intel — built for
+  AVX2-class machines, i.e. every Intel Mac new enough to run macOS 26) from
+  the
   [releases page](https://github.com/choreographr/choreographr/releases) and
   put the shipped binaries on your `PATH`. The binaries are unsigned, so
   Gatekeeper quarantines them: clear the attribute with

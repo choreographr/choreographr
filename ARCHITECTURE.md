@@ -188,14 +188,18 @@ target and is never shipped as a binary. `choreo-gui` is built separately (deskt
 Android via `dx build --platform android`, iOS via `scripts/build-ios.sh` +
 the `ios/` Xcode scaffold) and is not shipped either.
 
-The shipped target set is exactly two; `release.sh` and `install.sh` hardcode
-this pair and refuse any other platform ("ships Linux x86_64 and macOS arm64
-only"), and `release.sh` builds whichever of the two it is run on:
+The shipped target set is exactly three; `release.sh` and `install.sh`
+hardcode this set and refuse any other platform ("ships Linux x86_64,
+macOS arm64, and macOS x86_64"), and `release.sh` builds the Linux tarball on
+a Linux host and BOTH darwin tarballs on a Darwin-arm64 host (the x86_64 one
+cross-compiled — Apple's arm64-hosted toolchain targets x86_64-apple-darwin
+natively, sharing the single Xcode SDK):
 
 | Target | Platform | Asset |
 |---|---|---|
 | `x86_64-unknown-linux-musl` | Linux x86_64 | `choreographr-<version>-x86_64-unknown-linux-musl.tar.gz` |
-| `aarch64-apple-darwin` | macOS arm64 | `choreographr-<version>-aarch64-apple-darwin.tar.gz` |
+| `aarch64-apple-darwin` | macOS arm64 (native) | `choreographr-<version>-aarch64-apple-darwin.tar.gz` |
+| `x86_64-apple-darwin` | macOS Intel (cross-built on the arm64 host) | `choreographr-<version>-x86_64-apple-darwin.tar.gz` |
 
 The Linux tarball is a **fully static musl build** — `release.sh` cross-builds
 it to `x86_64-unknown-linux-musl` with `--features mimalloc`, so one artifact
@@ -241,9 +245,17 @@ stable release build; env rustflags additionally override any developer's
   pragmatic floor between "runs on anything since 2003" and modern
   vectorization. Future per-CPU-level artifacts (e.g. a v3 tarball) reuse the
   same `RUSTFLAGS` mechanism with a different value.
-- **macOS tarball: the target default** — `aarch64-apple-darwin` already
+- **macOS arm64 tarball: the target default** — `aarch64-apple-darwin` already
   defaults to `apple-a14` (Apple-Silicon-tuned), and the fleet is homogeneous
   by definition; no flag needed.
+- **macOS x86_64 tarball: x86-64-v3** (AVX2/FMA). Unlike the aarch64 target,
+  `x86_64-apple-darwin` defaults to generic baseline x86-64 (2003 SSE2),
+  which undershoots the actual fleet: the last Intel-capable macOS (26 Tahoe)
+  supports only the 2019–2020 Intel Macs (Coffee/Ice/Comet Lake, mac Pro
+  2019), every one AVX2-class — so v3 DESCRIBES the fleet rather than betting
+  on it. The fleet can only shrink (macOS 27 is Apple-Silicon-only), so v3
+  can never become too aggressive, and Rosetta 2 emulates AVX2/FMA, so the
+  binary also stays valid if run translated on Apple Silicon.
 - **Android/Termux: generic `armv8-a`** — the device fleet spans a decade of
   cores with nothing newer in common; `build-android.sh` enforces
   `RUSTFLAGS="-C target-cpu=generic"`.

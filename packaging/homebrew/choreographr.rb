@@ -9,6 +9,8 @@
 #   2. Update both `url` lines — tag, filename, and embedded version.
 #   3. Recompute the checksums and paste them into the `sha256` fields:
 #        curl -fL -O <url> && shasum -a 256 <downloaded>.tar.gz
+#      (scripts/update-homebrew-tap.sh automates this for BOTH branches; both
+#      darwin tarballs are required — the script aborts if either is missing.)
 #   4. Sanity-check locally: brew install ./choreographr.rb && choreographr --version
 #   5. Commit and push to the tap repo.
 #
@@ -19,14 +21,15 @@ class Choreographr < Formula
   homepage "https://choreographr.com"
   version "0.2.0"
 
-  # arm64 (Apple Silicon) is the sole macOS target; the x86_64 branch is a
-  # placeholder so adding an Intel tarball later is a one-digest change rather
-  # than a formula restructure.
+  # Both macOS targets ship: aarch64 (native) and x86_64 (cross-built with
+  # target-cpu=x86-64-v3 on the arm64 CI host — see scripts/release.sh). brew
+  # selects the branch at install time via Hardware::CPU, matching the
+  # installer's own Homebrew prefix (/opt/homebrew vs /usr/local).
   if Hardware::CPU.arm?
     url "https://github.com/choreographr/choreographr/releases/download/v0.2.0/choreographr-0.2.0-aarch64-apple-darwin.tar.gz"
     sha256 "3bc84f0363f766670dd4aabbfaedbc845fe4bbd4e5dbfbe5f653a76ec4bfd9cd"
   else
-    # x86_64 macOS is not shipped yet — kept for future-proofing.
+    # x86_64-apple-darwin: cross-built by release.sh on the arm64 CI host.
     url "https://github.com/choreographr/choreographr/releases/download/v0.2.0/choreographr-0.2.0-x86_64-apple-darwin.tar.gz"
     sha256 "<sha256-x86_64>"
   end

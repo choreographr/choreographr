@@ -21,9 +21,14 @@
 #                   rpmbuild is apt-installed below, so release.sh's best-effort
 #                   step builds both.
 #   macos-arm64     scripts/release.sh on the arm64 macOS runner — native
-#                   aarch64-apple-darwin tarball (.deb/.rpm skipped as on the
-#                   MacBook; zig is still required — zlob's build.rs compiles
-#                   its Zig source with `zig cc` on every host target).
+#                   aarch64-apple-darwin tarball PLUS the cross-built
+#                   x86_64-apple-darwin tarball (both from one release.sh
+#                   pass; .deb/.rpm skipped as on the MacBook; zig is still
+#                   required — zlob's build.rs compiles its Zig source with
+#                   `zig cc` on every host target). The Intel slice is never
+#                   executed natively in CI (GitHub's macOS x64 runners are
+#                   paid larger-runners only) — it gets Rosetta smoke tests
+#                   here plus digest-level verification downstream.
 #   windows-msvc    hand-rolled: build-stable.sh host build (same --profile
 #                   dist shipped-artifact profile as release.sh) + zip of the
 #                   .exe files. release.sh is not reused here because its
@@ -180,9 +185,9 @@ jobs:
           if-no-files-found: error
 
   macos-arm64:
-    name: macOS aarch64
+    name: macOS aarch64 + x86_64 cross
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
@@ -202,30 +207,56 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build (aarch64-apple-darwin tarball)
+      - name: Build (aarch64 + x86_64-apple-darwin tarballs)
         run: |
-          # On a Darwin-arm64 host release.sh takes its native-build path:
-          # aarch64-apple-darwin tarball, no musl/mimalloc, .deb/.rpm skipped.
-          # Same --allow-dirty rationale as the linux job: a CI checkout IS
-          # the pushed commit, so the guard's uncommitted-edits threat model
+          # On a Darwin-arm64 host release.sh builds BOTH darwin tarballs in
+          # one pass: native aarch64-apple-darwin plus cross-built
+          # x86_64-apple-darwin (no musl/mimalloc, .deb/.rpm skipped). The
+          # x86_64 target is added here so the toolchain setup is visible in
+          # the job log (release.sh re-runs it idempotently). Same
+          # --allow-dirty rationale as the linux job: a CI checkout IS the
+          # pushed commit, so the guard's uncommitted-edits threat model
           # cannot apply; --allow-dirty is its documented CI-style escape
           # hatch (the BSD-sed run died inside the strips — never reached the
           # build — so any tooling-dirt here has not surfaced yet; the
           # diagnostic above the linux build would show it).
+          rustup target add x86_64-apple-darwin
           ./scripts/release.sh --allow-dirty
 
-      - name: Smoke-test the tarball
+      - name: Smoke-test the aarch64 tarball
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-aarch64-apple-darwin.tar.gz"
 
-      - name: Daemon smoke-test the tarball
+      - name: Daemon smoke-test the aarch64 tarball
         run: |
           # Boot the shipped daemon hermetically (scratch socket + config dir,
           # see scripts/daemon-smoke.sh's header) — smoke-test.sh above only
           # exercises --version/--help, which never touches the listener.
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           ./scripts/daemon-smoke.sh "dist/choreographr-${VERSION}-aarch64-apple-darwin.tar.gz"
+
+      - name: Smoke-test the x86_64 tarball under Rosetta
+        run: |
+          # No free x64 macOS runner exists, so the Intel slice is exercised
+          # interpretively here: Rosetta 2 (preinstalled on runners; the
+          # softwareupdate call is a belt-and-braces bootstrap) runs the
+          # x86_64 binaries through the SAME smoke suite. This is an
+          # approximation, not proof — Rosetta masks some real-hardware
+          # failure classes — so this is coverage, not a guarantee; what
+          # structurally protects the Intel channel is generation-side (both
+          # tarballs required by release.sh and update-homebrew-tap.sh),
+          # plus the digest-level checks downstream.
+          softwareupdate --install-rosetta --agree-to-license || true
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          arch -x86_64 ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-x86_64-apple-darwin.tar.gz"
+
+      - name: Daemon smoke-test the x86_64 tarball under Rosetta
+        run: |
+          # Same daemon boot as the aarch64 step above, translated (Rosetta
+          # caveat as in the previous step's comment).
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          arch -x86_64 ./scripts/daemon-smoke.sh "dist/choreographr-${VERSION}-x86_64-apple-darwin.tar.gz"
 
       - uses: actions/upload-artifact@v7
         with:

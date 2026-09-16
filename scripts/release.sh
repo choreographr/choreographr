@@ -80,16 +80,20 @@ if [ "$ALLOW_DIRTY" -eq 0 ] && [ -n "$(git status --porcelain)" ]; then
     exit 1
 fi
 
-# Host-target detection mirrors scripts/install.sh: exactly two targets in
-# $VERSION. (Cross-compiling other targets is out of scope for this script.)
-# Linux-x86_64 maps to the static musl triple — the Linux release tarball is a
-# fully static musl build (see below); macOS stays the native host build.
+# Host-target detection mirrors scripts/install.sh. (Cross-compiling other
+# targets is out of scope for this script.) Linux-x86_64 maps to the static
+# musl triple — the Linux release tarball is a fully static musl build (see
+# below). A Darwin-arm64 host builds BOTH darwin tarballs in one pass: native
+# aarch64-apple-darwin plus a cross-built x86_64-apple-darwin (Apple's clang
+# targeting x86_64 from an arm64 host is first-class and shares the single
+# Xcode SDK both triples need — no extra SDK install).
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) TARGET="x86_64-unknown-linux-musl" ;;
-    Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
+    Darwin-arm64) TARGET="aarch64-apple-darwin" ;;  # host tarball; x86_64 is cross-built below
     *)
         echo "error: unsupported platform: $(uname -s) $(uname -m)" >&2
-        echo "error: ${VERSION} ships Linux x86_64 and macOS arm64 only" >&2
+        echo "error: ${VERSION} ships Linux x86_64 (musl), macOS arm64, and macOS x86_64" >&2
+        echo "error: the macOS x86_64 tarball is cross-built on the Darwin-arm64 host" >&2
         exit 1
         ;;
 esac
@@ -99,7 +103,6 @@ esac
 # release — release binaries ship only the daemon + TUI suite.
 BINARIES=(choreographr choreo-tui)
 
-echo "==> building release binaries (daemon + TUI packages)"
 # Build only the shipped binaries, from their two owning packages: the daemon
 # (root package `choreographr`) and the TUI (the `choreo-tui` crate) are now
 # SEPARATE packages (binary-split refactor), so a single `-p choreographr` no
@@ -132,9 +135,10 @@ echo "==> building release binaries (daemon + TUI packages)"
 # compatibility dance: a musl binary runs on any Linux kernel regardless of
 # the host's glibc version. The `mimalloc` feature swaps in mimalloc's
 # per-thread allocator, which is markedly better than musl's default malloc
-# (see the `#[global_allocator]` blocks in src/bin/*.rs). The macOS tarball is
-# the native aarch64-apple-darwin host build (no musl, no mimalloc — Apple
-# builds keep the system allocator).
+# (see the `#[global_allocator]` blocks in src/bin/*.rs). The macOS tarballs
+# are built in the SAME pass on the Darwin-arm64 host: native
+# aarch64-apple-darwin plus a cross-built x86_64-apple-darwin (no musl, no
+# mimalloc — Apple builds keep the system allocator).
 #
 # The cross-build runs through cargo-zigbuild because cc-rs passes the full
 # Rust triple `x86_64-unknown-linux-musl` to the C compiler, and `zig cc`'s
@@ -149,7 +153,16 @@ echo "==> building release binaries (daemon + TUI packages)"
 # semver-compatible version like the 2026-08-20 arrayref@0.3.10 attack
 # (RUSTSEC-2026-0260). The lockfile itself is also checked by
 # scripts/check-supply-chain.sh (deny.toml bans) in `just pre-commit`/`ci`.
+#
+# The two darwin builds are separate cargo INVOCATIONS even though they share
+# a feature set, because they do NOT share RUSTFLAGS (a single invocation with
+# two --target triples gets one rustflags value for both) — and only the
+# `--target` form is used for the native triple too, so the artifacts land in
+# distinct keyed target/<triple>/dist dirs and the staging loop below is
+# uniform across all three shipped targets.
+TARBALL_JOBS=()
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
+    echo "==> building release binaries (daemon + TUI packages)"
     # CPU floor: x86-64-v2 (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/CMPXCHG16B) — the
     # level every AMD64 CPU since Intel Nehalem (2008) / AMD Bulldozer (2011)
     # implements, and the direction enterprise distros have moved (RHEL 10
@@ -161,34 +174,65 @@ if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     # comparable. Future per-CPU-level artifacts (e.g. a v3 tarball) reuse this
     # exact mechanism with a different value.
     RUSTFLAGS="-C target-cpu=x86-64-v2" ./scripts/build-stable.sh zigbuild --locked --profile dist -p choreographr -p choreo-tui --target x86_64-unknown-linux-musl --features choreographr/metrics,choreographr/blockchain,choreographr/mimalloc,choreo-tui/mimalloc
-    TARBALL_BIN_DIR="target/x86_64-unknown-linux-musl/dist"
+    TARBALL_JOBS+=("x86_64-unknown-linux-musl target/x86_64-unknown-linux-musl/dist")
 else
-    # macOS: NO target-cpu flag — the aarch64-apple-darwin target spec already
-    # defaults to apple-a14 (Apple-Silicon-tuned), and the fleet is homogeneous
-    # by definition, so the target default is the right answer here.
-    ./scripts/build-stable.sh build --locked --profile dist -p choreographr -p choreo-tui --features choreographr/metrics,choreographr/blockchain
-    TARBALL_BIN_DIR="target/dist"
+    echo "==> building release binaries (daemon + TUI packages)"
+    # Native aarch64: NO target-cpu flag — the aarch64-apple-darwin target spec
+    # already defaults to apple-a14 (Apple-Silicon-tuned), and the fleet is
+    # homogeneous by definition, so the target default is the right answer here.
+    ./scripts/build-stable.sh build --locked --profile dist -p choreographr -p choreo-tui --target aarch64-apple-darwin --features choreographr/metrics,choreographr/blockchain
+    TARBALL_JOBS+=("aarch64-apple-darwin target/aarch64-apple-darwin/dist")
+
+    # Cross x86_64: -C target-cpu=x86-64-v3 (AVX2/FMA). Unlike the aarch64 case,
+    # the x86_64-apple-darwin target defaults to GENERIC baseline x86-64 (2003
+    # SSE2), which undershoots the real fleet: the last Intel-capable macOS
+    # (26 Tahoe) supports only 2019–2020 Intel Macs (Coffee/Ice/Comet Lake +
+    # mac Pro 2019), every one of which implements AVX2 — so v3 DESCRIBES the
+    # fleet rather than betting on it (contrast the musl build's v2 floor over
+    # an open-ended Linux fleet). The fleet can only shrink from here (macOS 27
+    # is Apple-Silicon-only), so v3 can never become too aggressive; Rosetta 2
+    # emulates AVX2/FMA, so the binary also stays valid if ever run translated
+    # on Apple Silicon. Same env-RUSTFLAGS-not-profile-rustflags reasoning as
+    # the musl branch above, and the same reason this build is its own cargo
+    # invocation: rustflags differ per triple within one pass.
+    echo "==> cross-building the macOS x86_64 tarball"
+    rustup target add x86_64-apple-darwin
+    RUSTFLAGS="-C target-cpu=x86-64-v3" ./scripts/build-stable.sh build --locked --profile dist -p choreographr -p choreo-tui --target x86_64-apple-darwin --features choreographr/metrics,choreographr/blockchain
+    TARBALL_JOBS+=("x86_64-apple-darwin target/x86_64-apple-darwin/dist")
 fi
 
-# Stage the tarball contents: the shipped binaries plus both service files, all
+# Stage each tarball: the shipped binaries plus both service files, all
 # at the top level of the archive (no bin/ prefix) so install.sh and the
 # Homebrew formula can reference them directly. tar preserves exec bits.
+# Every entry of TARBALL_JOBS (“triple bindir”) MUST produce a tarball — the
+# hard-fail below fires on a missing binary BEFORE the SHA256SUMS step, so a
+# half-successful pass can never emit an incomplete checksum file (with two
+# darwin tarballs in one run, a skipped x86_64 cross build must abort, not
+# silently checksum only the arm64 one).
 mkdir -p dist
-STAGE="$(mktemp -d)"
+STAGE=""
 trap 'rm -rf "$STAGE"' EXIT
-for b in "${BINARIES[@]}"; do
-    [ -x "$TARBALL_BIN_DIR/$b" ] || {
-        echo "error: missing $TARBALL_BIN_DIR/$b — build did not produce it" >&2
-        exit 1
-    }
-    install -m 0755 "$TARBALL_BIN_DIR/$b" "$STAGE/$b"
-done
-install -m 0644 packaging/choreographr.service "$STAGE/choreographr.service"
-install -m 0644 packaging/com.choreographr.daemon.plist "$STAGE/com.choreographr.daemon.plist"
+TARBALL=""
+for job in "${TARBALL_JOBS[@]}"; do
+    triple="${job%% *}"
+    bindir="${job#* }"
+    STAGE="$(mktemp -d)"
+    for b in "${BINARIES[@]}"; do
+        [ -x "$bindir/$b" ] || {
+            echo "error: missing $bindir/$b — build did not produce $triple's binary set" >&2
+            exit 1
+        }
+        install -m 0755 "$bindir/$b" "$STAGE/$b"
+    done
+    install -m 0644 packaging/choreographr.service "$STAGE/choreographr.service"
+    install -m 0644 packaging/com.choreographr.daemon.plist "$STAGE/com.choreographr.daemon.plist"
 
-TARBALL="dist/choreographr-${VERSION}-${TARGET}.tar.gz"
-tar czf "$TARBALL" -C "$STAGE" \
-    "${BINARIES[@]}" choreographr.service com.choreographr.daemon.plist
+    TARBALL="dist/choreographr-${VERSION}-${triple}.tar.gz"
+    tar czf "$TARBALL" -C "$STAGE" \
+        "${BINARIES[@]}" choreographr.service com.choreographr.daemon.plist
+    rm -rf "$STAGE"
+    STAGE=""
+done
 
 # ── .deb/.rpm build (host glibc, no mimalloc) ───────────────────────────────
 # The .deb/.rpm stay native glibc host-target builds WITHOUT the mimalloc
@@ -226,10 +270,11 @@ fi
 
 # ── Checksums over EVERY artifact for this version ──────────────────────────
 # SHA256SUMS ships beside the tarball (install.sh verifies against this file).
-# It covers every `choreographr-${VERSION}-*` file already in dist/: this host's
-# tarball, the .deb/.rpm just built above, and any other-arch tarball an
-# operator staged into dist/ before upload (the macOS tarball copied over from
-# the MacBook — see RELEASE.md Phase 4). Regenerating here, after the .deb/.rpm
+# It covers every `choreographr-${VERSION}-*` file already in dist/: every
+# tarball this pass built (on the macOS host: BOTH the native arm64 and the
+# cross-built x86_64 tarballs), the .deb/.rpm just built above, and any
+# other-arch tarball an operator staged into dist/ before upload. Regenerating
+# here, after the .deb/.rpm
 # step and from the glob rather than the single host tarball, means a combined
 # file is produced and `--upload` never clobbers it with a single-host one.
 ( cd dist && sha256sum choreographr-${VERSION}-* > SHA256SUMS )

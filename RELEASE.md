@@ -58,15 +58,18 @@ built nowhere.
 | Job | Runner | Artifacts |
 |---|---|---|
 | `linux-musl` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` + `.rpm` (via `scripts/release.sh`; `rpmbuild` is apt-installed in the job, since it is not preinstalled) |
-| `macos-arm64` | macos-latest | native `aarch64-apple-darwin` tarball (via `scripts/release.sh`) |
+| `macos-arm64` | macos-latest | native `aarch64-apple-darwin` tarball **plus** the cross-built `x86_64-apple-darwin` tarball (both via one `scripts/release.sh` pass; the Intel slice is smoke-tested under Rosetta and verified by construction downstream — no free x64 macOS runner exists) |
 | `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the shipped `.exe` files — **built and smoke-tested on every tag, but currently NOT part of the published release** (the `release` job's `needs` omits this job until the Windows runtime is ready to ship) |
 | `android-termux` | ubuntu-latest + NDK | `aarch64-linux-android` Termux tarball (via `scripts/build-android.sh --features metrics,blockchain`) + the Termux-native `.deb` (via `scripts/build-deb-termux.sh`, structural smoke-test on the runner; the packaged binaries are then extracted with Termux's own dpkg-deb under qemu-user and executed against an unpacked Termux aarch64 rootfs — see the workflow's qemu step) |
 | `ios-build` | macos-latest | **none** — `choreo-gui` (the only crate that ships to iOS) compile check for both iOS targets, the real Xcode app link via the `ios/` scaffold, and a non-blocking simulator boot smoke (`continue-on-error` until the plumbing has proven stable). Deliberately not part of the release; a failing link is diagnosed from the log |
 
-Every build job smoke-tests its own artifact beyond the clap surface:
-the three desktop jobs run `scripts/daemon-smoke.sh` (boots the shipped
-daemon hermetically — scratch socket + config dir — and proves the listener
-comes up), and the android job **executes** its binaries under qemu-user
+Every build job smoke-tests its own artifact beyond the clap surface: the
+three desktop jobs run `scripts/daemon-smoke.sh` (boots the shipped daemon
+hermetically — scratch socket + config dir — and proves the listener comes
+up); the macOS job additionally runs the x86_64 tarball's smoke suites under
+Rosetta (an approximation, not native execution — no free x64 macOS runner
+exists; see the release.yml comments); and the android job **executes** its
+binaries under qemu-user
 against the official Termux aarch64 rootfs (skopeo fetches the image layers;
 no docker), closing the "never executed before release" gap.
 
@@ -445,7 +448,8 @@ Conductor duties while the workflow runs:
 2. **Verify the release page** once the `release` job completes:
    - the tag on the release matches `vX.Y.Z` and the manifest version
      (the job guards this too — a guard failure means a Phase 1/2 mistake);
-   - all assets are present: three tarballs (musl, macOS, Android Termux),
+   - all assets are present: four tarballs (musl, macOS arm64, macOS x86_64,
+     Android Termux),
      the desktop `.deb` and `.rpm`, the Termux-native `.deb`, and the
      combined `SHA256SUMS` (the Windows `.zip` is built but intentionally not
      attached — see [CI builds](#ci-builds-github-actions));
@@ -627,8 +631,11 @@ desktop machines run `scripts/release.sh`, which:
   by mistake (see root `Cargo.toml`),
 - builds every artifact at an explicit **CPU floor per target** via
   `RUSTFLAGS="-C target-cpu=…"` (see ARCHITECTURE.md "Release & packaging"):
-  x86-64-v2 for the musl tarball, the target default (`apple-a14`) for macOS,
-  baseline for the `.deb`/`.rpm` — the local `-C target-cpu=native` profile
+  x86-64-v2 for the musl tarball, the target default (`apple-a14`) for the
+  macOS arm64 tarball, x86-64-v3 (AVX2/FMA) for the macOS x86_64 tarball —
+  the last Intel-capable macOS fleet is exactly the 2019–2020 Intel Macs,
+  all AVX2-capable — and baseline for the `.deb`/`.rpm` — the local
+  `-C target-cpu=native` profile
   flags (and the nightly `-Z…` flags) are additionally stripped by
   `scripts/build-stable.sh` before each stable build, so the build machine's
   CPU can never leak into a shipped artifact,
@@ -643,8 +650,10 @@ desktop machines run `scripts/release.sh`, which:
 
 The manual flow needs one **Linux x86_64 box** (musl tarball — static,
 mimalloc — plus `.deb`/`.rpm`; needs `cargo-zigbuild`, optional
-`dpkg-deb`/`rpmbuild`) and one **M1 MacBook** (native aarch64 tarball).
-Artifacts are staged and uploaded from the Linux box — the macOS tarball is
+`dpkg-deb`/`rpmbuild`) and one **M1 MacBook** (both darwin tarballs —
+release.sh on a Darwin-arm64 host native-builds the aarch64 tarball AND
+cross-builds the x86_64 one in the same pass).
+Artifacts are staged and uploaded from the Linux box — the macOS tarballs are
 copied there before upload. Windows and Android/Termux artifacts have no
 manual path; if CI is unavailable for them, skip those assets for the
 release or wait for CI (a re-pushed tag after `gh release delete` re-triggers
@@ -662,7 +671,7 @@ Confirm `dist/` contains the musl tarball, `.deb`, `.rpm`, and `SHA256SUMS`.
 ### M1 MacBook
 
 ```nu
-just release            # dry-run: aarch64 tarball + SHA256SUMS (no .deb/.rpm)
+just release            # dry-run: BOTH darwin tarballs + SHA256SUMS (no .deb/.rpm)
 just smoke-test
 ```
 
@@ -682,7 +691,8 @@ GitHub uploads happen **once, from the Linux box**, so all assets land in one
 release:
 
 ```nu
-scp "macbook:…/choreographr-<V>-aarch64-apple-darwin.tar.gz" dist/
+scp "macbook:…/choreographr-<V>-aarch64-apple-darwin.tar.gz" \
+    "macbook:…/choreographr-<V>-x86_64-apple-darwin.tar.gz" dist/
 just smoke-test         # re-validate on the Linux box for good measure
 just release-upload     # regenerates a combined SHA256SUMS over ALL dist/ artifacts
                         # (host tarball + staged macOS tarball + .deb/.rpm) and
@@ -713,6 +723,7 @@ awk -v "ver=X.Y.Z" 'index($0, "## [" ver "]") == 1 {f=1; next} f && /^## /{exit}
 let assets = [
   "dist/choreographr-X.Y.Z-x86_64-unknown-linux-musl.tar.gz"
   "dist/choreographr-X.Y.Z-aarch64-apple-darwin.tar.gz"
+  "dist/choreographr-X.Y.Z-x86_64-apple-darwin.tar.gz"
   "dist/choreographr-X.Y.Z-x86_64.deb"
   "dist/choreographr-X.Y.Z-x86_64.rpm"
   "dist/SHA256SUMS"

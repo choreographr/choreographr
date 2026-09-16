@@ -95,36 +95,36 @@ fi
 # which behaves identically everywhere.
 
 # ── macOS tarballs in dist/ ──────────────────────────────────────────────────
-# The formula downloads the macOS tarball from the GitHub release, so the
-# arm64 tarball is REQUIRED — Phase 4 staged it here via scp from the
-# MacBook. The x86_64-apple-darwin tarball is not shipped yet (the formula's
-# else-branch is a documented placeholder for future Intel support); when it
-# exists its digest is bumped too, otherwise the branch is left untouched.
+# The formula downloads the macOS tarballs from the GitHub release, so BOTH
+# are REQUIRED — release.sh produces them in one pass (native aarch64 +
+# cross-built x86_64 on the Darwin-arm64 host). Requiring the x86_64 tarball
+# here — instead of leaving the formula's else-branch untouched when it is
+# absent — is the generation-time guarantee that the tap can never carry a
+# stale/placeholder Intel digest next to live URLs: with only digest-level CI
+# verification available for the Intel branch (no runner executes the x86_64
+# slice natively), a missing tarball must abort the bump rather than silently
+# ship a broken Intel formula.
 ARM64_TARBALL="dist/choreographr-${VERSION}-aarch64-apple-darwin.tar.gz"
-if [ ! -f "$ARM64_TARBALL" ]; then
-    echo "error: $ARM64_TARBALL not found — the formula cannot point at a release asset" >&2
-    echo "error: build it on the MacBook (just release) and scp it to dist/ (RELEASE.md Phase 4)" >&2
-    exit 1
-fi
+X86_64_TARBALL="dist/choreographr-${VERSION}-x86_64-apple-darwin.tar.gz"
+for _tarball in "$ARM64_TARBALL" "$X86_64_TARBALL"; do
+    if [ ! -f "$_tarball" ]; then
+        echo "error: $_tarball not found — the formula cannot point at a release asset" >&2
+        echo "error: both darwin tarballs come out of one scripts/release.sh pass; stage them into dist/ (RELEASE.md Phase 4)" >&2
+        exit 1
+    fi
+done
 
 ARM64_SHA="$("${SHA256[@]}" "$ARM64_TARBALL" | awk '{print $1}')"
 echo "==> arm64 tarball   $ARM64_TARBALL   (sha256 ${ARM64_SHA:0:12}…)"
 
 X86_64_TARBALL="dist/choreographr-${VERSION}-x86_64-apple-darwin.tar.gz"
-X86_64_SHA=""
-if [ -f "$X86_64_TARBALL" ]; then
-    X86_64_SHA="$("${SHA256[@]}" "$X86_64_TARBALL" | awk '{print $1}')"
-    echo "==> x86_64 tarball $X86_64_TARBALL   (sha256 ${X86_64_SHA:0:12}…)"
-else
-    echo "==> no $X86_64_TARBALL — leaving the formula's x86_64 branch untouched"
-fi
+X86_64_SHA="$("${SHA256[@]}" "$X86_64_TARBALL" | awk '{print $1}')"
+echo "==> x86_64 tarball $X86_64_TARBALL   (sha256 ${X86_64_SHA:0:12}…)"
 
 # A digest field that is not exactly 64 lowercase hex would fail brew install;
 # reject it up front rather than writing a broken formula.
 [[ "$ARM64_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "error: arm64 digest is not 64 hex chars: $ARM64_SHA" >&2; exit 1; }
-if [ -n "$X86_64_SHA" ]; then
-    [[ "$X86_64_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "error: x86_64 digest is not 64 hex chars: $X86_64_SHA" >&2; exit 1; }
-fi
+[[ "$X86_64_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "error: x86_64 digest is not 64 hex chars: $X86_64_SHA" >&2; exit 1; }
 
 # ── best-effort: the release exists on GitHub ────────────────────────────────
 # The formula URL must resolve; confirm the release is live before pointing
@@ -164,8 +164,8 @@ OLD_VERSION="$(sed -n 's/^  version "\([^"]*\)"/\1/p' "$FORMULA" | head -n1)"
 [ -n "$OLD_VERSION" ] || { echo "error: could not read version from $FORMULA" >&2; exit 1; }
 
 # The old digests are needed as literal needles AND for the same-version
-# comparison below (the arm64 one is a "<sha256-aarch64>" placeholder until
-# the first real release).
+# comparison below (each may be a "<sha256-…>" placeholder on a formula that
+# was scaffolded before the corresponding tarball existed).
 OLD_ARM64_SHA="$(sed -n '/if Hardware::CPU.arm?/,/^  else/ s/^    sha256 "\([^"]*\)"/\1/p' "$FORMULA" | head -n1)"
 OLD_X86_64_SHA="$(sed -n '/^  else/,/^  end/ s/^    sha256 "\([^"]*\)"/\1/p' "$FORMULA" | head -n1)"
 [ -n "$OLD_ARM64_SHA" ] || { echo "error: could not read arm64 sha256 from $FORMULA" >&2; exit 1; }
@@ -195,9 +195,7 @@ NEEDS_INSTALL=0
 if [ "$OLD_VERSION" != "$VERSION" ]; then
     NEEDS_REWRITE=1
     NEEDS_DIGEST=1
-elif [ "$OLD_ARM64_SHA" != "$ARM64_SHA" ]; then
-    NEEDS_DIGEST=1
-elif [ -n "$X86_64_SHA" ] && [ "$OLD_X86_64_SHA" != "$X86_64_SHA" ]; then
+elif [ "$OLD_ARM64_SHA" != "$ARM64_SHA" ] || [ "$OLD_X86_64_SHA" != "$X86_64_SHA" ]; then
     NEEDS_DIGEST=1
 fi
 [ "$OLD_INSTALL" = "$NEW_INSTALL" ] || NEEDS_INSTALL=1
@@ -269,15 +267,14 @@ if [ "$NEEDS_REWRITE" -eq 1 ]; then
     replace_literal "choreographr-$OLD_VERSION-" "choreographr-$VERSION-" 2 "url filename"
 fi
 # 2. Digests — whenever they differ from the dist/ tarballs (placeholder
-#    digests count as different). The x86_64 digest is only touched when that
-#    tarball exists; otherwise the documented placeholder stays in place.
+#    digests count as different). Both digests are now ALWAYS rewritten: the
+#    x86_64 tarball is required above, so the Intel branch can never be left
+#    carrying a placeholder.
 if [ "$NEEDS_DIGEST" -eq 1 ]; then
     # The arm64 digest (the sha256 line inside the `if Hardware::CPU.arm?` block).
     replace_literal "sha256 \"$OLD_ARM64_SHA\"" "sha256 \"$ARM64_SHA\"" 1 "arm64 digest"
     # The x86_64 digest (the sha256 line in the `else` branch).
-    if [ -n "$X86_64_SHA" ]; then
-        replace_literal "sha256 \"$OLD_X86_64_SHA\"" "sha256 \"$X86_64_SHA\"" 1 "x86_64 digest"
-    fi
+    replace_literal "sha256 \"$OLD_X86_64_SHA\"" "sha256 \"$X86_64_SHA\"" 1 "x86_64 digest"
 fi
 # 3. The bin.install list — whenever it differs from the mirrored formula (e.g.
 #    the shipped binary set changed since the tap was scaffolded).
@@ -304,13 +301,7 @@ verify_count "version \"$VERSION\"" 1 "version line"
 verify_count "$ARM64_URL" 1 "arm64 url"
 verify_count "$X86_64_URL" 1 "x86_64 url"
 verify_count "sha256 \"$ARM64_SHA\"" 1 "arm64 digest"
-if [ -n "$X86_64_SHA" ]; then
-    verify_count "sha256 \"$X86_64_SHA\"" 1 "x86_64 digest"
-else
-    # No x86_64 tarball this release: the branch must be untouched, i.e. its
-    # digest still matches what we read before the rewrite.
-    verify_count "sha256 \"$OLD_X86_64_SHA\"" 1 "x86_64 digest (unchanged)"
-fi
+verify_count "sha256 \"$X86_64_SHA\"" 1 "x86_64 digest"
 # Exactly two sha256 fields must remain (arm64 + x86_64 branches).
 verify_count 'sha256 "' 2 "sha256 fields"
 # The bin.install list must NOW match the mirrored formula exactly.
@@ -321,8 +312,9 @@ if [ "$NEEDS_REWRITE" -eq 1 ]; then
     verify_count "v$OLD_VERSION/" 0 "stale url tag"
     verify_count "choreographr-$OLD_VERSION-" 0 "stale url filename"
 fi
-# The arm64 placeholder must be gone (it would break checksum verification).
+# Both placeholders must be gone (they would break checksum verification).
 verify_count '<sha256-aarch64>' 0 "arm64 placeholder"
+verify_count '<sha256-x86_64>' 0 "x86_64 placeholder"
 
 # Syntax-check the Ruby when ruby is available; it often is not on the Linux
 # box, so warn and continue rather than block.
