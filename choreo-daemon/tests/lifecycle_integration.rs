@@ -95,6 +95,11 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
     // syscall sequence as raise(2) and delivers SIGINT to this process.
     let _ = rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::INT);
 
-    // The server thread should exit cleanly within a reasonable timeout.
-    handle.join().expect("server thread panicked");
+    // The server thread should exit cleanly within a reasonable timeout, so
+    // reclaim its `run_server` result and assert it did not error out (the
+    // same pattern as common/mod.rs and ctrlc_after_connection.rs).
+    let result = handle.join().expect("server thread panicked");
+    if let Err(e) = result {
+        panic!("run_server exited with an error during shutdown: {e}");
+    }
 }
