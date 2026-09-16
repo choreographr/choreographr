@@ -758,7 +758,7 @@ by `shutdown_all`. All real functionality is Unix-only; the Windows analogue
 |---|---|
 | `socket_registry.rs` | `SocketRegistry` — `register` / `shutdown_all` / `prune_dead` / `registered_count`; cheap `Clone` (shared fd list) |
 | `tuning.rs` | `SocketTuning` — TCP keepalive (idle/interval/retries) applied post-connect |
-| `connector.rs` | `RegisteringTcpConnector` (`ureq` feature) — dialing connector that registers every socket |
+| `connector.rs` | `RegisteringTcpConnector` (`ureq` feature) — dialing connector that registers every socket; mirrors ureq's address-fallback face (geometric per-address budget split, fall-through on address-specific failures and on dial timeouts while overall connect budget remains, ureq #1184 parity) |
 
 ### `choreo-power-events` — Platform suspend/wake notifications
 

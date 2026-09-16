@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Provider connections no longer stall or give up when the first resolved
+  IP is unreachable instead of declining the connection.** The daemon's HTTP
+  connector previously only moved on to the next resolved address after an
+  explicit-refusal failure; on a network where the first address is
+  blackholed (e.g. a stale IPv6 answer on a broken v6 route), the dial hung
+  until the connect timeout expired without ever trying the v4 address that
+  would have connected. The dialing loop now matches ureq's own TCP
+  connector: the overall connect budget is split across resolved addresses,
+  address-specific failures (refused, host/network unreachable, address
+  unavailable) and dial timeouts fall through to the next address while
+  budget remains, and the total dial is bounded by the connect timeout.
+
 ### Added
 
 - **macOS x86_64 (Intel) release target:** a `choreographr-<version>-x86_64-apple-darwin.tar.gz`
