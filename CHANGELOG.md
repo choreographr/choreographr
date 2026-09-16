@@ -92,8 +92,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `shutdown(SD_BOTH)` on every registered socket before closing it, so a cancel
   or a suspend can now un-block an inference worker wedged in a provider read
   on Windows — the same service `shutdown(SHUT_RDWR)` provides on Unix.
-  `prune_dead` probes each socket for liveness with the same non-blocking
-  `recv(MSG_PEEK)` technique the Unix path uses (via `ioctlsocket(FIONBIO)`),
+  `prune_dead` probes each socket for liveness with the same verdicts the
+  Unix `recv(MSG_PEEK)` probe uses (EOF / unsolicited data / reset ⇒ dead),
+  but through a purely observational zero-timeout `WSAPoll`: the probe never
+  flips `FIONBIO`, so it cannot misclassify live sockets while a worker is
+  blocked in a provider read (`ioctlsocket` is not permitted then) and cannot
+  touch the blocking mode shared with the caller's twin handle; a failed poll
+  keeps conservatively instead of closing a possibly-healthy connection,
   replacing the old "close the oldest entry once the 256-entry cap is hit"
   stand-in; and `SocketTuning::apply` applies `SO_KEEPALIVE` plus the idle /
   interval timings through `WSAIoctl(SIO_KEEPALIVE_VALS)` (Windows has no

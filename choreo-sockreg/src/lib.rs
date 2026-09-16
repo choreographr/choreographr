@@ -38,9 +38,12 @@
 //!
 //! Unix uses `nix`. Windows implements the same public API via `windows-sys`:
 //! `shutdown_all` issues a Winsock `shutdown(SD_BOTH)` (to un-block a peer
-//! thread) then closes the duplicate handle; `prune_dead` probes liveness with
-//! a non-blocking `recv(MSG_PEEK)` (the `TcpTransport::is_open` technique); and
-//! `SocketTuning::apply` sets `SO_KEEPALIVE` plus the timings through
+//! thread) then closes the duplicate handle; `prune_dead` probes liveness via a
+//! purely observational zero-timeout `WSAPoll` plus a `recv(MSG_PEEK)` verdict
+//! only when an event is pending — deliberately NOT the FIONBIO flip
+//! `TcpTransport::is_open` uses (changing the mode is not permitted while a
+//! peer thread is blocked on the socket and is shared with the twin handle);
+//! and `SocketTuning::apply` sets `SO_KEEPALIVE` plus the timings through
 //! `WSAIoctl(SIO_KEEPALIVE_VALS)`.
 
 #![forbid(unsafe_op_in_unsafe_fn)]

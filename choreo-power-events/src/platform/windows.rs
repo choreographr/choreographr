@@ -20,6 +20,17 @@
 //! deliberate leak the macOS backend uses for its run-loop context). The
 //! callback must return promptly, so it only does a non-blocking channel
 //! `send` — all real work happens on the consumer's thread.
+//!
+//! # One registration per process
+//!
+//! The leak has a consequence: every successful `PowerMonitor::new()` on
+//! Windows permanently leaks one context + channel and one OS registration
+//! (`UnregisterSuspendResumeNotification` is deliberately never called —
+//! reclaiming them would need the handle to outlive a monitor `Drop`, which
+//! buys nothing). Create the monitor ONCE per process (as the daemon does,
+//! via `PowerMonitor::best_effort` at startup) and never re-create it; a
+//! second monitor's callback would only send into a dropped receiver anyway
+//! (harmless, one debug log per power event).
 
 use std::ffi::c_void;
 
@@ -82,6 +93,11 @@ unsafe extern "system" fn power_callback(
 /// Registration happens HERE (on the caller's thread) so a failure can be
 /// logged before degrading to the inert monitor, exactly like the macOS
 /// backend's registration step.
+///
+/// Call at most ONCE per process: a successful registration is never
+/// unregistered and its context is deliberately leaked so the system-thread
+/// callback stays valid (see the module docs' "One registration per
+/// process"); repeated calls simply multiply that leak.
 // `Result` is intentional even though this backend never returns `Err`: it
 // keeps the platform modules' contract uniform (`crate::platform::spawn_monitor`
 // dispatches on `windows::spawn_monitor()` exactly like the Linux/macOS arms),

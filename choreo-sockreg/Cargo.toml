@@ -27,11 +27,18 @@ tracing.workspace = true
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["socket", "net", "fs"] }
 
-# Winsock FFI for the Windows path: shutdown/recv/ioctlsocket/setsockopt/
+# Winsock FFI for the Windows path: shutdown/recv/WSAPoll/setsockopt/
 # WSAIoctl live in WinSock; WSAIoctl's signature also names
 # Win32_System_IO::OVERLAPPED, so that feature is required too.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }
+
+[dev-dependencies]
+# crossbeam per the AGENTS.md house rule: cross-thread messaging (the
+# reader-thread handshake in `tests/windows_registry.rs`) always uses
+# crossbeam_channel, never std::sync::mpsc — here only as a test dependency,
+# since the library itself is threadless by design.
+crossbeam-channel.workspace = true
 
 [dependencies.ureq]
 workspace = true

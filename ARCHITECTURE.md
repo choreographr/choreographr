@@ -765,7 +765,7 @@ module uses `nix`/`std::os::fd`, which do not exist there).
 
 | Module | Purpose |
 |---|---|
-| `socket_registry.rs` | `SocketRegistry` — `register` / `shutdown_all` / `prune_dead` / `registered_count`; cheap `Clone` (shared fd list). `shutdown_all` uses `shutdown(SHUT_RDWR)` (Unix) / `shutdown(SD_BOTH)` (Windows) to un-block readers; `prune_dead` probes with a non-blocking `recv(MSG_PEEK)` on both (Windows reuses `ioctlsocket(FIONBIO)`) |
+| `socket_registry.rs` | `SocketRegistry` — `register` / `shutdown_all` / `prune_dead` / `registered_count`; cheap `Clone` (shared fd list). `shutdown_all` uses `shutdown(SHUT_RDWR)` (Unix) / `shutdown(SD_BOTH)` (Windows) to un-block readers; `prune_dead` probes liveness — Unix via a non-blocking `recv(MSG_PEEK)` (flags saved/restored), Windows via a purely observational zero-timeout `WSAPoll` (no FIONBIO flip: `ioctlsocket` is forbidden while a peer thread is blocked on the same socket, and the mode is shared with the caller's twin handle; a failed poll keeps conservatively, never a false "dead") |
 | `tuning.rs` | `SocketTuning` — TCP keepalive (idle/interval/retries) applied post-connect. Unix sets `SO_KEEPALIVE` + per-platform timing sockopts; Windows sets `SO_KEEPALIVE` + the timings via `WSAIoctl(SIO_KEEPALIVE_VALS)` |
 | `connector.rs` | `RegisteringTcpConnector` (`ureq` feature) — dialing connector that registers every socket; mirrors ureq's address-fallback face (geometric per-address budget split, fall-through on address-specific failures and on dial timeouts while overall connect budget remains, ureq #1184 parity) |
 

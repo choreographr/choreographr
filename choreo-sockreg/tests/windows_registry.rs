@@ -42,7 +42,12 @@ fn shutdown_all_unblocks_blocking_reader() {
     let dup = client.try_clone().expect("try_clone");
     let _id = registry.register(OwnedSocket::from(dup));
 
-    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<usize>>();
+    // crossbeam per the workspace house rule (never std::sync::mpsc for
+    // cross-thread messaging, even in tests):
+    // - unbounded like the production event paths;
+    // - `send` returning an Err on a dropped receiver keeps this a fair
+    //   handshake (a `try_send`-style embedding would lose that).
+    let (tx, rx) = crossbeam_channel::bounded::<std::io::Result<usize>>(1);
     let mut reader_client = client;
     let reader = std::thread::spawn(move || {
         let mut buf = [0u8; 64];
@@ -51,6 +56,8 @@ fn shutdown_all_unblocks_blocking_reader() {
 
     registry.shutdown_all();
 
+    // Blocking `recv` is fine here: the reader thread's send is the only
+    // sender and the runtime is the (single) consumer — a plain handshake.
     let sent = rx.recv().expect("reader thread sent its read result");
     match sent {
         Ok(0) => {}

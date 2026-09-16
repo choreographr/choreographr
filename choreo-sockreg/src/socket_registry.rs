@@ -307,14 +307,22 @@ impl SocketRegistry {
     /// Probes every registered handle and removes (and closes) the dead ones.
     ///
     /// The Winsock probe mirrors ureq's `TcpTransport::is_open` (and the Unix
-    /// `probe_alive`): flip the socket non-blocking, do a 1-byte
-    /// `recv(MSG_PEEK)`, then restore blocking mode.
+    /// `probe_alive`) in its verdicts but NOT its mechanism: it uses a zero-
+    /// timeout `WSAPoll` to check readability, and only issues a 1-byte
+    /// `recv(MSG_PEEK)` — which then cannot block — when Winsock reports an
+    /// event. Unlike the historical FIONBIO flip, this never mutates the
+    /// socket's blocking mode (which is per-SOCKET, shared with the caller's
+    /// twin handle), and never touches socket state while a peer thread is
+    /// blocked in a provider read (the exact case `prune_dead` exists for,
+    /// and a scenario where mode changes are not permitted).
     ///
-    /// * `WSAEWOULDBLOCK` — nothing buffered to read, socket alive: keep.
+    /// * poll-then-peek verdicts: `WSAEWOULDBLOCK` — nothing usable
+    ///   buffered, socket alive: keep.
     /// * `recv == Ok(0)` — EOF (peer closed): remove and close.
     /// * `recv == Ok(n>0)` — unsolicited peer data (the stream is already
     ///   corrupt for us, as ureq treats it): remove and close.
     /// * any other Winsock error (`WSAECONNRESET`, `WSAENOTSOCK`, …) — dead.
+    ///   A failed poll itself keeps conservatively (never a false "dead").
     ///
     /// Returns the number of dead entries removed and closed.
     #[cfg(windows)]
@@ -452,48 +460,90 @@ fn probe_alive(fd: std::os::fd::BorrowedFd<'_>) -> bool {
 }
 
 /// The liveness probe (Windows). Returns `true` when the socket looks usable
-/// (see `prune_dead`'s docs). Windows has no way to READ the current FIONBIO
-/// state (`ioctlsocket` is set-only), so the probe restores BLOCKING mode —
-/// correct for every socket this registry holds (the connector registers
-/// `try_clone`d blocking `std::net::TcpStream`s).
+/// (see `prune_dead`'s docs).
+///
+/// Mechanism: a zero-timeout `WSAPoll(POLLIN)` — NO FIONBIO flip. The old
+/// approach (flip non-blocking, peek, restore blocking) had two hazards the
+/// poll form eliminates: (a) `ioctlsocket(FIONBIO)` is documented to fail
+/// while a blocking Winsock call is in progress on the same socket — i.e.
+/// exactly when a worker thread is wedged in a provider read, so failure
+/// would have misclassified live wedged sockets as dead; (b) the mode is
+/// per-SOCKET (shared with the caller's twin handle), so silently restoring
+/// BLOCKING mode would have corrupted any non-blocking socket ever
+/// registered through the public `register` API.
+///
+/// Verdict mapping (`WSAPoll` timeout 0, `revents` from Winsock):
+/// * `WSAPoll` itself fails — keep CONSERVATIVELY (like `WSAEINTR` on the
+///   Unix path and like `WSAEWOULDBLOCK` used to be): an unusable poll does
+///   not prove the connection is dead, and a false "dead" verdict closes a
+///   possibly-healthy provider connection. The next probe / the failure to
+///   use the socket will surface the real problem.
+/// * `POLLNVAL` — invalid handle: dead.
+/// * no revents (idle, healthy): alive.
+/// * any event (POLLIN / POLLHUP / POLLERR): fall through to a 1-byte
+///   `recv(MSG_PEEK)`, which now cannot block (Winsock guarantees recv
+///   returns immediately once the event signals a pending error), and map
+///   like the Unix probe: `WSAEWOULDBLOCK`/`WSAEINTR` → conservatively
+///   alive; anything else, EOF (`0`), or unsolicited data (`n > 0`) → dead.
 #[cfg(windows)]
 fn probe_alive(socket: std::os::windows::io::BorrowedSocket<'_>) -> bool {
     use std::os::windows::io::AsRawSocket;
 
     use windows_sys::Win32::Networking::WinSock::{
-        FIONBIO, MSG_PEEK, SOCKET_ERROR, WSAEINTR, WSAEWOULDBLOCK, WSAGetLastError, ioctlsocket,
-        recv,
+        MSG_PEEK, POLLIN, POLLNVAL, SOCKET_ERROR, WSAEINTR, WSAEWOULDBLOCK, WSAGetLastError,
+        WSAPOLLFD, WSAPoll, recv,
     };
 
     // SOCKET is `usize` in windows-sys but std's RawSocket differs on 64-bit;
     // `socket_handle` bridges them (see its docs).
     let raw = crate::socket_handle(socket.as_raw_socket());
-    // Flip to non-blocking so the peek returns immediately instead of
-    // blocking on an idle-but-open socket.
-    let mut nonblocking: u32 = 1;
-    // SAFETY: `raw` is a live SOCKET; FIONBIO takes a *mut u32 flag
-    // (nonzero = non-blocking). `&raw mut` is the raw-pointer form clippy
-    // prefers over an implicitly-coerced `&mut`.
-    if unsafe { ioctlsocket(raw, FIONBIO, &raw mut nonblocking) } == SOCKET_ERROR {
+
+    // Ask ONLY (timeout 0): is there an event pending? Nothing is mutated —
+    // unlike FIONBIO, poll is purely observational.
+    let mut pfd = WSAPOLLFD {
+        fd: raw,
+        events: POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` lives for the duration of the synchronous (timeout 0)
+    // call and the array pointer covers exactly one entry.
+    let rc = unsafe { WSAPoll(&raw mut pfd, 1, 0) };
+    if rc == SOCKET_ERROR {
+        // SAFETY: reads this thread's last Winsock error.
+        let err = unsafe { WSAGetLastError() };
+        tracing::debug!(
+            handle = raw,
+            error = err,
+            "probe poll failed; keeping conservatively"
+        );
+        return true;
+    }
+
+    // Zero-event result: the connection is open and idle — the definition
+    // of "alive" for this probe.
+    if pfd.revents == 0 {
+        return true;
+    }
+    // An invalid handle is unambiguously dead — and `recv` could "succeed"
+    // on a stale value from a different future socket, so bail before peeking.
+    if pfd.revents & POLLNVAL != 0 {
         return false;
     }
 
+    // Some event (POLLIN, POLLHUP, POLLERR — possibly combined) is pending;
+    // `recv(MSG_PEEK)` therefore returns immediately with the outcome. The
+    // peek leaves the receive queue untouched, so a retry elsewhere (the
+    // worker's own read, or a later probe) still sees the same data.
     let mut buf = [0u8; 1];
-    // SAFETY: `buf` is one byte and `raw` is live; MSG_PEEK leaves the
-    // receive queue untouched; non-blocking mode makes this immediate.
+    // SAFETY: `buf` is one byte and `raw` is the socket just polled; progress
+    // is pending, so this cannot block.
     let n = unsafe { recv(raw, buf.as_mut_ptr(), 1, MSG_PEEK) };
-
-    // Restore blocking mode regardless of the verdict (0 = blocking).
-    let mut blocking: u32 = 0;
-    // SAFETY: same live SOCKET; a zero flag clears FIONBIO.
-    let _ = unsafe { ioctlsocket(raw, FIONBIO, &raw mut blocking) };
-
     if n == SOCKET_ERROR {
         // SAFETY: reads this thread's last Winsock error.
         let err = unsafe { WSAGetLastError() };
-        // Nothing buffered, no error: open and idle => alive. EINTR is an
-        // indeterminate interrupted probe; keep conservatively (mirrors the
-        // Unix path).
+        // WOULDBLOCK here is unexpected (an event was reported) and EINTR an
+        // indeterminate interrupted probe: keep conservatively (mirrors the
+        // Unix path). ECONNRESET, ENOTSOCK, ETIMEDOUT, …: dead.
         return err == WSAEWOULDBLOCK || err == WSAEINTR;
     }
     // Ok(0) = EOF, Ok(n>0) = unsolicited data: both mean the connection is

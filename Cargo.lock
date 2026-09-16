@@ -3084,6 +3084,7 @@ dependencies = [
 name = "choreo-sockreg"
 version = "0.2.0"
 dependencies = [
+ "crossbeam-channel",
  "nix 0.31.3",
  "tracing",
  "ureq",
