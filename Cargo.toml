@@ -135,7 +135,7 @@ default-members = [".", "choreo-tui"]
 # relative to the workspace root (the file that lives at ./README.md).
 [workspace.package]
 rust-version = "1.95.0"
-version = "0.2.0"
+version = "0.2.1"
 license = "Apache-2.0"
 repository = "https://github.com/choreographr/choreographr"
 homepage = "https://choreographr.com"
