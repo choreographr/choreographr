@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Removed the orphaned `dua.jpg` demo asset and its dead `REQUEST_IMAGE_*`
+  constants.** The image was left behind after the demo `/image` command was
+  removed: `choreo-daemon` still embedded it via `include_bytes!` and re-exported
+  `REQUEST_IMAGE_BYTES` / `REQUEST_IMAGE_WIDTH` / `REQUEST_IMAGE_HEIGHT` /
+  `REQUEST_IMAGE_MIME_TYPE` from its public API, but nothing in the workspace
+  consumed them — the constants survived only as compiled-in dead weight
+  (~57 KiB per build) with no remaining user. The asset file, the four constants,
+  and the re-export are gone; the image-generation path is unaffected.
+
 ### Fixed
 
 - **`read_file_range` no longer rejects calls that omit the range fields** —

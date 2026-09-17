@@ -24,9 +24,6 @@ pub use crate::daemon::{DaemonCommand, DaemonState, OpenOptions};
 pub use crate::embedded::{EmbeddedDaemon, EmbeddedLink, EmbeddedOptions, spawn_embedded};
 #[cfg(feature = "test-utils")]
 pub use crate::reasoning::build_chat_request_messages;
-pub use crate::requests::{
-    REQUEST_IMAGE_BYTES, REQUEST_IMAGE_HEIGHT, REQUEST_IMAGE_MIME_TYPE, REQUEST_IMAGE_WIDTH,
-};
 pub use crate::server::run_server;
 #[cfg(feature = "test-utils")]
 pub use crate::sessions::join_session_shutdown_with_grace_for_test;

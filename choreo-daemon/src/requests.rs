@@ -1344,10 +1344,6 @@ pub(crate) fn run_agent_loop(
 /// Anthropic/OpenAI high-detail run higher). This feeds the context-window
 /// display and compaction weighting, not billing (which uses provider usage).
 pub const IMAGE_TOKEN_ESTIMATE: u32 = 1000;
-pub const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
-pub const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
-pub const REQUEST_IMAGE_WIDTH: u32 = 640;
-pub const REQUEST_IMAGE_HEIGHT: u32 = 640;
 
 #[cfg(test)]
 // Every test in this module reads the process-wide `PROVIDER_CATALOG`
