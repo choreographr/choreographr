@@ -320,6 +320,14 @@ check-supply-chain:
 check-release-name:
     ./scripts/check-release-name.sh
 
+# CHANGELOG structure guard: every `## [X.Y.Z]` section may carry each Keep a
+# Changelog category (Added/Changed/Deprecated/Removed/Fixed/Security) AT MOST
+# ONCE, with no empty blocks. The release job extracts the version's section
+# verbatim as the release body, so a duplicated `### Fixed` would ship as two
+# Fixed sections on the release page. See scripts/check-changelog.sh.
+check-changelog:
+    ./scripts/check-changelog.sh
+
 # Install the dependency-policy tool cargo-deny (the authoritative layer of
 # check-supply-chain). Without it the script falls back to cargo-audit + a
 # literal lockfile scan, which covers advisories but not hard version bans.
@@ -328,11 +336,13 @@ install-cargo-deny:
 
 # Run this before `git commit` — it must pass green.
 # The pre-commit gate from AGENTS.md: formatting, lints, the full suite, and
-# the supply-chain checks (deny.toml bans + RustSec advisories + cache scan).
-pre-commit: fmt-check clippy test-all check-supply-chain check-release-name
+# the supply-chain checks (deny.toml bans + RustSec advisories + cache scan)
+# plus the release-metadata guards (release-name drift + changelog structure).
+pre-commit: fmt-check clippy test-all check-supply-chain check-release-name check-changelog
 
 # CI gate: format check + warnings-denied lints + full suite + supply chain
-ci: fmt-check clippy-strict test-all check-supply-chain check-release-name
+# + the release-metadata guards (release-name drift + changelog structure).
+ci: fmt-check clippy-strict test-all check-supply-chain check-release-name check-changelog
 
 # ── running ───────────────────────────────────────────────────────────────────
 

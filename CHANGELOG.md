@@ -7,59 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Removed
-
-- **Removed the orphaned `dua.jpg` demo asset and its dead `REQUEST_IMAGE_*`
-  constants.** The image was left behind after the demo `/image` command was
-  removed: `choreo-daemon` still embedded it via `include_bytes!` and re-exported
-  `REQUEST_IMAGE_BYTES` / `REQUEST_IMAGE_WIDTH` / `REQUEST_IMAGE_HEIGHT` /
-  `REQUEST_IMAGE_MIME_TYPE` from its public API, but nothing in the workspace
-  consumed them — the constants survived only as compiled-in dead weight
-  (~57 KiB per build) with no remaining user. The asset file, the four constants,
-  and the re-export are gone; the image-generation path is unaffected.
-
-### Fixed
-
-- **`read_file_range` no longer rejects calls that omit the range fields** —
-  `start_line` defaults to `1` and `max_lines` to the 500-line cap, so calling
-  it with only `path` reads the whole file (with its usual range metadata)
-  instead of failing with "missing field `start_line`".
-- **`http_request` no longer rejects calls that omit `method`** — the field
-  now defaults to `GET` (the schema marks it optional), and method names are
-  case-normalized (`"get"` behaves like `"GET"`), so the model-facing
-  failures "missing field `method`" and unsupported lowercase variants are
-  gone.
-- **`http_request` sends the same structured `User-Agent`
-  (`choreographr/<daemon version>`) as inference requests** instead of a
-  stale hardcoded `choreographr/0.1`; the product string is now shared via
-  a single helper. An explicit caller-supplied `User-Agent` header still
-  overrides it (matched case-insensitively) — the default is now applied only
-  when the caller omits one, because ureq *appends* request headers, so the
-  old "set ours, then the caller's" order put two `user-agent` lines on the
-  wire instead of replacing ours.
-- **`http_request` reports the timeout and method it actually uses.** The
-  `timeout_secs` argument's schema text claimed a 30-second default while the
-  tool defaulted to 10s and clamped to 1–30s, and the invocation summary
-  echoed the raw (unclamped) value while the request used the clamped one;
-  the default, bounds, and summary now derive from one helper. The summary
-  also upper-cases the method (`"get"` is shown as `GET`) to match the
-  canonical form the request dispatch uses.
-- **Provider connections no longer stall or give up when the first resolved
-  IP is unreachable instead of declining the connection.** The daemon's HTTP
-  connector previously only moved on to the next resolved address after an
-  explicit-refusal failure; on a network where the first address is
-  blackholed (e.g. a stale IPv6 answer on a broken v6 route), the dial hung
-  until the connect timeout expired without ever trying the v4 address that
-  would have connected. The dialing loop now matches ureq's own TCP
-  connector: the overall connect budget is split across resolved addresses,
-  address-specific failures (refused, host/network unreachable, address
-  unavailable) and dial timeouts fall through to the next address while
-  budget remains, and the total dial is bounded by the connect timeout. A
-  fast address-specific failure (a refusal or an unreachable route) leaves the
-  next address's time slice intact — it consumed no budget — whereas a dial
-  timeout halves it, exactly as ureq's own geometric scheduling does.
-
 ### Added
+
+- **A `check-changelog` guard now enforces the CHANGELOG category rule.**
+  Every `## [...]` section may carry each Keep a Changelog category heading
+  (`### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`,
+  `### Security`) at most once, must not invent an unknown heading, and must
+  not leave a category empty. It runs in `just pre-commit`/`just ci`
+  (`just check-changelog`, via `scripts/check-changelog.sh`) and in the release
+  workflow *before* the release body is extracted, so a malformed section
+  fails the release instead of shipping a release page with two Fixed
+  sections.
 
 - **macOS x86_64 (Intel) release target:** a `choreographr-<version>-x86_64-apple-darwin.tar.gz`
   now ships alongside the arm64 tarball. It is cross-built in the same
@@ -199,7 +157,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is renamed `effective_provider_slug` so it no longer shadows the
   `provider_slug` field.
 
+### Removed
+
+- **Removed the orphaned `dua.jpg` demo asset and its dead `REQUEST_IMAGE_*`
+  constants.** The image was left behind after the demo `/image` command was
+  removed: `choreo-daemon` still embedded it via `include_bytes!` and re-exported
+  `REQUEST_IMAGE_BYTES` / `REQUEST_IMAGE_WIDTH` / `REQUEST_IMAGE_HEIGHT` /
+  `REQUEST_IMAGE_MIME_TYPE` from its public API, but nothing in the workspace
+  consumed them — the constants survived only as compiled-in dead weight
+  (~57 KiB per build) with no remaining user. The asset file, the four constants,
+  and the re-export are gone; the image-generation path is unaffected.
+
 ### Fixed
+
+- **`[Unreleased]` had two `### Fixed` blocks, which would have shipped a
+  release page with two Fixed sections.** The duplicate arose because a fresh
+  `### Fixed` heading was inserted at the top of the section (before the
+  existing `### Added`/`### Changed`/`### Fixed` blocks) rather than appending
+  the bullet under the already-present `### Fixed` further down, and every
+  later commit added to the new top block. The entries are merged into a single
+  `### Fixed` and the section now follows the canonical
+  Added/Changed/Removed/Fixed order; the new `check-changelog` guard prevents a
+  recurrence.
+
+- **`read_file_range` no longer rejects calls that omit the range fields** —
+  `start_line` defaults to `1` and `max_lines` to the 500-line cap, so calling
+  it with only `path` reads the whole file (with its usual range metadata)
+  instead of failing with "missing field `start_line`".
+- **`http_request` no longer rejects calls that omit `method`** — the field
+  now defaults to `GET` (the schema marks it optional), and method names are
+  case-normalized (`"get"` behaves like `"GET"`), so the model-facing
+  failures "missing field `method`" and unsupported lowercase variants are
+  gone.
+- **`http_request` sends the same structured `User-Agent`
+  (`choreographr/<daemon version>`) as inference requests** instead of a
+  stale hardcoded `choreographr/0.1`; the product string is now shared via
+  a single helper. An explicit caller-supplied `User-Agent` header still
+  overrides it (matched case-insensitively) — the default is now applied only
+  when the caller omits one, because ureq *appends* request headers, so the
+  old "set ours, then the caller's" order put two `user-agent` lines on the
+  wire instead of replacing ours.
+- **`http_request` reports the timeout and method it actually uses.** The
+  `timeout_secs` argument's schema text claimed a 30-second default while the
+  tool defaulted to 10s and clamped to 1–30s, and the invocation summary
+  echoed the raw (unclamped) value while the request used the clamped one;
+  the default, bounds, and summary now derive from one helper. The summary
+  also upper-cases the method (`"get"` is shown as `GET`) to match the
+  canonical form the request dispatch uses.
+- **Provider connections no longer stall or give up when the first resolved
+  IP is unreachable instead of declining the connection.** The daemon's HTTP
+  connector previously only moved on to the next resolved address after an
+  explicit-refusal failure; on a network where the first address is
+  blackholed (e.g. a stale IPv6 answer on a broken v6 route), the dial hung
+  until the connect timeout expired without ever trying the v4 address that
+  would have connected. The dialing loop now matches ureq's own TCP
+  connector: the overall connect budget is split across resolved addresses,
+  address-specific failures (refused, host/network unreachable, address
+  unavailable) and dial timeouts fall through to the next address while
+  budget remains, and the total dial is bounded by the connect timeout. A
+  fast address-specific failure (a refusal or an unreachable route) leaves the
+  next address's time slice intact — it consumed no budget — whereas a dial
+  timeout halves it, exactly as ureq's own geometric scheduling does.
 
 - **The context window and reasoning capability no longer blink out on a
   locked keystore.** A session's static catalog facts — the model's context

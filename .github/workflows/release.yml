@@ -735,6 +735,12 @@ jobs:
           # the complete release, exactly like release.sh's dist/ glob.
           ( cd dist && sha256sum choreographr-* > SHA256SUMS && cat SHA256SUMS )
 
+      - name: Check the changelog is well-formed
+        # Fail before extraction: the extractor is heading-agnostic and would
+        # happily ship a section with two `### Fixed` blocks (rendering two
+        # Fixed sections on the release page). Guard the structure up front.
+        run: ./scripts/check-changelog.sh
+
       - name: Extract the changelog section for this version
         # The release body is the curated CHANGELOG.md section, not just the
         # auto-generated commit list. Keep a Changelog flow (RELEASE.md Phase

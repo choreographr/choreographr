@@ -77,7 +77,9 @@ The `release` job (tag pushes only) downloads the three shipping platforms'
 build artifacts (`linux-musl`, `macos-arm64`, `android-termux` — deliberately
 not the not-yet-shipped `windows-msvc`),
 generates one combined `SHA256SUMS` over everything, guards that the pushed
-tag matches the manifest version, extracts the version's section from
+tag matches the manifest version, runs the `check-changelog` guard (a repeated
+or unknown `### ` category heading in a `## [...]` section fails the job
+before extraction), extracts the version's section from
 `CHANGELOG.md` (the Keep a Changelog promotion from Phase 1 makes it the
 release body — a missing section fails the job), runs the `check-release-name`
 guard, and creates the release with
@@ -226,7 +228,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/cred
    > job extracts the `## [X.Y.Z]` section from `CHANGELOG.md` for the release
    > body and fails the job if it is absent — the curated notes are the
    > release notes, not an afterthought. The heading may carry an optional
-   > `- YYYY-MM-DD` date and ` (Name)`. The release **title** now comes from
+   > `- YYYY-MM-DD` date and ` (Name)`. The job also runs the `check-changelog`
+   > guard first, so a section that repeats a category heading (e.g. two
+   > `### Fixed` blocks) fails before extraction rather than shipping a
+   > malformed release page. The release **title** now comes from
    > `choreo-proto/release-name.txt` (not the heading) — but the job first runs
    > the `check-release-name` guard, so the heading and the file must agree.
 
@@ -602,7 +607,7 @@ Finally, commit any post-release doc/version drift in this repo and push.
 
 - [ ] `just ci` green; tree clean; master pulled
 - [ ] MSRV sync: `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'` → update `rust-version` in `[workspace.package]` (with `Cargo.lock`) if changed
-- [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD (Name)` section — ` (Name)` for a major/minor release (name picked at release time), or the current series name kept for a patch — with a fresh empty `[Unreleased]` + compare link above it
+- [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD (Name)` section — ` (Name)` for a major/minor release (name picked at release time), or the current series name kept for a patch — with a fresh empty `[Unreleased]` + compare link above it (structure enforced by `just check-changelog`: one heading per category, no empty blocks)
 - [ ] `choreo-proto/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch; must match the ` (Name)` on the CHANGELOG heading (enforced by `just check-release-name`)
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -p choreographr -x` → `vX.Y.Z` (the explicit `-p` avoids a stray `choreo-tui-vX.Y.Z` tag)
 - [ ] Signed in to crates.io (Phase 2 step 0): the `/api/v1/me` token check returns `200`, else `cargo login` a token with the publish-new/publish-update scopes
