@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opens the model selector only on legacy terminals; on kitty-protocol
   terminals the binding is `Ctrl+M`.
 
+- **Command dispatch is table-driven end to end in `choreo-tui`.** The Chat
+  page now resolves *every* command shortcut through the single logical
+  shortcut table before page key handling — including the non-Ctrl `Alt+Enter`,
+  which previously needed its own hard-coded match arm — so a key and its typed
+  `/command` spelling share one dispatcher. The dispatcher itself moved out of
+  the (already large) `connection/chat.rs` into `connection/command.rs`, and
+  `parse_input_line` dropped its now-unused `attached_session_id` argument.
+
 ### Removed
 
 - **The `/models` alias is gone — use `/model`.**
@@ -79,6 +87,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The Responses `reasoning` object is likewise emitted only when the selected
   model actually supports reasoning — a non-reasoning model never receives any
   reasoning configuration at all, even a stray effort.
+
+- **`Shift+Enter` no longer inserts a newline in command-entry mode.** The
+  command line is single-line, so a stray `\n` only made the parser reject an
+  otherwise-valid command; `Shift+Enter` now runs the command exactly like
+  plain `Enter` (both are intercepted before the prompt's newline binding).
+
+- **The inline command palette no longer recomputes the Chat-page layout.**
+  `render_chat` returns the command input box rect it already laid out and the
+  palette reuses it, so the layout solver runs once per frame instead of twice.
 
 ## [0.2.1] - 2026-09-17 (Lindy)
 

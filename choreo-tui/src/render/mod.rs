@@ -76,11 +76,20 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
-    match app.page {
-        Page::Chat => render_chat(frame, app),
-        Page::SessionManager => render_session_manager(frame, app),
-        Page::AIProviders => render_ai_providers(frame, app),
-    }
+    // `render_chat` returns the command input box `Rect` it just laid out, so
+    // the command palette (drawn below) can reuse it instead of recomputing
+    // the whole Chat-page layout a second time in the same frame.
+    let chat_input_rect = match app.page {
+        Page::Chat => Some(render_chat(frame, app)),
+        Page::SessionManager => {
+            render_session_manager(frame, app);
+            None
+        }
+        Page::AIProviders => {
+            render_ai_providers(frame, app);
+            None
+        }
+    };
 
     // The model selector overlay draws on top of the Chat page content.
     if app.model_selector.is_open() {
@@ -90,9 +99,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     // The inline command palette floats above the command input box on the
     // Chat page.  Drawn after the model selector so the selector (when open)
     // covers it; it is suppressed entirely while the selector is open (see
-    // `command_palette_active`).
-    if app.page == Page::Chat && app.command_palette_active() {
-        render_command_palette(frame, app);
+    // `command_palette_active`).  It reuses the input-box rect `render_chat`
+    // just computed rather than re-deriving the layout.
+    if let Some(input_rect) = chat_input_rect
+        && app.command_palette_active()
+    {
+        render_command_palette(frame, app, input_rect);
     }
 }
 
@@ -207,7 +219,7 @@ fn render_fullscreen_image(
     render_fullscreen_placeholder(frame);
 }
 
-fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
+fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
     // Compute the Chat page's vertical layout via the shared helper so that
     // rendering, mouse hit-testing (connection.rs click-to-position), and the
     // history viewport (update_viewport_from_terminal_size) all use identical
@@ -497,6 +509,10 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
     let status_bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Reset));
     frame.render_widget(status_bar, status_bar_area);
+
+    // Return the command input box rect so the caller can reuse it (e.g. the
+    // command palette anchored above the box) without recomputing the layout.
+    input_area
 }
 
 fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {

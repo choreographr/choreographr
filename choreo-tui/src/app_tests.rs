@@ -1575,6 +1575,37 @@ fn palette_enter_runs_the_command_and_exits_mode() {
 }
 
 #[test]
+fn palette_shift_enter_runs_the_command_without_a_newline() {
+    // Shift must not insert a newline in command mode: the command line is
+    // single-line, so `Shift+Enter` runs the command exactly like plain
+    // `Enter` (both are intercepted before the prompt's newline binding).
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    for c in "model".chars() {
+        press(&mut app, &tx, KeyCode::Char(c));
+    }
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        &mut app,
+        &tx,
+    )
+    .expect("shift+enter");
+
+    assert!(
+        app.model_selector.is_open(),
+        "Shift+Enter runs the command like Enter"
+    );
+    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert!(!app.command_mode, "running the command exits command mode");
+    assert!(
+        app.input.text.is_empty(),
+        "no stray newline survives command-mode completion"
+    );
+}
+
+#[test]
 fn palette_enter_on_empty_line_is_a_noop() {
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();

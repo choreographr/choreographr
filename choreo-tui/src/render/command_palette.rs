@@ -25,9 +25,12 @@ pub(super) const COMMAND_PALETTE_MAX_ROWS: usize = 8;
 
 /// Draw the inline command palette above the command input box.
 ///
+/// `input` is the command input box `Rect` the caller (`render_chat`) already
+/// laid out — passed in so the palette never recomputes the Chat-page layout.
+///
 /// No-op (draws nothing) when the palette has no matches, when there is no room
 /// above the input box (`input.y == 0`), or on a zero-area box.
-pub(super) fn render_command_palette(frame: &mut Frame<'_>, app: &mut App) {
+pub(super) fn render_command_palette(frame: &mut Frame<'_>, app: &mut App, input: Rect) {
     let matches = app.command_palette_matches();
     if matches.is_empty() {
         return;
@@ -35,11 +38,9 @@ pub(super) fn render_command_palette(frame: &mut Frame<'_>, app: &mut App) {
 
     // Anchor to the command input box: the palette's bottom edge sits on the
     // box's top border and shares its left edge and width, so it never covers
-    // the input box or the status bar beneath it.  Geometry comes from the
-    // shared `input_box_rect` so it tracks the box even on tiny terminals where
-    // the layout solver relocates it.
-    let area = frame.area();
-    let input = app.input_box_rect(area.width, area.height);
+    // the input box or the status bar beneath it.  `input` is the same shared
+    // geometry `render_chat` laid out, so it tracks the box even on tiny
+    // terminals where the layout solver relocates it.
     if input.y == 0 {
         // The box is at the very top of the screen: drawing the palette above
         // it would either cover the box or fall off-screen, so draw nothing.

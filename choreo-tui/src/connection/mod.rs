@@ -41,6 +41,7 @@ use std::{thread, time::Duration};
 // module only — because nothing outside the connection glue calls them.
 mod ai_providers;
 mod chat;
+mod command;
 mod daemon;
 mod model_selector;
 mod session_manager;

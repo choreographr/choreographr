@@ -104,7 +104,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
     let _ = state.chat_id_tx.send(chat_id_val);
 
     let mut request_id = state.request_id.get();
-    let command = parse_input_line(text, &mut request_id, None);
+    let command = parse_input_line(text, &mut request_id);
     state.request_id.set(request_id);
 
     match command {

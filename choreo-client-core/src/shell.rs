@@ -224,18 +224,14 @@ fn parse_model_command(rest: &str) -> Option<Command> {
     None
 }
 
-pub fn parse_input_line(
-    line: &str,
-    next_request_id: &mut u32,
-    attached_session_id: Option<u64>,
-) -> Command {
+pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> Command {
     let line = line.trim();
     if line.is_empty() {
         return Command::Empty;
     }
 
     if let Some(rest) = line.strip_prefix('/') {
-        let cmd = parse_command(rest, next_request_id, attached_session_id);
+        let cmd = parse_command(rest);
         debug!("parsed command: {cmd:?}");
         return cmd;
     }
@@ -248,11 +244,7 @@ pub fn parse_input_line(
     })
 }
 
-fn parse_command(
-    rest: &str,
-    _next_request_id: &mut u32,
-    _attached_session_id: Option<u64>,
-) -> Command {
+fn parse_command(rest: &str) -> Command {
     // Try grouped sub-command parsers before falling through to the flat commands.
     // Session, account, and model commands each have their own mini grammar and
     // were extracted from this function to keep each parser focused.
@@ -521,7 +513,7 @@ mod tests {
     fn refresh_models_parses_plain() {
         let mut id = 0;
         assert_eq!(
-            parse_input_line("/refresh-models", &mut id, None),
+            parse_input_line("/refresh-models", &mut id),
             Command::RefreshModels { force: false },
         );
     }
@@ -530,11 +522,11 @@ mod tests {
     fn refresh_models_parses_force() {
         let mut id = 0;
         assert_eq!(
-            parse_input_line("/refresh-models --force", &mut id, None),
+            parse_input_line("/refresh-models --force", &mut id),
             Command::RefreshModels { force: true },
         );
         assert_eq!(
-            parse_input_line("/refresh-models force", &mut id, None),
+            parse_input_line("/refresh-models force", &mut id),
             Command::RefreshModels { force: true },
         );
     }
@@ -543,7 +535,7 @@ mod tests {
     fn refresh_models_rejects_unknown_args() {
         let mut id = 0;
         assert!(matches!(
-            parse_input_line("/refresh-models --bogus", &mut id, None),
+            parse_input_line("/refresh-models --bogus", &mut id),
             Command::UnknownCommand(_),
         ));
     }

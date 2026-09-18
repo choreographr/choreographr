@@ -43,8 +43,7 @@ pub(crate) fn submit_input(
     state.write().input.clear();
     let command = {
         let mut guard = state.write();
-        let attached = guard.attached_session_id;
-        parse_input_line(&line, &mut guard.next_request_id, attached)
+        parse_input_line(&line, &mut guard.next_request_id)
     };
     handle_shell_command(&mut state.write(), daemon_tx, command);
 }

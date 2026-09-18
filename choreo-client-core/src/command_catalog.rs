@@ -3,9 +3,12 @@
 //! Every command the client understands — whether it ships a [`ClientMessage`]
 //! to the daemon or drives local UI — is described here exactly once. The
 //! catalog is the single source of truth for command discovery and
-//! descriptions (e.g. a future command palette); the parser in [`crate::shell`]
-//! is the single source of truth for *behavior*. The drift-guard tests keep the
-//! two in lockstep: a name present in one but not the other fails the suite.
+//! descriptions (e.g. the TUI command palette); the parser in [`crate::shell`]
+//! is the single source of truth for *behavior*. The drift-guard tests in
+//! `tests.rs` pin the two together: every catalog command must parse, and the
+//! catalog must equal the explicit list of parser command names (which a new
+//! parse arm is required to extend). A catalog entry with no parse arm fails
+//! the suite; a parse arm is caught once it is named in that list.
 //!
 //! [`ClientMessage`]: choreo_proto::ClientMessage
 

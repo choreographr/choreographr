@@ -298,7 +298,13 @@ impl App {
             return;
         };
         self.input.text = format!("{} ", found.spec.name);
-        self.input.cursor = self.input.text.len();
+        // Place the cursor at the end of the completed line via the buffer's
+        // own accessor.  `InputBuffer::cursor` is a BYTE offset (every edit
+        // advances it by `len_utf8`, and the buffer slices on it), so the end
+        // of the text is its byte length — `cursor_end` sets exactly that.  A
+        // char count would desync the cursor from its byte-indexed invariant
+        // the moment the completed line ever held non-ASCII text.
+        self.input.cursor_end();
         self.input.generation += 1;
         self.ensure_input_cursor_visible();
     }
