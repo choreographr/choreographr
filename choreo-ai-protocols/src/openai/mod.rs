@@ -717,15 +717,11 @@ fn annotate_model_usage_error(model: &str, err: OpenAiError) -> OpenAiError {
     let OpenAiError::ClientError { status, detail } = &err else {
         return err;
     };
-    if !is_model_usage_rejection(detail) {
+    // The helper lowercases once and decides both *whether* this is a
+    // model-usability rejection and *how* to phrase it; a `None` here means
+    // the body is unrelated and must pass through verbatim.
+    let Some(reason) = model_usage_rejection_reason(detail) else {
         return err;
-    }
-    // Name the cause only where we can read it plainly; everything else in the
-    // family reads the same to a user ("can't be used here").
-    let reason = if detail.to_ascii_lowercase().contains("not a chat model") {
-        "is not a chat model"
-    } else {
-        "can't be used here"
     };
     // Keep the provider's technical wording for operators — the user only sees
     // the plain line below.
@@ -736,17 +732,37 @@ fn annotate_model_usage_error(model: &str, err: OpenAiError) -> OpenAiError {
     }
 }
 
-/// Whether a provider error body means the selected model cannot be used on
-/// the endpoint (not a chat model / unknown model). The body is free-form
-/// prose, so this is a deliberately narrow substring match over the known
-/// OpenAI-family rejections.
-fn is_model_usage_rejection(detail: &str) -> bool {
+/// Classify a provider error body: `Some(reason)` when it means the selected
+/// model cannot be used on the endpoint, with the short phrase to name the
+/// cause; `None` when it is unrelated (and must pass through verbatim). The
+/// body is free-form prose, so this is a deliberately narrow substring match
+/// over the known OpenAI-family rejections.
+///
+/// `crate::retry::extract_error_message` (in `retry.rs`) unwraps the standard
+/// JSON error envelope and returns only `error.message`, DROPPING the `code`
+/// field. On that parsed-envelope path the human-readable
+/// `"does not exist or you do not have access"` prose is therefore the primary
+/// model-not-found signal — the literal `"model_not_found"` code never
+/// survives extraction. That literal only reaches here when the body was NOT a
+/// parseable envelope, in which case the verbatim body is kept.
+///
+/// Note: `"not supported in the v1/chat/completions"` / `"not supported in the
+/// v1/responses"` are deliberately NOT matched — `OpenAI` uses the same wording
+/// for genuine "Unsupported parameter" errors, so matching them would mask real
+/// parameter bugs behind the generic line. The intended legacy-completions case
+/// is already covered by `"not a chat model"`.
+fn model_usage_rejection_reason(detail: &str) -> Option<&'static str> {
+    // One lowercase pass for both the classification and the phrasing.
     let d = detail.to_ascii_lowercase();
-    d.contains("not a chat model")
-        || d.contains("not supported in the v1/chat/completions")
-        || d.contains("not supported in the v1/responses")
-        || d.contains("model_not_found")
+    if d.contains("not a chat model") {
+        Some("is not a chat model")
+    } else if d.contains("model_not_found")
         || d.contains("does not exist or you do not have access")
+    {
+        Some("can't be used here")
+    } else {
+        None
+    }
 }
 
 // Zhipu (z.ai / bigmodel.cn) provider-specific request shaping lives in the

@@ -17,11 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `include: ["reasoning.summary"]` — not a member of the fixed `include` enum,
   so a hard `400`. Both now live in the nested `reasoning` object
   (`reasoning.effort` and `reasoning.summary: "auto"`), and the invalid
-  `include` is gone. The object is emitted only for reasoning-capable models
-  (`ServiceConfig::model_supports_reasoning`), so non-reasoning models such as
-  `gpt-4o` and `gpt-4.1` send no reasoning config at all. Previously no
-  official-OpenAI request could succeed: non-reasoning models failed on
-  `reasoning.summary`, reasoning models on `reasoning_effort`.
+  `include` is gone. The `reasoning` object is emitted ONLY for
+  reasoning-capable models (`ServiceConfig::model_supports_reasoning`), so
+  non-reasoning models such as `gpt-4o` and `gpt-4.1` send no reasoning config
+  at all. Previously no official-OpenAI request could succeed: non-reasoning
+  models failed on `reasoning.summary`, reasoning models on `reasoning_effort`.
 
 - **Selecting a model choreographr can't drive now yields an actionable
   error.** The live model picker deliberately lists the provider's whole
@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `404 This is not a chat model …`); it is now shown as a short, plain line —
   e.g. `'gpt-3.5-turbo-instruct' is not a chat model — please try a different
   one.` — with the provider's jargon kept in the log rather than the UI.
+
+- **Model-usage detection narrowed so genuine errors are no longer masked, and
+  the Responses `reasoning` object gated wholly on model capability.** The
+  check that recognises a not-a-chat-model or model-not-found rejection no
+  longer matches the over-broad "not supported in the v1/…" wording, so an
+  unrelated "Unsupported parameter … is not supported in the v1/…" error now
+  surfaces its own message instead of being hidden behind the generic rewrite.
+  The Responses `reasoning` object is likewise emitted only when the selected
+  model actually supports reasoning — a non-reasoning model never receives any
+  reasoning configuration at all, even a stray effort.
 
 ## [0.2.1] - 2026-09-17 (Lindy)
 

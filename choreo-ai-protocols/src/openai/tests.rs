@@ -540,12 +540,55 @@ fn leaves_non_client_errors_untouched() {
 }
 
 #[test]
-fn detects_model_not_found_bodies() {
-    assert!(is_model_usage_rejection(
-        "The model 'x' does not exist or you do not have access to it."
-    ));
-    assert!(is_model_usage_rejection("model_not_found"));
-    assert!(!is_model_usage_rejection(
-        "Invalid value: 'reasoning.summary'."
-    ));
+fn leaves_unsupported_parameter_errors_untouched() {
+    // Change #2: OpenAI reuses the SAME "is not supported in the v1/responses"
+    // wording for genuine parameter errors. Matching it would rewrite a real
+    // parameter bug as a model-usability rejection and hide the cause, so the
+    // body must pass through verbatim (character-for-character).
+    let body =
+        "Unsupported parameter: 'reasoning_effort' is not supported in the v1/responses API.";
+    let err = annotate_model_usage_error(
+        "gpt-4o",
+        OpenAiError::ClientError {
+            status: 400,
+            detail: body.to_string(),
+        },
+    );
+    let OpenAiError::ClientError { status, detail } = err else {
+        panic!("expected ClientError, got {err:?}");
+    };
+    assert_eq!(status, 400);
+    assert_eq!(detail, body);
+}
+
+#[test]
+fn model_usage_rejection_reason_classifies_bodies() {
+    // A realistic OpenAI "not a chat model" body — the exact wording the live
+    // model list can produce for a legacy completions model.
+    assert_eq!(
+        model_usage_rejection_reason(
+            "This is not a chat model and thus not supported in the \
+             v1/chat/completions endpoint. Did you mean to use v1/completions?"
+        ),
+        Some("is not a chat model")
+    );
+    // The parsed-envelope model-not-found signal: `extract_error_message`
+    // keeps only `error.message`, so this human prose is what reaches us.
+    assert_eq!(
+        model_usage_rejection_reason(
+            "The model 'x' does not exist or you do not have access to it."
+        ),
+        Some("can't be used here")
+    );
+    // The literal code only survives when the body was NOT a parseable
+    // envelope (kept verbatim) — still recognized.
+    assert_eq!(
+        model_usage_rejection_reason("model_not_found"),
+        Some("can't be used here")
+    );
+    // An unrelated body is not a model-usability rejection.
+    assert_eq!(
+        model_usage_rejection_reason("Invalid value: 'reasoning.summary'."),
+        None
+    );
 }

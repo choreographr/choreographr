@@ -360,17 +360,16 @@ fn build_responses_request_body(
     //   * the reasoning summary is requested via `reasoning.summary` ("auto"),
     //     NOT via `include` — `include` accepts only a fixed enum
     //     (`reasoning.encrypted_content`, …) and 400s on `reasoning.summary`.
+    //
+    // The whole object is emitted ONLY for models the catalogue records as
+    // reasoning-capable: non-reasoning models (gpt-4o, gpt-4.1, …) reject any
+    // reasoning config outright (400), so a stray non-`off` effort must never
+    // leak one through — gate on the capability, not on effort being present.
     let reasoning_capable = config.model_supports_reasoning(model);
-    let reasoning = if reasoning_effort.is_some() || reasoning_capable {
-        Some(ResponsesReasoning {
-            effort: reasoning_effort,
-            // Ask for a summary only where it is valid — non-reasoning models
-            // (gpt-4o, gpt-4.1, …) reject `reasoning.summary` outright.
-            summary: reasoning_capable.then_some("auto"),
-        })
-    } else {
-        None
-    };
+    let reasoning = reasoning_capable.then_some(ResponsesReasoning {
+        effort: reasoning_effort,
+        summary: Some("auto"),
+    });
 
     // tool_choice: "auto" tells the model to use function calling.
     // Without this, some models may generate tool calls as plain text instead.
@@ -1233,9 +1232,21 @@ mod tests {
             ..Default::default()
         };
 
-        // Non-reasoning model, no effort: no `reasoning` object at all. A
-        // top-level `reasoning_effort` or `include: ["reasoning.summary"]` is
-        // a hard 400 on the Responses API, so neither may appear.
+        // Collect the serialized body's keys as a sorted `Vec<String>` so we
+        // can assert the EXACT key set — more precise than poking at
+        // individual fields (which is tautological now that the old
+        // top-level `reasoning_effort` / `include` fields no longer exist on
+        // `ResponsesRequest`).
+        let body_keys = |body: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = body.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+
+        // Case 1: non-reasoning model, no effort — no `reasoning` object at
+        // all. A top-level `reasoning_effort` or `include:
+        // ["reasoning.summary"]` is a hard 400 on the Responses API, so
+        // neither may appear.
         let (_url, body) = build_responses_request_body(
             &config,
             "gpt-4o",
@@ -1249,11 +1260,10 @@ mod tests {
         )
         .expect("non-reasoning body builds");
         assert!(body.get("reasoning").is_none(), "{body}");
-        assert!(body.get("reasoning_effort").is_none(), "{body}");
-        assert!(body.get("include").is_none(), "{body}");
+        assert_eq!(body_keys(&body), ["input", "model", "store"]);
 
-        // Reasoning model with effort "high": effort and summary both live
-        // under the nested `reasoning` object (never top-level).
+        // Case 2: reasoning model with effort "high" — effort and summary
+        // both live under the nested `reasoning` object (never top-level).
         let (_url, body) = build_responses_request_body(
             &config,
             "gpt-5.4",
@@ -1268,7 +1278,26 @@ mod tests {
         .expect("reasoning body builds");
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "auto");
-        assert!(body.get("reasoning_effort").is_none(), "{body}");
+        assert_eq!(body_keys(&body), ["input", "model", "reasoning", "store"]);
+
+        // Case 3: non-reasoning model handed a stray non-`off` effort — the
+        // whole `reasoning` object must still be suppressed (gated on the
+        // capability, not on effort being present). This pins the fix:
+        // emitting `reasoning: { effort }` here would be a provider 400.
+        let (_url, body) = build_responses_request_body(
+            &config,
+            "gpt-4o",
+            &[],
+            &[],
+            Some("high"),
+            None,
+            &[],
+            false,
+            false,
+        )
+        .expect("non-reasoning body with stray effort builds");
+        assert!(body.get("reasoning").is_none(), "{body}");
+        assert_eq!(body_keys(&body), ["input", "model", "store"]);
     }
 
     #[test]
