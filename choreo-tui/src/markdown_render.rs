@@ -1726,6 +1726,30 @@ fn render_markdown_block(
 
 // ── Table rendering ───────────────────────────────────────────────────────
 
+/// The box-drawing glyphs for a data table's outer frame.
+///
+/// Only the four outer corners differ from a square table — nushell's
+/// "rounded" preset keeps the `│`/`─` strokes and the `┬`/`┴`/`├`/`┤`/`┼`
+/// T-junctions identical and rounds only the frame's corners, so those
+/// junctions stay plain literals at their use sites below.
+struct TableBorders {
+    top_left: char,
+    top_mid: char,
+    top_right: char,
+    bottom_left: char,
+    bottom_mid: char,
+    bottom_right: char,
+}
+
+const TABLE_BORDERS: TableBorders = TableBorders {
+    top_left: '╭',
+    top_mid: '┬',
+    top_right: '╮',
+    bottom_left: '╰',
+    bottom_mid: '┴',
+    bottom_right: '╯',
+};
+
 fn render_table_lines(
     alignments: &[MarkdownAlignment],
     header: &[Vec<MarkdownInline>],
@@ -1771,27 +1795,45 @@ fn render_table_lines(
     let header_alignment = normalized_alignments(alignments, column_count);
     let mut lines = Vec::new();
     let mut joins = Vec::new();
-    lines.push(table_border_line('┌', '┬', '┐', &widths, indent));
+    lines.push(table_border_line(
+        TABLE_BORDERS.top_left,
+        TABLE_BORDERS.top_mid,
+        TABLE_BORDERS.top_right,
+        &widths,
+        indent,
+    ));
     joins.push(LineJoin::Break);
+    // The header row is the table's first row and the only one drawn bold —
+    // the same emphasis nushell gives its column headers.
     let (header_lines, header_joins) = table_rows
         .first()
-        .map(|row| render_table_row_wrapped(row, &widths, &header_alignment, indent))
+        .map(|row| {
+            render_table_row_wrapped(row, &widths, &header_alignment, indent, Modifier::BOLD)
+        })
         .unwrap_or_default();
     lines.extend(header_lines);
     joins.extend(header_joins);
-    lines.push(table_separator_line(&widths, &header_alignment, indent));
+    lines.push(table_separator_line(&widths, indent));
     joins.push(LineJoin::Break);
     for (index, row) in table_rows.iter().enumerate().skip(1) {
         let (row_lines, row_joins) =
-            render_table_row_wrapped(row, &widths, &header_alignment, indent);
+            render_table_row_wrapped(row, &widths, &header_alignment, indent, Modifier::empty());
         lines.extend(row_lines);
         joins.extend(row_joins);
         if index < table_rows.len() - 1 {
+            // Inter-row junctions stay square: nushell's rounded preset
+            // rounds only the outer corners, never the T-junctions.
             lines.push(table_border_line('├', '┼', '┤', &widths, indent));
             joins.push(LineJoin::Break);
         }
     }
-    lines.push(table_border_line('└', '┴', '┘', &widths, indent));
+    lines.push(table_border_line(
+        TABLE_BORDERS.bottom_left,
+        TABLE_BORDERS.bottom_mid,
+        TABLE_BORDERS.bottom_right,
+        &widths,
+        indent,
+    ));
     joins.push(LineJoin::Break);
     (lines, joins)
 }
@@ -1861,22 +1903,20 @@ fn table_border_line(
     indented_line(indent, text)
 }
 
-fn table_separator_line(
-    widths: &[usize],
-    alignments: &[MarkdownAlignment],
-    indent: usize,
-) -> Line<'static> {
+/// The rule between the header row and the body.
+///
+/// A uniform `├───┼───┤` for every column: column alignment is expressed by
+/// the cells' padding (`pad_aligned`), not by the `:───` / `:───:` / `───:`
+/// marks the GFM delimiter row uses. Those source-level marks used to be
+/// echoed into the rendered rule, which reads as stray punctuation next to a
+/// nushell-style frame; the rule is now plain.
+fn table_separator_line(widths: &[usize], indent: usize) -> Line<'static> {
     let mut text = String::new();
     text.push('├');
     for (index, width) in widths.iter().enumerate() {
-        // `alignments` is normalized to the same column count as `widths`.
-        text.push_str(&alignment_rule_segment(
-            *width,
-            alignments
-                .get(index)
-                .copied()
-                .unwrap_or(MarkdownAlignment::None),
-        ));
+        // One `─` per display column of the cell plus its two padding cells,
+        // matching `table_border_line`'s span so the junctions line up.
+        text.push_str(&"─".repeat(*width + 2));
         text.push(if index + 1 == widths.len() {
             '┤'
         } else {
@@ -1886,27 +1926,12 @@ fn table_separator_line(
     indented_line(indent, text)
 }
 
-fn alignment_rule_segment(width: usize, alignment: MarkdownAlignment) -> String {
-    let inner = width + 2;
-    match alignment {
-        MarkdownAlignment::Left => format!(":{}", "─".repeat(inner.saturating_sub(1))),
-        MarkdownAlignment::Center => {
-            if inner <= 2 {
-                ":".repeat(inner)
-            } else {
-                format!(":{}:", "─".repeat(inner - 2))
-            }
-        }
-        MarkdownAlignment::Right => format!("{}:", "─".repeat(inner.saturating_sub(1))),
-        MarkdownAlignment::None => "─".repeat(inner),
-    }
-}
-
 fn render_table_row_wrapped(
     row: &[String],
     widths: &[usize],
     alignments: &[MarkdownAlignment],
     indent: usize,
+    modifier: Modifier,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>) {
     let wrapped_cells: Vec<Vec<String>> = row
         .iter()
@@ -1941,7 +1966,7 @@ fn render_table_row_wrapped(
             text.push(' ');
             text.push('│');
         }
-        lines.push(indented_line(indent, text));
+        lines.push(indented_styled_line(indent, text, modifier));
     }
     // Every table row (visual or wrapped) is a distinct line in the copy:
     // the cell borders and padding are per-row rendering chrome that must
@@ -2090,11 +2115,18 @@ fn append_inline_plain_text(inlines: &[MarkdownInline], text: &mut String) {
 // ── Line-building helpers ─────────────────────────────────────────────────
 
 fn indented_line(indent: usize, text: String) -> Line<'static> {
+    indented_styled_line(indent, text, Modifier::empty())
+}
+
+/// Like [`indented_line`], but applies `modifier` (e.g. `Modifier::BOLD` for a
+/// table's header row) to the text span only — the indent stays unstyled so the
+/// emphasis never bleeds into the leading margin.
+fn indented_styled_line(indent: usize, text: String, modifier: Modifier) -> Line<'static> {
     let mut spans = Vec::new();
     if indent > 0 {
         spans.push(Span::styled(" ".repeat(indent), Style::default()));
     }
-    spans.push(Span::styled(text, Style::default()));
+    spans.push(Span::styled(text, Style::default().add_modifier(modifier)));
     Line::from(spans)
 }
 

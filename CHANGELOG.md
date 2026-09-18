@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Markdown tables in the TUI now use a nushell-style rounded frame.** The
+  outer corners are `╭ ╮ ╰ ╯` (the `┬`/`┴`/`├`/`┤`/`┼` junctions and `│`/`─`
+  strokes are unchanged, matching nushell's rounded preset), the header row is
+  drawn bold, and the header rule is a uniform `├───┼───┤`. Column alignment is
+  still applied via cell padding, but the GFM delimiter row's alignment colons
+  (`:---`, `:---:`, `---:`) are no longer echoed into the rendered rule — they
+  read as stray punctuation against the rounded frame.
+
 ### Fixed
 
 - **OpenAI Responses requests now use the correct `reasoning` shape, fixing

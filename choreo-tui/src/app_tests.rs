@@ -43,7 +43,7 @@ fn markdown_lines_render_tables() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(rendered.contains("┌"));
+    assert!(rendered.contains("╭"));
     assert!(rendered.contains("Ada Lovelace"));
     assert!(rendered.contains("Grace Hopper"));
     assert!(rendered.contains("Mathematician"));
