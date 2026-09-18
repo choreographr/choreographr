@@ -8,7 +8,7 @@ mod tests;
 mod zhipu;
 pub use crate::shared::MaxTokensField;
 use crate::types::{ChatTurnResult, StreamEvent};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::SocketRegistry;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
@@ -483,7 +483,7 @@ impl OpenAiClient {
     /// Returns [`OpenAiError`] on HTTP, provider, retry, or decoding
     /// failures.
     pub fn completion(&self, model: &str, prompt: &str) -> Result<String, OpenAiError> {
-        match self.config.request_format_for_model(model) {
+        let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request(
                 &self.http,
                 &self.config,
@@ -500,7 +500,8 @@ impl OpenAiClient {
                 prompt,
                 None,
             ),
-        }
+        };
+        result.map_err(|e| annotate_model_usage_error(model, e))
     }
 
     /// Streaming completion in the model's configured wire format.
@@ -526,7 +527,7 @@ impl OpenAiClient {
             return Ok(());
         }
 
-        match self.config.request_format_for_model(model) {
+        let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request_streaming(
                 &self.http,
                 &self.config,
@@ -546,7 +547,8 @@ impl OpenAiClient {
                 None,
                 &mut on_event,
             ),
-        }
+        };
+        result.map_err(|e| annotate_model_usage_error(model, e))
     }
 
     /// Non-streaming multiline chat-completion dispatch.
@@ -563,6 +565,10 @@ impl OpenAiClient {
         &self,
         params: crate::ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, OpenAiError> {
+        // `params.model` is a `Copy` `&str`; capture it before `params` is
+        // moved into the request builders below so the error annotation can
+        // still name the model.
+        let model = params.model;
         // z.ai models only accept a subset of the OpenAI effort slugs, and
         // the accepted set differs by GLM generation — dispatch to the
         // Zhipu-specific mapper for those providers, plain pass-through for
@@ -576,7 +582,7 @@ impl OpenAiClient {
         // The turn's real session/request ids drive the opencode gateway's
         // per-session sticky routing (see `shared::opencode_gateway_headers`).
         let route = Some((params.session_id.as_str(), params.request_id.as_str()));
-        match self.config.request_format_for_model(params.model) {
+        let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request_with_tools(
                 &self.http,
                 &self.config,
@@ -606,7 +612,8 @@ impl OpenAiClient {
                     route,
                 )
             }
-        }
+        };
+        result.map_err(|e| annotate_model_usage_error(model, e))
     }
 
     /// Streaming multiline dispatch (see [`Self::chat_completion_turn`]).
@@ -624,6 +631,9 @@ impl OpenAiClient {
     where
         F: FnMut(StreamEvent) -> io::Result<()>,
     {
+        // Same `Copy` capture as `chat_completion_turn`, for the model-named
+        // error annotation on the streaming dispatch below.
+        let model = params.model;
         // Same Zhipu dispatch as `chat_completion_turn` — both turn paths
         // must apply the identical mapping so streaming and non-streaming
         // requests carry the same wire value.
@@ -646,7 +656,7 @@ impl OpenAiClient {
         // The turn's real session/request ids drive the opencode gateway's
         // per-session sticky routing (see `shared::opencode_gateway_headers`).
         let route = Some((params.session_id.as_str(), params.request_id.as_str()));
-        match self.config.request_format_for_model(params.model) {
+        let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request_streaming_with_tools(
                 &self.http,
                 &self.config,
@@ -678,7 +688,8 @@ impl OpenAiClient {
                     &mut on_event,
                 )
             }
-        }
+        };
+        result.map_err(|e| annotate_model_usage_error(model, e))
     }
 }
 
@@ -686,6 +697,56 @@ impl OpenAiClient {
 /// "off" → None (omit the field). Others → Some(slug).
 pub(crate) fn reasoning_effort_api_value(slug: &str) -> Option<&str> {
     if slug == "off" { None } else { Some(slug) }
+}
+
+/// Rewrite a provider rejection that means "this model can't be used here"
+/// into a short, plain message, e.g. `'gpt-4o' is not a chat model — please
+/// try a different one.`
+///
+/// The live model picker deliberately lists the provider's *full* catalogue —
+/// including models choreographr cannot drive (legacy completions models,
+/// embeddings, audio, image, moderation). A just-released or custom model must
+/// stay selectable too, so the list is never filtered; instead, when a turn is
+/// sent with an unusable model, the provider's verdict (e.g. the `OpenAI`
+/// `404 This is not a chat model …`) becomes a short user-facing line. The
+/// provider is the only reliable authority on usability (the `/v1/models`
+/// payload carries no modality), so this reacts to its verdict rather than
+/// guessing locally. The provider's raw wording is jargon to a user, so it is
+/// dropped from the message and kept in the log instead.
+fn annotate_model_usage_error(model: &str, err: OpenAiError) -> OpenAiError {
+    let OpenAiError::ClientError { status, detail } = &err else {
+        return err;
+    };
+    if !is_model_usage_rejection(detail) {
+        return err;
+    }
+    // Name the cause only where we can read it plainly; everything else in the
+    // family reads the same to a user ("can't be used here").
+    let reason = if detail.to_ascii_lowercase().contains("not a chat model") {
+        "is not a chat model"
+    } else {
+        "can't be used here"
+    };
+    // Keep the provider's technical wording for operators — the user only sees
+    // the plain line below.
+    info!(model = %model, provider_detail = %detail, "provider rejected the model as unusable");
+    OpenAiError::ClientError {
+        status: *status,
+        detail: format!("'{model}' {reason} — please try a different one."),
+    }
+}
+
+/// Whether a provider error body means the selected model cannot be used on
+/// the endpoint (not a chat model / unknown model). The body is free-form
+/// prose, so this is a deliberately narrow substring match over the known
+/// OpenAI-family rejections.
+fn is_model_usage_rejection(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    d.contains("not a chat model")
+        || d.contains("not supported in the v1/chat/completions")
+        || d.contains("not supported in the v1/responses")
+        || d.contains("model_not_found")
+        || d.contains("does not exist or you do not have access")
 }
 
 // Zhipu (z.ai / bigmodel.cn) provider-specific request shaping lives in the

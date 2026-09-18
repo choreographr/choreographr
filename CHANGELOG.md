@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **OpenAI Responses requests now use the correct `reasoning` shape, fixing
+  every model on the official OpenAI provider.** Reasoning was sent wrong
+  twice over: the effort went out as the Chat Completions top-level
+  `reasoning_effort` (the Responses API rejects it with "this parameter has
+  moved to `reasoning.effort`"), and the reasoning summary was requested via
+  `include: ["reasoning.summary"]` — not a member of the fixed `include` enum,
+  so a hard `400`. Both now live in the nested `reasoning` object
+  (`reasoning.effort` and `reasoning.summary: "auto"`), and the invalid
+  `include` is gone. The object is emitted only for reasoning-capable models
+  (`ServiceConfig::model_supports_reasoning`), so non-reasoning models such as
+  `gpt-4o` and `gpt-4.1` send no reasoning config at all. Previously no
+  official-OpenAI request could succeed: non-reasoning models failed on
+  `reasoning.summary`, reasoning models on `reasoning_effort`.
+
+- **Selecting a model choreographr can't drive now yields an actionable
+  error.** The live model picker deliberately lists the provider's whole
+  catalogue (so just-released and custom models stay selectable), which
+  includes entries choreographr cannot use — legacy completions models such as
+  `gpt-3.5-turbo-instruct`, embeddings, audio, and image models. Sending a turn
+  with one used to surface the provider's terse rejection verbatim (OpenAI's
+  `404 This is not a chat model …`); it is now shown as a short, plain line —
+  e.g. `'gpt-3.5-turbo-instruct' is not a chat model — please try a different
+  one.` — with the provider's jargon kept in the log rather than the UI.
+
 ## [0.2.1] - 2026-09-17 (Lindy)
 
 ### Added
@@ -1303,6 +1331,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Initial release: daemon, TUI, protocol, Noise transport, provider catalog,
 markdown rendering, PDF tooling, and the 12-crate crates.io suite.
 
-[Unreleased]: https://github.com/choreographr/choreographr/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/choreographr/choreographr/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/choreographr/choreographr/releases/tag/v0.2.1
 [0.2.0]: https://github.com/choreographr/choreographr/releases/tag/v0.2.0
 [0.1.0]: https://github.com/choreographr/choreographr/releases/tag/v0.1.0

@@ -107,6 +107,25 @@ impl ServiceConfig {
             .unwrap_or(self.default_request_format)
     }
 
+    /// Whether the catalogue records the model as reasoning-capable, i.e.
+    /// whether it is valid to ask the Responses API for a reasoning summary.
+    ///
+    /// The Responses API validates `include` **strictly**: `reasoning.summary`
+    /// sent for a non-reasoning model (`gpt-4o`, `gpt-4.1`, …) is a hard 400
+    /// (`Invalid value: 'reasoning.summary'`), not a silently-ignored field —
+    /// so the caller must gate on this fact rather than always requesting it.
+    ///
+    /// `model_reasoning_capability` returns an empty effort set exactly when
+    /// the catalogue knows the model does not reason; unknown models fall back
+    /// to (non-empty) protocol defaults, so a brand-new model keeps the
+    /// summary request and a known non-reasoning one drops it.
+    #[must_use]
+    pub fn model_supports_reasoning(&self, model: &str) -> bool {
+        !crate::catalog::model_reasoning_capability(&self.provider_slug, model)
+            .available_effort_levels
+            .is_empty()
+    }
+
     /// Clamp a requested output-token limit down to the catalog's per-model
     /// `max_output_tokens` fact (`lookup_max_output_tokens`), when one exists.
     ///
@@ -392,6 +411,28 @@ mod tests {
             config.request_format_for_model("totally-unknown-xyz"),
             RequestFormat::Responses
         );
+    }
+
+    #[test]
+    fn model_supports_reasoning_reflects_catalog_fact() {
+        let config = ServiceConfig {
+            provider_slug: "openai".to_string(),
+            ..Default::default()
+        };
+        // Official OpenAI models all use the Responses API (`openai_responses`
+        // is provider-level), so the reasoning-summary `include` must be gated
+        // on the per-model reasoning fact instead of the endpoint.
+        assert_eq!(
+            config.request_format_for_model("gpt-4o"),
+            RequestFormat::Responses
+        );
+        // gpt-4o is recorded (models.dev) as a non-reasoning model → no
+        // reasoning-summary request for it.
+        assert!(!config.model_supports_reasoning("gpt-4o"));
+        // A reasoning model keeps the summary request.
+        assert!(config.model_supports_reasoning("gpt-5.4"));
+        // An unknown model falls back to protocol defaults → true (best-effort).
+        assert!(config.model_supports_reasoning("totally-unknown-xyz"));
     }
 
     #[test]

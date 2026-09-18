@@ -467,3 +467,85 @@ fn sleep_or_cancel_disconnected_returns_ok() {
     let result = crate::retry::sleep_or_cancel(Duration::from_millis(1), Some(&rx));
     assert!(result.is_ok());
 }
+
+// -- model-usage error annotation -------------------------------------
+
+#[test]
+fn annotates_not_a_chat_model_rejection_with_the_model() {
+    // The exact OpenAI body the live model list can produce when the user
+    // selects a legacy completions model. The user-facing message must be
+    // short and plain, and must NOT leak the provider's technical wording.
+    let err = annotate_model_usage_error(
+        "gpt-3.5-turbo-instruct",
+        OpenAiError::ClientError {
+            status: 404,
+            detail: "This is not a chat model and thus not supported in the \
+                     v1/chat/completions endpoint. Did you mean to use v1/completions?"
+                .to_string(),
+        },
+    );
+    let OpenAiError::ClientError { status, detail } = err else {
+        panic!("expected ClientError, got {err:?}");
+    };
+    assert_eq!(status, 404);
+    assert_eq!(
+        detail,
+        "'gpt-3.5-turbo-instruct' is not a chat model — please try a different one."
+    );
+    assert!(!detail.contains("v1/chat/completions"), "{detail}");
+}
+
+#[test]
+fn annotates_model_not_found_with_a_plain_message() {
+    // The generic "model doesn't exist / no access" body reads the same to a
+    // user: the model can't be used here.
+    let err = annotate_model_usage_error(
+        "gpt-6-astra",
+        OpenAiError::ClientError {
+            status: 404,
+            detail: "The model 'gpt-6-astra' does not exist or you do not have access to it."
+                .to_string(),
+        },
+    );
+    let OpenAiError::ClientError { detail, .. } = err else {
+        panic!("expected ClientError, got {err:?}");
+    };
+    assert_eq!(
+        detail,
+        "'gpt-6-astra' can't be used here — please try a different one."
+    );
+}
+
+#[test]
+fn leaves_unrelated_client_errors_untouched() {
+    // A 400 that has nothing to do with model usability must pass through
+    // verbatim so the real cause is not masked.
+    let err = annotate_model_usage_error(
+        "gpt-4o",
+        OpenAiError::ClientError {
+            status: 400,
+            detail: "Invalid value: 'reasoning.summary'.".to_string(),
+        },
+    );
+    let OpenAiError::ClientError { detail, .. } = err else {
+        panic!("expected ClientError, got {err:?}");
+    };
+    assert_eq!(detail, "Invalid value: 'reasoning.summary'.");
+}
+
+#[test]
+fn leaves_non_client_errors_untouched() {
+    let err = annotate_model_usage_error("gpt-4o", OpenAiError::Cancelled);
+    assert!(matches!(err, OpenAiError::Cancelled));
+}
+
+#[test]
+fn detects_model_not_found_bodies() {
+    assert!(is_model_usage_rejection(
+        "The model 'x' does not exist or you do not have access to it."
+    ));
+    assert!(is_model_usage_rejection("model_not_found"));
+    assert!(!is_model_usage_rejection(
+        "Invalid value: 'reasoning.summary'."
+    ));
+}

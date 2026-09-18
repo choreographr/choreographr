@@ -36,6 +36,20 @@ pub(crate) enum ResponsesInputItem {
     },
 }
 
+/// Nested `reasoning` object for Responses requests.
+///
+/// The Responses API moved the Chat Completions top-level `reasoning_effort`
+/// into this object (`reasoning.effort`), and the reasoning *summary* is
+/// requested here too (`reasoning.summary`) — it is **not** an `include`
+/// value (the `include` enum is a fixed set; `reasoning.summary` is a 400).
+#[derive(Debug, Serialize)]
+pub(crate) struct ResponsesReasoning<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) summary: Option<&'a str>,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ResponsesRequest<'a> {
     pub(crate) model: &'a str,
@@ -50,13 +64,11 @@ pub(crate) struct ResponsesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reasoning_effort: Option<&'a str>,
+    pub(crate) reasoning: Option<ResponsesReasoning<'a>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) previous_response_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) include: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -340,9 +352,25 @@ fn build_responses_request_body(
         Some(responses_tools)
     };
 
-    // Always request reasoning summary — the server omits it for models
-    // that don't support reasoning.
-    let include = Some(vec!["reasoning.summary"]);
+    // Reasoning config lives under a nested `reasoning` object in the Responses
+    // API. Two former mistakes are fixed here:
+    //   * the Chat Completions top-level `reasoning_effort` is rejected
+    //     ("Unsupported parameter: 'reasoning_effort' … moved to
+    //     'reasoning.effort'"), so the effort goes in `reasoning.effort`;
+    //   * the reasoning summary is requested via `reasoning.summary` ("auto"),
+    //     NOT via `include` — `include` accepts only a fixed enum
+    //     (`reasoning.encrypted_content`, …) and 400s on `reasoning.summary`.
+    let reasoning_capable = config.model_supports_reasoning(model);
+    let reasoning = if reasoning_effort.is_some() || reasoning_capable {
+        Some(ResponsesReasoning {
+            effort: reasoning_effort,
+            // Ask for a summary only where it is valid — non-reasoning models
+            // (gpt-4o, gpt-4.1, …) reject `reasoning.summary` outright.
+            summary: reasoning_capable.then_some("auto"),
+        })
+    } else {
+        None
+    };
 
     // tool_choice: "auto" tells the model to use function calling.
     // Without this, some models may generate tool calls as plain text instead.
@@ -359,12 +387,11 @@ fn build_responses_request_body(
         tools: tools_opt,
         stream,
         max_output_tokens,
-        reasoning_effort,
+        reasoning,
         // store: true is required for previous_response_id to work correctly
         // and matches the @ai-sdk/openai default behavior.
         store: true,
         previous_response_id,
-        include,
         parallel_tool_calls: None,
         tool_choice,
     })
@@ -392,11 +419,10 @@ fn build_simple_responses_body(
         tools: None,
         stream,
         max_output_tokens: None,
-        reasoning_effort: None,
+        reasoning: None,
         // Simple requests are ephemeral — don't persist on the server side.
         store: false,
         previous_response_id: None,
-        include: None,
         parallel_tool_calls: None,
         tool_choice: None,
     })
@@ -1200,6 +1226,52 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(catalog)]
+    fn responses_body_nests_reasoning_and_omits_it_for_non_reasoning() {
+        let config = super::super::ServiceConfig {
+            provider_slug: "openai".to_string(),
+            ..Default::default()
+        };
+
+        // Non-reasoning model, no effort: no `reasoning` object at all. A
+        // top-level `reasoning_effort` or `include: ["reasoning.summary"]` is
+        // a hard 400 on the Responses API, so neither may appear.
+        let (_url, body) = build_responses_request_body(
+            &config,
+            "gpt-4o",
+            &[],
+            &[],
+            None,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .expect("non-reasoning body builds");
+        assert!(body.get("reasoning").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+        assert!(body.get("include").is_none(), "{body}");
+
+        // Reasoning model with effort "high": effort and summary both live
+        // under the nested `reasoning` object (never top-level).
+        let (_url, body) = build_responses_request_body(
+            &config,
+            "gpt-5.4",
+            &[],
+            &[],
+            Some("high"),
+            None,
+            &[],
+            false,
+            false,
+        )
+        .expect("reasoning body builds");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
+
+    #[test]
     fn responses_request_serializes_with_store_true() {
         let req = ResponsesRequest {
             model: "gpt-4",
@@ -1208,10 +1280,9 @@ mod tests {
             tools: None,
             stream: false,
             max_output_tokens: None,
-            reasoning_effort: None,
+            reasoning: None,
             store: true,
             previous_response_id: None,
-            include: None,
             parallel_tool_calls: None,
             tool_choice: None,
         };
@@ -1241,10 +1312,9 @@ mod tests {
             }]),
             stream: false,
             max_output_tokens: None,
-            reasoning_effort: None,
+            reasoning: None,
             store: false,
             previous_response_id: None,
-            include: None,
             parallel_tool_calls: None,
             tool_choice: None,
         };
@@ -1272,10 +1342,9 @@ mod tests {
             }]),
             stream: false,
             max_output_tokens: None,
-            reasoning_effort: None,
+            reasoning: None,
             store: false,
             previous_response_id: None,
-            include: None,
             parallel_tool_calls: None,
             tool_choice: None,
         };
@@ -1296,10 +1365,9 @@ mod tests {
             tools: None,
             stream: false,
             max_output_tokens: None,
-            reasoning_effort: None,
+            reasoning: None,
             store: false,
             previous_response_id: None,
-            include: None,
             parallel_tool_calls: None,
             tool_choice: None,
         };
