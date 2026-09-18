@@ -184,10 +184,12 @@
   # 128K max output, per the official GLM-5.3-Flash model card
   # (docs.z.ai/guides/vlm/glm-5.3-flash — "Maximum Output Tokens: 128K";
   # verified 2026-09). Without this pin the model's output ceiling resolved
-  # to "unknown" (0), so `clamp_output_to_catalog` could not bound it and a
-  # single oversized tool call (e.g. a large `write_file`) could run to the
-  # gateway's default and be cut off mid-arguments — the truncation this pin
-  # accompanies the recovery for.
+  # to "unknown" (0), so `clamp_output_to_catalog` had no ceiling to apply and
+  # an account/model `max_tokens` override could request more than the model can
+  # produce; the pin clamps that override down to the real limit. (It bounds the
+  # *requested* limit only when one is configured — a response reaching the
+  # ceiling mid-arguments is what the agent-loop's truncation recovery
+  # handles.)
   max_output_tokens = 128000
   reasoning_supported = true
   reasoning_content_required = true

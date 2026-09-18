@@ -685,11 +685,16 @@ pub(crate) mod test_util {
     /// Provider client whose streaming turns return `TruncatedToolCall` for the
     /// first `truncations` calls (simulating a provider that cuts the response
     /// off at its output-token limit mid-tool-call), then a normal final answer.
-    /// Exercises the agent loop's truncated-tool-call recovery.
+    /// Exercises the agent loop's truncated-tool-call recovery. Also records the
+    /// `previous_response_id` of every call so a test can assert how the loop
+    /// chains (or stops chaining) across a recovery.
     #[derive(Debug)]
     pub(crate) struct TruncatingProviderClient {
         truncations: usize,
         calls: std::sync::atomic::AtomicUsize,
+        // Every chain id the loop sent, in call order. Poisoning is irrelevant
+        // in a test, so the lock is recovered rather than propagated.
+        seen_prev_response_ids: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     impl TruncatingProviderClient {
@@ -697,12 +702,20 @@ pub(crate) mod test_util {
             Self {
                 truncations,
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                seen_prev_response_ids: std::sync::Mutex::new(Vec::new()),
             }
         }
 
-        /// Advance the call counter and return either a truncated-tool-call
-        /// error or a normal final answer.
-        fn next_result(&self) -> Result<ChatTurnResult, InferenceError> {
+        /// Record the chain id the loop sent, then advance the call counter and
+        /// return either a truncated-tool-call error or a normal final answer.
+        fn next_result(
+            &self,
+            prev_response_id: Option<&str>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            self.seen_prev_response_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(prev_response_id.map(str::to_string));
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n < self.truncations {
                 return Err(InferenceError::TruncatedToolCall {
@@ -723,6 +736,14 @@ pub(crate) mod test_util {
                 },
             ))
         }
+
+        /// The chain ids the client was called with so far, in call order.
+        pub(crate) fn seen_previous_response_ids(&self) -> Vec<Option<String>> {
+            self.seen_prev_response_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
     }
 
     impl ProviderClient for TruncatingProviderClient {
@@ -734,17 +755,17 @@ pub(crate) mod test_util {
 
         fn chat_completion_turn(
             &self,
-            _params: ChatTurnRequest<'_>,
+            params: ChatTurnRequest<'_>,
         ) -> Result<ChatTurnResult, InferenceError> {
-            self.next_result()
+            self.next_result(params.previous_response_id)
         }
 
         fn chat_completion_turn_streaming(
             &self,
-            _params: ChatTurnRequest<'_>,
+            params: ChatTurnRequest<'_>,
             _on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
         ) -> Result<ChatTurnResult, InferenceError> {
-            self.next_result()
+            self.next_result(params.previous_response_id)
         }
 
         fn list_models(&self) -> Result<Vec<String>, InferenceError> {
@@ -754,10 +775,22 @@ pub(crate) mod test_util {
 
     /// Build a provider that truncates its first `truncations` streaming turns.
     pub(crate) fn make_truncating_provider(truncations: usize) -> InferenceProvider {
-        InferenceProvider {
-            client: Arc::new(TruncatingProviderClient::new(truncations)),
-            slug: "test-truncating".to_string(),
+        make_truncating_provider_with_slug(truncations, "test-truncating").0
+    }
+
+    /// Like [`make_truncating_provider`], but with a caller-chosen catalog slug
+    /// (so a test can select a `ResponseId`-policy provider) and handing back the
+    /// concrete client so the test can inspect the chain ids it was called with.
+    pub(crate) fn make_truncating_provider_with_slug(
+        truncations: usize,
+        slug: &str,
+    ) -> (InferenceProvider, Arc<TruncatingProviderClient>) {
+        let client = Arc::new(TruncatingProviderClient::new(truncations));
+        let provider = InferenceProvider {
+            client: client.clone(),
+            slug: slug.to_string(),
             image_client: None,
-        }
+        };
+        (provider, client)
     }
 }

@@ -147,17 +147,39 @@ impl std::fmt::Display for DiscardedToolCall {
         // case this variant exists for) can carry tens of kilobytes of
         // half-written arguments, and this string is embedded verbatim in the
         // error message the daemon logs and shows. A short preview plus the
-        // total byte count keeps the message diagnosable without dumping the
-        // whole blob into logs or the transcript.
+        // total character count keeps the message diagnosable without dumping
+        // the whole blob into logs or the transcript.
         const PREVIEW_CHARS: usize = 200;
         let args = &self.arguments_json;
         let total = args.chars().count();
         if total <= PREVIEW_CHARS {
-            write!(f, "{}: {}", self.name, args)
+            write!(f, "{}: {}", self.name, sanitize_control_chars(args))
         } else {
             let preview: String = args.chars().take(PREVIEW_CHARS).collect();
-            write!(f, "{} ({total} chars): {preview}…", self.name)
+            write!(
+                f,
+                "{} ({total} chars): {}…",
+                self.name,
+                sanitize_control_chars(&preview)
+            )
         }
+    }
+}
+
+/// Replace any control character with a space so a (possibly truncated) tool
+/// payload can never inject a newline or other control byte into a single-line
+/// log line or transcript entry. Borrows when there is nothing to sanitize (the
+/// common case — arguments are JSON, whose newlines are already backslash-
+/// escaped on the wire).
+fn sanitize_control_chars(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.chars().any(char::is_control) {
+        std::borrow::Cow::Owned(
+            s.chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(s)
     }
 }
 

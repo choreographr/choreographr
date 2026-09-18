@@ -827,6 +827,14 @@ fn discarded_tool_call_display_is_bounded() {
         rendered.len() < 300,
         "preview must stay bounded: {rendered}"
     );
+
+    // Control characters (a cropped payload can carry raw newlines) are
+    // replaced with spaces so the rendered call never breaks onto a new line.
+    let control = DiscardedToolCall {
+        name: "write_file".into(),
+        arguments_json: "line1\nline2\ttab".into(),
+    };
+    assert_eq!(control.to_string(), "write_file: line1 line2 tab");
 }
 
 #[test]

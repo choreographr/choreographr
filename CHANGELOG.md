@@ -48,7 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   user turn ("your call was truncated; split large writes into smaller tool
   calls"), and retries — up to `MAX_TRUNCATION_RECOVERIES` times before ending
   the request cleanly. The cap is essential because a session may run with
-  `max_turns == 0` (unlimited), which cannot bound the loop itself.
+  `max_turns == 0` (unlimited), which cannot bound the loop itself. For
+  `ResponseId`-policy (Responses-API) providers the retry also drops the
+  `previous_response_id` chain — the truncated turn's id was never captured, so
+  chaining onto the pre-truncation id would replay a `function_call` whose
+  matching output was dropped with the discarded call; the retry resends the
+  full, self-consistent history instead.
 
 ### Changed
 
@@ -180,10 +185,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`glm-5.3-flash` now carries its real output-token ceiling
   (`choreo-ai-protocols`).** The model overlay comment claimed "1M context /
   128K output" but only pinned `context_window`, leaving `max_output_tokens`
-  unknown (`0`) — so the catalog clamp could not bound the model's output and a
-  single oversized tool call could run to the gateway's default. Pinned to
-  `128000` per the official GLM-5.3-Flash model card (verified against
-  docs.z.ai).
+  unknown (`0`) — so the catalog's clamp-down had no ceiling to apply and an
+  account/model `max_tokens` override could request more than the model can
+  produce. Pinned to `128000` per the official GLM-5.3-Flash model card
+  (verified against docs.z.ai), so that override is clamped to the real
+  ceiling. (The pin bounds the *requested* limit only when one is configured;
+  it does not by itself stop a response from reaching the ceiling — the
+  agent-loop recovery above handles that.)
 
 ## [0.2.1] - 2026-09-17 (Lindy)
 

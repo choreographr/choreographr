@@ -3338,9 +3338,14 @@ records the truncation as an explanatory assistant turn, seeds
 `TRUNCATION_RECOVERY_INSTRUCTION` as the next turn's user text, and retries —
 bounded by `MAX_TRUNCATION_RECOVERIES` so an output-limited model cannot spin
 the loop forever (this bounding is necessary because sessions may run with
-`max_turns == 0`, i.e. unlimited). The observed trigger is a single oversized
-`write_file` whose arguments exceed the provider's output budget (e.g.
-`glm-5.3-flash` on `opencode-go`).
+`max_turns == 0`, i.e. unlimited). For `ResponseId`-policy (Responses-API)
+providers the retry also clears `previous_response_id` (and the persisted
+session id): the truncated turn's own response id was never captured, so
+chaining onto the pre-truncation id would replay a `function_call` whose
+matching `function_call_output` was dropped, leaving an unpaired call on the
+wire — the retry resends the full, self-consistent history instead. The
+observed trigger is a single oversized `write_file` whose arguments exceed the
+provider's output budget (e.g. `glm-5.3-flash` on `opencode-go`).
 
 Two daemon conventions keep this gating correct:
 

@@ -1336,6 +1336,12 @@ pub(crate) fn run_agent_loop(
                     let names = discarded
                         .iter()
                         .map(|d| d.name.as_str())
+                        // A discarded call can carry an empty name (a provider
+                        // stub cut off before the function name arrived); drop
+                        // those so the joined list never renders as a bare
+                        // ", " and the `names.is_empty()` check below stays
+                        // meaningful.
+                        .filter(|name| !name.is_empty())
                         .collect::<Vec<_>>()
                         .join(", ");
                     let subject = if names.is_empty() {
@@ -1365,7 +1371,25 @@ pub(crate) fn run_agent_loop(
                         },
                     );
                     finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
+                    // The discarded call's results were never recorded, and the
+                    // next turn's assistant message carries no tool_calls, so
+                    // nothing references the accumulator from the previous
+                    // batch — clear it so the retry does not resend a stale
+                    // tool batch that the model has effectively already moved
+                    // past.
                     tool_results.clear();
+                    // Drop the ResponseId chain: the provider's response for
+                    // THIS turn was cut off mid-call and its id was never
+                    // captured, so chaining the retry onto the pre-truncation
+                    // id would replay a `function_call` whose matching output we
+                    // just dropped — an unpaired call on the Responses wire.
+                    // Clearing the id forces the retry to resend the full, self-
+                    // consistent history instead. Persist the clear too, so a
+                    // later user request cannot resurrect the broken chain; the
+                    // final answer (if recovery succeeds) records a fresh id.
+                    prev_resp_id = None;
+                    session.config.last_response_id = None;
+                    session.config.last_response_id_producer = None;
                     if truncation_recoveries >= MAX_TRUNCATION_RECOVERIES {
                         tracing::warn!(
                             session_id = ctx.session_id,

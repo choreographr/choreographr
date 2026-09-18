@@ -15,6 +15,7 @@ use crate::daemon::DaemonCommand;
 use crate::providers::InferenceProvider;
 use crate::providers::test_util::{
     make_failing_provider, make_test_provider, make_truncating_provider,
+    make_truncating_provider_with_slug,
 };
 use crate::reasoning::{
     build_chat_request_messages, initial_prev_resp_id, warn_on_missing_reasoning_artifacts,
@@ -1928,6 +1929,74 @@ fn agent_loop_gives_up_after_truncation_recovery_budget() {
         MAX_TRUNCATION_RECOVERIES as usize,
         "the recovery loop stops at the budget"
     );
+}
+
+#[test]
+fn agent_loop_drops_response_id_chain_on_truncation_recovery() {
+    // A ResponseId-policy provider ("openai"/"gpt-5.4" in the bundled catalog)
+    // chains turns via `previous_response_id`. When a turn is truncated
+    // mid-tool-call, the recovery must NOT chain the retry onto the
+    // pre-truncation id: that would replay a `function_call` whose matching
+    // output was dropped (the function_call_output lives in `tool_results`,
+    // which the truncation arm clears), an unpaired call on the Responses wire.
+    // The retry must instead resend the full history (no chain), and the
+    // persisted id must be cleared so a later request cannot resurrect the
+    // broken chain.
+    let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 1,
+        db,
+        tool_registry: ToolRegistry::new().build(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: crate::broadcast::LagLimits::default(),
+        global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        substrate_credential: None,
+    };
+    // Slug "openai" + model "gpt-5.4" is a ResponseId-policy pair, so the seeded
+    // chain id below is restored as `prev_resp_id` on the first turn.
+    let (provider, client) =
+        make_truncating_provider_with_slug(MAX_TRUNCATION_RECOVERIES as usize + 5, "openai");
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let mut session = SessionState::empty();
+    session.config.last_response_id = Some("resp_seed".to_string());
+    session.config.last_response_id_producer = Some(ReasoningProducer {
+        provider_slug: "openai".to_string(),
+        model: "gpt-5.4".to_string(),
+    });
+
+    let result = run_agent_loop(
+        &provider,
+        &mut session,
+        "gpt-5.4",
+        7,
+        &cancel_rx,
+        &ctx,
+        Some("hi"),
+    );
+    assert!(!result.unwrap(), "the request ends cleanly at the budget");
+
+    // The first (pre-truncation) call chains on the seeded id; every recovery
+    // retry sends no chain id (full history).
+    let seen = client.seen_previous_response_ids();
+    assert_eq!(
+        seen.first(),
+        Some(&Some("resp_seed".to_string())),
+        "the first call chains on the seeded response id, got {seen:?}"
+    );
+    assert_eq!(seen.len(), MAX_TRUNCATION_RECOVERIES as usize, "{seen:?}");
+    assert!(
+        seen.iter().skip(1).all(Option::is_none),
+        "every recovery retry must drop the chain, got {seen:?}"
+    );
+    // The persisted chain is cleared so a later user request cannot chain onto
+    // the pre-truncation response.
+    assert_eq!(session.config.last_response_id, None);
+    assert_eq!(session.config.last_response_id_producer, None);
 }
 
 // -- resolve_reasoning_effort tests ------------------------------------
