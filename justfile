@@ -319,7 +319,7 @@ clippy-fix: _require-zig
 check-supply-chain:
     ./scripts/check-supply-chain.sh
 
-# Release-name drift guard: `choreo-proto/release-name.txt` (the machine source
+# Release-name drift guard: `choreo-shared/release-name.txt` (the machine source
 # of truth baked into the binaries and read by CI for the release title) must
 # match the `(Name)` on the current version's CHANGELOG heading. See
 # scripts/check-release-name.sh.

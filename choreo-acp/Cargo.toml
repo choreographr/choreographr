@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 choreo-proto.workspace = true
+choreo-shared.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true

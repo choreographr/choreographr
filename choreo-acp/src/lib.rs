@@ -15,39 +15,20 @@ use std::sync::mpsc;
 use std::thread;
 
 use anyhow::Context;
+use choreo_shared::clap_styles;
+use choreo_shared::logging::{LoggingConfig, Verbosity};
 use clap::Parser;
-use tracing_subscriber::prelude::*;
-
-/// Shared clap [`Styles`] for this crate's CLI binary.
-///
-/// Each CLI crate keeps its own copy (choreo-proto is the wire protocol and
-/// must not host CLI styling); if this ever grows, promote it to a dedicated
-/// micro-crate instead of putting it in choreo-proto.
-///
-/// Uses real ANSI hues (green headers/usage, cyan literals/placeholders) rather
-/// than bold/underline only, so help output stays legible even in terminals whose
-/// bold text isn't visually distinct (e.g. themes that don't remap the bold color).
-/// `Styles::styled()` keeps clap's default error/invalid/valid coloring; the
-/// overrides colorize the help elements.
-fn clap_styles() -> clap::builder::Styles {
-    use clap::builder::styling::{AnsiColor, Effects, Styles};
-    Styles::styled()
-        .header(AnsiColor::Green.on_default() | Effects::BOLD)
-        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
-        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
-        .placeholder(AnsiColor::Cyan.on_default())
-}
 
 #[derive(Parser)]
 // `--version` prints the crate version (CARGO_PKG_VERSION) with the release
-// name appended via `choreo_proto::release_name` — e.g. `0.2.0 (Lindy)`, or the
+// name appended via `choreo_shared::release_name` — e.g. `0.2.0 (Lindy)`, or the
 // bare version when the name file is empty. clap handles it before the app
 // starts, so it works headless too.
 // `color` is explicitly `Auto` (clap's default) to document the intent that
 // help/error output is colored only when stdout/stderr is a TTY.
 #[command(
     name = "choreo-acp",
-    version = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION")),
+    version = choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION")),
     about = "ACP bridge for Choreographr",
     color = clap::ColorChoice::Auto,
     styles = clap_styles()
@@ -60,6 +41,10 @@ struct Cli {
     /// Path to the log file (stderr is unused to avoid corrupting the ACP protocol stream).
     #[arg(long = "log-file", default_value_t = default_log_file())]
     log_file: String,
+
+    // Increase logging verbosity (-v debug, -vv trace)
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// The ACP adapter's default log file: under the PLATFORM temp dir
@@ -73,7 +58,7 @@ fn default_log_file() -> String {
         .into_owned()
 }
 
-fn setup_logging(log_file: &str) {
+fn setup_logging(log_file: &str, verbosity: Verbosity) {
     // The log file is auxiliary diagnostics — stdout carries the ACP JSON-RPC
     // stream and the adapter's job is to relay it, so a failure to create the
     // log must never kill the adapter (the Termux /tmp lesson: diagnostics
@@ -85,21 +70,28 @@ fn setup_logging(log_file: &str) {
         );
         return;
     };
-    let file_layer = tracing_subscriber::fmt::layer()
+    // Shared level policy (flags win over RUST_LOG), plus this adapter's own
+    // module kept at debug by default: an ACP client owns the terminal, so the
+    // adapter's diagnostics are only ever read from the log file, and the
+    // default `info` would hide them.
+    let logging = LoggingConfig::resolve(verbosity);
+    let mut filter = logging.filter;
+    if let Ok(directive) = "choreo_acp=debug".parse::<tracing_subscriber::filter::Directive>() {
+        filter = filter.add_directive(directive);
+    }
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
         .with_writer(std::sync::Mutex::new(file))
-        .with_ansi(false);
-    let choreographr_acp_directive = "choreo_acp=debug".parse().unwrap_or_else(|e| {
-        // Warning only — not fatal; logged before tracing is fully initialized.
-        eprintln!("warning: failed to parse default log directive: {e}");
-        tracing_subscriber::filter::LevelFilter::DEBUG.into()
-    });
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .from_env_lossy()
-        .add_directive(choreographr_acp_directive);
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(file_layer)
         .init();
+    // Observable now that the subscriber exists.
+    if logging.rust_log_ignored {
+        tracing::warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
+    }
+    tracing::info!(
+        effective_level = logging.effective_level,
+        "logging initialized"
+    );
 }
 
 /// Entry point for the `choreo-acp` bridge binary.
@@ -119,7 +111,7 @@ pub fn main() -> Result<(), anyhow::Error> {
     // Logging goes to $TMPDIR/choreo-acp.log (never stderr, which is unused
     // in the ACP protocol — stdout carries the JSON-RPC stream); if the log
     // file cannot be created the adapter continues without file logging.
-    setup_logging(&cli.log_file);
+    setup_logging(&cli.log_file, cli.verbosity);
 
     tracing::info!(
         socket_path = %cli.socket_path,
@@ -187,8 +179,8 @@ mod cli_tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
-        // And the release name (from choreo-proto/release-name.txt) rides along.
-        let expected = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION"));
+        // And the release name (from choreo-shared/release-name.txt) rides along.
+        let expected = choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION"));
         assert!(err.to_string().contains(&expected));
     }
 
@@ -217,7 +209,13 @@ mod cli_tests {
 
         // setup_logging cannot fail (it returns unit) — the assertion is
         // only that reaching here means the function degraded safely.
-        setup_logging(&impossible.to_string_lossy());
+        setup_logging(
+            &impossible.to_string_lossy(),
+            Verbosity {
+                verbose: 0,
+                quiet: 0,
+            },
+        );
 
         let _ = std::fs::remove_file(&blocker);
     }

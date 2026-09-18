@@ -2769,6 +2769,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "choreo-proto",
+ "choreo-shared",
  "clap",
  "mimalloc",
  "serde",
@@ -2892,6 +2893,7 @@ dependencies = [
  "choreo-power-events",
  "choreo-proto",
  "choreo-sanitize",
+ "choreo-shared",
  "choreo-transport",
  "chrono",
  "ckb-vm",
@@ -2958,6 +2960,7 @@ dependencies = [
  "choreo-keystore",
  "choreo-markdown",
  "choreo-proto",
+ "choreo-shared",
  "clap",
  "crossbeam-channel",
  "dioxus",
@@ -2969,6 +2972,7 @@ dependencies = [
  "tempfile",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 
@@ -2982,6 +2986,7 @@ dependencies = [
  "choreo-keystore",
  "choreo-markdown",
  "choreo-proto",
+ "choreo-shared",
  "clap",
  "mimalloc",
  "serde",
@@ -3081,6 +3086,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "choreo-shared"
+version = "0.2.1"
+dependencies = [
+ "clap",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "choreo-sockreg"
 version = "0.2.1"
 dependencies = [
@@ -3122,6 +3135,7 @@ dependencies = [
  "choreo-markdown",
  "choreo-proto",
  "choreo-sanitize",
+ "choreo-shared",
  "choreo-transport",
  "chrono",
  "clap",

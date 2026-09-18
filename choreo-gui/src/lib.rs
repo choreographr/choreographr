@@ -20,10 +20,13 @@ use crate::hooks::use_daemon_connection;
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{ConnectionMode, read_server_pk};
 use choreo_proto::socket_path;
+use choreo_shared::clap_styles;
+use choreo_shared::logging::{LoggingConfig, Verbosity};
 use clap::Parser;
 use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use std::sync::OnceLock;
+use tracing_subscriber::EnvFilter;
 
 /// Global connection mode, set once at startup from CLI args.
 static CONNECTION_MODE: OnceLock<ConnectionMode> = OnceLock::new();
@@ -225,39 +228,24 @@ fn default_connection_mode() -> ConnectionMode {
         .unwrap_or_else(|| ConnectionMode::TcpPinned(IOS_DEFAULT_TCP_ADDR.to_string()))
 }
 
-/// Shared clap [`Styles`] for this crate's CLI binary.
-///
-/// Each CLI crate keeps its own copy (choreo-proto is the wire protocol and
-/// must not host CLI styling); if this ever grows, promote it to a dedicated
-/// micro-crate instead of putting it in choreo-proto.
-///
-/// Uses real ANSI hues (green headers/usage, cyan literals/placeholders) rather
-/// than bold/underline only, so help output stays legible even in terminals whose
-/// bold text isn't visually distinct (e.g. themes that don't remap the bold color).
-/// `Styles::styled()` keeps clap's default error/invalid/valid coloring; the
-/// overrides colorize the help elements.
-fn clap_styles() -> clap::builder::Styles {
-    use clap::builder::styling::{AnsiColor, Effects, Styles};
-    Styles::styled()
-        .header(AnsiColor::Green.on_default() | Effects::BOLD)
-        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
-        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
-        .placeholder(AnsiColor::Cyan.on_default())
-}
-
 #[derive(Parser)]
-// Bare `version` wires `--version`/`-V` to CARGO_PKG_VERSION, matching the
-// other suite binaries (Homebrew formula test + smoke test rely on it).
-// ColorChoice is explicitly Auto (clap's default): color only on a TTY,
-// never forced into pipes.
+// `--version`/`-V` reports CARGO_PKG_VERSION with the release name appended via
+// `choreo_shared::release_name`, matching the other suite binaries (the
+// Homebrew formula test + smoke test rely on the version). ColorChoice is
+// explicitly Auto (clap's default): color only on a TTY, never forced into
+// pipes.
 #[command(
     name = "choreo-gui",
-    version,
+    version = choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION")),
     about = "Choreographr GUI",
     color = clap::ColorChoice::Auto,
     styles = clap_styles()
 )]
 struct Cli {
+    // Increase logging verbosity (-v debug, -vv trace)
+    #[command(flatten)]
+    verbosity: Verbosity,
+
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
@@ -276,6 +264,19 @@ struct Cli {
 /// (`publish = false`), so it is built from the workspace tree only.
 pub fn main() {
     let cli = Cli::parse();
+
+    // A windowed app has no reliable stderr (launched from a desktop icon it is
+    // lost), so diagnostics go to a pid-keyed file under the platform temp dir,
+    // selected by the shared `-v`/`-q`/RUST_LOG policy every other binary uses.
+    let logging = LoggingConfig::resolve(cli.verbosity);
+    init_file_logging(logging.filter);
+    if logging.rust_log_ignored {
+        tracing::warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
+    }
+    tracing::info!(
+        effective_level = logging.effective_level,
+        "logging initialized"
+    );
 
     let mode = if let Some(addr) = cli.tcp_addr {
         // On iOS there is no `~/.config/choreographr/transport.pub` to read —
@@ -313,6 +314,26 @@ pub fn main() {
     // cfg routes this to the Dioxus Native (Blitz) renderer, which serves
     // desktop, Android and iOS — no desktop()/mobile() branching anywhere.
     dioxus::launch(App);
+}
+
+/// Initialize file logging to `$TMPDIR/choreo-gui-<pid>.log`.
+///
+/// The platform temp dir (not a hardcoded `/tmp`) keeps this working on
+/// Termux/Android, where `/tmp` is not writable, and the pid-keyed name lets
+/// parallel instances coexist. A failure to create the log degrades to no file
+/// logging (an event before a subscriber exists is dropped) — logging is never
+/// a startup precondition. ANSI is off (escape codes are unreadable in a file);
+/// the shared `env_filter` sets the level exactly as every other binary does.
+fn init_file_logging(env_filter: EnvFilter) {
+    let log_path = std::env::temp_dir().join(format!("choreo-gui-{}.log", std::process::id()));
+    let Ok(log_file) = std::fs::File::create(&log_path) else {
+        return;
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_ansi(false)
+        .with_writer(log_file)
+        .init();
 }
 
 // ── Android entry glue ────────────────────────────────────────────────────────

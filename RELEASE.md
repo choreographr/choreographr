@@ -5,7 +5,7 @@ phases in order; each phase has a **gate** that must pass before moving on.
 
 A release ships three things:
 
-1. **18 crates to crates.io** (every workspace member except `choreo-gui`, in
+1. **19 crates to crates.io** (every workspace member except `choreo-gui`, in
    dependency order) — enables
    `cargo install choreographr choreo-tui` / `cargo binstall`.
 2. **GitHub release `vX.Y.Z`** on `choreographr/choreographr` with prebuilt
@@ -84,7 +84,7 @@ before extraction), extracts the version's section from
 release body — a missing section fails the job), runs the `check-release-name`
 guard, and creates the release with
 `gh release create vX.Y.Z dist/* --notes-file … --generate-notes`. The
-release **title** is read from `choreo-proto/release-name.txt` — the same file
+release **title** is read from `choreo-shared/release-name.txt` — the same file
 compiled into the binaries, so the title and `--version` cannot drift (an empty
 file yields the bare `choreographr X.Y.Z`). A
 re-run after the release already exists fails on create — assets are
@@ -120,7 +120,7 @@ channel updates in Phase 4 as before.
   style, e.g. *Lindy* — chosen by the conductor at release time (there is no
   pre-assigned list; pick whatever fits). **Patch releases keep the current
   name.** The name is a *per-minor-series* attribute stored in ONE file,
-  `choreo-proto/release-name.txt` — the single source of truth. The file is
+  `choreo-shared/release-name.txt` — the single source of truth. The file is
   compiled into the binaries (so `choreographr --version` prints
   `choreographr 0.2.0 (Lindy)`) and read by the CI release job for the GitHub
   release title. It also appears in the CHANGELOG section heading
@@ -177,7 +177,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/cred
    For a **major or minor** release (not a patch), also choose a **new name**
    here — a dance style such as *Lindy*; there is no pre-assigned list, pick
    whatever fits (see [Release names](#versioning--gates)). A **patch** release
-   keeps the current name: leave `choreo-proto/release-name.txt` and the
+   keeps the current name: leave `choreo-shared/release-name.txt` and the
    CHANGELOG heading as they are (step 2).
 
 2. **Enact the decision** — the command that carries it out is
@@ -201,7 +201,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/cred
    1. `cargo release version <level> -x` — applies the manifest bump (clean
       tree required; see above).
    2. Set the release name (**major/minor only**) — write one line to
-      `choreo-proto/release-name.txt`; a patch release leaves it untouched.
+      `choreo-shared/release-name.txt`; a patch release leaves it untouched.
    3. Promote the changelog section — rename `## [Unreleased]` to
       `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md`, keeping the series name in
       parentheses so it matches the file (`## [0.2.1] - 2026-10-01 (Lindy)` for
@@ -213,7 +213,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/cred
       (README install section).
 
    ```nu
-   git add Cargo.toml Cargo.lock choreo-proto/release-name.txt CHANGELOG.md README.md  # + any other docs touched
+   git add Cargo.toml Cargo.lock choreo-shared/release-name.txt CHANGELOG.md README.md  # + any other docs touched
    git commit -m "release: bump to X.Y.Z"
    ```
 
@@ -232,7 +232,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/cred
    > guard first, so a section that repeats a category heading (e.g. two
    > `### Fixed` blocks) fails before extraction rather than shipping a
    > malformed release page. The release **title** now comes from
-   > `choreo-proto/release-name.txt` (not the heading) — but the job first runs
+   > `choreo-shared/release-name.txt` (not the heading) — but the job first runs
    > the `check-release-name` guard, so the heading and the file must agree.
 
 4. **Tag the bump commit** (cargo-release reads the version back from
@@ -332,12 +332,13 @@ with `-x` to execute. `publish` does NOT bump or tag — that was
 ```nu
 # Nushell has no `\` line continuation — collect the flags in a list and spread
 # them into the command with `...$list`.
-# ── Batch 1 — the eight dependency leaves (4 new crates) ──
+# ── Batch 1 — the nine dependency leaves ──
 let b1 = ["publish"
   "-p" "choreo-proto" "-p" "choreo-keystore"
   "-p" "choreo-markdown" "-p" "choreo-mcp"
   "-p" "choreo-sanitize" "-p" "choreo-image"
-  "-p" "choreo-sockreg" "-p" "choreo-power-events"]
+  "-p" "choreo-sockreg" "-p" "choreo-power-events"
+  "-p" "choreo-shared"]
 ./scripts/publish-stable.sh ...$b1        # dry-run; must end `aborting release due to dry run`
 ./scripts/publish-stable.sh ...$b1 -x     # execute
 
@@ -354,12 +355,14 @@ let b2 = ["publish"
 ./scripts/publish-stable.sh ...$b2 -x     # execute
 ```
 
-> **This step is written for 0.2.0.** It is the only release that creates new
-> crates; once all 18 exist on crates.io every later release is pure
-> *updates* and publishes single-shot with
-> `./scripts/publish-stable.sh publish --workspace -x`. Re-derive that
-> no-decision-needed rule from the dry run's ending when cutting the next
-> release.
+> **This step is written for 0.2.0.** `choreo-shared` (a dependency leaf: clap
+> + tracing-subscriber only) is a NEW publish-set member added after 0.2.0, so
+> the set is now 19 crates and the next release that ships it is again a
+> multi-crate one — add `"-p" "choreo-shared"` to Batch 1 above. Once all 19
+> exist on crates.io every later release is pure *updates* and publishes
+> single-shot with `./scripts/publish-stable.sh publish --workspace -x`.
+> Re-derive that no-decision-needed rule from the dry run's ending when cutting
+> the next release.
 
 Publishing runs through `scripts/publish-stable.sh` (or `just publish-stable`),
 not bare `cargo release`: the per-profile `rustflags` keys in the root
@@ -404,7 +407,7 @@ package by default: a bare `cargo release publish` plans just `choreographr`,
 marks every workspace member as `disabled by user, skipping`, and then dies
 with `error: choreographr 0.1.0 depends on unpublished workspace package
 choreo-*` — the root's deps are neither in the publish set nor on crates.io
-yet. `--workspace` puts all 18 publish-set members in the set; cargo-release
+yet. `--workspace` puts all 19 publish-set members in the set; cargo-release
 hands them to a single `cargo publish` call and cargo uploads them in
 dependency order. `choreo-gui` is the one private member kept out by the
 wrapper's derived `--exclude` flag — cargo-release 1.1.5 does *not* honor
@@ -430,7 +433,7 @@ cargo install choreographr choreo-tui --locked
 ^$"($env.CARGO_HOME)/bin/choreo-tui" --version      # the TUI is its own package now
 ```
 
-**Gate:** 18 crates published, `cargo install choreographr choreo-tui --locked`
+**Gate:** 19 crates published, `cargo install choreographr choreo-tui --locked`
 works in a scratch CARGO_HOME, tag `vX.Y.Z` pushed.
 
 ---
@@ -608,10 +611,10 @@ Finally, commit any post-release doc/version drift in this repo and push.
 - [ ] `just ci` green; tree clean; master pulled
 - [ ] MSRV sync: `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'` → update `rust-version` in `[workspace.package]` (with `Cargo.lock`) if changed
 - [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD (Name)` section — ` (Name)` for a major/minor release (name picked at release time), or the current series name kept for a patch — with a fresh empty `[Unreleased]` + compare link above it (structure enforced by `just check-changelog`: one heading per category, no empty blocks)
-- [ ] `choreo-proto/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch; must match the ` (Name)` on the CHANGELOG heading (enforced by `just check-release-name`)
+- [ ] `choreo-shared/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch; must match the ` (Name)` on the CHANGELOG heading (enforced by `just check-release-name`)
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -p choreographr -x` → `vX.Y.Z` (the explicit `-p` avoids a stray `choreo-tui-vX.Y.Z` tag)
 - [ ] Signed in to crates.io (Phase 2 step 0): the `/api/v1/me` token check returns `200`, else `cargo login` a token with the publish-new/publish-update scopes
-- [ ] Publish in **two batches** (0.2.0 creates 6 new crates > burst 5; a single `--workspace` is refused): dry-run then `-x` each — Batch 1 (`-p choreo-proto … -p choreo-power-events`), wait ≥ 10 min, Batch 2 (`-p choreo-transport … -p choreographr`) → 18 crates on crates.io; `cargo install --locked` verified
+- [ ] Publish in **two batches** (0.2.0 created 6 new crates > burst 5; the post-0.2.0 `choreo-shared` adds a 19th member, also in Batch 1 — a single `--workspace` is refused): dry-run then `-x` each — Batch 1 (`-p choreo-proto … -p choreo-power-events -p choreo-shared`), wait ≥ 10 min, Batch 2 (`-p choreo-transport … -p choreographr`) → 19 crates on crates.io; `cargo install --locked` verified
 - [ ] Push the bump commit + `vX.Y.Z` tag → CI builds all platforms and creates the GitHub release; verify the release page lists every asset + `SHA256SUMS` and they download
 - [ ] `gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/`, then `scripts/update-homebrew-tap.sh --push` (commit the synced `packaging/homebrew/choreographr.rb`); `gh workflow run homebrew-verify.yml -f version=X.Y.Z` green
 - [ ] AUR — **deferred** (no AUR account; registration closed): `packaging/aur/` bumped in-repo but not pushed
@@ -716,7 +719,7 @@ source-of-truth file, so it matches the CI-produced title exactly (an empty
 ```nu
 # Title from the source-of-truth file, matching the CI job: a named series gets
 # a trailing " (Name)", the unnamed series stays bare.
-let NAME = (open --raw choreo-proto/release-name.txt | str trim)
+let NAME = (open --raw choreo-shared/release-name.txt | str trim)
 let TITLE = if ($NAME | is-empty) { "choreographr X.Y.Z" } else { "choreographr X.Y.Z (" + $NAME + ")" }
 
 # gh needs a real path for --notes-file (nushell has no <(...) substitution):

@@ -76,6 +76,7 @@ choreo-content = { workspace = true, optional = true }
 choreo-mcp = { workspace = true, optional = true }
 choreo-proto.workspace = true
 choreo-sanitize.workspace = true
+choreo-shared.workspace = true
 choreo-image.workspace = true
 choreo-transport.workspace = true
 choreo-ai-protocols.workspace = true

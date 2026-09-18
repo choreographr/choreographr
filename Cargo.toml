@@ -102,6 +102,7 @@ members = [
     "choreo-power-events",
     "choreo-proto",
     "choreo-sanitize",
+    "choreo-shared",
     "choreo-sockreg",
     "choreo-tui",
     "choreo-gui",
@@ -370,6 +371,9 @@ choreo-keystore = { path = "choreo-keystore", version = "0.2" }
 choreo-proto = { path = "choreo-proto", version = "0.2" }
 choreo-power-events = { path = "choreo-power-events", version = "0.2" }
 choreo-sanitize = { path = "choreo-sanitize", version = "0.2" }
+# Shared binary-facing helpers (release-name metadata, clap styling, `-v`/`-q`
+# verbosity) — a deliberate leaf crate every CLI binary depends on.
+choreo-shared = { path = "choreo-shared", version = "0.2" }
 choreo-sockreg = { path = "choreo-sockreg", version = "0.2" }
 choreo-image = { path = "choreo-image", version = "0.2" }
 # Not in [workspace.dependencies]: the root crate is the only consumer, and
@@ -448,7 +452,7 @@ rmp-serde = "1.3"
 tempfile = "3"
 # `string` lets `#[command(version = <expr>)]` accept a runtime-built `String`
 # (clap's `Str: From<String>` is behind this feature) — used by every shipped
-# binary to append the release name from `choreo_proto::release_name`.
+# binary to append the release name from `choreo_shared::release_name`.
 clap = { version = "4.6", features = ["derive", "string"] }
 # Multi-producer/single-consumer channels with `select!` — the event-driven
 # replacement for `recv_timeout` polling when a thread must wait on several

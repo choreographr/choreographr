@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal in use. A `/command` line typed directly and submitted via the
   normal prompt still works.
 
+- **New `choreo-shared` leaf crate.** The suite's small binary-facing helpers
+  now live in one place: the release-name metadata (`release-name.txt`, moved
+  out of `choreo-proto` and `include_str!`-baked exactly as before, so
+  `--version` and the CI release title are unchanged), the shared clap `Styles`
+  (previously copy-pasted into five CLI crates), and the `-v`/`-q` verbosity
+  flags plus log-level resolution (`Verbosity`, `LoggingConfig::resolve`). Every
+  binary — `choreographr`, `choreo-tui`, `choreo-gui`, `choreo-im`,
+  `choreo-acp` — depends on it.
+
 - **`retrieve_webpage` can render WebGL.** A new opt-in `webgl` argument
   launches Chromium in new-headless mode with ANGLE/SwiftShader software GL —
   including `--enable-unsafe-swiftshader`, which modern Chrome requires before
@@ -60,6 +69,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/command` spelling share one dispatcher. The dispatcher itself moved out of
   the (already large) `connection/chat.rs` into `connection/command.rs`, and
   `parse_input_line` dropped its now-unused `attached_session_id` argument.
+
+- **Uniform logging across every binary.** `choreo-tui`, `choreo-gui`,
+  `choreo-im`, and `choreo-acp` now accept the same `-v`/`-q` flags and apply
+  the same level policy as the daemon, resolved once in `choreo-shared::logging`.
+  Precedence follows the Unix convention — **explicit flags win over `RUST_LOG`**
+  (the daemon previously let `RUST_LOG` win and ignored the flags). `--version`
+  on `choreo-gui` now also appends the release name, matching the other binaries.
 
 ### Removed
 
@@ -109,6 +125,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The inline command palette no longer recomputes the Chat-page layout.**
   `render_chat` returns the command input box rect it already laid out and the
   palette reuses it, so the layout solver runs once per frame instead of twice.
+
+- **`choreo-tui` no longer writes an unfiltered TRACE log.** Its file
+  subscriber installed no level filter, so the subscriber's max level defaulted
+  to TRACE and every `debug!`/`trace!` event from the TUI *and its dependencies*
+  was appended to `$TMPDIR/choreo-tui-<pid>.log` — the source of
+  multi-hundred-MB log files. It now honors the shared `-v`/`-q`/`RUST_LOG`
+  policy (default `info`).
+
+- **The daemon's `RUST_LOG is set; -v/-q CLI flags are ignored` warning is no
+  longer lost.** It was emitted *before* the tracing subscriber was installed,
+  so it was silently dropped; it now logs after init (and reports that the
+  flags take precedence).
 
 ## [0.2.1] - 2026-09-17 (Lindy)
 

@@ -365,7 +365,9 @@ cargo run --release -p choreographr -- -q   # warnings only
 cargo run --release -p choreographr -- --log-file /tmp/choreo.log  # log to a file instead of stderr
 ```
 
-`RUST_LOG` takes precedence over the CLI flags:
+`RUST_LOG` supplies the directives when no `-v`/`-q` flag is given; explicit
+flags win over it. Every binary in the suite shares this policy — the daemon,
+TUI, GUI, IM, and ACP adapters all take the same `-v`/`-q` flags.
 
 ```bash
 RUST_LOG=debug cargo run --release -p choreographr
@@ -379,6 +381,11 @@ cargo run --release -p choreo-gui      # desktop app
 cargo run --release -p choreo-im       # IM bridge
 cargo run --release -p choreo-acp      # ACP bridge for editors
 ```
+
+Each client accepts the same `-v`/`-q` flags as the daemon. The TUI and GUI
+write diagnostics to `$TMPDIR/choreo-tui-<pid>.log` and
+`$TMPDIR/choreo-gui-<pid>.log`; the ACP adapter writes to its `--log-file`
+(default `$TMPDIR/choreo-acp.log`).
 
 ### First conversation
 
@@ -414,6 +421,7 @@ data model.
 |---|---|
 | `choreographr` | Workspace root — declares ONLY the daemon binary; `cargo run -p choreographr` / `cargo install choreographr` select it via `default-run`. Workspace `default-members = [".", "choreo-tui"]` keeps a bare `cargo build` at the root producing daemon + TUI exactly as before the binary split |
 | `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
+| `choreo-shared` | Leaf crate — shared binary-facing helpers: the release-name metadata (`release-name.txt`, compiled in for `--version` and the CI release title), the shared clap styling, and the `-v`/`-q` verbosity + log-level policy every CLI binary uses |
 | `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (208 providers) |
 | `choreo-sockreg` | Leaf crate — live provider-socket registry (force-close + RAII deregistration: transports unregister on drop, so only live connections are listed; opportunistic prune stays as a backstop) and TCP keepalive tuning; every provider HTTP connection registers here so cancels/suspends can un-block wedged readers |
 | `choreo-power-events` | Leaf crate — platform suspend/wake notifications as crossbeam events (logind on Linux, IOKit on macOS, user32 suspend/resume callbacks on Windows, inert fallback elsewhere); best-effort over sockreg's kernel keepalives |
@@ -1156,10 +1164,12 @@ choreographr`).
 
 ## Troubleshooting
 
-- `choreo-tui` writes its diagnostics to `/tmp/choreo-tui.log` — check there
-  for client-side issues.
+- `choreo-tui` writes its diagnostics to `$TMPDIR/choreo-tui-<pid>.log`
+  (platform temp dir — set `TMPDIR` to relocate); check there for client-side
+  issues, and pass `-v`/`-vv` for more detail.
 - The daemon logs to stderr; use `-v`/`-vv` for more detail, or set
-  `RUST_LOG`.
+  `RUST_LOG`. Every binary takes the same `-v`/`-q` flags (explicit flags win
+  over `RUST_LOG`).
 
 ## License
 

@@ -1,10 +1,6 @@
 mod error;
 mod frame;
 mod io;
-// Public: the release-name source of truth (`release-name.txt`) is compiled in
-// here and read by every shipped binary for `--version` and startup logs, and by
-// CI for the GitHub release title.
-pub mod release_name;
 mod size;
 mod types;
 

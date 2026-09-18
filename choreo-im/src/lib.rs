@@ -1,12 +1,14 @@
 use anyhow::{Context, bail};
 use choreo_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
+use choreo_shared::clap_styles;
+use choreo_shared::logging::{LoggingConfig, Verbosity};
 use clap::Parser;
 use std::env;
 use std::io::{BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use tracing::{error, info};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing::{error, info, warn};
+use tracing_subscriber::fmt;
 // Windows: std::os::windows::net::UnixStream is unstable (E0658, feature
 // `windows_unix_domain_sockets`, rust-lang/rust#150487), so uds_windows provides
 // the same connect/try_clone/shutdown API over named pipes.
@@ -17,34 +19,14 @@ pub mod bridge;
 pub mod telegram;
 pub mod tg_api;
 
-/// Shared clap [`Styles`] for this crate's CLI binary.
-///
-/// Each CLI crate keeps its own copy (choreo-proto is the wire protocol and
-/// must not host CLI styling); if this ever grows, promote it to a dedicated
-/// micro-crate instead of putting it in choreo-proto.
-///
-/// Uses real ANSI hues (green headers/usage, cyan literals/placeholders) rather
-/// than bold/underline only, so help output stays legible even in terminals whose
-/// bold text isn't visually distinct (e.g. themes that don't remap the bold color).
-/// `Styles::styled()` keeps clap's default error/invalid/valid coloring; the
-/// overrides colorize the help elements.
-fn clap_styles() -> clap::builder::Styles {
-    use clap::builder::styling::{AnsiColor, Effects, Styles};
-    Styles::styled()
-        .header(AnsiColor::Green.on_default() | Effects::BOLD)
-        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
-        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
-        .placeholder(AnsiColor::Cyan.on_default())
-}
-
 #[derive(Parser)]
 // `--version`/`-V` reports CARGO_PKG_VERSION with the release name appended via
-// `choreo_proto::release_name`, matching the rest of the suite. ColorChoice is
+// `choreo_shared::release_name`, matching the rest of the suite. ColorChoice is
 // explicitly Auto (clap's default): color only on a TTY, never forced into
 // pipes.
 #[command(
     name = "choreo-im",
-    version = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION")),
+    version = choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION")),
     about = "IM platform bridge for Choreographr",
     color = clap::ColorChoice::Auto,
     styles = clap_styles()
@@ -52,6 +34,10 @@ fn clap_styles() -> clap::builder::Styles {
 struct Cli {
     /// IM platform to bridge (e.g. telegram)
     platform: String,
+
+    // Increase logging verbosity (-v debug, -vv trace)
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// Entry point for the `choreo-im` platform bridge binary.
@@ -64,15 +50,21 @@ struct Cli {
 /// Returns an error when tracing initialization fails or the daemon
 /// connection/bridge loop surfaces an unrecoverable error.
 pub fn main() -> anyhow::Result<()> {
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
-
     let cli = Cli::parse();
     let platform = cli.platform;
+
+    // Logging init AFTER arg parsing so the `-v`/`-q` flags can be honored
+    // (flags win over RUST_LOG); the shared resolver keeps every binary's
+    // policy identical.
+    let logging = LoggingConfig::resolve(cli.verbosity);
+    fmt().with_env_filter(logging.filter).init();
+    if logging.rust_log_ignored {
+        warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
+    }
+    info!(
+        effective_level = logging.effective_level,
+        "logging initialized"
+    );
 
     let path = socket_path();
     let stream = UnixStream::connect(&path).context("failed to connect to daemon")?;
@@ -306,8 +298,8 @@ mod tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
-        // And the release name (from choreo-proto/release-name.txt) rides along.
-        let expected = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION"));
+        // And the release name (from choreo-shared/release-name.txt) rides along.
+        let expected = choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION"));
         assert!(err.to_string().contains(&expected));
     }
 

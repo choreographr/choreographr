@@ -406,6 +406,34 @@ is declared by the root package's `src/bin/choreographr.rs`.
 
 ## Crate details
 
+### `choreo-shared` — Shared binary helpers
+
+A deliberately tiny **leaf crate** (dependencies: `clap` and `tracing-subscriber`
+only) holding the small, binary-facing helpers that every CLI crate in the
+suite used to duplicate. It carries no protocol or transport logic —
+`choreo-proto` stays the wire protocol.
+
+- **`release_name`** — the build-info source of truth for the suite's
+dance-style release name. The raw name lives in one file,
+`choreo-shared/release-name.txt`, pulled in with `include_str!` (compile-time
+inclusion, no `build.rs`) so it is baked into every binary; the file sits inside
+the crate directory so it also ships in the published `.crate`. `release_name()`
+returns `Option<&str>` (`None` when the file is empty — the unnamed 0.1.0
+series) and `version_string(base)` renders `"0.2.0 (Lindy)"` for a binary's own
+`CARGO_PKG_VERSION`, or `base` unchanged when unnamed. Every clap binary
+(`choreographr`, `choreo-tui`, `choreo-im`, `choreo-acp`, `choreo-gui`) passes it
+to `#[command(version = …)]` so `--version` reports it, and the daemon, TUI, IM,
+ACP, and GUI binaries log it at startup. The CI release job reads the same file
+for the GitHub release title, and `scripts/check-release-name.sh` (the
+`just check-release-name` guard) fails on drift between it and the CHANGELOG
+heading.
+- **`clap_styles`** — the single shared clap `Styles` (green headers/usage, cyan
+literals/placeholders) every CLI's `#[command(...)]` names; previously
+copy-pasted into each crate.
+- **`logging`** — the shared `Verbosity` flags (`#[command(flatten)]` `-v`/`-q`)
+and `LoggingConfig::resolve`, the one place the suite's level policy lives (see
+**Logging** below).
+
 ### `choreo-proto` — Wire protocol
 
 Defines all shared message types and framing. No dependencies on other workspace crates.
@@ -416,20 +444,6 @@ dial primitives `connect_unix` / `socket_listening` / `dial_error_means_no_liste
 on Windows). Keeping the dial and its "nothing is listening" classification
 here means the client (autostart) and the daemon (stale-socket probe) cannot
 classify a socket path differently.
-
-It also hosts the **`release_name` module** — the build-info source of truth
-for the suite's dance-style release name. The raw name lives in one file,
-`choreo-proto/release-name.txt`, pulled in with `include_str!` (compile-time
-inclusion, no `build.rs`) so it is baked into every binary; the file sits inside
-the crate directory so it also ships in the published `.crate`. `release_name()`
-returns `Option<&str>` (`None` when the file is empty — the unnamed 0.1.0
-series) and `version_string(base)` renders `"0.2.0 (Lindy)"` for a binary's own
-`CARGO_PKG_VERSION`, or `base` unchanged when unnamed. The four clap binaries
-(`choreographr`, `choreo-tui`, `choreo-im`, `choreo-acp`) pass it to
-`#[command(version = …)]` so `--version` reports it, and the daemon and TUI also
-log it at startup. The CI release job reads the same file for the GitHub release
-title, and `scripts/check-release-name.sh` (the `just check-release-name` guard)
-fails on drift between it and the CHANGELOG heading.
 
 **Key types:**
 
@@ -2958,9 +2972,16 @@ A value of `0` means *unlimited* — the agent loop runs until the model
 produces a final answer, is cancelled, or hits an error. This is a daemon-wide
 cap; individual sessions no longer carry their own `max_turns`.
 
-**Logging:** `choreographr` uses `tracing` with `tracing-subscriber`. Default level is `info`.
-CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level.
-`RUST_LOG` env var takes precedence over CLI flags.
+**Logging:** every binary uses `tracing` with `tracing-subscriber`. Default level is `info`.
+CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level, and
+**explicit flags take precedence over `RUST_LOG`** (the Unix convention; `RUST_LOG`
+is a per-target directive language, applied verbatim when no flag is given). The
+flag parsing (`Verbosity`) and the level resolution (`LoggingConfig::resolve`)
+live once in `choreo-shared::logging`, so all five binaries — daemon, TUI, GUI,
+IM, and ACP — share the exact same policy. Subscriber construction stays
+per-crate because destinations differ: the daemon logs to stderr or `--log-file`,
+the TUI and GUI to `$TMPDIR/choreo-tui-<pid>.log` / `choreo-gui-<pid>.log`, and
+the ACP adapter to `--log-file` (default `$TMPDIR/choreo-acp.log`).
 
 **Session persistence:** On daemon start, sessions are loaded from the database into
 `session_metadata` (in-memory). Model selection (`/model <name>`) updates both the

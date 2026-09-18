@@ -1,0 +1,23 @@
+[package]
+name = "choreo-shared"
+version.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+edition = "2024"
+rust-version.workspace = true
+
+# A deliberately tiny, *leaf* crate: the small binary-facing helpers that every
+# CLI crate in the workspace used to duplicate (release-name metadata, the
+# shared clap styling, the `-v`/`-q` verbosity handling). It holds no protocol
+# or transport logic — `choreo-proto` remains the wire protocol — so it stays
+# cheap to depend on from every binary.
+[dependencies]
+clap.workspace = true
+tracing-subscriber.workspace = true
+
+# Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
+[lints]
+workspace = true

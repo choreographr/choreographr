@@ -2,7 +2,7 @@
 # scripts/check-release-name.sh — keep the release-name source of truth and the
 # CHANGELOG heading in sync.
 #
-# `choreo-proto/release-name.txt` is the machine source of truth (compiled into
+# `choreo-shared/release-name.txt` is the machine source of truth (compiled into
 # the binaries AND read by the CI release job for the release title). The
 # CHANGELOG heading for the current version records the same dance-style name
 # for humans (`## [X.Y.Z] - YYYY-MM-DD (Lindy)`). Nothing else ties the two
@@ -27,7 +27,7 @@ fi
 
 # The name baked into the binaries: first line of the source-of-truth file,
 # trimmed of surrounding whitespace (empty when the file is empty).
-FILE="$(head -n1 choreo-proto/release-name.txt 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
+FILE="$(head -n1 choreo-shared/release-name.txt 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
 
 # The name recorded on the CHANGELOG heading for this version — the `(Name)`
 # substring, or empty when the heading is absent or carries no parentheses.
@@ -35,7 +35,7 @@ HEAD="$(awk -v ver="$VER" 'index($0,"## ["ver"]")==1 { if (match($0,/\([^)]*\)/)
 
 if [ "$FILE" != "$HEAD" ]; then
     echo "error: release-name drift detected" >&2
-    echo "  choreo-proto/release-name.txt: '${FILE}'" >&2
+    echo "  choreo-shared/release-name.txt: '${FILE}'" >&2
     echo "  CHANGELOG.md ## [${VER}]:      '${HEAD}'" >&2
     echo "Update both (major/minor sets a new name; patch releases keep it)." >&2
     exit 1

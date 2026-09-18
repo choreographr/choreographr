@@ -19,6 +19,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 choreo-proto.workspace = true
+choreo-shared.workspace = true
 choreo-keystore.workspace = true
 choreo-client-core.workspace = true
 choreo-markdown.workspace = true

@@ -2,53 +2,31 @@ use crate::config::load_daemon_config;
 use crate::daemon::DaemonState;
 use anyhow::Context;
 use choreo_proto::socket_path;
+use choreo_shared::clap_styles;
+use choreo_shared::logging::{LoggingConfig, Verbosity};
 use choreo_transport::key::ensure_transport_keypair;
 use clap::Parser;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
-
-/// Shared clap [`Styles`] for this crate's CLI binary.
-///
-/// Each CLI crate keeps its own copy (choreo-proto is the wire protocol and
-/// must not host CLI styling); if this ever grows, promote it to a dedicated
-/// micro-crate instead of putting it in choreo-proto.
-///
-/// Uses real ANSI hues (green headers/usage, cyan literals/placeholders) rather
-/// than bold/underline only, so help output stays legible even in terminals whose
-/// bold text isn't visually distinct (e.g. themes that don't remap the bold color).
-/// `Styles::styled()` keeps clap's default error/invalid/valid coloring; the
-/// overrides colorize the help elements.
-fn clap_styles() -> clap::builder::Styles {
-    use clap::builder::styling::{AnsiColor, Effects, Styles};
-    Styles::styled()
-        .header(AnsiColor::Green.on_default() | Effects::BOLD)
-        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
-        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
-        .placeholder(AnsiColor::Cyan.on_default())
-}
+use tracing_subscriber::fmt;
 
 #[derive(Parser)]
 // `--version`/`-V` reports this crate's CARGO_PKG_VERSION (which the Homebrew
 // formula test, installer, and smoke tests rely on) with the release name
-// appended via `choreo_proto::release_name` — e.g. `0.2.0 (Lindy)`, or the
-// bare version when the name file is empty. See `choreo-proto/release-name.txt`.
+// appended via `choreo_shared::release_name` — e.g. `0.2.0 (Lindy)`, or the
+// bare version when the name file is empty. See `choreo-shared/release-name.txt`.
 // `color` is explicitly `Auto` (clap's default) to document the intent that
 // help/error output is colored only when stdout/stderr is a TTY.
 #[command(
     name = "choreographr",
-    version = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION")),
+    version = choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION")),
     about = "Choreographr AI daemon",
     color = clap::ColorChoice::Auto,
     styles = clap_styles()
 )]
 struct Cli {
-    /// Increase logging verbosity (-v debug, -vv trace)
-    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
-    verbose: u8,
-
-    /// Decrease logging verbosity (only errors and warnings)
-    #[arg(short = 'q', long = "quiet", action = clap::ArgAction::Count)]
-    quiet: u8,
+    // Increase logging verbosity (-v debug, -vv trace)
+    #[command(flatten)]
+    verbosity: Verbosity,
 
     /// Enable Prometheus metrics HTTP server on this socket address
     /// (e.g. 127.0.0.1:9464).  When absent no metrics server is started.
@@ -266,26 +244,12 @@ fn open_log_file(path: &str) -> anyhow::Result<std::fs::File> {
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Determine log level: RUST_LOG env var takes precedence, otherwise use CLI flags
-    let log_level = if std::env::var("RUST_LOG").is_ok() {
-        if cli.verbose > 0 || cli.quiet > 0 {
-            warn!("RUST_LOG is set; -v/-q CLI flags are ignored");
-        }
-        None // Use RUST_LOG as-is
-    } else {
-        let level = match (cli.verbose, cli.quiet) {
-            (0, 0) => "info",
-            (_, q) if q > 0 => "warn",
-            (1, 0) => "debug",
-            _ => "trace",
-        };
-        Some(level)
-    };
-
-    let env_filter = match log_level {
-        Some(level) => EnvFilter::new(level),
-        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-    };
+    // Resolve the log configuration from the shared `-v`/`-q` flags. Explicit
+    // flags win over RUST_LOG (the Unix precedence convention); the decision is
+    // made here but the "flags take precedence" warning is emitted AFTER the
+    // subscriber is installed — a warning logged before `init()` has no
+    // subscriber and is silently dropped.
+    let logging = LoggingConfig::resolve(cli.verbosity);
 
     // Logging init happens HERE — before any subcommand/state work — because
     // everything after it wants to log. With --log-file, open the file first
@@ -297,15 +261,23 @@ pub fn main() -> anyhow::Result<()> {
         // `Mutex<File>` is a `MakeWriter`: each tracing event locks the file
         // briefly, serializing writes without any extra plumbing.
         fmt()
-            .with_env_filter(env_filter)
+            .with_env_filter(logging.filter)
             .with_ansi(false)
             .with_writer(std::sync::Mutex::new(file))
             .init();
     } else {
-        fmt().with_env_filter(env_filter).init();
+        fmt().with_env_filter(logging.filter).init();
     }
 
-    info!(effective_level = ?log_level.unwrap_or("from RUST_LOG"), "logging initialized");
+    // Now that a subscriber exists, these are observable: warn when the flags
+    // the user passed override a set RUST_LOG, then report the effective level.
+    if logging.rust_log_ignored {
+        warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
+    }
+    info!(
+        effective_level = logging.effective_level,
+        "logging initialized"
+    );
 
     // Utility subcommands exit early — they are one-shot file operations and
     // never touch the DB, providers, or listeners below.
@@ -355,10 +327,10 @@ pub fn main() -> anyhow::Result<()> {
     // policy, so its behavior is unchanged.
     let max_turns = resolve_max_turns().context("failed to resolve tool-loop iteration limit")?;
     info!(max_turns, "tool loop iteration limit");
-    // The release name (choreo-proto/release-name.txt) is part of the startup
+    // The release name (choreo-shared/release-name.txt) is part of the startup
     // banner alongside the crate version, so logs identify the exact series.
     info!(
-        version = %choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION")),
+        version = %choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION")),
         "choreographr starting (locked)"
     );
 
@@ -544,8 +516,8 @@ mod tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
-        // And the release name (from choreo-proto/release-name.txt) rides along.
-        let expected = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION"));
+        // And the release name (from choreo-shared/release-name.txt) rides along.
+        let expected = choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION"));
         assert!(err.to_string().contains(&expected));
     }
 }

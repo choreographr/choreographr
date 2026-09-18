@@ -772,7 +772,7 @@ jobs:
           cat /tmp/release-notes.md
 
       - name: Check the release name is in sync
-        # The release TITLE below is read from choreo-proto/release-name.txt,
+        # The release TITLE below is read from choreo-shared/release-name.txt,
         # while the CHANGELOG heading records the same name for humans. Fail
         # the release on drift so a mislabelled title can never ship.
         run: ./scripts/check-release-name.sh
@@ -795,12 +795,12 @@ jobs:
           # The body comes from CHANGELOG.md (extracted above); the
           # auto-generated notes are appended after it.
           # Release name: read from the source-of-truth file that is ALSO
-          # compiled into the binaries (choreo-proto/release-name.txt) — the
+          # compiled into the binaries (choreo-shared/release-name.txt) — the
           # same file the check-release-name guard validated against the
           # CHANGELOG heading in the previous step. Patch releases have an
           # empty file and get a bare title. Parentheses match the binaries'
           # `--version` output (e.g. `choreographr 0.2.0 (Lindy)`).
-          CODENAME="$(head -n1 choreo-proto/release-name.txt 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
+          CODENAME="$(head -n1 choreo-shared/release-name.txt 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
           TITLE="choreographr ${VERSION}"
           if [ -n "$CODENAME" ]; then
               TITLE="${TITLE} (${CODENAME})"

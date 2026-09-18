@@ -114,43 +114,30 @@ pub(crate) fn connection_quit_message(error: &ClientError) -> String {
 }
 
 use anyhow::Context;
+use choreo_shared::clap_styles;
+use choreo_shared::logging::{LoggingConfig, Verbosity};
 use clap::Parser;
-
-/// Shared clap [`Styles`] for this crate's CLI binary.
-///
-/// Each CLI crate keeps its own copy (choreo-proto is the wire protocol and
-/// must not host CLI styling); if this ever grows, promote it to a dedicated
-/// micro-crate instead of putting it in choreo-proto.
-///
-/// Uses real ANSI hues (green headers/usage, cyan literals/placeholders) rather
-/// than bold/underline only, so help output stays legible even in terminals whose
-/// bold text isn't visually distinct (e.g. themes that don't remap the bold color).
-/// `Styles::styled()` keeps clap's default error/invalid/valid coloring; the
-/// overrides colorize the help elements.
-fn clap_styles() -> clap::builder::Styles {
-    use clap::builder::styling::{AnsiColor, Effects, Styles};
-    Styles::styled()
-        .header(AnsiColor::Green.on_default() | Effects::BOLD)
-        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
-        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
-        .placeholder(AnsiColor::Cyan.on_default())
-}
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 // `--version` prints the crate version (CARGO_PKG_VERSION) with the release
-// name appended via `choreo_proto::release_name` — e.g. `0.2.0 (Lindy)`, or the
+// name appended via `choreo_shared::release_name` — e.g. `0.2.0 (Lindy)`, or the
 // bare version when the name file is empty. clap handles it before the app
 // starts, so it works headless too.
 // `color` is explicitly `Auto` (clap's default) to document the intent that
 // help/error output is colored only when stdout/stderr is a TTY.
 #[command(
     name = "choreo-tui",
-    version = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION")),
+    version = choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION")),
     about = "Choreographr terminal UI",
     color = clap::ColorChoice::Auto,
     styles = clap_styles()
 )]
 struct Cli {
+    // Increase logging verbosity (-v debug, -vv trace)
+    #[command(flatten)]
+    verbosity: Verbosity,
+
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
@@ -402,6 +389,25 @@ fn confirm_first_contact(
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Logging is initialized FIRST — before the TCP trust flow below, which
+    // emits `tracing` events (this mirrors the daemon, whose logging init is
+    // its very first act). The file subscriber's level comes from the shared
+    // resolver, so the TUI honors `-v`/`-q` (flags win) and `RUST_LOG` exactly
+    // as every other binary does.
+    let logging = LoggingConfig::resolve(cli.verbosity);
+    let log_path = init_file_logging(logging.filter);
+    let _ = log_path; // path is diagnostics only; run_app does not need it
+
+    // Only once a subscriber exists are these observable (an event logged
+    // before `init()` has no subscriber and is dropped).
+    if logging.rust_log_ignored {
+        tracing::warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
+    }
+    tracing::info!(
+        effective_level = logging.effective_level,
+        "logging initialized"
+    );
+
     let mode = if let Some(addr) = cli.tcp_addr {
         resolve_connect_mode(
             &addr,
@@ -417,15 +423,12 @@ pub fn main() -> anyhow::Result<()> {
         choreo_client_core::ConnectionMode::UnixSocket(choreo_proto::socket_path())
     };
 
-    let log_path = init_file_logging();
-    let _ = log_path; // path is diagnostics only; run_app does not need it
-
     // Best-effort startup banner carrying the release name
-    // (choreo-proto/release-name.txt) alongside the crate version. Logging here
+    // (choreo-shared/release-name.txt) alongside the crate version. Logging here
     // is deliberately best-effort: when init_file_logging found no writable log
     // file, no subscriber is installed and this event is simply dropped.
     tracing::info!(
-        version = %choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION")),
+        version = %choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION")),
         "choreo-tui starting"
     );
 
@@ -444,9 +447,13 @@ pub fn main() -> anyhow::Result<()> {
 /// respects `TMPDIR` (Termux sets it to its prefix tmp dir); any remaining
 /// failure degrades this run to no file logging (tracing events are then
 /// simply dropped — no subscriber is installed).
-fn init_file_logging() -> Option<std::path::PathBuf> {
-    use tracing_subscriber::prelude::*;
-
+///
+/// `env_filter` sets the subscriber's level exactly as every other binary does.
+/// It is applied via `fmt()` (NOT `registry().with(fmt::layer())`): a bare
+/// layer carries no filter, so the subscriber's max level defaults to TRACE and
+/// every debug/trace event from this crate and its dependencies is written —
+/// the multi-hundred-MB log file this replaced.
+fn init_file_logging(env_filter: EnvFilter) -> Option<std::path::PathBuf> {
     let log_path = log_file_path();
     let Ok(log_file) = std::fs::File::create(&log_path) else {
         // No panic, no error exit: a missing log must not take the TUI down
@@ -455,10 +462,13 @@ fn init_file_logging() -> Option<std::path::PathBuf> {
         // degradation is documented here and pinned by the tests below.
         return None;
     };
-    let file_layer = tracing_subscriber::fmt::layer()
+    // ANSI is off for file output (escape codes are unreadable in a log file);
+    // a plain `File` is the `MakeWriter`.
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_ansi(false)
         .with_writer(log_file)
-        .with_ansi(false);
-    tracing_subscriber::registry().with(file_layer).init();
+        .init();
     Some(log_path)
 }
 
@@ -487,8 +497,8 @@ mod cli_tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
-        // And the release name (from choreo-proto/release-name.txt) rides along.
-        let expected = choreo_proto::release_name::version_string(env!("CARGO_PKG_VERSION"));
+        // And the release name (from choreo-shared/release-name.txt) rides along.
+        let expected = choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION"));
         assert!(err.to_string().contains(&expected));
     }
 
@@ -683,8 +693,22 @@ mod cli_tests {
     /// happen once per process.
     #[test]
     fn init_file_logging_creates_the_log_file() {
-        let path = init_file_logging().expect("a writable temp dir must yield a log file");
+        let path = init_file_logging(EnvFilter::new("info"))
+            .expect("a writable temp dir must yield a log file");
         assert!(path.exists(), "the log file must have been created");
+    }
+
+    /// The shared `-v`/`-q` flags are flattened into the TUI's CLI, so `-vv`
+    /// must parse as verbose == 2 and the bare form as 0/0.
+    #[test]
+    fn cli_parses_the_shared_verbosity_flags() {
+        let cli = Cli::try_parse_from(["choreo-tui", "-vv", "-q"]).expect("flags parse");
+        assert_eq!(cli.verbosity.verbose, 2);
+        assert_eq!(cli.verbosity.quiet, 1);
+
+        let default = Cli::try_parse_from(["choreo-tui"]).expect("no flags parse");
+        assert_eq!(default.verbosity.verbose, 0);
+        assert_eq!(default.verbosity.quiet, 0);
     }
 }
 

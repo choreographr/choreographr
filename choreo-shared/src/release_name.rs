@@ -1,7 +1,7 @@
 //! Release-name metadata: the single source of truth for a release's dance-style
 //! name (e.g. *Lindy*).
 //!
-//! `choreo-proto/release-name.txt` — a single line sitting next to this crate's
+//! `choreo-shared/release-name.txt` — a single line sitting next to this crate's
 //! `Cargo.toml` — is that source of truth. [`RELEASE_NAME`] pulls it in with
 //! [`include_str!`], so the name is baked into every binary at compile time with
 //! no `build.rs` (nothing is generated or probed at build time; the literal is
@@ -22,7 +22,7 @@
 //! An empty file means *unnamed* (the pre-name 0.1.0 series), which
 //! [`release_name`] reports as `None`.
 
-/// The raw contents of `choreo-proto/release-name.txt`, included at compile time.
+/// The raw contents of `choreo-shared/release-name.txt`, included at compile time.
 pub const RELEASE_NAME: &str = include_str!("../release-name.txt");
 
 /// Parse the raw file contents: trim surrounding whitespace; empty → `None`.
