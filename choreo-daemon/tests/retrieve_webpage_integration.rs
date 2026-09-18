@@ -208,3 +208,88 @@ fn retrieve_webpage_element_screenshot_below_the_fold() {
         "element screenshot must contain the target's red pixels (blank capture = viewport-clip bug)"
     );
 }
+
+/// A page that clears a WebGL canvas to pure green. With the historical launch
+/// flags WebGL is unavailable and the canvas stays transparent (body white), so
+/// a present green pixel proves the opt-in WebGL configuration actually worked.
+const WEBGL_PAGE: &str = "<!doctype html><html><head><meta charset='utf-8'>\
+     <style>html,body{margin:0;background:#fff}canvas{display:block}</style></head>\
+     <body><canvas id='c' width='200' height='200'></canvas>\
+     <script>const c=document.getElementById('c');\
+     const gl=c.getContext('webgl2')||c.getContext('webgl');\
+     if(gl){gl.clearColor(0.0,1.0,0.0,1.0);gl.clear(gl.COLOR_BUFFER_BIT);}</script>\
+     </body></html>";
+
+/// Opt-in `webgl: true` must both report the context status and actually
+/// render WebGL content. This hosts a real browser and is therefore an
+/// `#[ignore = "integration"]` test.
+///
+/// Hosts without a usable WebGL stack are skipped (rather than failed): the
+/// tool's behaviour is correct — it reports `WebGL: unavailable` — but the
+/// environment lacks the capability, exactly the graceful-skip policy the other
+/// tests in this file use for a missing browser.
+#[test]
+#[ignore = "integration"]
+fn retrieve_webpage_webgl_renders_a_canvas() {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(90));
+        eprintln!("retrieve_webpage_integration: exceeded 90s; aborting to avoid a hang");
+        std::process::abort();
+    });
+
+    let dir = std::env::temp_dir().join("choreo-retrieve-webpage-webgl-test");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("index.html");
+    std::fs::write(&path, WEBGL_PAGE).expect("write temp html");
+    let url = url::Url::from_file_path(&path)
+        .expect("temp path should convert to a file:// URL")
+        .to_string();
+
+    let out_path = dir.join("webgl.png");
+    let registry = ToolRegistry::new().build();
+    let tool_call = ChatToolCall {
+        id: "call_4".to_string(),
+        name: "retrieve_webpage".to_string(),
+        arguments_json: format!(
+            r#"{{"url": "{url}", "action": "screenshot", "webgl": true, "output_path": "{}", "timeout_ms": 20000}}"#,
+            out_path.display()
+        ),
+        caller: None,
+    };
+
+    let output = registry
+        .execute_json(&tool_call, ToolOutputFormat::Text, None, None, None, None)
+        .expect("tool execution should return");
+
+    if output.is_error && output.content.contains("no chromium or chrome binary") {
+        eprintln!("retrieve_webpage_integration: skipping (no chromium/chrome installed)");
+        return;
+    }
+    assert!(
+        !output.is_error,
+        "webgl screenshot should succeed: {}",
+        output.content
+    );
+    // The tool must always report the WebGL status when the option is set.
+    assert!(
+        output.content.contains("WebGL:"),
+        "result should report WebGL status, got: {}",
+        output.content
+    );
+    // No context on this host: correct behaviour, but nothing to pixel-assert.
+    if output.content.contains("WebGL: unavailable") {
+        eprintln!("retrieve_webpage_integration: skipping (host has no usable WebGL)");
+        return;
+    }
+
+    let png = std::fs::read(&out_path).expect("screenshot should be written to output_path");
+    let img = image::load_from_memory(&png).expect("output should be a valid PNG");
+    // A WebGL clear to (0,1,0) must land as a strongly-green pixel; a failed
+    // context would leave only the white body background.
+    assert!(
+        img.to_rgba8()
+            .pixels()
+            .any(|p| p.0[1] > 200 && p.0[0] < 60 && p.0[2] < 60),
+        "webgl canvas must render its green clear colour (blank = WebGL did not run)"
+    );
+}

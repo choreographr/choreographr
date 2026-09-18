@@ -7,7 +7,8 @@ use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
 use headless_chrome::{Browser, LaunchOptions};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -59,6 +60,11 @@ pub struct RetrieveWebpageArgs {
     /// Where to write the result for `screenshot` / `pdf`. Resolved against the
     /// session working directory. PDFs require this.
     output_path: Option<String>,
+    /// Enable WebGL-capable rendering (new headless + software `SwiftShader`) so
+    /// canvas/3D pages render instead of coming back blank. Off by default (the
+    /// historical launch flags would disable WebGL). The result text reports the
+    /// WebGL version obtained, or that no context could be created.
+    webgl: Option<bool>,
 }
 
 /// Default viewport / nav timeout used when the caller omits them.
@@ -168,6 +174,63 @@ fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
+/// Build the Chromium launch options in a pure, testable way (no process is
+/// spawned), so the flag set can be asserted in unit tests.
+///
+/// When `webgl` is false this reproduces the historical configuration exactly:
+/// legacy headless with the crate's default `--disable-gpu`. When `webgl` is
+/// true it switches to new headless with ANGLE/`SwiftShader` so canvas/3D content
+/// renders — see the inline comments for why each flag is required.
+fn build_launch_options(
+    binary: PathBuf,
+    width: u32,
+    height: u32,
+    timeout_ms: u64,
+    webgl: bool,
+) -> Result<LaunchOptions<'static>, ToolExecError> {
+    let mut builder = LaunchOptions::default_builder();
+    builder.path(Some(binary));
+    builder.window_size(Some((width, height)));
+    // Keep the DevTools socket alive well past the resolved navigation timeout
+    // so a slow page can't get torn down mid-navigation; the idle grace is
+    // derived from (and always larger than) the caller's timeout.
+    builder.idle_browser_timeout(Duration::from_millis(
+        timeout_ms.saturating_mul(2).max(60_000),
+    ));
+
+    if webgl {
+        // The crate's `headless` flag only controls the bare `--headless`
+        // switch, which it appends to argv *after* our custom `args`. Chromium
+        // resolves duplicate switches to the LAST one, so leaving it true would
+        // emit `… --headless=new … --headless` and silently drop us back to
+        // legacy headless (which has poor/absent WebGL support). Turn it off and
+        // supply `--headless=new` ourselves below.
+        builder.headless(false);
+        // Drop the crate's `--disable-gpu`: WebGL — even SwiftShader — runs
+        // through the GPU/ANGLE path, and a global `--disable-gpu` can leave
+        // `getContext('webgl')` returning null even though the flags look right.
+        builder.enable_gpu(true);
+        builder.args(vec![
+            // New headless is the real browser rendering path required for WebGL.
+            OsStr::new("--headless=new"),
+            // Route GL through ANGLE's SwiftShader backend: portable software
+            // WebGL that works on headless hosts with no usable GPU.
+            OsStr::new("--use-gl=angle"),
+            OsStr::new("--use-angle=swiftshader"),
+            // REQUIRED on modern Chrome: without it the SwiftShader fallback
+            // backing WebGL is refused and the context comes back null.
+            OsStr::new("--enable-unsafe-swiftshader"),
+            // Don't let a conservative GPU blocklist disable GL outright.
+            OsStr::new("--ignore-gpu-blocklist"),
+        ]);
+    } else {
+        // Historical default: legacy headless, GPU left disabled by the crate.
+        builder.headless(true);
+    }
+
+    builder.build().map_err(|e| ToolExecError(e.to_string()))
+}
+
 /// True when `url` has an http, https, or file scheme — the schemes a headless
 /// browser can be asked to render. `file://` lets the browser read arbitrary
 /// local files from the daemon's host; that reach is intended and is not gated
@@ -223,6 +286,52 @@ fn page_content_size(tab: &Tab) -> Result<(f64, f64), ToolExecError> {
         .unwrap_or((0.0, 0.0));
     debug!(raw_width = %raw, "measured page content size");
     Ok((w, h))
+}
+
+/// JS that attempts to create a WebGL context and returns its version string,
+/// or an empty string when no context can be created. The result is a
+/// *primitive* string on purpose: the crate's `evaluate` hard-codes
+/// `returnByValue: false`, which yields `.value` only for primitives — see
+/// `PAGE_SIZE_JS` for the same rationale.
+const WEBGL_PROBE_JS: &str = "(() => { const c = document.createElement('canvas'); \
+     const gl = c.getContext('webgl2') || c.getContext('webgl'); \
+     return gl ? gl.getParameter(gl.VERSION) : ''; })()";
+
+/// Ask the page whether a WebGL context is actually usable, returning its
+/// version string (e.g. `"WebGL 2.0 (…)"`) or `None` when none was created.
+///
+/// A flag being present is not proof WebGL works: driver/host/Chrome-version
+/// variance means the only reliable signal is asking the page itself. This is
+/// why the tool probes rather than trusting the launch configuration.
+fn probe_webgl(tab: &Tab) -> Option<String> {
+    match tab.evaluate(WEBGL_PROBE_JS, false) {
+        Ok(obj) => {
+            let version = remote_text(&obj);
+            let version = version.trim();
+            if version.is_empty() {
+                None
+            } else {
+                Some(version.to_string())
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "retrieve_webpage: WebGL probe failed");
+            None
+        }
+    }
+}
+
+/// One-line report appended to the tool result when WebGL was requested: the
+/// context version on success, or an explicit "unavailable" note (plus a
+/// warning) when no context could be created, so a blank canvas render is never
+/// mistaken for success.
+fn webgl_note(tab: &Tab) -> String {
+    if let Some(version) = probe_webgl(tab) {
+        format!("WebGL: {version}")
+    } else {
+        warn!("retrieve_webpage: WebGL requested but no context was created");
+        "WebGL: unavailable (no context created)".to_string()
+    }
 }
 
 /// JS that measures an element's bounding box in **document space** (bounding
@@ -427,7 +536,7 @@ impl super::Tool for RetrieveWebpage {
         "retrieve_webpage"
     }
     fn description(&self) -> &'static str {
-        "Render a URL in a local headless Chromium/Chrome and return page content (HTML), plain text, a screenshot (PNG), or a PDF. Runs locally and offline; requires a chromium/chrome binary already installed (prefers chromium; override with CHROMIUM_BIN). Screenshots are returned inline or saved to output_path; PDFs require output_path. One-shot per call — no persistent session."
+        "Render a URL in a local headless Chromium/Chrome and return page content (HTML), plain text, a screenshot (PNG), or a PDF. Runs locally and offline; requires a chromium/chrome binary already installed (prefers chromium; override with CHROMIUM_BIN). Screenshots are returned inline or saved to output_path; PDFs require output_path. Set webgl true for WebGL-capable rendering (new headless + software SwiftShader); the result then reports the WebGL version or that no context could be created. One-shot per call — no persistent session."
     }
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let action = args
@@ -440,6 +549,9 @@ impl super::Tool for RetrieveWebpage {
         )];
         if let Some(sel) = args.selector.as_deref() {
             parts.push(format!(" Selector: {sel}."));
+        }
+        if args.webgl.unwrap_or(false) {
+            parts.push(" WebGL enabled.".to_string());
         }
         if let Some(out) = args.output_path.as_deref() {
             parts.push(format!(" Output: {out}."));
@@ -482,28 +594,23 @@ impl super::Tool for RetrieveWebpage {
             .min(MAX_TIMEOUT_MS);
         let wait_ms = args.wait_ms.map(|ms| ms.min(MAX_WAIT_MS));
 
+        let webgl = args.webgl.unwrap_or(false);
+
         // Launch a private, headless, one-shot browser instance with an
         // explicit path (so it uses the resolved chromium, never auto-detect)
-        // and our viewport.
-        let mut builder = LaunchOptions::default_builder();
-        builder.headless(true);
-        builder.path(Some(binary));
-        builder.window_size(Some((
+        // and our viewport. `webgl` selects the WebGL-capable flag set instead
+        // of the historical legacy-headless/GPU-disabled default.
+        let options = build_launch_options(
+            binary,
             args.width.unwrap_or(1280),
             args.height.unwrap_or(800),
-        )));
-        // Keep the DevTools socket alive well past the resolved navigation
-        // timeout so a slow page can't get torn down mid-navigation. The idle
-        // grace is derived from (and always larger than) the timeout, rather
-        // than a fixed constant that could be shorter than a caller's timeout.
-        builder.idle_browser_timeout(Duration::from_millis(
-            timeout_ms.saturating_mul(2).max(60_000),
-        ));
-        let options = builder.build().map_err(|e| ToolExecError(e.to_string()))?;
+            timeout_ms,
+            webgl,
+        )?;
 
         let browser = Browser::new(options)
             .map_err(|e| ToolExecError(format!("failed to launch headless browser: {e:#}")))?;
-        debug!("launched headless browser");
+        debug!(webgl, "launched headless browser");
 
         // Run the whole capture in a closure so the `Browser` (and its Chromium
         // child process) is released on every path, success or error, when it
@@ -528,7 +635,15 @@ impl super::Tool for RetrieveWebpage {
             }
             debug!(timeout_ms, wait_ms, "page navigated; capturing");
 
-            Self::capture(&tab, &args, action, url, working_dir)
+            let mut result = Self::capture(&tab, &args, action, url, working_dir)?;
+            // When WebGL was requested, report whether a context was actually
+            // created — flags in argv are not proof the host can render WebGL,
+            // so surface the real outcome regardless of which action ran.
+            if webgl {
+                result.text.push('\n');
+                result.text.push_str(&webgl_note(&tab));
+            }
+            Ok(result)
         })();
 
         match &outcome {
@@ -788,5 +903,74 @@ mod tests {
     fn png_dimensions_rejects_garbage() {
         assert_eq!(png_dimensions(b"not a png"), None);
         assert_eq!(png_dimensions(&[0u8; 32]), None);
+    }
+
+    #[test]
+    fn launch_options_webgl_enables_swiftshader_flags() {
+        let opts = build_launch_options(
+            std::path::PathBuf::from("/usr/bin/chromium"),
+            1280,
+            800,
+            30_000,
+            true,
+        )
+        .expect("build launch options");
+
+        // WebGL needs new headless, so the crate's legacy `--headless` (which it
+        // appends AFTER our custom flags and would win as the last duplicate
+        // switch) must be off, and the crate's `--disable-gpu` must be dropped.
+        assert!(!opts.headless, "webgl must not use legacy --headless");
+        assert!(opts.enable_gpu, "webgl must drop --disable-gpu");
+
+        let args: Vec<&str> = opts.args.iter().filter_map(|a| a.to_str()).collect();
+        for expected in [
+            "--headless=new",
+            "--use-gl=angle",
+            "--use-angle=swiftshader",
+            "--enable-unsafe-swiftshader",
+            "--ignore-gpu-blocklist",
+        ] {
+            assert!(args.contains(&expected), "missing {expected} in {args:?}");
+        }
+    }
+
+    #[test]
+    fn launch_options_default_matches_historical_config() {
+        let opts = build_launch_options(
+            std::path::PathBuf::from("/usr/bin/chromium"),
+            1280,
+            800,
+            30_000,
+            false,
+        )
+        .expect("build launch options");
+
+        assert!(opts.headless, "default keeps legacy headless");
+        assert!(!opts.enable_gpu, "default keeps the crate's --disable-gpu");
+        assert!(opts.args.is_empty(), "default must add no custom flags");
+    }
+
+    #[test]
+    fn webgl_probe_js_requests_a_context_and_reads_version() {
+        assert!(WEBGL_PROBE_JS.contains("getContext('webgl2')"));
+        assert!(WEBGL_PROBE_JS.contains("getContext('webgl')"));
+        assert!(WEBGL_PROBE_JS.contains("VERSION"));
+    }
+
+    #[test]
+    fn describe_invocation_mentions_webgl_only_when_enabled() {
+        let tool = RetrieveWebpage::new();
+        let on = RetrieveWebpageArgs {
+            url: "https://example.com".to_string(),
+            webgl: Some(true),
+            ..RetrieveWebpageArgs::default()
+        };
+        assert!(tool.describe_invocation(&on).contains("WebGL enabled"));
+
+        let off = RetrieveWebpageArgs {
+            url: "https://example.com".to_string(),
+            ..RetrieveWebpageArgs::default()
+        };
+        assert!(!tool.describe_invocation(&off).contains("WebGL enabled"));
     }
 }

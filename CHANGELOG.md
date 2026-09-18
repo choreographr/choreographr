@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal in use. A `/command` line typed directly and submitted via the
   normal prompt still works.
 
+- **`retrieve_webpage` can render WebGL.** A new opt-in `webgl` argument
+  launches Chromium in new-headless mode with ANGLE/SwiftShader software GL —
+  including `--enable-unsafe-swiftshader`, which modern Chrome requires before
+  it will grant a SwiftShader-backed WebGL context — and suppresses the
+  crate's GPU-disabling defaults that would otherwise leave canvas/3D pages
+  blank. The default stays legacy headless with GPU disabled, so existing calls
+  are unchanged. Because a flag being present is not proof WebGL works, the
+  tool probes the page for a real context and reports the WebGL version, or
+  that no context could be created, in its result.
+
 ### Changed
 
 - **Markdown tables in the TUI now use a nushell-style rounded frame.** The
