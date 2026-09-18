@@ -3,7 +3,8 @@ use crate::markdown_render::*;
 use crate::state::*;
 use crate::test_util::{make_session, test_app};
 use choreo_proto::{
-    AccountInfo, CatalogProvider, ClientMessage, DaemonMessage, RefreshStatus, SessionStatus, Turn,
+    AccountInfo, CatalogProvider, ClientMessage, DaemonMessage, ReasoningCapability, RefreshStatus,
+    SessionStatus, Turn,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
@@ -263,25 +264,28 @@ fn submitting_prompt_with_unknown_status_fails_open() {
 #[test]
 fn slash_command_is_accepted_while_busy() {
     // The guard only applies to plain prompts: a shell command such as
-    // `/cancel` must still reach the daemon while the session is busy.
+    // `/ping` must still reach the daemon while the session is busy.
+    // (`/models` no longer exists — `/model` opens the selector and
+    // `ListModels` is sent from there, so `/ping` is the minimal
+    // daemon-reaching command for this check.)
     let mut app = test_app();
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Inference);
-    app.input.text = "/models".to_string();
+    app.input.text = "/ping ".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
     press_enter(&mut app, &tx);
 
     assert_eq!(
         rx.recv().expect("sent message"),
-        ClientMessage::ListModels,
+        ClientMessage::Ping,
         "slash-commands must bypass the idle guard"
     );
 }
 
 #[test]
 fn empty_submission_while_busy_is_a_noop() {
-    // An empty line is `ShellCommand::Empty`, not a prompt — it must not trip
+    // An empty line is `Command::Empty`, not a prompt — it must not trip
     // the guard and must not set an error status.
     let mut app = test_app();
     app.attached_session_id = Some(42);
@@ -368,7 +372,7 @@ fn continue_command_while_busy_is_rejected_by_the_same_guard() {
     let mut app = test_app();
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Inference);
-    app.input.text = "/continue".to_string();
+    app.input.text = "/continue ".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
     press_enter(&mut app, &tx);
@@ -389,7 +393,7 @@ fn continue_command_while_locked_is_rejected_by_the_same_guard() {
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Inactive);
     app.keystore_locked = true;
-    app.input.text = "/continue".to_string();
+    app.input.text = "/continue ".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
     press_enter(&mut app, &tx);
@@ -1459,4 +1463,312 @@ mod unsent_draft_tests {
             "quit message must explain the shutdown, got: {msg}"
         );
     }
+}
+
+// ── Inline command palette + unified command dispatch ──────────────────
+//
+// Task 3 wired the palette (typed `/`), the keyboard shortcuts, and the
+// `/quit`-and-friends command variants into one dispatch path.  These tests
+// drive the full terminal-event pipeline to pin the end-to-end behavior.
+
+/// Send one unmodified key through the full terminal-event pipeline.
+fn press(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>, code: KeyCode) {
+    handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), app, tx)
+        .expect("handle key");
+}
+
+#[test]
+fn typing_slash_on_empty_prompt_enters_command_mode() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    assert!(!app.command_palette_active(), "inactive before typing");
+
+    press(&mut app, &tx, KeyCode::Char('/'));
+
+    assert!(app.command_mode, "`/` enters command mode");
+    assert!(
+        app.input.text.is_empty(),
+        "the `/` trigger is never stored in the buffer"
+    );
+    assert!(app.command_palette_active());
+    assert_eq!(
+        app.command_palette_matches().len(),
+        choreo_client_core::command_catalog().len(),
+        "an empty command line shows the whole catalog"
+    );
+}
+
+#[test]
+fn typing_further_narrows_palette_to_model() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    for c in ['m', 'o'] {
+        press(&mut app, &tx, KeyCode::Char(c));
+    }
+    assert_eq!(app.input.text, "mo", "the command line carries no slash");
+    let names: Vec<&str> = app
+        .command_palette_matches()
+        .iter()
+        .map(|m| m.spec.name)
+        .collect();
+    assert_eq!(names, vec!["model"]);
+}
+
+#[test]
+fn palette_up_down_move_the_highlight() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    assert_eq!(app.command_palette_focused(), 0);
+
+    press(&mut app, &tx, KeyCode::Down);
+    assert_eq!(app.command_palette_focused(), 1);
+    press(&mut app, &tx, KeyCode::Up);
+    assert_eq!(app.command_palette_focused(), 0);
+    // The move keys must not have edited the input.
+    assert!(
+        app.input.text.is_empty(),
+        "navigation must not edit the buffer"
+    );
+}
+
+#[test]
+fn palette_tab_completes_name_without_submitting() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    for c in ['m', 'o'] {
+        press(&mut app, &tx, KeyCode::Char(c));
+    }
+
+    press(&mut app, &tx, KeyCode::Tab);
+
+    assert_eq!(app.input.text, "model ", "Tab completes the name, no slash");
+    assert_eq!(app.input.cursor, "model ".len());
+    assert!(app.command_mode, "Tab stays in command mode");
+    assert!(rx.try_recv().is_err(), "Tab must never submit");
+}
+
+#[test]
+fn palette_enter_runs_the_command_and_exits_mode() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    for c in "model".chars() {
+        press(&mut app, &tx, KeyCode::Char(c));
+    }
+
+    press(&mut app, &tx, KeyCode::Enter);
+
+    // `Enter` RUNS `/model`, which opens the selector (not completion).
+    assert!(
+        app.model_selector.is_open(),
+        "Enter runs `/model`, opening the model selector"
+    );
+    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert!(!app.command_mode, "running a command exits command mode");
+    assert!(
+        app.input.is_empty(),
+        "the command line is discarded on exit"
+    );
+}
+
+#[test]
+fn palette_enter_on_empty_line_is_a_noop() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    assert!(app.command_palette_active());
+
+    press(&mut app, &tx, KeyCode::Enter);
+
+    assert!(app.command_mode, "an empty command line stays in mode");
+    assert!(
+        app.input.text.is_empty(),
+        "an empty command line writes nothing"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "an empty command line sends nothing"
+    );
+}
+
+#[test]
+fn command_mode_enter_runs_an_unknown_command() {
+    // `command_palette_active()` must stay TRUE with zero matches, so an
+    // unmatched line still submits (and the daemon/parser reports it).
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    for c in "zzz-no-such-command".chars() {
+        press(&mut app, &tx, KeyCode::Char(c));
+    }
+    assert!(
+        app.command_palette_active(),
+        "active even with zero matches"
+    );
+    assert!(app.command_palette_matches().is_empty());
+
+    press(&mut app, &tx, KeyCode::Enter);
+
+    assert!(rx.try_recv().is_err(), "an unknown command sends nothing");
+    assert!(!app.command_mode, "Enter always exits command mode");
+    assert!(app.input.is_empty());
+    assert!(
+        app.status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("unknown command")),
+        "got: {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn palette_esc_exits_command_mode_without_cancelling() {
+    let mut app = test_app();
+    // A live session means the normal Esc would send Cancel.
+    app.attached_session_id = Some(42);
+    let (tx, rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    assert!(app.command_palette_active());
+
+    press(&mut app, &tx, KeyCode::Esc);
+
+    assert!(!app.command_mode, "Esc exits command mode");
+    assert!(app.input.text.is_empty(), "Esc returns to an empty prompt");
+    assert!(
+        rx.try_recv().is_err(),
+        "exiting command mode must NOT cancel generation"
+    );
+}
+
+#[test]
+fn slash_with_existing_text_inserts_literally() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.input.text = "hi".to_string();
+    app.input.cursor = 2;
+
+    press(&mut app, &tx, KeyCode::Char('/'));
+
+    assert!(!app.command_mode, "a non-empty prompt keeps `/` literal");
+    assert_eq!(app.input.text, "hi/");
+}
+
+#[test]
+fn literal_slash_command_submits_via_normal_prompt_path() {
+    // A `/model` line set directly (e.g. pasted) and submitted via the normal
+    // prompt path — without ever entering command mode — still parses and runs.
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.input.text = "/model".to_string();
+    app.input.cursor = "/model".len();
+
+    press(&mut app, &tx, KeyCode::Enter);
+
+    assert!(app.model_selector.is_open(), "`/model` opens the selector");
+    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert!(!app.command_mode);
+}
+
+#[test]
+fn attaching_a_session_exits_command_mode_without_a_draft() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.attached_session_id = Some(1);
+    app.display_for(1);
+    app.enter_command_mode();
+    app.input.text = "model".to_string();
+
+    app.attach_to_session(2, &tx).expect("attach to session 2");
+
+    assert!(!app.command_mode, "switching sessions exits command mode");
+    assert!(
+        app.input.is_empty(),
+        "the command line must not become a session draft"
+    );
+    assert_eq!(
+        app.display_for(1).draft,
+        "",
+        "no command leaked into a draft"
+    );
+}
+
+#[test]
+fn ctrl_r_cycles_reasoning_effort() {
+    let mut app = test_app();
+    app.display_for(0).reasoning_capability = Some(ReasoningCapability {
+        available_effort_levels: vec!["off".into(), "low".into(), "high".into()],
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("ctrl+r");
+
+    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(app.status.as_deref(), Some("reasoning: low"));
+    assert_eq!(
+        rx.recv().expect("sent message"),
+        ClientMessage::SetReasoningEffort {
+            effort: "low".to_string()
+        }
+    );
+}
+
+#[test]
+fn ctrl_s_opens_session_manager() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("ctrl+s");
+
+    assert_eq!(app.page, Page::SessionManager);
+    assert_eq!(
+        rx.recv().expect("ListSessions"),
+        ClientMessage::ListSessions
+    );
+    assert_eq!(
+        rx.recv().expect("SubscribeSessionsSummary"),
+        ClientMessage::SubscribeSessionsSummary
+    );
+    // A bare keypress must not echo a `> /session` status.
+    assert!(app.status.is_none());
+}
+
+#[test]
+fn ctrl_m_opens_selector_and_requests_models() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("ctrl+m");
+
+    assert!(app.model_selector.is_open());
+    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert!(app.status.is_none(), "a bare keypress must not echo");
+}
+
+#[test]
+fn quit_command_sets_should_quit() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.input.text = "/quit ".to_string();
+
+    press_enter(&mut app, &tx);
+
+    assert!(app.should_quit, "/quit exits the TUI");
 }

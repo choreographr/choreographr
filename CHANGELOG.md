@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Command-entry mode + inline command palette in `choreo-tui`.** Pressing
+  `/` on an EMPTY prompt enters a dedicated command-entry mode: the `/` is only
+  a trigger and is never shown, the input holds the bare command line (e.g.
+  `model`, or `model gpt-4o`), and a keyboard-only overlay lists the matching
+  commands. `↑`/`↓` move the highlight, `Tab` completes the highlighted
+  command's name into the input (a trailing space is added) and stays in the
+  mode, **`Enter` runs the command**, and `Esc` returns to the prompt. Each row
+  shows the command's summary and its keyboard shortcut, resolved for the
+  terminal in use. A `/command` line typed directly and submitted via the
+  normal prompt still works.
+
 ### Changed
 
 - **Markdown tables in the TUI now use a nushell-style rounded frame.** The
@@ -16,6 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still applied via cell padding, but the GFM delimiter row's alignment colons
   (`:---`, `:---:`, `---:`) are no longer echoed into the rendered rule — they
   read as stray punctuation against the rounded frame.
+
+- **Unified command model.** A single catalog in `choreo-client-core`
+  (`command_catalog`) is now the source of truth for command discovery, and
+  parsing and the TUI's keyboard shortcuts both route through the same
+  `Command` path — so a key and its typed spelling behave identically. Bare
+  forms are now the "most useful" form: `/model` opens the picker, `/session`
+  opens the session manager, `/account` opens the accounts page, and
+  `/reasoning` cycles effort (`/reasoning list` lists the levels). `Ctrl+O`
+  opens the model selector only on legacy terminals; on kitty-protocol
+  terminals the binding is `Ctrl+M`.
+
+### Removed
+
+- **The `/models` alias is gone — use `/model`.**
 
 ### Fixed
 

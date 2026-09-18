@@ -100,9 +100,9 @@ use crossterm::event::KeyEvent;
 ///
 /// Terminals that do not implement the kitty protocol simply ignore the push
 /// and keep legacy encodings (there Ctrl+M arrives as Enter).  That case is
-/// detected at startup via `supports_keyboard_enhancement` and the model
-/// selector is rebound to Ctrl+O — see `App::keyboard_enhanced` and the
-/// `KeyCode::Char('o')` arm in `handle_chat_ctrl_key`.
+/// detected at startup via `supports_keyboard_enhancement`, and the model
+/// selector's runtime-resolved shortcut (`binding_for`) rebinds it to Ctrl+O
+/// there — see `App::keyboard_enhanced`.
 const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags = KeyboardEnhancementFlags::from_bits_retain(
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits(),
 );

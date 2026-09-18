@@ -2,9 +2,9 @@ use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column};
 use crate::state::{
     App, INPUT_PAD, InputBuffer, PAGE_SCROLL_LINES, Page, find_turn_at_row, input_inner_width,
 };
-use crate::{ShellCommand, clipboard, parse_input_line, selection};
+use crate::{Command, clipboard, parse_input_line, selection};
 use choreo_client_core::{
-    ClientError, broken_pipe, build_add_credential_message, resolve_private_key, shell_command_echo,
+    ClientError, broken_pipe, build_add_credential_message, command_echo, resolve_private_key,
 };
 use choreo_proto::ClientMessage;
 use crossterm::event::{
@@ -45,7 +45,7 @@ fn send_continue_generation(
         app.error = None;
         return Ok(());
     }
-    if echo && let Some(text) = shell_command_echo(&ShellCommand::Continue) {
+    if echo && let Some(text) = command_echo(&Command::Continue) {
         app.status = Some(text);
     }
     let request_id = app.next_request_id;
@@ -61,6 +61,413 @@ fn send_continue_generation(
         .map_err(broken_pipe)?;
     app.scroll_to(0);
     Ok(())
+}
+
+/// Open the model selector and request a fresh model list — the shared body of
+/// the `Ctrl+M`/`Ctrl+O` shortcut and the bare `/model` command.
+///
+/// Clears any armed text selection first: the selector is a modal overlay that
+/// routes mouse events away from the history-pane selection arms, so a mid-drag
+/// open must not leave a dangling gesture that swallows the first click after
+/// the selector closes.
+fn open_model_selector(
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    tracing::debug!(
+        enhanced = app.keyboard_enhanced,
+        "[choreo-tui] opening model selector"
+    );
+    app.text_selection = None;
+    app.model_selector.open();
+    client_tx
+        .send(ClientMessage::ListModels)
+        .map_err(broken_pipe)?;
+    Ok(())
+}
+
+/// Open the session manager, highlighting the session the user was just viewing
+/// — the shared body of the `Ctrl+S` shortcut and the bare `/session` command.
+fn open_session_manager(
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    tracing::debug!("[choreo-tui] navigating to session manager");
+    // Record the viewed session so the ListSessions reply lands the highlight
+    // on it (the selection survives the round-trip via `pending_select`).
+    if let Some(session_id) = app.attached_session_id {
+        app.session_mgr.select_session(session_id);
+    }
+    app.set_page(Page::SessionManager);
+    client_tx
+        .send(ClientMessage::ListSessions)
+        .map_err(broken_pipe)?;
+    client_tx
+        .send(ClientMessage::SubscribeSessionsSummary)
+        .map_err(broken_pipe)?;
+    Ok(())
+}
+
+/// Open the AI-provider accounts page — the shared body of the `Ctrl+A`
+/// shortcut and the bare `/account` command.
+fn open_accounts_page(
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    tracing::debug!("[choreo-tui] navigating to AI provider accounts");
+    app.set_page(Page::AIProviders);
+    client_tx
+        .send(ClientMessage::ListAccounts)
+        .map_err(broken_pipe)?;
+    Ok(())
+}
+
+/// Cycle the attached session's reasoning effort to the next level — the shared
+/// body of the `Ctrl+R` shortcut and the bare `/reasoning` command.
+///
+/// Writes the status line directly (there is no shell echo): "no session
+/// attached" when there is no display, the daemon's own `SetReasoningEffort`
+/// bounds-checked against the cached capability, and a distinct message for
+/// "not supported" (an empty level set) versus "not yet known" (`None` with a
+/// model selected) versus "no model selected".
+fn cycle_reasoning(
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Some(display) = app.active_display_ref() else {
+        // No session attached — there is no display whose capability could be
+        // consulted.  Mirror the wording the other session-bound shortcuts use
+        // (Alt+Enter, Esc, /stop).
+        app.status = Some("no session attached".to_string());
+        tracing::warn!(
+            session_id = ?app.attached_session_id,
+            "reasoning cycle ignored — no active display (no session attached)",
+        );
+        return Ok(());
+    };
+    // Snapshot the display fields before mutating `app` below so the immutable
+    // borrow of the display ends before the status writes.
+    let capability = display.reasoning_capability.clone();
+    let current_effort = display.reasoning_effort.clone();
+    let selected_model = display.selected_model.clone();
+    match capability.as_ref() {
+        // A present-but-empty capability is the daemon's explicit "reasoning
+        // not supported" signal.  This must stay distinct from `None`, which
+        // only means "capability not yet known".
+        Some(c) if c.available_effort_levels.is_empty() => {
+            app.status = Some("model does not support reasoning".to_string());
+        }
+        Some(c) => {
+            let current = current_effort.unwrap_or_else(|| "off".to_string());
+            if let Some(next) = c.cycle_from(&current) {
+                if let Some(d) = app.active_display() {
+                    d.reasoning_effort = Some(next.clone());
+                }
+                app.status = Some(format!("reasoning: {next}"));
+                tracing::info!(
+                    session_id = ?app.attached_session_id,
+                    current = %current,
+                    next = %next,
+                    "cycling reasoning effort",
+                );
+                client_tx
+                    .send(ClientMessage::SetReasoningEffort { effort: next })
+                    .map_err(broken_pipe)?;
+            } else {
+                // `cycle_from` only returns None for an empty level set, which
+                // the guard above already handled — this is a defensive
+                // fallback.
+                app.status = Some("model does not support reasoning".to_string());
+            }
+        }
+        // A model is selected but the daemon has not reported its effort
+        // levels yet.  `None` here must NOT be conflated with "reasoning
+        // unsupported".
+        None if selected_model.is_some() => {
+            app.status = Some("reasoning capability not yet available".to_string());
+            tracing::info!(
+                session_id = ?app.attached_session_id,
+                model = ?selected_model,
+                "reasoning cycle pressed before reasoning capability was reported",
+            );
+        }
+        None => {
+            app.status = Some(format!(
+                "no model selected — pick one with {}",
+                app.model_selector_label()
+            ));
+            tracing::warn!(
+                session_id = ?app.attached_session_id,
+                "reasoning cycle pressed with no model selected",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// List the attached session's available reasoning levels — the `/reasoning
+/// list` command.  Reuses [`cycle_reasoning`]'s not-supported /
+/// not-yet-available / no-model wording so the two share one vocabulary.
+fn reasoning_list(app: &mut App) {
+    let (capability, selected_model) = if let Some(display) = app.active_display_ref() {
+        (
+            display.reasoning_capability.clone(),
+            display.selected_model.clone(),
+        )
+    } else {
+        app.status = Some("no session attached".to_string());
+        return;
+    };
+    match capability.as_ref() {
+        Some(c) if c.available_effort_levels.is_empty() => {
+            app.status = Some("model does not support reasoning".to_string());
+        }
+        Some(c) => {
+            app.status = Some(format!(
+                "reasoning levels: {}",
+                c.available_effort_levels.join(", ")
+            ));
+        }
+        None if selected_model.is_some() => {
+            app.status = Some("reasoning capability not yet available".to_string());
+        }
+        None => {
+            app.status = Some(format!(
+                "no model selected — pick one with {}",
+                app.model_selector_label()
+            ));
+        }
+    }
+}
+
+/// Dispatch a parsed [`Command`] into its side effect(s).
+///
+/// Shared by the typed `/`-command path (Enter) and the keyboard-shortcut path
+/// ([`run_named`]).  `echo` controls whether the command's shell echo
+/// ([`command_echo`]) is written to the status line: a typed command echoes
+/// (`true`), a bare keypress does not (`false`) — preserving the historical
+/// "keypresses don't echo" behavior.
+fn run_command(
+    command: Command,
+    echo: bool,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    match command {
+        Command::Empty => {}
+        Command::InvalidCancel(value) => {
+            app.status = Some(format!("invalid request id: {value}"));
+        }
+        Command::UnknownCommand(error) => app.status = Some(error),
+        Command::Send(message) => {
+            // Client-side validation: reject reasoning slugs that the attached
+            // model's capability set does not include.  This provides faster
+            // feedback than waiting for the daemon to reply with
+            // ReasoningEffortSetFailed.
+            if let ClientMessage::SetReasoningEffort { ref effort } = message
+                && effort != "off"
+            {
+                let valid = app
+                    .active_display_ref()
+                    .and_then(|d| d.reasoning_capability.as_ref())
+                    // No capability cached → let daemon validate.
+                    .is_none_or(|c| c.available_effort_levels.iter().any(|l| l == effort));
+                if !valid {
+                    tracing::warn!(
+                        %effort,
+                        "TUI rejected reasoning slug not in capability set",
+                    );
+                    app.status = Some(format!("model does not support reasoning '{effort}'"));
+                    return Ok(());
+                }
+            }
+            let message = match message {
+                ClientMessage::CreateSession {
+                    title,
+                    parent_session_id,
+                    working_dir,
+                    context_config,
+                    account_name,
+                    selected_model,
+                    reasoning_effort,
+                } => ClientMessage::CreateSession {
+                    title,
+                    parent_session_id,
+                    // Inherit fields from the currently attached session when
+                    // not explicitly provided by the user.
+                    working_dir: working_dir
+                        .or_else(|| app.active_display_ref().and_then(|d| d.working_dir.clone())),
+                    context_config,
+                    account_name: account_name.or_else(|| {
+                        app.active_display_ref()
+                            .and_then(|d| d.account_name.clone())
+                    }),
+                    selected_model: selected_model.or_else(|| {
+                        app.active_display_ref()
+                            .and_then(|d| d.selected_model.clone())
+                    }),
+                    reasoning_effort: reasoning_effort.or_else(|| {
+                        app.active_display_ref()
+                            .and_then(|d| d.reasoning_effort.clone())
+                    }),
+                },
+                other => other,
+            };
+            if echo && let Some(text) = command_echo(&Command::Send(message.clone())) {
+                app.status = Some(text);
+            }
+            if let ClientMessage::RunInput { request_id, .. } = &message {
+                app.error = None;
+                // The active display tracks in-flight request ids for the
+                // spinner; with no session active there is nothing to track, so
+                // skip instead of panicking.
+                if let Some(display) = app.active_display() {
+                    display.active.insert(*request_id);
+                }
+            }
+            client_tx.send(message).map_err(broken_pipe)?;
+
+            // Scroll the history view to the bottom so the user can see their
+            // submitted message appear as the daemon processes it.
+            app.scroll_to(0);
+        }
+        Command::Unlock { method } => {
+            match resolve_private_key(&method, &app.connection_addr) {
+                Ok(private_key) => {
+                    // Hold the key until the daemon CONFIRMS the unlock, then
+                    // record it per-daemon.
+                    app.pending_unlock_key = Some(private_key.clone());
+                    let _ = client_tx.send(ClientMessage::Unlock { private_key });
+                }
+                Err(e) => {
+                    tracing::warn!("[choreo-tui] unlock failed: {e}");
+                    // Surface the failure (e.g. NoUnlockKey, or a malformed
+                    // base64 key from /unlock <key>) in the status bar — a
+                    // warn-only log would look like the command silently did
+                    // nothing.
+                    app.status = Some(format!("[error] {e}"));
+                    app.error = None;
+                }
+            }
+        }
+        Command::AddCredential {
+            ref service,
+            ref credential_type,
+            ref fields,
+        } => {
+            match build_add_credential_message(
+                &app.connection_addr,
+                service.clone(),
+                credential_type.clone(),
+                fields.clone(),
+            ) {
+                Ok((msg, key)) => {
+                    // Record only after the daemon CONFIRMS (CredentialAdded /
+                    // Unlocked) — see `record_confirmed_unlock_key`.
+                    app.pending_unlock_key = Some(key);
+                    let _ = client_tx.send(msg);
+                }
+                Err(e) => {
+                    tracing::warn!("[choreo-tui] add credential failed: {e}");
+                }
+            }
+        }
+        Command::AclAdd { ref pubkey } => {
+            if echo
+                && let Some(text) = command_echo(&Command::AclAdd {
+                    pubkey: pubkey.clone(),
+                })
+            {
+                app.status = Some(text);
+            }
+            let _ = client_tx.send(ClientMessage::AclAdd {
+                pubkey: pubkey.clone(),
+            });
+        }
+        Command::RemoveCredential { ref service } => {
+            if echo
+                && let Some(text) = command_echo(&Command::RemoveCredential {
+                    service: service.clone(),
+                })
+            {
+                app.status = Some(text);
+            }
+            let _ = client_tx.send(ClientMessage::RemoveCredential {
+                service: service.clone(),
+            });
+        }
+        Command::Undo => {
+            if echo && let Some(text) = command_echo(&Command::Undo) {
+                app.status = Some(text);
+            }
+            let _ = client_tx.send(ClientMessage::Undo);
+        }
+        Command::Redo => {
+            if echo && let Some(text) = command_echo(&Command::Redo) {
+                app.status = Some(text);
+            }
+            let _ = client_tx.send(ClientMessage::Redo);
+        }
+        Command::Continue => {
+            // `/continue` (or Alt+Enter) — same guard, same
+            // `ContinueGeneration`; echoes `> continue` only for the typed
+            // command (`echo`).
+            send_continue_generation(app, client_tx, echo)?;
+        }
+        Command::Stop => {
+            if echo && let Some(text) = command_echo(&Command::Stop) {
+                app.status = Some(text);
+            }
+            // Send Cancel with request_id 0 (the CANCEL_ALL sentinel) to stop
+            // whatever request is currently active on the attached session and
+            // all its children.
+            if app.attached_session_id.is_some() {
+                client_tx
+                    .send(ClientMessage::Cancel { request_id: 0 })
+                    .map_err(broken_pipe)?;
+            } else {
+                app.status = Some("no session attached".to_string());
+            }
+        }
+        Command::RefreshModels { force } => {
+            // Show immediate feedback; the daemon replies asynchronously via
+            // ModelsRefreshed / ModelsRefreshFailed.
+            let suffix = if force { " (forced)" } else { "" };
+            app.status = Some(format!("refreshing models…{suffix}"));
+            client_tx
+                .send(ClientMessage::RefreshModels { force })
+                .map_err(broken_pipe)?;
+        }
+        // Local-UI commands (the unified command model's non-daemon variants).
+        Command::Quit => {
+            tracing::info!("[choreo-tui] /quit requested");
+            app.should_quit = true;
+        }
+        Command::OpenModelSelector => open_model_selector(app, client_tx)?,
+        Command::OpenSessions => open_session_manager(app, client_tx)?,
+        Command::OpenAccounts => open_accounts_page(app, client_tx)?,
+        Command::ReasoningCycle => cycle_reasoning(app, client_tx)?,
+        Command::ReasoningList => reasoning_list(app),
+    }
+    Ok(())
+}
+
+/// Run a command by name through the unified command path: parse `"/<name>"`
+/// and [`run_command`] it.  Used by the keyboard shortcuts so a key and its
+/// typed-command spelling share one implementation; the shortcut is a bare
+/// keypress, so it passes `echo = false`.
+fn run_named(
+    name: &str,
+    echo: bool,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let command = parse_input_line(
+        &format!("/{name}"),
+        &mut app.next_request_id,
+        app.attached_session_id,
+    );
+    run_command(command, echo, app, client_tx)
 }
 
 pub(super) fn handle_chat_event(
@@ -80,7 +487,68 @@ pub(super) fn handle_chat_event(
             if key.code != KeyCode::Char('h') || !key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.show_ctrl_help = false;
             }
+            // A plain (unmodified) keypress predicate, used by the
+            // command-mode arms below so Ctrl/Alt chords still fall through to
+            // the shortcut handler rather than the palette.
+            let plain = !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
+                // ── Command-entry mode ────────────────────────────────
+                // While in command mode the palette is shown and these keys
+                // belong to it: Esc returns to the prompt (never cancels
+                // generation), Enter RUNS the typed command, Tab completes the
+                // highlighted name into the buffer, and ↑/↓ move the palette
+                // highlight.  They are FIRST so they win over the normal
+                // prompt bindings, but only fire for plain keys, so Ctrl+Q and
+                // the other chords keep working; every other key falls through
+                // to normal editing (typing edits the command line).
+                KeyCode::Esc if app.command_mode && plain => {
+                    app.exit_command_mode();
+                    return Ok(());
+                }
+                // Enter RUNS the command (it does NOT merely complete, and is
+                // NOT the normal prompt submit).  An empty command line is a
+                // no-op that stays in mode; a non-empty one runs and exits.
+                // The buffer is only discarded AFTER the command runs, so its
+                // echo is preserved.
+                KeyCode::Enter if app.command_mode && key.modifiers == KeyModifiers::NONE => {
+                    if !app.input.text.is_empty() {
+                        let line = app.input.text.clone();
+                        let command = parse_input_line(
+                            &format!("/{line}"),
+                            &mut app.next_request_id,
+                            app.attached_session_id,
+                        );
+                        run_command(command, true, app, client_tx)?;
+                        app.exit_command_mode();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Tab if app.command_mode && plain => {
+                    if !app.command_palette_matches().is_empty() {
+                        app.command_palette_complete();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Up if app.command_mode && plain => {
+                    app.command_palette_move(-1);
+                    return Ok(());
+                }
+                KeyCode::Down if app.command_mode && plain => {
+                    app.command_palette_move(1);
+                    return Ok(());
+                }
+                // `/` on an EMPTY prompt is a TRIGGER: it enters command mode
+                // and is never inserted, so it never appears in the
+                // buffer/prompt.  Anywhere else a `/` is a literal character
+                // (mid-prompt, or inside the command line itself).
+                KeyCode::Char('/')
+                    if !app.command_mode
+                        && key.modifiers == KeyModifiers::NONE
+                        && app.input.text.is_empty() =>
+                {
+                    app.enter_command_mode();
+                }
                 // All Ctrl+ combinations delegated to a dedicated handler.
                 _ if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     handle_chat_ctrl_key(*key, app, client_tx)?;
@@ -90,7 +558,7 @@ pub(super) fn handle_chat_event(
                 // command; Alt+Enter is a bare keypress, so it shows no
                 // `> continue` echo (`echo = false`).
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                    send_continue_generation(app, client_tx, false)?;
+                    run_named("continue", false, app, client_tx)?;
                 }
                 KeyCode::Esc => {
                     if app.attached_session_id.is_some() {
@@ -174,203 +642,9 @@ pub(super) fn handle_chat_event(
                     // doesn't resurface when the user returns to this session.
                     app.clear_current_draft();
                     app.commit_to_history();
-                    match parse_input_line(&line, &mut app.next_request_id, app.attached_session_id)
-                    {
-                        ShellCommand::Empty => {}
-                        ShellCommand::InvalidCancel(value) => {
-                            app.status = Some(format!("invalid request id: {value}"));
-                        }
-                        ShellCommand::UnknownCommand(error) => app.status = Some(error),
-                        ShellCommand::Send(message) => {
-                            // Client-side validation: reject reasoning slugs that
-                            // the attached model's capability set does not include.
-                            // This provides faster feedback than waiting for the
-                            // daemon to reply with ReasoningEffortSetFailed.
-                            if let ClientMessage::SetReasoningEffort { ref effort } = message
-                                && effort != "off"
-                            {
-                                let valid = app
-                                    .active_display_ref()
-                                    .and_then(|d| d.reasoning_capability.as_ref())
-                                    // No capability cached → let daemon validate.
-                                    .is_none_or(|c| {
-                                        c.available_effort_levels.iter().any(|l| l == effort)
-                                    });
-                                if !valid {
-                                    tracing::warn!(
-                                        %effort,
-                                        "TUI rejected reasoning slug not in capability set",
-                                    );
-                                    app.status = Some(format!(
-                                        "model does not support reasoning '{effort}'"
-                                    ));
-                                    return Ok(());
-                                }
-                            }
-                            let message = match message {
-                                ClientMessage::CreateSession {
-                                    title,
-                                    parent_session_id,
-                                    working_dir,
-                                    context_config,
-                                    account_name,
-                                    selected_model,
-                                    reasoning_effort,
-                                } => ClientMessage::CreateSession {
-                                    title,
-                                    parent_session_id,
-                                    // Inherit fields from the currently attached session
-                                    // when not explicitly provided by the user.
-                                    working_dir: working_dir.or_else(|| {
-                                        app.active_display_ref().and_then(|d| d.working_dir.clone())
-                                    }),
-                                    context_config,
-                                    account_name: account_name.or_else(|| {
-                                        app.active_display_ref()
-                                            .and_then(|d| d.account_name.clone())
-                                    }),
-                                    selected_model: selected_model.or_else(|| {
-                                        app.active_display_ref()
-                                            .and_then(|d| d.selected_model.clone())
-                                    }),
-                                    reasoning_effort: reasoning_effort.or_else(|| {
-                                        app.active_display_ref()
-                                            .and_then(|d| d.reasoning_effort.clone())
-                                    }),
-                                },
-                                other => other,
-                            };
-                            if let Some(echo) =
-                                shell_command_echo(&ShellCommand::Send(message.clone()))
-                            {
-                                app.status = Some(echo);
-                            }
-                            if let ClientMessage::RunInput { request_id, .. } = &message {
-                                app.error = None;
-                                // The active display tracks in-flight request ids
-                                // for the spinner; with no session active there is
-                                // nothing to track, so skip instead of panicking.
-                                if let Some(display) = app.active_display() {
-                                    display.active.insert(*request_id);
-                                }
-                            }
-                            client_tx.send(message).map_err(broken_pipe)?;
-
-                            // Scroll the history view to the bottom so the user can
-                            // see their submitted message appear as the daemon
-                            // processes it.  Without this, a user who has scrolled
-                            // up to read past conversation would remain scrolled up
-                            // and miss the new content arriving at the bottom.
-                            app.scroll_to(0);
-                        }
-                        ShellCommand::Unlock { method } => {
-                            match resolve_private_key(&method, &app.connection_addr) {
-                                Ok(private_key) => {
-                                    // Hold the key until the daemon CONFIRMS
-                                    // the unlock, then record it per-daemon.
-                                    app.pending_unlock_key = Some(private_key.clone());
-                                    let _ = client_tx.send(ClientMessage::Unlock { private_key });
-                                }
-                                Err(e) => {
-                                    tracing::warn!("[choreo-tui] unlock failed: {e}");
-                                    // Surface the failure (e.g. NoUnlockKey, or a
-                                    // malformed base64 key from /unlock <key>) in
-                                    // the status bar — a warn-only log would look
-                                    // like the command silently did nothing.
-                                    app.status = Some(format!("[error] {e}"));
-                                    app.error = None;
-                                }
-                            }
-                        }
-                        ShellCommand::AddCredential {
-                            ref service,
-                            ref credential_type,
-                            ref fields,
-                        } => {
-                            match build_add_credential_message(
-                                &app.connection_addr,
-                                service.clone(),
-                                credential_type.clone(),
-                                fields.clone(),
-                            ) {
-                                Ok((msg, key)) => {
-                                    // Record only after the daemon CONFIRMS
-                                    // (CredentialAdded / Unlocked) — see
-                                    // `record_confirmed_unlock_key`.
-                                    app.pending_unlock_key = Some(key);
-                                    let _ = client_tx.send(msg);
-                                }
-                                Err(e) => {
-                                    tracing::warn!("[choreo-tui] add credential failed: {e}");
-                                }
-                            }
-                        }
-                        ShellCommand::AclAdd { ref pubkey } => {
-                            if let Some(echo) = shell_command_echo(&ShellCommand::AclAdd {
-                                pubkey: pubkey.clone(),
-                            }) {
-                                app.status = Some(echo);
-                            }
-                            let _ = client_tx.send(ClientMessage::AclAdd {
-                                pubkey: pubkey.clone(),
-                            });
-                        }
-                        ShellCommand::RemoveCredential { ref service } => {
-                            if let Some(echo) =
-                                shell_command_echo(&ShellCommand::RemoveCredential {
-                                    service: service.clone(),
-                                })
-                            {
-                                app.status = Some(echo);
-                            }
-                            let _ = client_tx.send(ClientMessage::RemoveCredential {
-                                service: service.clone(),
-                            });
-                        }
-                        ShellCommand::Undo => {
-                            if let Some(echo) = shell_command_echo(&ShellCommand::Undo) {
-                                app.status = Some(echo);
-                            }
-                            let _ = client_tx.send(ClientMessage::Undo);
-                        }
-                        ShellCommand::Redo => {
-                            if let Some(echo) = shell_command_echo(&ShellCommand::Redo) {
-                                app.status = Some(echo);
-                            }
-                            let _ = client_tx.send(ClientMessage::Redo);
-                        }
-                        ShellCommand::Continue => {
-                            // `/continue` is the shell-command spelling of
-                            // Alt+Enter — same guard, same `ContinueGeneration`
-                            // — but it echoes `> continue` (`echo = true`).
-                            send_continue_generation(app, client_tx, true)?;
-                        }
-                        ShellCommand::Stop => {
-                            if let Some(echo) = shell_command_echo(&ShellCommand::Stop) {
-                                app.status = Some(echo);
-                            }
-                            // Send Cancel with request_id 0 (the CANCEL_ALL sentinel)
-                            // to stop whatever request is currently active on the
-                            // attached session and all its children.
-                            if app.attached_session_id.is_some() {
-                                client_tx
-                                    .send(ClientMessage::Cancel { request_id: 0 })
-                                    .map_err(broken_pipe)?;
-                            } else {
-                                app.status = Some("no session attached".to_string());
-                            }
-                        }
-                        ShellCommand::RefreshModels { force } => {
-                            // Show immediate feedback; the daemon replies
-                            // asynchronously via ModelsRefreshed /
-                            // ModelsRefreshFailed.
-                            let suffix = if force { " (forced)" } else { "" };
-                            app.status = Some(format!("refreshing models…{suffix}"));
-                            client_tx
-                                .send(ClientMessage::RefreshModels { force })
-                                .map_err(broken_pipe)?;
-                        }
-                    }
+                    let command =
+                        parse_input_line(&line, &mut app.next_request_id, app.attached_session_id);
+                    run_command(command, true, app, client_tx)?;
                 }
                 KeyCode::Backspace
                 | KeyCode::Delete
@@ -661,147 +935,26 @@ fn handle_chat_ctrl_key(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // Route every command shortcut through the single logical shortcut table
+    // (`binding_for`), so the key and its typed-command spelling share one
+    // implementation and one place decides which terminal binds what.  This is
+    // also what makes `Ctrl+O` the model selector ONLY on legacy terminals:
+    // `binding_for` resolves the logical `Ctrl+M` to `Ctrl+O` there (because
+    // byte 0x0D makes `Ctrl+M` indistinguishable from Enter).  A bare keypress
+    // passes `echo = false`.
+    if let Some(name) = crate::state::binding_for(&key, app.keyboard_enhanced) {
+        return run_named(name, false, app, client_tx);
+    }
     match key.code {
-        KeyCode::Char('r') => {
-            let Some(display) = app.active_display_ref() else {
-                // No session attached — there is no display whose capability
-                // could be consulted.  Mirror the wording the other
-                // session-bound shortcuts use (Alt+Enter, Esc, /stop).
-                app.status = Some("no session attached".to_string());
-                tracing::warn!(
-                    session_id = ?app.attached_session_id,
-                    "Ctrl+R ignored — no active display (no session attached)",
-                );
-                return Ok(());
-            };
-            // Snapshot the display fields before mutating `app` below so the
-            // immutable borrow of the display ends before the status writes.
-            let capability = display.reasoning_capability.clone();
-            let current_effort = display.reasoning_effort.clone();
-            let selected_model = display.selected_model.clone();
-            match capability.as_ref() {
-                // A present-but-empty capability is the daemon's explicit
-                // "reasoning not supported" signal.  This must stay distinct
-                // from `None`, which only means "capability not yet known".
-                Some(c) if c.available_effort_levels.is_empty() => {
-                    app.status = Some("model does not support reasoning".to_string());
-                }
-                Some(c) => {
-                    let current = current_effort.unwrap_or_else(|| "off".to_string());
-                    if let Some(next) = c.cycle_from(&current) {
-                        if let Some(d) = app.active_display() {
-                            d.reasoning_effort = Some(next.clone());
-                        }
-                        app.status = Some(format!("reasoning: {next}"));
-                        tracing::info!(
-                            session_id = ?app.attached_session_id,
-                            current = %current,
-                            next = %next,
-                            "Ctrl+R cycling reasoning effort",
-                        );
-                        client_tx
-                            .send(ClientMessage::SetReasoningEffort { effort: next })
-                            .map_err(broken_pipe)?;
-                    } else {
-                        // `cycle_from` only returns None for an empty level
-                        // set, which the guard above already handled — this
-                        // is a defensive fallback.
-                        app.status = Some("model does not support reasoning".to_string());
-                    }
-                }
-                // A model is selected but the daemon has not reported its
-                // effort levels yet.  `None` here must NOT be conflated with
-                // "reasoning unsupported" — the user may simply not have
-                // selected a model yet (the original bug this fixes).
-                None if selected_model.is_some() => {
-                    app.status = Some("reasoning capability not yet available".to_string());
-                    tracing::info!(
-                        session_id = ?app.attached_session_id,
-                        model = ?selected_model,
-                        "Ctrl+R pressed before reasoning capability was reported",
-                    );
-                }
-                None => {
-                    app.status = Some(format!(
-                        "no model selected — pick one with {}",
-                        app.model_selector_label()
-                    ));
-                    tracing::warn!(
-                        session_id = ?app.attached_session_id,
-                        "Ctrl+R pressed with no model selected",
-                    );
-                }
-            }
-        }
         KeyCode::Char('h') => {
             tracing::debug!("Ctrl+H toggling help overlay");
             app.show_ctrl_help = !app.show_ctrl_help;
         }
-        KeyCode::Char('s') => {
-            tracing::debug!("Ctrl+S navigating to session manager");
-            // Highlight the session the user was just viewing so returning
-            // to the session list lands on the session they came from (the
-            // selection survives the ListSessions round-trip via
-            // `pending_select`).
-            if let Some(session_id) = app.attached_session_id {
-                app.session_mgr.select_session(session_id);
-            }
-            app.set_page(Page::SessionManager);
-            client_tx
-                .send(ClientMessage::ListSessions)
-                .map_err(broken_pipe)?;
-            client_tx
-                .send(ClientMessage::SubscribeSessionsSummary)
-                .map_err(broken_pipe)?;
-        }
-        KeyCode::Char('a') => {
-            tracing::debug!("Ctrl+A navigating to AI provider accounts");
-            app.set_page(Page::AIProviders);
-            client_tx
-                .send(ClientMessage::ListAccounts)
-                .map_err(broken_pipe)?;
-        }
-        KeyCode::Char('m' | 'o') => {
-            // Two bindings, deliberately BOTH always live:
-            //   - Ctrl+M is the historical binding; it can only arrive as
-            //     Char('m')+CONTROL on a terminal that emitted the kitty CSI-u
-            //     encoding for it (a legacy terminal's Ctrl+M is byte 0x0D,
-            //     which crossterm reports as Enter and never reaches this arm).
-            //   - Ctrl+O is the legacy-terminal binding (Termux and friends,
-            //     where the kitty push is ignored) — see
-            //     `App::keyboard_enhanced`. Binding it unconditionally keeps
-            //     one code path and gives kitty terminals a working alias.
-            // The hint/status strings only ever name the key that works on
-            // the current terminal (`model_selector_label`).
-            tracing::debug!(
-                key = ?key.code,
-                enhanced = app.keyboard_enhanced,
-                "opening model selector"
-            );
-            // An armed selection is keyed to the Chat page's history, but
-            // the selector is a modal overlay that routes mouse events away
-            // from the selection arms — a mid-drag Ctrl+M must not leave the
-            // gesture dangling underneath it (it would swallow the first
-            // click after the selector closes).
-            app.text_selection = None;
-            app.model_selector.open();
-            client_tx
-                .send(ClientMessage::ListModels)
-                .map_err(broken_pipe)?;
-        }
-        // Ctrl+C is a deliberate no-op on the chat page (no copy/sigint
-        // in raw mode). Absorb it here so it doesn't fall through to the
-        // input handler which would insert a literal 'c'.
+        // Ctrl+C is a deliberate no-op on the chat page (no copy/sigint in raw
+        // mode).  Absorb it here so it does not fall through to the input
+        // handler, which would insert a literal 'c'.
         KeyCode::Char('c') => {
             tracing::debug!("Ctrl+C ignored on chat page");
-        }
-        KeyCode::Up => {
-            tracing::debug!("Ctrl+Up undo");
-            client_tx.send(ClientMessage::Undo).map_err(broken_pipe)?;
-        }
-        KeyCode::Down => {
-            tracing::debug!("Ctrl+Down redo");
-            client_tx.send(ClientMessage::Redo).map_err(broken_pipe)?;
         }
         // Ctrl+Left, Ctrl+Right, Ctrl+Backspace, Ctrl+Delete, Ctrl+Home,
         // Ctrl+End, etc. are text-editing shortcuts that should still work

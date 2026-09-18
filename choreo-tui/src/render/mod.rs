@@ -30,10 +30,12 @@ use std::sync::Arc;
 // the connection-layer mouse handlers, and the viewport cache share one
 // geometry.
 mod ai_providers;
+mod command_palette;
 mod model_selector;
 mod session_manager;
 
 use self::ai_providers::render_ai_providers;
+use self::command_palette::render_command_palette;
 use self::model_selector::render_model_selector;
 use self::session_manager::render_session_manager;
 
@@ -83,6 +85,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     // The model selector overlay draws on top of the Chat page content.
     if app.model_selector.is_open() {
         render_model_selector(frame, app);
+    }
+
+    // The inline command palette floats above the command input box on the
+    // Chat page.  Drawn after the model selector so the selector (when open)
+    // covers it; it is suppressed entirely while the selector is open (see
+    // `command_palette_active`).
+    if app.page == Page::Chat && app.command_palette_active() {
+        render_command_palette(frame, app);
     }
 }
 
@@ -337,11 +347,21 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         })
         .collect();
 
-    let input = Paragraph::new(Text::from(text_lines)).block(
-        Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .padding(Padding::new(INPUT_PAD, INPUT_PAD, 0, 0)),
-    );
+    // In command-entry mode the buffer holds a command line (no leading `/`),
+    // so a block title is the visible affordance telling the user Enter will
+    // RUN the command rather than submit a prompt.  The `/` is never drawn
+    // because it is never in the buffer.  Read the flag before the text borrow
+    // above is consumed so the block can be built without a borrow conflict.
+    let mut input_block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .padding(Padding::new(INPUT_PAD, INPUT_PAD, 0, 0));
+    if app.command_mode {
+        input_block = input_block
+            .title(" command ")
+            .border_style(Style::default().fg(Color::Cyan));
+    }
+
+    let input = Paragraph::new(Text::from(text_lines)).block(input_block);
     frame.render_widget(input, input_area);
     // Clamp to visible area so the cursor is always inside the box,
     // even when scroll_offset hasn't been adjusted yet (e.g. after

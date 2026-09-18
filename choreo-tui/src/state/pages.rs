@@ -34,7 +34,12 @@ pub(crate) const PROVIDER_PAGE_LINES: usize = 10;
 /// pushed down when focus falls below the fold), so repeated calls with the
 /// same inputs return identical results — render can never mutate focus/scroll
 /// state during `draw()`.
-fn picker_window(scroll: usize, focused: usize, len: usize, height: usize) -> (usize, usize) {
+pub(crate) fn picker_window(
+    scroll: usize,
+    focused: usize,
+    len: usize,
+    height: usize,
+) -> (usize, usize) {
     if len == 0 || height == 0 {
         return (0, 0);
     }

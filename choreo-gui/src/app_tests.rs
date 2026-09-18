@@ -1,6 +1,6 @@
 use super::*;
 use crate::client::handle_shell_command;
-use choreo_client_core::{ShellCommand, dispatch_daemon_message};
+use choreo_client_core::{Command, dispatch_daemon_message};
 use choreo_proto::{
     ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream, SessionEvent,
     TimestampMs, TokenUsage, Turn,
@@ -159,7 +159,7 @@ fn handle_continue_when_attached_sends_continue_generation() {
     state.next_request_id = 5;
     let (tx, rx) = std::sync::mpsc::channel();
 
-    handle_shell_command(&mut state, Some(tx), ShellCommand::Continue);
+    handle_shell_command(&mut state, Some(tx), Command::Continue);
 
     assert_eq!(state.next_request_id, 6);
     let msg = rx.recv().expect("should send ContinueGeneration");
@@ -171,7 +171,7 @@ fn handle_continue_when_not_attached_shows_error() {
     let mut state = AppState::new("/tmp/choreographr.sock");
     state.attached_session_id = None;
 
-    handle_shell_command(&mut state, None, ShellCommand::Continue);
+    handle_shell_command(&mut state, None, Command::Continue);
 
     assert!(
         state
@@ -187,7 +187,7 @@ fn handle_stop_when_attached_sends_cancel_all() {
     state.attached_session_id = Some(42);
     let (tx, rx) = std::sync::mpsc::channel();
 
-    handle_shell_command(&mut state, Some(tx), ShellCommand::Stop);
+    handle_shell_command(&mut state, Some(tx), Command::Stop);
 
     let msg = rx.recv().expect("should send Cancel");
     assert_eq!(msg, ClientMessage::Cancel { request_id: 0 });
@@ -198,7 +198,7 @@ fn handle_stop_when_not_attached_shows_error() {
     let mut state = AppState::new("/tmp/choreographr.sock");
     state.attached_session_id = None;
 
-    handle_shell_command(&mut state, None, ShellCommand::Stop);
+    handle_shell_command(&mut state, None, Command::Stop);
 
     assert!(
         state
@@ -213,7 +213,7 @@ fn handle_undo_sends_undo_message() {
     let mut state = AppState::new("/tmp/choreographr.sock");
     let (tx, rx) = std::sync::mpsc::channel();
 
-    handle_shell_command(&mut state, Some(tx), ShellCommand::Undo);
+    handle_shell_command(&mut state, Some(tx), Command::Undo);
 
     let msg = rx.recv().expect("should send Undo");
     assert_eq!(msg, ClientMessage::Undo);
@@ -224,7 +224,7 @@ fn handle_redo_sends_redo_message() {
     let mut state = AppState::new("/tmp/choreographr.sock");
     let (tx, rx) = std::sync::mpsc::channel();
 
-    handle_shell_command(&mut state, Some(tx), ShellCommand::Redo);
+    handle_shell_command(&mut state, Some(tx), Command::Redo);
 
     let msg = rx.recv().expect("should send Redo");
     assert_eq!(msg, ClientMessage::Redo);

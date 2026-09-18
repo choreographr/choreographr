@@ -1,3 +1,4 @@
+pub mod command_catalog;
 pub mod connection;
 pub mod credentials;
 pub mod diff;
@@ -14,6 +15,9 @@ pub mod shell;
 pub mod test_support;
 
 pub use choreo_transport::key::{fingerprint, read_server_pk};
+pub use command_catalog::{
+    CommandGroup, CommandMatch, CommandSpec, command_catalog, match_commands,
+};
 pub use connection::{
     ConnectionMode, PreflightError, own_transport_pubkey, probe_server_key, run_daemon_connection,
     run_daemon_connection_with_autostart, run_daemon_connection_with_mode, run_daemon_reader,
@@ -30,9 +34,7 @@ pub use dispatch::{SessionStateData, ToolCallEvent, TurnEventHandler, dispatch_d
 pub use error::{ClientError, broken_pipe};
 pub use history::SessionView;
 pub use known_servers::{KnownServerEntry, KnownServers, known_servers_path};
-pub use shell::{
-    ShellCommand, UnlockMethod, is_valid_account_name, parse_input_line, shell_command_echo,
-};
+pub use shell::{Command, UnlockMethod, command_echo, is_valid_account_name, parse_input_line};
 
 #[cfg(test)]
 mod tests;

@@ -801,3 +801,73 @@ fn format_timestamp_older_year_shows_full_date() {
         "older dates include the year"
     );
 }
+
+// ── Inline command palette rendering ───────────────────────────────────
+
+/// Render the Chat page and return the flat buffer content as a string.
+fn render_chat_content(app: &mut crate::state::App, w: u16, h: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render(frame, app))
+        .expect("render chat page");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(Cell::symbol)
+        .collect()
+}
+
+#[test]
+fn command_palette_lists_commands_when_in_command_mode() {
+    use crate::test_util::test_app;
+
+    let mut app = test_app();
+    app.enter_command_mode();
+    assert!(
+        app.command_palette_active(),
+        "command mode shows the palette"
+    );
+
+    let content = render_chat_content(&mut app, 80, 24);
+    assert!(content.contains("/model"), "model row is drawn");
+    assert!(content.contains("/session"), "session row is drawn");
+    assert!(
+        content.contains("command"),
+        "the command-mode affordance (input-box title) is drawn"
+    );
+}
+
+#[test]
+fn command_palette_narrows_to_model_for_prefix_query() {
+    use crate::test_util::test_app;
+
+    let mut app = test_app();
+    app.enter_command_mode();
+    app.input.text = "mo".to_string();
+
+    let content = render_chat_content(&mut app, 80, 24);
+    assert!(content.contains("/model"), "the matched command is drawn");
+    assert!(
+        !content.contains("/session"),
+        "non-matching commands are hidden"
+    );
+}
+
+#[test]
+fn command_palette_draws_nothing_outside_command_mode() {
+    use crate::test_util::test_app;
+
+    let mut app = test_app();
+    app.input.text = "hi".to_string();
+    assert!(!app.command_palette_active(), "plain text opens nothing");
+
+    let content = render_chat_content(&mut app, 80, 24);
+    assert!(!content.contains("/model"), "no palette row is drawn");
+    assert!(!content.contains("/session"), "no palette row is drawn");
+}

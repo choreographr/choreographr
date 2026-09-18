@@ -19,7 +19,7 @@ pub enum UnlockMethod {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShellCommand {
+pub enum Command {
     Send(ClientMessage),
     Unlock {
         method: UnlockMethod,
@@ -51,6 +51,19 @@ pub enum ShellCommand {
     RefreshModels {
         force: bool,
     },
+    /// `/quit` — exit the TUI.
+    Quit,
+    /// Bare `/session` — open the session manager (a local-UI command, not a
+    /// message to the daemon).
+    OpenSessions,
+    /// Bare `/account` — open the accounts page.
+    OpenAccounts,
+    /// Bare `/model` — open the model picker.
+    OpenModelSelector,
+    /// Bare `/reasoning` — cycle the reasoning effort on the attached session.
+    ReasoningCycle,
+    /// `/reasoning list` — list the available reasoning levels.
+    ReasoningList,
     InvalidCancel(String),
     UnknownCommand(String),
     Empty,
@@ -85,19 +98,19 @@ fn validate_pubkey_b64(b64: &str) -> Result<(), String> {
 
 // ── Sub-parsers for grouped shell commands ──────────────────────
 
-fn parse_session_subcommand(rest: &str, attached_session_id: Option<u64>) -> Option<ShellCommand> {
+fn parse_session_subcommand(rest: &str) -> Option<Command> {
     if let Some(sub) = rest.strip_prefix("session ") {
         let sub = sub.trim();
         if let Some(session_id) = sub.strip_prefix("switch ") {
             return Some(match session_id.trim().parse::<u64>() {
-                Ok(id) => ShellCommand::Send(ClientMessage::AttachSession { session_id: id }),
-                Err(_) => ShellCommand::UnknownCommand("usage: /session switch <id>".to_string()),
+                Ok(id) => Command::Send(ClientMessage::AttachSession { session_id: id }),
+                Err(_) => Command::UnknownCommand("usage: /session switch <id>".to_string()),
             });
         }
         if let Some(session_id) = sub.strip_prefix("info ") {
             return Some(match session_id.trim().parse::<u64>() {
-                Ok(id) => ShellCommand::Send(ClientMessage::GetSessionState { session_id: id }),
-                Err(_) => ShellCommand::UnknownCommand("usage: /session info <id>".to_string()),
+                Ok(id) => Command::Send(ClientMessage::GetSessionState { session_id: id }),
+                Err(_) => Command::UnknownCommand("usage: /session info <id>".to_string()),
             });
         }
         if let Some(title) = sub.strip_prefix("new ") {
@@ -107,7 +120,7 @@ fn parse_session_subcommand(rest: &str, attached_session_id: Option<u64>) -> Opt
             } else {
                 Some(title.to_string())
             };
-            return Some(ShellCommand::Send(ClientMessage::CreateSession {
+            return Some(Command::Send(ClientMessage::CreateSession {
                 title,
                 parent_session_id: None,
                 working_dir: None,
@@ -118,7 +131,7 @@ fn parse_session_subcommand(rest: &str, attached_session_id: Option<u64>) -> Opt
             }));
         }
         if sub == "new" {
-            return Some(ShellCommand::Send(ClientMessage::CreateSession {
+            return Some(Command::Send(ClientMessage::CreateSession {
                 title: None,
                 parent_session_id: None,
                 working_dir: None,
@@ -129,30 +142,27 @@ fn parse_session_subcommand(rest: &str, attached_session_id: Option<u64>) -> Opt
             }));
         }
         if sub == "list" {
-            return Some(ShellCommand::Send(ClientMessage::ListSessions));
+            return Some(Command::Send(ClientMessage::ListSessions));
         }
-        return Some(ShellCommand::UnknownCommand(
+        return Some(Command::UnknownCommand(
             "session subcommands: list, new [title], switch <id>, info <id>".to_string(),
         ));
     }
 
+    // Bare `/session` is the "most useful form": open the interactive session
+    // manager. The direct forms (`switch`, `info`) live above.
     if rest == "session" {
-        return Some(match attached_session_id {
-            Some(id) => ShellCommand::Send(ClientMessage::GetSessionState { session_id: id }),
-            None => ShellCommand::UnknownCommand(
-                "no session attached. use /session switch <id> to attach".to_string(),
-            ),
-        });
+        return Some(Command::OpenSessions);
     }
 
     None
 }
 
-fn parse_account_subcommand(rest: &str) -> Option<ShellCommand> {
+fn parse_account_subcommand(rest: &str) -> Option<Command> {
     if let Some(args) = rest.strip_prefix("account ") {
         let args = args.trim();
         if args.is_empty() {
-            return Some(ShellCommand::UnknownCommand(
+            return Some(Command::UnknownCommand(
                 "usage: /account list | /account remove <name> | /account <name>".to_string(),
             ));
         }
@@ -160,7 +170,7 @@ fn parse_account_subcommand(rest: &str) -> Option<ShellCommand> {
         // args was checked non-empty above, so first() is always Some; the
         // catch-all arm treats the None case identically anyway.
         return Some(match parts.first().copied() {
-            Some("list") => ShellCommand::Send(ClientMessage::ListAccounts),
+            Some("list") => Command::Send(ClientMessage::ListAccounts),
             Some("remove") => {
                 let name = args
                     .trim_start()
@@ -168,11 +178,11 @@ fn parse_account_subcommand(rest: &str) -> Option<ShellCommand> {
                     .unwrap_or("")
                     .trim();
                 if name.is_empty() {
-                    ShellCommand::UnknownCommand("usage: /account remove <name>".to_string())
+                    Command::UnknownCommand("usage: /account remove <name>".to_string())
                 } else if !is_valid_account_name(name) {
-                    ShellCommand::UnknownCommand(INVALID_ACCOUNT_NAME.to_string())
+                    Command::UnknownCommand(INVALID_ACCOUNT_NAME.to_string())
                 } else {
-                    ShellCommand::Send(ClientMessage::RemoveAccount {
+                    Command::Send(ClientMessage::RemoveAccount {
                         name: name.to_string(),
                     })
                 }
@@ -180,33 +190,33 @@ fn parse_account_subcommand(rest: &str) -> Option<ShellCommand> {
             _ => {
                 let name = args.to_string();
                 if is_valid_account_name(&name) {
-                    ShellCommand::Send(ClientMessage::SetSessionAccount { name })
+                    Command::Send(ClientMessage::SetSessionAccount { name })
                 } else {
-                    ShellCommand::UnknownCommand(INVALID_ACCOUNT_NAME.to_string())
+                    Command::UnknownCommand(INVALID_ACCOUNT_NAME.to_string())
                 }
             }
         });
     }
 
+    // Bare `/account` is the "most useful form": open the accounts page. The
+    // direct forms (`list`, `remove`, `<name>`) live above.
     if rest == "account" {
-        return Some(ShellCommand::Send(ClientMessage::ListAccounts));
+        return Some(Command::OpenAccounts);
     }
 
     None
 }
 
-/// Handles both `/model` and `/models` — they are aliases.
-fn parse_model_subcommand(rest: &str) -> Option<ShellCommand> {
-    if rest == "model" || rest == "models" {
-        return Some(ShellCommand::Send(ClientMessage::ListModels));
+/// `/model` has no alias: bare `model` opens the picker, `model <id>` sets the
+/// model directly.
+fn parse_model_command(rest: &str) -> Option<Command> {
+    if rest == "model" {
+        return Some(Command::OpenModelSelector);
     }
-    if let Some(model) = rest
-        .strip_prefix("model ")
-        .or_else(|| rest.strip_prefix("models "))
-    {
+    if let Some(model) = rest.strip_prefix("model ") {
         let model = model.trim();
         if !model.is_empty() {
-            return Some(ShellCommand::Send(ClientMessage::SetModel {
+            return Some(Command::Send(ClientMessage::SetModel {
                 model: model.to_string(),
             }));
         }
@@ -218,10 +228,10 @@ pub fn parse_input_line(
     line: &str,
     next_request_id: &mut u32,
     attached_session_id: Option<u64>,
-) -> ShellCommand {
+) -> Command {
     let line = line.trim();
     if line.is_empty() {
-        return ShellCommand::Empty;
+        return Command::Empty;
     }
 
     if let Some(rest) = line.strip_prefix('/') {
@@ -232,7 +242,7 @@ pub fn parse_input_line(
 
     let request_id = *next_request_id;
     *next_request_id = next_request_id.wrapping_add(1);
-    ShellCommand::Send(ClientMessage::RunInput {
+    Command::Send(ClientMessage::RunInput {
         request_id,
         input: line.as_bytes().to_vec(),
     })
@@ -241,48 +251,52 @@ pub fn parse_input_line(
 fn parse_command(
     rest: &str,
     _next_request_id: &mut u32,
-    attached_session_id: Option<u64>,
-) -> ShellCommand {
+    _attached_session_id: Option<u64>,
+) -> Command {
     // Try grouped sub-command parsers before falling through to the flat commands.
     // Session, account, and model commands each have their own mini grammar and
     // were extracted from this function to keep each parser focused.
-    if let Some(cmd) = parse_session_subcommand(rest, attached_session_id) {
+    if let Some(cmd) = parse_session_subcommand(rest) {
         return cmd;
     }
     if let Some(cmd) = parse_account_subcommand(rest) {
         return cmd;
     }
-    if let Some(cmd) = parse_model_subcommand(rest) {
+    if let Some(cmd) = parse_model_command(rest) {
         return cmd;
     }
 
     if let Some(arg) = rest.strip_prefix("cancel ") {
         return match arg.trim().parse::<u32>() {
-            Ok(request_id) => ShellCommand::Send(ClientMessage::Cancel { request_id }),
-            Err(_) => ShellCommand::InvalidCancel(arg.trim().to_string()),
+            Ok(request_id) => Command::Send(ClientMessage::Cancel { request_id }),
+            Err(_) => Command::InvalidCancel(arg.trim().to_string()),
         };
     }
 
     if rest == "ping" {
-        return ShellCommand::Send(ClientMessage::Ping);
+        return Command::Send(ClientMessage::Ping);
+    }
+
+    if rest == "quit" {
+        return Command::Quit;
     }
 
     if let Some(key) = rest.strip_prefix("unlock ") {
         let trimmed = key.trim();
         if trimmed.is_empty() {
-            return ShellCommand::UnknownCommand("usage: /unlock [base64-unlock-key]".to_string());
+            return Command::UnknownCommand("usage: /unlock [base64-unlock-key]".to_string());
         }
         // The argument is the UNLOCK KEY ITSELF (base64 of the 32 raw bytes),
         // not a passphrase: /unlock <key> records it into known_servers.toml
         // and then unlocks with it. Decoding/validation happens in
         // `resolve_private_key` (which owns the store), so the parser stays a
         // pure syntax layer.
-        return ShellCommand::Unlock {
+        return Command::Unlock {
             method: UnlockMethod::Key(trimmed.to_string()),
         };
     }
     if rest == "unlock" {
-        return ShellCommand::Unlock {
+        return Command::Unlock {
             method: UnlockMethod::Raw,
         };
     }
@@ -290,19 +304,19 @@ fn parse_command(
     if let Some(args) = rest.strip_prefix("add-key ") {
         let parts: Vec<&str> = args.split_whitespace().collect();
         if parts.len() < 2 {
-            return ShellCommand::UnknownCommand("usage: /add-key <service> <api_key>".to_string());
+            return Command::UnknownCommand("usage: /add-key <service> <api_key>".to_string());
         }
         // The len check above bounds-guarantees both fields; get() keeps the
         // accesses total.
         let service = parts.first().copied().unwrap_or_default().to_string();
         if !is_valid_account_name(&service) {
-            return ShellCommand::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
+            return Command::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
         }
         let key = parts.get(1).copied().unwrap_or_default().to_string();
         // The unlock key is always resolved per-addr by
         // `build_add_credential_message` (stored → legacy → fresh), so the
         // shell takes no `unlock` argument anymore.
-        return ShellCommand::AddCredential {
+        return Command::AddCredential {
             service,
             credential_type: "api_key".to_string(),
             fields: vec![key],
@@ -312,7 +326,7 @@ fn parse_command(
     if let Some(args) = rest.strip_prefix("add-x ") {
         let parts: Vec<&str> = args.split_whitespace().collect();
         if parts.len() < 6 {
-            return ShellCommand::UnknownCommand(
+            return Command::UnknownCommand(
                 "usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_".to_string(),
             );
         }
@@ -335,7 +349,7 @@ fn parse_command(
         ];
         let service = service.copied().unwrap_or_default().to_string();
         if !is_valid_account_name(&service) {
-            return ShellCommand::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
+            return Command::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
         }
         let api_key = api_key.copied().unwrap_or_default().to_string();
         let api_key_secret = api_key_secret.copied().unwrap_or_default().to_string();
@@ -345,7 +359,7 @@ fn parse_command(
         // The unlock key is always resolved per-addr by
         // `build_add_credential_message` (stored → legacy → fresh), so the
         // shell takes no `unlock` argument anymore.
-        return ShellCommand::AddCredential {
+        return Command::AddCredential {
             service,
             credential_type: "x".to_string(),
             fields: vec![
@@ -359,17 +373,17 @@ fn parse_command(
     }
 
     if rest == "remove-key" {
-        return ShellCommand::UnknownCommand("usage: /remove-key <service>".to_string());
+        return Command::UnknownCommand("usage: /remove-key <service>".to_string());
     }
     if let Some(name) = rest.strip_prefix("remove-key ") {
         let name = name.trim();
         if name.is_empty() {
-            return ShellCommand::UnknownCommand("usage: /remove-key <service>".to_string());
+            return Command::UnknownCommand("usage: /remove-key <service>".to_string());
         }
         if !is_valid_account_name(name) {
-            return ShellCommand::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
+            return Command::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
         }
-        return ShellCommand::RemoveCredential {
+        return Command::RemoveCredential {
             service: name.to_string(),
         };
     }
@@ -382,9 +396,7 @@ fn parse_command(
         match parts.first().copied() {
             Some("add") => {
                 if parts.len() != 2 {
-                    return ShellCommand::UnknownCommand(
-                        "usage: /acl add <base64-pubkey>".to_string(),
-                    );
+                    return Command::UnknownCommand("usage: /acl add <base64-pubkey>".to_string());
                 }
                 // Syntactic validation only (base64 shape + 32-byte length);
                 // the daemon re-validates authoritatively. parts.len() == 2
@@ -392,58 +404,66 @@ fn parse_command(
                 let pubkey = match parts.get(1) {
                     Some(pubkey) => {
                         if let Err(e) = validate_pubkey_b64(pubkey) {
-                            return ShellCommand::UnknownCommand(e);
+                            return Command::UnknownCommand(e);
                         }
                         pubkey.to_string()
                     }
                     None => {
-                        return ShellCommand::UnknownCommand(
+                        return Command::UnknownCommand(
                             "usage: /acl add <base64-pubkey>".to_string(),
                         );
                     }
                 };
-                return ShellCommand::AclAdd { pubkey };
+                return Command::AclAdd { pubkey };
             }
             _ => {
-                return ShellCommand::UnknownCommand("usage: /acl add <base64-pubkey>".to_string());
+                return Command::UnknownCommand("usage: /acl add <base64-pubkey>".to_string());
             }
         }
     }
 
     if rest == "lock" {
-        return ShellCommand::Send(ClientMessage::Lock);
+        return Command::Send(ClientMessage::Lock);
     }
 
     // /refresh-models [--force]: refresh the models.dev catalog. Kept as a
     // non-Send variant so the TUI can set a "refreshing models…" status
     // BEFORE the request goes out (and the reply is asynchronous).
     if rest == "refresh-models" {
-        return ShellCommand::RefreshModels { force: false };
+        return Command::RefreshModels { force: false };
     }
     if let Some(arg) = rest.strip_prefix("refresh-models ") {
         return match arg.trim() {
-            "--force" | "force" => ShellCommand::RefreshModels { force: true },
-            other => ShellCommand::UnknownCommand(format!(
-                "usage: /refresh-models [--force] (got '{other}')"
-            )),
+            "--force" | "force" => Command::RefreshModels { force: true },
+            other => {
+                Command::UnknownCommand(format!("usage: /refresh-models [--force] (got '{other}')"))
+            }
         };
     }
 
     if rest == "undo" {
-        return ShellCommand::Undo;
+        return Command::Undo;
     }
     if rest == "redo" {
-        return ShellCommand::Redo;
+        return Command::Redo;
     }
     if rest == "continue" {
-        return ShellCommand::Continue;
+        return Command::Continue;
     }
     if rest == "stop" {
-        return ShellCommand::Stop;
+        return Command::Stop;
     }
 
+    // Bare `/reasoning` is the "most useful form": cycle to the next effort
+    // level on the attached session. The direct forms are `list` and `<level>`.
+    if rest == "reasoning" {
+        return Command::ReasoningCycle;
+    }
     if let Some(effort_s) = rest.strip_prefix("reasoning ") {
         let raw = effort_s.trim();
+        if raw == "list" {
+            return Command::ReasoningList;
+        }
         let slug = raw.to_lowercase();
         let effort = match slug.as_str() {
             // Normalise common aliases to canonical slugs.
@@ -455,21 +475,18 @@ fn parse_command(
             // capability set and rejects unsupported values.
             other => other,
         };
-        return ShellCommand::Send(ClientMessage::SetReasoningEffort {
+        return Command::Send(ClientMessage::SetReasoningEffort {
             effort: effort.to_string(),
         });
     }
-    if rest == "reasoning" {
-        return ShellCommand::Send(ClientMessage::GetReasoningEffort);
-    }
 
-    ShellCommand::UnknownCommand(format!("unknown command: /{rest}"))
+    Command::UnknownCommand(format!("unknown command: /{rest}"))
 }
 
 #[must_use]
-pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
+pub fn command_echo(command: &Command) -> Option<String> {
     match command {
-        ShellCommand::Send(message) => match message {
+        Command::Send(message) => match message {
             ClientMessage::RunInput { .. } => None,
             ClientMessage::SetModel { model } => Some(format!("> set model: {model}")),
             ClientMessage::SetReasoningEffort { effort } => {
@@ -480,15 +497,15 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
         },
         // Non-Send shell commands: echo the raw line so the user can see
         // what they typed even though no ClientMessage is sent.
-        ShellCommand::Unlock { .. } => Some("> /unlock".to_string()),
-        ShellCommand::AddCredential { service, .. } => Some(format!("> /add-key {service}")),
-        ShellCommand::RemoveCredential { service } => Some(format!("> /remove-key {service}")),
-        ShellCommand::AclAdd { pubkey } => Some(format!("> /acl add {pubkey}")),
-        ShellCommand::Undo => Some("> undo".to_string()),
-        ShellCommand::Redo => Some("> redo".to_string()),
-        ShellCommand::Continue => Some("> continue".to_string()),
-        ShellCommand::Stop => Some("> stop".to_string()),
-        ShellCommand::RefreshModels { force } => {
+        Command::Unlock { .. } => Some("> /unlock".to_string()),
+        Command::AddCredential { service, .. } => Some(format!("> /add-key {service}")),
+        Command::RemoveCredential { service } => Some(format!("> /remove-key {service}")),
+        Command::AclAdd { pubkey } => Some(format!("> /acl add {pubkey}")),
+        Command::Undo => Some("> undo".to_string()),
+        Command::Redo => Some("> redo".to_string()),
+        Command::Continue => Some("> continue".to_string()),
+        Command::Stop => Some("> stop".to_string()),
+        Command::RefreshModels { force } => {
             let suffix = if *force { " --force" } else { "" };
             Some(format!("> /refresh-models{suffix}"))
         }
@@ -505,7 +522,7 @@ mod tests {
         let mut id = 0;
         assert_eq!(
             parse_input_line("/refresh-models", &mut id, None),
-            ShellCommand::RefreshModels { force: false },
+            Command::RefreshModels { force: false },
         );
     }
 
@@ -514,11 +531,11 @@ mod tests {
         let mut id = 0;
         assert_eq!(
             parse_input_line("/refresh-models --force", &mut id, None),
-            ShellCommand::RefreshModels { force: true },
+            Command::RefreshModels { force: true },
         );
         assert_eq!(
             parse_input_line("/refresh-models force", &mut id, None),
-            ShellCommand::RefreshModels { force: true },
+            Command::RefreshModels { force: true },
         );
     }
 
@@ -527,18 +544,18 @@ mod tests {
         let mut id = 0;
         assert!(matches!(
             parse_input_line("/refresh-models --bogus", &mut id, None),
-            ShellCommand::UnknownCommand(_),
+            Command::UnknownCommand(_),
         ));
     }
 
     #[test]
     fn refresh_models_echo_mentions_force() {
         assert_eq!(
-            shell_command_echo(&ShellCommand::RefreshModels { force: false }).as_deref(),
+            command_echo(&Command::RefreshModels { force: false }).as_deref(),
             Some("> /refresh-models"),
         );
         assert_eq!(
-            shell_command_echo(&ShellCommand::RefreshModels { force: true }).as_deref(),
+            command_echo(&Command::RefreshModels { force: true }).as_deref(),
             Some("> /refresh-models --force"),
         );
     }

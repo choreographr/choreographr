@@ -16,7 +16,7 @@ mod selection;
 mod state;
 mod syntax;
 
-pub use choreo_client_core::{ClientError, ShellCommand, parse_input_line};
+pub use choreo_client_core::{ClientError, Command, parse_input_line};
 pub use choreo_markdown::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 use choreo_proto::ImageMetadata;
 use image::imageops::FilterType;

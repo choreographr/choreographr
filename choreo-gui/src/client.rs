@@ -1,8 +1,8 @@
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{
-    AutoBindAttempt, ClientError, ConnectionMode, ShellCommand, attempt_keystore_auto_bind,
-    build_add_credential_message, dispatch_daemon_message, parse_input_line, record_unlock_key,
-    resolve_private_key, run_daemon_connection_with_mode, shell_command_echo,
+    AutoBindAttempt, ClientError, Command, ConnectionMode, attempt_keystore_auto_bind,
+    build_add_credential_message, command_echo, dispatch_daemon_message, parse_input_line,
+    record_unlock_key, resolve_private_key, run_daemon_connection_with_mode,
 };
 use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, socket_path};
 use dioxus::prelude::*;
@@ -72,16 +72,16 @@ pub(crate) fn connection_addr() -> String {
 pub(crate) fn handle_shell_command(
     state: &mut AppState,
     daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
-    command: ShellCommand,
+    command: Command,
 ) {
     match command {
-        ShellCommand::Empty => {}
-        ShellCommand::InvalidCancel(value) => state
+        Command::Empty => {}
+        Command::InvalidCancel(value) => state
             .status_texts
             .push(format!("invalid request id: {value}")),
-        ShellCommand::UnknownCommand(error) => state.status_texts.push(error),
-        ShellCommand::Send(message) => send_client_message(state, daemon_tx, message),
-        ShellCommand::Unlock { method } => match resolve_private_key(&method, &connection_addr()) {
+        Command::UnknownCommand(error) => state.status_texts.push(error),
+        Command::Send(message) => send_client_message(state, daemon_tx, message),
+        Command::Unlock { method } => match resolve_private_key(&method, &connection_addr()) {
             Ok(private_key) => {
                 // Hold the key until the daemon confirms the unlock, then
                 // record it per-daemon (see [`record_pending_unlock_key`]).
@@ -92,7 +92,7 @@ pub(crate) fn handle_shell_command(
                 state.status_texts.push(format!("[error] {e}"));
             }
         },
-        ShellCommand::AddCredential {
+        Command::AddCredential {
             service,
             credential_type,
             fields,
@@ -110,25 +110,25 @@ pub(crate) fn handle_shell_command(
                 Err(e) => state.status_texts.push(format!("[error] {e}")),
             }
         }
-        ShellCommand::AclAdd { pubkey } => {
+        Command::AclAdd { pubkey } => {
             // The daemon enforces local-only; forward like any other command
             // and surface the refusal if this GUI connection is remote.
             send_client_message(state, daemon_tx, ClientMessage::AclAdd { pubkey });
         }
-        ShellCommand::RemoveCredential { service } => {
+        Command::RemoveCredential { service } => {
             send_client_message(
                 state,
                 daemon_tx,
                 ClientMessage::RemoveCredential { service },
             );
         }
-        ShellCommand::Undo => {
+        Command::Undo => {
             send_client_message(state, daemon_tx, ClientMessage::Undo);
         }
-        ShellCommand::Redo => {
+        Command::Redo => {
             send_client_message(state, daemon_tx, ClientMessage::Redo);
         }
-        ShellCommand::Continue => {
+        Command::Continue => {
             if state.attached_session_id.is_some() {
                 let request_id = state.next_request_id;
                 state.next_request_id = state.next_request_id.wrapping_add(1);
@@ -141,7 +141,7 @@ pub(crate) fn handle_shell_command(
                 state.status_texts.push("no session attached".to_string());
             }
         }
-        ShellCommand::Stop => {
+        Command::Stop => {
             // Send Cancel with request_id 0 (CANCEL_ALL sentinel) to stop
             // whatever request is currently active on the attached session.
             if state.attached_session_id.is_some() {
@@ -150,7 +150,7 @@ pub(crate) fn handle_shell_command(
                 state.status_texts.push("no session attached".to_string());
             }
         }
-        ShellCommand::RefreshModels { force } => {
+        Command::RefreshModels { force } => {
             state.status_texts.push(if force {
                 "refreshing models… (forced)".to_string()
             } else {
@@ -158,6 +158,16 @@ pub(crate) fn handle_shell_command(
             });
             send_client_message(state, daemon_tx, ClientMessage::RefreshModels { force });
         }
+        // TODO(task 3): the unified command model's local-UI variants
+        // (open session manager / accounts / model picker, reasoning
+        // cycle/list, quit) are not yet wired into the GUI event loop; a
+        // later task hooks them into the corresponding Dioxus surfaces.
+        Command::OpenSessions
+        | Command::OpenAccounts
+        | Command::OpenModelSelector
+        | Command::ReasoningCycle
+        | Command::ReasoningList
+        | Command::Quit => {}
     }
 }
 
@@ -173,7 +183,7 @@ pub(crate) fn send_client_message(
         return;
     };
 
-    if let Some(echo) = shell_command_echo(&ShellCommand::Send(message.clone())) {
+    if let Some(echo) = command_echo(&Command::Send(message.clone())) {
         state.status_texts.push(echo);
     }
 

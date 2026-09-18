@@ -1,6 +1,6 @@
 use ammonia::Builder as HtmlSanitizer;
 use choreo_client_core::{
-    ShellCommand, build_add_credential_message, parse_input_line, resolve_private_key,
+    Command, build_add_credential_message, parse_input_line, resolve_private_key,
 };
 use choreo_markdown::render_markdown_html;
 use choreo_proto::{ClientMessage, socket_path};
@@ -108,7 +108,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
     state.request_id.set(request_id);
 
     match command {
-        ShellCommand::Send(client_msg) => {
+        Command::Send(client_msg) => {
             if let ClientMessage::RunInput { input, .. } = &client_msg {
                 let echo = format!("> {}", String::from_utf8_lossy(input));
                 if let Err(e) = bot.send_message(chat_id_val, &echo, None) {
@@ -120,13 +120,13 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
                 warn!("failed to send command to bridge: {e}");
             }
         }
-        ShellCommand::UnknownCommand(err) => {
+        Command::UnknownCommand(err) => {
             warn!(%err, "unknown command from user");
             if let Err(e) = bot.send_message(chat_id_val, &err, None) {
                 warn!("failed to send error message to telegram: {e}");
             }
         }
-        ShellCommand::Unlock { method } => match resolve_private_key(&method, &socket_path()) {
+        Command::Unlock { method } => match resolve_private_key(&method, &socket_path()) {
             Ok(private_key) => {
                 if let Err(e) = state.bridge_tx.send(ClientMessage::Unlock { private_key }) {
                     warn!("failed to send unlock to bridge: {e}");
@@ -136,7 +136,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
                 let _ = bot.send_message(chat_id_val, &format!("[error] {e}"), None);
             }
         },
-        ShellCommand::AddCredential {
+        Command::AddCredential {
             service,
             credential_type,
             fields,
@@ -150,7 +150,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
                 let _ = bot.send_message(chat_id_val, &format!("[error] {e}"), None);
             }
         },
-        ShellCommand::RemoveCredential { service } => {
+        Command::RemoveCredential { service } => {
             if let Err(e) = state
                 .bridge_tx
                 .send(ClientMessage::RemoveCredential { service })
@@ -158,7 +158,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
                 warn!("failed to send remove credential to bridge: {e}");
             }
         }
-        ShellCommand::AclAdd { .. } => {
+        Command::AclAdd { .. } => {
             // An IM bridge is inherently a REMOTE client: the daemon refuses
             // AclAdd from TCP/Noise connections, so do not even forward it.
             let _ = bot.send_message(
@@ -167,17 +167,27 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
                 None,
             );
         }
-        ShellCommand::Empty | ShellCommand::InvalidCancel(_) => {}
-        ShellCommand::Undo | ShellCommand::Redo => {}
-        ShellCommand::Continue | ShellCommand::Stop => {
+        Command::Empty | Command::InvalidCancel(_) => {}
+        Command::Undo | Command::Redo => {}
+        Command::Continue | Command::Stop => {
             debug!("telegram does not support Continue/Stop commands");
         }
-        ShellCommand::RefreshModels { force } => {
+        Command::RefreshModels { force } => {
             // The daemon refresh is client-agnostic: forward the request over
             // the bridge like any other Send command.
             if let Err(e) = state.bridge_tx.send(ClientMessage::RefreshModels { force }) {
                 warn!("failed to send refresh-models to bridge: {e}");
             }
+        }
+        // The unified command model's local-UI variants are TUI concerns; the
+        // IM bridge is a headless stub, so it accepts them as no-ops.
+        Command::OpenSessions
+        | Command::OpenAccounts
+        | Command::OpenModelSelector
+        | Command::ReasoningCycle
+        | Command::ReasoningList
+        | Command::Quit => {
+            debug!("telegram stub ignores interactive shell command");
         }
     }
 }

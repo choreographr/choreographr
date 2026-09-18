@@ -702,11 +702,21 @@ are only required when running prompts.
 
 In `choreo-tui`:
 
+Pressing `/` on an **empty** prompt enters **command-entry mode** — a
+keyboard-only overlay (it floats above the input box, never covering the input
+or the status bar) that lists every command. The `/` is only a trigger: it is
+never shown, and the input holds the command line itself (e.g. `model`, or
+`model gpt-4o`). While in command mode, `↑`/`↓` move the highlight, `Tab`
+completes the highlighted command's name into the input (a trailing space is
+added) and stays in the mode, **`Enter` runs the command**, and `Esc` returns
+to the prompt without cancelling anything. (You can also just type a
+`/command` line directly and press `Enter`, as before.)
+
 - `/ping` — health check
-- `/models` — list and select models
-- `/model` — alias for `/models`
+- `/model` — open the model selector picker
+- `/model <name>` — set the session's model directly
 - `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts; a burst of `/refresh-models` requests is coalesced into a single fetch (each requester's status reflects its own `--force` flag, and a 304 reply is ordered after any queued overlay reload so the counts are current).
-- `/session` — show current session info
+- `/session` — open the interactive session manager
 - `/session list` — list all sessions
 - `/session new [title]` — create a new session
 - `/session switch <id>` — switch to a different session
@@ -719,16 +729,19 @@ In `choreo-tui`:
 - `/add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_` — add an X credential (service name must be `[a-z0-9_-]`)
 - `/acl add <base64-pubkey>` — enroll a new client's transport public key in the daemon's ACL (local/Unix-socket connections only; takes effect immediately via the ACL hot-reload)
 - `/remove-key <service>` — remove a credential
+- `/account` — open the AI provider accounts page
 - `/account list` — list configured AI provider accounts
 - `/account remove <name>` — remove an AI provider account
 - `/account <name>` — set the session's AI provider account
 - `Ctrl+A` — open the AI provider accounts page (list accounts; `Enter` sets the highlighted account on the active session and returns to chat, `r` removes, `c` opens the API-key modal, `n` starts the new-account wizard; a click on an account row does the same as selecting it and pressing `Enter`, and the mouse wheel scrolls the highlight)
 - `Ctrl+S` — open the session manager page (list sessions; `j`/`k` or the mouse wheel navigate, `Enter` attaches to the highlighted session and returns to chat, `i` opens details, `n` creates a new session, `d` deletes; a click on a session row does the same as selecting it and pressing `Enter`, and `Esc` returns to chat)
 - New-account wizard (`n` on the accounts page) — centered modal windows: a **searchable provider picker** (type to filter by provider name, `↑`/`↓`/`PgUp`/`PgDn` or the mouse wheel navigate, `Enter` or a click on a row picks — the list is alphabetical), then a separate **slug modal** (enter the account's unique name, e.g. `/account <slug>`); `Enter` creates the account and jumps straight to the **API-key modal**
-- `/reasoning` — show current reasoning effort slug
+- `/reasoning` — cycle the reasoning effort for the attached session's model
+- `/reasoning list` — list the available reasoning effort slugs
 - `/reasoning <slug>` — set reasoning effort (e.g. `off`, `low`, `medium`, `high`, `on`, `xhigh`, `max`; available values depend on the model)
 - `Ctrl+R` — cycle reasoning effort through available slugs for the attached session's model (status message states: model reports no effort levels → "model does not support reasoning"; no model selected → "no model selected — pick one with Ctrl+M"; model selected but capability not yet reported → "reasoning capability not yet available")
 - `Ctrl+M` — open the model selector: list models available on the attached session's account, type to filter, `↑`/`↓`/`PgUp`/`PgDn` or the mouse wheel to navigate, click a row or press Enter to select, Esc to dismiss (requires a terminal that implements the kitty keyboard protocol — e.g. kitty, foot, wezterm, ghostty, alacritty; on other terminals Ctrl+M arrives as Enter)
+- `Ctrl+O` — the model-selector binding on **legacy terminals only**: on a terminal without the kitty keyboard protocol, `Ctrl+M` is byte `0x0D` (indistinguishable from `Enter`), so the selector is reached with `Ctrl+O` there. It is **not** an alias on kitty-protocol terminals, where `Ctrl+M` is the binding
 - `Ctrl+Backspace` — clear the draft prompt in the input box (empties the whole draft wherever the cursor sits; `Ctrl+W` deletes the previous word and `Ctrl+U` clears only up to the cursor)
 - Mouse select-to-copy — drag to select text in the history pane; on release it is copied to the system clipboard automatically (via the OSC 52 escape sequence, so it works in kitty/wezterm/ghostty/alacritty ≥0.13/Windows Terminal and over SSH/tmux, and is a silent no-op in terminals without OSC 52 support such as macOS Terminal.app), and the status line reports "Selection copied to clipboard.". Only the message text is selected — the box chrome around turns (the `┃` gutter, padding, and trailing fill) is excluded from both the highlight and the copy. Wrapped text is copied *unwrapped*: rows the renderer folded onto separate lines because the pane is narrow are re-joined into the original text (paragraph wraps regain their single space, verbatim tool output is reproduced byte-for-byte), while real line/paragraph breaks — and the blank spacer rows the renderer leaves between blocks — stay newlines, so copying a heading and its paragraph keeps the blank line between them. Selections over 1 MiB are refused with a "too large to copy" status (OSC 52 payloads are base64 and terminals cap oversized pastes). Selection starts only on plain text — clicking a reasoning/tool-result header still toggles it, a plain click without a drag copies nothing, and scrolling mid-selection — by wheel or because new content streams in — keeps the starting point pinned to the text while the selection tracks the cursor
 - `/continue` — continue a stopped/idle session by sending a "Please continue." prompt

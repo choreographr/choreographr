@@ -510,7 +510,7 @@ fn session_state_snapshot_fills_missing_last_prompt_tokens() {
 fn enter_continue_when_attached_sends_continue_generation() {
     let mut app = test_app();
     app.attached_session_id = Some(1);
-    app.input.text = "/continue".to_string();
+    app.input.text = "/continue ".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
@@ -530,7 +530,7 @@ fn enter_continue_when_attached_sends_continue_generation() {
 fn enter_continue_when_not_attached_shows_error() {
     let mut app = test_app();
     app.attached_session_id = None;
-    app.input.text = "/continue".to_string();
+    app.input.text = "/continue ".to_string();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
@@ -559,7 +559,7 @@ fn enter_continue_scrolls_to_bottom() {
     app.scroll_up(2);
     let scrolled = app.effective_scroll();
     assert!(scrolled > 0, "should be scrolled up");
-    app.input.text = "/continue".to_string();
+    app.input.text = "/continue ".to_string();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
@@ -576,7 +576,7 @@ fn enter_continue_scrolls_to_bottom() {
 fn enter_stop_when_attached_sends_cancel_all() {
     let mut app = test_app();
     app.attached_session_id = Some(1);
-    app.input.text = "/stop".to_string();
+    app.input.text = "/stop ".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
@@ -595,7 +595,7 @@ fn enter_stop_when_attached_sends_cancel_all() {
 fn enter_stop_when_not_attached_shows_error() {
     let mut app = test_app();
     app.attached_session_id = None;
-    app.input.text = "/stop".to_string();
+    app.input.text = "/stop ".to_string();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
@@ -611,7 +611,7 @@ fn enter_stop_when_not_attached_shows_error() {
 #[test]
 fn enter_undo_sends_undo() {
     let mut app = test_app();
-    app.input.text = "/undo".to_string();
+    app.input.text = "/undo ".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
@@ -629,7 +629,7 @@ fn enter_undo_sends_undo() {
 #[test]
 fn enter_redo_sends_redo() {
     let mut app = test_app();
-    app.input.text = "/redo".to_string();
+    app.input.text = "/redo ".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
@@ -657,7 +657,7 @@ fn enter_stop_does_not_scroll() {
     app.scroll_up(1);
     let scrolled = app.effective_scroll();
     assert!(scrolled > 0, "should be scrolled up");
-    app.input.text = "/stop".to_string();
+    app.input.text = "/stop ".to_string();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(

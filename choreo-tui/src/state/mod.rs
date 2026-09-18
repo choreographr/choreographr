@@ -31,6 +31,7 @@ use crate::markdown_render::{
 #[cfg(test)]
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+mod command_palette;
 mod input;
 mod layout;
 mod pages;
@@ -39,6 +40,7 @@ mod providers;
 // Compatibility layer: every item moved into the sibling modules is
 // re-exported here so `crate::state::X` references (in this crate and in
 // `app_tests.rs`/`render_tests.rs`) keep resolving exactly as before.
+pub(crate) use command_palette::*;
 pub(crate) use input::*;
 pub(crate) use layout::*;
 pub(crate) use pages::*;
@@ -384,6 +386,16 @@ pub(crate) struct App {
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
     pub(crate) model_selector: ModelSelectorState,
+    /// Transient selection state for the inline command palette (Chat page).
+    /// The palette's highlight and scroll window; its visible/hidden condition
+    /// is the `command_mode` flag (see `command_palette_active`).
+    pub(crate) command_palette: CommandPaletteState,
+    /// Whether the Chat composer is in **command-entry mode**: the prompt was
+    /// opened by a `/` trigger on an empty prompt, so `input` holds a bare
+    /// command line (no leading slash) and the palette is shown.  Enter RUNS
+    /// the command, Esc returns to the prompt.  Only ever entered from an empty
+    /// prompt and cleared on exit, so no second buffer is needed.
+    pub(crate) command_mode: bool,
     /// The live provider list for the new-account wizard's provider picker
     /// (S4). Initialized from the static `PROVIDER_OPTIONS` default and
     /// replaced wholesale whenever the daemon broadcasts `CatalogUpdated`, so
@@ -561,6 +573,8 @@ impl App {
             session_mgr: SessionManagerState::new(),
             ai_providers: AIProvidersState::new(),
             model_selector: ModelSelectorState::new(),
+            command_palette: CommandPaletteState::new(),
+            command_mode: false,
             // Start from the static default; the daemon's CatalogUpdated
             // broadcast replaces it with the live list.  The picker must be
             // alphabetical, so sort the default here too (see `sort_providers`
@@ -1009,6 +1023,10 @@ impl App {
 
     pub(crate) fn reset_for_session_switch(&mut self, session_id: u64) {
         self.active_session_id = Some(session_id);
+        // A command line belongs to the session the user was editing; it must
+        // never become the newly-attached session's draft.  Exiting command
+        // mode clears the buffer before any draft hand-off happens elsewhere.
+        self.exit_command_mode();
         // A selection is keyed to the previous session's rendered content in
         // screen coordinates; it must not linger and highlight the next
         // session's history.
@@ -1317,6 +1335,11 @@ impl App {
 
     pub(crate) fn set_page(&mut self, page: Page) {
         self.page = page;
+        // A command line is scoped to the Chat page: a page change (e.g.
+        // Ctrl+S opening the session manager) must never leave command-entry
+        // mode active underneath.  Guarded so a real prompt draft survives a
+        // page change (see `exit_command_mode`).
+        self.exit_command_mode();
         // A selection is stored in screen coordinates keyed to the Chat
         // page's rendered history; leaving the page (or re-entering via an
         // attach flow, which changes the underlying session) invalidates
@@ -1764,6 +1787,11 @@ impl App {
         client_tx
             .send(ClientMessage::AttachSession { session_id })
             .map_err(broken_pipe)?;
+        // Drop command-entry mode BEFORE the input hand-off below: a command
+        // line is not a prompt, so it must be discarded (not stashed as the
+        // outgoing session's draft) and the target session's draft loaded in
+        // its place.
+        self.exit_command_mode();
         // Hand the input bar over to the target session (stash the outgoing
         // session's input, load the target's draft) before `attached_session_id`
         // is rebound below — it still names the session the input bar's

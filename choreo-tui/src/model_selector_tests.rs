@@ -52,14 +52,16 @@ fn chat_ctrl_m_opens_selector_and_requests_models() {
 // ── Model selector (Ctrl+O — legacy-terminal binding) ──
 //
 // On terminals without the kitty keyboard protocol (Termux et al.) Ctrl+M is
-// byte 0x0D — identical to Enter — so the selector is rebound to Ctrl+O (see
-// `App::keyboard_enhanced`). The binding itself is unconditional in the
-// handler; only hints are mode-aware.
+// byte 0x0D — identical to Enter — so the shortcut table rebinds the model
+// selector to Ctrl+O there (see `App::keyboard_enhanced`). Both dispatch
+// (`binding_for`) and hints are mode-aware, so Ctrl+O only opens the selector
+// on a legacy terminal.
 
 #[test]
 fn chat_ctrl_o_opens_selector_and_requests_models() {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut app = test_app();
+    app.keyboard_enhanced = false; // legacy terminal → Ctrl+O is the binding
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
@@ -75,10 +77,10 @@ fn chat_ctrl_o_opens_selector_and_requests_models() {
 }
 
 #[test]
-fn chat_ctrl_o_also_works_in_enhanced_mode() {
-    // Ctrl+O stays live on kitty-protocol terminals as an undocumented alias
-    // (the hints there advertise Ctrl+M, the historical binding).
-    let (tx, _rx) = std::sync::mpsc::channel();
+fn chat_ctrl_o_is_unbound_on_enhanced_terminal() {
+    // On a kitty-protocol terminal the model selector is Ctrl+M, so Ctrl+O is
+    // unbound: it must neither open the selector nor send anything.
+    let (tx, rx) = std::sync::mpsc::channel();
     let mut app = test_app();
     assert!(app.keyboard_enhanced, "test_app defaults to enhanced mode");
 
@@ -89,7 +91,14 @@ fn chat_ctrl_o_also_works_in_enhanced_mode() {
     )
     .expect("handle ctrl+o in enhanced mode");
 
-    assert!(app.model_selector.is_open());
+    assert!(
+        !app.model_selector.is_open(),
+        "ctrl+o must not open the selector on a kitty terminal"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "ctrl+o must not send anything on a kitty terminal"
+    );
 }
 
 #[test]
