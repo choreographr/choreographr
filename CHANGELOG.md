@@ -40,6 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that no context could be created, in its result — appended as a clearly
   delimited `[webgl] …` line so it can't be mistaken for captured page content.
 
+- **Bounded auto-recovery from truncated tool calls in the agent loop
+  (`choreo-daemon`).** When a provider cuts a response off at its output-token
+  limit mid-tool-call (the arguments JSON arrives truncated and is discarded as
+  unsafe to execute), the loop no longer dead-ends the request: it records a
+  short explanatory turn, seeds an actionable recovery instruction as the next
+  user turn ("your call was truncated; split large writes into smaller tool
+  calls"), and retries — up to `MAX_TRUNCATION_RECOVERIES` times before ending
+  the request cleanly. The cap is essential because a session may run with
+  `max_turns == 0` (unlimited), which cannot bound the loop itself.
+
 ### Changed
 
 - **`just pre-commit` is now the commit gate, run automatically after every implementation run.** The gate runs in mutation-aware order — `clippy-fix` → `clippy-strict` → `test-all` → `fmt` → `check-changelog` — and the agent loops it (fix by hand, re-run) until green before committing, without asking the user first. Clippy and `test-all` now cover **all targets and all features**, and any clippy warning fails the gate (the verification pass denies warnings). Formatting runs *last*, not first, precisely because `clippy-fix` mutates the tree while `fmt` is semantics-preserving — the tested bytes stay behaviourally identical to the committed bytes. Commit messages now follow **Conventional Commits**, scoped by crate. The supply-chain and release-name guards moved out of the commit path to the release workflow (they are release guards, not pre-commit guards), and the redundant local-only `just ci` recipe was removed. When work is delegated, each subsession now runs the same gate and commits its unit before returning its report; a subsession that aborts leaves its changes uncommitted for the parent to inspect. The clippy/fmt gate flags live in `.cargo/config.toml` aliases (`clippy-all`, `clippy-all-fix`, `fmt-all`) so the `just` recipes stay flag-free.
@@ -155,6 +165,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer lost.** It was emitted *before* the tracing subscriber was installed,
   so it was silently dropped; it now logs after init (and reports that the
   flags take precedence).
+
+- **A length-truncated tool call no longer masquerades as an empty answer
+  (`choreo-ai-protocols`, `choreo-proto`).** The chat-completions adapter (the
+  path the opencode zen/go gateway uses) returned a `FinalText` with empty
+  content and `truncated: true` whenever every tool call's arguments were cut
+  off mid-JSON — which the daemon rendered as a bare "⚠ response truncated
+  (length limit)" with no explanation and no recovery. It now returns
+  `TruncatedToolCall` instead, matching the Responses adapter, so the daemon's
+  dedicated handler takes over. `DiscardedToolCall`'s `Display` is also bounded
+  (tool name, a short preview, and the total size) so a cropped ~20 KB
+  `write_file` payload can no longer bloat the log line or the transcript.
+
+- **`glm-5.3-flash` now carries its real output-token ceiling
+  (`choreo-ai-protocols`).** The model overlay comment claimed "1M context /
+  128K output" but only pinned `context_window`, leaving `max_output_tokens`
+  unknown (`0`) — so the catalog clamp could not bound the model's output and a
+  single oversized tool call could run to the gateway's default. Pinned to
+  `128000` per the official GLM-5.3-Flash model card (verified against
+  docs.z.ai).
 
 ## [0.2.1] - 2026-09-17 (Lindy)
 

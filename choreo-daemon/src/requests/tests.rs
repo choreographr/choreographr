@@ -13,7 +13,9 @@ use super::*;
 use crate::context::LoadedSkill;
 use crate::daemon::DaemonCommand;
 use crate::providers::InferenceProvider;
-use crate::providers::test_util::{make_failing_provider, make_test_provider};
+use crate::providers::test_util::{
+    make_failing_provider, make_test_provider, make_truncating_provider,
+};
 use crate::reasoning::{
     build_chat_request_messages, initial_prev_resp_id, warn_on_missing_reasoning_artifacts,
 };
@@ -1815,6 +1817,116 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
     assert!(
         saw_error_appended,
         "expected a TurnAppended broadcast carrying the failure"
+    );
+}
+
+#[test]
+fn agent_loop_recovers_from_truncated_tool_call() {
+    // A provider that truncates its first streaming turn (a tool call cut off at
+    // the output-token limit) must NOT dead-end the request: the loop discards
+    // the partial call, records an explanatory turn, seeds the recovery
+    // instruction as the next user turn, and retries — reaching the provider's
+    // normal answer without the user restarting the session.
+    let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 1,
+        db,
+        tool_registry: ToolRegistry::new().build(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: crate::broadcast::LagLimits::default(),
+        global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        substrate_credential: None,
+    };
+    let provider = make_truncating_provider(1);
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let mut session = SessionState::empty();
+
+    let result = run_agent_loop(
+        &provider,
+        &mut session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &ctx,
+        Some("hi"),
+    );
+    assert!(!result.unwrap(), "a recovered request completes normally");
+
+    // Turn 0 = user "hi" + the truncation note; turn 1 = recovery instruction +
+    // the final answer.
+    assert_eq!(
+        session.turns.len(),
+        2,
+        "exactly one recovery turn was added"
+    );
+    let t0 = session.turns.get(&0).expect("turn 0 exists");
+    assert_eq!(t0.user_text.as_deref(), Some("hi"));
+    assert!(
+        t0.assistant_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("output-token"),
+        "turn 0 must carry the truncation note, got {:?}",
+        t0.assistant_text
+    );
+    let t1 = session.turns.get(&1).expect("turn 1 exists");
+    assert_eq!(
+        t1.user_text.as_deref(),
+        Some(TRUNCATION_RECOVERY_INSTRUCTION),
+        "the recovery instruction is seeded as the retry's user turn"
+    );
+    assert_eq!(t1.assistant_text.as_deref(), Some("done"));
+}
+
+#[test]
+fn agent_loop_gives_up_after_truncation_recovery_budget() {
+    // A provider that truncates every turn: the loop must retry only up to the
+    // budget, then end the request cleanly (Ok(false)) instead of spinning
+    // forever — critical because this session runs with `max_turns == 0`
+    // (unlimited), which cannot bound the loop itself.
+    let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 1,
+        db,
+        tool_registry: ToolRegistry::new().build(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: crate::broadcast::LagLimits::default(),
+        global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        substrate_credential: None,
+    };
+    let provider = make_truncating_provider(MAX_TRUNCATION_RECOVERIES as usize + 5);
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let mut session = SessionState::empty();
+
+    let result = run_agent_loop(
+        &provider,
+        &mut session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &ctx,
+        Some("hi"),
+    );
+    assert!(
+        !result.unwrap(),
+        "the request ends cleanly, not with an error"
+    );
+    // One turn per recovery attempt, capped at the budget (the first attempt
+    // starts turn 0, so the count equals MAX_TRUNCATION_RECOVERIES).
+    assert_eq!(
+        session.turns.len(),
+        MAX_TRUNCATION_RECOVERIES as usize,
+        "the recovery loop stops at the budget"
     );
 }
 

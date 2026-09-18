@@ -681,4 +681,83 @@ pub(crate) mod test_util {
             image_client: None,
         }
     }
+
+    /// Provider client whose streaming turns return `TruncatedToolCall` for the
+    /// first `truncations` calls (simulating a provider that cuts the response
+    /// off at its output-token limit mid-tool-call), then a normal final answer.
+    /// Exercises the agent loop's truncated-tool-call recovery.
+    #[derive(Debug)]
+    pub(crate) struct TruncatingProviderClient {
+        truncations: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TruncatingProviderClient {
+        fn new(truncations: usize) -> Self {
+            Self {
+                truncations,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Advance the call counter and return either a truncated-tool-call
+        /// error or a normal final answer.
+        fn next_result(&self) -> Result<ChatTurnResult, InferenceError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.truncations {
+                return Err(InferenceError::TruncatedToolCall {
+                    discarded: vec![choreo_proto::DiscardedToolCall {
+                        name: "write_file".to_string(),
+                        arguments_json: "{\"path\":\"x\",".to_string(),
+                    }],
+                });
+            }
+            Ok(ChatTurnResult::FinalText(
+                choreo_ai_protocols::FinalTextResult {
+                    content: "done".to_string(),
+                    truncated: false,
+                    reasoning: None,
+                    usage: None,
+                    response_id: None,
+                    reasoning_artifact: None,
+                },
+            ))
+        }
+    }
+
+    impl ProviderClient for TruncatingProviderClient {
+        // &'static str is the trait's required lifetime, not an over-bound literal.
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn provider_slug(&self) -> &str {
+            "test-truncating"
+        }
+
+        fn chat_completion_turn(
+            &self,
+            _params: ChatTurnRequest<'_>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            self.next_result()
+        }
+
+        fn chat_completion_turn_streaming(
+            &self,
+            _params: ChatTurnRequest<'_>,
+            _on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            self.next_result()
+        }
+
+        fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Build a provider that truncates its first `truncations` streaming turns.
+    pub(crate) fn make_truncating_provider(truncations: usize) -> InferenceProvider {
+        InferenceProvider {
+            client: Arc::new(TruncatingProviderClient::new(truncations)),
+            slug: "test-truncating".to_string(),
+            image_client: None,
+        }
+    }
 }

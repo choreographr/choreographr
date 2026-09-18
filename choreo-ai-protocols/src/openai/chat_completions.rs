@@ -429,15 +429,25 @@ fn chat_completions_response_to_turn(
     }
 
     if !discarded.is_empty() {
-        // All calls had invalid arguments. Return the text if the model
-        // produced any, so the session continues gracefully and the LLM
-        // can retry with valid arguments on the next turn.
+        // Every tool call had invalid (truncated) arguments: the provider cut
+        // the response off mid-call, so the call is unsafe to execute. If the
+        // model also produced visible text, surface it — the casualty is the
+        // tool call, not the answer. Otherwise there is nothing usable to
+        // return, so signal a dedicated `TruncatedToolCall` instead of
+        // fabricating an empty "final answer" that looks complete. This mirrors
+        // the Responses adapter and the shared invariant that a length-
+        // truncated tool call must never be laundered into a final turn — the
+        // daemon special-cases `TruncatedToolCall` to tell the model what
+        // happened and let it retry in smaller steps.
         let content = choice
             .message
             .content
             .unwrap_or_default()
             .trim()
             .to_string();
+        if content.is_empty() {
+            return Err(super::OpenAiError::TruncatedToolCall { discarded });
+        }
         return Ok(ChatTurnResult::FinalText(FinalTextResult {
             content,
             truncated,
@@ -809,8 +819,15 @@ impl ChatCompletionsStreamAccumulator {
                 }));
             }
             if !discarded.is_empty() {
-                // All calls had invalid arguments. Return accumulated text so
-                // the session can continue gracefully.
+                // Every accumulated tool call had invalid (truncated)
+                // arguments. If the model also streamed visible text, return it
+                // (the tool call is the casualty, not the answer); otherwise
+                // surface `TruncatedToolCall` so the daemon can recover instead
+                // of rendering an empty, truncated-looking final answer. Same
+                // invariant and shape as the non-streaming path above.
+                if self.full_content.is_empty() {
+                    return Err(super::OpenAiError::TruncatedToolCall { discarded });
+                }
                 return Ok(ChatTurnResult::FinalText(FinalTextResult {
                     content: self.full_content,
                     truncated,
@@ -1007,6 +1024,41 @@ mod tests {
     }
 
     #[test]
+    fn all_truncated_tool_calls_without_text_is_truncated_tool_call() {
+        // length + every tool call's arguments cut mid-JSON + no content: the
+        // call is unsafe to execute and there is no text to fall back on, so
+        // the adapter must signal TruncatedToolCall (not an empty FinalText).
+        let json = r#"{"choices":[{"message":{
+            "content":null,
+            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"x\","}}],
+            "reasoning_content":null,"reasoning":null,"reasoning_text":null
+        },"finish_reason":"length"}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let err = chat_completions_response_to_turn(payload).unwrap_err();
+        assert!(
+            matches!(err, crate::openai::OpenAiError::TruncatedToolCall { .. }),
+            "expected TruncatedToolCall, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn all_truncated_tool_calls_with_text_returns_text() {
+        // Same shape, but the model also produced visible text: return it so
+        // the session keeps the partial answer instead of dropping everything.
+        let json = r#"{"choices":[{"message":{
+            "content":"here is the plan",
+            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"write_file","arguments":"{\"path\":"}}],
+            "reasoning_content":null,"reasoning":null,"reasoning_text":null
+        },"finish_reason":"length"}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let turn = chat_completions_response_to_turn(payload).unwrap();
+        let ChatTurnResult::FinalText(result) = turn else {
+            panic!("expected FinalText");
+        };
+        assert_eq!(result.content, "here is the plan");
+    }
+
+    #[test]
     fn stop_keeps_behavior_unchanged() {
         let json =
             r#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}],"usage":null}"#;
@@ -1147,6 +1199,39 @@ mod tests {
             }
             other => panic!("expected FinalText, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn streaming_all_truncated_tool_calls_without_text_is_truncated_tool_call() {
+        // A streamed tool call whose arguments are cut mid-JSON, no content:
+        // the accumulator must surface TruncatedToolCall, not an empty
+        // truncated final answer.
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"x\","}}]},"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk, &mut |_| Ok(())).unwrap();
+        let err = acc.into_turn_result().unwrap_err();
+        assert!(
+            matches!(err, crate::openai::OpenAiError::TruncatedToolCall { .. }),
+            "expected TruncatedToolCall, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_all_truncated_tool_calls_with_text_returns_text() {
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":"partial answer","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write_file","arguments":"{\"path\":"}}]},"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk, &mut |_| Ok(())).unwrap();
+        let result = acc.into_turn_result().unwrap();
+        let ChatTurnResult::FinalText(f) = result else {
+            panic!("expected FinalText");
+        };
+        assert_eq!(f.content, "partial answer");
     }
 
     // -- validate_tool_call_arguments tests --------------------------------

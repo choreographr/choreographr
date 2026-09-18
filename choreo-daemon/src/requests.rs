@@ -354,6 +354,31 @@ fn apply_pending_config_change(
     }
 }
 
+/// Maximum number of truncated-tool-call auto-recoveries within a single
+/// request before the agent loop gives up and ends the request.
+///
+/// A length-truncated tool call (the provider cut the response off at its
+/// output-token limit mid-arguments) is discarded as unsafe to execute. Rather
+/// than dead-ending the request — which historically left the user staring at a
+/// bare "truncated" notice and restarting the session — the loop tells the
+/// model what happened and retries once or twice in smaller steps. The cap
+/// bounds that: a model that keeps overflowing would otherwise spin the loop
+/// forever, especially when `max_turns == 0` (unlimited) cannot do the bounding
+/// itself.
+const MAX_TRUNCATION_RECOVERIES: u32 = 3;
+
+/// Model-visible instruction seeded as the next turn's user text after a
+/// truncated tool call, so the retry produces smaller outputs the provider
+/// will not cut off. Phrased as a user message (not a synthetic tool result),
+/// matching the reference agents: truncation can occur with no tool call at
+/// all, and an unpaired tool result is invalid on several provider wire formats.
+const TRUNCATION_RECOVERY_INSTRUCTION: &str = "Your previous response was \
+     truncated at the model's output-token limit while a tool call was being \
+     generated, so that call was discarded and did not run. Continue the task, \
+     but produce much smaller outputs: split large writes into several smaller \
+     tool calls (write a file in sections and append, or use multiple smaller \
+     files), and avoid emitting very large tool arguments in a single call.";
+
 pub(crate) fn run_agent_loop(
     client: &InferenceProvider,
     session: &mut SessionState,
@@ -379,6 +404,13 @@ pub(crate) fn run_agent_loop(
     let mut tool_results: Vec<ToolResultItem> = Vec::new();
     let mut known_hint_paths: Vec<PathBuf> = Vec::new();
     let mut pending_hints: Vec<String> = Vec::new();
+
+    // Truncated-tool-call recovery: `pending_user_text` seeds the NEXT loop
+    // iteration's user turn (see the `TruncatedToolCall` arm below), and the
+    // counter caps how many times the loop auto-retries before ending the
+    // request.
+    let mut pending_user_text: Option<String> = None;
+    let mut truncation_recoveries: u32 = 0;
 
     // Precondition guard (phase 4c): before sending a request whose passback
     // policy requires echoing reasoning, verify every turn that will carry an
@@ -437,11 +469,13 @@ pub(crate) fn run_agent_loop(
             return Ok(true);
         }
 
-        // Start a new turn for this agent loop iteration.
+        // Start a new turn for this agent loop iteration. The first iteration
+        // carries the caller's user text; a later iteration carries the
+        // truncation-recovery instruction when the previous turn was cut off.
         let turn_user_text = if turn_iter == 0 {
             user_text.map(std::string::ToString::to_string)
         } else {
-            None
+            pending_user_text.take()
         };
         let (current_turn_id, _) = session.start_turn(turn_user_text);
         broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, current_turn_id);
@@ -1285,15 +1319,45 @@ pub(crate) fn run_agent_loop(
             Err(choreo_proto::InferenceError::Cancelled) => {
                 return Ok(true);
             }
-            Err(e) => {
-                // Finalize the turn so the session doesn't have an orphaned
-                // open turn that confuses the LLM on the next request.
-                if matches!(&e, choreo_proto::InferenceError::TruncatedToolCall { .. }) {
-                    tracing::warn!(?e, "truncated tool call, finalizing turn gracefully");
+            Err(e) => match e {
+                // A truncated tool call is not a terminal failure: the provider
+                // cut the response off at its output-token limit mid-call, so
+                // the partial call was discarded (unsafe to execute). Tell the
+                // model what happened and retry in smaller steps, bounded by
+                // MAX_TRUNCATION_RECOVERIES. Fall through to the next loop
+                // iteration (like the ToolUse arm) instead of ending the
+                // request, so the session continues without a restart.
+                choreo_proto::InferenceError::TruncatedToolCall { discarded } => {
+                    truncation_recoveries = truncation_recoveries.saturating_add(1);
+                    // Name the affected tool(s) for the visible record; the
+                    // exact per-call note is built from the names only — the
+                    // cropped JSON lives in the (now-bounded) Display and the
+                    // log, never in the transcript text.
+                    let names = discarded
+                        .iter()
+                        .map(|d| d.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let subject = if names.is_empty() {
+                        "A tool call".to_string()
+                    } else {
+                        format!("The {names} tool call")
+                    };
+                    tracing::warn!(
+                        session_id = ctx.session_id,
+                        request_id,
+                        recovery = truncation_recoveries,
+                        max_recoveries = MAX_TRUNCATION_RECOVERIES,
+                        tools = %names,
+                        "truncated tool call: discarding the partial call and retrying in smaller steps",
+                    );
                     session.set_assistant_response(
                         current_turn_id,
                         AssistantResponse {
-                            text: Some(format!("[tool call truncated: {e}]")),
+                            text: Some(format!(
+                                "[{subject} was cut off at the model's output-token \
+                                 limit before its arguments finished, so it did not run.]"
+                            )),
                             // No artifact or producer: the model never completed a
                             // response, so there is nothing to replay. Everything
                             // else (tool_calls, usage) stays at its default.
@@ -1302,7 +1366,22 @@ pub(crate) fn run_agent_loop(
                     );
                     finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
                     tool_results.clear();
-                    return Ok(false);
+                    if truncation_recoveries >= MAX_TRUNCATION_RECOVERIES {
+                        tracing::warn!(
+                            session_id = ctx.session_id,
+                            request_id,
+                            recovery = truncation_recoveries,
+                            "output-token truncation persisted after the recovery budget; \
+                             ending the request",
+                        );
+                        return Ok(false);
+                    }
+                    // Seed the recovery instruction as the next turn's user
+                    // text; the loop then re-sends with that guidance so the
+                    // model produces a smaller output the provider won't cut.
+                    pending_user_text = Some(TRUNCATION_RECOVERY_INSTRUCTION.to_string());
+                    // Fall through (no return): turn_iter advances and the loop
+                    // retries.
                 }
                 // Any other inference failure (provider 4xx/5xx, network error,
                 // deadline) leaves the current turn open and without a visible
@@ -1312,24 +1391,27 @@ pub(crate) fn run_agent_loop(
                 // the turn). The finalize is best-effort: a storage error must
                 // not mask the original inference error, which the caller needs
                 // to surface as RequestOutcome::Failed.
-                session.set_turn_error(current_turn_id, e.to_string());
-                tracing::debug!(
-                    session_id = ctx.session_id,
-                    turn_id = current_turn_id,
-                    %e,
-                    "failure marked on turn; finalize will deliver the error turn to clients via TurnAppended",
-                );
-                if let Err(persist_err) = finalize_and_broadcast_turn(session, ctx, current_turn_id)
-                {
-                    warn!(
+                other => {
+                    session.set_turn_error(current_turn_id, other.to_string());
+                    tracing::debug!(
                         session_id = ctx.session_id,
                         turn_id = current_turn_id,
-                        error = %persist_err,
-                        "failed to persist the failed turn; the inference error is still reported",
+                        error = %other,
+                        "failure marked on turn; finalize will deliver the error turn to clients via TurnAppended",
                     );
+                    if let Err(persist_err) =
+                        finalize_and_broadcast_turn(session, ctx, current_turn_id)
+                    {
+                        warn!(
+                            session_id = ctx.session_id,
+                            turn_id = current_turn_id,
+                            error = %persist_err,
+                            "failed to persist the failed turn; the inference error is still reported",
+                        );
+                    }
+                    return Err(other.into());
                 }
-                return Err(e.into());
-            }
+            },
         }
 
         // Advance the turn counter for the next iteration.

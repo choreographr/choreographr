@@ -143,7 +143,21 @@ pub struct DiscardedToolCall {
 
 impl std::fmt::Display for DiscardedToolCall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {:?}", self.name, self.arguments_json)
+        // Bound the cropped payload: a length-truncated `write_file` (the exact
+        // case this variant exists for) can carry tens of kilobytes of
+        // half-written arguments, and this string is embedded verbatim in the
+        // error message the daemon logs and shows. A short preview plus the
+        // total byte count keeps the message diagnosable without dumping the
+        // whole blob into logs or the transcript.
+        const PREVIEW_CHARS: usize = 200;
+        let args = &self.arguments_json;
+        let total = args.chars().count();
+        if total <= PREVIEW_CHARS {
+            write!(f, "{}: {}", self.name, args)
+        } else {
+            let preview: String = args.chars().take(PREVIEW_CHARS).collect();
+            write!(f, "{} ({total} chars): {preview}…", self.name)
+        }
     }
 }
 

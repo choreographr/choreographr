@@ -803,6 +803,33 @@ fn inference_error_metric_labels_are_stable() {
 }
 
 #[test]
+fn discarded_tool_call_display_is_bounded() {
+    // Short payloads render in full (name + raw arguments).
+    let small = DiscardedToolCall {
+        name: "get_weather".into(),
+        arguments_json: r#"{"city":"London"}"#.into(),
+    };
+    assert_eq!(small.to_string(), r#"get_weather: {"city":"London"}"#);
+
+    // A large cropped payload (the length-truncated write_file case) is
+    // previewed with its total size, never dumped whole.
+    let big = DiscardedToolCall {
+        name: "write_file".into(),
+        arguments_json: "x".repeat(500),
+    };
+    let rendered = big.to_string();
+    assert!(
+        rendered.starts_with("write_file (500 chars): "),
+        "{rendered}"
+    );
+    assert!(rendered.ends_with('…'), "{rendered}");
+    assert!(
+        rendered.len() < 300,
+        "preview must stay bounded: {rendered}"
+    );
+}
+
+#[test]
 fn inference_error_metric_labels_are_distinct() {
     // Every variant must map to a unique label. Collisions would silently
     // merge distinct error classes in the Prometheus counters, hiding real
