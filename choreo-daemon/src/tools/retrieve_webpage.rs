@@ -174,19 +174,54 @@ fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
+/// How Chromium is launched. `Headless` is the historical default — legacy
+/// headless with the crate's GPU-disabling `--disable-gpu`. `WebGl` opts into
+/// new-headless with ANGLE/`SwiftShader` software GL so canvas/3D pages render
+/// instead of coming back blank. Modelling this as an enum (rather than a bare
+/// `bool`) makes the call site self-describing and leaves room for a future
+/// launch variant to be an additive arm rather than a third boolean.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum LaunchMode {
+    #[default]
+    Headless,
+    WebGl,
+}
+
+/// Extra Chromium switches that enable software-rendered WebGL, in the order
+/// they are appended to argv. Single-sourced so the production launch path and
+/// the unit tests that pin the flag set can never drift apart (a typo here is
+/// caught by the same list the tests iterate).
+///
+/// - `--headless=new`: the real-browser rendering path WebGL needs — the crate's
+///   bare `--headless` is legacy headless, with poor/absent WebGL support.
+/// - `--use-gl=angle --use-angle=swiftshader`: route GL through ANGLE's
+///   `SwiftShader` backend — portable software WebGL on hosts with no usable GPU.
+/// - `--enable-unsafe-swiftshader`: REQUIRED on modern Chrome — without it the
+///   `SwiftShader` fallback backing WebGL is refused and the context comes back
+///   null.
+/// - `--ignore-gpu-blocklist`: don't let a conservative GPU blocklist disable GL.
+const WEBGL_ARGS: &[&str] = &[
+    "--headless=new",
+    "--use-gl=angle",
+    "--use-angle=swiftshader",
+    "--enable-unsafe-swiftshader",
+    "--ignore-gpu-blocklist",
+];
+
 /// Build the Chromium launch options in a pure, testable way (no process is
 /// spawned), so the flag set can be asserted in unit tests.
 ///
-/// When `webgl` is false this reproduces the historical configuration exactly:
-/// legacy headless with the crate's default `--disable-gpu`. When `webgl` is
-/// true it switches to new headless with ANGLE/`SwiftShader` so canvas/3D content
-/// renders — see the inline comments for why each flag is required.
+/// [`LaunchMode::Headless`] reproduces the historical configuration exactly:
+/// legacy headless with the crate's default `--disable-gpu`.
+/// [`LaunchMode::WebGl`] switches to new headless with ANGLE/`SwiftShader` so
+/// canvas/3D content renders — see [`WEBGL_ARGS`] and the inline comments for
+/// why each flag is required.
 fn build_launch_options(
     binary: PathBuf,
     width: u32,
     height: u32,
     timeout_ms: u64,
-    webgl: bool,
+    mode: LaunchMode,
 ) -> Result<LaunchOptions<'static>, ToolExecError> {
     let mut builder = LaunchOptions::default_builder();
     builder.path(Some(binary));
@@ -198,34 +233,25 @@ fn build_launch_options(
         timeout_ms.saturating_mul(2).max(60_000),
     ));
 
-    if webgl {
-        // The crate's `headless` flag only controls the bare `--headless`
-        // switch, which it appends to argv *after* our custom `args`. Chromium
-        // resolves duplicate switches to the LAST one, so leaving it true would
-        // emit `… --headless=new … --headless` and silently drop us back to
-        // legacy headless (which has poor/absent WebGL support). Turn it off and
-        // supply `--headless=new` ourselves below.
-        builder.headless(false);
-        // Drop the crate's `--disable-gpu`: WebGL — even SwiftShader — runs
-        // through the GPU/ANGLE path, and a global `--disable-gpu` can leave
-        // `getContext('webgl')` returning null even though the flags look right.
-        builder.enable_gpu(true);
-        builder.args(vec![
-            // New headless is the real browser rendering path required for WebGL.
-            OsStr::new("--headless=new"),
-            // Route GL through ANGLE's SwiftShader backend: portable software
-            // WebGL that works on headless hosts with no usable GPU.
-            OsStr::new("--use-gl=angle"),
-            OsStr::new("--use-angle=swiftshader"),
-            // REQUIRED on modern Chrome: without it the SwiftShader fallback
-            // backing WebGL is refused and the context comes back null.
-            OsStr::new("--enable-unsafe-swiftshader"),
-            // Don't let a conservative GPU blocklist disable GL outright.
-            OsStr::new("--ignore-gpu-blocklist"),
-        ]);
-    } else {
-        // Historical default: legacy headless, GPU left disabled by the crate.
-        builder.headless(true);
+    match mode {
+        LaunchMode::WebGl => {
+            // The crate's `headless` flag only controls the bare `--headless`
+            // switch, which it appends to argv *after* our custom `args`.
+            // Chromium resolves duplicate switches to the LAST one, so leaving it
+            // true would emit `… --headless=new … --headless` and silently drop
+            // us back to legacy headless (which has poor/absent WebGL support).
+            // Turn it off and supply `--headless=new` ourselves via `WEBGL_ARGS`.
+            builder.headless(false);
+            // Drop the crate's `--disable-gpu`: WebGL — even SwiftShader — runs
+            // through the GPU/ANGLE path, and a global `--disable-gpu` can leave
+            // `getContext('webgl')` returning null even though the flags look right.
+            builder.enable_gpu(true);
+            builder.args(WEBGL_ARGS.iter().copied().map(OsStr::new).collect());
+        }
+        LaunchMode::Headless => {
+            // Historical default: legacy headless, GPU left disabled by the crate.
+            builder.headless(true);
+        }
     }
 
     builder.build().map_err(|e| ToolExecError(e.to_string()))
@@ -296,6 +322,12 @@ fn page_content_size(tab: &Tab) -> Result<(f64, f64), ToolExecError> {
 const WEBGL_PROBE_JS: &str = "(() => { const c = document.createElement('canvas'); \
      const gl = c.getContext('webgl2') || c.getContext('webgl'); \
      return gl ? gl.getParameter(gl.VERSION) : ''; })()";
+
+/// Prefix introducing the WebGL status line appended to the tool result, so it
+/// is always delimited from captured page content — the `content`/`text`
+/// actions otherwise return exactly the page's HTML/text, and a bare trailing
+/// note could be misread as part of it.
+const WEBGL_NOTE_PREFIX: &str = "\n\n[webgl] ";
 
 /// Ask the page whether a WebGL context is actually usable, returning its
 /// version string (e.g. `"WebGL 2.0 (…)"`) or `None` when none was created.
@@ -594,23 +626,27 @@ impl super::Tool for RetrieveWebpage {
             .min(MAX_TIMEOUT_MS);
         let wait_ms = args.wait_ms.map(|ms| ms.min(MAX_WAIT_MS));
 
-        let webgl = args.webgl.unwrap_or(false);
+        let mode = if args.webgl.unwrap_or(false) {
+            LaunchMode::WebGl
+        } else {
+            LaunchMode::Headless
+        };
 
         // Launch a private, headless, one-shot browser instance with an
         // explicit path (so it uses the resolved chromium, never auto-detect)
-        // and our viewport. `webgl` selects the WebGL-capable flag set instead
+        // and our viewport. `mode` selects the WebGL-capable flag set instead
         // of the historical legacy-headless/GPU-disabled default.
         let options = build_launch_options(
             binary,
             args.width.unwrap_or(1280),
             args.height.unwrap_or(800),
             timeout_ms,
-            webgl,
+            mode,
         )?;
 
         let browser = Browser::new(options)
             .map_err(|e| ToolExecError(format!("failed to launch headless browser: {e:#}")))?;
-        debug!(webgl, "launched headless browser");
+        debug!(?mode, "launched headless browser");
 
         // Run the whole capture in a closure so the `Browser` (and its Chromium
         // child process) is released on every path, success or error, when it
@@ -638,9 +674,11 @@ impl super::Tool for RetrieveWebpage {
             let mut result = Self::capture(&tab, &args, action, url, working_dir)?;
             // When WebGL was requested, report whether a context was actually
             // created — flags in argv are not proof the host can render WebGL,
-            // so surface the real outcome regardless of which action ran.
-            if webgl {
-                result.text.push('\n');
+            // so surface the real outcome regardless of which action ran. The
+            // note is delimited (`WEBGL_NOTE_PREFIX`) so it can't be mistaken
+            // for captured page content.
+            if mode == LaunchMode::WebGl {
+                result.text.push_str(WEBGL_NOTE_PREFIX);
                 result.text.push_str(&webgl_note(&tab));
             }
             Ok(result)
@@ -906,13 +944,18 @@ mod tests {
     }
 
     #[test]
+    fn launch_mode_defaults_to_headless() {
+        assert_eq!(LaunchMode::default(), LaunchMode::Headless);
+    }
+
+    #[test]
     fn launch_options_webgl_enables_swiftshader_flags() {
         let opts = build_launch_options(
             std::path::PathBuf::from("/usr/bin/chromium"),
             1280,
             800,
             30_000,
-            true,
+            LaunchMode::WebGl,
         )
         .expect("build launch options");
 
@@ -922,15 +965,11 @@ mod tests {
         assert!(!opts.headless, "webgl must not use legacy --headless");
         assert!(opts.enable_gpu, "webgl must drop --disable-gpu");
 
+        // Assert against the same single-sourced list production uses, so the
+        // test can never pass with a flag set that has drifted from `WEBGL_ARGS`.
         let args: Vec<&str> = opts.args.iter().filter_map(|a| a.to_str()).collect();
-        for expected in [
-            "--headless=new",
-            "--use-gl=angle",
-            "--use-angle=swiftshader",
-            "--enable-unsafe-swiftshader",
-            "--ignore-gpu-blocklist",
-        ] {
-            assert!(args.contains(&expected), "missing {expected} in {args:?}");
+        for expected in WEBGL_ARGS {
+            assert!(args.contains(expected), "missing {expected} in {args:?}");
         }
     }
 
@@ -941,7 +980,7 @@ mod tests {
             1280,
             800,
             30_000,
-            false,
+            LaunchMode::Headless,
         )
         .expect("build launch options");
 

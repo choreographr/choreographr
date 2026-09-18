@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blank. The default stays legacy headless with GPU disabled, so existing calls
   are unchanged. Because a flag being present is not proof WebGL works, the
   tool probes the page for a real context and reports the WebGL version, or
-  that no context could be created, in its result.
+  that no context could be created, in its result — appended as a clearly
+  delimited `[webgl] …` line so it can't be mistaken for captured page content.
 
 ### Changed
 
