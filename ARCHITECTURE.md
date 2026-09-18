@@ -28,8 +28,8 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 
 ## Workspace topology
 
-Nineteen crates in a single Cargo workspace (resolver = "3") — the root
-package plus eighteen members:
+Twenty crates in a single Cargo workspace (resolver = "3") — the root
+package plus nineteen members:
 
 ```
 Choreographr (workspace)
@@ -40,6 +40,10 @@ Choreographr (workspace)
 │                       the binary split (the GUI is a separate crate,
 │                       choreo-gui, deliberately excluded from default-members)
 ├── choreo-proto           Wire protocol (shared types + framing)
+├── choreo-shared         Leaf crate — shared binary-facing helpers:
+│                       release-name metadata, clap styling, and the
+│                       `-v`/`-q` verbosity + log-level policy every CLI
+│                       binary uses; no protocol or transport logic
 ├── choreo-sanitize        Leaf crate — shared Unicode "spoofing" predicates
 │                       and the tool-output byte budget + truncation marker
 ├── choreo-image          Leaf crate — shared image decode (EXIF-orientation
@@ -342,8 +346,8 @@ with `systemctl --user enable --now choreographr` (Linux) or
 The workspace inherits crates.io-required fields from `[workspace.package]`
 in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
 `readme`, `description`), and members opt into publishing by *not* setting
-`publish = false`. The **publish set** is therefore eighteen of the nineteen
-workspace packages (the root package plus all eighteen members except
+`publish = false`. The **publish set** is therefore nineteen of the twenty
+workspace packages (the root package plus all nineteen members except
 `choreo-gui`) — everything except `choreo-gui`, the one private member (a leaf
 client nothing depends on).
 `choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`, and
@@ -354,10 +358,10 @@ will not even package a crate whose dependency is unpublished — optional deps
 included):
 
 `choreographr` (root), `choreo-daemon`, `choreo-blockchain`, `choreo-tui`,
-`choreo-im`, `choreo-acp`, `choreo-proto`, `choreo-keystore`, `choreo-transport`,
-`choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`, `choreo-sanitize`,
-`choreo-markdown`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`,
-`choreo-content`
+`choreo-im`, `choreo-acp`, `choreo-proto`, `choreo-shared`, `choreo-keystore`,
+`choreo-transport`, `choreo-ai-protocols`, `choreo-mcp`, `choreo-client-core`,
+`choreo-sanitize`, `choreo-markdown`, `choreo-image`, `choreo-sockreg`,
+`choreo-power-events`, `choreo-content`
 
 `choreo-gui` sets `publish = false`: it drags in the Dioxus Native (Blitz/wgpu)
 renderer tree and is not part of the shipped suite, so
@@ -370,11 +374,11 @@ cargo-release 1.1.5 does not honor
 `publish = false` in `--workspace` selection (verified: its plan lists the
 private crate, and a real publish would then fail on cargo's own
 refusal). The
-root `choreographr` package transitively depends on the other 17 publish-set
-members, so releasing the suite publishes 18 crates in dependency order.
+root `choreographr` package transitively depends on the other 18 publish-set
+members, so releasing the suite publishes 19 crates in dependency order.
 
 Releases are driven by **cargo-release** (`[workspace.metadata.release]` in
-the root `Cargo.toml`): it bumps versions, tags, and publishes the 18 crates
+the root `Cargo.toml`): it bumps versions, tags, and publishes the 19 crates
 to crates.io topologically. With `dependent-version = "fix"`, published
 manifest requirements (e.g. `choreo-tui = "0.1"`) stay in lockstep across
 minor/major bumps. The crates.io publish runs through `scripts/publish-stable.sh`
@@ -408,8 +412,9 @@ is declared by the root package's `src/bin/choreographr.rs`.
 
 ### `choreo-shared` — Shared binary helpers
 
-A deliberately tiny **leaf crate** (dependencies: `clap` and `tracing-subscriber`
-only) holding the small, binary-facing helpers that every CLI crate in the
+A deliberately tiny **leaf crate** (dependencies: `clap`, `tracing`, and
+`tracing-subscriber` only) holding the small, binary-facing helpers that every
+CLI crate in the
 suite used to duplicate. It carries no protocol or transport logic —
 `choreo-proto` stays the wire protocol.
 

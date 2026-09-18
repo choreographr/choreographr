@@ -310,7 +310,7 @@ launchctl load ~/Library/LaunchAgents/com.choreographr.daemon.plist   # macOS: n
 choreographr                                     # ...or just run it in a terminal
 ```
 
-`--version` (on all four binaries) prints the version with the series' release
+`--version` (on all five binaries) prints the version with the series' release
 name — e.g. `choreographr <version> (<series name>)`, or the bare version for an
 unnamed series.
 
@@ -411,7 +411,7 @@ write diagnostics to `$TMPDIR/choreo-tui-<pid>.log` and
 
 ## Crates
 
-A Rust workspace of nineteen crates (resolver = "3"):
+A Rust workspace of twenty crates (resolver = "3"):
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the daemon's
 internals — threading model, provider architecture, tool system, and session

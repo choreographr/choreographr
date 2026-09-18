@@ -269,14 +269,8 @@ pub fn main() {
     // lost), so diagnostics go to a pid-keyed file under the platform temp dir,
     // selected by the shared `-v`/`-q`/RUST_LOG policy every other binary uses.
     let logging = LoggingConfig::resolve(cli.verbosity);
-    init_file_logging(logging.filter);
-    if logging.rust_log_ignored {
-        tracing::warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
-    }
-    tracing::info!(
-        effective_level = logging.effective_level,
-        "logging initialized"
-    );
+    init_file_logging(logging.filter.clone());
+    logging.emit_startup_logs();
 
     let mode = if let Some(addr) = cli.tcp_addr {
         // On iOS there is no `~/.config/choreographr/transport.pub` to read —
@@ -326,7 +320,11 @@ pub fn main() {
 /// the shared `env_filter` sets the level exactly as every other binary does.
 fn init_file_logging(env_filter: EnvFilter) {
     let log_path = std::env::temp_dir().join(format!("choreo-gui-{}.log", std::process::id()));
-    let Ok(log_file) = std::fs::File::create(&log_path) else {
+    // Owner-only (0600) and symlink-refusing via the shared opener: the
+    // platform temp dir is shared and the pid-keyed name is predictable, so a
+    // planted symlink or a world-readable file must not divert or expose the
+    // GUI's diagnostics.
+    let Some(log_file) = choreo_shared::logging::create_log_file(&log_path) else {
         return;
     };
     tracing_subscriber::fmt()

@@ -395,18 +395,13 @@ pub fn main() -> anyhow::Result<()> {
     // resolver, so the TUI honors `-v`/`-q` (flags win) and `RUST_LOG` exactly
     // as every other binary does.
     let logging = LoggingConfig::resolve(cli.verbosity);
-    let log_path = init_file_logging(logging.filter);
+    let log_path = init_file_logging(logging.filter.clone());
     let _ = log_path; // path is diagnostics only; run_app does not need it
 
-    // Only once a subscriber exists are these observable (an event logged
-    // before `init()` has no subscriber and is dropped).
-    if logging.rust_log_ignored {
-        tracing::warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
-    }
-    tracing::info!(
-        effective_level = logging.effective_level,
-        "logging initialized"
-    );
+    // Only once a subscriber exists is this observable (an event logged before
+    // `init()` has no subscriber and is dropped); the shared reporter emits the
+    // same warning + banner as every other binary.
+    logging.emit_startup_logs();
 
     let mode = if let Some(addr) = cli.tcp_addr {
         resolve_connect_mode(
@@ -455,7 +450,10 @@ pub fn main() -> anyhow::Result<()> {
 /// the multi-hundred-MB log file this replaced.
 fn init_file_logging(env_filter: EnvFilter) -> Option<std::path::PathBuf> {
     let log_path = log_file_path();
-    let Ok(log_file) = std::fs::File::create(&log_path) else {
+    // Owner-only (0600) and symlink-refusing: the platform temp dir is shared
+    // and the pid-keyed name is predictable, so the open is hardened through
+    // the one shared helper rather than a bare `File::create`.
+    let Some(log_file) = choreo_shared::logging::create_log_file(&log_path) else {
         // No panic, no error exit: a missing log must not take the TUI down
         // (the observed Termux failure mode). Diagnostics for THIS decision
         // cannot go through tracing (no subscriber yet) — the silent

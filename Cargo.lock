@@ -3090,6 +3090,8 @@ name = "choreo-shared"
 version = "0.2.1"
 dependencies = [
  "clap",
+ "tempfile",
+ "tracing",
  "tracing-subscriber",
 ]
 

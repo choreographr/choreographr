@@ -7,7 +7,7 @@ use std::env;
 use std::io::{BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::fmt;
 // Windows: std::os::windows::net::UnixStream is unstable (E0658, feature
 // `windows_unix_domain_sockets`, rust-lang/rust#150487), so uds_windows provides
@@ -57,14 +57,13 @@ pub fn main() -> anyhow::Result<()> {
     // (flags win over RUST_LOG); the shared resolver keeps every binary's
     // policy identical.
     let logging = LoggingConfig::resolve(cli.verbosity);
-    fmt().with_env_filter(logging.filter).init();
-    if logging.rust_log_ignored {
-        warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
-    }
-    info!(
-        effective_level = logging.effective_level,
-        "logging initialized"
-    );
+    // `.with_target(false)` keeps the bridge's log lines terse, matching its
+    // format before the shared logging wiring (which had dropped it).
+    fmt()
+        .with_env_filter(logging.filter.clone())
+        .with_target(false)
+        .init();
+    logging.emit_startup_logs();
 
     let path = socket_path();
     let stream = UnixStream::connect(&path).context("failed to connect to daemon")?;

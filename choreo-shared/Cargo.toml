@@ -16,7 +16,11 @@ rust-version.workspace = true
 # cheap to depend on from every binary.
 [dependencies]
 clap.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 # Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
 [lints]

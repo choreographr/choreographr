@@ -6,7 +6,7 @@ use choreo_shared::clap_styles;
 use choreo_shared::logging::{LoggingConfig, Verbosity};
 use choreo_transport::key::ensure_transport_keypair;
 use clap::Parser;
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::fmt;
 
 #[derive(Parser)]
@@ -261,23 +261,18 @@ pub fn main() -> anyhow::Result<()> {
         // `Mutex<File>` is a `MakeWriter`: each tracing event locks the file
         // briefly, serializing writes without any extra plumbing.
         fmt()
-            .with_env_filter(logging.filter)
+            .with_env_filter(logging.filter.clone())
             .with_ansi(false)
             .with_writer(std::sync::Mutex::new(file))
             .init();
     } else {
-        fmt().with_env_filter(logging.filter).init();
+        fmt().with_env_filter(logging.filter.clone()).init();
     }
 
-    // Now that a subscriber exists, these are observable: warn when the flags
-    // the user passed override a set RUST_LOG, then report the effective level.
-    if logging.rust_log_ignored {
-        warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
-    }
-    info!(
-        effective_level = logging.effective_level,
-        "logging initialized"
-    );
+    // Now that a subscriber exists, these are observable: the shared reporter
+    // warns when the flags the user passed override a set RUST_LOG, then logs
+    // the effective level (identical wording in every binary).
+    logging.emit_startup_logs();
 
     // Utility subcommands exit early — they are one-shot file operations and
     // never touch the DB, providers, or listeners below.
@@ -312,7 +307,7 @@ pub fn main() -> anyhow::Result<()> {
     match choreo_content::init() {
         Ok(()) => {}
         Err(e) => {
-            warn!(
+            tracing::warn!(
                 error = %e,
                 "failed to initialize the coordination platform tokio runtime; \
                  content write tools will be unavailable"

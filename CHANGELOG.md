@@ -77,6 +77,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the daemon previously let `RUST_LOG` win and ignored the flags). `--version`
   on `choreo-gui` now also appends the release name, matching the other binaries.
 
+- **The shared logging policy now owns the startup diagnostics and the
+  log-file open.** `LoggingConfig::emit_startup_logs` emits the
+  "flags take precedence over `RUST_LOG`" warning plus the effective-level
+  banner (previously five hand-copied blocks), and the file-only binaries —
+  `choreo-tui`, `choreo-gui`, and `choreo-acp` — open their pid-keyed
+  temp-dir log through one `logging::create_log_file` helper that is
+  owner-only (0600) and refuses a symlink planted at the predictable path.
+  `choreo-im` keeps its target-less log format (the shared wiring had dropped
+  `.with_target(false)`), and `choreo-acp`'s default level is now the shared
+  `info` (its own module still at `debug`) instead of the ad-hoc env-only
+  filter it used before.
+
+- **Documentation reconciled with the new workspace size.** `ARCHITECTURE.md`
+  and `README.md` now call the workspace twenty crates (root + nineteen
+  members) and the publish set nineteen crates, list `choreo-shared` in the
+  workspace topology and the publish set, and say all five binaries report the
+  release name from `--version`.
+
 ### Removed
 
 - **The `/models` alias is gone — use `/model`.**

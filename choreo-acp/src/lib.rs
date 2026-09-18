@@ -64,7 +64,7 @@ fn setup_logging(log_file: &str, verbosity: Verbosity) {
     // log must never kill the adapter (the Termux /tmp lesson: diagnostics
     // are never a startup precondition). The warning goes to stderr, which
     // ACP clients surface as adapter logs without protocol corruption.
-    let Ok(file) = std::fs::File::create(log_file) else {
+    let Some(file) = choreo_shared::logging::create_log_file(std::path::Path::new(log_file)) else {
         eprintln!(
             "warning: could not create log file '{log_file}'; continuing without file logging"
         );
@@ -75,7 +75,7 @@ fn setup_logging(log_file: &str, verbosity: Verbosity) {
     // adapter's diagnostics are only ever read from the log file, and the
     // default `info` would hide them.
     let logging = LoggingConfig::resolve(verbosity);
-    let mut filter = logging.filter;
+    let mut filter = logging.filter.clone();
     if let Ok(directive) = "choreo_acp=debug".parse::<tracing_subscriber::filter::Directive>() {
         filter = filter.add_directive(directive);
     }
@@ -84,14 +84,8 @@ fn setup_logging(log_file: &str, verbosity: Verbosity) {
         .with_ansi(false)
         .with_writer(std::sync::Mutex::new(file))
         .init();
-    // Observable now that the subscriber exists.
-    if logging.rust_log_ignored {
-        tracing::warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
-    }
-    tracing::info!(
-        effective_level = logging.effective_level,
-        "logging initialized"
-    );
+    // Observable now that the subscriber exists (shared wording).
+    logging.emit_startup_logs();
 }
 
 /// Entry point for the `choreo-acp` bridge binary.

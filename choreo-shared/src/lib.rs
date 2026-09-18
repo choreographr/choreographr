@@ -8,12 +8,13 @@
 //!   release title.
 //! - [`clap_styles`] — the one shared clap [`Styles`](clap::builder::Styles)
 //!   used by every CLI (previously copy-pasted into each crate).
-//! - [`logging`] — the shared `-v`/`-q` verbosity flags and the log-level
-//!   resolution that every binary applies identically.
+//! - [`logging`] — the shared `-v`/`-q` verbosity flags, the log-level
+//!   resolution every binary applies identically, and the one hardened
+//!   pid-keyed log-file opener the file-only binaries share.
 //!
-//! It is deliberately a *leaf* (deps: `clap` and `tracing-subscriber` only) and
-//! holds no protocol or transport logic — `choreo-proto` stays the wire
-//! protocol.
+//! It is deliberately a *leaf* (deps: `clap`, `tracing`, and
+//! `tracing-subscriber` only) and holds no protocol or transport logic —
+//! `choreo-proto` stays the wire protocol.
 //!
 //! Logging precedence follows the Unix convention: **explicit CLI flags win
 //! over the ambient environment** (see [`logging`]).
