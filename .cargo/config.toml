@@ -32,8 +32,19 @@ test-fast = "nextest run --workspace --all-features"                 # unit test
 test-lean = "nextest run --workspace"
 # integration tests (the #[ignore] suite)
 test-integration = "nextest run --workspace --all-features --run-ignored only"
-# everything: unit + integration in one pass
-test-all = "nextest run --workspace --all-features --run-ignored all"
+# everything: unit + integration in one pass. `--all-targets` also covers
+# examples/benches (there are none with tests today, so the delta is ~zero — it
+# future-proofs coverage if such targets are added).
+test-all = "nextest run --workspace --all-targets --all-features --run-ignored all"
+
+# Clippy / fmt gate aliases — the single home of the AGENTS.md commit-gate flags
+# (see AGENTS.md → Commit Workflow), so the `justfile` recipes stay flag-free. The
+# `-all` suffix is required: Cargo rejects a user alias that shadows a subcommand
+# (an alias named `clippy`/`fmt` is a recursive-definition error —
+# rust-lang/cargo#10049).
+clippy-all     = "clippy --workspace --all-targets --all-features --locked"
+clippy-all-fix = "clippy --workspace --all-targets --all-features --locked --fix --allow-dirty --allow-staged"
+fmt-all        = "fmt --all"
 
 # Per-profile rustflags (unstable Cargo feature, nightly-only). This opt-in is
 # what lets the root Cargo.toml scope `-Z` compiler flags by profile —

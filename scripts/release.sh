@@ -152,7 +152,7 @@ BINARIES=(choreographr choreo-tui)
 # a release can never pick up a freshly republished (potentially compromised)
 # semver-compatible version like the 2026-08-20 arrayref@0.3.10 attack
 # (RUSTSEC-2026-0260). The lockfile itself is also checked by
-# scripts/check-supply-chain.sh (deny.toml bans) in `just pre-commit`/`ci`.
+# scripts/check-supply-chain.sh (deny.toml bans) in the release workflow.
 #
 # The two darwin builds are separate cargo INVOCATIONS even though they share
 # a feature set, because they do NOT share RUSTFLAGS (a single invocation with

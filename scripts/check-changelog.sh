@@ -20,8 +20,8 @@
 #   * a category heading has no entries (an empty section — AGENTS.md: "do not
 #     add an empty one").
 #
-# Wired into `just check-changelog`, `just pre-commit`, `just ci`, and the
-# release workflow (before the changelog section is extracted).
+# Wired into `just check-changelog`, `just pre-commit`, and the release workflow
+# (before the changelog section is extracted).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

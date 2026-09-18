@@ -13,8 +13,8 @@
 # Empty == empty passes: the unnamed 0.1.0 series has an empty name file and a
 # bare `## [0.1.0]` heading.
 #
-# Wired into `just check-release-name`, `just pre-commit`, `just ci`, and the
-# release workflow (before "Create the GitHub release").
+# Wired into `just check-release-name` and the release workflow (before "Create
+# the GitHub release").
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

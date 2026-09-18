@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/check-supply-chain.sh — the workspace's dependency supply-chain gate.
 #
-# Wired into `just check-supply-chain`, `just pre-commit`, and `just ci`;
+# Wired into `just check-supply-chain` and the release workflow (`release.yml`);
 # also runs from a plain `./scripts/check-supply-chain.sh`. It exists because
 # of the 2026-08-20 `arrayref` supply-chain attack
 # (https://blog.rust-lang.org/2026/08/20/supply-chain-attack-on-arrayref/):

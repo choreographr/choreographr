@@ -256,8 +256,8 @@ test-integration: _require-nextest _require-zig
     cargo test-integration
 
 # Everything: unit + integration via nextest in one pass.
-# `--locked` keeps the committed Cargo.lock authoritative on the gate path (CI
-# and pre-commit): a stale/regenerated lockfile fails instead of silently
+# `--locked` keeps the committed Cargo.lock authoritative on the gate path
+# (pre-commit): a stale/regenerated lockfile fails instead of silently
 # re-resolving against the live registry (see release.sh for the same control).
 test-all: _require-nextest _require-zig
     cargo test-all {{ CARGO_FLAGS }} --locked
@@ -290,21 +290,27 @@ retry n="2": _require-nextest _require-zig
 
 # ── lint & format ─────────────────────────────────────────────────────────────
 
-# Format all code in place (rustfmt)
+# Format all code in place (rustfmt). Flags live in .cargo/config.toml (`fmt-all`).
 fmt:
-    cargo fmt {{ CARGO_FLAGS }} --all
+    cargo fmt-all {{ CARGO_FLAGS }}
 
-# Check formatting without modifying files (CI gate)
+# Check formatting without modifying files (tree-stays-clean gate).
 fmt-check:
-    cargo fmt {{ CARGO_FLAGS }} --all -- --check
+    cargo fmt-all {{ CARGO_FLAGS }} -- --check
 
-# Lint the whole workspace, all targets. `--locked` = no silent lockfile reuse.
+# Lint the whole workspace, all targets + all features (flags in `clippy-all`).
 clippy: _require-zig
-    cargo clippy {{ CARGO_FLAGS }} --locked --workspace --all-targets
+    cargo clippy-all {{ CARGO_FLAGS }}
 
-# Lint with warnings denied — the CI-grade gate (stricter than `clippy`)
+# Lint with warnings denied — a genuinely clean-clippy gate (any warning fails).
 clippy-strict: _require-zig
-    cargo clippy {{ CARGO_FLAGS }} --locked --workspace --all-targets -- -D warnings
+    cargo clippy-all {{ CARGO_FLAGS }} -- -D warnings
+
+# Auto-apply machine-applicable lints in place; the rest are hand-fixed afterwards.
+# `--allow-dirty --allow-staged` let it edit a tree that already holds the in-progress
+# change. Used by `pre-commit` (the commit gate).
+clippy-fix: _require-zig
+    cargo clippy-all-fix {{ CARGO_FLAGS }}
 
 # Supply-chain gate: deny.toml bans (the 2026-08-20 arrayref@0.3.10 attacker
 # versions — RUSTSEC-2026-0260 — plus the six deleted payload crates), RustSec
@@ -334,15 +340,14 @@ check-changelog:
 install-cargo-deny:
     cargo install cargo-deny
 
-# Run this before `git commit` — it must pass green.
-# The pre-commit gate from AGENTS.md: formatting, lints, the full suite, and
-# the supply-chain checks (deny.toml bans + RustSec advisories + cache scan)
-# plus the release-metadata guards (release-name drift + changelog structure).
-pre-commit: fmt-check clippy test-all check-supply-chain check-release-name check-changelog
-
-# CI gate: format check + warnings-denied lints + full suite + supply chain
-# + the release-metadata guards (release-name drift + changelog structure).
-ci: fmt-check clippy-strict test-all check-supply-chain check-release-name check-changelog
+# The commit gate (AGENTS.md → Commit Workflow), in mutation-aware order:
+# fix lints → prove clippy-clean → full test suite → format LAST → changelog guard.
+# Formatting runs last (not first) because `clippy-fix` mutates the tree and fmt is
+# semantics-preserving, so the formatted bytes stay behaviourally identical to the
+# tested bytes. Safe to re-run: loop it (fix by hand, re-run) until it passes green,
+# then `git commit`. The supply-chain and release-name guards are RELEASE guards —
+# they run in the release workflow, not here.
+pre-commit: clippy-fix clippy-strict test-all fmt check-changelog
 
 # ── running ───────────────────────────────────────────────────────────────────
 

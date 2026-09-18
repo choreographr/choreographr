@@ -36,7 +36,7 @@ Every non-trivial change (new features, fixes, refactors, dependency updates, be
 
 ### CHANGELOG.md
 
-- **One heading per category, at most.** `[Unreleased]` is organized with the Keep a Changelog category headings — `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security` — each appearing **once at most**. Append a new bullet under the matching existing heading; never open a second `### Changed` (or any other) block. Include only the categories that apply — do not add an empty one. A section that repeats a category heading is malformed, not just untidy. The `just check-changelog` guard (scripts/check-changelog.sh) — also run by `just pre-commit`/`ci` and the release workflow before extraction — enforces this: it fails on a repeated or unknown `### ` category heading, or an empty category block, in ANY `## [...]` section.
+- **One heading per category, at most.** `[Unreleased]` is organized with the Keep a Changelog category headings — `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security` — each appearing **once at most**. Append a new bullet under the matching existing heading; never open a second `### Changed` (or any other) block. Include only the categories that apply — do not add an empty one. A section that repeats a category heading is malformed, not just untidy. The `just check-changelog` guard (scripts/check-changelog.sh) — also run by `just pre-commit` and the release workflow before extraction — enforces this: it fails on a repeated or unknown `### ` category heading, or an empty category block, in ANY `## [...]` section.
 - **Write it for the release page.** At tag time the CI `release` job copies the entire `## [X.Y.Z]` section (heading stripped) verbatim into the GitHub release body, followed by the auto-generated commit notes (see [RELEASE.md](./RELEASE.md) Phase 1). The file is user-facing prose, not a scratchpad: no TODOs, no internal scaffolding, no "see commit …".
 - **Promotion at release.** Phase 1 renames `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and starts a fresh, empty `[Unreleased]` above it (moving the compare link so `[Unreleased]` points at `HEAD` again). Once a series is named, the heading always carries that dance-style name in parentheses — `## [X.Y.Z] - YYYY-MM-DD (Name)` — where a **major/minor** release sets a new name and a **patch** keeps the current one (the pre-name 0.1.0 heading has none). The machine source of truth for that name is `choreo-proto/release-name.txt` (a single line; edited on major/minor only), which is compiled into the binaries and read by the CI release job for the release title. The `just check-release-name` guard — also run by the release workflow — fails the release if the file and the heading drift apart. The extraction accepts the dated, undated, and named heading forms.
 
@@ -48,7 +48,9 @@ Every non-trivial change (new features, fixes, refactors, dependency updates, be
 
 ## Task Execution
 
-When implementing a list of code changes across multiple files, delegate each task to a subagent and run them in series (one at a time), not in parallel. This avoids filesystem conflicts from concurrent edits to overlapping files and keeps each subagent's context focused. Subagents should verify their work by running `cargo nextest run -p <crates>` on only the crates they modified. (The `cargo test-*` aliases bake in `--workspace` and reject `-p`, so call nextest directly when targeting specific crates.)
+When implementing a list of code changes across multiple files, delegate each task to a subsession and run them in series (one at a time), not in parallel. This avoids filesystem conflicts from concurrent edits to overlapping files and keeps each subsession's context focused. (There is no worktree-per-branch support yet, so subsessions share one working tree — hence the serial execution.)
+
+During development a subsession may iterate against just the crates it changed with `cargo nextest run -p <crates>` (the `cargo test-*` aliases bake in `--workspace` and reject `-p`, so call nextest directly — or use `just test-crate <crate>`). That is for fast feedback only. **Before returning its report, a subsession must run the full [Commit Workflow](#commit-workflow) gate and commit its work**; a scoped `-p` run is never sufficient to commit from. A subsession that cannot complete the work must not commit and must leave its changes in the tree for the parent to inspect (see [Commit Workflow → Sub-sessions](#sub-sessions)).
 
 ## Dependency Management
 
@@ -107,11 +109,49 @@ Apply it as follows:
 
 Always write inline comments around new code explaining how it works. Focus on the "why" — the reasoning, intent, and non-obvious details — rather than restating what the code literally does.
 
-## Pre-Commit Workflow
+## Commit Workflow
 
-Before committing:
-1. Run `cargo test-all` — full suite (unit + integration) via nextest must pass
-2. Stage changes with `git add`
-3. Commit with `git commit`
+Finishing an implementation run means the work is **not done until it is committed**. When a run of implementation turns completes, verify and commit it yourself, in the same run. Do not stop to ask the user whether to commit — the commit is part of the task, not a separate approval step.
 
-The `.githooks/pre-commit` hook has been removed. Run `cargo clippy` and `cargo fmt` manually before committing.
+A run is committed **once, at the end of each unit of work** — not once per turn. When a run delegates to subsessions, each completed subsession commits its own unit before returning (see [Task Execution](#task-execution)); the parent then commits whatever remains when its own run ends.
+
+### The gate
+
+Run **`just pre-commit`**. It is the commit gate, and it is safe to re-run: loop it (fix by hand, re-run) until it passes green, then commit. It runs, in mutation-aware order (the flags themselves live in `.cargo/config.toml`):
+
+1. **`clippy-fix`** — `cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets --all-features --locked` auto-applies machine-applicable lints. It will not fix everything; whatever remains is hand-fixed in step 2.
+2. **`clippy-strict`** — the same invocation plus `-- -D warnings`, which must report **nothing**. Fix pre-existing warnings too, not just the ones the change introduced — the gate is a clean workspace, not a clean diff.
+3. **`test-all`** — the full unit + integration suite via nextest, all features and all targets (see [Test Discipline](#test-discipline)). It must pass in full.
+4. **`fmt`** — `cargo fmt --all`, applied **last**: fmt is semantics-preserving, so the formatted bytes are behaviourally identical to the tested bytes and need no re-test. (Formatting runs last, not first, precisely because `clippy-fix` mutates the tree — a non-mutating CI check would instead run `fmt --check` first.)
+5. **`check-changelog`** — the `[Unreleased]` structure guard (see [Documentation](#documentation)).
+
+If any step fails, fix the cause and re-run `just pre-commit` from the top — a hand fix can introduce a new clippy warning or test failure, so the gate only holds when the whole sequence is clean in one pass. If clippy, formatting, or the tests genuinely cannot be made to pass, **do not commit**; stop and report the failure instead.
+
+### Documentation and changelog (part of the run, before committing)
+
+Update `CHANGELOG.md` under `## [Unreleased]` (see [Documentation](#documentation)) and `ARCHITECTURE.md` / `README.md` if the change touches anything they describe.
+
+### Commit
+
+Stage with `git add`, then commit immediately with `git commit` and a message that meets the same standard as any hand-written commit, following **Conventional Commits**:
+
+    <type>[optional scope][!]: <description>
+
+    [optional body]
+
+    [optional footer(s)]
+
+`<type>` is one of `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`; a trailing `!` (or a `BREAKING CHANGE:` footer) marks an incompatible change. Set the optional scope to the affected crate name (e.g. `fix(choreo-daemon): …`) and omit it for workspace-wide changes (root `Cargo.toml`, CI, docs). Use the body to explain the "why", not the "what". Only after the commit succeeds, report back with a summary and the commit hash.
+
+### When *not* to commit
+
+- The run produced no file changes (a question, a read-only investigation, a plan).
+- Clippy, formatting, or `cargo test-all` cannot be made to pass. Do **not** commit a red tree — a broken commit poisons `git bisect`. Fix it; if you genuinely cannot, stop and report the failure.
+- The changes span more than one logically independent unit — split them and commit each instead of bundling unrelated work.
+- The tree contains unexpected or sensitive untracked content (credentials, stray files, large blobs) — surface it before staging.
+
+### Sub-sessions
+
+When work is delegated to a subsession, the subsession **runs this gate and commits its work before returning its report** — it does not hand back the report with the changes still uncommitted. If the subsession aborts before completion (an unrecoverable clippy/test failure, a cancelled or timed-out run, any other reason), it must leave its changes **uncommitted** in the working tree and say so in its report, so the parent can inspect the partial state and decide how to proceed. A subsession that cannot finish never commits a red or partial tree.
+
+The `.githooks/pre-commit` hook has been removed; the `just pre-commit` recipe is the gate, and nothing runs it automatically — it is the agent's responsibility on every implementation run.

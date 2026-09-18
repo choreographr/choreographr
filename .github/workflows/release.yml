@@ -735,6 +735,12 @@ jobs:
           # the complete release, exactly like release.sh's dist/ glob.
           ( cd dist && sha256sum choreographr-* > SHA256SUMS && cat SHA256SUMS )
 
+      - name: Check the dependency supply chain
+        # The dependency gate (deny.toml bans + RustSec advisories + local
+        # registry-cache scan). It is deliberately NOT part of `just pre-commit`
+        # — it is a release guard, enforced here before the release publishes.
+        run: ./scripts/check-supply-chain.sh
+
       - name: Check the changelog is well-formed
         # Fail before extraction: the extractor is heading-agnostic and would
         # happily ship a section with two `### Fixed` blocks (rendering two

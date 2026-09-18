@@ -155,6 +155,8 @@ Currently, as with most AI agents, if the LLM wants to see a file it issues the 
 
 ### Git Worktree Support
 
+**Status: planned — not yet implemented.** Subsessions currently run in series in the shared working tree (see AGENTS.md → Task Execution); the design below is what we intend to build on top of that.
+
 To get the most out of subsessions, they need to run in parallel on the same codebase. The problem is that they will interfere with each other's work. The solution is for each subsession to work on its own branch in its own directory. This is where [Git Worktrees](https://git-scm.com/docs/git-worktree) come in. Once a subsession has finished committing in its own branch, the parent session can merge it into its own branch. Any merge conflicts can be resolved by the LLM.
 
 The problem with worktrees is that programming languages such as Rust can have many gigabytes of build artifacts. If each worktree has to regenerate these it consumes CPU bandwidth, I/O bandwidth, storage space and is generally very slow. Copying the artifacts from the parent's tree reduces the CPU bandwidth, but is still a big problem.
@@ -968,11 +970,10 @@ just test-libtest         # unit tests via libtest (no nextest required)
 just test-crate choreo-proto   # a single crate via nextest
 
 just fmt                  # cargo fmt --all
-just clippy               # cargo clippy --workspace --all-targets
+just clippy               # lint the workspace (all targets + features)
 just check-supply-chain   # dependency gate: deny.toml bans + RustSec advisories + cache scan
 just install-cargo-deny   # install the policy tool (cargo-deny) that check-supply-chain prefers
-just pre-commit           # AGENTS.md gate: fmt-check + clippy + test-all + check-supply-chain
-just ci                   # CI gate: fmt-check + clippy-strict + test-all + check-supply-chain
+just pre-commit           # the commit gate: clippy-fix + clippy-strict + test-all + fmt + check-changelog
 
 just daemon -v            # run the daemon with debug logging
 just tui / gui / im / acp # run the other clients (im takes e.g. `just im telegram`)
@@ -1105,8 +1106,8 @@ of attack fail loudly instead of landing silently:
   `~/.cargo/registry` cache for the deleted malicious `.crate` files (the Rust
   blog's own remediation `find` — neither cargo-deny nor cargo-audit can see
   idle cache files), then `cargo-deny` (preferred) or, as a fallback,
-  `cargo-audit` plus a literal lockfile scan. It is part of `just pre-commit`
-  and `just ci`.
+  `cargo-audit` plus a literal lockfile scan. It is a release guard: the release
+  workflow runs it before publishing, and `just check-supply-chain` runs it locally.
 
 RustSec advisories for the attack (`RUSTSEC-2026-0260` and friends) are in the
 advisory database cargo-deny/cargo-audit fetch automatically, so any future

@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`just pre-commit` is now the commit gate, run automatically after every implementation run.** The gate runs in mutation-aware order — `clippy-fix` → `clippy-strict` → `test-all` → `fmt` → `check-changelog` — and the agent loops it (fix by hand, re-run) until green before committing, without asking the user first. Clippy and `test-all` now cover **all targets and all features**, and any clippy warning fails the gate (the verification pass denies warnings). Formatting runs *last*, not first, precisely because `clippy-fix` mutates the tree while `fmt` is semantics-preserving — the tested bytes stay behaviourally identical to the committed bytes. Commit messages now follow **Conventional Commits**, scoped by crate. The supply-chain and release-name guards moved out of the commit path to the release workflow (they are release guards, not pre-commit guards), and the redundant local-only `just ci` recipe was removed. When work is delegated, each subsession now runs the same gate and commits its unit before returning its report; a subsession that aborts leaves its changes uncommitted for the parent to inspect. The clippy/fmt gate flags live in `.cargo/config.toml` aliases (`clippy-all`, `clippy-all-fix`, `fmt-all`) so the `just` recipes stay flag-free.
+
 - **Markdown tables in the TUI now use a nushell-style rounded frame.** The
   outer corners are `╭ ╮ ╰ ╯` (the `┬`/`┴`/`├`/`┤`/`┼` junctions and `│`/`─`
   strokes are unchanged, matching nushell's rounded preset), the header row is
