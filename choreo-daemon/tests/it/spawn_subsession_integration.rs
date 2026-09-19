@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::thread;
 
-mod common;
+use crate::common;
 
 /// Verify that `SpawnSubsession::execute` correctly communicates with the
 /// daemon to create a child session, sends the prompt via `RunChildInput`

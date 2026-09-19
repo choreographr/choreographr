@@ -15,7 +15,7 @@ use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
 
-mod common;
+use crate::common;
 
 /// `run_server` must refuse to start over a LIVE daemon's socket: the probe
 /// in `remove_stale_socket` must detect the listening peer via a successful

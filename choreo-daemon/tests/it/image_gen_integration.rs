@@ -17,6 +17,7 @@
     clippy::panic_in_result_fn,
     clippy::indexing_slicing
 )]
+use crate::common;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_ai_protocols::{OpenAiImageClient, openai::ServiceConfig};
 use choreo_daemon::tools::Tool;
@@ -24,7 +25,6 @@ use choreo_daemon::tools::context::ToolContext;
 use choreo_daemon::tools::image::DisplayImageReturn;
 use choreo_daemon::tools::image_gen::{GenerateImage, GenerateImageArgs};
 use choreo_daemon::{DaemonCommand, providers::ImageProviderHandle};
-mod common;
 use common::test_db;
 use std::io::{Read, Write};
 use std::net::TcpListener;

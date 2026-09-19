@@ -829,5 +829,5 @@ mod tests {
 
     // The live-listener refusal case needs a real Unix socket at a real
     // path — that is a filesystem/IPC boundary test, so it lives in
-    // tests/lifecycle_integration.rs (remove_stale_socket_refuses_live_listener).
+    // tests/it/lifecycle_integration.rs (remove_stale_socket_refuses_live_listener).
 }

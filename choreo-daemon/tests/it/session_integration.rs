@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 
-mod common;
+use crate::common;
 
 fn spawn_session(
     db: Arc<redb::Database>,

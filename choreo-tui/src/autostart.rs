@@ -56,7 +56,7 @@ pub(crate) fn daemon_log_path() -> PathBuf {
 /// our own child between the spawn and the connection retry. The probe is a
 /// parameter (not hardcoded [`choreo_proto::socket_listening`]) so unit tests
 /// can drive this with scripted closures and never sleep; the real-dial timing
-/// behavior is exercised by `tests/autostart_poll.rs`.
+/// behavior is exercised by `tests/it/autostart_poll.rs`.
 ///
 /// Returns `true` only when the probe reported a live listener within the
 /// budget. There is exactly one interval-sleep between probes (the first
@@ -218,7 +218,7 @@ mod tests {
     // terminate without ever reaching the sleep, so these stay valid UNIT
     // tests. The cases that actually wait (a probe that stays dead, a probe
     // that flips live mid-poll) and every real-socket case moved to
-    // tests/autostart_poll.rs per the no-time-based-waits rule for unit
+    // tests/it/autostart_poll.rs per the no-time-based-waits rule for unit
     // tests.
 
     #[test]

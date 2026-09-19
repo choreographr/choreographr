@@ -158,7 +158,7 @@ mcp = ["dep:choreo-mcp"]
 # (Linux pkg-config, brew on macOS, vcpkg on Windows).
 avif = ["image/avif-native"]
 # Test-only: exposes the bounded-shutdown seam (`join_session_shutdown_with_grace_for_test`)
-# used by tests/session_shutdown.rs.  Enabled for test builds via the self
+# used by tests/it/session_shutdown.rs.  Enabled for test builds via the self
 # dev-dependency below, so it never leaks into the published public API.
 test-utils = []
 
@@ -172,7 +172,7 @@ choreo-daemon = { path = ".", features = ["test-utils"] }
 # tests lives in choreo-ai-protocols behind its `test-utils` feature.
 choreo-ai-protocols = { workspace = true, features = ["test-utils"] }
 # The real client-side connection library used by the daemon<->client
-# integration tests (tests/daemon_client_unix.rs, tests/daemon_client_noise.rs).
+# integration tests (tests/it/daemon_client_unix.rs, tests/it/daemon_client_noise.rs).
 choreo-client-core.workspace = true
 
 # Windows-only deps: process-tree isolation for shell tools (the Job Object

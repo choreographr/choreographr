@@ -8,11 +8,12 @@
 //! free TCP port, and graceful shutdown via SIGINT. That scaffolding lives
 //! here so the per-test files stay focused on what they exercise.
 //!
-//! Each integration-test binary that declares `mod common;` compiles this
-//! module standalone, so an item unused by a particular binary (e.g. `test_db`
-//! in the lifecycle test, or `SpawnedDaemon` until the `daemon_client`_* tests
-//! land) would otherwise trip `dead_code`. The harness is intentionally a
-//! superset of what any single test file uses.
+//! This module is declared once, at the crate root of the single integration
+//! binary (`tests/it/main.rs`), and the test modules reach it via
+//! `use crate::common;`. An item unused by a particular test module (e.g.
+//! `test_db` in the lifecycle test, or `SpawnedDaemon` until the
+//! `daemon_client_*` tests land) would otherwise trip `dead_code`. The harness
+//! is intentionally a superset of what any single test module uses.
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
 // allow-*-in-tests config only recognizes #[test]-annotated functions —
 // helper fns in this file need this file-level allowance.

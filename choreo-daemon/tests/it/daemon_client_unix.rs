@@ -36,7 +36,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-mod common;
+use crate::common;
 
 /// Bounded receive timeout for daemon replies: short enough that a wedged
 /// daemon fails the test loudly, long enough that a loaded CI box doesn't

@@ -35,7 +35,7 @@ use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
 /// Bounded wait for the post-cancel `Done`: generous headroom for a loaded
 /// CI box, but far below the provider request timeout (30 s) — the whole

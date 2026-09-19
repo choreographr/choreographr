@@ -35,7 +35,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Network
 
 [dev-dependencies]
 # crossbeam per the AGENTS.md house rule: cross-thread messaging (the
-# reader-thread handshake in `tests/windows_registry.rs`) always uses
+# reader-thread handshake in `tests/it/windows_registry.rs`) always uses
 # crossbeam_channel, never std::sync::mpsc — here only as a test dependency,
 # since the library itself is threadless by design.
 crossbeam-channel.workspace = true
@@ -44,11 +44,10 @@ crossbeam-channel.workspace = true
 workspace = true
 optional = true
 
-# Gated so a plain `cargo test` (no features) never tries to build the ureq
-# integration test against an absent dependency.
-[[test]]
-name = "ureq_connector"
-required-features = ["ureq"]
+# The former per-file `[[test]] name = "ureq_connector" required-features = ["ureq"]`
+# target is gone: the integration suite is now the single `tests/it` binary, and
+# `tests/it/ureq_connector.rs` self-gates with `#![cfg(all(unix, feature = "ureq"))]`,
+# so a plain (feature-off) build still never references the absent dependency.
 
 # Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
 [lints]

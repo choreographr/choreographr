@@ -30,7 +30,7 @@ pub(crate) use markdown::PdfToMarkdown;
 pub use markdown::{PdfToMarkdownArgs, execute_pdf_to_markdown};
 
 // Shared deterministic PDF fixture builders for the unit tests. The
-// integration test (`tests/pdf_tool_integration.rs`) pulls the *same* file
+// integration test (`tests/it/pdf_tool_integration.rs`) pulls the *same* file
 // in via `#[path]`, so the fixture layout can never drift between the two.
 #[cfg(test)]
 mod test_fixtures;

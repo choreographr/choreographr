@@ -45,7 +45,7 @@ rand.workspace = true
 # Own tests also use tempfile directly; duplicated with the optional dep
 # because the optional one is for the feature-gated test_support module.
 tempfile.workspace = true
-# Integration tests (tests/first_contact.rs) generate X25519 server keypairs
+# Integration tests (tests/it/first_contact.rs) generate X25519 server keypairs
 # for the hand-rolled responder threads and read the client's transport
 # keypair override from choreo-transport.
 x25519-dalek.workspace = true

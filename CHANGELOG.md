@@ -70,6 +70,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Integration tests consolidated into one binary per crate (build-time win).**
+  Each crate's integration suite now lives in a single `tests/it/main.rs` target —
+  one module per former `tests/*.rs` file — instead of one test binary per file.
+  Cargo compiles every top-level `tests/*.rs` into a separate binary that
+  statically links the whole library, so `choreo-daemon`'s 33-file suite meant 33
+  relinks and 33 clippy re-checks on every change to the library or any of its
+  dependencies; the single `it` target collapses that fan-out to one compile +
+  link. Measured on a 16-core box, a post-edit `just pre-commit` drops from
+  ~48s to ~30s (daemon-only: `cargo nextest run -p choreo-daemon --all-targets
+  --all-features` 37s → 19s; `cargo clippy -p choreo-daemon` 28s → 8s). Runtime
+  behaviour is unchanged — cargo-nextest spawns the test binary once per test,
+  so process-per-test isolation is preserved and all 3,412 tests still run.
+  `choreo-daemon`'s shared `tests/common` harness is declared once at the crate
+  root and reached via `use crate::common;`; `choreo-sockreg`'s per-file
+  `[[test]] name = "ureq_connector" required-features = ["ureq"]` target is gone
+  (the moved module self-gates on `feature = "ureq"`). File-level
+  `#![cfg(...)]` / `#![allow(...)]` attributes move with each file and apply to
+  its module. The only caveat is the libtest fallback (`cargo test --
+  --ignored`), which now runs a crate's whole integration suite in one process.
+
 - Routine dependency refresh: `Cargo.lock` re-resolved to current upstream
   releases (`cargo update`), no manifest-requirement or source changes. Notable
   bumps: `ammonia` 4.1.4 → 4.2.0 (dragging `cssparser` 0.37 → 0.38,

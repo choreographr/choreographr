@@ -22,7 +22,7 @@
     clippy::panic_in_result_fn,
     clippy::indexing_slicing
 )]
-mod common;
+use crate::common;
 
 use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_tcp_connection;

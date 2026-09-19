@@ -34,7 +34,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
 /// How long to wait for the daemon's server thread to exit after SIGINT.
 /// A healthy shutdown takes well under a second (empty daemon); the drain

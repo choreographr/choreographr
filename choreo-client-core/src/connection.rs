@@ -1096,7 +1096,7 @@ mod in_process_tests {
     /// fails, so a successful run would be impossible — the pinned outcome is
     /// exactly one hook invocation and the hook's error surfacing as the
     /// connection result. (The live-listener half of this contract binds real
-    /// sockets, so it lives in `tests/connection_autostart.rs` — no filesystem
+    /// sockets, so it lives in `tests/it/connection_autostart.rs` — no filesystem
     /// or IPC boundary in unit tests.)
     #[test]
     fn autostart_hook_invoked_when_nothing_listens() {

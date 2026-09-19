@@ -55,7 +55,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
 /// Bounded wait for a session-stream message: long enough that a wedged
 /// session fails loudly instead of hanging the suite, with plenty of headroom

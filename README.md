@@ -918,7 +918,12 @@ gives per-test timeouts and retries. Install it once with
 `cargo install cargo-nextest` (or `brew install nextest` on macOS); the aliases
 below fail with "no such command" until it is on `PATH`. The unit-vs-integration
 split is the same as libtest's — integration tests live in crate-level `tests/`
-and are marked `#[ignore]` (see AGENTS.md):
+and are marked `#[ignore]`. Each crate keeps its integration suite in ONE
+`tests/it/main.rs` binary (one module per former `tests/*.rs` file), NOT one
+binary per file: cargo compiles each `tests/*.rs` into a separate binary that
+statically links the whole library, so a 33-file suite meant 33 relinks on
+every change. Nextest still runs every test in its own process, so the
+consolidation changes nothing observable (see AGENTS.md):
 
 ```bash
 cargo test-fast          # unit tests (nextest, parallel)
@@ -941,12 +946,11 @@ out of sync with the real backend.
 
 The nextest profile lives in `.config/nextest.toml`: `fail-fast = false` (run
 the whole suite even after a failure) and a 120s `slow-timeout` that aborts any
-hung test. On a 16-core machine `cargo test-all` runs the entire suite (~2,050
-tests, unit + integration) in ~6s wall, versus ~22s for the two equivalent
-libtest commands (`cargo test` + `cargo test -- --ignored`) on a warm build.
-Nextest wins on two fronts: it parallelizes across test binaries (libtest runs
-them one at a time) and runs every test in its own process. Useful raw nextest
-invocations:
+hung test. On a 16-core machine a warm `cargo test-all` clears the entire suite
+(~3,400 tests, unit + integration) in ~13s wall. Nextest wins on two fronts: it
+parallelizes across test binaries (libtest runs them one at a time) and runs
+every test in its own process — which is also why the one-binary-per-crate
+layout above costs nothing in isolation. Useful raw nextest invocations:
 
 ```bash
 cargo nextest run --workspace -E 'test(ignored)'   # filterset: integration only

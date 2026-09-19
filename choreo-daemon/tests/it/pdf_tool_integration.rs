@@ -25,7 +25,7 @@ use std::collections::HashSet;
 // image-only fixture, RUSTSEC-2026-0187 PoC, temp-file writer) from the
 // crate source so the unit tests and this integration test can never drift
 // apart.
-#[path = "../src/tools/pdf/test_fixtures.rs"]
+#[path = "../../src/tools/pdf/test_fixtures.rs"]
 mod test_fixtures;
 
 use test_fixtures::{

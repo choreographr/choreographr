@@ -1,7 +1,7 @@
 //! Deterministic PDF fixture builders shared by the unit tests
 //! (`src/tools/pdf/`, declared via `#[cfg(test)] mod test_fixtures;` in
 //! `mod.rs`) and the crate-level integration test
-//! (`tests/pdf_tool_integration.rs`, which pulls the *same* file in via a
+//! (`tests/it/pdf_tool_integration.rs`, which pulls the *same* file in via a
 //! `#[path]` include).
 //!
 //! Keeping the builders in one file — rather than duplicated verbatim in the
