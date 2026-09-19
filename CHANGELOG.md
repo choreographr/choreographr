@@ -55,16 +55,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching output was dropped with the discarded call; the retry resends the
   full, self-consistent history instead.
 
-- **New `just pre-release` — a read-only release gate.** Where `just pre-commit`
-  is the commit gate (and, by design, *mutates* the tree via `clippy-fix` and
-  `fmt`), `pre-release` is its read-only twin for release time: it runs
-  `preflight`, the release-state check (on `master`, clean, not behind
-  `origin/master`), `fmt-check`, `clippy-strict`, `test-all`, and
-  the release-only guards `pre-commit` omits (`check-supply-chain`,
-  `check-changelog`, `check-release-name`) plus the new crates.io credential
-  check — and never edits a single file. `RELEASE.md`'s Preflight
-  section (now just `just pre-release`) and the gates now call it in place of
-  the long-removed `just ci`.
+- **New `just pre-release` — the release gate.** Where `just pre-commit` is the
+  commit gate (and, by design, *mutates* the tree via `fmt`),
+  `pre-release` is everything a release needs before Phase 1 and never edits the
+  working tree: the toolchain (`preflight`), the git release-state check (on
+  `master`, clean, not behind `origin/master`), `fmt-check`, `clippy-strict`,
+  `test-all`, the release-only guards `pre-commit` omits (`check-supply-chain`,
+  `check-changelog`, `check-release-name`), and the crates.io credential check.
+  As its final step it pushes `master` and kicks the release workflow via
+  `gh workflow run release.yml` — a `workflow_dispatch` run that builds every
+  platform but creates no GitHub release, so the pipeline is proven on GitHub
+  before a tag. `RELEASE.md`'s Preflight section (now just `just pre-release`)
+  and the gates call it in place of the long-removed `just ci`.
 
 ### Changed
 
@@ -86,7 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The TUI command palette now runs the highlighted command on `Enter` — no preceding `Tab`.** Previously a `/`-query had to be completed with `Tab` before `Enter` would submit it, so selecting a row with `↑`/`↓` and pressing `Enter` did nothing on an empty or partial line. `Enter` now resolves the line through `command_palette_enter_line`: a first token that already names a command exactly runs verbatim (arguments preserved — `model gpt-4o`, `session new foo`), while an empty or still-partial token adopts the highlighted row (keeping any argument tail, so `mo gpt-4o` runs `model gpt-4o`). `Tab` still completes the name without submitting for users who want to keep editing the line.
 
-- **`just pre-commit` is now the commit gate, run automatically after every implementation run.** The gate runs in mutation-aware order — `clippy-fix` → `clippy-strict` → `test-all` → `fmt` → `check-changelog` — and the agent loops it (fix by hand, re-run) until green before committing, without asking the user first. Clippy and `test-all` now cover **all targets and all features**, and any clippy warning fails the gate (the verification pass denies warnings). Formatting runs *last*, not first, precisely because `clippy-fix` mutates the tree while `fmt` is semantics-preserving — the tested bytes stay behaviourally identical to the committed bytes. Commit messages now follow **Conventional Commits**, scoped by crate. The supply-chain and release-name guards moved out of the commit path to the release workflow (they are release guards, not pre-commit guards), and the redundant local-only `just ci` recipe was removed. When work is delegated, each subsession now runs the same gate and commits its unit before returning its report; a subsession that aborts leaves its changes uncommitted for the parent to inspect. The clippy/fmt gate flags live in `.cargo/config.toml` aliases (`clippy-all`, `clippy-all-fix`, `fmt-all`) so the `just` recipes stay flag-free.
+- **`just pre-commit` is now the commit gate, run automatically after every implementation run.** The gate runs `clippy-strict` → `test-all` → `fmt` → `check-changelog` and the agent loops it (fix by hand, re-run) until green before committing, without asking the user first. The gate only *verifies*: it no longer auto-rewrites the tree with `cargo clippy --fix` before checking it (machine-applicable lints are applied by hand with `just clippy-fix` when wanted), leaving `fmt` as its single tree-mutating step — and even that runs *last*, precisely because it is semantics-preserving, keeping the tested bytes behaviourally identical to the committed ones. Clippy and `test-all` cover **all targets and all features**, and any clippy warning fails the gate (`clippy-strict` denies warnings). Commit messages now follow **Conventional Commits**, scoped by crate. The supply-chain and release-name guards moved out of the commit path to the release workflow (they are release guards, not pre-commit guards), and the redundant local-only `just ci` recipe was removed. When work is delegated, each subsession now runs the same gate and commits its unit before returning its report; a subsession that aborts leaves its changes uncommitted for the parent to inspect. The clippy/fmt gate flags live in `.cargo/config.toml` aliases (`clippy-all`, `clippy-all-fix`, `fmt-all`) so the `just` recipes stay flag-free.
 
 - **Markdown tables in the TUI now use a nushell-style rounded frame.** The
   outer corners are `╭ ╮ ╰ ╯` (the `┬`/`┴`/`├`/`┤`/`┼` junctions and `│`/`─`

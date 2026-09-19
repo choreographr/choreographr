@@ -130,22 +130,28 @@ channel updates in Phase 4 as before.
 
 ### Preflight (before Phase 1)
 
-Run the read-only release gate on `master`, up to date with origin, with a clean
-working tree:
+Run the release gate on `master`, up to date with origin, with a clean working
+tree:
 
 ```nu
 just pre-release
 ```
 
-`just pre-release` is everything a release needs and nothing that edits the
-tree: the toolchain check (cargo + zig, notes nextest), the git release-state
-check (on `master`, clean, and not behind `origin/master`), `fmt --check`,
-clippy with warnings denied, the full unit + integration suite, the
-supply-chain, changelog, and release-name guards, and the crates.io credential
-check. Unlike `just pre-commit` it never mutates the tree (no `clippy --fix` /
-`fmt`). The individual steps remain available as `just preflight`,
-`just check-release-state`, `just check-crates-io-token`, etc. if you need to
-isolate one.
+`just pre-release` is everything a release needs before Phase 1, and never edits
+the working tree (no `clippy --fix` / `fmt`): the toolchain check (cargo + zig,
+notes nextest), the git release-state check (on `master`, clean, not behind
+`origin/master`), `fmt --check`, clippy with warnings denied, the full unit +
+integration suite, the supply-chain / changelog / release-name guards, and the
+crates.io credential check. **As its final step it pushes `master` and kicks the
+release workflow** (`gh workflow run release.yml`) — a `workflow_dispatch` dry
+run that builds every platform exactly like a tag does but creates **no** GitHub
+release, so the pipeline is proven on GitHub before you ever tag (watch it with
+`gh run watch`). That push is why `master` must be clean and up to date before
+you start.
+
+The individual steps remain available as `just preflight`,
+`just check-release-state`, `just check-crates-io-token`,
+`just release-workflow-dry-run`, etc. if you need to isolate one.
 
 ---
 

@@ -308,7 +308,9 @@ clippy-strict: _require-zig
 
 # Auto-apply machine-applicable lints in place; the rest are hand-fixed afterwards.
 # `--allow-dirty --allow-staged` let it edit a tree that already holds the in-progress
-# change. Used by `pre-commit` (the commit gate).
+# change. NOT part of `pre-commit` — the commit gate only VERIFIES lint cleanliness
+# (via `clippy-strict`); run this by hand first when you want the autofixable lints
+# applied before looping the gate.
 clippy-fix: _require-zig
     cargo clippy-all-fix {{ CARGO_FLAGS }}
 
@@ -371,33 +373,49 @@ check-release-state:
 check-crates-io-token:
     ./scripts/check-crates-io-token.sh
 
+# Release preflight, final step: publish master and kick the release workflow via
+# `workflow_dispatch`. That run builds every platform exactly like a tag does but
+# creates NO GitHub release (the `release` job is tag-only: `if: startsWith(ref,
+# 'refs/tags/v')`), so the pipeline is exercised on GitHub before Phase 1 ever
+# tags — the first real tag is never the first test of the pipeline. Requires an
+# authenticated `gh` and push access to origin.
+release-workflow-dry-run:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git push origin master
+    gh workflow run release.yml --ref master
+    echo "release workflow dispatched (dry run — no release created)"
+    echo "watch it with: gh run watch   (or the repo's Actions tab)"
+
 # Install the dependency-policy tool cargo-deny (the authoritative layer of
 # check-supply-chain). Without it the script falls back to cargo-audit + a
 # literal lockfile scan, which covers advisories but not hard version bans.
 install-cargo-deny:
     cargo install cargo-deny
 
-# The commit gate (AGENTS.md → Commit Workflow), in mutation-aware order:
-# fix lints → prove clippy-clean → full test suite → format LAST → changelog guard.
-# Formatting runs last (not first) because `clippy-fix` mutates the tree and fmt is
-# semantics-preserving, so the formatted bytes stay behaviourally identical to the
-# tested bytes. Safe to re-run: loop it (fix by hand, re-run) until it passes green,
-# then `git commit`. The supply-chain and release-name guards are RELEASE guards —
-# they run in the release workflow, not here.
-pre-commit: clippy-fix clippy-strict test-all fmt check-changelog
+# The commit gate (AGENTS.md → Commit Workflow): prove clippy-clean → full test
+# suite → format LAST → changelog guard. `clippy-strict` denies warnings, so any
+# remaining lint fails the gate and is hand-fixed (run `just clippy-fix` first if
+# you want the machine-applicable lints applied automatically). Formatting runs
+# last, not first, so the formatted bytes stay behaviourally identical to the
+# tested bytes. Safe to re-run: loop it (fix by hand, re-run) until it passes
+# green, then `git commit`. The supply-chain and release-name guards are RELEASE
+# guards — they run in the release workflow, not here.
+pre-commit: clippy-strict test-all fmt check-changelog
 
-# The READ-ONLY release gate (RELEASE.md → Preflight) — the single command the
-# conductor runs before Phase 1. It is the union of every pre-release check: the
-# toolchain (`preflight`), the git release state (on master, clean, not behind
-# origin), the quality gate minus its two tree-mutating steps — `fmt` and
-# `clippy-fix`, replaced by the read-only `fmt-check` and `clippy-strict` — the
-# full test suite, the release-only guards `pre-commit` omits
-# (`check-supply-chain`, `check-changelog`, `check-release-name`), and the
-# crates.io credential check. It never edits the tree, so it is safe on a clean
-# release checkout. Never use `pre-commit` as a release gate — it rewrites the
-# source with `cargo clippy --fix` and `cargo fmt`.
+# The release gate (RELEASE.md → Preflight) — the single command the conductor
+# runs before Phase 1. Every local check, in one pass: the toolchain
+# (`preflight`), the git release state (on master, clean, not behind origin), the
+# quality gate with its one tree-mutating step — `fmt` — replaced by the
+# non-mutating `fmt-check` (alongside `clippy-strict`) — the full test suite, the
+# release-only guards `pre-commit` omits (`check-supply-chain`, `check-changelog`,
+# `check-release-name`), the crates.io credential check, and finally the GitHub dry
+# run (`release-workflow-dry-run`): push master + kick the release workflow so the
+# pipeline is proven before a tag. Nothing here edits the working tree. Never use
+# `pre-commit` as a release gate — it still rewrites the source with `cargo fmt`.
 pre-release: preflight check-release-state fmt-check clippy-strict test-all \
-    check-supply-chain check-changelog check-release-name check-crates-io-token
+    check-supply-chain check-changelog check-release-name check-crates-io-token \
+    release-workflow-dry-run
 
 # ── running ───────────────────────────────────────────────────────────────────
 

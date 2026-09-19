@@ -117,13 +117,12 @@ A run is committed **once, at the end of each unit of work** — not once per tu
 
 ### The gate
 
-Run **`just pre-commit`**. It is the commit gate, and it is safe to re-run: loop it (fix by hand, re-run) until it passes green, then commit. It runs, in mutation-aware order (the flags themselves live in `.cargo/config.toml`):
+Run **`just pre-commit`**. It is the commit gate, and it is safe to re-run: loop it (fix by hand, re-run) until it passes green, then commit. The gate only *verifies*, except for the single tree-mutating step (`fmt`) which runs last; it runs (the flags themselves live in `.cargo/config.toml`):
 
-1. **`clippy-fix`** — `cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets --all-features --locked` auto-applies machine-applicable lints. It will not fix everything; whatever remains is hand-fixed in step 2.
-2. **`clippy-strict`** — the same invocation plus `-- -D warnings`, which must report **nothing**. Fix pre-existing warnings too, not just the ones the change introduced — the gate is a clean workspace, not a clean diff.
-3. **`test-all`** — the full unit + integration suite via nextest, all features and all targets (see [Test Discipline](#test-discipline)). It must pass in full.
-4. **`fmt`** — `cargo fmt --all`, applied **last**: fmt is semantics-preserving, so the formatted bytes are behaviourally identical to the tested bytes and need no re-test. (Formatting runs last, not first, precisely because `clippy-fix` mutates the tree — a non-mutating CI check would instead run `fmt --check` first.)
-5. **`check-changelog`** — the `[Unreleased]` structure guard (see [Documentation](#documentation)).
+1. **`clippy-strict`** — `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, which must report **nothing**. Fix pre-existing warnings too, not just the ones the change introduced — the gate is a clean workspace, not a clean diff. The gate does not auto-apply lints: run `just clippy-fix` (`cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets --all-features --locked`) by hand first if you want the machine-applicable ones applied automatically.
+2. **`test-all`** — the full unit + integration suite via nextest, all features and all targets (see [Test Discipline](#test-discipline)). It must pass in full.
+3. **`fmt`** — `cargo fmt --all`, applied **last**: fmt is semantics-preserving, so the formatted bytes are behaviourally identical to the tested bytes and need no re-test.
+4. **`check-changelog`** — the `[Unreleased]` structure guard (see [Documentation](#documentation)).
 
 If any step fails, fix the cause and re-run `just pre-commit` from the top — a hand fix can introduce a new clippy warning or test failure, so the gate only holds when the whole sequence is clean in one pass. If clippy, formatting, or the tests genuinely cannot be made to pass, **do not commit**; stop and report the failure instead.
 
