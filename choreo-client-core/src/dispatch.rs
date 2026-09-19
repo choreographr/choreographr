@@ -133,12 +133,19 @@ pub trait TurnEventHandler {
 ///   own requests (`Sessions`, `Models`, `Pong`, keystore/account replies,
 ///   catalog/refresh replies, on-demand `Image`, …), handled by
 ///   `dispatch_flat_message`.
-pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandler) {
+pub fn dispatch_daemon_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler) {
     debug!("dispatching daemon message: {msg:?}");
     match msg {
         DaemonMessage::Session { session_id, event } => {
-            dispatch_session_event(session_id.as_ref(), event, handler);
+            // The session-event dispatch keeps borrowing its inputs: the
+            // envelope is owned now, so `.as_ref()` / `&event` hand it the
+            // exact `&u64` / `&SessionEvent` it always took — no clone, and no
+            // need to change `dispatch_session_event`'s signature.
+            dispatch_session_event(session_id.as_ref(), &event, handler);
         }
+        // Move the flat envelope into `dispatch_flat_message` so its `Image`
+        // arm can MOVE the (potentially multi-MB) image buffer into the
+        // handler instead of cloning it.
         flat => dispatch_flat_message(flat, handler),
     }
 }
@@ -151,7 +158,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
 /// compile time instead of being silently swallowed by a wildcard arm
 /// (matching the same rule `dispatch_session_event` applies to its
 /// `SessionEvent` match).
-fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandler) {
+fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler) {
     match msg {
         DaemonMessage::Sessions { .. } => {
             // Handled upstream by the caller before dispatch.
@@ -241,7 +248,7 @@ fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandle
             ));
         }
         DaemonMessage::AclAddResult { ok, message } => {
-            if *ok {
+            if ok {
                 handler.handle_status_text(format!("[daemon] {message}"));
             } else {
                 handler.handle_error(format!("[daemon] acl add failed: {message}"));
@@ -289,7 +296,11 @@ fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandle
             image_index,
             data,
         } => {
-            handler.handle_image(*session_id, *turn_id, *image_index, data.clone());
+            // By-value match: `data` is owned here, so it MOVES into the
+            // handler. This is the whole point of the by-value dispatch — a
+            // default-no-op `handle_image` (GUI/ACP) still pays nothing, and
+            // an image-rendering handler gets the bytes without a clone.
+            handler.handle_image(session_id, turn_id, image_index, data);
         }
         // Explicit no-ops, enumerated so a new flat variant still forces this
         // match to grow:
@@ -298,10 +309,12 @@ fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandle
         //   dispatch.
         // - Evicted: the best-effort advisory travels ahead of the
         //   disconnect and the connection layer shows it.
-        DaemonMessage::ModelsRefreshed { .. }
+        // The `@` binding keeps the whole owned envelope available for the
+        // debug line even though the arm matches several variants by shape.
+        msg @ (DaemonMessage::ModelsRefreshed { .. }
         | DaemonMessage::ModelsRefreshFailed { .. }
         | DaemonMessage::CatalogUpdated { .. }
-        | DaemonMessage::Evicted => {
+        | DaemonMessage::Evicted) => {
             debug!("flat daemon message has no generic-dispatch text: {msg:?}");
         }
         // A `Session` envelope here is a routing bug — `dispatch_daemon_message`
@@ -317,7 +330,7 @@ fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandle
             session_id, event, ..
         } => {
             warn!(
-                session_id,
+                ?session_id,
                 "session envelope reached the flat-message dispatch; event is dropped: {event:?}"
             );
         }

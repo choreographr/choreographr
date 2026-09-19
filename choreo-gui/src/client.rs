@@ -401,5 +401,5 @@ pub(crate) fn apply_daemon_message(
         _ => {}
     }
 
-    dispatch_daemon_message(&message, state);
+    dispatch_daemon_message(message, state);
 }

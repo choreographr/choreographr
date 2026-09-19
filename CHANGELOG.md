@@ -183,6 +183,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DaemonCommand::GetDisplayImage` variant, its `handle_command` arm, and the
   `handle_get_display_image` handler are removed.
 
+- **Daemon-message dispatch now consumes the message by value, so a
+  displayed-image reply moves its bytes instead of cloning them
+  (`choreo-client-core`).** `dispatch_daemon_message` and its private
+  `dispatch_flat_message` take an owned `DaemonMessage`, and the
+  `DaemonMessage::Image` arm moves `data` straight into
+  `handler.handle_image`. Previously every image reply cloned the
+  (potentially multi-MB) buffer — even for handlers whose `handle_image` is
+  the default no-op (the GUI and the ACP bridge), which paid the copy for
+  bytes they never render. The TUI/GUI callers move their owned value in; the
+  session-event dispatch still borrows (`&SessionEvent`), so its signature is
+  unchanged. No wire change.
+
 ### Removed
 
 - **The `/models` alias is gone — use `/model`.**
@@ -296,6 +308,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ceiling. (The pin bounds the *requested* limit only when one is configured;
   it does not by itself stop a response from reaching the ceiling — the
   agent-loop recovery above handles that.)
+
+- **The IM bridge now attaches to a session so its on-demand image fetch can
+  actually work (`choreo-im`).** Protocol v6 moved displayed-image bytes off
+  `TurnAppended` and onto a `ClientMessage::GetImage` request/reply, but the
+  daemon only serves `GetImage` for — and only delivers session-scoped events
+  (`TurnAppended`, …) to subscribers of — the session a connection is
+  ATTACHED to, and the bridge never sent `AttachSession`. It therefore
+  received no live turns at all and its fetch would have been refused. The
+  bridge now requests `ListSessions` at startup, chooses a session from the
+  reply via the pure `session_to_attach` helper (first top-level session,
+  else the first), and attaches exactly once. Because it is now attached, the
+  session-metadata/status variants it previously fell through to a `warn!`
+  (`SessionState`, `SessionAttached`, `SessionStatusChanged`, `SessionDeleted`,
+  `SessionDeleteFailed`, `SessionCreated`, `ContextWindowResolved`,
+  `LiveOutputTokenCount`, `TokenUsageUpdate`) now no-op at `debug`, so
+  ordinary streaming no longer spams warnings; the `Sessions` reply itself is
+  consumed silently.
 
 ## [0.2.1] - 2026-09-17 (Lindy)
 

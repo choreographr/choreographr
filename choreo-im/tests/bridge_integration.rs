@@ -27,6 +27,14 @@ fn connected_bridge() -> (DaemonBridge, BufReader<UnixStream>, BufWriter<UnixStr
     (bridge, BufReader::new(my_reader), BufWriter::new(my_writer))
 }
 
+/// The bridge now sends `ClientMessage::ListSessions` at startup (to pick a
+/// session to attach). Tests that read the bridge's outgoing wire must consume
+/// that handshake message before their own.
+fn consume_startup_list_sessions(reader: &mut BufReader<UnixStream>) {
+    let msg = read_message::<_, ClientMessage>(reader).unwrap();
+    assert!(matches!(msg, ClientMessage::ListSessions));
+}
+
 #[ignore = "integration"]
 #[test]
 fn bridge_ping_pong() {
@@ -35,6 +43,7 @@ fn bridge_ping_pong() {
 
     tx.send(ClientMessage::Ping).unwrap();
 
+    consume_startup_list_sessions(&mut daemon_reader);
     let msg = read_message::<_, ClientMessage>(&mut daemon_reader).unwrap();
     assert!(matches!(msg, ClientMessage::Ping));
 
@@ -57,6 +66,7 @@ fn bridge_unlock_locked() {
     })
     .unwrap();
 
+    consume_startup_list_sessions(&mut daemon_reader);
     let msg = read_message::<_, ClientMessage>(&mut daemon_reader).unwrap();
     assert!(matches!(msg, ClientMessage::Unlock { .. }));
 

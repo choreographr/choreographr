@@ -1,4 +1,6 @@
-use choreo_proto::{ClientMessage, DaemonMessage, OutputStream, SessionEvent, Turn, write_message};
+use choreo_proto::{
+    ClientMessage, DaemonMessage, OutputStream, SessionEvent, SessionSummary, Turn, write_message,
+};
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 #[cfg(unix)]
@@ -125,9 +127,27 @@ impl DaemonBridge {
             let mut reader = reader;
             let mut buffers: HashMap<u32, StreamBuffer> = HashMap::new();
             let mut tool_buffers: HashMap<u32, String> = HashMap::new();
+            // Attach-once latch. The daemon only serves `GetImage` for — and
+            // only delivers session-scoped events (`TurnAppended`, …) to
+            // subscribers of — the session a connection is ATTACHED to. So the
+            // bridge must attach before its image path can work. The latch
+            // lives on the reader thread because the decision is driven by the
+            // `ListSessions` reply arriving on this socket.
+            let mut attached = false;
 
             let result = choreo_client_core::run_daemon_reader(&mut reader, |msg| {
                 debug!(?msg, "received daemon message");
+                // The startup `ListSessions` reply: pick a session and attach,
+                // mirroring how the GUI/TUI choose one. Sent once — later
+                // summary refreshes must not re-trigger an attach.
+                if let DaemonMessage::Sessions { sessions } = &msg
+                    && !attached
+                    && let Some(session_id) = session_to_attach(sessions)
+                {
+                    attached = true;
+                    info!(session_id, "bridge attaching to session");
+                    let _ = reader_client_tx.send(ClientMessage::AttachSession { session_id });
+                }
                 // Live turns carry displayed images, but only their metadata:
                 // request each image's bytes and emit them when the matching
                 // `Image` reply arrives.
@@ -168,6 +188,18 @@ impl DaemonBridge {
                 info!("daemon disconnected cleanly");
             }
         });
+
+        // Kick off the session-selection handshake: ask for the session list;
+        // the reader thread's `Sessions` arm picks one and attaches. Without
+        // this the bridge receives no live turns and its on-demand image
+        // fetch would be refused (daemon serves `GetImage` per attached
+        // session only). Best-effort: `client_tx` outlives the writer thread
+        // as long as the bridge is alive, so the send can only fail if the
+        // writer already exited (daemon gone), in which case no attach would
+        // help anyway.
+        if let Err(e) = client_tx.send(ClientMessage::ListSessions) {
+            warn!("failed to request session list at bridge startup: {e}");
+        }
 
         Self {
             client_tx,
@@ -213,6 +245,21 @@ fn collect_turn_images(
         }
     }
     (events, requests)
+}
+
+/// Choose which session the bridge attaches to from a `ListSessions` reply.
+///
+/// Prefer the first top-level session (`parent_session_id.is_none()`) — the
+/// daemon's notion of a root conversation, matching the GUI/TUI's default —
+/// and otherwise fall back to the first session of any kind. `None` when the
+/// list is empty (nothing to attach to yet). Pure so the attach policy is
+/// unit-tested without a live socket.
+fn session_to_attach(sessions: &[SessionSummary]) -> Option<u64> {
+    sessions
+        .iter()
+        .find(|s| s.parent_session_id.is_none())
+        .or_else(|| sessions.first())
+        .map(|s| s.session_id)
 }
 
 fn daemon_to_bridge_events(
@@ -353,11 +400,30 @@ fn daemon_to_bridge_events(
                 | SessionEvent::SessionState { .. }
                 | SessionEvent::SessionStatusChanged { .. }
                 | SessionEvent::SessionDeleted
-                | SessionEvent::SessionDeleteFailed { .. },
+                | SessionEvent::SessionDeleteFailed { .. }
+                | SessionEvent::ContextWindowResolved { .. }
+                | SessionEvent::LiveOutputTokenCount { .. }
+                | SessionEvent::TokenUsageUpdate { .. },
             ..
+        } => {
+            // Expected traffic once the bridge is ATTACHED to a session (it
+            // now sends `AttachSession` at startup): session metadata, the
+            // attach acknowledgement, status changes, and the live token
+            // counters. None of these map to a rendered bridge event, so drop
+            // them at debug rather than warning on every ordinary turn.
+            debug!(
+                ?msg,
+                "bridge ignoring attached-session metadata/status event"
+            );
+            None
         }
-        | DaemonMessage::Sessions { .. }
-        | DaemonMessage::CredentialAdded { .. }
+        DaemonMessage::Sessions { .. } => {
+            // The `ListSessions` reply is consumed by the reader callback (to
+            // choose the session to attach to); the event channel has nothing
+            // to render. Expected startup traffic, so no warning.
+            None
+        }
+        DaemonMessage::CredentialAdded { .. }
         | DaemonMessage::CredentialAddFailed { .. }
         | DaemonMessage::CredentialRemoved { .. }
         | DaemonMessage::CredentialRemoveFailed { .. }
@@ -384,8 +450,65 @@ fn daemon_to_bridge_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use choreo_proto::{DaemonMessage, OutputStream, SessionEvent};
+    use choreo_proto::{DaemonMessage, OutputStream, SessionEvent, SessionStatus, SessionSummary};
     use std::collections::HashMap;
+
+    /// Minimal `SessionSummary` for the attach-decision tests: only the two
+    /// fields `session_to_attach` consults (`session_id`,
+    /// `parent_session_id`) matter; the rest are filler.
+    fn summary(session_id: u64, parent_session_id: Option<u64>) -> SessionSummary {
+        SessionSummary {
+            session_id,
+            title: None,
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id,
+            working_dir: None,
+            created_at: 0,
+            last_modified: 0,
+            turn_count: 0,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: None,
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+        }
+    }
+
+    #[test]
+    fn session_to_attach_prefers_a_top_level_session() {
+        // A sub-session first in the list must be skipped in favour of the
+        // first top-level session.
+        let sessions = vec![summary(5, Some(9)), summary(7, None), summary(8, None)];
+        assert_eq!(session_to_attach(&sessions), Some(7));
+    }
+
+    #[test]
+    fn session_to_attach_falls_back_to_first_and_handles_empty() {
+        // No top-level session: fall back to whatever is first.
+        assert_eq!(session_to_attach(&[summary(5, Some(9))]), Some(5));
+        // Nothing to attach to yet.
+        assert_eq!(session_to_attach(&[]), None);
+    }
+
+    #[test]
+    fn reader_sessions_reply_attaches_to_first_session() {
+        // Mirrors the reader callback's `Sessions` handling: the chosen id is
+        // turned into a single `AttachSession`. Driving the pure helper here
+        // (choreo-im has no in-crate socket test harness) proves the reader's
+        // decision without a live daemon.
+        let sessions = vec![summary(5, Some(9)), summary(7, None)];
+        let msg = session_to_attach(&sessions)
+            .map(|session_id| ClientMessage::AttachSession { session_id });
+        assert_eq!(msg, Some(ClientMessage::AttachSession { session_id: 7 }));
+
+        // Empty list attaches to nothing.
+        assert_eq!(
+            session_to_attach(&[]).map(|session_id| ClientMessage::AttachSession { session_id }),
+            None
+        );
+    }
 
     #[test]
     fn test_output_chunk_buffering() {

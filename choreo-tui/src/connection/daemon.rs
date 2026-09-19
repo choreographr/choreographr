@@ -726,7 +726,7 @@ pub(crate) fn handle_daemon_message(
     }
 
     // Dispatch remaining variants through the generic turn-event handler.
-    dispatch_daemon_message(&message, app);
+    dispatch_daemon_message(message, app);
     Ok(())
 }
 
