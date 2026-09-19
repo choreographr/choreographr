@@ -22,13 +22,19 @@
 # do not (and should not) do. The user opts in with:
 #     systemctl --user enable --now choreographr
 
+# Arch tag: build-rpm.sh passes --define pkg_arch=<x86_64|aarch64> (detected from
+# the host). The default keeps a bare `rpmbuild -bb` working. Using the macro
+# rather than a hardcoded x86_64 is what lets a native arm64 host produce a
+# correctly-tagged aarch64 package.
+%{!?pkg_arch:%global pkg_arch x86_64}
+
 Name:           choreographr
 Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Agentic coding assistant — daemon, TUI, and bridges
 License:        Apache-2.0
 URL:            https://choreographr.com
-BuildArch:      x86_64
+BuildArch:      %{pkg_arch}
 
 %description
 Choreographr is an agentic coding assistant: a local daemon (choreographr)

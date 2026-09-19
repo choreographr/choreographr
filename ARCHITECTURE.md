@@ -193,25 +193,32 @@ target and is never shipped as a binary. `choreo-gui` is built separately (deskt
 Android via `dx build --platform android`, iOS via `scripts/build-ios.sh` +
 the `ios/` Xcode scaffold) and is not shipped either.
 
-The shipped target set is exactly three; `release.sh` and `install.sh`
-hardcode this set and refuse any other platform ("ships Linux x86_64,
-macOS arm64, and macOS x86_64"), and `release.sh` builds the Linux tarball on
-a Linux host and BOTH darwin tarballs on a Darwin-arm64 host (the x86_64 one
+The shipped target set is exactly four; `release.sh` and `install.sh`
+hardcode this set and refuse any other platform ("ships Linux x86_64 + arm64,
+macOS arm64, and macOS x86_64"), and `release.sh` builds each Linux host's
+own arch — the x86_64 tarball on a Linux-x86_64 host, the aarch64 tarball on a
+Linux-aarch64 host — and BOTH darwin tarballs on a Darwin-arm64 host (the
+x86_64 one
 cross-compiled — Apple's arm64-hosted toolchain targets x86_64-apple-darwin
 natively, sharing the single Xcode SDK):
 
 | Target | Platform | Asset |
 |---|---|---|
 | `x86_64-unknown-linux-musl` | Linux x86_64 | `choreographr-<version>-x86_64-unknown-linux-musl.tar.gz` |
+| `aarch64-unknown-linux-musl` | Linux arm64 | `choreographr-<version>-aarch64-unknown-linux-musl.tar.gz` |
 | `aarch64-apple-darwin` | macOS arm64 (native) | `choreographr-<version>-aarch64-apple-darwin.tar.gz` |
 | `x86_64-apple-darwin` | macOS Intel (cross-built on the arm64 host) | `choreographr-<version>-x86_64-apple-darwin.tar.gz` |
 
-The Linux tarball is a **fully static musl build** — `release.sh` cross-builds
-it to `x86_64-unknown-linux-musl` with `--features mimalloc`, so one artifact
-runs on any Linux kernel regardless of the host's glibc version (this also
+The Linux tarballs are **fully static musl builds** — `release.sh`
+cross-builds each to `<arch>-unknown-linux-musl` with `--features mimalloc`, so
+each artifact
+runs on any Linux kernel of its arch regardless of the host's glibc version
+(this also
 replaces the old "build inside an old-glibc container" compatibility dance).
 The `.deb`/`.rpm` remain native glibc host-target builds without the
-`mimalloc` feature — see `scripts/release.sh`. The tarball holds the two
+`mimalloc` feature — see `scripts/release.sh`; `build-deb.sh`/`build-rpm.sh`
+tag them from the host arch (Debian's `amd64`/`arm64` in the control field,
+the tarball spelling `x86_64`/`aarch64` in the filename). The tarball holds the two
 binaries at the **top level** (no `bin/` prefix)
 plus both service files, exec bits preserved — `install.sh` and the Homebrew
 formula reference them directly.
@@ -243,13 +250,16 @@ nightly-only, and are stripped by `scripts/build-stable.sh` before every
 stable release build; env rustflags additionally override any developer's
 `~/.cargo/config.toml`, so local and CI artifacts are comparable):
 
-- **musl tarball + Windows zip: x86-64-v2** (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/
+- **x86_64 musl tarball + Windows zip: x86-64-v2** (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/
   CMPXCHG16B — Intel Nehalem 2008+, AMD Bulldozer 2011+). The level enterprise
   distros have moved to (RHEL 10 baseline = v3, SLES 16 = v2) while the
   community distros (Debian/Arch/Fedora, Ubuntu mainline) stay v1 — v2 is the
   pragmatic floor between "runs on anything since 2003" and modern
   vectorization. Future per-CPU-level artifacts (e.g. a v3 tarball) reuse the
   same `RUSTFLAGS` mechanism with a different value.
+- **arm64 musl tarball: the generic aarch64 baseline (no flag)** — SIMD (NEON)
+  is mandatory in AArch64, so there is no x86-style v1/v2/v3 tier split to aim
+  at; the target default is the fleet-safe choice.
 - **macOS arm64 tarball: the target default** — `aarch64-apple-darwin` already
   defaults to `apple-a14` (Apple-Silicon-tuned), and the fleet is homogeneous
   by definition; no flag needed.
@@ -266,7 +276,7 @@ stable release build; env rustflags additionally override any developer's
   `RUSTFLAGS="-C target-cpu=generic"`.
 - **.deb/.rpm: baseline (v1)** — the glibc-distro range they serve is split
   (Debian/Arch = v1, RHEL 10 = v3), so baseline is the only level covering
-  all of them.
+  all of them (2003 SSE2 on x86-64; the generic aarch64 baseline on arm64).
 
 C dependencies (mimalloc, compiled by `cc`/zig) are NOT affected by
 `RUSTFLAGS` — only rustc codegen is — but those libraries do their own runtime
@@ -323,7 +333,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 | Script | Role |
 |---|---|
 | `install.sh` | curl\|sh installer — downloads the pinned-version tarball, verifies its SHA-256 against the `SHA256SUMS` fetched over the same TLS channel (no trust-on-first-use, no eval), extracts only the shipped binaries via an explicit member list, installs the platform service file, and never auto-enables. `--uninstall` removes everything; `CHOREOGRAPHR_BASE_URL` overrides the download base for testing/mirrors only. |
-| `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing the shipped binaries plus the systemd user unit, from existing `target/dist/` artifacts. The `.deb` forces xz archive members (`-Zxz`) — dpkg ≥ 1.22 defaults to zstd, which older-dpkg distros the package targets (e.g. Ubuntu 22.04) cannot read |
+| `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing the shipped binaries plus the systemd user unit, from existing `target/dist/` artifacts. Both detect the host arch (`uname -m`): x86_64/aarch64 only, failing loudly otherwise. The `.deb` control field uses Debian's tag (`amd64`/`arm64`) while the filename uses the tarball tag (`x86_64`/`aarch64`); the `.rpm` gets its `BuildArch` from the `pkg_arch` macro passed to the spec. The `.deb` forces xz archive members (`-Zxz`) — dpkg ≥ 1.22 defaults to zstd, which older-dpkg distros the package targets (e.g. Ubuntu 22.04) cannot read |
 | `build-deb-termux.sh` | Build the **Termux-native** `.deb` from the already-cross-built `target/android/arm64-v8a/` binaries (NO rebuild) — package `choreographr`, `Architecture: aarch64` (Termux's tag, not Debian's `arm64`), files at `./data/data/com.termux/files/usr/bin/<name>` — Termux's dpkg installs against `/` with no chroot, so the package must carry the real on-device path of the fixed `$PREFIX` (as upstream Termux packages do; the earlier `./bin/` convention made dpkg try to write `/bin` at the read-only device root), no maintainer scripts / conffiles (Termux dpkg runs as the app uid, no root). Built with `dpkg-deb --build --root-owner-group -Zxz` — xz is forced because dpkg ≥ 1.22 on the ubuntu runners defaults to zstd and Termux's dpkg has no zstd support (it only finds `control.tar{xz,lzma,}` members; the on-device failure this caused is what the in-script member assertion guards against); validates control fields, archive members, contents, and exec bits in-script — structural only, since there is no Termux on the build host. Output: `dist/choreographr-termux_<ver>_aarch64.deb` (the `-termux-` infix disambiguates it from the desktop `.deb` on the release page). Wired into the release workflow's android job only — deliberately NOT into `release.sh` |
 | `smoke-test.sh` | Dispatches on the artifact suffix: a release tarball is extracted, the shipped binaries' presence/exec bits/`--version`/`--help` are checked; a `.deb` (the Termux package) is validated structurally via `dpkg-deb` — control fields, no `Depends:`/maintainer scripts, the shipped binaries at Termux's `$PREFIX` path (`./data/data/com.termux/files/usr/bin/`) with 0755 modes — the structural ceiling since no Termux exists on the host |
 | `release.sh` | The release orchestrator — local builds (its CI counterpart is `.github/workflows/release.yml`, which runs it on the Linux/macOS runners); dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard (CI passes it: a checkout IS the pushed commit, so the uncommitted-edits threat model cannot apply) |
@@ -336,7 +346,7 @@ with `systemctl --user enable --now choreographr` (Linux) or
 ### Distribution channels (0.1)
 
 - **Homebrew tap** — `brew tap choreographr/choreographr && brew install choreographr` (prebuilt formula)
-- **GitHub Releases** — the tarball, `SHA256SUMS`, the desktop `.deb`/`.rpm`, and the Termux `.deb` at `https://github.com/choreographr/choreographr/releases`
+- **GitHub Releases** — the Linux x86_64 + arm64 musl tarballs, `SHA256SUMS`, the desktop `.deb`/`.rpm` in both Linux arches, and the Termux `.deb` at `https://github.com/choreographr/choreographr/releases`
 - **choreographr.com** — `https://choreographr.com/download/<version>/` mirrors the tarball and `SHA256SUMS` (this is what `install.sh` fetches); `https://choreographr.com/install.sh` serves the installer, and per-version download redirects are added at release time
 - **AUR** — `choreographr-bin` (prepared in `packaging/aur/`, **not yet published**: no maintainer account and AUR registration is closed)
 - **crates.io** — `cargo install choreographr choreo-tui` (source build, needs Zig) and `cargo binstall choreographr choreo-tui` (prebuilt; asset naming resolved via `[package.metadata.binstall]` in each package, below)
@@ -393,7 +403,9 @@ The root package declares `[package.metadata.binstall]`, so
 requiring a manual `--pkg-url`; `bin-dir = "{ bin }{ binary-ext }"` maps the
 tarball's archive-root binaries (an empty `bin-dir` is rejected by binstall),
 and an `x86_64-unknown-linux-gnu` override maps glibc hosts to the static
-musl tarball (the only Linux asset shipped). The `choreo-tui` crate carries
+musl tarball, plus an `aarch64-unknown-linux-gnu` override mapping arm64 glibc
+hosts to the arm64 musl tarball (each arch's static musl tarball is the only
+Linux asset shipped for that arch). The `choreo-tui` crate carries
 an IDENTICAL `[package.metadata.binstall]` block: the release tarball is one
 archive containing both binaries, and binstall installs only the binaries a
 package declares — so `cargo binstall choreo-tui` resolves the SAME asset

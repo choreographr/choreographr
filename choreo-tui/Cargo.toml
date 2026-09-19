@@ -87,10 +87,14 @@ pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ ver
 bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
-# Same glibc mapping as the root package: x86_64-unknown-linux-gnu hosts get
-# no native Linux asset, so binstall is pointed at the static musl tarball.
+# Same glibc mapping as the root package: glibc hosts get no native Linux
+# asset, so binstall is pointed at the static musl tarball — both x86_64 and
+# arm64 host targets.
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-x86_64-unknown-linux-musl{ archive-suffix }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-aarch64-unknown-linux-musl{ archive-suffix }"
 
 [dev-dependencies]
 tempfile.workspace = true

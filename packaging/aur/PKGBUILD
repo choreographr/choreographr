@@ -15,18 +15,25 @@ pkgname=choreographr-bin
 pkgver=0.2.0
 pkgrel=1
 pkgdesc="Agentic coding assistant — daemon, TUI, and bridges"
-arch=('x86_64')
+# Both Linux arches ship; the source array below is arch-dependent, so the
+# package builds/installs on x86_64 and aarch64 alike. (The AUR itself serves
+# x86_64; aarch64 is built on Arch Linux ARM.)
+arch=('x86_64' 'aarch64')
 url="https://choreographr.com"
 license=('Apache-2.0')
 # Empty depends: the release binaries are static — no runtime dependencies.
 depends=()
-# The Linux release tarball is the fully static musl build (see
-# scripts/release.sh): one artifact serves general Linux AND the AUR -bin
-# package.
-source=("https://github.com/choreographr/choreographr/releases/download/v0.2.0/choreographr-0.2.0-x86_64-unknown-linux-musl.tar.gz")
-# The digest of the exact release tarball, from the release's SHA256SUMS
-# (choreographr-<V>-x86_64-unknown-linux-musl.tar.gz). Update it with pkgver.
-sha256sums=('58efee8c92187cb3686a5a30f0014aac29b6bd9094cfc7ac0a0f420b02053f6c')
+# The Linux release tarballs are the fully static musl builds (see
+# scripts/release.sh): one artifact per arch serves general Linux AND the AUR
+# -bin package.
+source_x86_64=("https://github.com/choreographr/choreographr/releases/download/v0.2.0/choreographr-0.2.0-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("https://github.com/choreographr/choreographr/releases/download/v0.2.0/choreographr-0.2.0-aarch64-unknown-linux-musl.tar.gz")
+# The digests of the exact release tarballs, from the release's SHA256SUMS
+# (choreographr-<V>-<arch>-unknown-linux-musl.tar.gz). Update with pkgver.
+# NOTE: the aarch64 digest is a placeholder (all-zero) until the arm64 tarball
+# ships in a release; fill it from that release's SHA256SUMS alongside pkgver.
+sha256sums_x86_64=('58efee8c92187cb3686a5a30f0014aac29b6bd9094cfc7ac0a0f420b02053f6c')
+sha256sums_aarch64=('0000000000000000000000000000000000000000000000000000000000000000')
 
 package() {
     # Release tarball layout: the shipped binaries at the top level, exec bits

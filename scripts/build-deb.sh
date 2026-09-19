@@ -19,6 +19,20 @@ VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -n
 
 BINARIES=(choreographr choreo-tui)
 
+# Host arch → the two arch spellings this package needs. DEB_ARCH is Debian's
+# control-file tag (amd64/arm64); PKG_ARCH is the filename tag, matching the
+# tarballs (x86_64/aarch64). Only x86_64 and aarch64 hosts are supported — the
+# same set release.sh builds for — so anything else fails loudly here rather
+# than producing a mislabelled package.
+case "$(uname -m)" in
+    x86_64)  DEB_ARCH="amd64"; PKG_ARCH="x86_64" ;;
+    aarch64|arm64) DEB_ARCH="arm64"; PKG_ARCH="aarch64" ;;
+    *)
+        echo "error: unsupported host arch for .deb: $(uname -m) (need x86_64 or aarch64)" >&2
+        exit 1
+        ;;
+esac
+
 command -v dpkg-deb >/dev/null 2>&1 || {
     echo "error: dpkg-deb not found — install it with: pacman -S dpkg" >&2
     exit 1
@@ -51,7 +65,7 @@ install -m 0644 "$REPO_ROOT/packaging/choreographr.service" \
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: choreographr
 Version: $VERSION
-Architecture: amd64
+Architecture: $DEB_ARCH
 Maintainer: Choreographr Maintainers <maintainers@choreographr.com>
 Depends:
 Section: utils
@@ -69,7 +83,7 @@ mkdir -p "$REPO_ROOT/dist"
 # with "could not locate member control.tar{xz,lzma,}" on a zstd package.
 # xz is universally supported; the assertion below guards the choice so a
 # future dpkg default flip fails here, not at install time.
-DEB="$REPO_ROOT/dist/choreographr-${VERSION}-x86_64.deb"
+DEB="$REPO_ROOT/dist/choreographr-${VERSION}-${PKG_ARCH}.deb"
 # --root-owner-group stamps the archive files as root:root regardless of who
 # builds, so the .deb is byte-stable across builders.
 dpkg-deb --build --root-owner-group -Zxz "$STAGE" "$DEB"
@@ -83,4 +97,4 @@ if [ "$MEMBERS" != "$(printf 'debian-binary\ncontrol.tar.xz\ndata.tar.xz')" ]; t
 fi
 echo "==> members ok: debian-binary + control.tar.xz + data.tar.xz (no zstd)"
 
-echo "built dist/choreographr-${VERSION}-x86_64.deb"
+echo "built dist/choreographr-${VERSION}-${PKG_ARCH}.deb"

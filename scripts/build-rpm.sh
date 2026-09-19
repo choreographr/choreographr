@@ -24,6 +24,19 @@ VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -n
 
 BINARIES=(choreographr choreo-tui)
 
+# Host arch → the package arch tag, matching the tarballs (x86_64/aarch64).
+# Passed to the spec as the `pkg_arch` macro (the spec's BuildArch uses it) so
+# a native arm64 host builds an aarch64 .rpm instead of a mislabelled x86_64
+# one. Only the two archs release.sh ships are supported.
+case "$(uname -m)" in
+    x86_64)  PKG_ARCH="x86_64" ;;
+    aarch64|arm64) PKG_ARCH="aarch64" ;;
+    *)
+        echo "error: unsupported host arch for .rpm: $(uname -m) (need x86_64 or aarch64)" >&2
+        exit 1
+        ;;
+esac
+
 command -v rpmbuild >/dev/null 2>&1 || {
     echo "error: rpmbuild not found — install it with: pacman -S rpm-tools" >&2
     exit 1
@@ -58,10 +71,11 @@ rpmbuild -bb \
     --define "_topdir $TOPDIR" \
     --define "_tmppath $TOPDIR/tmp" \
     --define "__os_install_post %{nil}" \
+    --define "pkg_arch $PKG_ARCH" \
     "$REPO_ROOT/packaging/rpm/choreographr.spec"
 
 mkdir -p "$REPO_ROOT/dist"
 RPM="$(find "$TOPDIR/RPMS" -type f -name 'choreographr-*.rpm' | head -n1)"
 [ -n "$RPM" ] || { echo "error: rpmbuild produced no .rpm" >&2; exit 1; }
-install -m 0644 "$RPM" "$REPO_ROOT/dist/choreographr-${VERSION}-x86_64.rpm"
-echo "built dist/choreographr-${VERSION}-x86_64.rpm"
+install -m 0644 "$RPM" "$REPO_ROOT/dist/choreographr-${VERSION}-${PKG_ARCH}.rpm"
+echo "built dist/choreographr-${VERSION}-${PKG_ARCH}.rpm"

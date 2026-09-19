@@ -9,8 +9,8 @@
 #   scripts/release.sh --upload        # also run `gh release create`
 #   scripts/release.sh --allow-dirty   # skip the dirty-tree guard
 #
-# Requires: cargo install cargo-zigbuild (the Linux x86_64 musl tarball build
-# below cross-compiles via zig).
+# Requires: cargo install cargo-zigbuild (the Linux musl tarball build below —
+# x86_64 and arm64 — cross-compiles via zig).
 #
 # Dist/release binaries are built on STABLE Rust (reproducible; matches the
 # crates.io/MSRV story) under the workspace's dedicated [profile.dist] profile
@@ -81,21 +81,36 @@ if [ "$ALLOW_DIRTY" -eq 0 ] && [ -n "$(git status --porcelain)" ]; then
 fi
 
 # Host-target detection mirrors scripts/install.sh. (Cross-compiling other
-# targets is out of scope for this script.) Linux-x86_64 maps to the static
+# targets is out of scope for this script.) Both Linux hosts map to the static
 # musl triple — the Linux release tarball is a fully static musl build (see
-# below). A Darwin-arm64 host builds BOTH darwin tarballs in one pass: native
-# aarch64-apple-darwin plus a cross-built x86_64-apple-darwin (Apple's clang
-# targeting x86_64 from an arm64 host is first-class and shares the single
-# Xcode SDK both triples need — no extra SDK install).
+# below), on x86_64 AND aarch64. A Darwin-arm64 host builds BOTH darwin
+# tarballs in one pass: native aarch64-apple-darwin plus a cross-built
+# x86_64-apple-darwin (Apple's clang targeting x86_64 from an arm64 host is
+# first-class and shares the single Xcode SDK both triples need — no extra SDK
+# install). Each host builds its own arch's tarball; the CI release workflow
+# pairs an x86_64 runner (this musl path) with an arm64 one (Linux-aarch64) so
+# both Linux tarballs are produced natively.
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) TARGET="x86_64-unknown-linux-musl" ;;
+    Linux-aarch64) TARGET="aarch64-unknown-linux-musl" ;;
     Darwin-arm64) TARGET="aarch64-apple-darwin" ;;  # host tarball; x86_64 is cross-built below
     *)
         echo "error: unsupported platform: $(uname -s) $(uname -m)" >&2
-        echo "error: ${VERSION} ships Linux x86_64 (musl), macOS arm64, and macOS x86_64" >&2
+        echo "error: ${VERSION} ships Linux x86_64 + arm64 (static musl), macOS arm64, and macOS x86_64" >&2
         echo "error: the macOS x86_64 tarball is cross-built on the Darwin-arm64 host" >&2
         exit 1
         ;;
+esac
+
+# Linux package arch tag for the .deb/.rpm filenames — the same spelling the
+# tarballs use (x86_64 / aarch64), NOT Debian's control-file arch (amd64 /
+# arm64, which build-deb.sh maps it to internally). Empty on the macOS target,
+# where .deb/.rpm are not built; used both to gate that block and to name its
+# artifacts.
+case "$TARGET" in
+    x86_64-unknown-linux-musl) PKG_ARCH="x86_64" ;;
+    aarch64-unknown-linux-musl) PKG_ARCH="aarch64" ;;
+    *) PKG_ARCH="" ;;
 esac
 
 # The release binaries (must match scripts/install.sh and the formula). The
@@ -127,7 +142,10 @@ BINARIES=(choreographr choreo-tui)
 # replaced the RUSTSEC-2026-0187-vulnerable lopdf ^0.41 pin.
 
 # ── Tarball build ────────────────────────────────────────────────────────────
-# The Linux tarball is a fully static x86_64-unknown-linux-musl cross-build.
+# The Linux tarballs are fully static musl builds — x86_64-unknown-linux-musl
+# (cross-built on the Linux-x86_64 host) and aarch64-unknown-linux-musl (built
+# on the Linux-aarch64 host; each host produces its own arch's tarball, and the
+# CI workflow pairs an x86_64 runner with an arm64 one).
 # A static musl build is viable because the shipped binaries link no C
 # libraries: the desktop-notify tool (notify-rust/libdbus-sys — the last C
 # dependency) was removed from the daemon, so nothing requires glibc anymore.
@@ -141,7 +159,7 @@ BINARIES=(choreographr choreo-tui)
 # mimalloc — Apple builds keep the system allocator).
 #
 # The cross-build runs through cargo-zigbuild because cc-rs passes the full
-# Rust triple `x86_64-unknown-linux-musl` to the C compiler, and `zig cc`'s
+# Rust triple `<arch>-unknown-linux-musl` to the C compiler, and `zig cc`'s
 # target-query grammar rejects the `unknown` vendor slot
 # (`UnknownOperatingSystem`); cargo-zigbuild translates the Rust triple to
 # zig's grammar (`x86_64-linux-musl`) for both cc-rs and the linker, which is
@@ -159,7 +177,7 @@ BINARIES=(choreographr choreo-tui)
 # two --target triples gets one rustflags value for both) — and only the
 # `--target` form is used for the native triple too, so the artifacts land in
 # distinct keyed target/<triple>/dist dirs and the staging loop below is
-# uniform across all three shipped targets.
+# uniform across all shipped targets.
 TARBALL_JOBS=()
 if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     echo "==> building release binaries (daemon + TUI packages)"
@@ -175,6 +193,17 @@ if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     # exact mechanism with a different value.
     RUSTFLAGS="-C target-cpu=x86-64-v2" ./scripts/build-stable.sh zigbuild --locked --profile dist -p choreographr -p choreo-tui --target x86_64-unknown-linux-musl --features choreographr/metrics,choreographr/blockchain,choreographr/mimalloc,choreo-tui/mimalloc
     TARBALL_JOBS+=("x86_64-unknown-linux-musl target/x86_64-unknown-linux-musl/dist")
+elif [ "$TARGET" = "aarch64-unknown-linux-musl" ]; then
+    echo "==> building release binaries (daemon + TUI packages)"
+    # aarch64 musl: the SAME fully-static-musl + mimalloc story as x86_64,
+    # cross-built through cargo-zigbuild the same way (zig cc compiles the C
+    # deps — ring, aws-lc-sys, mimalloc — for the aarch64-linux target). NO
+    # target-cpu flag: the generic aarch64 baseline already includes NEON (SIMD
+    # is mandatory in AArch64), so there is no x86-style v1/v2/v3 tier split to
+    # aim at and the target default is the correct, fleet-safe choice — the
+    # same reasoning as the Darwin-arm64 arm below.
+    ./scripts/build-stable.sh zigbuild --locked --profile dist -p choreographr -p choreo-tui --target aarch64-unknown-linux-musl --features choreographr/metrics,choreographr/blockchain,choreographr/mimalloc,choreo-tui/mimalloc
+    TARBALL_JOBS+=("aarch64-unknown-linux-musl target/aarch64-unknown-linux-musl/dist")
 else
     echo "==> building release binaries (daemon + TUI packages)"
     # Native aarch64: NO target-cpu flag — the aarch64-apple-darwin target spec
@@ -250,17 +279,21 @@ done
 # the AUR `-bin` package in one artifact), not of the distro packages. They
 # consume `target/dist/` from a plain host build; the musl tarball build
 # above does NOT populate that directory, so build it here. (On macOS this
-# step is skipped — dpkg/rpmbuild are not present.)
-if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
+# step is skipped — dpkg/rpmbuild are not present.) The block runs on EITHER
+# Linux host: build-deb.sh/build-rpm.sh detect the host arch and name the
+# artifacts accordingly (x86_64 / aarch64), so a native arm64 box produces the
+# arm64 .deb/.rpm the same way.
+if [ -n "$PKG_ARCH" ]; then
     echo "==> building host (glibc) dist binaries for .deb/.rpm"
     # Deliberately NO target-cpu: the .deb/.rpm serve the full glibc-distro
     # range, whose baselines are split (Debian/Arch/Fedora = v1, RHEL 10 =
-    # v3), so baseline (2003 SSE2) is the only level that covers them all.
+    # v3), so baseline (2003 SSE2 on x86-64; the generic aarch64 baseline on
+    # arm64) is the only level that covers them all.
     ./scripts/build-stable.sh build --locked --profile dist -p choreographr -p choreo-tui --features choreographr/metrics,choreographr/blockchain
 
     # .deb/.rpm are best-effort: skip with a warning when the toolchain is
-    # absent so a Linux-x86_64 release can still proceed without dpkg/rpmbuild
-    # installed. The whole block is gated on the Linux-musl target because
+    # absent so a Linux release can still proceed without dpkg/rpmbuild
+    # installed. The whole block is gated on the Linux package arch because
     # .deb/.rpm are Linux-only artifacts — on the macOS build these checks
     # would otherwise print irrelevant "dpkg-deb/rpmbuild not found" warnings
     # (seen for real in the 2026-08-31 workflow_dispatch macOS job).
@@ -281,7 +314,9 @@ fi
 # It covers every `choreographr-${VERSION}-*` file already in dist/: every
 # tarball this pass built (on the macOS host: BOTH the native arm64 and the
 # cross-built x86_64 tarballs), the .deb/.rpm just built above, and any
-# other-arch tarball an operator staged into dist/ before upload. Regenerating
+# other-arch tarball an operator staged into dist/ before upload (the CI
+# release job builds x86_64 and arm64 on separate runners and merges their
+# artifacts, so the combined file spans both). Regenerating
 # here, after the .deb/.rpm
 # step and from the glob rather than the single host tarball, means a combined
 # file is produced and `--upload` never clobbers it with a single-host one.
@@ -295,13 +330,14 @@ ls -lh dist/
 # tarball present in dist/ for this version (the host's plus any staged
 # other-arch tarballs), the checksum file, then the .deb/.rpm when built. The
 # glob always matches at least the host tarball just created, so it needs no
-# nullglob guard under `set -u`.
+# nullglob guard under `set -u`. The .deb/.rpm are named for THIS host's
+# package arch (PKG_ARCH is empty on macOS, where neither exists).
 GH_ARTIFACTS=("dist/SHA256SUMS")
 for tarball in dist/choreographr-${VERSION}-*.tar.gz; do
     GH_ARTIFACTS+=("$tarball")
 done
-[ -f "dist/choreographr-${VERSION}-x86_64.deb" ] && GH_ARTIFACTS+=("dist/choreographr-${VERSION}-x86_64.deb")
-[ -f "dist/choreographr-${VERSION}-x86_64.rpm" ] && GH_ARTIFACTS+=("dist/choreographr-${VERSION}-x86_64.rpm")
+[ -f "dist/choreographr-${VERSION}-${PKG_ARCH}.deb" ] && GH_ARTIFACTS+=("dist/choreographr-${VERSION}-${PKG_ARCH}.deb")
+[ -f "dist/choreographr-${VERSION}-${PKG_ARCH}.rpm" ] && GH_ARTIFACTS+=("dist/choreographr-${VERSION}-${PKG_ARCH}.rpm")
 
 echo
 echo "==> validate before uploading:"

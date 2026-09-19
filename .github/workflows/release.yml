@@ -15,11 +15,17 @@
 #     are iterated out on demand.
 #
 # What each job builds (mirroring the manual SOP's conventions):
-#   linux-musl      scripts/release.sh on ubuntu — static x86_64-unknown-linux-musl
-#                   tarball (cargo-zigbuild cross-build, mimalloc) plus best-effort
-#                   .deb and .rpm: dpkg-deb is preinstalled on the runner and
-#                   rpmbuild is apt-installed below, so release.sh's best-effort
-#                   step builds both.
+#   linux-x86_64    scripts/release.sh on an x86_64 ubuntu — static
+#                   x86_64-unknown-linux-musl tarball (cargo-zigbuild cross-build,
+#                   mimalloc) plus best-effort .deb and .rpm: dpkg-deb is
+#                   preinstalled on the runner and rpmbuild is apt-installed below,
+#                   so release.sh's best-effort step builds both.
+#   linux-arm64     scripts/release.sh on a NATIVE arm64 ubuntu runner — static
+#                   aarch64-unknown-linux-musl tarball plus the arm64 .deb/.rpm.
+#                   release.sh detects Linux-aarch64 and takes the aarch64 musl
+#                   branch (same cargo-zigbuild path, no target-cpu flag). Because
+#                   the runner is arm64, its smoke tests execute the binaries
+#                   NATIVELY (no qemu) — the strongest coverage of the arm64 slice.
 #   macos-arm64     scripts/release.sh on the arm64 macOS runner — native
 #                   aarch64-apple-darwin tarball PLUS the cross-built
 #                   x86_64-apple-darwin tarball (both from one release.sh
@@ -52,8 +58,9 @@
 # The windows-msvc build is TEMPORARILY excluded from the published release:
 # the job still runs (build + smoke tests + artifact upload) so the Windows
 # binary stays exercised on every tag, but the release job neither lists it in
-# `needs` NOR downloads it — its `download-artifact` step enumerates the three
-# shipping platforms, with a guard that fails on a stray Windows artifact.
+# `needs` NOR downloads it — its `download-artifact` step enumerates the four
+# shipping platforms (Linux x86_64 + arm64, macOS, Android), with a guard that
+# fails on a stray Windows artifact.
 # `needs` alone is not enough (it only gates when the job starts): a bare
 # `pattern: "*"` download pulls in EVERY artifact in the run, so the zip once
 # raced into a release and leaked into SHA256SUMS. When the Windows runtime is
@@ -97,7 +104,7 @@ defaults:
     shell: bash
 
 jobs:
-  linux-musl:
+  linux-x86_64:
     name: linux x86_64 (static musl)
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -181,6 +188,74 @@ jobs:
           # picked up without touching this file. Per-job SHA256SUMS files are
           # deliberately NOT uploaded — the release job recomputes one
           # combined checksum file over ALL artifacts.
+          path: dist/choreographr-*
+          if-no-files-found: error
+
+  linux-arm64:
+    name: linux aarch64 (static musl)
+    # Native arm64 Linux: GitHub's free public arm64 runners. Running natively
+    # (rather than cross-compiling arm64 on the x86_64 job) means the smoke
+    # tests EXECUTE the arm64 binaries on real arm64 hardware — no qemu — so
+    # the arm64 slice gets the same first-class execution coverage as x86_64.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        run: |
+          # Same release policy as the x86_64 job: stable only, never the
+          # toml-pinned nightly. release.sh detects Linux-aarch64 and takes the
+          # aarch64 musl branch, so the target here is the arm64 musl one.
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add --toolchain stable aarch64-unknown-linux-musl
+
+      # Same cargo-zigbuild + zig setup as the x86_64 job (release.sh's aarch64
+      # branch runs through `build-stable.sh zigbuild` too: cc-rs passes the
+      # full Rust triple, which zig's target grammar rejects; cargo-zigbuild
+      # translates it for cc-rs and the linker).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - uses: mlugg/setup-zig@v2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install rpmbuild
+        run: |
+          # Same best-effort .deb/.rpm story as the x86_64 job (dpkg-deb is
+          # preinstalled; rpmbuild is apt-installed here). The apt update is
+          # scoped to Ubuntu's own sources for the same Google-Chrome-repo
+          # reason documented on the x86_64 job.
+          sudo apt-get update -qq \
+            -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0"
+          sudo apt-get install -y -qq rpm
+
+      - name: Build (static musl tarball + .deb/.rpm)
+        run: |
+          git status --porcelain || true
+          # Same --allow-dirty rationale as the x86_64 job: a CI checkout IS the
+          # pushed commit. On this arm64 runner release.sh builds the
+          # aarch64-unknown-linux-musl tarball and the arm64 .deb/.rpm.
+          ./scripts/release.sh --allow-dirty
+
+      - name: Smoke-test the tarball
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+
+      - name: Daemon smoke-test the tarball
+        run: |
+          # Boots the shipped arm64 daemon hermetically — native execution on
+          # this arm64 runner, the same bring-up check the x86_64 job runs.
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          ./scripts/daemon-smoke.sh "dist/choreographr-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-aarch64-musl
           path: dist/choreographr-*
           if-no-files-found: error
 
@@ -693,7 +768,7 @@ jobs:
 
   release:
     name: create GitHub release
-    needs: [linux-musl, macos-arm64, android-termux]
+    needs: [linux-x86_64, linux-arm64, macos-arm64, android-termux]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Only tag pushes publish. workflow_dispatch runs skip this job — their
@@ -709,10 +784,11 @@ jobs:
       # which downloads EVERY artifact in the run and races the not-yet-shippable
       # windows-msvc zip into the release (it once did, and leaked into
       # SHA256SUMS). `needs` gates when this job starts; it does not scope the
-      # download.
+      # download. Both Linux arches (x86_64 + aarch64) ship, each from its own
+      # runner, so both artifact names are listed.
       - uses: actions/download-artifact@v8
         with:
-          pattern: "{linux-x86_64-musl,macos-aarch64,android-aarch64-termux}"
+          pattern: "{linux-x86_64-musl,linux-aarch64-musl,macos-aarch64,android-aarch64-termux}"
           merge-multiple: true
           path: dist
 

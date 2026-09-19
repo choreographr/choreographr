@@ -139,7 +139,8 @@ platform case keys on `Linux-riscv64`.
 ### Build orchestration
 
 - **`scripts/release.sh`** — today the target is derived from `uname` and the
-  musl build path is gated on `TARGET = x86_64-unknown-linux-musl`. Add:
+  musl build path is gated on the Linux package arch (x86_64/aarch64 share the
+  `zigbuild` branch, keyed off `PKG_ARCH`). Add:
   - an explicit **target override** (env `RELEASE_TARGET` or `--target <triple>`)
     so the x86_64 CI runner can emit the riscv tarball (release.sh is otherwise
     host-keyed);
@@ -162,14 +163,13 @@ platform case keys on `Linux-riscv64`.
   to the platform case; update the "ships … only" error text.
 - **`packaging/aur/PKGBUILD`** — `arch=('x86_64' 'riscv64')` with a
   `CARCH`-conditional `source`/`sha256sums` (both arch use the musl tarball,
-  different filenames); `.SRCINFO` regenerated.
-- **Optional `.deb`/`.rpm`** — because the riscv binaries are **static**, riscv
-  packages can be produced from the same binaries with only an arch-string
-  change (no cross-toolchain): parameterize `scripts/build-deb.sh`
-  (`Architecture: amd64` → selectable; Debian arch `riscv64`) and
-  `scripts/build-rpm.sh` + `packaging/rpm/choreographr.spec`
-  (`BuildArch: x86_64` → selectable; RPM arch `riscv64`). Gated behind a
-  decision ([§8](#8-decisions)).
+  different filenames); `.SRCINFO` regenerated. (The PKGBUILD already carries
+  arch-conditional sources for x86_64/aarch64 — extend that pattern.)
+- **`.deb`/`.rpm`** — `scripts/build-deb.sh` / `build-rpm.sh` now detect the
+  host arch (`uname -m`) and tag the package from it (x86_64/aarch64 today);
+  both build from the **static** musl binaries' sibling glibc build, so adding
+  riscv64 is an arch-string case plus a glibc-host build (gated behind a
+  decision, [§8](#8-decisions)).
 
 ### Tooling & docs
 
@@ -186,13 +186,13 @@ platform case keys on `Linux-riscv64`.
 ## 5. CI job design
 
 New `linux-riscv64` job in `.github/workflows/release.yml`, modeled on the
-existing `linux-musl` job (cross-builds on `ubuntu-latest`; no native runner
+existing `linux-x86_64` job (cross-builds on `ubuntu-latest`; no native runner
 needed):
 
 1. `ubuntu-latest`; install stable toolchain +
    `rustup target add --toolchain stable riscv64gc-unknown-linux-musl`.
 2. `mlugg/setup-zig@v2` + `taiki-e/install-action` (cargo-zigbuild), same as
-   `linux-musl`.
+   `linux-x86_64`.
 3. Build via `release.sh` with `RELEASE_TARGET=riscv64gc-unknown-linux-musl`
    (or inline like the windows job).
 4. `sudo apt-get install -y qemu-user-static` — this registers riscv64 binfmt on
@@ -315,6 +315,6 @@ Dependencies: 0 → 1 → (2) → (3) → (4) → 5.
   — `fix: support riscv64 gnu/musl targets`.
 - `zlob` `rust/build.rs` (`rust_target_to_clang`, `rust_target_to_zig`).
 - `deny.toml` — `[sources]` crates.io-only policy.
-- `.github/workflows/release.yml` — `linux-musl`, `android-termux` (qemu-user),
+- `.github/workflows/release.yml` — `linux-x86_64`, `android-termux` (qemu-user),
   `ios-build` (`BINDGEN_EXTRA_CLANG_ARGS_*`) jobs.
 - `run_riscv` guest tool: `choreo-daemon/src/tools/vm.rs`.

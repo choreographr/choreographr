@@ -206,8 +206,8 @@ after Choreographr.
 Prebuilt releases ship exactly two binaries — `choreographr choreo-tui`
 (`choreo-mcp` is a library-only crate and ships no binary; the `choreo-im`
 and `choreo-acp` bridges ship only in source builds — `cargo build -p choreo-im`
-/ `cargo build -p choreo-acp`) — for **x86_64 Linux**, **macOS (Apple Silicon
-and Intel)**, **Windows (x86_64)**,
+/ `cargo build -p choreo-acp`) — for **Linux (x86_64 and aarch64)**, **macOS
+(Apple Silicon and Intel)**, **Windows (x86_64)**,
 and **Android/Termux (aarch64)**. All installs below use prebuilt binaries; no
 Rust or Zig toolchain is required. (The binaries are built by the GitHub
 Actions `release` workflow on every `vX.Y.Z` tag — see RELEASE.md's
@@ -255,18 +255,25 @@ Alternatives:
 
 ### Linux
 
-- **Debian / Ubuntu** — install the `.deb` from the release:
-  `sudo apt install ./choreographr-<version>-x86_64.deb`
+Both Linux architectures ship: **x86_64** and **aarch64** (arm64). The
+`.deb`/`.rpm` and the tarball are named for the arch — use the `x86_64` asset
+on an Intel/AMD box and the `aarch64` asset on an arm64 one.
+
+- **Debian / Ubuntu** — install the `.deb` from the release (use `arm64`'s
+  filename tag `aarch64`):
+  `sudo apt install ./choreographr-<version>-x86_64.deb` (or
+  `./choreographr-<version>-aarch64.deb`)
 - **Fedora / RHEL / openSUSE** — install the `.rpm` from the release:
-  `sudo dnf install ./choreographr-<version>-x86_64.rpm`
+  `sudo dnf install ./choreographr-<version>-x86_64.rpm` (or
+  `./choreographr-<version>-aarch64.rpm`)
 - **Arch Linux (AUR)** — the prebuilt `choreographr-bin` package is **not yet
   published** (no maintainer account yet; AUR registration is closed). For now
   use the tarball/installer or `cargo install` below.
 - **Any distro** — tarball + installer, or cargo:
   `curl -fsSL https://choreographr.com/install.sh | sh` ·
   `cargo binstall choreographr` (prebuilt, no toolchain — fetches the static
-  musl tarball from GitHub Releases; the binstall manifest maps glibc x86_64
-  hosts to the musl asset, so no `--target` is needed) ·
+  musl tarball from GitHub Releases; the binstall manifest maps glibc hosts to
+  the musl asset for both x86_64 and arm64, so no `--target` is needed) ·
   `cargo install choreographr choreo-tui choreo-im choreo-acp` (source build,
   needs Zig — installs the daemon + TUI + bridges; from a local clone, one
   `cargo install --path <crate-dir>` per crate)
@@ -1141,7 +1148,7 @@ dependency snapshot; it is intentionally not enabled (repo size).
 Release tooling lives in [`scripts/`](./scripts) and the packaging assets it
 consumes in [`packaging/`](./packaging) — see `packaging/README.md` for the
 per-asset breakdown. The end-to-end runbook for cutting a release (crates.io
-publish, both build machines, GitHub release, Homebrew/AUR/choreographr.com
+publish, the build hosts, GitHub release, Homebrew/AUR/choreographr.com
 updates) is [`RELEASE.md`](./RELEASE.md). The one-command flow is:
 
 ```bash

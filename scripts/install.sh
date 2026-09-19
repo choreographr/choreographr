@@ -63,18 +63,19 @@ for arg in "$@"; do
     esac
 done
 
-# Platform detection — match the shipped tarballs. The Linux tarball is the
-# fully static musl build (see scripts/release.sh), so it runs on any x86_64
-# Linux regardless of the host's glibc version.
+# Platform detection — match the shipped tarballs. Both Linux tarballs are
+# fully static musl builds (see scripts/release.sh), so each runs on any host
+# of its arch regardless of the host's glibc version: x86_64 and aarch64.
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "${OS}-${ARCH}" in
     Linux-x86_64) ASSET="choreographr-${VERSION}-x86_64-unknown-linux-musl.tar.gz" ;;
+    Linux-aarch64) ASSET="choreographr-${VERSION}-aarch64-unknown-linux-musl.tar.gz" ;;
     Darwin-arm64) ASSET="choreographr-${VERSION}-aarch64-apple-darwin.tar.gz" ;;
     Darwin-x86_64) ASSET="choreographr-${VERSION}-x86_64-apple-darwin.tar.gz" ;;
     *)
         echo "$0: error: unsupported platform: ${OS} ${ARCH}" >&2
-        echo "$0: error: ${VERSION} ships Linux x86_64, macOS arm64, and macOS x86_64 only" >&2
+        echo "$0: error: ${VERSION} ships Linux x86_64 + arm64, macOS arm64, and macOS x86_64 only" >&2
         exit 1
         ;;
 esac

@@ -9,7 +9,8 @@ A release ships three things:
    dependency order) — enables
    `cargo install choreographr choreo-tui` / `cargo binstall`.
 2. **GitHub release `vX.Y.Z`** on `choreographr/choreographr` with prebuilt
-   artifacts (musl/macOS/Android tarballs, desktop `.deb` + `.rpm`,
+   artifacts (Linux x86_64 + arm64 musl tarballs, macOS/Android tarballs,
+   desktop `.deb` + `.rpm` in both Linux arches,
    Termux-native `.deb`, combined `SHA256SUMS`) — enables Homebrew,
    AUR, `cargo binstall`, and the `choreographr.com` installer. (The Windows
    `.zip` is built and smoke-tested on every tag but is not attached to the
@@ -57,24 +58,27 @@ built nowhere.
 
 | Job | Runner | Artifacts |
 |---|---|---|
-| `linux-musl` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` + `.rpm` (via `scripts/release.sh`; `rpmbuild` is apt-installed in the job, since it is not preinstalled) |
+| `linux-x86_64` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` + `.rpm` (via `scripts/release.sh`; `rpmbuild` is apt-installed in the job, since it is not preinstalled) |
+| `linux-arm64` | ubuntu-24.04-arm | static `aarch64-unknown-linux-musl` tarball + arm64 `.deb` + `.rpm` (via `scripts/release.sh` on a NATIVE arm64 runner, so its smoke tests execute the arm64 binaries on real arm64 hardware) |
 | `macos-arm64` | macos-latest | native `aarch64-apple-darwin` tarball **plus** the cross-built `x86_64-apple-darwin` tarball (both via one `scripts/release.sh` pass; the Intel slice is smoke-tested under Rosetta and verified by construction downstream — no free x64 macOS runner exists) |
 | `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the shipped `.exe` files — **built and smoke-tested on every tag, but currently NOT part of the published release** (the `release` job's `needs` omits this job until the Windows runtime is ready to ship) |
 | `android-termux` | ubuntu-latest + NDK | `aarch64-linux-android` Termux tarball (via `scripts/build-android.sh --features metrics,blockchain`) + the Termux-native `.deb` (via `scripts/build-deb-termux.sh`, structural smoke-test on the runner; the packaged binaries are then extracted with Termux's own dpkg-deb under qemu-user and executed against an unpacked Termux aarch64 rootfs — see the workflow's qemu step) |
 | `ios-build` | macos-latest | **none** — `choreo-gui` (the only crate that ships to iOS) compile check for both iOS targets, the real Xcode app link via the `ios/` scaffold, and a non-blocking simulator boot smoke (`continue-on-error` until the plumbing has proven stable). Deliberately not part of the release; a failing link is diagnosed from the log |
 
 Every build job smoke-tests its own artifact beyond the clap surface: the
-three desktop jobs run `scripts/daemon-smoke.sh` (boots the shipped daemon
+four desktop jobs run `scripts/daemon-smoke.sh` (boots the shipped daemon
 hermetically — scratch socket + config dir — and proves the listener comes
-up); the macOS job additionally runs the x86_64 tarball's smoke suites under
+up); the arm64 Linux job runs both smoke suites NATIVELY on real arm64
+hardware; the macOS job additionally runs the x86_64 tarball's smoke suites under
 Rosetta (an approximation, not native execution — no free x64 macOS runner
 exists; see the release.yml comments); and the android job **executes** its
 binaries under qemu-user
 against the official Termux aarch64 rootfs (skopeo fetches the image layers;
 no docker), closing the "never executed before release" gap.
 
-The `release` job (tag pushes only) downloads the three shipping platforms'
-build artifacts (`linux-musl`, `macos-arm64`, `android-termux` — deliberately
+The `release` job (tag pushes only) downloads the four shipping platforms'
+build artifacts (`linux-x86_64`, `linux-arm64`, `macos-arm64`, `android-termux`
+— deliberately
 not the not-yet-shipped `windows-msvc`),
 generates one combined `SHA256SUMS` over everything, guards that the pushed
 tag matches the manifest version, runs the `check-changelog` guard (a repeated
@@ -456,8 +460,9 @@ details in [CI builds](#ci-builds-github-actions)).
 
 Conductor duties while the workflow runs:
 
-1. **Watch the run** (`gh run watch` on the `release` workflow) — the three
-   jobs the release waits on (`linux-musl`, `macos-arm64`, `android-termux`)
+1. **Watch the run** (`gh run watch` on the `release` workflow) — the four
+   jobs the release waits on (`linux-x86_64`, `linux-arm64`, `macos-arm64`,
+   `android-termux`)
    must go green. The `windows-msvc` job runs and smoke-tests its artifact but
    does NOT gate the release (it is not in the release job's `needs`), and the
    `ios-build` job may report its (non-blocking) smoke result; investigate a
@@ -465,9 +470,10 @@ Conductor duties while the workflow runs:
 2. **Verify the release page** once the `release` job completes:
    - the tag on the release matches `vX.Y.Z` and the manifest version
      (the job guards this too — a guard failure means a Phase 1/2 mistake);
-   - all assets are present: four tarballs (musl, macOS arm64, macOS x86_64,
-     Android Termux),
-     the desktop `.deb` and `.rpm`, the Termux-native `.deb`, and the
+   - all assets are present: five tarballs (Linux musl x86_64 + arm64,
+     macOS arm64, macOS x86_64, Android Termux),
+     the desktop `.deb` and `.rpm` for both Linux arches, the Termux-native
+     `.deb`, and the
      combined `SHA256SUMS` (the Windows `.zip` is built but intentionally not
      attached — see [CI builds](#ci-builds-github-actions));
    - each asset downloads.
@@ -540,9 +546,11 @@ published the moment an account exists.
 When an AUR account is available — `packaging/aur/PKGBUILD`:
 
 1. Bump `pkgver` to `X.Y.Z`, reset `pkgrel` to `1`.
-2. Update the `source` URL and `sha256sums` (the digest from the release's
-   `SHA256SUMS` — the tarball is
-   `choreographr-<V>-x86_64-unknown-linux-musl.tar.gz`).
+2. Update both `source_<arch>` URLs and both `sha256sums_<arch>` digests (from
+   the release's `SHA256SUMS` — the tarballs are
+   `choreographr-<V>-x86_64-unknown-linux-musl.tar.gz` and
+   `choreographr-<V>-aarch64-unknown-linux-musl.tar.gz`). The aarch64 digest is
+   a placeholder until the arm64 tarball ships — fill it here.
 3. Regenerate `.SRCINFO` and commit **in this repo** (`packaging/aur/` is part
    of `choreographr/choreographr`, not an AUR checkout):
    ```nu
@@ -651,7 +659,9 @@ desktop machines run `scripts/release.sh`, which:
   x86-64-v2 for the musl tarball, the target default (`apple-a14`) for the
   macOS arm64 tarball, x86-64-v3 (AVX2/FMA) for the macOS x86_64 tarball —
   the last Intel-capable macOS fleet is exactly the 2019–2020 Intel Macs,
-  all AVX2-capable — and baseline for the `.deb`/`.rpm` — the local
+  all AVX2-capable — and baseline for the `.deb`/`.rpm` and for the arm64 musl
+  tarball (the generic aarch64 baseline already includes NEON, so no flag) —
+  the local
   `-C target-cpu=native` profile
   flags (and the nightly `-Z…` flags) are additionally stripped by
   `scripts/build-stable.sh` before each stable build, so the build machine's
@@ -665,25 +675,30 @@ desktop machines run `scripts/release.sh`, which:
 - builds `.deb`/`.rpm` best-effort (Linux only, host glibc, no mimalloc),
 - prints the `gh release create` command and the post-publish checklist.
 
-The manual flow needs one **Linux x86_64 box** (musl tarball — static,
-mimalloc — plus `.deb`/`.rpm`; needs `cargo-zigbuild`, optional
-`dpkg-deb`/`rpmbuild`) and one **M1 MacBook** (both darwin tarballs —
+The manual flow needs one **Linux box** — x86_64 or arm64, each producing its
+own arch's musl tarball (static, mimalloc) plus that arch's `.deb`/`.rpm`;
+needs `cargo-zigbuild`, optional
+`dpkg-deb`/`rpmbuild` — and one **M1 MacBook** (both darwin tarballs —
 release.sh on a Darwin-arm64 host native-builds the aarch64 tarball AND
 cross-builds the x86_64 one in the same pass).
-Artifacts are staged and uploaded from the Linux box — the macOS tarballs are
+Artifacts are staged and uploaded from the Linux box — the arm64 Linux and
+macOS tarballs are
 copied there before upload. Windows and Android/Termux artifacts have no
 manual path; if CI is unavailable for them, skip those assets for the
 release or wait for CI (a re-pushed tag after `gh release delete` re-triggers
 it).
 
-### Linux x86_64 box
+### Linux box
 
 ```nu
-just release            # dry-run: musl tarball + SHA256SUMS + .deb + .rpm
+just release            # dry-run: this arch's musl tarball + SHA256SUMS + .deb + .rpm
 just smoke-test         # extract tarball; verify 2 binaries, --version, --help
 ```
 
 Confirm `dist/` contains the musl tarball, `.deb`, `.rpm`, and `SHA256SUMS`.
+Run it on an x86_64 box for the x86_64 set and on an arm64 box for the arm64 set
+(or cross-build the arm64 tarball from x86_64 with the same `--target`
+`scripts/release.sh` uses; the `.deb`/`.rpm` are emitted only for the host arch).
 
 ### M1 MacBook
 
@@ -739,14 +754,17 @@ awk -v "ver=X.Y.Z" 'index($0, "## [" ver "]") == 1 {f=1; next} f && /^## /{exit}
 # spread the asset paths from a list (no line continuation in nushell)
 let assets = [
   "dist/choreographr-X.Y.Z-x86_64-unknown-linux-musl.tar.gz"
+  "dist/choreographr-X.Y.Z-aarch64-unknown-linux-musl.tar.gz"
   "dist/choreographr-X.Y.Z-aarch64-apple-darwin.tar.gz"
   "dist/choreographr-X.Y.Z-x86_64-apple-darwin.tar.gz"
   "dist/choreographr-X.Y.Z-x86_64.deb"
+  "dist/choreographr-X.Y.Z-aarch64.deb"
   "dist/choreographr-X.Y.Z-x86_64.rpm"
+  "dist/choreographr-X.Y.Z-aarch64.rpm"
   "dist/SHA256SUMS"
 ]
 gh release create vX.Y.Z ...$assets --title $TITLE --notes-file $NOTES --generate-notes
 ```
 
-**Gate:** release page lists the five manual-flow assets + `SHA256SUMS`;
+**Gate:** release page lists the manual-flow assets + `SHA256SUMS`;
 assets download.

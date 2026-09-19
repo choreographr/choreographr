@@ -74,9 +74,10 @@ pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ ver
 bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
-# Linux glibc hosts (x86_64-unknown-linux-gnu) get no release tarball: the
-# Linux tarball is the static musl build. Map that target to the musl asset so
-# plain `cargo binstall choreographr` works on glibc distros without --target.
+# Linux glibc hosts get no native release tarball: the Linux tarballs are the
+# static musl builds. Map both glibc host targets to their musl asset so plain
+# `cargo binstall choreographr` works on glibc distros (x86_64 and arm64)
+# without --target.
 #
 # Template notes (binstall semantics): `{ version }` renders as the bare semver
 # (0.1.0) — the `v` prefix on the tag is written explicitly in the path — and
@@ -87,6 +88,9 @@ pkg-fmt = "tgz"
 # source path and binstall rejects it.
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-x86_64-unknown-linux-musl{ archive-suffix }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-aarch64-unknown-linux-musl{ archive-suffix }"
 
 [workspace]
 members = [

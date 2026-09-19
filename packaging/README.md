@@ -67,11 +67,13 @@ the Termux session.
 — plus both service files into
 `dist/choreographr-<version>-<target>.tar.gz`, with the binaries at the **top
 level** of the archive (no `bin/` prefix) and their exec bits preserved. The
-Linux tarball is a **fully static `x86_64-unknown-linux-musl`** build (with
-mimalloc as the allocator), so one artifact serves general Linux — including
-the AUR `choreographr-bin` package — regardless of the host's glibc version;
-the macOS tarball is the native `aarch64-apple-darwin` build. The
-tarball is published to the GitHub release
+Linux tarballs are **fully static musl** builds (`x86_64-unknown-linux-musl`
+and `aarch64-unknown-linux-musl`, with mimalloc as the allocator), so each
+serves its arch of general Linux — including the AUR `choreographr-bin`
+package — regardless of the host's glibc version;
+the macOS tarballs are the native `aarch64-apple-darwin` build and a
+cross-built `x86_64-apple-darwin` one. The
+tarballs are published to the GitHub release
 (`https://github.com/choreographr/choreographr/releases`) and mirrored at
 `https://choreographr.com/download/<version>/`, where a `SHA256SUMS` file sits
 beside it for `scripts/install.sh`.
@@ -109,6 +111,16 @@ bump checklist. The manual steps that must stay in lockstep:
 
 ## Notes
 
+- **Linux ships two arches (x86_64 + aarch64).** Both Linux tarballs are
+  fully static musl builds, and the desktop `.deb`/`.rpm` are built on each
+  arch's own host. `scripts/build-deb.sh`/`build-rpm.sh` detect the host arch
+  (`uname -m`) and tag accordingly: the `.deb` control field uses Debian's
+  spelling (`amd64`/`arm64`) while the filename uses the tarball spelling
+  (`x86_64`/`aarch64`), and the RPM spec's `BuildArch` comes from the
+  `pkg_arch` macro the build script passes. In CI each arch is built on its own
+  runner — `linux-x86_64` on `ubuntu-latest`, `linux-arm64` on the native
+  `ubuntu-24.04-arm` runner (whose smoke tests execute the arm64 binaries on
+  real arm64 hardware, no qemu).
 - **`.deb` archives are xz-compressed.** `dpkg-deb` ≥ 1.22 defaults to zstd
   members, but both deb flavors must install on dpkg builds without zstd: the
   desktop `.deb` targets old-dpkg distros (Ubuntu 22.04's dpkg 1.21.1), and

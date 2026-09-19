@@ -55,6 +55,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching output was dropped with the discarded call; the retry resends the
   full, self-consistent history instead.
 
+- **aarch64 (arm64) Linux is now a first-class release target.** The Linux
+  channel shipped only the static `x86_64-unknown-linux-musl` tarball plus an
+  x86_64-only `.deb`/`.rpm`; it now also ships a static
+  `aarch64-unknown-linux-musl` tarball and arm64 `.deb`/`.rpm`, so an arm64 box
+  (Raspberry Pi, Graviton, Apple-Silicon VM, Termux-adjacent server) installs
+  from prebuilt artifacts exactly like x86_64. `scripts/release.sh` detects
+  `Linux-aarch64` and takes a new aarch64 musl branch (cross-built through the
+  same cargo-zigbuild path — `zig cc` compiles ring/aws-lc-sys/mimalloc for
+  aarch64-linux; no `target-cpu` flag, since the generic aarch64 baseline
+  already includes NEON); `build-deb.sh`/`build-rpm.sh` tag their package from
+  the host arch (Debian's `amd64`/`arm64` in the control field, the tarball
+  spelling `x86_64`/`aarch64` in the filename; the RPM spec's `BuildArch` now
+  comes from a `pkg_arch` macro); `install.sh` gained the `Linux-aarch64`
+  mapping; and the binstall manifest in both `choreographr` and `choreo-tui`
+  maps arm64 glibc hosts to the arm64 musl tarball (mirroring the x86_64
+  override). CI gained a `linux-arm64` job on GitHub's native
+  `ubuntu-24.04-arm` runner (the existing job is renamed `linux-x86_64`);
+  because the runner is arm64 its smoke tests execute the arm64 binaries on
+  real arm64 hardware, and the `release` job now gates on and publishes it. The
+  AUR `choreographr-bin` PKGBUILD carries arch-dependent sources for both
+  arches (its arm64 digest is a placeholder until the first arm64 release).
+
 - **New `just pre-release` — the release gate.** Where `just pre-commit` is the
   commit gate (and, by design, *mutates* the tree via `fmt`),
   `pre-release` is everything a release needs before Phase 1 and never edits the
