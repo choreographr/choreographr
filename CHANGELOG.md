@@ -70,6 +70,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Displayed-image state/handlers extracted into `choreo-tui/src/state/images.rs`.**
+  The image-related `App` methods (`sync_turn_images`, `apply_image_result`,
+  `request_image_fetch`, `flush_image_fetches`, `handle_image_reply`,
+  `submit_image_job`) moved out of the ~7000-line `state/mod.rs` into a sibling
+  module, matching the existing `state/{command_palette,input,layout,pages,providers}.rs`
+  split; the `App` fields and the `TurnEventHandler` impl stay in `state/mod.rs`,
+  so call sites are unchanged (inherent methods resolve crate-wide).
+
 - **Displayed-image bytes are now fetched on demand instead of shipped with every session snapshot (protocol v6).** Opening a session used to transfer the entire image history: `SessionState`, `TurnAppended`, and `TurnsRedone` each carried the full bytes of every `DisplayedImageRecord`, so a long session moved every generated/shown image up front (and a turn accumulating N images re-sent all N on each live append — O(N²)). The daemon now strips `DisplayedImageRecord.data` in `turn_for_client` — the same treatment `ToolResultRecord.image` already received — leaving only the metadata (dimensions, mime, `byte_len`, alt), and clients fetch the bytes when an image actually needs them (the TUI when it scrolls into view) via a new `ClientMessage::GetImage` ⇄ `DaemonMessage::Image` pair keyed by `(session_id, turn_id, image_index)` — the exact `d{i}` slot the DB stores under. Each image is written to the durable attachment store the instant the tool produces it (persist-at-emit in `emit_image`), so the DB is the single source of truth for image bytes at every instant, including mid-request; the daemon serves `GetImage` from that store with one read (`db::read_display_image`), answering `None` (not found) rather than erroring when the slot is absent. This also drops the per-append cost of a multi-image turn from O(N²) to O(N). `PROTOCOL_VERSION` is bumped 5 → 6 (the variant set is the wire contract; mixed-version peers still fail fast at the version gate). Metadata-only frontends (the GUI's image label, the ACP bridge) are unchanged; the TUI and the IM bridge were updated to fetch.
 
 - **`MAX_FRAME_SIZE` raised from 32 MiB to 64 MiB (`choreo-proto`).** The
@@ -180,6 +188,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The `/models` alias is gone — use `/model`.**
 
 ### Fixed
+
+- **A transient displayed-image fetch failure no longer hides the image for the
+  rest of the session (`choreo-tui`).** Image bytes are persisted at emit time,
+  but if that write fails the daemon retries at turn finalize and re-broadcasts
+  the turn — yet the TUI latched `fetch_failed` permanently on the first `None`
+  reply, so `request_image_fetch` never re-requested and an image the daemon did
+  later persist stayed invisible. `sync_turn_images` now clears the latch when a
+  turn is (re-)advertised for an image that is still advertised with
+  `byte_len > 0` and no stored bytes; the `fetching`/`fetch_failed` flags still
+  gate the per-frame render path, so the recovery costs no per-frame spin.
 
 - **The RELEASE.md crates.io sign-in check now actually works.** The documented
   `curl … /api/v1/me` probe could never return `200`: crates.io declares that
