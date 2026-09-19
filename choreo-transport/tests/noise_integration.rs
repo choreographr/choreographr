@@ -217,7 +217,7 @@ fn noise_encrypted_message_round_trip() {
 /// continuation header), which is the *largest payload a single Noise fragment
 /// can carry*: the Noise spec caps messages at 65535 bytes ciphertext, and
 /// snow 0.10 enforces this via a hard `MAXMSGLEN` constant with no builder
-/// knob to raise it. proto's 32 MiB `MAX_FRAME_SIZE` governs only the typed
+/// knob to raise it. proto's 64 MiB `MAX_FRAME_SIZE` governs only the typed
 /// codec layer above the cipher; this test pins the single-fragment wire
 /// format, while `noise_fragmented_message_round_trip` covers payloads past
 /// this cap (which the transport now splits and reassembles transparently).

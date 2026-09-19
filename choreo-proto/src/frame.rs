@@ -31,10 +31,13 @@ pub const PROTOCOL_VERSION: u8 = 5;
 /// `MAX_FRAME_SIZE + 4` bytes.
 ///
 /// Bumped from 1 MiB to 32 MiB to accommodate `SessionState` responses that
-/// carry full image binary data inside `DisplayedImage` records.  The old
-/// limit was tight enough that a single large tool-generated image could
-/// overflow the frame when the client re-attaches to a session.
-pub const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
+/// carry full image binary data inside `DisplayedImage` records, then to
+/// 64 MiB because a long session's full `SessionState` snapshot is
+/// re-serialized *uncompressed* for the wire (the on-disk turns are
+/// zstd-compressed), so accumulated tool output plus displayed images can
+/// exceed 32 MiB even when the database is far smaller.  A payload over the
+/// limit fails to encode (`FrameTooLarge`).
+pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
 /// Encode `(PROTOCOL_VERSION, message)` as named `MessagePack`, enforcing
 /// [`MAX_FRAME_SIZE`]. Shared by [`encode_payload`] (transport-provided
@@ -74,7 +77,7 @@ pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
     let payload = encode_inner(message)?;
 
     let mut frame = Vec::with_capacity(4 + payload.len());
-    // `encode_inner` already bounds `payload.len()` to MAX_FRAME_SIZE (32 MiB),
+    // `encode_inner` already bounds `payload.len()` to MAX_FRAME_SIZE (64 MiB),
     // far below u32::MAX, but go through `try_from` so the length prefix can
     // never silently truncate if the limit is ever raised past 4 GiB.
     let len = u32::try_from(payload.len()).map_err(|_| ProtoError::FrameTooLarge)?;

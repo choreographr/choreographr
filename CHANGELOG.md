@@ -68,6 +68,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`MAX_FRAME_SIZE` raised from 32 MiB to 64 MiB (`choreo-proto`).** The
+  codec's shared single-frame cap — enforced on send and receive by the
+  Unix-socket and TCP/Noise transports, and used as the Noise
+  fragment-reassembly bound — is doubled so a large full-session
+  `SessionState` snapshot still encodes. A long session's turns are
+  re-serialized *uncompressed* for the wire (the on-disk copy is
+  zstd-compressed), so an attach snapshot carrying many turns of tool output
+  and displayed images can exceed 32 MiB even when the database is well under
+  it. Past the cap `encode_inner` returned `FrameTooLarge`, which the daemon's
+  writer treated as a fatal transport error and aborted the connection —
+  escalating, on a single-client auto-started daemon, to a full graceful
+  shutdown. This is a stopgap: the oversized-frame path is still treated as
+  fatal, it just takes 64 MiB to reach. The in-process/embedded transport is
+  unaffected either way — it forwards `DaemonMessage` values and never
+  serializes.
+
 - **The TUI command palette now runs the highlighted command on `Enter` — no preceding `Tab`.** Previously a `/`-query had to be completed with `Tab` before `Enter` would submit it, so selecting a row with `↑`/`↓` and pressing `Enter` did nothing on an empty or partial line. `Enter` now resolves the line through `command_palette_enter_line`: a first token that already names a command exactly runs verbatim (arguments preserved — `model gpt-4o`, `session new foo`), while an empty or still-partial token adopts the highlighted row (keeping any argument tail, so `mo gpt-4o` runs `model gpt-4o`). `Tab` still completes the name without submitting for users who want to keep editing the line.
 
 - **`just pre-commit` is now the commit gate, run automatically after every implementation run.** The gate runs in mutation-aware order — `clippy-fix` → `clippy-strict` → `test-all` → `fmt` → `check-changelog` — and the agent loops it (fix by hand, re-run) until green before committing, without asking the user first. Clippy and `test-all` now cover **all targets and all features**, and any clippy warning fails the gate (the verification pass denies warnings). Formatting runs *last*, not first, precisely because `clippy-fix` mutates the tree while `fmt` is semantics-preserving — the tested bytes stay behaviourally identical to the committed bytes. Commit messages now follow **Conventional Commits**, scoped by crate. The supply-chain and release-name guards moved out of the commit path to the release workflow (they are release guards, not pre-commit guards), and the redundant local-only `just ci` recipe was removed. When work is delegated, each subsession now runs the same gate and commits its unit before returning its report; a subsession that aborts leaves its changes uncommitted for the parent to inspect. The clippy/fmt gate flags live in `.cargo/config.toml` aliases (`clippy-all`, `clippy-all-fix`, `fmt-all`) so the `just` recipes stay flag-free.

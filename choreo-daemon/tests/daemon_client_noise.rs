@@ -564,7 +564,7 @@ fn noise_shutdown_notifies_client() {
 /// loop stores the blob (`handle_add_credential_sync`), and the `CredentialAdded`
 /// reply travels back through the same encrypted channel. This proves the
 /// framing change is invisible above the transport: typed proto messages can
-/// now be as large as the codec's 32 MiB `MAX_FRAME_SIZE`, not just 65518
+/// now be as large as the codec's 64 MiB `MAX_FRAME_SIZE`, not just 65518
 /// bytes.
 #[test]
 #[ignore = "integration"]
