@@ -205,7 +205,7 @@ mod tests {
         // The failure this exists to fix: the model sends only a path. The
         // serde defaults must yield start_line 1 / max_lines 500, not a
         // "missing field` parse error.
-        let args: ReadFileRangeArgs = serde_json::from_str(r#"{"path": "CHANGELOG.md"}"#)
+        let args: ReadFileRangeArgs = serde_json::from_str(r#"{"path": "README.md"}"#)
             .expect("omitted range fields must default");
         assert_eq!(args.start_line, 1);
         assert_eq!(args.max_lines, MAX_READ_FILE_RANGE_LINES);
