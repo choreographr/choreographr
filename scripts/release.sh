@@ -344,7 +344,8 @@ echo "==> validate before uploading:"
 echo "    scripts/smoke-test.sh ${TARBALL}"
 echo
 echo "==> release command (run manually, or re-run this script with --upload):"
-echo "    gh release create v${VERSION} ${GH_ARTIFACTS[*]} --title \"choreographr ${VERSION}\" --generate-notes"
+echo "    scripts/release-notes.sh ${VERSION} > /tmp/release-notes.md"
+echo "    gh release create v${VERSION} ${GH_ARTIFACTS[*]} --title \"choreographr ${VERSION}\" --notes-file /tmp/release-notes.md"
 echo
 echo "==> post-publish checklist:"
 echo "  - Homebrew: bump packaging/homebrew/choreographr.rb (version, urls,"
@@ -366,7 +367,12 @@ if [ "$UPLOAD" -eq 1 ]; then
     }
     echo
     echo "==> uploading release v${VERSION}"
+    # Release notes are generated from the commit messages (git-cliff), matching
+    # the CI release job — never the GitHub auto-generated notes.
+    NOTES="$(mktemp)"
+    ./scripts/release-notes.sh "${VERSION}" > "$NOTES"
     gh release create "v${VERSION}" "${GH_ARTIFACTS[@]}" \
-        --title "choreographr ${VERSION}" --generate-notes
+        --title "choreographr ${VERSION}" --notes-file "$NOTES"
+    rm -f "$NOTES"
     echo "==> upload complete"
 fi

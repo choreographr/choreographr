@@ -603,7 +603,7 @@ commit before returning).
   collapsed `Context` rows.
 - **Phase 9 — Docs + gate.** `ARCHITECTURE.md` (new "Prompt-cache discipline &
   append-only transcript" section; loop-flow update; remove stale `SessionMessage`
-  rows), `CHANGELOG.md`, this plan marked done.
+  rows), and this plan marked done.
 
 Dependencies: 0 → (1,2) → (3,4,5) → 6 → 7 → 8 → 9. Phases 1–2 deliver the
 immediate caching win; 7–8 are the heavyweight ones.
@@ -700,7 +700,7 @@ Must not regress:
   pre-change baseline (provider-reported `cached_tokens`).
 - `SCHEMA_VERSION 3` + migration passes against a real v2 DB; `PROTOCOL_VERSION 6`
   with all clients building; full `just pre-commit` green.
-- `ARCHITECTURE.md`, `README.md`, `CHANGELOG.md` updated; stale
+- `ARCHITECTURE.md`, `README.md` updated; stale
   `SessionMessage`/`SessionMessageKind` docs removed.
 
 ---

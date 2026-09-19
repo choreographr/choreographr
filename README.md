@@ -996,8 +996,9 @@ just fmt                  # cargo fmt --all
 just clippy               # lint the workspace (all targets + features)
 just check-supply-chain   # dependency gate: deny.toml bans + RustSec advisories + cache scan
 just install-cargo-deny   # install the policy tool (cargo-deny) that check-supply-chain prefers
-just pre-commit           # the commit gate: clippy-strict + test-all + fmt + check-changelog
-just pre-release          # the release gate: preflight + release-state + fmt-check + clippy-strict + test-all + the release guards + crates.io token check, then push master + dispatch the release-workflow dry run
+just pre-commit           # the commit gate: clippy-strict + test-all + fmt
+just pre-release          # the release gate: preflight + release-state + fmt-check + clippy-strict + test-all + the supply-chain guard + crates.io token check, then push master + dispatch the release-workflow dry run
+just release-notes X.Y.Z  # preview the release notes, generated from commit messages by git-cliff
 just check-release-state  # release preflight: on master, clean, not behind origin/master
 just check-crates-io-token  # confirm the stored crates.io token authenticates (release preflight)
 just release-workflow-dry-run  # push master + kick the release workflow (workflow_dispatch; builds all platforms, creates no release)

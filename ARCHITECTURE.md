@@ -441,9 +441,9 @@ series) and `version_string(base)` renders `"0.2.0 (Lindy)"` for a binary's own
 (`choreographr`, `choreo-tui`, `choreo-im`, `choreo-acp`, `choreo-gui`) passes it
 to `#[command(version = …)]` so `--version` reports it, and the daemon, TUI, IM,
 ACP, and GUI binaries log it at startup. The CI release job reads the same file
-for the GitHub release title, and `scripts/check-release-name.sh` (the
-`just check-release-name` guard) fails on drift between it and the CHANGELOG
-heading.
+for the GitHub release title. (The suite's release notes are no longer a
+hand-maintained `CHANGELOG.md`: they are generated from commit messages by
+git-cliff — `cliff.toml`, via `scripts/release-notes.sh`.)
 - **`clap_styles`** — the single shared clap `Styles` (green headers/usage, cyan
 literals/placeholders) every CLI's `#[command(...)]` names; previously
 copy-pasted into each crate.

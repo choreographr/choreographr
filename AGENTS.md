@@ -32,13 +32,13 @@ Always try to refactor when implementing new features. Look for opportunities to
 
 When making changes, ensure [ARCHITECTURE.md](./ARCHITECTURE.md) and [README.md](./README.md) are kept up to date. If a change affects the architectural decisions, module structure, data flow, or any other documented aspect, update the files accordingly.
 
-Every non-trivial change (new features, fixes, refactors, dependency updates, behavior changes — anything a reviewer would mention in a commit summary) must also get an entry in [CHANGELOG.md](./CHANGELOG.md) under the `## [Unreleased]` section. Only trivial changes (typo fixes, comment-only edits, test-only tweaks) may skip it.
+### Release notes via commits
 
-### CHANGELOG.md
+There is **no hand-maintained `CHANGELOG.md`** — the release notes are generated from the commit messages by [git-cliff](https://git-cliff.org) (`cliff.toml`, via `scripts/release-notes.sh`). The CI `release` job renders the pushed tag's section and uses it verbatim as the GitHub release body. **The commit message is therefore the release note**, and writing it is part of every non-trivial change (a new feature, fix, refactor, dependency update, or behavior change — anything a reviewer would mention in a commit summary). Trivial changes (typo fixes, comment-only edits, test-only tweaks) need nothing extra.
 
-- **One heading per category, at most.** `[Unreleased]` is organized with the Keep a Changelog category headings — `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security` — each appearing **once at most**. Append a new bullet under the matching existing heading; never open a second `### Changed` (or any other) block. Include only the categories that apply — do not add an empty one. A section that repeats a category heading is malformed, not just untidy. The `just check-changelog` guard (scripts/check-changelog.sh) — also run by `just pre-commit` and the release workflow before extraction — enforces this: it fails on a repeated or unknown `### ` category heading, or an empty category block, in ANY `## [...]` section.
-- **Write it for the release page.** At tag time the CI `release` job copies the entire `## [X.Y.Z]` section (heading stripped) verbatim into the GitHub release body, followed by the auto-generated commit notes (see [RELEASE.md](./RELEASE.md) Phase 1). The file is user-facing prose, not a scratchpad: no TODOs, no internal scaffolding, no "see commit …".
-- **Promotion at release.** Phase 1 renames `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and starts a fresh, empty `[Unreleased]` above it (moving the compare link so `[Unreleased]` points at `HEAD` again). Once a series is named, the heading always carries that dance-style name in parentheses — `## [X.Y.Z] - YYYY-MM-DD (Name)` — where a **major/minor** release sets a new name and a **patch** keeps the current one (the pre-name 0.1.0 heading has none). The machine source of truth for that name is `choreo-shared/release-name.txt` (a single line; edited on major/minor only), which is compiled into the binaries and read by the CI release job for the release title. The `just check-release-name` guard — also run by the release workflow — fails the release if the file and the heading drift apart. The extraction accepts the dated, undated, and named heading forms.
+- **Write the commit for the release page.** The subject becomes the bullet (its Conventional `type(scope):` prefix is stripped) and the body becomes that bullet's indented paragraph: user-facing prose, not a scratchpad — no TODOs, no internal scaffolding, no "see commit …". One commit per release-note paragraph; avoid nested `- ` sub-bullets (render them as prose).
+- **Types that appear on the release page:** `feat` → **Added**, `fix` → **Fixed**, `perf`/`refactor` → **Changed**, plus two deliberate non-standard types that map 1:1 to their Keep a Changelog headings because they cannot be inferred: **`remove`** → Removed and **`security`** → Security. Housekeeping types — `chore` (except `chore(deps)`, which stays under Changed), `docs`, `ci`, `test`, `style`, `build` — are omitted from the notes. The mapping lives in `cliff.toml`; keep this list and that file in sync.
+- **Release metadata.** A major/minor release sets a new dance-style **name**, a patch keeps the current one — the machine source of truth is `choreo-shared/release-name.txt` (a single line, edited on major/minor only), compiled into the binaries and read by the CI release job for the release title. See [RELEASE.md](./RELEASE.md) Phase 1.
 
 ## Test Discipline
 
@@ -118,13 +118,13 @@ A run is committed **once, at the end of each unit of work** — not once per tu
 
 ### Run the gate directly — do not invent intermediate gates
 
-When a run is ready to verify, run **`just pre-commit`** as the one and only gate. Do **not** prefix it with a bespoke sequence of checks — a scoped `cargo clippy -p …`/`cargo clippy --all-targets …`, a scoped `cargo nextest run -p …`, a hand-picked lint or format pass, or any ad-hoc command assembled "to be sure." The recipe already runs the full clippy + test + fmt + changelog sequence with the exact flags the release workflow expects (they live in `.cargo/config.toml`), so every custom pre-check is wasted work — and, worse, a bespoke check can pass while the real gate fails (different scope/flags), or fail while the real gate passes, sending you to fix a non-problem. An inner-loop `cargo nextest run -p <crate>` while you are still editing is fine (see [Task Execution](#task-execution)); the moment the work is ready, go straight to `just pre-commit`, loop it (fix by hand, re-run) until it is green in one pass, then commit.
+When a run is ready to verify, run **`just pre-commit`** as the one and only gate. Do **not** prefix it with a bespoke sequence of checks — a scoped `cargo clippy -p …`/`cargo clippy --all-targets …`, a scoped `cargo nextest run -p …`, a hand-picked lint or format pass, or any ad-hoc command assembled "to be sure." The recipe already runs the full clippy + test + fmt sequence with the exact flags the release workflow expects (they live in `.cargo/config.toml`), so every custom pre-check is wasted work — and, worse, a bespoke check can pass while the real gate fails (different scope/flags), or fail while the real gate passes, sending you to fix a non-problem. An inner-loop `cargo nextest run -p <crate>` while you are still editing is fine (see [Task Execution](#task-execution)); the moment the work is ready, go straight to `just pre-commit`, loop it (fix by hand, re-run) until it is green in one pass, then commit.
 
 ### When the gate is not required
 
 Some changes cannot be affected by any step of the gate and may be committed **without** running `just pre-commit`:
 
-- **Documentation-only changes** — Markdown and other non-Rust text (`README.md`, `ARCHITECTURE.md`, `RELEASE.md`, `AGENTS.md`, `docs/`, `packaging/` service/PKGBUILD files, `.github/workflows/*.yml`, …). `clippy`/`test-all`/`fmt` operate on Rust sources and cannot be affected by them. The one relevant gate step is `check-changelog`: it only matters when `CHANGELOG.md` itself changed, and then you can run `just check-changelog` (or `./scripts/check-changelog.sh`) alone.
+- **Documentation-only changes** — Markdown and other non-Rust text (`README.md`, `ARCHITECTURE.md`, `RELEASE.md`, `AGENTS.md`, `docs/`, `packaging/` service/PKGBUILD files, `.github/workflows/*.yml`, …). `clippy`/`test-all`/`fmt` operate on Rust sources and cannot be affected by them, and no other gate step reads non-Rust text — so these need no gate run. (The release notes are generated from commit messages by git-cliff in CI, so there is no changelog to guard locally; see [Release notes via commits](#release-notes-via-commits).)
 
 Anything that touches Rust source, `Cargo.toml`/`Cargo.lock`, build scripts, or the `.cargo` config still requires the full gate. A mixed change (docs **and** code) takes the strictest applicable rule — run the full gate. When in doubt, run it: it is cheap next to a broken commit.
 
@@ -135,13 +135,12 @@ Run **`just pre-commit`**. It is the commit gate, and it is safe to re-run: loop
 1. **`clippy-strict`** — `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, which must report **nothing**. Fix pre-existing warnings too, not just the ones the change introduced — the gate is a clean workspace, not a clean diff. The gate does not auto-apply lints: run `just clippy-fix` (`cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets --all-features --locked`) by hand first if you want the machine-applicable ones applied automatically.
 2. **`test-all`** — the full unit + integration suite via nextest, all features and all targets (see [Test Discipline](#test-discipline)). It must pass in full.
 3. **`fmt`** — `cargo fmt --all`, applied **last**: fmt is semantics-preserving, so the formatted bytes are behaviourally identical to the tested bytes and need no re-test.
-4. **`check-changelog`** — the `[Unreleased]` structure guard (see [Documentation](#documentation)).
 
 If any step fails, fix the cause and re-run `just pre-commit` from the top — a hand fix can introduce a new clippy warning or test failure, so the gate only holds when the whole sequence is clean in one pass. If clippy, formatting, or the tests genuinely cannot be made to pass, **do not commit**; stop and report the failure instead.
 
-### Documentation and changelog (part of the run, before committing)
+### Documentation (part of the run, before committing)
 
-Update `CHANGELOG.md` under `## [Unreleased]` (see [Documentation](#documentation)) and `ARCHITECTURE.md` / `README.md` if the change touches anything they describe.
+Update `ARCHITECTURE.md` / `README.md` if the change touches anything they describe, and write the commit message as the release note (see [Release notes via commits](#release-notes-via-commits)).
 
 ### Commit
 

@@ -817,41 +817,27 @@ jobs:
         # — it is a release guard, enforced here before the release publishes.
         run: ./scripts/check-supply-chain.sh
 
-      - name: Check the changelog is well-formed
-        # Fail before extraction: the extractor is heading-agnostic and would
-        # happily ship a section with two `### Fixed` blocks (rendering two
-        # Fixed sections on the release page). Guard the structure up front.
-        run: ./scripts/check-changelog.sh
+      - name: Install git-cliff
+        # Release notes are generated from commit messages (cliff.toml); there is
+        # no hand-maintained CHANGELOG.md. Prebuilt binary — no cargo compile time.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
 
-      - name: Extract the changelog section for this version
-        # The release body is the curated CHANGELOG.md section, not just the
-        # auto-generated commit list. Keep a Changelog flow (RELEASE.md Phase
-        # 1): the section was renamed from [Unreleased] to [X.Y.Z] with the
-        # version bump, so it is committed at this exact tag. If it is
-        # missing, fail loudly — a silent fallback to --generate-notes alone
-        # would ship releases whose curated notes silently rot.
+      - name: Generate the release notes
+        # Commit messages ARE the changelog (AGENTS.md → Documentation): the
+        # shared scripts/release-notes.sh runs git-cliff (cliff.toml) to render
+        # each release-worthy commit as a Keep a Changelog bullet and appends the
+        # "Full Changelog" compare link. HEAD is the pushed tag, so the script
+        # renders that tag's section. Fail loudly on empty output — a silent
+        # fallback would ship a release with no notes.
         run: |
-          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          # Everything from the "## [X.Y.Z]" heading — optionally dated
-          # ("## [X.Y.Z] - YYYY-MM-DD", the Keep a Changelog 1.1 form) — up to
-          # (not including) the next "## " heading, heading stripped. The
-          # changelog is repo-root CHANGELOG.md.
-          awk -v ver="$VERSION" '
-            index($0, "## [" ver "]") == 1 { found=1; next }
-            found && /^## /   { exit }
-            found             { print }
-          ' CHANGELOG.md > /tmp/release-notes.md
+          ./scripts/release-notes.sh > /tmp/release-notes.md
           if [ ! -s /tmp/release-notes.md ]; then
-              echo "error: CHANGELOG.md has no '## [$VERSION]' section — run the Phase-1 changelog promotion step before tagging" >&2
+              echo "error: scripts/release-notes.sh produced no notes — check cliff.toml and the tag's commit messages" >&2
               exit 1
           fi
           cat /tmp/release-notes.md
-
-      - name: Check the release name is in sync
-        # The release TITLE below is read from choreo-shared/release-name.txt,
-        # while the CHANGELOG heading records the same name for humans. Fail
-        # the release on drift so a mislabelled title can never ship.
-        run: ./scripts/check-release-name.sh
 
       - name: Create the GitHub release
         env:
@@ -868,14 +854,13 @@ jobs:
           # Assets are immutable once uploaded (RELEASE.md hotfix section): a
           # re-run after the release exists fails on create — delete and
           # re-create per the SOP rather than "fixing" this job.
-          # The body comes from CHANGELOG.md (extracted above); the
-          # auto-generated notes are appended after it.
+          # The body is the git-cliff-generated notes (above) — commit messages
+          # rendered as Keep a Changelog sections, already carrying the "Full
+          # Changelog" compare link, so no separate --generate-notes pass.
           # Release name: read from the source-of-truth file that is ALSO
-          # compiled into the binaries (choreo-shared/release-name.txt) — the
-          # same file the check-release-name guard validated against the
-          # CHANGELOG heading in the previous step. Patch releases have an
-          # empty file and get a bare title. Parentheses match the binaries'
-          # `--version` output (e.g. `choreographr 0.2.0 (Lindy)`).
+          # compiled into the binaries (choreo-shared/release-name.txt). Patch
+          # releases have an empty file and get a bare title. Parentheses match
+          # the binaries' `--version` output (e.g. `choreographr 0.2.0 (Lindy)`).
           CODENAME="$(head -n1 choreo-shared/release-name.txt 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
           TITLE="choreographr ${VERSION}"
           if [ -n "$CODENAME" ]; then
@@ -883,5 +868,4 @@ jobs:
           fi
           gh release create "v${VERSION}" dist/* \
               --title "$TITLE" \
-              --notes-file /tmp/release-notes.md \
-              --generate-notes
+              --notes-file /tmp/release-notes.md

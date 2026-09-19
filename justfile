@@ -11,6 +11,9 @@
 #   - cargo-nextest  optional but recommended: the primary test runner
 #                    (install once with `just install-nextest`; every nextest-backed
 #                    recipe fails with a hint until it is on PATH)
+#   - git-cliff      release tooling: builds the release notes from commit
+#                    messages (`just release-notes`). Required by the release
+#                    gate; install once with `just install-git-cliff`
 #
 # The recipes mirror the README "Testing & development" section and the
 # AGENTS.md pre-commit workflow (fmt + clippy + full test suite).
@@ -38,17 +41,23 @@ default:
 help:
     @just --list
 
-# Verify the toolchain: cargo + zig required, cargo-nextest recommended
+# Verify the toolchain: cargo + zig + git-cliff required, cargo-nextest recommended
 preflight:
     @echo "==> checking toolchain"
     @command -v cargo >/dev/null 2>&1 || { echo "error: cargo not found — install Rust via rustup (https://rustup.rs/)" >&2; exit 1; }
     @command -v zig >/dev/null 2>&1 || { echo "error: zig not found — install it (choreo-daemon's zlob dependency needs it)" >&2; exit 1; }
+    @command -v git-cliff >/dev/null 2>&1 || { echo "error: git-cliff not found — release notes are generated from commit messages (run \`just install-git-cliff\`)" >&2; exit 1; }
     @command -v cargo-nextest >/dev/null 2>&1 || echo "note: cargo-nextest not found (recommended — run \`just install-nextest\`)"
-    @echo "==> toolchain OK: cargo $(cargo --version | cut -d' ' -f2) · zig $(zig version)"
+    @echo "==> toolchain OK: cargo $(cargo --version | cut -d' ' -f2) · zig $(zig version) · git-cliff $(git-cliff --version | cut -d' ' -f2)"
 
 # Install the primary test runner (cargo-nextest). `brew install nextest` on macOS.
 install-nextest:
     cargo install cargo-nextest
+
+# Install git-cliff (the release-notes generator). Prebuilt binaries from
+# https://github.com/orhun/git-cliff are fine too.
+install-git-cliff:
+    cargo install git-cliff
 
 # ── hidden prerequisites ──────────────────────────────────────────────────────
 
@@ -62,6 +71,10 @@ _require-zig:
 # command: test-fast".
 _require-nextest:
     @command -v cargo-nextest >/dev/null 2>&1 || { echo "error: cargo-nextest not found — run \`just install-nextest\`" >&2; exit 1; }
+
+# Fail fast with a hint when git-cliff is missing (release-notes generation).
+_require-git-cliff:
+    @command -v git-cliff >/dev/null 2>&1 || { echo "error: git-cliff not found — run \`just install-git-cliff\`" >&2; exit 1; }
 
 # ── build & check ─────────────────────────────────────────────────────────────
 
@@ -321,20 +334,11 @@ clippy-fix: _require-zig
 check-supply-chain:
     ./scripts/check-supply-chain.sh
 
-# Release-name drift guard: `choreo-shared/release-name.txt` (the machine source
-# of truth baked into the binaries and read by CI for the release title) must
-# match the `(Name)` on the current version's CHANGELOG heading. See
-# scripts/check-release-name.sh.
-check-release-name:
-    ./scripts/check-release-name.sh
-
-# CHANGELOG structure guard: every `## [X.Y.Z]` section may carry each Keep a
-# Changelog category (Added/Changed/Deprecated/Removed/Fixed/Security) AT MOST
-# ONCE, with no empty blocks. The release job extracts the version's section
-# verbatim as the release body, so a duplicated `### Fixed` would ship as two
-# Fixed sections on the release page. See scripts/check-changelog.sh.
-check-changelog:
-    ./scripts/check-changelog.sh
+# Preview the release notes, generated from commit messages by git-cliff
+# (cliff.toml, via scripts/release-notes.sh). Defaults to the workspace version;
+# pass one to preview an upcoming release, e.g. `just release-notes 0.3.0`.
+release-notes args="": _require-git-cliff
+    ./scripts/release-notes.sh {{ args }}
 
 # Release preflight: the release is cut from `master`, up to date with origin, on
 # a clean working tree (RELEASE.md "Preflight"). Read-only — it only inspects git
@@ -394,28 +398,27 @@ install-cargo-deny:
     cargo install cargo-deny
 
 # The commit gate (AGENTS.md → Commit Workflow): prove clippy-clean → full test
-# suite → format LAST → changelog guard. `clippy-strict` denies warnings, so any
-# remaining lint fails the gate and is hand-fixed (run `just clippy-fix` first if
-# you want the machine-applicable lints applied automatically). Formatting runs
-# last, not first, so the formatted bytes stay behaviourally identical to the
-# tested bytes. Safe to re-run: loop it (fix by hand, re-run) until it passes
-# green, then `git commit`. The supply-chain and release-name guards are RELEASE
-# guards — they run in the release workflow, not here.
-pre-commit: clippy-strict test-all fmt check-changelog
+# suite → format LAST. `clippy-strict` denies warnings, so any remaining lint
+# fails the gate and is hand-fixed (run `just clippy-fix` first if you want the
+# machine-applicable lints applied automatically). Formatting runs last, not
+# first, so the formatted bytes stay behaviourally identical to the tested bytes.
+# Safe to re-run: loop it (fix by hand, re-run) until it passes green, then
+# `git commit`. The supply-chain guard is a RELEASE guard — it runs in the
+# release workflow, not here.
+pre-commit: clippy-strict test-all fmt
 
 # The release gate (RELEASE.md → Preflight) — the single command the conductor
 # runs before Phase 1. Every local check, in one pass: the toolchain
 # (`preflight`), the git release state (on master, clean, not behind origin), the
 # quality gate with its one tree-mutating step — `fmt` — replaced by the
 # non-mutating `fmt-check` (alongside `clippy-strict`) — the full test suite, the
-# release-only guards `pre-commit` omits (`check-supply-chain`, `check-changelog`,
-# `check-release-name`), the crates.io credential check, and finally the GitHub dry
-# run (`release-workflow-dry-run`): push master + kick the release workflow so the
-# pipeline is proven before a tag. Nothing here edits the working tree. Never use
-# `pre-commit` as a release gate — it still rewrites the source with `cargo fmt`.
+# release-only guard `pre-commit` omits (`check-supply-chain`), the crates.io
+# credential check, and finally the GitHub dry run (`release-workflow-dry-run`):
+# push master + kick the release workflow so the pipeline is proven before a tag.
+# Nothing here edits the working tree. Never use `pre-commit` as a release gate —
+# it still rewrites the source with `cargo fmt`.
 pre-release: preflight check-release-state fmt-check clippy-strict test-all \
-    check-supply-chain check-changelog check-release-name check-crates-io-token \
-    release-workflow-dry-run
+    check-supply-chain check-crates-io-token release-workflow-dry-run
 
 # ── running ───────────────────────────────────────────────────────────────────
 

@@ -10,7 +10,7 @@ release tarball alongside the current three.
 **Touches:** `scripts/release.sh`, `scripts/install.sh`, `Cargo.toml`
 (binstall metadata), `packaging/aur/PKGBUILD`, `.github/workflows/release.yml`,
 `justfile`, plus docs (`README.md`, `packaging/README.md`, `ARCHITECTURE.md`,
-`RELEASE.md`) and `CHANGELOG.md`. Optional: `scripts/build-deb.sh`,
+`RELEASE.md`). Optional: `scripts/build-deb.sh`,
 `scripts/build-rpm.sh`, `packaging/rpm/choreographr.spec`.
 
 > **TL;DR.** The whole workspace already cross-compiles to and **runs** on
@@ -179,7 +179,8 @@ platform case keys on `Linux-riscv64`.
   useful for `just smoke-test`.
 - **Docs** — `README.md` (supported platforms), `packaging/README.md`
   (release-tarball section), `ARCHITECTURE.md` (shipped-target matrix),
-  `RELEASE.md` (phases), and a `CHANGELOG.md` `[Unreleased]` entry.
+  `RELEASE.md` (phases); the release notes come from the commit messages
+  (git-cliff).
 
 ---
 
@@ -237,7 +238,7 @@ Each phase is one commit; overlapping-file phases run as **serial subsessions**
   `install.sh` case; binstall override.
 - **Phase 3 — CI.** `linux-riscv64` job + QEMU smoke; wire into `release` `needs`.
 - **Phase 4 — optional packaging.** riscv `.deb`/`.rpm` + AUR `riscv64`.
-- **Phase 5 — docs + CHANGELOG.** README / packaging/README / ARCHITECTURE /
+- **Phase 5 — docs.** README / packaging/README / ARCHITECTURE /
   RELEASE; mark this plan done.
 
 Dependencies: 0 → 1 → (2) → (3) → (4) → 5.
@@ -305,7 +306,7 @@ Dependencies: 0 → 1 → (2) → (3) → (4) → 5.
 - `smoke-test.sh` **and** `daemon-smoke.sh` pass on the tarball under
   `qemu-user-static` in CI.
 - `cargo binstall` resolves on a glibc riscv host (override present).
-- Docs updated; `just pre-commit` green; `CHANGELOG.md` `[Unreleased]` entry.
+- Docs updated; `just pre-commit` green; commit messages written as release notes.
 
 ---
 

@@ -1,0 +1,76 @@
+# git-cliff configuration — the release notes are generated from commit messages.
+#
+# Commit messages ARE the changelog: the subject is the release-page bullet and
+# the body is its paragraph. The `release` CI job (`.github/workflows/release.yml`)
+# runs git-cliff at tag time to build the GitHub release body; there is no
+# hand-maintained `CHANGELOG.md` (it was retired — see AGENTS.md → Documentation
+# and RELEASE.md → Phase 1). The governing convention lives in AGENTS.md:
+# write the commit body as the release-page paragraph and the subject as its
+# bullet.
+#
+# Conventional Commits are the INPUT; the Keep a Changelog category headings this
+# project has always published are the OUTPUT. Only types treated as
+# release-worthy emit a section — housekeeping (`chore`/`docs`/`ci`/`test`/
+# `style`/`build`) is skipped, as is anything that does not match a rule (the
+# catch-all `.*` skip below). `remove` and `security` are deliberate non-standard
+# types: they map 1:1 to the Removed / Security headings and cannot be inferred
+# from feat/fix (a breaking `!` is not necessarily a removal; security fixes use
+# the `security` type, not a scope — the `scope` slot is taken by crate names).
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project are documented here. Release notes are
+generated from commit messages by [git-cliff](https://git-cliff.org) — commit
+subjects are the bullets and commit bodies are the paragraphs.
+"""
+body = """
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- **{{ commit.message | upper_first }}**{% if commit.body %}\n{{ commit.body | trim | indent(prefix="  ", first=true, blank=true) }}{% endif %}
+{% endfor %}
+{% endfor %}\n
+"""
+# No `footer`/`[remote.github]`: git-cliff only populates the `previous`
+# context when several releases are rendered in one pass, and the `release` job
+# renders a single version. The `**Full Changelog**` compare link is appended by
+# scripts/release-notes.sh instead, so it is correct for the single-section case.
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+# Parser order IS group order (git-cliff emits groups in first-match order), so
+# these are listed in the canonical Keep a Changelog order. First match wins.
+commit_parsers = [
+    { message = "^feat",            group = "Added" },
+    { message = "^perf",            group = "Changed" },
+    { message = "^refactor",        group = "Changed" },
+    { message = "^chore\\(deps\\)", group = "Changed" },
+    { message = "^remove",          group = "Removed" },
+    { message = "^revert",          group = "Removed" },
+    { message = "^fix",             group = "Fixed" },
+    { message = "^security",        group = "Security" },
+    # Housekeeping — never on a release page.
+    { message = "^chore",           skip  = true },
+    { message = "^docs",            skip  = true },
+    { message = "^ci",              skip  = true },
+    { message = "^test",            skip  = true },
+    { message = "^style",           skip  = true },
+    { message = "^build",           skip  = true },
+    # Anything unmatched (including a stray non-conventional subject) is dropped
+    # rather than rendered under a noisy default heading.
+    { message = ".*",               skip  = true },
+]
+protect_breaking_commits = false
+filter_commits = false
+tag_pattern = "v[0-9].*"
+sort_commits = "oldest"

@@ -49,9 +49,9 @@ built nowhere.
 
 - **`v*` tag push** — builds everything, then creates the GitHub release with
   all artifacts and one combined `SHA256SUMS`. The release job guards that the
-  pushed tag matches the manifest version, extracts the version's
-  `CHANGELOG.md` section for the release body, and creates the release with
-  all artifacts and one combined `SHA256SUMS`.
+  pushed tag matches the manifest version, generates the release body from the
+  commit messages (git-cliff), and creates the release with all artifacts and
+  one combined `SHA256SUMS`.
 - **`workflow_dispatch`** — identical builds, but **no release is created**;
   artifacts attach to the workflow run (default 90-day retention). This is
   how the pipeline itself is tested without spamming tags.
@@ -81,13 +81,11 @@ build artifacts (`linux-x86_64`, `linux-arm64`, `macos-arm64`, `android-termux`
 — deliberately
 not the not-yet-shipped `windows-msvc`),
 generates one combined `SHA256SUMS` over everything, guards that the pushed
-tag matches the manifest version, runs the `check-changelog` guard (a repeated
-or unknown `### ` category heading in a `## [...]` section fails the job
-before extraction), extracts the version's section from
-`CHANGELOG.md` (the Keep a Changelog promotion from Phase 1 makes it the
-release body — a missing section fails the job), runs the `check-release-name`
-guard, and creates the release with
-`gh release create vX.Y.Z dist/* --notes-file … --generate-notes`. The
+tag matches the manifest version, generates the release body from the commit
+messages with git-cliff (`scripts/release-notes.sh` / `cliff.toml` — the commit
+subjects become the Keep a Changelog bullets and the bodies their paragraphs;
+an empty result fails the job), and creates the release with
+`gh release create vX.Y.Z dist/* --notes-file /tmp/release-notes.md`. The
 release **title** is read from `choreo-shared/release-name.txt` — the same file
 compiled into the binaries, so the title and `--version` cannot drift (an empty
 file yields the bare `choreographr X.Y.Z`). A
@@ -119,7 +117,8 @@ channel updates in Phase 4 as before.
   PKGBUILD all mirror it — do not edit them by hand for a version bump; let
   `cargo release` do it (Phase 1).
 - **Tag format:** `vX.Y.Z` (e.g. `v0.1.1`). Release notes are generated from
-  the tag diff (`gh release create --generate-notes`).
+  the commit messages of the new tag's range by git-cliff
+  (`scripts/release-notes.sh`).
 - **Release names:** a **major or minor** release sets a fun name — a dance
   style, e.g. *Lindy* — chosen by the conductor at release time (there is no
   pre-assigned list; pick whatever fits). **Patch releases keep the current
@@ -127,9 +126,7 @@ channel updates in Phase 4 as before.
   `choreo-shared/release-name.txt` — the single source of truth. The file is
   compiled into the binaries (so `choreographr --version` prints
   `choreographr 0.2.0 (Lindy)`) and read by the CI release job for the GitHub
-  release title. It also appears in the CHANGELOG section heading
-  (`## [X.Y.Z] - YYYY-MM-DD (Lindy)`); the `check-release-name` guard keeps the
-  file and the heading in sync. The name is release *metadata*: it is never in
+  release title. The name is release *metadata*: it is never in
   the git tag, the crate versions, or any install identifier.
 
 ### Preflight (before Phase 1)
@@ -142,11 +139,11 @@ just pre-release
 ```
 
 `just pre-release` is everything a release needs before Phase 1, and never edits
-the working tree (no `clippy --fix` / `fmt`): the toolchain check (cargo + zig,
-notes nextest), the git release-state check (on `master`, clean, not behind
-`origin/master`), `fmt --check`, clippy with warnings denied, the full unit +
-integration suite, the supply-chain / changelog / release-name guards, and the
-crates.io credential check. **As its final step it pushes `master` and kicks the
+the working tree (no `clippy --fix` / `fmt`): the toolchain check (cargo + zig +
+git-cliff, notes nextest), the git release-state check (on `master`, clean, not
+behind `origin/master`), `fmt --check`, clippy with warnings denied, the full
+unit + integration suite, the supply-chain guard, and the crates.io credential
+check. **As its final step it pushes `master` and kicks the
 release workflow** (`gh workflow run release.yml`) — a `workflow_dispatch` dry
 run that builds every platform exactly like a tag does but creates **no** GitHub
 release, so the pipeline is proven on GitHub before you ever tag (watch it with
@@ -163,9 +160,9 @@ The individual steps remain available as `just preflight`,
 
 1. **Decide the level** — the release conductor's judgment call, made before
    any tooling runs. There are only three options; which one applies is
-   determined by what changed since the last tag (the `CHANGELOG.md`
-   `[Unreleased]` section is the working evidence — keep it current as
-   features land):
+   determined by what changed since the last tag (`git log v<last>..HEAD` — the
+   commit messages are the release notes; preview the rendered result with
+   `just release-notes X.Y.Z`):
 
    | Level | Bump | When to pick it |
    |---|---|---|
@@ -184,8 +181,8 @@ The individual steps remain available as `just preflight`,
    For a **major or minor** release (not a patch), also choose a **new name**
    here — a dance style such as *Lindy*; there is no pre-assigned list, pick
    whatever fits (see [Release names](#versioning--gates)). A **patch** release
-   keeps the current name: leave `choreo-shared/release-name.txt` and the
-   CHANGELOG heading as they are (step 2).
+   keeps the current name: leave `choreo-shared/release-name.txt` as it is
+   (step 2).
 
 2. **Enact the decision** — the command that carries it out is
    `cargo release version <level>`, where `<level>` is replaced with the
@@ -209,18 +206,11 @@ The individual steps remain available as `just preflight`,
       tree required; see above).
    2. Set the release name (**major/minor only**) — write one line to
       `choreo-shared/release-name.txt`; a patch release leaves it untouched.
-   3. Promote the changelog section — rename `## [Unreleased]` to
-      `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md`, keeping the series name in
-      parentheses so it matches the file (`## [0.2.1] - 2026-10-01 (Lindy)` for
-      a patch in the Lindy series; `## [0.2.0] - 2026-09-14 (Lindy)` for the
-      major/minor that introduced it — see
-      [Release names](#versioning--gates)) — and start a fresh empty
-      `[Unreleased]` above it, moving the compare link.
-   4. Update any user-facing docs that state a version or install command
+   3. Update any user-facing docs that state a version or install command
       (README install section).
 
    ```nu
-   git add Cargo.toml Cargo.lock choreo-shared/release-name.txt CHANGELOG.md README.md  # + any other docs touched
+   git add Cargo.toml Cargo.lock choreo-shared/release-name.txt README.md  # + any other docs touched
    git commit -m "release: bump to X.Y.Z"
    ```
 
@@ -231,16 +221,13 @@ The individual steps remain available as `just preflight`,
 3. **Tag name check:** confirm no tag `vX.Y.Z` exists yet:
    `git ls-remote --tags origin | grep vX.Y.Z`.
 
-   > **Why the changelog section must exist at the tag:** the CI `release`
-   > job extracts the `## [X.Y.Z]` section from `CHANGELOG.md` for the release
-   > body and fails the job if it is absent — the curated notes are the
-   > release notes, not an afterthought. The heading may carry an optional
-   > `- YYYY-MM-DD` date and ` (Name)`. The job also runs the `check-changelog`
-   > guard first, so a section that repeats a category heading (e.g. two
-   > `### Fixed` blocks) fails before extraction rather than shipping a
-   > malformed release page. The release **title** now comes from
-   > `choreo-shared/release-name.txt` (not the heading) — but the job first runs
-   > the `check-release-name` guard, so the heading and the file must agree.
+   > **How the release notes are produced:** at the tag, the CI `release` job
+   > runs git-cliff over the commits in the new tag's range (`cliff.toml`, via
+   > `scripts/release-notes.sh`) and ships the result as the release body — the
+   > commit messages ARE the release notes, so write them for the release page
+   > (see AGENTS.md → Release notes via commits). The release **title** comes
+   > from `choreo-shared/release-name.txt`. Preview the notes locally with
+   > `just release-notes X.Y.Z`.
 
 4. **Tag the bump commit** (cargo-release reads the version back from
    `Cargo.toml`): `cargo release tag -p choreographr -x` → creates `vX.Y.Z` at
@@ -627,8 +614,8 @@ Finally, commit any post-release doc/version drift in this repo and push.
 
 - [ ] `just pre-release` green; tree clean; master pulled
 - [ ] MSRV sync: `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'` → update `rust-version` in `[workspace.package]` (with `Cargo.lock`) if changed
-- [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD (Name)` section — ` (Name)` for a major/minor release (name picked at release time), or the current series name kept for a patch — with a fresh empty `[Unreleased]` + compare link above it (structure enforced by `just check-changelog`: one heading per category, no empty blocks)
-- [ ] `choreo-shared/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch; must match the ` (Name)` on the CHANGELOG heading (enforced by `just check-release-name`)
+- [ ] `choreo-shared/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch
+- [ ] Release notes preview: `just release-notes X.Y.Z` reads as a proper release page (they are generated from the commit messages at tag time by git-cliff)
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -p choreographr -x` → `vX.Y.Z` (the explicit `-p` avoids a stray `choreo-tui-vX.Y.Z` tag)
 - [ ] Signed in to crates.io (Phase 2 step 0): `just check-crates-io-token` passes, else `cargo login` a token with the publish-new/publish-update scopes
 - [ ] Publish in **two batches** (0.2.0 created 6 new crates > burst 5; the post-0.2.0 `choreo-shared` adds a 19th member, also in Batch 1 — a single `--workspace` is refused): dry-run then `-x` each — Batch 1 (`-p choreo-proto … -p choreo-power-events -p choreo-shared`), wait ≥ 10 min, Batch 2 (`-p choreo-transport … -p choreographr`) → 19 crates on crates.io; `cargo install --locked` verified
@@ -747,9 +734,9 @@ let NAME = (open --raw choreo-shared/release-name.txt | str trim)
 let TITLE = if ($NAME | is-empty) { "choreographr X.Y.Z" } else { "choreographr X.Y.Z (" + $NAME + ")" }
 
 # gh needs a real path for --notes-file (nushell has no <(...) substitution):
-# extract the release's CHANGELOG section to a temp file.
+# generate the release notes from the commit messages into a temp file.
 let NOTES = (mktemp)
-awk -v "ver=X.Y.Z" 'index($0, "## [" ver "]") == 1 {f=1; next} f && /^## /{exit} f{print}' CHANGELOG.md | save -f $NOTES
+^./scripts/release-notes.sh X.Y.Z | save -f $NOTES
 
 # spread the asset paths from a list (no line continuation in nushell)
 let assets = [
@@ -763,7 +750,7 @@ let assets = [
   "dist/choreographr-X.Y.Z-aarch64.rpm"
   "dist/SHA256SUMS"
 ]
-gh release create vX.Y.Z ...$assets --title $TITLE --notes-file $NOTES --generate-notes
+gh release create vX.Y.Z ...$assets --title $TITLE --notes-file $NOTES
 ```
 
 **Gate:** release page lists the manual-flow assets + `SHA256SUMS`;
