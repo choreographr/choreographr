@@ -334,6 +334,43 @@ check-release-name:
 check-changelog:
     ./scripts/check-changelog.sh
 
+# Release preflight: the release is cut from `master`, up to date with origin, on
+# a clean working tree (RELEASE.md "Preflight"). Read-only — it only inspects git
+# state; it never fetches, checks out, or pulls (those are the conductor's move).
+check-release-state:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+    if [ "$branch" != "master" ]; then
+        echo "error: releases are cut from master, not '$branch'" >&2
+        exit 1
+    fi
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "error: working tree is not clean — commit or stash first:" >&2
+        git status --short >&2
+        exit 1
+    fi
+    # "Up to date with origin" is checked against the LOCAL remote-tracking ref
+    # (no network): compare HEAD to where origin/master was last fetched to.
+    if git rev-parse --verify --quiet origin/master >/dev/null; then
+        behind="$(git rev-list --count HEAD..origin/master)"
+        if [ "$behind" -ne 0 ]; then
+            echo "error: HEAD is $behind commit(s) behind origin/master — run \`git pull --ff-only\`" >&2
+            exit 1
+        fi
+    else
+        echo "note: no origin/master ref found — skipping the up-to-date check" >&2
+    fi
+    echo "OK: on master, clean, and not behind origin/master"
+
+# Release preflight: confirm the stored crates.io token authenticates, so
+# Phase 2's publish cannot die mid-batch on a missing/expired/revoked token.
+# `GET /api/v1/me` is cookie-only (crates.io forbids API tokens on it), so the
+# script probes the auth RESPONSE instead of expecting a 200 — see the header of
+# scripts/check-crates-io-token.sh. Read-only.
+check-crates-io-token:
+    ./scripts/check-crates-io-token.sh
+
 # Install the dependency-policy tool cargo-deny (the authoritative layer of
 # check-supply-chain). Without it the script falls back to cargo-audit + a
 # literal lockfile scan, which covers advisories but not hard version bans.
@@ -348,6 +385,19 @@ install-cargo-deny:
 # then `git commit`. The supply-chain and release-name guards are RELEASE guards —
 # they run in the release workflow, not here.
 pre-commit: clippy-fix clippy-strict test-all fmt check-changelog
+
+# The READ-ONLY release gate (RELEASE.md → Preflight) — the single command the
+# conductor runs before Phase 1. It is the union of every pre-release check: the
+# toolchain (`preflight`), the git release state (on master, clean, not behind
+# origin), the quality gate minus its two tree-mutating steps — `fmt` and
+# `clippy-fix`, replaced by the read-only `fmt-check` and `clippy-strict` — the
+# full test suite, the release-only guards `pre-commit` omits
+# (`check-supply-chain`, `check-changelog`, `check-release-name`), and the
+# crates.io credential check. It never edits the tree, so it is safe on a clean
+# release checkout. Never use `pre-commit` as a release gate — it rewrites the
+# source with `cargo clippy --fix` and `cargo fmt`.
+pre-release: preflight check-release-state fmt-check clippy-strict test-all \
+    check-supply-chain check-changelog check-release-name check-crates-io-token
 
 # ── running ───────────────────────────────────────────────────────────────────
 

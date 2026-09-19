@@ -55,6 +55,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching output was dropped with the discarded call; the retry resends the
   full, self-consistent history instead.
 
+- **New `just pre-release` — a read-only release gate.** Where `just pre-commit`
+  is the commit gate (and, by design, *mutates* the tree via `clippy-fix` and
+  `fmt`), `pre-release` is its read-only twin for release time: it runs
+  `preflight`, the release-state check (on `master`, clean, not behind
+  `origin/master`), `fmt-check`, `clippy-strict`, `test-all`, and
+  the release-only guards `pre-commit` omits (`check-supply-chain`,
+  `check-changelog`, `check-release-name`) plus the new crates.io credential
+  check — and never edits a single file. `RELEASE.md`'s Preflight
+  section (now just `just pre-release`) and the gates now call it in place of
+  the long-removed `just ci`.
+
 ### Changed
 
 - **The TUI command palette now runs the highlighted command on `Enter` — no preceding `Tab`.** Previously a `/`-query had to be completed with `Tab` before `Enter` would submit it, so selecting a row with `↑`/`↓` and pressing `Enter` did nothing on an empty or partial line. `Enter` now resolves the line through `command_palette_enter_line`: a first token that already names a command exactly runs verbatim (arguments preserved — `model gpt-4o`, `session new foo`), while an empty or still-partial token adopts the highlighted row (keeping any argument tail, so `mo gpt-4o` runs `model gpt-4o`). `Tab` still completes the name without submitting for users who want to keep editing the line.
@@ -117,6 +128,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The `/models` alias is gone — use `/model`.**
 
 ### Fixed
+
+- **The RELEASE.md crates.io sign-in check now actually works.** The documented
+  `curl … /api/v1/me` probe could never return `200`: crates.io declares that
+  endpoint cookie-only and rejects API tokens outright
+  (rust-lang/crates.io#3518, 2021), so it answers `403` for a *valid* token — and
+  crates.io's edge 403s curl's default User-Agent with an HTML page on top. The
+  new `scripts/check-crates-io-token.sh` (wired into `just check-crates-io-token`
+  and `just pre-release`) resolves the token the way cargo does
+  (`$CARGO_REGISTRY_TOKEN`, else `~/.cargo/credentials.toml`), sends a custom
+  User-Agent, and treats the endpoint's website-only 403 as *success* (the token
+  authenticated) while failing on `authentication failed` / `401`. The stale
+  `just ci` references in `RELEASE.md` and the doubly-wrong supply-chain wiring
+  note in `deny.toml` (that guard never ran in `pre-commit`) are corrected.
 
 - **The TUI command palette now lists commands in alphabetical order.** The
   palette presents the shared command catalog verbatim, but the catalog was

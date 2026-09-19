@@ -2,7 +2,7 @@
 #
 # Enforcement: `cargo deny check advisories bans sources` (see
 # scripts/check-supply-chain.sh, wired into `just check-supply-chain`,
-# `just pre-commit`, and `just ci`). Install with `cargo install cargo-deny`.
+# `just pre-release`, and the release workflow). Install with `cargo install cargo-deny`.
 #
 # This policy exists because of the 2026-08-20 `arrayref` supply-chain attack
 # (https://blog.rust-lang.org/2026/08/20/supply-chain-attack-on-arrayref/):

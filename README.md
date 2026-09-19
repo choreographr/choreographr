@@ -982,6 +982,8 @@ just clippy               # lint the workspace (all targets + features)
 just check-supply-chain   # dependency gate: deny.toml bans + RustSec advisories + cache scan
 just install-cargo-deny   # install the policy tool (cargo-deny) that check-supply-chain prefers
 just pre-commit           # the commit gate: clippy-fix + clippy-strict + test-all + fmt + check-changelog
+just pre-release          # the READ-ONLY release gate: preflight + clean-tree + fmt-check + clippy-strict + test-all + the release guards + the crates.io token check
+just check-crates-io-token  # confirm the stored crates.io token authenticates (release preflight)
 
 just daemon -v            # run the daemon with debug logging
 just tui / gui / im / acp # run the other clients (im takes e.g. `just im telegram`)

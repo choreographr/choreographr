@@ -130,25 +130,22 @@ channel updates in Phase 4 as before.
 
 ### Preflight (before Phase 1)
 
+Run the read-only release gate on `master`, up to date with origin, with a clean
+working tree:
+
 ```nu
-# 1. Working tree clean, on master, up to date with origin.
-git status --porcelain      # must be empty
-git checkout master
-git pull --ff-only origin master
-
-# 2. Full quality gate — fmt, clippy (warnings denied), unit + integration.
-just ci
-
-# 3. Tooling the conductor runs locally (Phases 1–5): gh, jq, git.
-#    The per-platform build toolchains (zig, cargo-zigbuild, NDK) live in the
-#    CI workflow — no local setup is needed unless you are using the manual
-#    fallback in the appendix.
-just preflight               # checks cargo + zig, notes nextest
-
-# 4. Signed in to crates.io — Phase 2 publishes with this token. Expect 200; a
-#    403 (or an `open`/`get` error if no token is stored) means not signed in.
-curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/credentials.toml | get registry.token)" https://crates.io/api/v1/me
+just pre-release
 ```
+
+`just pre-release` is everything a release needs and nothing that edits the
+tree: the toolchain check (cargo + zig, notes nextest), the git release-state
+check (on `master`, clean, and not behind `origin/master`), `fmt --check`,
+clippy with warnings denied, the full unit + integration suite, the
+supply-chain, changelog, and release-name guards, and the crates.io credential
+check. Unlike `just pre-commit` it never mutates the tree (no `clippy --fix` /
+`fmt`). The individual steps remain available as `just preflight`,
+`just check-release-state`, `just check-crates-io-token`, etc. if you need to
+isolate one.
 
 ---
 
@@ -249,7 +246,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/cred
    to existing tag` and skips — that's fine as long as the tag sits on the
    commit you're shipping; just push it in Phase 2.
 
-**Gate:** `just ci` green, tree clean, no conflicting tag.
+**Gate:** `just pre-release` green, tree clean, no conflicting tag.
 
 ---
 
@@ -262,15 +259,21 @@ tree:
 0. **Confirm you are signed in to crates.io.** The publish is
    token-authenticated; a missing, expired, or wrong-scoped token fails the
    *upload* — after the earlier crates in a batch have already published — with
-   `403 Forbidden: authentication failed`. Verify the stored token against the
-   crates.io API ( `GET /api/v1/me` answers `200` only for a valid token):
+   `403 Forbidden: authentication failed`. `just pre-release` already ran this
+   check; re-run it on its own after minting or rotating a token:
 
    ```nu
-   curl -s -o /dev/null -w '%{http_code}\n' -H $"Authorization: (open ~/.cargo/credentials.toml | get registry.token)" https://crates.io/api/v1/me
+   just check-crates-io-token
    ```
 
-   If that is not `200` (or the `open`/`get` errors because no token is
-   stored), mint a token at <https://crates.io/settings/tokens> — it needs the
+   This works where the old `curl … /api/v1/me` recipe did not: that endpoint
+   is **cookie-only** — crates.io forbids API tokens on it
+   (rust-lang/crates.io#3518) — so it answers `403` ("this action can only be
+   performed on the crates.io website") for a *valid* token, never `200`. The
+   script reads the token cargo would use (`$CARGO_REGISTRY_TOKEN`, else
+   `~/.cargo/credentials.toml`) and confirms the token *authenticates*.
+
+   If that fails, mint a token at <https://crates.io/settings/tokens> — it needs the
    **publish-new** and **publish-update** scopes (a full/legacy token also
    works) — and store it:
 
@@ -608,12 +611,12 @@ Finally, commit any post-release doc/version drift in this repo and push.
 
 ## Quick checklist (condensed)
 
-- [ ] `just ci` green; tree clean; master pulled
+- [ ] `just pre-release` green; tree clean; master pulled
 - [ ] MSRV sync: `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'` → update `rust-version` in `[workspace.package]` (with `Cargo.lock`) if changed
 - [ ] `CHANGELOG.md`: move entries from `[Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD (Name)` section — ` (Name)` for a major/minor release (name picked at release time), or the current series name kept for a patch — with a fresh empty `[Unreleased]` + compare link above it (structure enforced by `just check-changelog`: one heading per category, no empty blocks)
 - [ ] `choreo-shared/release-name.txt`: one line with the new name for a major/minor release; left untouched for a patch; must match the ` (Name)` on the CHANGELOG heading (enforced by `just check-release-name`)
 - [ ] `cargo release version <level> -x` (level from Phase 1) → bump committed with doc updates; `cargo release tag -p choreographr -x` → `vX.Y.Z` (the explicit `-p` avoids a stray `choreo-tui-vX.Y.Z` tag)
-- [ ] Signed in to crates.io (Phase 2 step 0): the `/api/v1/me` token check returns `200`, else `cargo login` a token with the publish-new/publish-update scopes
+- [ ] Signed in to crates.io (Phase 2 step 0): `just check-crates-io-token` passes, else `cargo login` a token with the publish-new/publish-update scopes
 - [ ] Publish in **two batches** (0.2.0 created 6 new crates > burst 5; the post-0.2.0 `choreo-shared` adds a 19th member, also in Batch 1 — a single `--workspace` is refused): dry-run then `-x` each — Batch 1 (`-p choreo-proto … -p choreo-power-events -p choreo-shared`), wait ≥ 10 min, Batch 2 (`-p choreo-transport … -p choreographr`) → 19 crates on crates.io; `cargo install --locked` verified
 - [ ] Push the bump commit + `vX.Y.Z` tag → CI builds all platforms and creates the GitHub release; verify the release page lists every asset + `SHA256SUMS` and they download
 - [ ] `gh release download vX.Y.Z -p 'choreographr-*.tar.gz' -D dist/`, then `scripts/update-homebrew-tap.sh --push` (commit the synced `packaging/homebrew/choreographr.rb`); `gh workflow run homebrew-verify.yml -f version=X.Y.Z` green
