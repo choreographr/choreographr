@@ -397,6 +397,11 @@ impl DaemonMessage {
                         .map(|p| 32 + p.slug.len() + p.display_name.len())
                         .sum::<usize>()
             }
+            // Targeted image reply: 4 fields (session_id, turn_id,
+            // image_index, data); the scalars fit the per-field allowance and
+            // only the (potentially large) byte payload is added on top. An
+            // empty `data` / `None` counts as just the envelope.
+            Self::Image { data, .. } => named_field_overhead(4) + data.as_ref().map_or(0, Vec::len),
         }
     }
 }

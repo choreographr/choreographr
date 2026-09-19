@@ -343,6 +343,12 @@ pub(crate) struct App {
     pub(crate) next_request_id: u32,
     pub(crate) rendered_images: HashMap<u64, HashMap<u32, HashMap<usize, RenderedImage>>>,
     pub(crate) pending_job_idx: HashMap<ImageId, (u64, u32, usize)>,
+    /// Displayed images the render path wants fetched on demand (protocol v6:
+    /// image bytes are stripped from turn snapshots). Queued here — deduped via
+    /// the per-image `fetching` flag — because the render path has no client
+    /// sender; the UI loop drains this each iteration and sends
+    /// `ClientMessage::GetImage`.
+    pub(crate) pending_image_fetch: Vec<(u64, u32, usize)>,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
     /// Why the TUI is exiting, when it is NOT a user-initiated quit (Ctrl+Q).
@@ -549,6 +555,7 @@ impl App {
             input: InputBuffer::new(),
             next_request_id: 1,
             rendered_images: HashMap::new(),
+            pending_image_fetch: Vec::new(),
             history_viewport: HistoryViewport::new(),
             should_quit: false,
             quit_message: None,
@@ -968,6 +975,89 @@ impl App {
                 img_idx,
             );
             img.apply_result(result);
+        }
+    }
+
+    /// Queue an on-demand fetch for a displayed image whose bytes were not
+    /// shipped in the turn snapshot (protocol v6 strips them). Deduped via the
+    /// image's own `fetching`/`fetch_failed` flags so the per-frame render path
+    /// cannot enqueue the same fetch repeatedly while a reply is in flight.
+    /// Only images that HAVE bytes to fetch (`byte_len > 0`) are requested; a
+    /// zero-byte image is a legitimately empty placeholder with nothing to
+    /// load, and one already resolved (bytes present, in flight, or failed)
+    /// is skipped.
+    pub(crate) fn request_image_fetch(&mut self, session_id: u64, turn_id: u32, img_idx: usize) {
+        let Some(img) = self
+            .rendered_images
+            .get_mut(&session_id)
+            .and_then(|s| s.get_mut(&turn_id))
+            .and_then(|imgs| imgs.get_mut(&img_idx))
+        else {
+            return;
+        };
+        if img.fetching || img.fetch_failed || !img.data.is_empty() || img.metadata.byte_len == 0 {
+            return;
+        }
+        img.fetching = true;
+        self.pending_image_fetch
+            .push((session_id, turn_id, img_idx));
+    }
+
+    /// Send every queued `GetImage` request to the daemon. Called by the UI
+    /// loop — the only place that owns the client sender — once per rendered
+    /// frame, so a scroll that reveals new images issues their fetches on the
+    /// next pass.
+    pub(crate) fn flush_image_fetches(
+        &mut self,
+        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    ) {
+        for (session_id, turn_id, img_idx) in self.pending_image_fetch.drain(..) {
+            // Indices are small; use `try_from` so a hypothetical >u32 index
+            // saturates rather than silently wrapping onto the wrong image.
+            let image_index = u32::try_from(img_idx).unwrap_or(u32::MAX);
+            let _ = client_tx.send(ClientMessage::GetImage {
+                session_id,
+                turn_id,
+                image_index,
+            });
+        }
+    }
+
+    /// Apply a `DaemonMessage::Image` reply: store the fetched bytes (clearing
+    /// any decode-failure state so the next render submits an encoding job), or
+    /// mark the image failed when the daemon had none (not found), so it is not
+    /// re-requested every frame.
+    pub(crate) fn handle_image_reply(
+        &mut self,
+        session_id: u64,
+        turn_id: u32,
+        image_index: u32,
+        data: Option<Vec<u8>>,
+    ) {
+        let Ok(img_idx) = usize::try_from(image_index) else {
+            return;
+        };
+        let Some(img) = self
+            .rendered_images
+            .get_mut(&session_id)
+            .and_then(|s| s.get_mut(&turn_id))
+            .and_then(|imgs| imgs.get_mut(&img_idx))
+        else {
+            return;
+        };
+        img.fetching = false;
+        match data {
+            Some(bytes) => {
+                img.data = Arc::from(bytes);
+                // Fresh bytes invalidate any prior encode outcome: an earlier
+                // frame may have recorded a failure for an empty placeholder.
+                img.protocols.clear();
+                img.failed_sizes.clear();
+                img.pending_job = None;
+            }
+            // Not found (deleted/evicted/stale index): stop re-requesting so a
+            // missing image cannot spin a fetch every frame.
+            None => img.fetch_failed = true,
         }
     }
 
@@ -2739,6 +2829,17 @@ fn turn_has_live_content(accumulated: &Turn, snapshot: &Turn) -> bool {
 // ── TurnEventHandler implementation ──────────────────────────────────
 
 impl TurnEventHandler for App {
+    fn handle_image(
+        &mut self,
+        session_id: u64,
+        turn_id: u32,
+        image_index: u32,
+        data: Option<Vec<u8>>,
+    ) {
+        tracing::trace!(%session_id, %turn_id, %image_index, "handle_image");
+        self.handle_image_reply(session_id, turn_id, image_index, data);
+    }
+
     fn handle_turn_appended(&mut self, session_id: u64, turn_id: u32, turn: Turn) {
         tracing::trace!(%turn_id, "handle_turn_appended");
         self.sync_turn_images(session_id, turn_id, &turn);
@@ -4391,6 +4492,131 @@ mod tests {
             app.rendered_images.get(&0).unwrap().get(&42).unwrap().len(),
             2
         );
+    }
+
+    #[test]
+    fn request_image_fetch_queues_only_stripped_nonempty_images() {
+        // After protocol v6 the client receives displayed images WITHOUT their
+        // bytes (only metadata). The render path queues a fetch for each image
+        // that actually has bytes (`byte_len > 0`) — never for one whose bytes
+        // are already present, nor for a genuinely zero-byte image.
+        let mut app = test_app();
+        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let meta = |byte_len| choreo_proto::ImageMetadata {
+            mime_type: "image/png".to_string(),
+            width: 4,
+            height: 4,
+            byte_len,
+            alt: None,
+        };
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![
+                // 0: already has bytes — nothing to fetch.
+                choreo_proto::DisplayedImageRecord {
+                    metadata: meta(4),
+                    data: b"AAAA".to_vec(),
+                    tool_call_id: None,
+                },
+                // 1: stripped (kept metadata, byte_len>0) — must be fetched.
+                choreo_proto::DisplayedImageRecord {
+                    metadata: meta(8),
+                    data: Vec::new(),
+                    tool_call_id: None,
+                },
+                // 2: stripped AND empty (byte_len==0) — nothing to fetch.
+                choreo_proto::DisplayedImageRecord {
+                    metadata: meta(0),
+                    data: Vec::new(),
+                    tool_call_id: None,
+                },
+            ],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        app.sync_turn_images(3, 9, &turn);
+        app.request_image_fetch(3, 9, 0);
+        app.request_image_fetch(3, 9, 1);
+        app.request_image_fetch(3, 9, 2);
+        // A repeat call for the queued image must not double-queue (deduped via
+        // the `fetching` flag until the reply arrives).
+        app.request_image_fetch(3, 9, 1);
+
+        app.flush_image_fetches(&tx);
+        let sent: Vec<ClientMessage> = rx.try_iter().collect();
+        assert_eq!(
+            sent,
+            vec![ClientMessage::GetImage {
+                session_id: 3,
+                turn_id: 9,
+                image_index: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn handle_image_reply_fills_bytes_and_marks_missing() {
+        // A `Some` reply stores the bytes (clearing the in-flight flag and any
+        // stale decode-failure state); a `None` reply marks the image failed so
+        // it is not re-requested every frame.
+        let mut app = test_app();
+        let meta = choreo_proto::ImageMetadata {
+            mime_type: "image/png".to_string(),
+            width: 4,
+            height: 4,
+            byte_len: 4,
+            alt: None,
+        };
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![
+                choreo_proto::DisplayedImageRecord {
+                    metadata: meta.clone(),
+                    data: Vec::new(),
+                    tool_call_id: None,
+                },
+                choreo_proto::DisplayedImageRecord {
+                    metadata: meta.clone(),
+                    data: Vec::new(),
+                    tool_call_id: None,
+                },
+            ],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        app.sync_turn_images(1, 2, &turn);
+
+        app.handle_image_reply(1, 2, 0, Some(b"PNG!".to_vec()));
+        let img0 = &app.rendered_images[&1][&2][&0];
+        assert_eq!(img0.data.as_ref(), b"PNG!");
+        assert!(!img0.fetching);
+        assert!(!img0.fetch_failed);
+
+        app.handle_image_reply(1, 2, 1, None);
+        let img1 = &app.rendered_images[&1][&2][&1];
+        assert!(img1.fetch_failed);
+        assert!(!img1.fetching);
+        assert!(img1.data.is_empty());
+
+        // A failed image is never re-queued by a later render pass.
+        app.request_image_fetch(1, 2, 1);
+        assert_eq!(app.pending_image_fetch.len(), 0);
     }
 
     // ── TurnImageLayout image_ranges ──

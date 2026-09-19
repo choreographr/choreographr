@@ -131,11 +131,11 @@ fn decode_tolerates_array_encoded_struct() {
     // Named mode writes structs as maps with field-name keys, but decode also
     // accepts the array (field-order) form — that is the compatibility
     // contract that keeps a future switch to compact mode backwards-readable.
-    // Hand-build `[5, [10, 20, 30]]`: version 5, then a `TokenUsage` struct
+    // Hand-build `[6, [10, 20, 30]]`: version 6, then a `TokenUsage` struct
     // serialized WITHOUT field names as a 3-element array.
     let blob = [
         0x92, // array of 2: (version, message)
-        0x05, // PROTOCOL_VERSION = 5
+        0x06, // PROTOCOL_VERSION = 6
         0x93, // array of 3: TokenUsage { input_tokens, output_tokens, total_tokens }
         0x0a, // input_tokens = 10
         0x14, // output_tokens = 20

@@ -1056,26 +1056,37 @@ impl SessionState {
 }
 
 /// Client-bound copy of a turn with the opaque reasoning round-trip payload
-/// and the vision image **bytes** stripped: only the daemon consumes
+/// and the image **bytes** stripped: only the daemon consumes
 /// `reasoning_artifact`/`reasoning_producer` (it rebuilds the next provider
-/// request from them) and `ToolResultRecord.image` (the request builder reads
-/// the bytes from the daemon-side `SessionState`/DB); clients render
-/// `assistant_reasoning` and never need the artifact bytes, and they render
-/// tool images via `displayed_images`, which is deliberately left INTACT
-/// here.  Stripping keeps the artifact and the vision bytes off every
-/// `DaemonMessage` payload (bandwidth + privacy: thinking-block JSON,
-/// encrypted provider blobs, and raw vision image bytes never leave the
-/// daemon process), while the authoritative `Turn` in `SessionState` and the
-/// DB keeps the full payload for the next request's builder.
+/// request from them), `ToolResultRecord.image` (the request builder reads
+/// the bytes from the authoritative daemon-side `SessionState`/DB), and
+/// `DisplayedImageRecord.data` (the bytes live in the DB; clients fetch them
+/// on demand via `ClientMessage::GetImage`).
+///
+/// Clients still receive each `DisplayedImageRecord`'s `metadata` (dimensions,
+/// mime, `byte_len`, alt), which is all they need to lay out and render a
+/// placeholder until the bytes are fetched — so a long session's history no
+/// longer ships every image up front. Stripping keeps the artifact and every
+/// image's bytes off each `DaemonMessage` payload (bandwidth + privacy:
+/// thinking-block JSON, encrypted provider blobs, and raw image bytes never
+/// leave the daemon process), while the authoritative `Turn` in `SessionState`
+/// and the DB keeps the full payload for the request builder and the image
+/// store.
 pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
     let mut clone = turn.clone();
     clone.reasoning_artifact = None;
     clone.reasoning_producer = None;
     // Vision image bytes are daemon/model-only: the request builder consumes
-    // them from the authoritative daemon-side turn, and the client renders
-    // images via `displayed_images` (kept below), so drop the raw bytes here.
+    // them from the authoritative daemon-side turn, and the client never
+    // renders them, so drop the raw bytes here.
     for record in &mut clone.tool_results {
         record.image = None;
+    }
+    // Displayed-image bytes are fetched on demand (ClientMessage::GetImage);
+    // the metadata (with `byte_len`) stays so the client can size the
+    // placeholder and knows whether there is anything to fetch.
+    for image in &mut clone.displayed_images {
+        image.data.clear();
     }
     clone
 }

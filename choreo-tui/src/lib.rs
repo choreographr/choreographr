@@ -52,6 +52,15 @@ pub struct RenderedImage {
     /// Job ID of a currently-pending encoding request, or `None` when
     /// no encoding is in flight (idle or cached).
     pub pending_job: Option<ImageId>,
+    /// True while an on-demand `ClientMessage::GetImage` for this image is in
+    /// flight (bytes stripped from the turn snapshot, protocol v6). Dedupes
+    /// the fetch so the per-frame render path cannot re-request the same image
+    /// while a reply is pending.
+    pub fetching: bool,
+    /// True once a fetch came back `None` (not found — deleted/evicted). The
+    /// render path then stops re-requesting, so a missing image cannot spin a
+    /// fetch every frame; it renders as an empty placeholder.
+    pub fetch_failed: bool,
 }
 
 impl RenderedImage {
@@ -66,6 +75,8 @@ impl RenderedImage {
             protocols: HashMap::new(),
             failed_sizes: HashSet::new(),
             pending_job: None,
+            fetching: false,
+            fetch_failed: false,
         }
     }
 

@@ -487,8 +487,12 @@ or re-normalization. Each provider's wire format is supported (OpenAI chat
 and a **vision gate** (`supports_vision` from the models.dev catalog, overridable
 via the overlay) ensures images are never sent to a text-only model — they
 degrade to a text placeholder instead. Vision bytes are daemon/model-only: they
-never reach clients, while `display_image` images (which clients render) persist
-in the same table and still stream to the TUI.
+never reach clients. `display_image`, `generate_image`, and `retrieve_webpage`
+screenshots instead land in `Turn::displayed_images` and persist in the same
+`session_attachments` table; those images are delivered to clients **on demand**
+— a session snapshot carries only the image metadata, and the client fetches an
+image's bytes when it is about to render it (the TUI when it scrolls into view)
+via a `GetImage` request the daemon answers from the DB.
 Vision support is per-model: pick a vision-capable model (e.g.
 `deepseek-v4-flash-vision-exp`) and call `read_image` with a path.
 

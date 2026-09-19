@@ -200,20 +200,32 @@ fn render_fullscreen_image(
         None => false,
     };
 
-    if should_submit
-        && let Some(images) = app.rendered_images.get(&session_id)
-        && let Some(imgs) = images.get(&turn_id)
-        && let Some(img) = imgs.get(&img_idx)
-    {
-        app.submit_image_job(
-            session_id,
-            turn_id,
-            img_idx,
-            img.data.clone(),
-            img.metadata.clone(),
-            full,
-            crate::IMAGE_RESIZE,
-        );
+    if should_submit {
+        // Extract the bytes/metadata while the immutable borrow is live, then
+        // drop it before touching `app` mutably (to fetch or submit).
+        let payload = app
+            .rendered_images
+            .get(&session_id)
+            .and_then(|imgs| imgs.get(&turn_id))
+            .and_then(|images| images.get(&img_idx))
+            .map(|img| (img.data.clone(), img.metadata.clone()));
+        if let Some((data, meta)) = payload {
+            if data.is_empty() && meta.byte_len > 0 {
+                // Bytes stripped from the snapshot: fetch on demand (see
+                // `render_turn_image` for the full rationale).
+                app.request_image_fetch(session_id, turn_id, img_idx);
+            } else {
+                app.submit_image_job(
+                    session_id,
+                    turn_id,
+                    img_idx,
+                    data,
+                    meta,
+                    full,
+                    crate::IMAGE_RESIZE,
+                );
+            }
+        }
     }
 
     render_fullscreen_placeholder(frame);
@@ -839,15 +851,24 @@ fn render_turn_image(
     };
 
     if needs_job {
-        app.submit_image_job(
-            session_id,
-            turn_id,
-            img_idx,
-            data,
-            meta.clone(),
-            inline_size,
-            crate::IMAGE_RESIZE,
-        );
+        if data.is_empty() && meta.byte_len > 0 {
+            // The bytes were stripped from the turn snapshot (protocol v6):
+            // fetch them on demand. The render path has no client sender, so
+            // `request_image_fetch` queues it (deduped) and the UI loop sends
+            // the `GetImage`; the reply stores the bytes and clears the failed
+            // state so a later frame submits the decode job.
+            app.request_image_fetch(session_id, turn_id, img_idx);
+        } else {
+            app.submit_image_job(
+                session_id,
+                turn_id,
+                img_idx,
+                data,
+                meta.clone(),
+                inline_size,
+                crate::IMAGE_RESIZE,
+            );
+        }
     }
 
     // Render placeholder frame while encoding is pending.

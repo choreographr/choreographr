@@ -218,11 +218,13 @@ fn turn_for_client_strips_artifact_and_producer() {
 }
 
 #[test]
-fn turn_for_client_strips_vision_image_keeps_displayed_images() {
-    // The client-facing copy must never carry vision image bytes: the request
-    // builder reads `ToolResultRecord.image` from the authoritative daemon-side
-    // turn, so the client clone strips them.  `displayed_images` are what the
-    // client actually renders, so they must survive intact.
+fn turn_for_client_strips_all_image_bytes_keeps_display_metadata() {
+    // The client-facing copy must carry NO image bytes: the request builder
+    // reads `ToolResultRecord.image` from the authoritative daemon-side turn,
+    // and displayed-image bytes are fetched on demand via `GetImage`, so the
+    // client clone strips both. The displayed image's METADATA (dimensions,
+    // mime, byte_len, alt) survives so the client can size the placeholder and
+    // knows there is something to fetch.
     let authoritative = Turn {
         created_at: TimestampMs::now(),
         undone: false,
@@ -271,16 +273,26 @@ fn turn_for_client_strips_vision_image_keeps_displayed_images() {
 
     // Vision image bytes are stripped (daemon/model-only)…
     assert_eq!(client.tool_results[0].image, None);
-    // …while the display image the client renders survives untouched.
-    assert_ne!(client.displayed_images[0].data, [] as [u8; 0]);
-    assert_eq!(client.displayed_images[0].data, b"\x89PNG-display-bytes");
+    // …and the displayed-image bytes are stripped too (fetched on demand)…
+    assert_eq!(client.displayed_images[0].data, [] as [u8; 0]);
+    // …but the display image's metadata survives so the client can lay out a
+    // placeholder and issue its `GetImage` fetch (`byte_len > 0` is the
+    // "there is something to fetch" signal).
+    assert_eq!(client.displayed_images[0].metadata.byte_len, 8);
+    assert_eq!(client.displayed_images[0].metadata.mime_type, "image/png");
+    assert_eq!(
+        client.displayed_images[0].tool_call_id.as_deref(),
+        Some("c0")
+    );
     assert_eq!(client.tool_results[0].name, "read_image");
 
-    // The authoritative turn keeps the vision bytes for the request builder.
+    // The authoritative turn keeps both byte payloads (the request builder and
+    // the DB image store rely on them).
     assert_ne!(
         authoritative.tool_results[0].image.as_ref().unwrap().data,
         [] as [u8; 0]
     );
+    assert_ne!(authoritative.displayed_images[0].data, [] as [u8; 0]);
 }
 
 #[test]

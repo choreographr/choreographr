@@ -1,4 +1,4 @@
-use choreo_proto::{ClientMessage, DaemonMessage, OutputStream, SessionEvent, write_message};
+use choreo_proto::{ClientMessage, DaemonMessage, OutputStream, SessionEvent, Turn, write_message};
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 #[cfg(unix)]
@@ -114,6 +114,12 @@ impl DaemonBridge {
 
         // Reader thread: uses the shared run_daemon_reader loop from choreo-client-core.
         // It handles EOF, connection reset, and protocol errors uniformly.
+        //
+        // The reader also drives on-demand image fetching: displayed-image
+        // bytes are stripped from `TurnAppended` (protocol v6), so it issues a
+        // `GetImage` per image that has bytes and forwards the fetched bytes to
+        // the bridge as an `Image` event (the path Telegram uploads).
+        let reader_client_tx = client_tx.clone();
         let image_event_tx = event_tx.clone();
         std::thread::spawn(move || {
             let mut reader = reader;
@@ -122,19 +128,33 @@ impl DaemonBridge {
 
             let result = choreo_client_core::run_daemon_reader(&mut reader, |msg| {
                 debug!(?msg, "received daemon message");
-                // Extract images from TurnAppended before passing
-                // to the standard handler.
+                // Live turns carry displayed images, but only their metadata:
+                // request each image's bytes and emit them when the matching
+                // `Image` reply arrives.
                 if let DaemonMessage::Session {
-                    event: SessionEvent::TurnAppended { turn, .. },
+                    session_id,
+                    event: SessionEvent::TurnAppended { turn_id, turn, .. },
                     ..
                 } = &msg
                 {
-                    for record in &turn.displayed_images {
-                        let _ = image_event_tx.send(BridgeEvent::Image {
-                            _mime: record.metadata.mime_type.clone(),
-                            data: record.data.clone(),
-                        });
+                    let (events, requests) =
+                        collect_turn_images(session_id.unwrap_or_default(), *turn_id, turn);
+                    for event in events {
+                        let _ = image_event_tx.send(event);
                     }
+                    for request in requests {
+                        let _ = reader_client_tx.send(request);
+                    }
+                }
+                // The on-demand reply: forward the fetched bytes.
+                if let DaemonMessage::Image {
+                    data: Some(bytes), ..
+                } = &msg
+                {
+                    let _ = image_event_tx.send(BridgeEvent::Image {
+                        _mime: String::new(),
+                        data: bytes.clone(),
+                    });
                 }
                 if let Some(event) = daemon_to_bridge_events(msg, &mut buffers, &mut tool_buffers) {
                     let _ = event_tx.send(event);
@@ -159,6 +179,40 @@ impl DaemonBridge {
     pub fn into_parts(self) -> (mpsc::Sender<ClientMessage>, mpsc::Receiver<BridgeEvent>) {
         (self.client_tx, self.event_rx)
     }
+}
+
+/// Split a live turn's displayed images into the ones to forward directly and
+/// the ones to fetch on demand.
+///
+/// Protocol v6 strips displayed-image bytes from `TurnAppended`, leaving only
+/// metadata — so an image with `byte_len > 0` but empty `data` must be
+/// requested with `ClientMessage::GetImage` (keyed by session, turn, and the
+/// image's index within the turn). An image that still carries bytes inline
+/// (an older daemon) is forwarded immediately, and a genuinely zero-byte image
+/// has nothing to send. Pure and side-effect free so the policy is unit-tested
+/// without a live socket.
+fn collect_turn_images(
+    session_id: u64,
+    turn_id: u32,
+    turn: &Turn,
+) -> (Vec<BridgeEvent>, Vec<ClientMessage>) {
+    let mut events = Vec::new();
+    let mut requests = Vec::new();
+    for (idx, record) in turn.displayed_images.iter().enumerate() {
+        if !record.data.is_empty() {
+            events.push(BridgeEvent::Image {
+                _mime: record.metadata.mime_type.clone(),
+                data: record.data.clone(),
+            });
+        } else if record.metadata.byte_len > 0 {
+            requests.push(ClientMessage::GetImage {
+                session_id,
+                turn_id,
+                image_index: u32::try_from(idx).unwrap_or(u32::MAX),
+            });
+        }
+    }
+    (events, requests)
 }
 
 fn daemon_to_bridge_events(
@@ -595,6 +649,61 @@ mod tests {
             }
             other => panic!("expected ToolCallFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn collect_turn_images_forwards_inline_and_requests_stripped() {
+        // Protocol v6: a live turn's images carry only metadata. An image that
+        // still has inline bytes is forwarded; one with byte_len>0 but no bytes
+        // is requested via GetImage; a zero-byte image is dropped.
+        let meta = |byte_len| choreo_proto::ImageMetadata {
+            mime_type: "image/png".into(),
+            width: 1,
+            height: 1,
+            byte_len,
+            alt: None,
+        };
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![
+                choreo_proto::DisplayedImageRecord {
+                    metadata: meta(4),
+                    data: b"AAAA".to_vec(),
+                    tool_call_id: None,
+                },
+                choreo_proto::DisplayedImageRecord {
+                    metadata: meta(9),
+                    data: Vec::new(),
+                    tool_call_id: None,
+                },
+                choreo_proto::DisplayedImageRecord {
+                    metadata: meta(0),
+                    data: Vec::new(),
+                    tool_call_id: None,
+                },
+            ],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        let (events, requests) = collect_turn_images(7, 3, &turn);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], BridgeEvent::Image { data, .. } if data == b"AAAA"));
+        assert_eq!(
+            requests,
+            vec![ClientMessage::GetImage {
+                session_id: 7,
+                turn_id: 3,
+                image_index: 1,
+            }]
+        );
     }
 
     #[test]

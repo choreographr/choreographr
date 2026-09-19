@@ -105,6 +105,20 @@ pub trait TurnEventHandler {
         token_usage: TokenUsage,
         last_prompt_tokens: Option<u32>,
     );
+    /// A previously-requested displayed image arrived (the reply to
+    /// `ClientMessage::GetImage`). `data: Some(bytes)` carries the image; `None`
+    /// means it was not found (deleted/evicted session or turn, or a stale
+    /// index). Only clients that render image *bytes* need this — the default
+    /// is a no-op so metadata-only frontends (e.g. the GUI's label) ignore it.
+    fn handle_image(
+        &mut self,
+        session_id: u64,
+        turn_id: u32,
+        image_index: u32,
+        data: Option<Vec<u8>>,
+    ) {
+        let _ = (session_id, turn_id, image_index, data);
+    }
 }
 
 /// Dispatch a [`DaemonMessage`] to the [`TurnEventHandler`], splitting the
@@ -115,9 +129,10 @@ pub trait TurnEventHandler {
 ///   value position there, so every arm below reads a single `session_id`)
 ///   and then handles the inner event; the flat variants never appear in its
 ///   match.
-/// - The 23 flat connection/reply/global variants — replies to the client's
+/// - The 24 flat connection/reply/global variants — replies to the client's
 ///   own requests (`Sessions`, `Models`, `Pong`, keystore/account replies,
-///   catalog/refresh replies, …), handled by `dispatch_flat_message`.
+///   catalog/refresh replies, on-demand `Image`, …), handled by
+///   `dispatch_flat_message`.
 pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandler) {
     debug!("dispatching daemon message: {msg:?}");
     match msg {
@@ -263,6 +278,18 @@ fn dispatch_flat_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandle
         }
         DaemonMessage::AccountListFailed { error } => {
             handler.handle_error(format!("[daemon] failed to list accounts: {error}"));
+        }
+        // On-demand displayed-image reply. The connection layer does NOT
+        // intercept this (unlike `Sessions`, handled before the generic
+        // dispatch), so it flows to the handler's `handle_image`, which fills
+        // the matching placeholder (data) or marks the fetch failed (None).
+        DaemonMessage::Image {
+            session_id,
+            turn_id,
+            image_index,
+            data,
+        } => {
+            handler.handle_image(*session_id, *turn_id, *image_index, data.clone());
         }
         // Explicit no-ops, enumerated so a new flat variant still forces this
         // match to grow:

@@ -67,12 +67,22 @@ pub(crate) fn broadcast_turn_appended(
     }
 }
 
-/// Persist a `PreparedImage` to the session's current active turn and
-/// broadcast it to live subscribers immediately (mid-turn) so the image
-/// appears as soon as the tool finishes rather than waiting for request
-/// completion.  Used by both the serial and concurrent tool paths.
+/// Persist a `PreparedImage` to the session's current active turn, write it
+/// through to the DB immediately, and broadcast it to live subscribers
+/// mid-turn so the image appears as soon as the tool finishes rather than
+/// waiting for request completion.  Used by both the serial and concurrent
+/// tool paths.
+///
+/// The DB write is the important half: the client receives a `TurnAppended`
+/// whose image carries only metadata (see `turn_for_client`) and fetches the
+/// bytes on demand via `GetImage`, so the bytes MUST already be in
+/// `session_attachments` when that fetch arrives. Persisting here — rather
+/// than waiting for `RequestFinished`, which is the only other turn write —
+/// makes the DB the single source of truth for image bytes at every instant,
+/// including mid-request.
 pub(crate) fn emit_image(
     cmd_tx: &mpsc::Sender<SessionCommand>,
+    db: &redb::Database,
     image: PreparedImage,
     tool_call_id: Option<String>,
     session: &mut SessionState,
@@ -91,6 +101,18 @@ pub(crate) fn emit_image(
         tool_call_id,
     };
     session.add_displayed_image(turn_id, record.clone());
+    // Persist-at-emit: write the turn (with its new `d{i}` attachment) right
+    // now so an on-demand `GetImage` for this image resolves. `write_turn`
+    // re-derives all attachment slots from the turn's `displayed_images`, so
+    // the index the wire request carries is exactly the slot just written. A
+    // failure is logged and swallowed: the image still renders from the
+    // in-memory turn, and `RequestFinished` retries the write at turn
+    // completion.
+    if let Some(turn) = session.turns.get(&turn_id)
+        && let Err(e) = crate::db::write_turn_retry(db, session_id, turn_id, turn)
+    {
+        warn!(turn_id, error = %e, "failed to persist displayed image at emit time");
+    }
     broadcast_turn_appended(cmd_tx, session, session_id, turn_id);
 }
 
@@ -830,6 +852,7 @@ pub(crate) fn record_tool_completion(
     if let Some(image) = image {
         emit_image(
             &ctx.cmd_tx,
+            &ctx.db,
             image,
             Some(tool_call.id.clone()),
             session,

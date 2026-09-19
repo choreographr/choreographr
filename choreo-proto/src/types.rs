@@ -612,6 +612,26 @@ pub enum ClientMessage {
     ContinueGeneration {
         request_id: u32,
     },
+    /// Request the raw bytes of one **displayed** image — the `image_index`-th
+    /// entry of `turn_id`'s `Turn::displayed_images` in `session_id`.
+    ///
+    /// Displayed-image bytes are deliberately kept OFF the session-scoped
+    /// snapshots (`SessionState`, `TurnAppended`, `TurnsRedone`): those carry
+    /// only the `ImageMetadata` (dimensions, mime, `byte_len`, alt), so a long
+    /// session's history no longer ships every image up front. The client
+    /// fetches each image on demand — typically when it scrolls into view —
+    /// and the daemon replies with a targeted [`DaemonMessage::Image`].
+    ///
+    /// The bytes are served from the daemon's durable `session_attachments`
+    /// store, keyed exactly like the wire request: (`session_id`, `turn_id`,
+    /// `d{image_index}`). `displayed_images` is append-only within a turn, so
+    /// the index is a stable identifier and matches the DB slot the turn was
+    /// persisted under.
+    GetImage {
+        session_id: u64,
+        turn_id: u32,
+        image_index: u32,
+    },
     SubscribeAllActivity,
     UnsubscribeAllActivity,
 }
@@ -1004,6 +1024,20 @@ pub enum DaemonMessage {
     /// provider list so clients can replace their static default picker.
     CatalogUpdated {
         providers: Vec<CatalogProvider>,
+    },
+    /// Targeted reply to [`ClientMessage::GetImage`]: the raw bytes of the
+    /// requested displayed image, or `None` when it is not found (the session
+    /// or turn was deleted, the attachment was evicted, or the index is
+    /// stale). `Some(vec![])` is a genuinely zero-byte image — distinct from
+    /// `None` (unknown), so the client can tell "empty image" from "fetch
+    /// failed" and avoid retrying a missing image forever. The `session_id`,
+    /// `turn_id`, and `image_index` echo the request so a client with several
+    /// fetches in flight can route the reply.
+    Image {
+        session_id: u64,
+        turn_id: u32,
+        image_index: u32,
+        data: Option<Vec<u8>>,
     },
     ShuttingDown,
     /// Best-effort advisory, sent by the daemon immediately before it
@@ -1889,6 +1923,15 @@ mod tests {
                         effort: "high".into(),
                         error: "model does not support it".into(),
                     },
+                },
+            ),
+            (
+                "Image",
+                DaemonMessage::Image {
+                    session_id: 1,
+                    turn_id: 1,
+                    image_index: 0,
+                    data: Some(vec![0u8; 4096]),
                 },
             ),
             ("ShuttingDown", DaemonMessage::ShuttingDown),

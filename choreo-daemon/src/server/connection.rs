@@ -548,6 +548,17 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             debug!("client {}: ListModels", ctx.client_id);
             handle_list_models_sync(ctx, *ctx.attached_session_id);
         }
+        ClientMessage::GetImage {
+            session_id,
+            turn_id,
+            image_index,
+        } => {
+            debug!(
+                "client {}: GetImage session={} turn={} index={}",
+                ctx.client_id, session_id, turn_id, image_index
+            );
+            handle_client_get_image(session_id, turn_id, image_index, ctx);
+        }
         ClientMessage::RefreshModels { force } => {
             debug!("client {}: RefreshModels force={}", ctx.client_id, force);
             handle_refresh_models_sync(ctx, force);
@@ -1282,6 +1293,49 @@ fn handle_list_models_sync(ctx: &mut ClientCtx, attached_session_id: Option<u64>
         }
         Err(_) => warn!("daemon disconnected while handling list models"),
     }
+}
+
+/// Handle a `GetImage` client message: read the requested displayed image's
+/// bytes and reply with a targeted [`DaemonMessage::Image`].
+///
+/// Only images of the session THIS connection is attached to are served — the
+/// same trust boundary every other session-scoped command enforces. A request
+/// for any other (or no) session is answered `None` rather than reading an
+/// arbitrary session's attachments. The daemon command loop owns the DB and
+/// performs the actual `get`, so this connection needs no DB handle; the reply
+/// channel is drained inline, exactly like the other session-scoped replies.
+fn handle_client_get_image(session_id: u64, turn_id: u32, image_index: u32, ctx: &ClientCtx) {
+    let data = if *ctx.attached_session_id == Some(session_id) {
+        let (reply, rx) = mpsc::channel();
+        if ctx
+            .daemon_tx
+            .send(DaemonCommand::GetDisplayImage {
+                session_id,
+                turn_id,
+                image_index,
+                reply,
+            })
+            .is_ok()
+        {
+            // `None` covers both "not found" and a dropped reply channel; the
+            // client treats it identically (mark the image failed, don't
+            // retry), so the two collapse here intentionally.
+            rx.recv().ok().flatten()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    send_to_writer(
+        ctx,
+        &DaemonMessage::Image {
+            session_id,
+            turn_id,
+            image_index,
+            data,
+        },
+    );
 }
 
 /// Handle a `RefreshModels` client message: forward the request to the daemon
@@ -2086,6 +2140,87 @@ mod tests {
         if let DaemonMessage::ModelsFailed { error } = &msg {
             assert_eq!(error, "daemon is locked");
         }
+    }
+
+    #[test]
+    fn handle_client_get_image_serves_attached_session() {
+        // A client attached to session 5 requests image 1 of turn 2; the daemon
+        // reads the bytes and the connection routes them back as Image.
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut attached = Some(5u64);
+        let mut none_tx = None;
+        let ctx = ClientCtx {
+            writer: &sink,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut attached,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            is_unix: true,
+        };
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::GetDisplayImage {
+                session_id,
+                turn_id,
+                image_index,
+                reply,
+            }) = daemon_rx.recv()
+            {
+                assert_eq!((session_id, turn_id, image_index), (5, 2, 1));
+                let _ = reply.send(Some(vec![1, 2, 3]));
+            }
+        });
+        handle_client_get_image(5, 2, 1, &ctx);
+        let msg = writer_rx.recv().unwrap();
+        match msg {
+            DaemonMessage::Image {
+                session_id,
+                turn_id,
+                image_index,
+                data,
+            } => {
+                assert_eq!((session_id, turn_id, image_index), (5, 2, 1));
+                assert_eq!(data, Some(vec![1, 2, 3]));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_client_get_image_refuses_unattached_session() {
+        // The client is NOT attached to the requested session: the daemon must
+        // not be consulted (no command sent) and the reply is a not-found None.
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut attached = Some(5u64);
+        let mut none_tx = None;
+        let ctx = ClientCtx {
+            writer: &sink,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut attached,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            is_unix: true,
+        };
+        handle_client_get_image(99, 0, 0, &ctx);
+        let msg = writer_rx.recv().unwrap();
+        match msg {
+            DaemonMessage::Image {
+                session_id, data, ..
+            } => {
+                assert_eq!(session_id, 99);
+                assert_eq!(data, None);
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+        assert!(
+            daemon_rx.try_recv().is_err(),
+            "an unattached request must not reach the daemon"
+        );
     }
 
     #[test]

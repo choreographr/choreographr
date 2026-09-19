@@ -1241,6 +1241,57 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
     Ok(turns)
 }
 
+/// Read a single persisted displayed-image attachment (raw bytes) by turn and
+/// index.
+///
+/// The attachment table is keyed `(session_id, turn_id, slot)`, where a
+/// displayed image at index `i` in its turn is stored under slot `d{i}` — the
+/// exact index the wire `ClientMessage::GetImage` carries. This is a single
+/// `get`: no turn decode and no whole-session scan, so an on-demand image
+/// fetch (a client scrolling an image into view) is O(log n) rather than
+/// proportional to the session's history.
+///
+/// Returns `Ok(None)` when the table or the slot is absent — a fresh database
+/// has no attachments table, a turn that persisted no image at that index has
+/// no row, and a deleted/evicted image is simply gone. All such cases are
+/// "not found", never an error.
+///
+/// # Errors
+///
+/// Returns Err only for a genuine redb failure (read transaction open, table
+/// open other than "does not exist", or the `get`).
+pub fn read_display_image(
+    db: &redb::Database,
+    session_id: u64,
+    turn_id: u32,
+    image_index: u32,
+) -> io::Result<Option<Vec<u8>>> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| db_err(format!("redb read txn (display image): {e}")))?;
+    let table = match read_txn.open_table(SESSION_ATTACHMENTS) {
+        Ok(t) => t,
+        // No attachments table yet (fresh database): nothing has ever been
+        // split out, so the image is simply not found.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => {
+            return Err(db_err(format!(
+                "redb open session_attachments (display image): {e}"
+            )));
+        }
+    };
+    // Display images occupy slot `d{index}` (see `write_turn`); the vision
+    // image slot `r{call_id}` is not served by this path.
+    let slot = format!("d{image_index}");
+    match table
+        .get((session_id, turn_id, slot))
+        .map_err(|e| db_err(format!("redb get display attachment: {e}")))?
+    {
+        Some(guard) => Ok(Some(guard.value().to_vec())),
+        None => Ok(None),
+    }
+}
+
 /// Retry a `write_turn` on transient storage errors (e.g. I/O contention)
 /// with up to 3 retries and a 1ms backoff.
 ///
@@ -2138,6 +2189,60 @@ mod tests {
             );
         }
         drop(db);
+    }
+
+    #[test]
+    fn read_display_image_returns_bytes_by_index_or_none() {
+        // On-demand fetch (protocol v6) reads a single display-image attachment
+        // by (session, turn, index) — the exact key `ClientMessage::GetImage`
+        // carries. A missing table/slot is `None`, never an error.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let id = 7u64;
+
+        // Fresh DB: no attachments table yet → not found, not an error.
+        assert_eq!(read_display_image(&db, id, 0, 0).unwrap(), None);
+
+        let mut turn = dummy_turn();
+        turn.displayed_images = vec![
+            DisplayedImageRecord {
+                metadata: ImageMetadata {
+                    mime_type: "image/png".into(),
+                    width: 1,
+                    height: 1,
+                    byte_len: 4,
+                    alt: None,
+                },
+                data: b"AAAA".to_vec(),
+                tool_call_id: None,
+            },
+            DisplayedImageRecord {
+                metadata: ImageMetadata {
+                    mime_type: "image/png".into(),
+                    width: 1,
+                    height: 1,
+                    byte_len: 4,
+                    alt: None,
+                },
+                data: b"BBBB".to_vec(),
+                tool_call_id: None,
+            },
+        ];
+        write_turn(&db, id, 3, &turn).unwrap();
+
+        // Each display index resolves to its own `d{i}` slot.
+        assert_eq!(
+            read_display_image(&db, id, 3, 0).unwrap(),
+            Some(b"AAAA".to_vec())
+        );
+        assert_eq!(
+            read_display_image(&db, id, 3, 1).unwrap(),
+            Some(b"BBBB".to_vec())
+        );
+        // Missing index, missing turn, missing session → None.
+        assert_eq!(read_display_image(&db, id, 3, 2).unwrap(), None);
+        assert_eq!(read_display_image(&db, id, 99, 0).unwrap(), None);
+        assert_eq!(read_display_image(&db, 999, 3, 0).unwrap(), None);
     }
 
     #[test]

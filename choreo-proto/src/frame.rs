@@ -23,7 +23,12 @@ use std::io::Cursor;
 /// authoritative three-state keystore status (`Unbound`/`Locked`/`Unlocked`),
 /// so a first-run client learns the keystore is unbound and auto-binds.
 /// `Locked`/`Unlocked` remain as targeted operation replies.
-pub const PROTOCOL_VERSION: u8 = 5;
+/// 6 = displayed-image bytes are no longer shipped in session-scoped
+/// snapshots (`SessionState`, `TurnAppended`, `TurnsRedone`) — those now
+/// carry only `ImageMetadata`. Clients fetch an image's bytes on demand via
+/// the new `ClientMessage::GetImage` ⇄ `DaemonMessage::Image` pair, so opening
+/// a long session no longer transfers its entire image history.
+pub const PROTOCOL_VERSION: u8 = 6;
 /// Max serialised *payload* size, enforced identically on encode (before the
 /// 4-byte length prefix is added — [`encode_inner`]) and on decode
 /// (`read_payload`, which checks the length prefix before reading the body).
@@ -31,12 +36,17 @@ pub const PROTOCOL_VERSION: u8 = 5;
 /// `MAX_FRAME_SIZE + 4` bytes.
 ///
 /// Bumped from 1 MiB to 32 MiB to accommodate `SessionState` responses that
-/// carry full image binary data inside `DisplayedImage` records, then to
+/// carried full image binary data inside `DisplayedImage` records, then to
 /// 64 MiB because a long session's full `SessionState` snapshot is
 /// re-serialized *uncompressed* for the wire (the on-disk turns are
 /// zstd-compressed), so accumulated tool output plus displayed images can
 /// exceed 32 MiB even when the database is far smaller.  A payload over the
 /// limit fails to encode (`FrameTooLarge`).
+///
+/// As of protocol v6 the displayed-image bytes no longer ride the snapshot
+/// (clients fetch them on demand via `ClientMessage::GetImage`), so the
+/// image-driven pressure that motivated the 32 MiB bump is gone; the limit
+/// stays at 64 MiB for the accumulated tool-output case.
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
 /// Encode `(PROTOCOL_VERSION, message)` as named `MessagePack`, enforcing

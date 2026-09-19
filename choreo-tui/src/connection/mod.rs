@@ -701,6 +701,9 @@ fn run_ui_loop(
     if app.fullscreen_image_target.is_none() {
         terminal.show_cursor()?;
     }
+    // Flush any on-demand image fetches the initial frame queued for visible
+    // images whose bytes were stripped from the turn snapshot.
+    app.flush_image_fetches(client_tx);
 
     let mut dirty = false;
 
@@ -807,6 +810,11 @@ fn run_ui_loop(
         }
 
         terminal.draw(|frame| render(frame, app))?;
+
+        // Flush any on-demand image fetches this frame queued for newly-visible
+        // images (bytes are stripped from turn snapshots; the render path has
+        // no client sender, so it queues and the UI loop sends).
+        app.flush_image_fetches(client_tx);
 
         // Re-show the cursor once the overlay is dismissed.
         if app.fullscreen_image_target.is_none() {
