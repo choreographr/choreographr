@@ -51,7 +51,7 @@ Every non-trivial change (new features, fixes, refactors, dependency updates, be
 
 When implementing a list of code changes across multiple files, delegate each task to a subsession and run them in series (one at a time), not in parallel. This avoids filesystem conflicts from concurrent edits to overlapping files and keeps each subsession's context focused. (There is no worktree-per-branch support yet, so subsessions share one working tree — hence the serial execution.)
 
-During development a subsession may iterate against just the crates it changed with `cargo nextest run -p <crates>` (the `cargo test-*` aliases bake in `--workspace` and reject `-p`, so call nextest directly — or use `just test-crate <crate>`). That is for fast feedback only. **Before returning its report, a subsession must run the full [Commit Workflow](#commit-workflow) gate and commit its work**; a scoped `-p` run is never sufficient to commit from. A subsession that cannot complete the work must not commit and must leave its changes in the tree for the parent to inspect (see [Commit Workflow → Sub-sessions](#sub-sessions)).
+During development a subsession may iterate against just the crates it changed with `cargo nextest run -p <crates>` (the `cargo test-*` aliases bake in `--workspace` and reject `-p`, so call nextest directly — or use `just test-crate <crate>`). That is for fast feedback *while still editing* only — never a substitute or precursor gate: when the work is ready to verify, run `just pre-commit` directly (see [Commit Workflow](#commit-workflow)). **Before returning its report, a subsession must run the full [Commit Workflow](#commit-workflow) gate and commit its work**; a scoped `-p` run is never sufficient to commit from. A subsession that cannot complete the work must not commit and must leave its changes in the tree for the parent to inspect (see [Commit Workflow → Sub-sessions](#sub-sessions)).
 
 ## Dependency Management
 
@@ -116,6 +116,18 @@ Finishing an implementation run means the work is **not done until it is committ
 
 A run is committed **once, at the end of each unit of work** — not once per turn. When a run delegates to subsessions, each completed subsession commits its own unit before returning (see [Task Execution](#task-execution)); the parent then commits whatever remains when its own run ends.
 
+### Run the gate directly — do not invent intermediate gates
+
+When a run is ready to verify, run **`just pre-commit`** as the one and only gate. Do **not** prefix it with a bespoke sequence of checks — a scoped `cargo clippy -p …`/`cargo clippy --all-targets …`, a scoped `cargo nextest run -p …`, a hand-picked lint or format pass, or any ad-hoc command assembled "to be sure." The recipe already runs the full clippy + test + fmt + changelog sequence with the exact flags the release workflow expects (they live in `.cargo/config.toml`), so every custom pre-check is wasted work — and, worse, a bespoke check can pass while the real gate fails (different scope/flags), or fail while the real gate passes, sending you to fix a non-problem. An inner-loop `cargo nextest run -p <crate>` while you are still editing is fine (see [Task Execution](#task-execution)); the moment the work is ready, go straight to `just pre-commit`, loop it (fix by hand, re-run) until it is green in one pass, then commit.
+
+### When the gate is not required
+
+Some changes cannot be affected by any step of the gate and may be committed **without** running `just pre-commit`:
+
+- **Documentation-only changes** — Markdown and other non-Rust text (`README.md`, `ARCHITECTURE.md`, `RELEASE.md`, `AGENTS.md`, `docs/`, `packaging/` service/PKGBUILD files, `.github/workflows/*.yml`, …). `clippy`/`test-all`/`fmt` operate on Rust sources and cannot be affected by them. The one relevant gate step is `check-changelog`: it only matters when `CHANGELOG.md` itself changed, and then you can run `just check-changelog` (or `./scripts/check-changelog.sh`) alone.
+
+Anything that touches Rust source, `Cargo.toml`/`Cargo.lock`, build scripts, or the `.cargo` config still requires the full gate. A mixed change (docs **and** code) takes the strictest applicable rule — run the full gate. When in doubt, run it: it is cheap next to a broken commit.
+
 ### The gate
 
 Run **`just pre-commit`**. It is the commit gate, and it is safe to re-run: loop it (fix by hand, re-run) until it passes green, then commit. The gate only *verifies*, except for the single tree-mutating step (`fmt`) which runs last; it runs (the flags themselves live in `.cargo/config.toml`):
@@ -154,4 +166,4 @@ Stage with `git add`, then commit immediately with `git commit` and a message th
 
 When work is delegated to a subsession, the subsession **runs this gate and commits its work before returning its report** — it does not hand back the report with the changes still uncommitted. If the subsession aborts before completion (an unrecoverable clippy/test failure, a cancelled or timed-out run, any other reason), it must leave its changes **uncommitted** in the working tree and say so in its report, so the parent can inspect the partial state and decide how to proceed. A subsession that cannot finish never commits a red or partial tree.
 
-The `.githooks/pre-commit` hook has been removed; the `just pre-commit` recipe is the gate, and nothing runs it automatically — it is the agent's responsibility on every implementation run.
+The `.githooks/pre-commit` hook has been removed; the `just pre-commit` recipe is the gate, and nothing runs it automatically — it is the agent's responsibility on every implementation run that changes Rust source, manifests, build scripts, or the `.cargo` config (documentation-only changes are exempt — see [When the gate is not required](#when-the-gate-is-not-required)).
