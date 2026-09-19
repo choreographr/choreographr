@@ -118,6 +118,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The TUI command palette now lists commands in alphabetical order.** The
+  palette presents the shared command catalog verbatim, but the catalog was
+  ordered by group (Session → Account → Security → System) in natural usage
+  order, so the picker read out of order. The catalog is now sorted A→Z by
+  command name (each entry keeps its group tag as metadata), and a
+  `catalog_is_alphabetical` unit test pins the order so it cannot silently
+  drift again.
+
 - **OpenAI Responses requests now use the correct `reasoning` shape, fixing
   every model on the official OpenAI provider.** Reasoning was sent wrong
   twice over: the effort went out as the Chat Completions top-level

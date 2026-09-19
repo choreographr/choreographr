@@ -835,8 +835,12 @@ fn command_palette_lists_commands_when_in_command_mode() {
     );
 
     let content = render_chat_content(&mut app, 80, 24);
-    assert!(content.contains("/model"), "model row is drawn");
-    assert!(content.contains("/session"), "session row is drawn");
+    // The palette lists the catalog alphabetically and windows to the first
+    // rows on an empty line, so the leading commands are drawn (the tail is
+    // summarized with a `+N more` row).
+    assert!(content.contains("/account"), "the leading row is drawn");
+    assert!(content.contains("/acl"), "alphabetical order is preserved");
+    assert!(content.contains("more"), "the hidden tail is summarized");
     assert!(
         content.contains("command"),
         "the command-mode affordance (input-box title) is drawn"

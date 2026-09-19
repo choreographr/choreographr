@@ -48,72 +48,23 @@ pub struct CommandSpec {
     pub group: CommandGroup,
 }
 
-/// The catalog, in the fixed order discovery surfaces present it: grouped
-/// Session → Account → Security → System, and within a group the natural
-/// usage order (not alphabetical).
+/// The catalog, in the fixed order discovery surfaces present it: alphabetical
+/// by command name.  The inline command palette is the discovery surface, and
+/// an A→Z list lets a user scan it predictably; each entry still carries its
+/// [`CommandGroup`] as metadata, but that grouping does not drive the ordering.
 static COMMAND_CATALOG: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     vec![
-        // ── Session ──────────────────────────────────────────────
-        CommandSpec {
-            name: "session",
-            summary: "Manage the session: open the manager, or list/new/switch/info",
-            arg_hint: Some("[list|new [title]|switch <id>|info <id>]"),
-            group: CommandGroup::Session,
-        },
-        CommandSpec {
-            name: "model",
-            summary: "Choose the session's model (opens the picker when omitted)",
-            arg_hint: Some("[model]"),
-            group: CommandGroup::Session,
-        },
-        CommandSpec {
-            name: "reasoning",
-            summary: "Cycle, list, or set the reasoning effort",
-            arg_hint: Some("[list|<level>]"),
-            group: CommandGroup::Session,
-        },
-        CommandSpec {
-            name: "continue",
-            summary: "Continue the current session",
-            arg_hint: None,
-            group: CommandGroup::Session,
-        },
-        CommandSpec {
-            name: "stop",
-            summary: "Stop the running request",
-            arg_hint: None,
-            group: CommandGroup::Session,
-        },
-        CommandSpec {
-            name: "cancel",
-            summary: "Cancel a request by id",
-            arg_hint: Some("<request-id>"),
-            group: CommandGroup::Session,
-        },
-        CommandSpec {
-            name: "undo",
-            summary: "Undo the last turn",
-            arg_hint: None,
-            group: CommandGroup::Session,
-        },
-        CommandSpec {
-            name: "redo",
-            summary: "Redo the last undone turn",
-            arg_hint: None,
-            group: CommandGroup::Session,
-        },
-        CommandSpec {
-            name: "ping",
-            summary: "Ping the daemon",
-            arg_hint: None,
-            group: CommandGroup::Session,
-        },
-        // ── Account ──────────────────────────────────────────────
         CommandSpec {
             name: "account",
             summary: "Manage accounts: open the accounts page, or list/remove/set",
             arg_hint: Some("[list|remove <name>|<name>]"),
             group: CommandGroup::Account,
+        },
+        CommandSpec {
+            name: "acl",
+            summary: "Manage the client ACL",
+            arg_hint: Some("add <base64-pubkey>"),
+            group: CommandGroup::Security,
         },
         CommandSpec {
             name: "add-key",
@@ -128,17 +79,16 @@ static COMMAND_CATALOG: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
             group: CommandGroup::Account,
         },
         CommandSpec {
-            name: "remove-key",
-            summary: "Remove a stored credential",
-            arg_hint: Some("<service>"),
-            group: CommandGroup::Account,
+            name: "cancel",
+            summary: "Cancel a request by id",
+            arg_hint: Some("<request-id>"),
+            group: CommandGroup::Session,
         },
-        // ── Security ─────────────────────────────────────────────
         CommandSpec {
-            name: "unlock",
-            summary: "Unlock the daemon keystore",
-            arg_hint: Some("[base64-key]"),
-            group: CommandGroup::Security,
+            name: "continue",
+            summary: "Continue the current session",
+            arg_hint: None,
+            group: CommandGroup::Session,
         },
         CommandSpec {
             name: "lock",
@@ -147,12 +97,35 @@ static COMMAND_CATALOG: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
             group: CommandGroup::Security,
         },
         CommandSpec {
-            name: "acl",
-            summary: "Manage the client ACL",
-            arg_hint: Some("add <base64-pubkey>"),
-            group: CommandGroup::Security,
+            name: "model",
+            summary: "Choose the session's model (opens the picker when omitted)",
+            arg_hint: Some("[model]"),
+            group: CommandGroup::Session,
         },
-        // ── System ───────────────────────────────────────────────
+        CommandSpec {
+            name: "ping",
+            summary: "Ping the daemon",
+            arg_hint: None,
+            group: CommandGroup::Session,
+        },
+        CommandSpec {
+            name: "quit",
+            summary: "Exit the TUI",
+            arg_hint: None,
+            group: CommandGroup::System,
+        },
+        CommandSpec {
+            name: "reasoning",
+            summary: "Cycle, list, or set the reasoning effort",
+            arg_hint: Some("[list|<level>]"),
+            group: CommandGroup::Session,
+        },
+        CommandSpec {
+            name: "redo",
+            summary: "Redo the last undone turn",
+            arg_hint: None,
+            group: CommandGroup::Session,
+        },
         CommandSpec {
             name: "refresh-models",
             summary: "Refresh the models.dev catalog",
@@ -160,10 +133,34 @@ static COMMAND_CATALOG: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
             group: CommandGroup::System,
         },
         CommandSpec {
-            name: "quit",
-            summary: "Exit the TUI",
+            name: "remove-key",
+            summary: "Remove a stored credential",
+            arg_hint: Some("<service>"),
+            group: CommandGroup::Account,
+        },
+        CommandSpec {
+            name: "session",
+            summary: "Manage the session: open the manager, or list/new/switch/info",
+            arg_hint: Some("[list|new [title]|switch <id>|info <id>]"),
+            group: CommandGroup::Session,
+        },
+        CommandSpec {
+            name: "stop",
+            summary: "Stop the running request",
             arg_hint: None,
-            group: CommandGroup::System,
+            group: CommandGroup::Session,
+        },
+        CommandSpec {
+            name: "undo",
+            summary: "Undo the last turn",
+            arg_hint: None,
+            group: CommandGroup::Session,
+        },
+        CommandSpec {
+            name: "unlock",
+            summary: "Unlock the daemon keystore",
+            arg_hint: Some("[base64-key]"),
+            group: CommandGroup::Security,
         },
     ]
 });
@@ -234,6 +231,20 @@ mod tests {
     #[test]
     fn catalog_is_non_empty() {
         assert!(!command_catalog().is_empty());
+    }
+
+    #[test]
+    fn catalog_is_alphabetical() {
+        // The palette presents the catalog verbatim, so the catalog order IS
+        // the on-screen order: it must stay sorted A→Z or the picker reads out
+        // of order.  Guard it here, next to the data it constrains.
+        let names: Vec<&str> = command_catalog().iter().map(|s| s.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            names, sorted,
+            "catalog presentation order must be alphabetical"
+        );
     }
 
     #[test]

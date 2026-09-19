@@ -1605,15 +1605,32 @@ fn palette_shift_enter_runs_the_command_without_a_newline() {
     );
 }
 
+/// Row index of `name` in the palette on an empty command line — the palette
+/// lists the shared catalog verbatim, so this is just the catalog position.
+/// Deriving the row keeps these tests robust to catalog reordering.
+fn palette_row_of(name: &str) -> usize {
+    choreo_client_core::command_catalog()
+        .iter()
+        .position(|spec| spec.name == name)
+        .expect("command is in the catalog")
+}
+
 #[test]
 fn palette_enter_on_empty_line_runs_the_highlighted_command() {
-    // The empty line highlights the first catalog command (`session`); Enter
-    // runs it directly — no preceding `Tab`.
+    // The empty line highlights the first catalog row; Enter runs whichever
+    // row is highlighted — no preceding `Tab`.  Drive to `/session` (wherever
+    // it sits in the alphabetical catalog) so the assertion can name it.
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
     press(&mut app, &tx, KeyCode::Char('/'));
     assert!(app.command_palette_active());
     assert_eq!(app.command_palette_focused(), 0);
+
+    let session_row = palette_row_of("session");
+    for _ in 0..session_row {
+        press(&mut app, &tx, KeyCode::Down);
+    }
+    assert_eq!(app.command_palette_focused(), session_row);
 
     press(&mut app, &tx, KeyCode::Enter);
 
@@ -1659,13 +1676,17 @@ fn palette_enter_on_a_partial_token_runs_the_highlighted_command() {
 #[test]
 fn palette_enter_runs_the_row_the_arrows_selected() {
     // Arrows move the highlight over the whole catalog on an empty line; Enter
-    // then runs whichever row is highlighted.
+    // then runs whichever row is highlighted.  Arrow down to `/model` at its
+    // current catalog position (the catalog is alphabetical, so this is not
+    // hardcoded to a fixed row).
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
     press(&mut app, &tx, KeyCode::Char('/'));
-    // Catalog row 1 is `/model` (row 0 is `/session`).
-    press(&mut app, &tx, KeyCode::Down);
-    assert_eq!(app.command_palette_focused(), 1);
+    let model_row = palette_row_of("model");
+    for _ in 0..model_row {
+        press(&mut app, &tx, KeyCode::Down);
+    }
+    assert_eq!(app.command_palette_focused(), model_row);
 
     press(&mut app, &tx, KeyCode::Enter);
 
