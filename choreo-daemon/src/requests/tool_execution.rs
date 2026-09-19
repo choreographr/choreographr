@@ -80,6 +80,14 @@ pub(crate) fn broadcast_turn_appended(
 /// than waiting for `RequestFinished`, which is the only other turn write —
 /// makes the DB the single source of truth for image bytes at every instant,
 /// including mid-request.
+///
+/// The emit-time write is a single-slot insert
+/// ([`crate::db::write_display_image_attachment`]): just the one `d{index}`
+/// row, in its own transaction. That makes an N-image turn cost O(N) disk
+/// writes across its emits, instead of the O(N²) a whole-turn rewrite per
+/// image would incur (`write_turn` clears and rewrites every attachment slot).
+/// The turn blob itself is not touched here — it is (re)written in full, blob
+/// plus ALL attachments atomically, at `finalize_turn`.
 pub(crate) fn emit_image(
     cmd_tx: &mpsc::Sender<SessionCommand>,
     db: &redb::Database,
@@ -100,19 +108,28 @@ pub(crate) fn emit_image(
         data: image.data,
         tool_call_id,
     };
-    session.add_displayed_image(turn_id, record.clone());
-    // Persist-at-emit: write the turn (with its new `d{i}` attachment) right
-    // now so an on-demand `GetImage` for this image resolves. `write_turn`
-    // re-derives all attachment slots from the turn's `displayed_images`, so
-    // the index the wire request carries is exactly the slot just written. A
-    // failure is logged and swallowed: the image still renders from the
-    // in-memory turn, and `RequestFinished` retries the write at turn
-    // completion.
-    if let Some(turn) = session.turns.get(&turn_id)
-        && let Err(e) = crate::db::write_turn_retry(db, session_id, turn_id, turn)
+    // The image's position in the turn's `displayed_images` BEFORE the push is
+    // exactly the slot the wire `GetImage` will carry (and the slot written
+    // below). A turn not yet present in `turns` has no images, so index 0.
+    let index = session
+        .turns
+        .get(&turn_id)
+        .map_or(0, |t| t.displayed_images.len());
+    // usize→u32: a turn's image count is bounded far below u32; saturate at the
+    // theoretical cap (the slot name stays total, matching display_slot).
+    let index = u32::try_from(index).unwrap_or(u32::MAX);
+    // Persist-at-emit: write ONLY this image's slot right now — BEFORE adding
+    // the image to the in-memory turn and BEFORE broadcasting — so an on-demand
+    // `GetImage` that arrives with the broadcast already resolves. A failure is
+    // logged and swallowed: the image still renders from the in-memory turn,
+    // and `finalize_turn` retries the full turn write (blob + all attachments)
+    // at turn completion.
+    if let Err(e) =
+        crate::db::write_display_image_attachment(db, session_id, turn_id, index, &record.data)
     {
         warn!(turn_id, error = %e, "failed to persist displayed image at emit time");
     }
+    session.add_displayed_image(turn_id, record);
     broadcast_turn_appended(cmd_tx, session, session_id, turn_id);
 }
 

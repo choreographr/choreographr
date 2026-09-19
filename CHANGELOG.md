@@ -143,6 +143,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace topology and the publish set, and say all five binaries report the
   release name from `--version`.
 
+- **Displayed-image emit now persists a single attachment slot instead of
+  rewriting the whole turn (`choreo-daemon`).** The turn-attachment byte store
+  moved out of `db/mod.rs` into a dedicated `db/attachments.rs` submodule
+  (sibling of `db/codec.rs`), which owns the `session_attachments` table, the
+  slot naming (`d{i}` display / `r<call_id>` vision), the `write_turn`/`read_turns`
+  attach/reattach steps, the delete helpers, and the on-demand
+  `read_display_image` (`db/mod.rs` re-exports the latter plus the new
+  `write_display_image_attachment`). `emit_image` previously called
+  `write_turn_retry` after every image, and `write_turn` clears and rewrites
+  EVERY attachment slot — so an N-image turn cost O(N²) disk bytes. It now
+  writes only its own `d{index}` slot through the new single-transaction
+  `write_display_image_attachment` (O(1) per image), still BEFORE the in-memory
+  append and the broadcast (persist-at-emit), while the full turn (blob + all
+  attachments) is still written atomically at finalize; the redundant
+  full-record clone in `emit_image` is gone (the record is moved into the turn).
+
 ### Removed
 
 - **The `/models` alias is gone — use `/model`.**

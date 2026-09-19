@@ -2754,7 +2754,7 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 |---|---|---|
 | `sessions` | `u64` session ID | MessagePack named(`SessionRecord`) |
 | `session_turns` | `(u64, u32)` (session ID, turn ID) | zstd-compressed MessagePack named(`Turn`) — since schema 2 each value is a zstd frame around the MessagePack blob; turn text/tool-output/reasoning is the bulk of the DB and compresses 4–10×. Image/attachment bytes are **split out** of the blob into `session_attachments` (they are already incompressible PNG/JPEG) |
-| `session_attachments` | `(u64, u32, String)` (session ID, turn ID, slot) | raw `Vec<u8>` — the general on-demand byte store for a turn: display + vision image bytes, persisted uncompressed and keyed by slot (`d{i}` for display index `i`, `r<call_id>` for a tool-result vision image), re-attached into the decoded turn by `read_turns`; written atomically with the turn blob in `write_turn` (which first clears the turn's stale slots so a rewrite with a shifted image layout never re-attaches old bytes to the wrong slot), removed by the session-wide delete helpers and both delete paths. Also the source for the on-demand image protocol: `read_display_image(db, session_id, turn_id, index)` does a single `d{i}` lookup (no turn decode) to serve a client's `GetImage`, and `emit_image` writes the attachment the instant a tool produces an image (persist-at-emit) so the DB is authoritative for image bytes even mid-request |
+| `session_attachments` | `(u64, u32, String)` (session ID, turn ID, slot) | raw `Vec<u8>` — the general on-demand byte store for a turn: display + vision image bytes, persisted uncompressed and keyed by slot (`d{i}` for display index `i`, `r<call_id>` for a tool-result vision image), re-attached into the decoded turn by `read_turns`; written atomically with the turn blob in `write_turn` (which first clears the turn's stale slots so a rewrite with a shifted image layout never re-attaches old bytes to the wrong slot), removed by the session-wide delete helpers and both delete paths. All of its I/O lives in the `db/attachments.rs` submodule (`db/mod.rs` re-exports `read_display_image`/`write_display_image_attachment`). Also the source for the on-demand image protocol: `read_display_image(db, session_id, turn_id, index)` does a single `d{i}` lookup (no turn decode) to serve a client's `GetImage`, and `emit_image` persists each image the instant a tool produces it (persist-at-emit) via `write_display_image_attachment` — a single-slot, single-transaction insert of just that image's `d{i}` row (O(1) per image; it does NOT clear the turn's other slots), so the DB is authoritative for image bytes even mid-request. The full turn (blob + ALL attachment slots) is still (re)written atomically at `finalize_turn` |
 | `credentials` | `&str` service name | encrypted blob |
 | `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
 | `deleted_sessions` | `u64` session ID | `()` tombstone — marks a deleted session whose still-shutting-down thread may re-create the record; written only when the delete is deferred (a live thread exists), cleared once the exit finalize re-deletes the record, purged at startup |
@@ -3176,7 +3176,11 @@ render it (`ClientMessage::GetImage` → `DaemonMessage::Image`, keyed by `(sess
 turn_id, image_index)`; the daemon reads a single `d{i}` slot via `read_display_image`).
 `emit_image` persists each image the instant the tool produces it (persist-at-emit) so the DB
 is authoritative for the bytes even mid-request, when the turn's final write has not happened
-yet — the on-demand fetch must never race that write.
+yet — the on-demand fetch must never race that write. That emit-time write is a SINGLE-slot
+insert (`db::write_display_image_attachment`: one `d{i}` row, one transaction, no stale-slot
+clear), so an N-image turn costs O(N) disk writes across its emits rather than the O(N²) a
+whole-turn rewrite-per-image would incur; the full turn (blob + all attachments) is still
+(re)written atomically at `finalize_turn`.
 
 **Image decay** replaces the old always-replay policy: previously the same normalized
 bytes rode EVERY later request too, so a long image-heavy session re-attached megabytes
