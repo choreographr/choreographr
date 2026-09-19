@@ -1,5 +1,32 @@
 use super::*;
 
+/// Run `check` over every Unicode scalar value, sharded across the available
+/// cores. The code-space sweep below is exhaustive by design (it pins the TUI's
+/// per-char terminal keep policy against the shared spoofing predicate for
+/// *every* char) and pure CPU; sharding keeps it exhaustive while cutting its
+/// wall time to roughly one core's share. A panic in any shard propagates out
+/// of `scope` once every thread has joined.
+fn sweep_code_space(check: impl Fn(char) + Sync) {
+    const TOTAL: u32 = 0x11_0000; // Unicode scalar range, excluding surrogates.
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let shard = TOTAL.div_ceil(u32::try_from(threads).unwrap_or(1)).max(1);
+    std::thread::scope(|scope| {
+        let mut start = 0u32;
+        while start < TOTAL {
+            let end = (start + shard).min(TOTAL);
+            let check = &check;
+            scope.spawn(move || {
+                for cp in start..end {
+                    if let Some(c) = char::from_u32(cp) {
+                        check(c);
+                    }
+                }
+            });
+            start = end;
+        }
+    });
+}
+
 // ── find_syntax ──────────────────────────────────────────────────────
 
 #[test]
@@ -2777,7 +2804,7 @@ fn terminal_keep_policy_sweeps_all_chars() {
     //     non-ASCII — never a control or spoofing char;
     //   - every control (except TAB/LF), spoofing char, and unprintable
     //     ASCII byte must be escaped — nothing safe may leak.
-    for c in '\u{0}'..=char::MAX {
+    sweep_code_space(|c| {
         let keeps = terminal_keeps(c);
         let structural = matches!(c, '\t' | '\n');
         let printable_ascii = c.is_ascii() && (' '..='~').contains(&c);
@@ -2797,7 +2824,7 @@ fn terminal_keep_policy_sweeps_all_chars() {
                 c as u32
             );
         }
-    }
+    });
 }
 
 #[test]

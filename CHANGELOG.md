@@ -70,6 +70,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Slow tests made much faster; dev-profile crypto/image hot loops
+  optimized.** Because cargo-nextest runs every test in its own process, the
+  suite's run phase is pinned by the single slowest test — so a handful of
+  CPU-heavy tests dominated it. Fixes: (1) `oversized_image_is_downscaled`
+  now normalizes a barely-over-cap 2002×1001 source encoded as uncompressed
+  BMP with an opaque RGB buffer, instead of a 4000×2000 PNG round-trip (the
+  same over-cap/downscale coverage, without seconds of PNG deflate/inflate);
+  (2) `encode_rejects_oversized_message` sizes its payload with a large
+  `String` (one msgpack `str` = one memcpy) rather than a 64 MiB `Vec<u8>`
+  (which rmp-serde emits as an msgpack *array* of 64M `u8` writes) — the same
+  `FrameTooLarge` gate, ~100× faster; (3) the three exhaustive Unicode
+  code-space sweeps (`choreo-sanitize`'s predicate guard, the daemon's
+  sanitize policy sweep, the TUI's terminal-filter sweep) shard their ~1.1M
+  code-point scan across the available cores with `std::thread::scope`;
+  (4) `embedded::embedded_transport_round_trips_values` now drops its second
+  `EmbeddedLink` before `shutdown()`, so the drain's bounded writer/connection
+  join returns immediately instead of waiting out the 5 s grace. (5) The
+  keystore's Polkadot-JS import tests were spending seconds in scrypt key
+  derivation under the *unoptimized* dev profile — `[profile.dev.package]`
+  now builds `scrypt`/`salsa20`/`pbkdf2` (and, for the image decode/encode
+  loops, `image`/`zune-jpeg`) at `opt-level = 3`; these are tiny crates, so
+  it is a one-time dev-build cost that speeds every test touching them.
+  (6) The lag-eviction test's wedged-writer path no longer waits out the real
+  5 s socket write timeout: `DaemonState` gains an injectable
+  `writer_write_timeout: Duration` (default 5 s, cloned into `DaemonCore` and
+  threaded to each accepted connection's writer), and the test sets it to
+  200 ms and streams 1 MiB instead of 2 MiB. Net effect on this box: the full
+  `cargo test-all` run phase drops from ~13 s to ~8 s (the remainder is
+  dominated by the four headless-Chromium `retrieve_webpage` renders), with
+  all 3,412 tests passing and coverage unchanged.
+
 - **Integration tests consolidated into one binary per crate (build-time win).**
   Each crate's integration suite now lives in a single `tests/it/main.rs` target —
   one module per former `tests/*.rs` file — instead of one test binary per file.

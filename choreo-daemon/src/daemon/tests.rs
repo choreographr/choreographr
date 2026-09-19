@@ -48,6 +48,7 @@ pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>
         client_subscribed_sessions: HashMap::new(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         lag_limits: LagLimits::default(),
+        writer_write_timeout: crate::server::connection::WRITER_WRITE_TIMEOUT,
         model_cache: HashMap::new(),
         model_prefetch_in_flight: HashSet::new(),
         mcp_manager: crate::mcp::McpManager::empty(),

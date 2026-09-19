@@ -119,6 +119,13 @@ fn embedded_transport_round_trips_values() {
         DaemonMessage::Pong
     ));
 
+    // Drop link2 BEFORE shutting down: a still-open connection thread is
+    // blocked on `client_rx`, so `shutdown`'s bounded writer/connection join
+    // would otherwise stall for the full grace period (the same reason
+    // `shutdown_delivers_shutting_down_before_channel_close` drops its link
+    // before joining the drain). Closing the channel first lets the join
+    // return immediately.
+    drop(link2);
     daemon.shutdown();
 }
 

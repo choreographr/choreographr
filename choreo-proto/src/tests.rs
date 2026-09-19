@@ -218,9 +218,15 @@ fn socket_path_default_when_env_not_set() {
 
 #[test]
 fn encode_rejects_oversized_message() {
-    let message = ClientMessage::RunInput {
-        request_id: 1,
-        input: vec![0; MAX_FRAME_SIZE],
+    // A payload over MAX_FRAME_SIZE must fail to encode. The size gate is
+    // length-based and message-agnostic, so pick a message whose payload
+    // serializes in O(n) memcpy rather than O(n) serializer calls: a large
+    // `String` becomes a single msgpack `str` (one length prefix + one memcpy),
+    // whereas `Vec<u8>` is encoded as an msgpack *array* of one u8 per element
+    // — a 64 MiB byte vector costs ~64M `serialize_u8` calls (~5s unoptimized)
+    // for byte-for-byte the same FrameTooLarge outcome.
+    let message = DaemonMessage::ModelsRefreshFailed {
+        error: "x".repeat(MAX_FRAME_SIZE),
     };
     let err = encode_frame(&message).expect_err("should fail");
     assert!(matches!(err, ProtoError::FrameTooLarge));

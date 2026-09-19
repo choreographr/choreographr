@@ -142,6 +142,14 @@ pub struct DaemonState {
     /// Lag thresholds (per-client cap + daemon-wide budget). Injectable so
     /// tests can use tiny caps; defaults are 64 MiB / 512 MiB.
     pub lag_limits: LagLimits,
+    /// Socket write timeout applied to every connection's writer thread
+    /// (bounds a single blocking `write` syscall so a wedged client — receive
+    /// window permanently zero — is reaped by lag eviction instead of stalling
+    /// its writer forever). Injectable so a wedged-writer test can use a tiny
+    /// value; production uses [`crate::server::connection::WRITER_WRITE_TIMEOUT`]
+    /// (5 s). Read once by the transport adapters when a connection is
+    /// accepted.
+    pub writer_write_timeout: Duration,
     pub model_cache: HashMap<String, (Vec<String>, Instant)>,
     /// Accounts with a model-list prefetch currently running on a background
     /// thread. The command loop sets a name when it spawns the fetch thread

@@ -100,6 +100,11 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         client_subscribed_sessions: HashMap::new(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         lag_limits: limits,
+        // Production default. Tests that exercise the wedged-writer eviction
+        // path override this on the returned state with a tiny timeout (see
+        // `stream_integrity::evicts_client_that_stops_reading`) so they do not
+        // have to wait out the real 5 s write timeout.
+        writer_write_timeout: Duration::from_secs(5),
         model_cache: HashMap::new(),
         model_prefetch_in_flight: HashSet::new(),
         mcp_manager: choreo_daemon::mcp::McpManager::empty(),

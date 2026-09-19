@@ -232,6 +232,33 @@ pub(crate) fn truncation_marker(truncated: bool, cap: usize, noun: &str) -> Opti
 mod tests {
     use super::*;
 
+    /// Run `check` over every Unicode scalar value, sharded across the
+    /// available cores. The code-space sweep below is exhaustive by design
+    /// (it pins the daemon's keep policy against the shared spoofing predicate
+    /// for *every* char) and pure CPU; sharding keeps it exhaustive while
+    /// cutting its wall time to roughly one core's share. A panic in any shard
+    /// propagates out of `scope` once every thread has joined.
+    fn sweep_code_space(check: impl Fn(char) + Sync) {
+        const TOTAL: u32 = 0x11_0000; // Unicode scalar range, excluding surrogates.
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let shard = TOTAL.div_ceil(u32::try_from(threads).unwrap_or(1)).max(1);
+        std::thread::scope(|scope| {
+            let mut start = 0u32;
+            while start < TOTAL {
+                let end = (start + shard).min(TOTAL);
+                let check = &check;
+                scope.spawn(move || {
+                    for cp in start..end {
+                        if let Some(c) = char::from_u32(cp) {
+                            check(c);
+                        }
+                    }
+                });
+                start = end;
+            }
+        });
+    }
+
     #[test]
     fn sanitize_name_escapes_control_chars() {
         assert_eq!(sanitize_name("plain.txt"), "plain.txt");
@@ -464,7 +491,7 @@ mod tests {
         // policy). The predicate's own correctness against the Unicode tables
         // is guarded by the code-space sweep in choreo-sanitize; this sweep
         // validates the daemon's keep policy against that shared predicate.
-        for c in '\u{0}'..=char::MAX {
+        sweep_code_space(|c| {
             let is_control = c.is_control();
             let is_unsafe = is_unsafe_unicode(c);
             // Name policy (tabs escaped): every control and spoofing char is
@@ -482,7 +509,7 @@ mod tests {
                 "content-policy keep drift for U+{:04X}",
                 c as u32
             );
-        }
+        });
     }
 
     #[test]

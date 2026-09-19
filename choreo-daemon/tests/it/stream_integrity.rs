@@ -428,21 +428,31 @@ fn evicts_client_that_stops_reading() {
     // Tiny lag caps: the per-client cap is a few KiB, so the first big
     // OutputChunk crosses it and the daemon must evict the client (removing
     // it from every subscriber map and tearing the connection down via the
-    // writer — notify-before-EOF when the writer is healthy, the 5 s socket
-    // write timeout when it is wedged, exactly what this test exercises).
+    // writer — notify-before-EOF when the writer is healthy, the socket write
+    // timeout when it is wedged, exactly what this test exercises).
     let limits = LagLimits {
         per_client_cap: 8 * 1024,
         global_budget: 64 * 1024,
     };
-    // ~2 MiB of answer text in ~2 KiB chunks — far past the cap, and more
-    // than the socket buffers can absorb once the client stops reading.
+    // ~1 MiB of answer text in ~2 KiB chunks — far past the 8 KiB cap, and
+    // comfortably more than the socket buffers can absorb once the client
+    // stops reading (so the writer still wedges and the write timeout fires),
+    // but no larger than needed: the mock SSE stream is what dominates this
+    // test's wall time, and 1 MiB already exercises both the eviction and the
+    // wedged-writer reap.
     let chunk = "y".repeat(2048);
-    let sse = sse_repeat_chunks(&chunk, 1024);
+    let sse = sse_repeat_chunks(&chunk, 512);
 
     let mut daemon = common::SpawnedDaemon::start_with_state(
         move || {
             let mock = MockProvider::start(vec![(200, "text/event-stream", sse.clone())]);
             let mut state = common::test_daemon_state_with_limits(limits);
+            // Shrink the connection write timeout from the 5 s production
+            // default to 200 ms: the daemon under test reaps the wedged
+            // writer via this timeout (see `DaemonState::writer_write_timeout`),
+            // so a tiny value exercises the exact same code path without
+            // making the test sit on the 5 s default.
+            state.writer_write_timeout = std::time::Duration::from_millis(200);
             // Seed the mock account so a session created with it resolves
             // its provider lazily (via ResolveAccountCmd) against its OWN
             // socket registry — the per-session-registry wiring under test.
@@ -541,10 +551,10 @@ fn evicts_client_that_stops_reading() {
     }
 
     // Wedged. The writer drains its lossless backlog into the socket until
-    // the kernel buffers fill, then blocks; the 5 s write timeout trips and
-    // the writer shuts the socket down, so the client eventually sees EOF.
-    // (A healthy writer flushes the Evicted advisory and closes cleanly —
-    // either way EOF arrives within the bounded deadline.)
+    // the kernel buffers fill, then blocks; the (test-shrunk) write timeout
+    // trips and the writer shuts the socket down, so the client eventually
+    // sees EOF. (A healthy writer flushes the Evicted advisory and closes
+    // cleanly — either way EOF arrives within the bounded deadline.)
     wait_for_eof(&mut stream, Duration::from_secs(15));
 
     // The daemon must stay healthy after evicting the laggard.

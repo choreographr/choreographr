@@ -43,7 +43,7 @@ const WRITER_JOIN_GRACE: Duration = Duration::from_secs(5);
 /// syscall, so a socket that makes any progress (each write completes in
 /// under this) survives; only a client that stops reading entirely trips it,
 /// which is exactly the lag condition eviction targets.
-const WRITER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const WRITER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A per-connection message sink implementing the single-writer contract.
 ///
@@ -810,6 +810,7 @@ impl ClientConn {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn client_thread(
     stream: UnixStream,
     daemon_tx: mpsc::Sender<DaemonCommand>,
@@ -818,12 +819,16 @@ pub(crate) fn client_thread(
     writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
     global_lag: Arc<AtomicUsize>,
     db: Arc<redb::Database>,
+    writer_write_timeout: Duration,
 ) -> io::Result<()> {
     // Bound the writer's blocking socket writes so a wedged client (receive
     // window permanently zero) cannot stall it forever — this is what makes
     // lag eviction reap the connection without a daemon-held close handle.
-    // The timeout applies to every clone of this socket.
-    stream.set_write_timeout(Some(WRITER_WRITE_TIMEOUT))?;
+    // The timeout applies to every clone of this socket. The value comes from
+    // `DaemonState::writer_write_timeout` (default [`WRITER_WRITE_TIMEOUT`]);
+    // it is injectable so a wedged-writer test can use a tiny timeout instead
+    // of waiting out the 5 s default.
+    stream.set_write_timeout(Some(writer_write_timeout))?;
     let reader = BufReader::new(stream.try_clone()?);
     let writer_buf = BufWriter::new(stream);
 
@@ -908,6 +913,7 @@ pub(crate) fn tcp_handshake_and_client_thread(
     writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
     global_lag: Arc<AtomicUsize>,
     db: Arc<redb::Database>,
+    writer_write_timeout: Duration,
 ) -> io::Result<()> {
     // The preamble read runs BEFORE any authentication, so it is bounded by
     // the transport's absolute-deadline machinery (same as the handshake
@@ -963,10 +969,18 @@ pub(crate) fn tcp_handshake_and_client_thread(
     };
 
     tcp_client_thread(
-        noise, daemon_tx, client_id, writer, writer_rx, global_lag, db,
+        noise,
+        daemon_tx,
+        client_id,
+        writer,
+        writer_rx,
+        global_lag,
+        db,
+        writer_write_timeout,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tcp_client_thread(
     noise: choreo_transport::noise::NoiseStream,
     daemon_tx: mpsc::Sender<DaemonCommand>,
@@ -975,14 +989,16 @@ pub(crate) fn tcp_client_thread(
     writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
     global_lag: Arc<AtomicUsize>,
     db: Arc<redb::Database>,
+    writer_write_timeout: Duration,
 ) -> io::Result<()> {
     // Writer thread: blocks on writer_rx, sends via NoiseStream encryption.
-    // Bound the underlying socket's blocking writes (see WRITER_WRITE_TIMEOUT)
-    // so a wedged client cannot stall the writer forever; the timeout applies
-    // to every clone of the TcpStream.
+    // Bound the underlying socket's blocking writes (see
+    // `DaemonState::writer_write_timeout`, default [`WRITER_WRITE_TIMEOUT`]) so
+    // a wedged client cannot stall the writer forever; the timeout applies to
+    // every clone of the TcpStream.
     noise
         .get_ref()
-        .set_write_timeout(Some(WRITER_WRITE_TIMEOUT))?;
+        .set_write_timeout(Some(writer_write_timeout))?;
     let writer_buf = noise.try_clone()?;
 
     let mut conn = ClientConn::new(ClientConnSetup {

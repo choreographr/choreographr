@@ -255,6 +255,36 @@ unchecked_time_subtraction = "deny"
 debug = "line-tables-only"
 rustflags = ["-Zunstable-options", "--jobs-frontend=0", "-Zshare-generics=yes", "-C", "target-cpu=native"]
 
+# Per-package optimization for the crates whose *pure-CPU hot loops* the unit
+# tests actually execute, so a handful of timing-sensitive tests stop
+# dominating the (unoptimized) dev test run. scrypt's ROMix (salsa20/8 block
+# mixing) plus the PBKDF2-HMAC-SHA256 layers are the whole cost of a
+# Polkadot-JS keystore import: `choreo-keystore`'s `import_bob_from_json`
+# fixture uses the allowed (N=2^17, p=1, r=8) parameters, which take ~5-6s (and
+# ~2-4s for the N=2^15 fixture) under opt-level 0 — enough to be the slowest
+# test in the suite. These crates are tiny, so building just them optimized is
+# ~free and makes the imports ~10x faster. (Kept per-package rather than a
+# blanket `opt-level` bump so dev builds of the rest of the graph stay fast to
+# compile.) scrypt -> salsa20 / pbkdf2 are its hot dependencies.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+# The `image` decode/encode hot loops. Several tests exercise real image
+# normalization (e.g. `choreo-daemon`'s `oversized_image_is_downscaled`, which
+# decodes and re-encodes a multi-megapixel image), and under the full-suite
+# parallel run those CPU-bound loops made that test the slowest in the suite
+# (~5.7s, versus ~2s unoptimized in isolation). `image`'s own codec code plus
+# `zune-jpeg` (its JPEG decoder) are the cost; building just those two
+# optimized is a one-time dev-build cost that speeds every image test.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
 # Release profile for locally-built optimized binaries (`cargo build
 # --release`); shipped artifacts build from its [profile.dist] child (see
 # below) so the release pipeline has its own output directory. One deliberate

@@ -207,6 +207,39 @@ impl ByteBudget {
 mod tests {
     use super::*;
 
+    /// Run `check` over every Unicode scalar value, sharded across the
+    /// available cores.
+    ///
+    /// The code-space sweeps below are *exhaustive* by design (they are the
+    /// guard that keeps the predicate honest as the Unicode tables are bumped),
+    /// but they are also pure CPU: ~1.1M `get_general_category` table lookups
+    /// per visit. Visiting every code point is the requirement, not visiting
+    /// them one thread — so the work is sharded here, keeping the guard exactly
+    /// as exhaustive while cutting its wall time to roughly one core's share
+    /// (it was among the slowest tests in the suite at ~3s). A panic in any
+    /// shard propagates out of `scope` once every thread has joined.
+    fn sweep_code_space(check: impl Fn(char) + Sync) {
+        const TOTAL: u32 = 0x11_0000; // Unicode scalar range, excluding surrogates.
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let shard = TOTAL.div_ceil(u32::try_from(threads).unwrap_or(1)).max(1);
+        std::thread::scope(|scope| {
+            let mut start = 0u32;
+            while start < TOTAL {
+                let end = (start + shard).min(TOTAL);
+                let check = &check;
+                scope.spawn(move || {
+                    for cp in start..end {
+                        // Surrogate code points are not `char`s.
+                        if let Some(c) = char::from_u32(cp) {
+                            check(c);
+                        }
+                    }
+                });
+                start = end;
+            }
+        });
+    }
+
     #[test]
     fn spoofing_predicates_match_unicode_tables_for_all_chars() {
         // Sweep the full code space: the predicates must equal exactly
@@ -216,7 +249,7 @@ mod tests {
         // `unicode-general-category` tables are updated by a crate bump — a
         // newly-assigned format char is escaped here, never silently passed
         // through.
-        for c in '\u{0}'..=char::MAX {
+        sweep_code_space(|c| {
             let is_separator = matches!(c, '\u{2028}' | '\u{2029}');
             let is_cf = get_general_category(c) == GeneralCategory::Format;
             let is_joiner = matches!(c, '\u{200c}' | '\u{200d}');
@@ -234,7 +267,7 @@ mod tests {
                 "is_non_joiner_format_char drift for U+{:04X}",
                 c as u32
             );
-        }
+        });
     }
 
     #[test]

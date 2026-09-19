@@ -420,21 +420,36 @@ mod tests {
 
     #[test]
     fn oversized_image_is_downscaled() {
-        // A 4000×2000 image (longest edge 4000 > 2000) is downscaled to fit.
-        let buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(4000, 2000, |x, y| {
-            // u8 pixel coordinates: x wraps by design across the 4000-px width,
-            // y (0..2000) is truncated mod 256 — the pattern is cosmetic.
+        // A 2002×1001 image (longest edge 2002 > the 2000 cap, exact 2:1
+        // aspect) is downscaled to fit. Kept barely over the cap deliberately:
+        // the unoptimized dev profile makes the Lanczos3 resample and BMP
+        // decode the cost here, and the test only needs *some* longest edge
+        // over the cap plus a clean 2:1 ratio (so the 2000×1000 output is
+        // exact) — a huge source adds seconds of resampling for no extra
+        // coverage.
+        //
+        // Encoded as UNCOMPRESSED BMP with an opaque (RGB, no-alpha) buffer:
+        // the behavior under test is the *downscale*, and a PNG round-trip of a
+        // multi-megapixel image costs seconds of deflate/inflate in the
+        // unoptimized dev profile for zero added coverage (the transparent-PNG
+        // re-encode path has its own tiny test below). Opaque input also keeps
+        // the output on the JPEG re-encode path (no alpha), which is cheap.
+        let buf: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(2002, 1001, |x, y| {
+            // u8 pixel coordinates: x wraps by design across the 2002-px width,
+            // y (0..1001) is truncated mod 256 — the pattern is cosmetic.
             #[allow(clippy::cast_possible_truncation)]
-            Rgba([x as u8, y as u8, 100, 255])
+            Rgb([x as u8, y as u8, 100])
         });
-        let img = DynamicImage::ImageRgba8(buf);
-        let bytes = as_png(&img);
-        let out = normalize_bytes(&bytes).unwrap();
+        let img = DynamicImage::ImageRgb8(buf);
+        let mut bytes = Cursor::new(Vec::new());
+        img.write_to(&mut bytes, ImageFormat::Bmp).unwrap();
+        let out = normalize_bytes(&bytes.into_inner()).unwrap();
         assert!(out.width <= MAX_IMAGE_DIMENSION);
         assert!(out.height <= MAX_IMAGE_DIMENSION);
-        // Aspect ratio preserved (2000×1000).
+        // Aspect ratio preserved (2000×1000), opaque input → JPEG output.
         assert_eq!(out.width, 2000);
         assert_eq!(out.height, 1000);
+        assert_eq!(out.mime_type, "image/jpeg");
     }
 
     #[cfg(not(feature = "avif"))]

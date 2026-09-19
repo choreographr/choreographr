@@ -209,6 +209,7 @@ impl DaemonState {
             // and every session thread (see `broadcast::SubscriberSink`).
             global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             lag_limits: crate::broadcast::LagLimits::default(),
+            writer_write_timeout: crate::server::connection::WRITER_WRITE_TIMEOUT,
             model_cache: HashMap::new(),
             model_prefetch_in_flight: HashSet::new(),
             mcp_manager,

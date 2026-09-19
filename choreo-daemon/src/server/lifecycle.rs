@@ -307,6 +307,10 @@ pub fn run_server(
     // thread reads on-demand images from its own redb handle instead of
     // round-tripping through the command loop (see DaemonCore::db).
     let db = Arc::clone(&core.db);
+    // Socket write timeout for each accepted connection's writer thread
+    // (`Duration` is `Copy`, so the accept closures below capture a copy
+    // without disturbing this binding). See DaemonCore::writer_write_timeout.
+    let writer_write_timeout = core.writer_write_timeout;
 
     // Signal handler thread: sets the shutdown flag and connects to our own
     // socket to unblock the blocking accept() call on the main thread.
@@ -515,8 +519,16 @@ pub fn run_server(
                             // pre-transport failure path.
                             if let Err(e) =
                                 crate::server::connection::tcp_handshake_and_client_thread(
-                                    tcp, sk_bytes, &acl, tx, client_id, writer_tx, writer_rx,
-                                    global_lag, db,
+                                    tcp,
+                                    sk_bytes,
+                                    &acl,
+                                    tx,
+                                    client_id,
+                                    writer_tx,
+                                    writer_rx,
+                                    global_lag,
+                                    db,
+                                    writer_write_timeout,
                                 )
                             {
                                 error!(error = %e, "TCP client error");
@@ -594,7 +606,14 @@ pub fn run_server(
                         // thread exits, even on panic.
                         let conn_slot = slot;
                         let result = crate::server::connection::client_thread(
-                            stream, tx, client_id, writer_tx, writer_rx, global_lag, db,
+                            stream,
+                            tx,
+                            client_id,
+                            writer_tx,
+                            writer_rx,
+                            global_lag,
+                            db,
+                            writer_write_timeout,
                         );
                         if let Err(e) = result {
                             error!(error = %e, "client error");
