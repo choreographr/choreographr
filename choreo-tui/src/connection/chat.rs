@@ -67,12 +67,16 @@ pub(super) fn handle_chat_event(
                 // single line, and a stray `\n` would only make the parser
                 // reject an otherwise-valid command.  Only Ctrl/Alt chords fall
                 // through (to the shortcut dispatch above / the Ctrl handler
-                // below).  An empty command line is a no-op that stays in mode;
-                // a non-empty one runs and exits, discarding the buffer AFTER
-                // the command runs so its echo is preserved.
+                // below).  The line to run is resolved through
+                // `command_palette_enter_line`, so Enter runs the HIGHLIGHTED
+                // command directly — no preceding `Tab` — while a fully-typed
+                // command (`model gpt-4o`) still runs verbatim with its
+                // arguments.  An empty command line with nothing highlighted is
+                // a no-op that stays in mode; a run exits the mode, discarding
+                // the buffer AFTER the command runs so its echo is preserved.
                 KeyCode::Enter if app.command_mode && plain => {
-                    if !app.input.text.is_empty() {
-                        let line = app.input.text.clone();
+                    let line = app.command_palette_enter_line();
+                    if !line.is_empty() {
                         let command =
                             parse_input_line(&format!("/{line}"), &mut app.next_request_id);
                         run_command(command, true, app, client_tx)?;

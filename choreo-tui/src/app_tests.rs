@@ -1606,23 +1606,75 @@ fn palette_shift_enter_runs_the_command_without_a_newline() {
 }
 
 #[test]
-fn palette_enter_on_empty_line_is_a_noop() {
+fn palette_enter_on_empty_line_runs_the_highlighted_command() {
+    // The empty line highlights the first catalog command (`session`); Enter
+    // runs it directly — no preceding `Tab`.
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
     press(&mut app, &tx, KeyCode::Char('/'));
     assert!(app.command_palette_active());
+    assert_eq!(app.command_palette_focused(), 0);
 
     press(&mut app, &tx, KeyCode::Enter);
 
-    assert!(app.command_mode, "an empty command line stays in mode");
-    assert!(
-        app.input.text.is_empty(),
-        "an empty command line writes nothing"
+    assert_eq!(
+        app.page,
+        Page::SessionManager,
+        "Enter ran the highlighted `/session`"
     );
-    assert!(
-        rx.try_recv().is_err(),
-        "an empty command line sends nothing"
+    assert_eq!(
+        rx.recv().expect("ListSessions"),
+        ClientMessage::ListSessions
     );
+    assert_eq!(
+        rx.recv().expect("SubscribeSessionsSummary"),
+        ClientMessage::SubscribeSessionsSummary
+    );
+    assert!(!app.command_mode, "running a command exits command mode");
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn palette_enter_on_a_partial_token_runs_the_highlighted_command() {
+    // Typing a prefix narrows the palette; Enter runs the highlighted command
+    // without a `Tab` completing it first.
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    for c in "mo".chars() {
+        press(&mut app, &tx, KeyCode::Char(c));
+    }
+    assert_eq!(app.command_palette_matches().len(), 1);
+
+    press(&mut app, &tx, KeyCode::Enter);
+
+    assert!(
+        app.model_selector.is_open(),
+        "Enter ran the highlighted `/model`"
+    );
+    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert!(!app.command_mode, "running a command exits command mode");
+}
+
+#[test]
+fn palette_enter_runs_the_row_the_arrows_selected() {
+    // Arrows move the highlight over the whole catalog on an empty line; Enter
+    // then runs whichever row is highlighted.
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    // Catalog row 1 is `/model` (row 0 is `/session`).
+    press(&mut app, &tx, KeyCode::Down);
+    assert_eq!(app.command_palette_focused(), 1);
+
+    press(&mut app, &tx, KeyCode::Enter);
+
+    assert!(
+        app.model_selector.is_open(),
+        "Enter ran the arrow-selected `/model`"
+    );
+    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert!(!app.command_mode);
 }
 
 #[test]

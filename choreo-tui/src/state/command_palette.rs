@@ -7,14 +7,15 @@
 //! trigger and never enters the buffer.  While in command mode the shared
 //! composer buffer (`App::input`) holds the command line WITHOUT its leading
 //! slash (`model`, `model gpt-4o`), the palette floats above the input box
-//! listing the matching commands, `Enter` RUNS the command, `Esc` returns to
-//! the prompt, `Tab` completes the highlighted name into the buffer, and
+//! listing the matching commands, `Enter` RUNS the highlighted command (no
+//! preceding `Tab` required — see `command_palette_enter_line`), `Esc` returns
+//! to the prompt, `Tab` completes the highlighted name into the buffer, and
 //! `↑`/`↓` move the palette highlight.  Command mode is only ever entered from
 //! an empty prompt and exiting clears the buffer, so there is never a prompt
 //! to preserve and no second buffer is needed.
 
 use crate::state::App;
-use choreo_client_core::{CommandMatch, match_commands};
+use choreo_client_core::{CommandMatch, command_catalog, match_commands};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A single logical key within a [`Chord`].
@@ -309,6 +310,55 @@ impl App {
         self.ensure_input_cursor_visible();
     }
 
+    /// Resolve the command line to RUN when the user presses Enter in command
+    /// mode — the bridge from "the highlighted palette row" to an executable
+    /// line, so Enter alone runs the selected command without a preceding
+    /// `Tab`.
+    ///
+    /// The typed line's FIRST whitespace-delimited token is what filters the
+    /// palette.  When that token already names a command EXACTLY the line is
+    /// returned verbatim — a fully-typed command must never be rewritten, and
+    /// its argument tail (`model gpt-4o`, `session new foo`) has to survive.
+    /// Otherwise the line is empty or a still-partial name: complete the first
+    /// token to the highlighted match and keep any argument tail
+    /// (`"mo gpt-4o"` → `"model gpt-4o"`), which is exactly what running the
+    /// selected row means.  With no highlighted match (a typo'd command) the
+    /// line is returned verbatim so the normal "unknown command" feedback
+    /// still fires.
+    pub(crate) fn command_palette_enter_line(&self) -> String {
+        let line = &self.input.text;
+        // Split off the leading token the same way `command_query` does (first
+        // whitespace-delimited token) so the exact-match test and the palette
+        // filter always agree on what the query is.
+        let first = line.split(char::is_whitespace).next().unwrap_or("");
+        // A fully-typed command runs untouched — its arguments belong to the
+        // user, not to a palette completion.
+        if command_catalog()
+            .iter()
+            .any(|spec| spec.name.eq_ignore_ascii_case(first))
+        {
+            return line.clone();
+        }
+        // Empty or still-partial token: adopt the highlighted row.  Prefer the
+        // focused match; fall back to the first match when the focus is stale.
+        // Keep whatever followed the token (`"mo gpt-4o"` → `"model gpt-4o"`)
+        // so a completed prefix does not drop an already-typed argument.
+        let matches = self.command_palette_matches();
+        let Some(found) = matches
+            .get(self.command_palette.focused)
+            .or_else(|| matches.first())
+        else {
+            // Nothing highlighted (no matches): run the line as typed so the
+            // parser reports the unknown command.
+            return line.clone();
+        };
+        // `first` is a whitespace-split prefix of `line`, so `first.len()` is a
+        // valid char boundary at or before the end; `get` keeps the slice
+        // total (clippy's `string_slice` denies a bare `&line[..]`).
+        let rest = line.get(first.len()..).unwrap_or("");
+        format!("{}{}", found.spec.name, rest)
+    }
+
     /// The highlighted row index, clamped against the current match count — the
     /// renderer uses it to place the `>` marker (and never points past the end
     /// of a narrowed list).
@@ -447,6 +497,64 @@ mod tests {
         app.input.text = "zzz-no-such-command".to_string();
         app.command_palette_complete();
         assert_eq!(app.input.text, "zzz-no-such-command");
+    }
+
+    #[test]
+    fn enter_line_uses_the_highlighted_command_on_an_empty_line() {
+        let mut app = test_app();
+        app.enter_command_mode(); // empty line → whole catalog, focus on row 0
+        assert_eq!(
+            app.command_palette_enter_line(),
+            choreo_client_core::command_catalog()[0].name,
+            "Enter runs the highlighted row without a preceding Tab"
+        );
+
+        // Moving the highlight changes which command Enter runs.
+        app.command_palette_move(1);
+        assert_eq!(
+            app.command_palette_enter_line(),
+            choreo_client_core::command_catalog()[1].name
+        );
+    }
+
+    #[test]
+    fn enter_line_completes_a_partial_first_token() {
+        let mut app = test_app();
+        app.enter_command_mode();
+        app.input.text = "mo".to_string();
+        assert_eq!(app.command_palette_enter_line(), "model");
+    }
+
+    #[test]
+    fn enter_line_keeps_the_argument_tail_of_a_partial_token() {
+        let mut app = test_app();
+        app.enter_command_mode();
+        app.input.text = "mo gpt-4o".to_string();
+        assert_eq!(app.command_palette_enter_line(), "model gpt-4o");
+    }
+
+    #[test]
+    fn enter_line_keeps_a_fully_typed_command_verbatim() {
+        let mut app = test_app();
+        app.enter_command_mode();
+        app.input.text = "model gpt-4o".to_string();
+        assert_eq!(
+            app.command_palette_enter_line(),
+            "model gpt-4o",
+            "an exact command name runs untouched, arguments and all"
+        );
+    }
+
+    #[test]
+    fn enter_line_returns_verbatim_when_nothing_matches() {
+        let mut app = test_app();
+        app.enter_command_mode();
+        app.input.text = "zzz-no-such-command".to_string();
+        assert_eq!(
+            app.command_palette_enter_line(),
+            "zzz-no-such-command",
+            "no highlighted row → the parser still reports the unknown command"
+        );
     }
 
     #[test]
